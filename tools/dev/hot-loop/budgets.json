@@ -1,0 +1,8 @@
+{
+  "priorityScope": { "p95": 50, "max": 150 },
+  "scroll": { "p95": 120 },
+  "folderSwitch": { "p95": 150 },
+  "preview": { "p95": 200 },
+  "thumbnailState": { "p95": 150 },
+  "thumbnailBlob": { "p95": 80 }
+}

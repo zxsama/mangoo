@@ -965,6 +965,42 @@ git commit -m "docs(perf): record final hot-loop results and fixes"
 - Measurement-first: Phases 5/6/7 are explicitly gated on Appendix A findings, honoring systematic-debugging while giving concrete primary code.
 - Type consistency: `summarize`/`checkBudgets`/`percentile`, `buildOperationPlan`/`OPERATION_KINDS`, `assessScrollTrace`, `shouldAttemptThumbnailBlob`/`shouldRefreshThumbnailState`, `buildLoadedMediaById`/`compactMediaSlots` used consistently across tasks.
 
-## Appendix A — Baseline & fix measurements (filled during execution)
+## Appendix A — Baseline & fix measurements
 
-_(To be filled in Phase 3 and updated after each fix: per-category p50/p95/max before and after, locked-failure counts, stuck-tile counts, worst long task.)_
+### Baseline (2026-07-04, real library `Y:\Repository\Billfish\Artists`, 100 ops, index threshold 20k, mid-run generate-all storm)
+
+Current perf-diff working tree (before any fix in this branch):
+
+| category | p50 (ms) | p95 (ms) | max (ms) | n |
+|---|---|---|---|---|
+| scroll | 3.1 | 6.1 | 8.4 | 40 |
+| **priorityScope** | **2.9** | **433** | **1092** | 20 |
+| thumbnailState | 6.7 | 209 | 209 | 10 |
+| folderSwitch | 1.2 | 2.4 | 2.4 | 10 |
+| preview | 5.6 | 49 | 49 | 10 |
+
+Settle pass: 96 ready, 0 skipped, 0 failed, **0 stuck, 0 locked-failures**.
+
+### Diagnosis (systematic-debugging, revises the fix plan below)
+
+- `busy_timeout(5s)` is **already set** (`crates/core/src/db/mod.rs:544`) → writers WAIT, never error (0 locked-failures confirms). **Task 8 (add busy_timeout) is therefore a NO-OP and is dropped.**
+- Root cause of the `priorityScope` p95/max tail, proven by `EXPLAIN QUERY PLAN` + timing at 200k rows:
+  `sync_thumbnail_priority_scope_with_promotions` (`db/mod.rs ~3115`) runs one SELECT with
+  `(tasks.priority > ?bg OR tasks.file_id IN (viewport))`. The OR defeats the tasks index, so the
+  planner drives from `files`: `SCAN files USING COVERING INDEX idx_files_root` = O(files-in-root).
+  At 200k files that SELECT alone is **86ms**; at 500k+ it is the multi-hundred-ms tail. It runs
+  inside the `BEGIN IMMEDIATE` write txn on the shared mutex on every scroll, holding the single WAL
+  writer (which also explains the `thumbnailState` spike — `get_thumbnail` escalates to the same
+  write mutex, `routes.rs:792`).
+- **Proven fix:** split into two index-friendly queries and union in Rust:
+  - elevated tasks driven FROM tasks: `FROM tasks INDEXED BY idx_tasks_kind_status_priority JOIN files ... WHERE ... AND tasks.priority > ?bg AND files.root_id = ?` → SEARCH tasks + SEARCH files by PK.
+  - scoped viewport ids (bounded ~17): `... AND files.root_id = ? AND tasks.file_id IN (...)` → per-id index seek.
+  Measured: **86ms → 0.07ms** (40 elevated); **2.3ms** with 5000 elevated. `SCAN files` eliminated.
+
+**Plan revision:** Phase 4 becomes the priority-scope query rewrite (below). Phases 5 (worker concurrency / WAL checkpoint) become optional, gated on whether the tail persists after the rewrite. Phases 6–7 (web stuck-tile / deep-scroll jank) remain gated on Test B; baseline Test A showed 0 stuck tiles so the stuck-tile web fix may be unneeded — confirmed via Test B in Phase 8.
+
+### Budgets set (`tools/dev/hot-loop/budgets.json`)
+
+`priorityScope` p95 ≤ 50, max ≤ 150 (anti-stutter guarantee); `scroll` p95 ≤ 120; `folderSwitch` ≤ 150; `preview` ≤ 200; `thumbnailState` ≤ 150; `thumbnailBlob` ≤ 80.
+
+_(Post-fix numbers appended after Phase 4.)_
