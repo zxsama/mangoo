@@ -436,9 +436,20 @@ async function opPriorityScope(
   return performance.now() - t0;
 }
 
-async function opThumbnailState(fileIds: number[], priority: string): Promise<number> {
+async function opThumbnailState(
+  fileIds: number[],
+  priority: string,
+  readyFileIds: Set<number>
+): Promise<number> {
   const t0 = performance.now();
-  await Promise.all(fileIds.map((id) => fetchJson(`/media/${id}/thumbnail?target=grid_320&priority=${priority}`)));
+  const responses = await Promise.all(
+    fileIds.map((id) => fetchJson<ThumbnailResponse>(`/media/${id}/thumbnail?target=grid_320&priority=${priority}`))
+  );
+  for (const thumbnail of responses) {
+    if (thumbnail.state === "ready") {
+      readyFileIds.add(thumbnail.fileId);
+    }
+  }
   return performance.now() - t0;
 }
 
@@ -449,9 +460,24 @@ async function opPreview(fileId: number): Promise<number> {
   return performance.now() - t0;
 }
 
-async function opThumbnailBlob(fileId: number): Promise<number> {
+// Returns elapsed ms on success, or null when the blob is not yet available
+// (404). A blob only exists once a thumbnail's state is "ready"; during an
+// active scan most tiles are not ready, so a 404 here is expected (the real UI
+// only fetches blobs for ready tiles) and must not abort the run. Other
+// non-2xx statuses are genuine errors and still throw.
+async function opThumbnailBlob(fileId: number): Promise<number | null> {
   const t0 = performance.now();
-  const response = await fetchResponse(`/media/${fileId}/thumbnail/blob?target=grid_320`);
+  const response = await fetch(`${BASE}/media/${fileId}/thumbnail/blob?target=grid_320`, {
+    headers: { "x-megle-session": TOKEN }
+  });
+  if (response.status === 404) {
+    await response.body?.cancel();
+    return null;
+  }
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`/media/${fileId}/thumbnail/blob -> ${response.status} ${response.statusText}: ${body}`);
+  }
   await response.arrayBuffer();
   return performance.now() - t0;
 }
@@ -571,6 +597,10 @@ async function main() {
     let lastWindowStart = 0;
     let lastWindowIds: number[] = (windowCache.get(0) ?? []).map((item) => item.id);
     let writeStormFired = false;
+    // Ids whose grid_320 thumbnail has been observed "ready", so the blob op
+    // only fetches blobs that actually exist (mirrors the real UI, which never
+    // requests a blob for a not-yet-ready tile).
+    const readyFileIds = new Set<number>();
 
     for (let i = 0; i < plan.length; i += 1) {
       const op = plan[i];
@@ -623,7 +653,7 @@ async function main() {
         }
         case "thumbnailState": {
           const ids = await idsNearWindow(op.windowStart, 8);
-          const elapsed = await opThumbnailState(ids, "visible");
+          const elapsed = await opThumbnailState(ids, "visible", readyFileIds);
           record("thumbnailState", elapsed);
           break;
         }
@@ -636,10 +666,15 @@ async function main() {
           break;
         }
         case "thumbnailBlob": {
-          const ids = await idsNearWindow(op.windowStart, 1);
-          if (ids.length > 0) {
-            const elapsed = await opThumbnailBlob(ids[0]);
-            record("thumbnailBlob", elapsed);
+          const ids = await idsNearWindow(op.windowStart, WINDOW_LIMIT);
+          // Prefer a ready id from the current window (its blob exists);
+          // fall back to the first id best-effort (may 404, which is fine).
+          const targetId = ids.find((id) => readyFileIds.has(id)) ?? ids[0];
+          if (targetId !== undefined) {
+            const elapsed = await opThumbnailBlob(targetId);
+            if (elapsed !== null) {
+              record("thumbnailBlob", elapsed);
+            }
           }
           break;
         }
