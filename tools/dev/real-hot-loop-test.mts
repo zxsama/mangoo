@@ -9,7 +9,11 @@
 //    (scroll / folderSwitch / priorityScope / thumbnailState / preview /
 //    thumbnailBlob) built from a deterministic weighted plan, with a mid-run
 //    bulk thumbnail-cache write storm to simulate write contention.
-// 4. Summarize p50/p95/max latency per operation category and, if
+// 4. Settle every thumbnail touched by the last scroll window and assert
+//    they all reach a terminal state, that ready blobs are valid WebP with
+//    the byte size the state reported, and that none failed with
+//    "database is locked".
+// 5. Summarize p50/p95/max latency per operation category and, if
 //    tools/dev/hot-loop/budgets.json exists, gate the run on it.
 //
 // This file is standalone: it does not import from real-load-test.mts, only
@@ -36,10 +40,13 @@ const INDEX_THRESHOLD = Number(process.env.MEGLE_HOTLOOP_INDEX_THRESHOLD ?? 2000
 const INDEX_WAIT_TIMEOUT_MS = Number(process.env.MEGLE_HOTLOOP_INDEX_TIMEOUT_MS ?? 600_000);
 const FOLDER_DISCOVERY_TARGET = Number(process.env.MEGLE_HOTLOOP_FOLDER_TARGET ?? 8);
 const FOLDER_DISCOVERY_VISIT_CAP = 250;
+const SETTLE_TIMEOUT_MS = Number(process.env.MEGLE_HOTLOOP_SETTLE_TIMEOUT_MS ?? 60_000);
+const SETTLE_POLL_INTERVAL_MS = Number(process.env.MEGLE_HOTLOOP_SETTLE_POLL_INTERVAL_MS ?? 200);
 const WRITE_STORM_OPERATION_INDEX = 20;
 const WINDOW_LIMIT = 96;
 
 const TERMINAL_TASK_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
+const TERMINAL_THUMBNAIL_STATES = new Set(["ready", "failed", "skipped_small"]);
 const closedChildren = new WeakSet<ChildProcess>();
 
 function log(...args: unknown[]) {
@@ -251,6 +258,10 @@ interface MediaPage extends Page<MediaRecord> {
   totalCount: number | null;
 }
 
+function isRetryableThumbnailFailure(thumbnail: ThumbnailResponse): boolean {
+  return thumbnail.state === "failed" && /database is locked/i.test(thumbnail.error ?? "");
+}
+
 async function listMediaPage(
   rootId: number,
   options: { folderId?: number; limit?: number; offset?: number } = {}
@@ -367,6 +378,29 @@ async function discoverFoldersWithMedia(rootId: number, rootFolderId: number, de
   }
 
   return result;
+}
+
+async function verifyThumbnailBlob(fileId: number, thumb: ThumbnailResponse): Promise<void> {
+  if (thumb.fileId !== fileId) {
+    throw new Error(`thumbnail response fileId=${thumb.fileId} did not match requested id=${fileId}`);
+  }
+  if (thumb.target !== "grid_320") {
+    throw new Error(`ready thumbnail ${fileId} returned unexpected target: ${thumb.target}`);
+  }
+  const response = await fetchResponse(`/media/${fileId}/thumbnail/blob?target=grid_320`);
+  const contentType = response.headers.get("content-type");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (contentType !== "image/webp") {
+    throw new Error(`thumbnail blob ${fileId} content-type=${contentType ?? "null"}`);
+  }
+  if (thumb.byteSize !== null && bytes.length !== thumb.byteSize) {
+    throw new Error(`thumbnail ${fileId} byte size mismatch: state=${thumb.byteSize} blob=${bytes.length}`);
+  }
+  const magic = Buffer.from(bytes.subarray(0, 4)).toString("ascii");
+  const subtype = Buffer.from(bytes.subarray(8, 12)).toString("ascii");
+  if (magic !== "RIFF" || subtype !== "WEBP") {
+    throw new Error(`thumbnail ${fileId} has invalid header: ${magic}/${subtype} (${bytes.length} bytes)`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +647,73 @@ async function main() {
     }
 
     log(`completed ${plan.length} operations`);
+
+    // --- Task 4: settle-and-verify pass -------------------------------------
+
+    let idsToSettle = lastWindowIds;
+    if (idsToSettle.length === 0) {
+      idsToSettle = await idsNearWindow(lastWindowStart, WINDOW_LIMIT);
+    }
+
+    const stuckIds: number[] = [];
+    const lockedFailures: ThumbnailResponse[] = [];
+    const terminalStates: ThumbnailResponse[] = [];
+
+    if (idsToSettle.length === 0) {
+      log("settle pass skipped: no ids available from the last window");
+    } else {
+      const pendingIds = new Set(idsToSettle);
+      const settleStart = Date.now();
+      while (pendingIds.size > 0 && Date.now() - settleStart < SETTLE_TIMEOUT_MS) {
+        const polled = await Promise.all(
+          [...pendingIds].map(
+            async (fileId) => fetchJson<ThumbnailResponse>(`/media/${fileId}/thumbnail?target=grid_320&priority=visible`)
+          )
+        );
+        for (const thumbnail of polled) {
+          if (isRetryableThumbnailFailure(thumbnail)) {
+            lockedFailures.push(thumbnail);
+            continue;
+          }
+          if (TERMINAL_THUMBNAIL_STATES.has(thumbnail.state)) {
+            terminalStates.push(thumbnail);
+            pendingIds.delete(thumbnail.fileId);
+          }
+        }
+        if (pendingIds.size > 0) {
+          await delay(SETTLE_POLL_INTERVAL_MS);
+        }
+      }
+      for (const fileId of pendingIds) {
+        stuckIds.push(fileId);
+      }
+
+      for (const thumbnail of terminalStates) {
+        if (thumbnail.state === "ready") {
+          await verifyThumbnailBlob(thumbnail.fileId, thumbnail);
+        }
+      }
+    }
+
+    const settleSummary = {
+      ready: terminalStates.filter((t) => t.state === "ready").length,
+      skipped: terminalStates.filter((t) => t.state === "skipped_small").length,
+      failed: terminalStates.filter((t) => t.state === "failed").length,
+      stuck: stuckIds.length,
+      lockedFailures: lockedFailures.length
+    };
+    log(`settle pass: ${JSON.stringify(settleSummary)}`);
+
+    if (stuckIds.length > 0) {
+      throw new Error(`thumbnails never reached terminal state: ${stuckIds.join(", ")}`);
+    }
+    if (lockedFailures.length > 0) {
+      const uniqueLockedIds = new Set(lockedFailures.map((thumbnail) => thumbnail.fileId));
+      throw new Error(
+        `${lockedFailures.length} poll(s) across ${uniqueLockedIds.size} file id(s) failed with "database is locked": ` +
+          `${[...uniqueLockedIds].join(", ")}`
+      );
+    }
 
     // --- Budget gate ---------------------------------------------------------
 
