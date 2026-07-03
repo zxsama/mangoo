@@ -31,4 +31,25 @@ describe("operation plan", () => {
     const b = buildOperationPlan({ totalOperations: 100, mediaTotal: 500_000 });
     assert.deepEqual(a, b);
   });
+
+  test("priority-scope dominates the sample for a stable p95", () => {
+    // priority-scope is the interactive-write hot path under test, so it must
+    // get the most samples of any single kind — otherwise p95 is dominated by
+    // one unlucky collision with the background write burst.
+    const plan = buildOperationPlan({ totalOperations: 200, mediaTotal: 500_000 });
+    const counts = new Map<string, number>();
+    for (const op of plan) {
+      counts.set(op.kind, (counts.get(op.kind) ?? 0) + 1);
+    }
+    const priorityScope = counts.get("priorityScope") ?? 0;
+    assert.ok(priorityScope >= 70, `expected >=70 priorityScope ops, got ${priorityScope}`);
+    for (const [kind, count] of counts) {
+      if (kind !== "priorityScope") {
+        assert.ok(
+          priorityScope >= count,
+          `priorityScope (${priorityScope}) must be >= ${kind} (${count})`
+        );
+      }
+    }
+  });
 });

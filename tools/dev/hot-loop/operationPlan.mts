@@ -20,8 +20,14 @@ export type Operation =
 const WINDOW = 96; // grid page size, matches INITIAL_MEDIA_WINDOW_LIMIT in the UI
 
 // Deterministic weighted mix that mirrors real desktop browsing: scrolling
-// dominates, priority-scope + state polling shadow it, preview/blob/folder
-// switches punctuate. No RNG so runs are comparable.
+// dominates, and each scroll is shadowed by the priority-scope + thumbnail-state
+// writes the UI fires on every viewport change (these are the interactive-write
+// hot path under test, so they get the most samples for a stable p95).
+// preview/blob/folder switches punctuate. No RNG so runs are comparable.
+//
+// Per 10-op cycle: 3 scroll, 4 priorityScope, 1 thumbnailState, 1 of
+// {folderSwitch, thumbnailBlob, preview} rotating. At 200 ops that is ~80
+// priorityScope samples — enough that p95 is not dominated by one collision.
 export function buildOperationPlan(input: {
   totalOperations: number;
   mediaTotal: number;
@@ -31,22 +37,31 @@ export function buildOperationPlan(input: {
   const ops: Operation[] = [];
   let offset = 0;
   const offsetStep = Math.max(WINDOW, Math.floor(maxOffset / Math.max(1, totalOperations)));
+  // Rotate the single "punctuation" slot across folderSwitch/thumbnailBlob/preview
+  // so all six kinds are still covered while priorityScope dominates the sample.
+  const punctuation: OperationKind[] = ["folderSwitch", "thumbnailBlob", "preview"];
+  let punctuationCursor = 0;
   for (let i = 0; i < totalOperations; i += 1) {
     const cycle = i % 10;
     const windowStart = Math.min(maxOffset, offset);
-    if (cycle === 0 || cycle === 2 || cycle === 5 || cycle === 7) {
+    if (cycle === 0 || cycle === 4 || cycle === 8) {
       ops.push({ kind: "scroll", offset: Math.min(maxOffset, offset), limit: WINDOW });
       offset = Math.min(maxOffset, offset + offsetStep);
-    } else if (cycle === 1 || cycle === 6) {
+    } else if (cycle === 1 || cycle === 3 || cycle === 5 || cycle === 7) {
       ops.push({ kind: "priorityScope", windowStart });
-    } else if (cycle === 3) {
+    } else if (cycle === 6) {
       ops.push({ kind: "thumbnailState", windowStart });
-    } else if (cycle === 4) {
-      ops.push({ kind: "folderSwitch", folderIndex: Math.floor(i / 10) });
-    } else if (cycle === 8) {
-      ops.push({ kind: "thumbnailBlob", windowStart });
     } else {
-      ops.push({ kind: "preview", windowStart });
+      // cycle 2 and 9: rotate the punctuation kind.
+      const kind = punctuation[punctuationCursor % punctuation.length];
+      punctuationCursor += 1;
+      if (kind === "folderSwitch") {
+        ops.push({ kind: "folderSwitch", folderIndex: Math.floor(i / 10) });
+      } else if (kind === "thumbnailBlob") {
+        ops.push({ kind: "thumbnailBlob", windowStart });
+      } else {
+        ops.push({ kind: "preview", windowStart });
+      }
     }
   }
   return ops;
