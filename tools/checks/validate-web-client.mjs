@@ -78,6 +78,10 @@ const mediaResourcesPath = "apps/web/src/core/mediaResources.ts";
 const mediaResources = existsSync(path.join(root, mediaResourcesPath))
   ? read(mediaResourcesPath)
   : "";
+const thumbnailObjectUrlCacheModulePath = "apps/web/src/core/thumbnailObjectUrlCache.ts";
+const thumbnailObjectUrlCacheModule = existsSync(path.join(root, thumbnailObjectUrlCacheModulePath))
+  ? read(thumbnailObjectUrlCacheModulePath)
+  : "";
 const mediaGrid = read("apps/web/src/features/media-grid/MediaGrid.tsx");
 const mediaGridLayoutGeometry = read("apps/web/src/features/media-grid/layoutGeometry.ts");
 const main = read("apps/web/src/main.tsx");
@@ -1262,13 +1266,23 @@ if (
   !/configureThumbnailCache/.test(app) ||
   !/previewPreferences\.thumbnailCacheLimitMb/.test(app) ||
   !/Thumbnail cache/.test(settingsView) ||
-  !/thumbnailObjectUrlCacheBytes/.test(mediaResources) ||
-  !/configureThumbnailCache/.test(mediaResources) ||
-  /THUMBNAIL_OBJECT_URL_CACHE_LIMIT\s*=\s*512/.test(mediaResources) ||
-  !/rememberThumbnailObjectUrl\([\s\S]*?byteSize/.test(mediaResources) ||
-  !/while\s*\(\s*thumbnailObjectUrlCacheBytes\s*>\s*thumbnailObjectUrlCacheLimitBytes/.test(mediaResources)
+  !/thumbnailObjectUrlCacheBytes/.test(thumbnailObjectUrlCacheModule) ||
+  !/configureThumbnailCache/.test(thumbnailObjectUrlCacheModule) ||
+  /THUMBNAIL_OBJECT_URL_CACHE_LIMIT\s*=\s*512/.test(thumbnailObjectUrlCacheModule) ||
+  !/rememberThumbnailObjectUrl\([\s\S]*?byteSize/.test(thumbnailObjectUrlCacheModule) ||
+  !/while\s*\(\s*thumbnailObjectUrlCacheBytes\s*>\s*thumbnailObjectUrlCacheLimitBytes/.test(thumbnailObjectUrlCacheModule)
 ) {
   fail("Preview browsing must expose a persisted 5120MB thumbnail cache and enforce it with an LRU byte budget");
+}
+if (
+  !/THUMBNAIL_OBJECT_URL_CACHE_MIN_ENTRIES/.test(thumbnailObjectUrlCacheModule) ||
+  !/thumbnailObjectUrlCache\.size\s*>\s*THUMBNAIL_OBJECT_URL_CACHE_MIN_ENTRIES/.test(
+    thumbnailObjectUrlCacheModule
+  )
+) {
+  fail(
+    "Thumbnail object-URL cache must keep a count-based retention floor so out-of-view tiles survive scrolling"
+  );
 }
 if (
   !/persistentThumbnailCacheAutoRefresh:\s*boolean/.test(previewPreferences) ||

@@ -668,8 +668,8 @@ for (const value of [
   "query.offset",
   "use_offset",
   "offset_clause",
-  "total_count: Some(total_count)",
-  "list_media_page_offset_window_reports_total_count"
+  "is_first_media_page",
+  "list_media_page_reports_total_count_on_first_page_only"
 ]) {
   if (!dbModRs.includes(value)) {
     fail(`Core media browsing viewport-window implementation missing ${value}`);

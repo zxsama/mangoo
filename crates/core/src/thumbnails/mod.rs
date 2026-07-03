@@ -5,7 +5,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use image::imageops::FilterType;
 use image::ImageReader;
 use sha2::{Digest, Sha256};
 
@@ -107,6 +106,15 @@ pub struct GeneratedThumbnail {
     pub height: i64,
     pub byte_size: i64,
     pub data: Vec<u8>,
+    /// Original media dimensions captured during the decode the thumbnail
+    /// pipeline already performs. Persisted to `media.width/height` so the
+    /// scan ingest path can leave dimensions `pending` and the layout engine
+    /// (justified rows / masonry) gets real aspect ratios without a second
+    /// decode pass. For video these are the aspect-preserving poster
+    /// dimensions, so the ratio is exact even though the absolute resolution
+    /// is the poster's.
+    pub source_width: i64,
+    pub source_height: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,7 +251,11 @@ pub fn generate_image_thumbnail_bytes_with_checkpoint(
     let (target_width, target_height) =
         target_dimensions(source_width, source_height, GRID_320_SHORT_SIDE_PX as u32);
 
-    let resized = decoded.resize_exact(target_width, target_height, FilterType::Triangle);
+    // `thumbnail_exact` is a single-pass area-average downscale: for large
+    // sources it is markedly faster than `resize_exact` with a separable
+    // bilinear kernel, and gives equal-or-better quality at thumbnail scale
+    // factors. Output dimensions are unchanged (still `target_dimensions`).
+    let resized = decoded.thumbnail_exact(target_width, target_height);
     checkpoint()?;
     // `webp::Encoder::from_image` only accepts RGB8/RGBA8. Convert through
     // `to_rgba8` so paletted, grayscale, and 16-bit decodes still encode.
@@ -256,6 +268,8 @@ pub fn generate_image_thumbnail_bytes_with_checkpoint(
         height: target_height as i64,
         byte_size: bytes.len() as i64,
         data: bytes.to_vec(),
+        source_width: source_width as i64,
+        source_height: source_height as i64,
     })
 }
 
@@ -282,7 +296,7 @@ pub fn generate_preview_placeholder(source_path: &Path) -> anyhow::Result<Previe
         PREVIEW_PLACEHOLDER_SHORT_SIDE_PX,
         PREVIEW_PLACEHOLDER_MAX_SIDE_PX,
     );
-    let resized = decoded.resize_exact(target_width, target_height, FilterType::Triangle);
+    let resized = decoded.thumbnail_exact(target_width, target_height);
     let rgba = resized.to_rgba8();
     let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height()).encode(45.0);
     let bytes: &[u8] = &encoded;
@@ -395,6 +409,11 @@ pub fn generate_video_thumbnail(
         height: dimensions.1 as i64,
         byte_size: metadata.len() as i64,
         data,
+        // ffmpeg's scale filter preserves aspect ratio, so the poster's
+        // dimensions carry the source ratio exactly (the absolute resolution
+        // is the poster's, not the original video's).
+        source_width: dimensions.0 as i64,
+        source_height: dimensions.1 as i64,
     })
 }
 

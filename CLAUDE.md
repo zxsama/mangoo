@@ -34,7 +34,7 @@ cargo test -p megle-core <test_name>     # run a single Rust test
 cargo run  -p megle-core                 # requires MEGLE_SESSION_TOKEN env var
 ```
 
-`check:schema` requires Python 3. `check:rust` falls back to `~/.cargo/bin` if cargo is not on PATH and prints `SKIP` rather than failing when the toolchain is unavailable.
+`check:schema` requires Python 3. `check:rust` falls back to `~/.cargo/bin` if cargo is not on PATH and prints `SKIP` rather than failing when the toolchain is unavailable. To run `cargo` directly (e.g. `cargo test -p megle-core <test>`) when it is not on the shell PATH, prepend it: `export PATH="$HOME/.cargo/bin:$PATH"` (MSVC toolchain on Windows; install rustfmt once with `rustup component add rustfmt`).
 
 ## High-Level Architecture
 
@@ -67,7 +67,8 @@ The desktop shell (`apps/desktop/src/main.ts`, `core-process.ts`, `core-session.
 - `contracts/core-api/openapi.yaml` is the single source of truth for HTTP endpoints, DTO names, and status codes. UI, Core, and tests all flow from it.
 - `packages/core-client` (`@megle/core-client`) holds a hand-maintained `generated-contract.ts` aligned to the OpenAPI by `scripts/check-contract.mjs`. Treat it as a generator placeholder: edit when the contract changes, never the other way around.
 - `contracts/plugins/manifest.schema.json` defines plugin manifest fields and capabilities (`decoder`, `metadata`, `action`, `import-provider`).
-- SQLite schema lives in `crates/core/migrations/NNNN_*.sql`. Every new table or hot-path index needs a numbered migration and matching assertions in `tools/checks/validate_sqlite_schema.py`.
+- SQLite schema lives in `crates/core/migrations/NNNN_*.sql` (currently `0001`–`0017`; `0014` is applied in code, not as a file). A new migration must be (1) created as the SQL file, (2) declared in `crates/core/src/db/migrations.rs`, (3) gated in `Database::apply_migrations` (`crates/core/src/db/mod.rs`), and (4) asserted in `tools/checks/validate_sqlite_schema.py` (`MIGRATIONS` plus `REQUIRED_TABLES`/`REQUIRED_INDEXES`).
+- Some structural checks grep Rust source for implementation markers and **specific test names** (e.g. `tools/checks/validate-core-api.mjs` pins viewport-window markers in `db/mod.rs`). Renaming a guarded function/test or deleting a marked code pattern fails the check — update the check alongside the rename.
 
 When adding an API path, plugin capability, table, or index, update the contract and the corresponding check before wiring code.
 
@@ -89,7 +90,7 @@ UI must follow `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.m
 
 ### Data Model Highlights
 
-The schema separates `roots` / `folders` / `files` / `media` / `user_metadata` / `tags` / `file_tags` / `thumbs` / `file_operations` so multi-million-file libraries do not duplicate full paths in one wide table. Queries must use keyset pagination, never large offsets. See `docs/architecture.md` for the full table list and required indexes.
+The schema separates `roots` / `folders` / `files` / `media` / `user_metadata` / `tags` / `file_tags` / `thumbs` / `thumb_blobs` / `file_operations` so multi-million-file libraries do not duplicate full paths in one wide table. `thumbs` tracks thumbnail *state* (`pending`/`queued`/`ready`/`failed`/`skipped_small`); `thumb_blobs` stores the generated WebP *bytes* as a SQLite BLOB keyed by `(file_id, profile)` — thumbnails live in the DB, not sidecar files (a legacy on-disk cache is migrated in once via `import_legacy_thumbnail_cache`). Queries must use keyset pagination, never large offsets. See `docs/architecture.md` for the full table list and required indexes.
 
 ### Thumbnail and Preview Rules
 
@@ -97,6 +98,17 @@ The schema separates `roots` / `folders` / `files` / `media` / `user_metadata` /
 - Originals smaller than 320px short side record `skipped_small` and the UI uses the original directly, except for non-displayable formats (RAW/PSD/HEIC) which still need WebP.
 - All generated thumbnails (including video posters) are WebP.
 - Preview switching never blocks the UI on original decoding: show cached preview first, prefetch neighbors, decode on a background queue with interactive preemption.
+- Thumbnails are stored as WebP BLOBs in `thumb_blobs` and served by `GET /api/media/{fileId}/thumbnail/blob` (1-year immutable; the client fingerprints the URL by version). A blob row exists only when state is `ready` and the file is active — every reset/disable/delete drops it in the same transaction, so a present blob is always serveable.
+- Generation downscales via `DynamicImage::thumbnail_exact` (fast single-pass area-average) then WebP-encodes. There is no reduced-resolution JPEG decode in the pinned `image`/`zune-jpeg`, so do not assume one.
+
+### Core Performance Model
+
+These conventions keep the UI fluid on million-file libraries; preserve them when touching Core hot paths.
+
+- **DB connections.** API write/mutating routes share one `Arc<Mutex<Database>>` (`AppState.database`). The scan worker, the watcher, and read handlers each use *separate* SQLite connections, so reads and background work do not serialize behind the write mutex. Read routes (`run_read_database`) reuse a per-blocking-thread cached connection instead of opening one per request.
+- **SQLite is tuned for regenerable data.** File-backed connections run WAL + `synchronous=NORMAL` + 64 MiB `cache_size` + 256 MiB `mmap_size` + `temp_store=MEMORY` (`configure_file_database_wal`, `db/mod.rs`). NORMAL is safe because every table is rebuildable by rescanning — keep it.
+- **Thumbnail scheduling is viewport-priority.** Task priorities are `bulk(-10) < background(0) < ahead(20) < visible(30) < selected(40)`, run on Tokio blocking threads gated by per-bucket semaphores (selected=1, foreground=12, background=2). The UI POSTs `/api/thumbnails/priority-scope` (selected/visible/ahead file ids) as it scrolls; Core re-prioritizes only tasks entering that scope or already elevated above background — never the whole root.
+- **No per-row work on hot paths.** Batch enqueues commit once (not per file); `list_media` computes `COUNT(*)` only on the first page (later offset windows reuse the client's retained total); the blob route does a single query. Prefer one transaction over a loop of commits, and avoid `COUNT(*)`/full-table-scan/`list_tasks()`-style whole-table loads on per-scroll or per-tile paths.
 
 ### File Operations
 

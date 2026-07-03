@@ -28,3 +28,5 @@ pub const ROOT_STATUS_BROWSING_INDEXES_MIGRATION: &str =
     include_str!("../../migrations/0015_root_status_browsing_indexes.sql");
 pub const FOLDER_STATUS_BROWSING_INDEXES_MIGRATION: &str =
     include_str!("../../migrations/0016_folder_status_browsing_indexes.sql");
+pub const THUMBNAIL_TASK_INDEXES_MIGRATION: &str =
+    include_str!("../../migrations/0017_thumbnail_task_indexes.sql");

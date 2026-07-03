@@ -5,6 +5,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::Query as ExtraQuery;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path as FilePath;
@@ -514,21 +515,49 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+thread_local! {
+    /// Per-blocking-thread cached read connection. Read handlers run on
+    /// Tokio's blocking pool, whose threads are reused across requests, so
+    /// caching one connection per thread amortizes the SQLite open + PRAGMA +
+    /// UDF-registration cost that was previously paid on *every* tile/page
+    /// fetch. WAL autocommit reads always observe the latest committed
+    /// snapshot, so a reused connection never serves stale data.
+    static READ_DATABASE: RefCell<Option<Database>> = const { RefCell::new(None) };
+}
+
+fn read_with_cached_connection<T>(
+    state: &AppState,
+    operation: impl FnOnce(&Database) -> ApiResult<T>,
+) -> ApiResult<T> {
+    if !state.has_read_database() {
+        // In-memory / test databases have no path to reopen; use the shared
+        // connection directly.
+        let database = state.database.lock().expect("database mutex poisoned");
+        return operation(&database);
+    }
+    READ_DATABASE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = state.open_read_database()?;
+        }
+        match slot.as_ref() {
+            Some(database) => operation(database),
+            None => {
+                let database = state.database.lock().expect("database mutex poisoned");
+                operation(&database)
+            }
+        }
+    })
+}
+
 async fn run_read_database<T, F>(state: AppState, operation: F) -> ApiResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> ApiResult<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        if let Some(database) = state.open_read_database()? {
-            operation(&database)
-        } else {
-            let database = state.database.lock().expect("database mutex poisoned");
-            operation(&database)
-        }
-    })
-    .await
-    .map_err(|error| CoreError::from(anyhow::anyhow!("database task failed: {error}")))?
+    tokio::task::spawn_blocking(move || read_with_cached_connection(&state, operation))
+        .await
+        .map_err(|error| CoreError::from(anyhow::anyhow!("database task failed: {error}")))?
 }
 
 async fn run_shared_database<T, F>(state: AppState, operation: F) -> ApiResult<T>
@@ -549,16 +578,9 @@ where
     T: Send + 'static,
     F: FnOnce(&Database) -> ApiResult<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        if let Some(database) = state.open_read_database()? {
-            operation(&database)
-        } else {
-            let database = state.database.lock().expect("database mutex poisoned");
-            operation(&database)
-        }
-    })
-    .await
-    .map_err(|error| CoreError::from(anyhow::anyhow!("database task failed: {error}")))?
+    tokio::task::spawn_blocking(move || read_with_cached_connection(&state, operation))
+        .await
+        .map_err(|error| CoreError::from(anyhow::anyhow!("database task failed: {error}")))?
 }
 
 async fn get_health() -> Json<HealthResponse> {
@@ -820,16 +842,13 @@ async fn get_thumbnail_blob(
     use axum::response::Response;
     let target = normalize_profile(query.target.as_deref())
         .ok_or_else(|| CoreError::bad_request("unsupported thumbnail target".to_string()))?;
+    // A `thumb_blobs` row exists only when the thumbnail is ready and the file
+    // is active: every state-reset / root-disable / delete path drops the blob
+    // in the same transaction, and the FK cascades on hard delete. So a present
+    // blob is always serveable — fetch it directly and skip the redundant
+    // get_thumbnail readiness probe (which cost two extra joined queries per
+    // tile on the hottest read path).
     let blob = run_read_database(state, move |database| {
-        let thumbnail = database
-            .get_thumbnail(file_id, target)?
-            .ok_or_else(|| CoreError::not_found("media item not found".to_string()))?;
-        if thumbnail.state.as_str() != "ready" {
-            return Err(CoreError::bad_request(format!(
-                "thumbnail not ready: state={}",
-                thumbnail.state
-            )));
-        }
         let blob = database
             .get_thumb_blob(file_id, target)?
             .ok_or_else(|| CoreError::not_found("thumbnail blob missing".to_string()))?;

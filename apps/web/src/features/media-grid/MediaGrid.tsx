@@ -1597,7 +1597,7 @@ function ThumbnailStateView({
         alt={item.name}
         className={`tile-thumb tile-thumb--${layoutMode}`}
         fileId={item.id}
-        mediaSignature={mediaContentSignature(item)}
+        contentSignature={mediaFileContentSignature(item)}
         previewPlaceholderUrl={previewPlaceholderUrl}
         requestPriority={requestPriority}
         resourcePriority={resourcePriority}
@@ -1983,7 +1983,7 @@ function ReadyThumbnail({
   alt,
   className,
   fileId,
-  mediaSignature,
+  contentSignature,
   previewPlaceholderUrl,
   requestPriority,
   resourcePriority,
@@ -1993,14 +1993,19 @@ function ReadyThumbnail({
   alt: string;
   className: string;
   fileId: number;
-  mediaSignature: string;
+  contentSignature: string;
   previewPlaceholderUrl: string | null;
   requestPriority: "interactive" | "resource";
   resourcePriority: "preview" | "visible" | "ahead";
   style: CSSProperties;
   thumbnailUpdatedAt: number | null;
 }) {
-  const cacheKey = thumbnailObjectUrlCacheKey(fileId, mediaSignature, thumbnailUpdatedAt);
+  // Key the durable object-URL cache by stable file-content identity
+  // (id:mtime:size), NOT by live thumbnail state/updatedAt. The key then stays
+  // constant across row-state -> live-state transitions and across scroll, so a
+  // tile scrolled out of and back into view reuses its cached image instead of
+  // re-fetching. A real content change (mtime/size) naturally busts it.
+  const cacheKey = thumbnailObjectUrlCacheKey(fileId, contentSignature, null);
   const [src, setSrc] = useState<string | null>(() => readCachedThumbnailObjectUrl(cacheKey));
   const [error, setError] = useState(false);
   const [retryToken, setRetryToken] = useState(0);

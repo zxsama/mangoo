@@ -301,6 +301,7 @@ pub fn start_worker_with_ffmpeg(worker_database: Database, ffmpeg_available: boo
     sender
 }
 
+#[cfg(test)]
 fn replay_startup_recovery_task_ids_with_after_each(
     database: &mut Database,
     task_ids: &[i64],
@@ -327,6 +328,7 @@ fn pending_drain_task_ids(database: &Database) -> anyhow::Result<Vec<i64>> {
 /// that haven't already been observed via the in-memory channel. This covers
 /// the case where the watcher persisted a pending task but `try_send` failed
 /// (channel full or closed).
+#[cfg(test)]
 fn drain_pending_persisted_tasks(database: &mut Database, ffmpeg_available: bool) {
     let pending_task_ids = match pending_drain_task_ids(database) {
         Ok(ids) => ids,
@@ -398,6 +400,7 @@ fn schedule_pending_worker_tasks_with_concurrency(
     }
 }
 
+#[cfg(test)]
 fn schedule_pending_tasks_with_thumbnail_concurrency(
     database: &mut Database,
     ffmpeg_available: bool,
@@ -425,6 +428,7 @@ fn schedule_pending_tasks_with_thumbnail_concurrency(
     }
 }
 
+#[cfg(test)]
 fn dispatch_task_with_thumbnail_concurrency(
     database: &mut Database,
     task_id: i64,
@@ -1105,6 +1109,9 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
         ));
     }
     let now = unix_timestamp();
+    // Captured from the decode this task already ran; persisted to media in the
+    // publish transaction below so the layout engine gets real aspect ratios.
+    let source_dimensions = Some((generated.source_width, generated.source_height));
     let blob = ThumbBlobRecord {
         file_id,
         profile: GRID_320_PROFILE.to_string(),
@@ -1117,7 +1124,7 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
         updated_at: now,
     };
     let published = database
-        .publish_thumbnail_blob_and_state_if_source_fingerprint_and_task_attempt_current(
+        .publish_thumbnail_and_succeed_task_if_source_fingerprint_and_task_attempt_current(
             ThumbnailStateUpsert {
                 file_id,
                 profile: GRID_320_PROFILE.to_string(),
@@ -1130,6 +1137,7 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
                 source_fingerprint: Some(source_fingerprint.clone()),
             },
             blob,
+            source_dimensions,
             &source_fingerprint,
             task_id,
             attempt_generation,
@@ -1139,7 +1147,6 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
             "{THUMBNAIL_SOURCE_CHANGED_ERROR}: {file_id}"
         ));
     }
-    database.mark_task_succeeded_for_attempt(task_id, attempt_generation)?;
     Ok(())
 }
 
@@ -1355,6 +1362,55 @@ mod tests {
             .expect("read cache root")
             .next()
             .is_none());
+
+        fs::remove_dir_all(temp_root).expect("cleanup media root");
+        fs::remove_dir_all(cache_root).expect("cleanup cache root");
+    }
+
+    #[test]
+    fn thumbnail_task_persists_source_dimensions_to_media() {
+        // The scan ingest path leaves media dimensions `pending`; the thumbnail
+        // task must persist the real source dimensions captured during the
+        // decode it already performs, so justified-rows / masonry layouts get
+        // true aspect ratios without a second decode pass.
+        let temp_root = unique_temp_dir("media");
+        fs::create_dir_all(&temp_root).expect("create media root");
+        write_test_image(&temp_root.join("portrait.jpg"), 600, 900);
+        let cache_root = unique_temp_dir("cache");
+        fs::create_dir_all(&cache_root).expect("create cache root");
+
+        let mut database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let file_id = seed_media_file(&database, &temp_root, "portrait.jpg");
+
+        // Precondition: scan leaves dimensions unpopulated and metadata pending.
+        let before = database
+            .get_thumbnail_source(file_id)
+            .expect("get source")
+            .expect("source exists");
+        assert_eq!(before.width, None);
+        assert_eq!(before.height, None);
+        assert_eq!(before.metadata_status.as_deref(), Some("pending"));
+
+        let task_id = database
+            .request_thumbnail_task(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                crate::db::ThumbnailTaskPriority::Visible,
+            )
+            .expect("request thumbnail task")
+            .task_id
+            .expect("thumbnail task id");
+        run_thumbnail_task_with_cache(&mut database, task_id, &cache_root, true)
+            .expect("run thumbnail task");
+
+        let after = database
+            .get_thumbnail_source(file_id)
+            .expect("get source")
+            .expect("source exists");
+        assert_eq!(after.width, Some(600));
+        assert_eq!(after.height, Some(900));
+        assert_eq!(after.metadata_status.as_deref(), Some("ready"));
 
         fs::remove_dir_all(temp_root).expect("cleanup media root");
         fs::remove_dir_all(cache_root).expect("cleanup cache root");

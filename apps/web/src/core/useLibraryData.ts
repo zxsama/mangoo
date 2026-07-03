@@ -35,7 +35,12 @@ const SEARCH_DEBOUNCE_MS = 250;
 const INTERACTIVE_FOLDER_SCAN_DEBOUNCE_MS = 300;
 const SCAN_REFRESH_INTERVAL_MS = 800;
 const SELECTED_THUMBNAIL_REPOLL_MS = 150;
-const THUMBNAIL_SCOPE_SYNC_DEBOUNCE_MS = 0;
+// Coalescing window for visible/ahead priority-scope syncs during continuous
+// scroll. A leading sync fires immediately on the first change, subsequent
+// changes inside the window are collapsed, and a trailing sync flushes the
+// latest viewport once the window elapses. `selected` stays off this path and
+// syncs near-immediately because it is a direct user action.
+const THUMBNAIL_SCOPE_SYNC_DEBOUNCE_MS = 120;
 const SHOW_SUBFOLDER_CONTENTS_STORAGE_KEY = "megle.library.subfolder-content-open";
 const SEEN_THUMBNAIL_PERSIST_BATCH_SIZE = 128;
 const SEEN_THUMBNAIL_PERSIST_DEBOUNCE_MS = 500;
@@ -296,6 +301,7 @@ export function useLibraryData(
   const thumbnailPriorityScopeRef = useRef<ThumbnailPriorityScope>(emptyThumbnailPriorityScope());
   const thumbnailPriorityScopeSyncKeyRef = useRef<string | null>(null);
   const thumbnailPriorityScopeSyncTimerRef = useRef<number | null>(null);
+  const thumbnailPriorityScopeSyncTrailingPendingRef = useRef(false);
   const pendingInteractiveScanRequestRef = useRef<PendingInteractiveScanRequest | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMoreMedia, setLoadingMoreMedia] = useState(false);
@@ -546,6 +552,9 @@ export function useLibraryData(
         window.clearTimeout(thumbnailPriorityScopeSyncTimerRef.current);
         thumbnailPriorityScopeSyncTimerRef.current = null;
       }
+      // A synchronous flush pushes the latest scope, so no coalesced trailing
+      // flush is owed once the window timer is torn down.
+      thumbnailPriorityScopeSyncTrailingPendingRef.current = false;
       if (rootId === null) {
         return;
       }
@@ -607,24 +616,60 @@ export function useLibraryData(
         mediaIds,
         selectedMediaIdRef.current
       );
-      if (thumbnailPriorityScopeSyncTimerRef.current !== null) {
-        window.clearTimeout(thumbnailPriorityScopeSyncTimerRef.current);
-        thumbnailPriorityScopeSyncTimerRef.current = null;
-      }
       if (selectedRootIdRef.current === null) {
+        if (thumbnailPriorityScopeSyncTimerRef.current !== null) {
+          window.clearTimeout(thumbnailPriorityScopeSyncTimerRef.current);
+          thumbnailPriorityScopeSyncTimerRef.current = null;
+        }
+        thumbnailPriorityScopeSyncTrailingPendingRef.current = false;
         return;
       }
+
+      // Open (or continue) the coalescing window so a trailing sync always lands
+      // shortly after the last visible/ahead change while scrolling settles. The
+      // window is never reset per change; subsequent changes just flag that the
+      // latest scope still needs a trailing flush.
+      const openThumbnailScopeSyncWindow = () => {
+        thumbnailPriorityScopeSyncTimerRef.current = window.setTimeout(() => {
+          thumbnailPriorityScopeSyncTimerRef.current = null;
+          if (!thumbnailPriorityScopeSyncTrailingPendingRef.current) {
+            return;
+          }
+          thumbnailPriorityScopeSyncTrailingPendingRef.current = false;
+          void flushThumbnailPriorityScopeSync().catch((cause) => {
+            setError(errorMessage(cause));
+          });
+          openThumbnailScopeSyncWindow();
+        }, THUMBNAIL_SCOPE_SYNC_DEBOUNCE_MS);
+      };
+
+      // A direct user selection must sync immediately. A visible change leads the
+      // scroll burst: it flushes immediately on the leading edge, then coalesces
+      // the rest of the burst into the trailing window above.
       if (priority === "selected" || priority === "visible") {
+        if (priority === "visible" && thumbnailPriorityScopeSyncTimerRef.current !== null) {
+          thumbnailPriorityScopeSyncTrailingPendingRef.current = true;
+          return;
+        }
         void flushThumbnailPriorityScopeSync().catch((cause) => {
           setError(errorMessage(cause));
         });
+        if (priority === "visible") {
+          openThumbnailScopeSyncWindow();
+        }
         return;
       }
-      thumbnailPriorityScopeSyncTimerRef.current = window.setTimeout(() => {
-        void flushThumbnailPriorityScopeSync().catch((cause) => {
-          setError(errorMessage(cause));
-        });
-      }, THUMBNAIL_SCOPE_SYNC_DEBOUNCE_MS);
+
+      // ahead: coalesce on the same cadence as visible so prefetch churn does not
+      // burst the network during continuous scroll.
+      if (thumbnailPriorityScopeSyncTimerRef.current !== null) {
+        thumbnailPriorityScopeSyncTrailingPendingRef.current = true;
+        return;
+      }
+      void flushThumbnailPriorityScopeSync().catch((cause) => {
+        setError(errorMessage(cause));
+      });
+      openThumbnailScopeSyncWindow();
     },
     [flushThumbnailPriorityScopeSync]
   );
@@ -1572,6 +1617,7 @@ export function useLibraryData(
         window.clearTimeout(thumbnailPriorityScopeSyncTimerRef.current);
         thumbnailPriorityScopeSyncTimerRef.current = null;
       }
+      thumbnailPriorityScopeSyncTrailingPendingRef.current = false;
       seenThumbnailPersistActiveRef.current = false;
       seenThumbnailPersistIdsRef.current.clear();
       if (seenThumbnailPersistFlushTimerRef.current !== null) {
@@ -1952,6 +1998,7 @@ export function useLibraryData(
       window.clearTimeout(thumbnailPriorityScopeSyncTimerRef.current);
       thumbnailPriorityScopeSyncTimerRef.current = null;
     }
+    thumbnailPriorityScopeSyncTrailingPendingRef.current = false;
     setScanRefreshFailures(0);
     setLoading(true);
     setLoadingMoreMedia(false);

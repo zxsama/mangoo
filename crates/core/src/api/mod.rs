@@ -75,6 +75,13 @@ impl AppState {
         };
         Ok(Some(Database::open(path)?))
     }
+
+    /// Whether a dedicated read connection can be opened (the database is
+    /// file-backed). In-memory/test databases return `false`, and read
+    /// handlers fall back to the shared connection.
+    pub fn has_read_database(&self) -> bool {
+        self.read_database_path.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default)]

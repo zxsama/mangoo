@@ -1,6 +1,18 @@
 import type { CoreRequestPriority, MediaRecord, ThumbnailResponse } from "@megle/core-client";
 import { createCoreClient } from "./client";
 
+// The durable thumbnail object-URL cache is an isolated, unit-tested unit;
+// re-export it so existing consumers keep importing it from here.
+export {
+  clearThumbnailObjectUrlCache,
+  configureThumbnailCache,
+  DEFAULT_THUMBNAIL_CACHE_LIMIT_BYTES,
+  readCachedThumbnailObjectUrl,
+  rememberThumbnailObjectUrl,
+  THUMBNAIL_OBJECT_URL_CACHE_MIN_ENTRIES,
+  thumbnailObjectUrlCache
+} from "./thumbnailObjectUrlCache";
+
 export type ThumbnailStateByMediaId = Record<number, ThumbnailResponse>;
 export type ThumbnailRequestPriority = "background" | "ahead" | "visible" | "selected";
 type CachedThumbnailEntry = {
@@ -11,10 +23,6 @@ type CachedOriginalPreviewEntry = {
   byteSize: number;
   mediaSignature: string;
   blob: Blob;
-};
-type CachedThumbnailObjectUrlEntry = {
-  byteSize: number;
-  objectUrl: string;
 };
 type SharedRequest<T> = {
   request: Promise<T>;
@@ -44,10 +52,8 @@ const thumbnailClient = createCoreClient();
 export const thumbnailResourceCache = new Map<number, CachedThumbnailEntry>();
 export const inFlightThumbnailRequests = new Map<string, SharedRequest<ThumbnailResponse>>();
 export const inFlightThumbnailBlobRequests = new Map<string, SharedRequest<Blob>>();
-export const thumbnailObjectUrlCache = new Map<string, CachedThumbnailObjectUrlEntry>();
 export const originalPreviewBlobCache = new Map<number, CachedOriginalPreviewEntry>();
 export const inFlightOriginalPreviewRequests = new Map<string, SharedRequest<Blob>>();
-export const DEFAULT_THUMBNAIL_CACHE_LIMIT_BYTES = 5120 * 1024 * 1024;
 export const DEFAULT_ORIGINAL_PREVIEW_BUFFER_LIMIT_BYTES = 1200 * 1024 * 1024;
 const MAX_FOREGROUND_RESOURCE_REQUESTS = 12;
 const MAX_INTERACTIVE_FOREGROUND_RESOURCE_REQUESTS = 2;
@@ -70,8 +76,6 @@ let activeForegroundResourceRequests = 0;
 let activeInteractiveForegroundResourceRequests = 0;
 let activeAheadForegroundResourceRequests = 0;
 let activeFallbackForegroundResourceRequests = 0;
-let thumbnailObjectUrlCacheBytes = 0;
-let thumbnailObjectUrlCacheLimitBytes = DEFAULT_THUMBNAIL_CACHE_LIMIT_BYTES;
 let originalPreviewBlobCacheBytes = 0;
 let originalPreviewBlobCacheLimitBytes = DEFAULT_ORIGINAL_PREVIEW_BUFFER_LIMIT_BYTES;
 const foregroundResourceRequestQueue: QueuedForegroundResourceRequest[] = [];
@@ -168,55 +172,6 @@ export async function requestThumbnailBlob(
   return withSharedAbortSignal(entry, options.signal);
 }
 
-export function readCachedThumbnailObjectUrl(cacheKey: string): string | null {
-  const cached = thumbnailObjectUrlCache.get(cacheKey);
-  if (!cached) {
-    return null;
-  }
-  thumbnailObjectUrlCache.delete(cacheKey);
-  thumbnailObjectUrlCache.set(cacheKey, cached);
-  return cached.objectUrl;
-}
-
-export function rememberThumbnailObjectUrl(
-  cacheKey: string,
-  objectUrl: string,
-  byteSize: number
-): boolean {
-  const normalizedByteSize = Math.max(0, Math.floor(byteSize));
-  const previous = thumbnailObjectUrlCache.get(cacheKey);
-  if (previous?.objectUrl === objectUrl) {
-    if (normalizedByteSize > thumbnailObjectUrlCacheLimitBytes) {
-      deleteThumbnailObjectUrlCacheEntry(cacheKey);
-      return false;
-    }
-    thumbnailObjectUrlCacheBytes = Math.max(
-      0,
-      thumbnailObjectUrlCacheBytes - previous.byteSize + normalizedByteSize
-    );
-    thumbnailObjectUrlCache.delete(cacheKey);
-    thumbnailObjectUrlCache.set(cacheKey, {
-      ...previous,
-      byteSize: normalizedByteSize
-    });
-    pruneThumbnailObjectUrlCache();
-    return thumbnailObjectUrlCache.get(cacheKey)?.objectUrl === objectUrl;
-  }
-
-  if (normalizedByteSize > thumbnailObjectUrlCacheLimitBytes) {
-    deleteThumbnailObjectUrlCacheEntry(cacheKey);
-    return false;
-  }
-
-  if (previous) {
-    deleteThumbnailObjectUrlCacheEntry(cacheKey);
-  }
-  thumbnailObjectUrlCache.set(cacheKey, { byteSize: normalizedByteSize, objectUrl });
-  thumbnailObjectUrlCacheBytes += normalizedByteSize;
-  pruneThumbnailObjectUrlCache();
-  return thumbnailObjectUrlCache.get(cacheKey)?.objectUrl === objectUrl;
-}
-
 export function thumbnailObjectUrlCacheKey(
   fileId: number,
   mediaSignature: string,
@@ -260,11 +215,6 @@ export function preloadImageObjectUrl(
 export function configureOriginalPreviewBuffer(maxBytes: number): void {
   originalPreviewBlobCacheLimitBytes = Math.max(0, Math.floor(maxBytes));
   pruneOriginalPreviewCache();
-}
-
-export function configureThumbnailCache(maxBytes: number): void {
-  thumbnailObjectUrlCacheLimitBytes = Math.max(0, Math.floor(maxBytes));
-  pruneThumbnailObjectUrlCache();
 }
 
 export function requestOriginalPreviewBlob(
@@ -519,23 +469,6 @@ function pruneOriginalPreviewCache(): void {
     if (firstKey === undefined) break;
     deleteOriginalPreviewCacheEntry(firstKey);
   }
-}
-
-function pruneThumbnailObjectUrlCache(): void {
-  while (thumbnailObjectUrlCacheBytes > thumbnailObjectUrlCacheLimitBytes) {
-    const firstKey = thumbnailObjectUrlCache.keys().next().value;
-    if (firstKey === undefined) break;
-    deleteThumbnailObjectUrlCacheEntry(firstKey);
-  }
-}
-
-function deleteThumbnailObjectUrlCacheEntry(cacheKey: string): void {
-  const cached = thumbnailObjectUrlCache.get(cacheKey);
-  if (cached) {
-    thumbnailObjectUrlCacheBytes = Math.max(0, thumbnailObjectUrlCacheBytes - cached.byteSize);
-    URL.revokeObjectURL(cached.objectUrl);
-  }
-  thumbnailObjectUrlCache.delete(cacheKey);
 }
 
 function scheduleForegroundResourceRequest<T>(

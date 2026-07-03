@@ -15,7 +15,7 @@
     "check:core-api": "node tools/checks/validate-core-api.mjs",
     "check:core-client": "npm --workspace @megle/core-client run check && npm --workspace @megle/core-client run typecheck && npm --workspace @megle/core-client run test",
     "check:desktop": "node tools/checks/validate-desktop-core.mjs && npm --workspace @megle/desktop run typecheck",
-    "check:web": "node tools/checks/validate-web-client.mjs && npm --workspace @megle/web run typecheck",
+    "check:web": "node tools/checks/validate-web-client.mjs && npm --workspace @megle/web run typecheck && npm --workspace @megle/web run test",
     "check:ui-design": "node tools/checks/validate-ui-design.mjs",
     "check:schema": "python tools/checks/validate_sqlite_schema.py",
     "check:rust": "node tools/checks/verify-rust.mjs",

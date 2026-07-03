@@ -19,6 +19,23 @@ pub const WAL_MODE: &str = "WAL";
 const WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
+/// `synchronous=NORMAL` (1) is the recommended setting under WAL: it never
+/// corrupts the database and only risks losing the last few *committed*
+/// transactions on OS crash / power loss. Every Megle table (thumbnail
+/// blobs, the file index, the task queue) is regenerable by rescanning, so
+/// this trade is safe — and it removes one fsync per commit, the dominant
+/// cost when the worker persists millions of thumbnails one row at a time.
+const SQLITE_SYNCHRONOUS_NORMAL: i64 = 1;
+/// Negative values are a size in KiB. -65536 → a 64 MiB page cache per
+/// connection so hot browse/scan joins stay resident instead of re-reading
+/// pages from disk on every grid page and thumbnail lookup.
+const SQLITE_CACHE_SIZE_KIB: i64 = -65536;
+/// 256 MiB memory-mapped I/O window so reads (notably serving thumbnail
+/// blobs out of `thumb_blobs`) avoid per-page `read()` syscalls.
+const SQLITE_MMAP_SIZE_BYTES: i64 = 256 * 1024 * 1024;
+/// Keep temp B-trees (ORDER BY / GROUP BY / the cache-stats aggregation)
+/// in memory rather than spilling to disk.
+const SQLITE_TEMP_STORE_MEMORY: i64 = 2;
 
 pub struct Database {
     connection: Connection,
@@ -110,7 +127,6 @@ pub struct ThumbnailTaskRequest {
     pub task_id: Option<i64>,
     #[allow(dead_code)]
     pub queued: bool,
-    pub accepted: bool,
     pub should_enqueue: bool,
 }
 
@@ -494,6 +510,19 @@ impl From<rusqlite::Error> for TagError {
     }
 }
 
+/// Decision returned by [`Database::request_thumbnail_task_in_transaction`] so
+/// the same logic can run standalone or batched inside one transaction.
+/// `terminal_thumbnail` is `Some` only on the no-op terminal path, letting the
+/// non-batched wrapper reproduce its exact original return without a second
+/// query.
+struct ThumbnailTaskRequestOutcome {
+    task_id: Option<i64>,
+    queued: bool,
+    accepted: bool,
+    should_enqueue: bool,
+    terminal_thumbnail: Option<ThumbnailRecord>,
+}
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -622,6 +651,10 @@ impl Database {
         if !self.migration_applied(16)? {
             self.connection
                 .execute_batch(migrations::FOLDER_STATUS_BROWSING_INDEXES_MIGRATION)?;
+        }
+        if !self.migration_applied(17)? {
+            self.connection
+                .execute_batch(migrations::THUMBNAIL_TASK_INDEXES_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
@@ -1414,22 +1447,81 @@ impl Database {
     }
 
     pub fn list_tasks(&self) -> anyhow::Result<Vec<TaskRecord>> {
-        let mut statement = self.connection.prepare(
-            r#"
-            SELECT id, kind, priority, status, root_id, folder_id, file_id, created_at, updated_at,
-                   items_seen, items_total, folders_seen, media_files_seen, skipped_files,
-                   thumbnail_source_fingerprint, attempt_generation, error
-            FROM tasks
-            ORDER BY id ASC
-            "#,
-        )?;
-        let rows = statement.query_map([], task_from_row)?;
+        // Bounded so /api/tasks stays responsive on huge libraries: the most
+        // recent tasks (covering active + recent thumbnail tasks the UI needs)
+        // plus every scan task (root_scan / interactive_folder_scan are few and
+        // the UI must track them across polls). Pending thumbnail tasks can
+        // number in the millions after a "generate all", and returning them all
+        // made this the slowest poll in the app. For small task tables this
+        // returns the full set, identical to before.
+        const RECENT_TASK_LIMIT: i64 = 2000;
+        const TASK_COLUMNS: &str = "id, kind, priority, status, root_id, folder_id, file_id, \
+             created_at, updated_at, items_seen, items_total, folders_seen, media_files_seen, \
+             skipped_files, thumbnail_source_fingerprint, attempt_generation, error";
 
-        let mut tasks = Vec::new();
-        for row in rows {
-            tasks.push(row?);
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut tasks: Vec<TaskRecord> = Vec::new();
+
+        // Most recent tasks by id (primary-key ordered, fast even at millions).
+        let mut recent = self.connection.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks ORDER BY id DESC LIMIT ?1"
+        ))?;
+        for row in recent.query_map([RECENT_TASK_LIMIT], task_from_row)? {
+            let task = row?;
+            if seen.insert(task.id) {
+                tasks.push(task);
+            }
         }
+        drop(recent);
+
+        // Always include scan tasks regardless of age (few; indexed by kind).
+        let mut scans = self.connection.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE kind IN ('root_scan', 'interactive_folder_scan')"
+        ))?;
+        for row in scans.query_map([], task_from_row)? {
+            let task = row?;
+            if seen.insert(task.id) {
+                tasks.push(task);
+            }
+        }
+        drop(scans);
+
+        tasks.sort_by_key(|task| task.id);
         Ok(tasks)
+    }
+
+    /// Counts pending/running *bulk* thumbnail tasks restricted to `file_ids`.
+    /// The per-file cache-stats path runs on every browse "seen" batch; a
+    /// bounded indexed COUNT (idx_tasks_kind_file_status) replaces loading the
+    /// entire `tasks` table into memory to filter in Rust.
+    pub fn count_active_bulk_thumbnail_tasks_for_file_ids(
+        &self,
+        file_ids: &[i64],
+    ) -> anyhow::Result<i64> {
+        let unique_file_ids: Vec<i64> = dedupe_scope_file_ids(file_ids).into_iter().collect();
+        if unique_file_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM tasks \
+             WHERE kind = 'thumbnail' \
+               AND status IN ('pending', 'running') \
+               AND priority = ?1 \
+               AND file_id IN (",
+        );
+        let mut params: Vec<i64> = vec![THUMBNAIL_BULK_PRIORITY];
+        for (index, file_id) in unique_file_ids.iter().enumerate() {
+            if index > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("?{}", index + 2));
+            params.push(*file_id);
+        }
+        sql.push(')');
+        let count: i64 =
+            self.connection
+                .query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?;
+        Ok(count)
     }
 
     pub fn get_task(&self, task_id: i64) -> anyhow::Result<Option<TaskRecord>> {
@@ -2012,6 +2104,7 @@ impl Database {
         };
         let mut predicates = vec!["files.status = 'active'".to_string()];
         let mut parameters = Vec::new();
+        let mut folder_scoped = false;
         if let Some(root_id) = query.root_id {
             predicates.push("files.root_id = ?".to_string());
             parameters.push(Value::Integer(root_id));
@@ -2040,6 +2133,7 @@ impl Database {
                 if !root_folder_descendant_scope {
                     predicates.push("files.folder_id = ?".to_string());
                     parameters.push(Value::Integer(folder_id));
+                    folder_scoped = true;
                 }
             }
         }
@@ -2047,16 +2141,24 @@ impl Database {
             predicates.push("media.kind = ?".to_string());
             parameters.push(Value::Text(kind.to_string()));
         }
-        let count_requires_media_join = query.kind.is_some();
-        let count_predicates = predicates.clone();
-        let count_parameters = parameters.clone();
-        let total_count: i64 = {
-            let count_sql =
-                media_count_sql(&count_predicates.join(" AND "), count_requires_media_join);
-            self.connection
-                .query_row(&count_sql, params_from_iter(count_parameters), |row| {
-                    row.get(0)
-                })?
+        // Only the first page pays for COUNT(*); later pages of the same scroll
+        // reuse the client's retained total. On million-row folders this count
+        // is the dominant per-page cost.
+        let is_first_media_page = if use_offset {
+            offset == 0
+        } else {
+            query.cursor.is_none()
+        };
+        let total_count: Option<i64> = if is_first_media_page {
+            let count_requires_media_join = query.kind.is_some();
+            let count_sql = media_count_sql(&predicates.join(" AND "), count_requires_media_join);
+            Some(self.connection.query_row(
+                &count_sql,
+                params_from_iter(parameters.clone()),
+                |row| row.get(0),
+            )?)
+        } else {
+            None
         };
         let cursor = if use_offset {
             None
@@ -2092,6 +2194,32 @@ impl Database {
             parameters.push(Value::Integer(offset));
         }
 
+        // Pin the index that already matches the scope + sort so SQLite scans it
+        // in order instead of materializing a TEMP B-TREE sort over the whole
+        // scope. Without this, a root-scoped browse (the default whole-library
+        // view) picks the mtime index and sorts ~1M rows by name per page.
+        let files_index = if folder_scoped {
+            match sort {
+                "mtime_asc" => Some("idx_files_folder_status_mtime_id_asc"),
+                "name_asc" => Some("idx_files_folder_status_name_id"),
+                "name_desc" => Some("idx_files_folder_status_name_id_desc"),
+                _ => Some("idx_files_folder_status_mtime_id"),
+            }
+        } else if query.root_id.is_some() {
+            match sort {
+                "mtime_asc" => Some("idx_files_root_status_mtime_id_asc"),
+                "name_asc" => Some("idx_files_root_status_name_id"),
+                "name_desc" => Some("idx_files_root_status_name_id_desc"),
+                _ => Some("idx_files_root_status_mtime_id"),
+            }
+        } else {
+            None
+        };
+        let files_from = match files_index {
+            Some(index) => format!("files INDEXED BY {index}"),
+            None => "files".to_string(),
+        };
+
         let sql = format!(
             r#"
             SELECT files.id, files.root_id, files.folder_id, files.name, files.ext,
@@ -2103,15 +2231,16 @@ impl Database {
                    thumbs.output_format, thumbs.cache_key, thumbs.width, thumbs.height,
                    thumbs.byte_size, thumbs.error, thumbs.source_fingerprint, thumbs.served_by,
                    thumbs.updated_at
-            FROM files
+            FROM {files_from}
             LEFT JOIN media ON media.file_id = files.id
             LEFT JOIN thumbs ON thumbs.file_id = files.id AND thumbs.profile = 'grid_320'
-            JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
+            CROSS JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
             WHERE {where_clause}
             ORDER BY {sort_clause}
             LIMIT ?
             {offset_clause}
             "#,
+            files_from = files_from,
             where_clause = predicates.join(" AND "),
             sort_clause = sort_clause,
             offset_clause = if use_offset { "OFFSET ?" } else { "" },
@@ -2133,7 +2262,7 @@ impl Database {
         Ok(Page {
             items,
             next_cursor,
-            total_count: Some(total_count),
+            total_count,
         })
     }
 
@@ -2182,7 +2311,15 @@ impl Database {
             base_parameters.push(Value::Text(kind.to_string()));
         }
 
-        let total_count: i64 = {
+        // First page only: the recursive-CTE COUNT(*) over the whole subtree is
+        // the dominant cost of paging a large folder tree; later pages reuse the
+        // client's retained total.
+        let is_first_media_page = if use_offset {
+            offset == 0
+        } else {
+            query.cursor.is_none()
+        };
+        let total_count: Option<i64> = if is_first_media_page {
             let count_sql = format!(
                 r#"
                 {descendant_cte}
@@ -2195,11 +2332,13 @@ impl Database {
                 "#,
                 where_clause = predicates.join(" AND "),
             );
-            self.connection.query_row(
+            Some(self.connection.query_row(
                 &count_sql,
                 params_from_iter(base_parameters.clone()),
                 |row| row.get(0),
-            )?
+            )?)
+        } else {
+            None
         };
 
         let cursor = if use_offset {
@@ -2253,7 +2392,7 @@ impl Database {
             CROSS JOIN files INDEXED BY {folder_index}
             LEFT JOIN media ON media.file_id = files.id
             LEFT JOIN thumbs ON thumbs.file_id = files.id AND thumbs.profile = 'grid_320'
-            JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
+            CROSS JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
             WHERE {where_clause}
             ORDER BY {sort_clause}
             LIMIT ?
@@ -2279,7 +2418,7 @@ impl Database {
         Ok(Page {
             items,
             next_cursor,
-            total_count: Some(total_count),
+            total_count,
         })
     }
 
@@ -2541,18 +2680,51 @@ impl Database {
 
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let source = thumbnail_source_in_transaction(&transaction, file_id)?
+        let outcome =
+            Self::request_thumbnail_task_in_transaction(&transaction, file_id, profile, priority)?;
+        transaction.commit()?;
+
+        // Reproduce the original return exactly: the terminal no-op path used the
+        // in-transaction record; every other path re-reads the committed row.
+        let thumbnail = match outcome.terminal_thumbnail {
+            Some(thumbnail) => thumbnail,
+            None => self
+                .get_thumbnail(file_id, profile)?
+                .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?,
+        };
+        Ok(ThumbnailTaskRequest {
+            thumbnail,
+            task_id: outcome.task_id,
+            queued: outcome.queued,
+            should_enqueue: outcome.should_enqueue,
+        })
+    }
+
+    /// Core of [`Database::request_thumbnail_task`] operating on a caller-owned
+    /// transaction so a batch enqueue can run many requests under a single
+    /// `BEGIN IMMEDIATE`/`COMMIT` instead of one transaction (plus one trailing
+    /// `get_thumbnail`) per file.
+    fn request_thumbnail_task_in_transaction(
+        transaction: &Transaction<'_>,
+        file_id: i64,
+        profile: &str,
+        priority: ThumbnailTaskPriority,
+    ) -> anyhow::Result<ThumbnailTaskRequestOutcome> {
+        if profile != GRID_320_PROFILE {
+            return Err(anyhow::anyhow!("unsupported thumbnail profile: {profile}"));
+        }
+        let source = thumbnail_source_in_transaction(transaction, file_id)?
             .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?;
         let source_fingerprint = source.source_fingerprint(profile);
 
         let requested_priority = priority.task_priority();
-        let current = thumbnail_for_update_in_transaction(&transaction, file_id, profile)?;
+        let current = thumbnail_for_update_in_transaction(transaction, file_id, profile)?;
         if let Some(current) = current {
             let ready_has_required_blob = if requested_priority <= THUMBNAIL_BULK_PRIORITY
                 && current.state == "ready"
                 && current.source_fingerprint.as_deref() == Some(source_fingerprint.as_str())
             {
-                thumb_blob_exists_in_transaction(&transaction, file_id, profile)?
+                thumb_blob_exists_in_transaction(transaction, file_id, profile)?
             } else {
                 true
             };
@@ -2562,19 +2734,18 @@ impl Database {
                 source_fingerprint.as_str(),
                 ready_has_required_blob,
             ) {
-                let task_id = latest_thumbnail_task_id_in_transaction(&transaction, file_id)?;
-                transaction.commit()?;
-                return Ok(ThumbnailTaskRequest {
-                    thumbnail: current,
+                let task_id = latest_thumbnail_task_id_in_transaction(transaction, file_id)?;
+                return Ok(ThumbnailTaskRequestOutcome {
                     task_id,
                     queued: false,
                     accepted: false,
                     should_enqueue: false,
+                    terminal_thumbnail: Some(current),
                 });
             }
         }
-        let existing_pending_task = pending_thumbnail_task(&transaction, file_id)?;
-        let existing_running_task = running_thumbnail_task(&transaction, file_id)?;
+        let existing_pending_task = pending_thumbnail_task(transaction, file_id)?;
+        let existing_running_task = running_thumbnail_task(transaction, file_id)?;
         let mut queued = false;
         let mut accepted = false;
         let mut should_enqueue = false;
@@ -2666,7 +2837,7 @@ impl Database {
         };
         if queued {
             upsert_thumbnail_state_in_transaction(
-                &transaction,
+                transaction,
                 ThumbnailStateUpsert {
                     file_id,
                     profile: profile.to_string(),
@@ -2680,18 +2851,41 @@ impl Database {
                 },
             )?;
         }
-        transaction.commit()?;
-
-        let thumbnail = self
-            .get_thumbnail(file_id, profile)?
-            .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?;
-        Ok(ThumbnailTaskRequest {
-            thumbnail,
+        Ok(ThumbnailTaskRequestOutcome {
             task_id: Some(task_id),
             queued,
             accepted,
             should_enqueue,
+            terminal_thumbnail: None,
         })
+    }
+
+    /// Transaction-bound twin of [`Database::reset_failed_thumbnail_for_manual_retry`]
+    /// so batch enqueue can reset failed rows inside its single transaction.
+    fn reset_failed_thumbnail_for_manual_retry_in_transaction(
+        transaction: &Transaction<'_>,
+        file_id: i64,
+        profile: &str,
+    ) -> anyhow::Result<()> {
+        transaction.execute(
+            r#"
+            UPDATE thumbs
+            SET state = 'pending',
+                cache_key = NULL,
+                width = NULL,
+                height = NULL,
+                byte_size = NULL,
+                error = NULL,
+                source_fingerprint = NULL,
+                served_by = NULL,
+                updated_at = ?1
+            WHERE file_id = ?2
+              AND profile = ?3
+              AND state = 'failed'
+            "#,
+            (unix_timestamp(), file_id, profile),
+        )?;
+        Ok(())
     }
 
     pub fn get_thumbnail_cache_stats(
@@ -2701,6 +2895,7 @@ impl Database {
         get_thumbnail_cache_stats_for_scope(self, scope)
     }
 
+    #[cfg(test)]
     pub fn get_thumbnail_cache_stats_for_file_ids(
         &self,
         file_ids: &[i64],
@@ -2720,6 +2915,11 @@ impl Database {
         let entries = self.list_thumbnail_cache_candidate_entries(scope, refresh_mode, limit)?;
         let mut accepted_count = 0usize;
         let mut task_id_to_wake = None;
+        // Enqueue the whole batch under one transaction: "generate cache" can
+        // touch thousands of files, and a per-file commit (plus a per-file
+        // get_thumbnail) was a large multiple of the necessary work.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         for entry in &entries {
             if accepted_count >= limit {
                 break;
@@ -2732,23 +2932,29 @@ impl Database {
             if refresh_mode == ThumbnailCacheRefreshMode::RetryFailedAndStale
                 && status == ThumbnailCacheStatus::Failed
             {
-                self.reset_failed_thumbnail_for_manual_retry(file_id, GRID_320_PROFILE)?;
+                Self::reset_failed_thumbnail_for_manual_retry_in_transaction(
+                    &transaction,
+                    file_id,
+                    GRID_320_PROFILE,
+                )?;
             }
-            let request = self.request_thumbnail_task(
+            let outcome = Self::request_thumbnail_task_in_transaction(
+                &transaction,
                 file_id,
                 GRID_320_PROFILE,
                 ThumbnailTaskPriority::Bulk,
             )?;
-            if request.accepted {
+            if outcome.accepted {
                 accepted_count += 1;
             }
-            if request.should_enqueue && task_id_to_wake.is_none() {
-                task_id_to_wake = request.task_id;
+            if outcome.should_enqueue && task_id_to_wake.is_none() {
+                task_id_to_wake = outcome.task_id;
             }
             if accepted_count >= limit {
                 break;
             }
         }
+        transaction.commit()?;
         if task_id_to_wake.is_none() && limit > 0 {
             if let Some((task_id, file_id, status)) =
                 self.first_scoped_pending_bulk_thumbnail_task_to_wake(scope, refresh_mode)?
@@ -2778,6 +2984,12 @@ impl Database {
         let entries = self.list_thumbnail_cache_entries_for_file_ids(file_ids)?;
         let mut accepted_count = 0usize;
         let mut task_id_to_wake = None;
+        // One transaction for the whole batch: this path runs on every browse
+        // "seen" persist (~every 500ms), so collapsing N per-file commits plus
+        // trailing get_thumbnail reads into a single commit keeps the global
+        // write lock held only briefly.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         for entry in &entries {
             if accepted_count >= limit {
                 break;
@@ -2790,24 +3002,32 @@ impl Database {
             if refresh_mode == ThumbnailCacheRefreshMode::RetryFailedAndStale
                 && status == ThumbnailCacheStatus::Failed
             {
-                self.reset_failed_thumbnail_for_manual_retry(file_id, GRID_320_PROFILE)?;
+                Self::reset_failed_thumbnail_for_manual_retry_in_transaction(
+                    &transaction,
+                    file_id,
+                    GRID_320_PROFILE,
+                )?;
             }
-            let request = self.request_thumbnail_task(
+            let outcome = Self::request_thumbnail_task_in_transaction(
+                &transaction,
                 file_id,
                 GRID_320_PROFILE,
                 ThumbnailTaskPriority::Bulk,
             )?;
-            if request.accepted {
+            if outcome.accepted {
                 accepted_count += 1;
             }
-            if request.should_enqueue && task_id_to_wake.is_none() {
-                task_id_to_wake = request.task_id;
+            if outcome.should_enqueue && task_id_to_wake.is_none() {
+                task_id_to_wake = outcome.task_id;
             }
             if accepted_count >= limit {
                 break;
             }
         }
-        let stats = self.get_thumbnail_cache_stats_for_file_ids(file_ids)?;
+        transaction.commit()?;
+        // Reuse the candidate entries already fetched above instead of
+        // re-querying them; this path runs on every browse "seen" batch.
+        let stats = build_thumbnail_cache_stats_for_file_ids(self, file_ids, &entries);
         Ok(ThumbnailCacheEnqueueResult {
             accepted_count,
             task_id_to_wake,
@@ -2915,17 +3135,48 @@ impl Database {
         let ahead_file_ids = dedupe_scope_file_ids(ahead_file_ids);
         let now = unix_timestamp();
         let mut updated = 0;
-        let mut statement = transaction.prepare(
-            r#"
-            SELECT tasks.id, tasks.file_id, tasks.priority, tasks.status
-            FROM tasks
-            JOIN files ON files.id = tasks.file_id
-            WHERE tasks.kind = 'thumbnail'
-              AND tasks.status IN ('pending', 'running')
-              AND files.root_id = ?1
-            "#,
-        )?;
-        let rows = statement.query_map([root_id], |row| {
+        // Bound the rescan to tasks that can actually change priority on this
+        // sync: files entering the new selected/visible/ahead scope (promotion
+        // candidates) plus any task currently elevated above the background
+        // baseline (demotion candidates now that the viewport moved). Scanning
+        // every pending task in the root made each scroll an
+        // O(pending-tasks-in-root) write burst under the API lock —
+        // pathological right after a "generate all", which queues a bulk task
+        // per file. Out-of-scope bulk tasks stay at bulk priority (they are
+        // already at/below background, so they need no demotion).
+        let scope_file_ids: Vec<i64> = selected_file_ids
+            .iter()
+            .chain(visible_file_ids.iter())
+            .chain(ahead_file_ids.iter())
+            .copied()
+            .collect::<HashSet<i64>>()
+            .into_iter()
+            .collect();
+        let mut select_sql = String::from(
+            "SELECT tasks.id, tasks.file_id, tasks.priority, tasks.status \
+             FROM tasks \
+             JOIN files ON files.id = tasks.file_id \
+             WHERE tasks.kind = 'thumbnail' \
+               AND tasks.status IN ('pending', 'running') \
+               AND files.root_id = ?1 \
+               AND (tasks.priority > ?2",
+        );
+        let mut select_params: Vec<i64> = vec![root_id, THUMBNAIL_BACKGROUND_PRIORITY];
+        if scope_file_ids.is_empty() {
+            select_sql.push(')');
+        } else {
+            select_sql.push_str(" OR tasks.file_id IN (");
+            for (index, file_id) in scope_file_ids.iter().enumerate() {
+                if index > 0 {
+                    select_sql.push(',');
+                }
+                select_sql.push_str(&format!("?{}", index + 3));
+                select_params.push(*file_id);
+            }
+            select_sql.push_str("))");
+        }
+        let mut statement = transaction.prepare(&select_sql)?;
+        let rows = statement.query_map(params_from_iter(select_params.iter()), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -3775,10 +4026,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn publish_thumbnail_blob_and_state_if_source_fingerprint_and_task_attempt_current(
+    pub fn publish_thumbnail_and_succeed_task_if_source_fingerprint_and_task_attempt_current(
         &self,
         state: ThumbnailStateUpsert,
         blob: ThumbBlobRecord,
+        source_dimensions: Option<(i64, i64)>,
         expected_source_fingerprint: &str,
         task_id: i64,
         attempt_generation: i64,
@@ -3790,6 +4042,7 @@ impl Database {
                 state.profile
             );
         }
+        let file_id = blob.file_id;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if !task_attempt_running_in_transaction(&transaction, task_id, attempt_generation)? {
@@ -3804,6 +4057,32 @@ impl Database {
         }
         upsert_thumb_blob_in_transaction(&transaction, &blob)?;
         upsert_thumbnail_state_in_transaction(&transaction, state)?;
+        // Persist the source dimensions captured during the decode the thumbnail
+        // pipeline already performed, moving `media.width/height` from the
+        // scan's `pending` placeholder to real values in the SAME transaction —
+        // no second decode pass and no extra commit. The layout engine reads
+        // these to give justified-rows / masonry their true aspect ratios.
+        if let Some((source_width, source_height)) = source_dimensions {
+            if source_width > 0 && source_height > 0 {
+                transaction.execute(
+                    "UPDATE media SET width = ?1, height = ?2, metadata_status = 'ready' WHERE file_id = ?3",
+                    (source_width, source_height, file_id),
+                )?;
+            }
+        }
+        // Complete the task in the SAME transaction as the blob/state write.
+        // The running-attempt guard above guarantees this row exists and is
+        // running with this attempt, so the worker persists one thumbnail with a
+        // single commit instead of a separate succeeded-UPDATE commit afterward.
+        let succeeded = transaction.execute(
+            "UPDATE tasks SET status = 'succeeded', updated_at = ?1, error = NULL WHERE id = ?2 AND status = 'running' AND attempt_generation = ?3",
+            (unix_timestamp(), task_id, attempt_generation),
+        )?;
+        if succeeded != 1 {
+            anyhow::bail!(
+                "expected to complete exactly one running thumbnail task {task_id} (attempt {attempt_generation}), updated {succeeded}"
+            );
+        }
         transaction.commit()?;
         Ok(true)
     }
@@ -3879,7 +4158,7 @@ impl Database {
                         continue;
                     }
                 };
-                if !is_decodable_webp(&data) {
+                if !is_importable_webp(&data) {
                     tracing::debug!(
                         file_id,
                         "legacy thumbnail cache import skipped invalid WebP file"
@@ -5824,11 +6103,20 @@ fn is_safe_thumbnail_cache_key(cache_key: &str) -> bool {
     is_safe_cache_key(cache_key)
 }
 
-fn is_decodable_webp(data: &[u8]) -> bool {
-    data.len() >= 12
-        && &data[0..4] == b"RIFF"
-        && &data[8..12] == b"WEBP"
-        && image::load_from_memory_with_format(data, image::ImageFormat::WebP).is_ok()
+fn is_importable_webp(data: &[u8]) -> bool {
+    // Validate the RIFF/WebP container and that the header parses (dimensions
+    // are readable) WITHOUT a full pixel decode. The legacy cache was written
+    // by our own pipeline, so a header check guards against truncated/corrupt
+    // files at one-time startup import while keeping the migration cheap even
+    // for million-file libraries (a full decode per file dominated startup).
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+        return false;
+    }
+    image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok())
+        .is_some()
 }
 
 fn dedupe_scope_file_ids(file_ids: &[i64]) -> HashSet<i64> {
@@ -6454,23 +6742,8 @@ fn build_thumbnail_cache_stats_for_file_ids(
     file_ids: &[i64],
     entries: &[ThumbnailCacheEntry],
 ) -> ThumbnailCacheStats {
-    let file_id_set: HashSet<i64> = dedupe_scope_file_ids(file_ids).into_iter().collect();
     let active_bulk_task_count = database
-        .list_tasks()
-        .map(|tasks| {
-            tasks
-                .into_iter()
-                .filter(|task| {
-                    task.kind == "thumbnail"
-                        && task.priority == THUMBNAIL_BULK_PRIORITY
-                        && matches!(task.status.as_str(), "pending" | "running")
-                })
-                .filter(|task| {
-                    task.file_id
-                        .is_some_and(|file_id| file_id_set.contains(&file_id))
-                })
-                .count() as i64
-        })
+        .count_active_bulk_thumbnail_tasks_for_file_ids(file_ids)
         .unwrap_or(0);
     build_thumbnail_cache_stats_with_active_count(entries, active_bulk_task_count)
 }
@@ -6716,8 +6989,13 @@ fn hex_value(value: u8) -> anyhow::Result<u8> {
 
 fn configure_file_database_wal(connection: &Connection) -> anyhow::Result<()> {
     connection.pragma_update(None, "journal_mode", WAL_MODE)?;
+    // Must follow journal_mode=WAL: NORMAL is only safe under WAL.
+    connection.pragma_update(None, "synchronous", SQLITE_SYNCHRONOUS_NORMAL)?;
     connection.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
     connection.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
+    connection.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)?;
+    connection.pragma_update(None, "mmap_size", SQLITE_MMAP_SIZE_BYTES)?;
+    connection.pragma_update(None, "temp_store", SQLITE_TEMP_STORE_MEMORY)?;
     Ok(())
 }
 
@@ -8676,10 +8954,29 @@ mod tests {
     }
 
     #[test]
-    fn list_media_page_offset_window_reports_total_count() {
+    fn list_media_page_reports_total_count_on_first_page_only() {
         let database = migrated_database();
         let (root_id, folder_id) = seed_media_page_fixture(&database);
 
+        // The first page (offset 0) carries the total so the client can size
+        // the virtual grid once.
+        let first_page = database
+            .list_media_page(MediaPageQuery {
+                root_id: Some(root_id),
+                folder_id: Some(folder_id),
+                include_descendants: false,
+                limit: 2,
+                offset: Some(0),
+                cursor: None,
+                sort: "name_asc".to_string(),
+                kind: Some("image".to_string()),
+            })
+            .expect("list first media page");
+        assert_eq!(first_page.total_count, Some(4));
+        assert_eq!(first_page.items.len(), 2);
+
+        // Later offset windows omit COUNT(*) (the client retains the total),
+        // while still returning the correct items and cursor.
         let page = database
             .list_media_page(MediaPageQuery {
                 root_id: Some(root_id),
@@ -8693,7 +8990,7 @@ mod tests {
             })
             .expect("list offset media page");
 
-        assert_eq!(page.total_count, Some(4));
+        assert_eq!(page.total_count, None);
         assert_eq!(media_names(&page.items), vec!["bravo.jpg", "charlie.jpg"]);
         assert!(page.next_cursor.is_some());
 
@@ -8710,7 +9007,7 @@ mod tests {
             })
             .expect("list root descendant offset media page");
 
-        assert_eq!(root_descendant_page.total_count, Some(4));
+        assert_eq!(root_descendant_page.total_count, None);
         assert_eq!(
             media_names(&root_descendant_page.items),
             vec!["bravo.jpg", "charlie.jpg"]

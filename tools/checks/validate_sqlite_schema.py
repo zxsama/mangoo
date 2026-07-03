@@ -21,6 +21,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0013_preview_served_by.sql",
     ROOT / "crates" / "core" / "migrations" / "0015_root_status_browsing_indexes.sql",
     ROOT / "crates" / "core" / "migrations" / "0016_folder_status_browsing_indexes.sql",
+    ROOT / "crates" / "core" / "migrations" / "0017_thumbnail_task_indexes.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -81,6 +82,8 @@ REQUIRED_INDEXES = {
     "idx_thumbs_profile_state",
     "idx_thumbs_state_updated",
     "idx_tasks_status_priority",
+    "idx_tasks_kind_file_status",
+    "idx_tasks_kind_status_priority",
     "idx_file_operations_status_created",
     "idx_plugins_status",
     "idx_thumb_blobs_profile_updated_at",
