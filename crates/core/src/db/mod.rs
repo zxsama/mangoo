@@ -3152,43 +3152,88 @@ impl Database {
             .collect::<HashSet<i64>>()
             .into_iter()
             .collect();
-        let mut select_sql = String::from(
-            "SELECT tasks.id, tasks.file_id, tasks.priority, tasks.status \
-             FROM tasks \
-             JOIN files ON files.id = tasks.file_id \
-             WHERE tasks.kind = 'thumbnail' \
-               AND tasks.status IN ('pending', 'running') \
-               AND files.root_id = ?1 \
-               AND (tasks.priority > ?2",
-        );
-        let mut select_params: Vec<i64> = vec![root_id, THUMBNAIL_BACKGROUND_PRIORITY];
-        if scope_file_ids.is_empty() {
-            select_sql.push(')');
-        } else {
-            select_sql.push_str(" OR tasks.file_id IN (");
+        // The two candidate sets above are read as two separate,
+        // index-friendly queries instead of one query with an OR
+        // disjunction. A single `(tasks.priority > ? OR tasks.file_id IN
+        // (...))` predicate defeats the tasks indexes: SQLite ends up
+        // driving the join from `files` (`SCAN files USING COVERING INDEX
+        // idx_files_root`), which costs O(files-in-root) per sync — a
+        // multi-hundred-ms stall on million-file roots, taken while holding
+        // the single WAL writer. Splitting into a demotion-candidate query
+        // driven from `tasks` (`idx_tasks_kind_status_priority`) and a
+        // promotion-candidate query keyed by file id (`idx_tasks_kind_file_status`)
+        // keeps both queries index-driven; the results are deduped by task
+        // id before the update loop runs.
+        let mut seen_task_ids: HashSet<i64> = HashSet::new();
+        let mut pending_tasks: Vec<(i64, i64, i64, String)> = Vec::new();
+
+        // Query 1: demotion candidates — tasks already elevated above the
+        // background baseline, regardless of whether their file is still in
+        // scope. Driven from `tasks` via idx_tasks_kind_status_priority.
+        {
+            let mut statement = transaction.prepare(
+                "SELECT tasks.id, tasks.file_id, tasks.priority, tasks.status \
+                 FROM tasks INDEXED BY idx_tasks_kind_status_priority \
+                 JOIN files ON files.id = tasks.file_id \
+                 WHERE tasks.kind = 'thumbnail' \
+                   AND tasks.status IN ('pending', 'running') \
+                   AND tasks.priority > ?1 \
+                   AND files.root_id = ?2",
+            )?;
+            let rows = statement.query_map((THUMBNAIL_BACKGROUND_PRIORITY, root_id), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let task = row?;
+                if seen_task_ids.insert(task.0) {
+                    pending_tasks.push(task);
+                }
+            }
+        }
+
+        // Query 2: promotion candidates — tasks for files entering the new
+        // selected/visible/ahead scope. Seeked per file id via
+        // idx_tasks_kind_file_status.
+        if !scope_file_ids.is_empty() {
+            let mut select_sql = String::from(
+                "SELECT tasks.id, tasks.file_id, tasks.priority, tasks.status \
+                 FROM tasks \
+                 JOIN files ON files.id = tasks.file_id \
+                 WHERE tasks.kind = 'thumbnail' \
+                   AND tasks.status IN ('pending', 'running') \
+                   AND files.root_id = ?1 \
+                   AND tasks.file_id IN (",
+            );
+            let mut select_params: Vec<i64> = vec![root_id];
             for (index, file_id) in scope_file_ids.iter().enumerate() {
                 if index > 0 {
                     select_sql.push(',');
                 }
-                select_sql.push_str(&format!("?{}", index + 3));
+                select_sql.push_str(&format!("?{}", index + 2));
                 select_params.push(*file_id);
             }
-            select_sql.push_str("))");
+            select_sql.push(')');
+            let mut statement = transaction.prepare(&select_sql)?;
+            let rows = statement.query_map(params_from_iter(select_params.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let task = row?;
+                if seen_task_ids.insert(task.0) {
+                    pending_tasks.push(task);
+                }
+            }
         }
-        let mut statement = transaction.prepare(&select_sql)?;
-        let rows = statement.query_map(params_from_iter(select_params.iter()), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut pending_tasks = Vec::new();
-        for row in rows {
-            pending_tasks.push(row?);
-        }
-        drop(statement);
 
         let mut promoted_pending_task_ids = Vec::new();
         for (task_id, file_id, current_priority, status) in pending_tasks {
@@ -12067,6 +12112,96 @@ mod tests {
         assert_eq!(ahead_task.priority, THUMBNAIL_AHEAD_PRIORITY);
         assert_eq!(stale_task.priority, THUMBNAIL_BACKGROUND_PRIORITY);
         assert_eq!(running_task.priority, THUMBNAIL_BACKGROUND_PRIORITY);
+    }
+
+    #[test]
+    fn thumbnail_scope_sync_promotes_new_viewport_task_and_demotes_stale_task_in_one_call() {
+        // Regression test for the two-query split in
+        // sync_thumbnail_priority_scope_with_promotions: query 1 (elevated
+        // tasks, demotion candidates) only sees tasks whose priority is
+        // already above background, so a task that starts at background
+        // priority and only enters scope on this call must be picked up by
+        // query 2 (scoped file ids) or the promotion is silently dropped.
+        // This test exercises both a promotion and a demotion in the same
+        // sync call so the union (and its de-dup by task id) is proven.
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_media_page_fixture(&database);
+
+        let stale_elevated_file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "stale-elevated.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 100,
+                mtime: 20,
+                ctime: None,
+                file_key: Some("stale-elevated-a".to_string()),
+            })
+            .expect("insert stale elevated file");
+        let new_viewport_file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "new-viewport.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 100,
+                mtime: 21,
+                ctime: None,
+                file_key: Some("new-viewport-a".to_string()),
+            })
+            .expect("insert new viewport file");
+        for file_id in [stale_elevated_file_id, new_viewport_file_id] {
+            database
+                .upsert_media_kind(file_id, "image")
+                .expect("insert media kind");
+        }
+
+        // Elevated above background from a previous scroll; this call's
+        // scope no longer includes it, so it must be demoted.
+        let stale_task = database
+            .request_thumbnail_task(
+                stale_elevated_file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                ThumbnailTaskPriority::Visible,
+            )
+            .expect("queue stale elevated thumbnail");
+        // At (or below) background priority going in; this call's scope
+        // promotes it to selected. Query 1 alone would never see this task.
+        let new_viewport_task = database
+            .request_thumbnail_task(
+                new_viewport_file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                ThumbnailTaskPriority::Background,
+            )
+            .expect("queue new viewport thumbnail");
+
+        let result = database
+            .sync_thumbnail_priority_scope_with_promotions(
+                root_id,
+                &[new_viewport_file_id],
+                &[],
+                &[],
+            )
+            .expect("sync thumbnail scope");
+
+        assert_eq!(result.updated, 2);
+        assert_eq!(
+            result.promoted_pending_task_ids,
+            vec![new_viewport_task.task_id.expect("new viewport task id")]
+        );
+
+        let stale_task = database
+            .get_task(stale_task.task_id.expect("stale task id"))
+            .expect("get stale task")
+            .expect("stale task exists");
+        let new_viewport_task = database
+            .get_task(new_viewport_task.task_id.expect("new viewport task id"))
+            .expect("get new viewport task")
+            .expect("new viewport task exists");
+
+        assert_eq!(stale_task.priority, THUMBNAIL_BACKGROUND_PRIORITY);
+        assert_eq!(new_viewport_task.priority, THUMBNAIL_SELECTED_PRIORITY);
     }
 
     #[test]
