@@ -273,6 +273,13 @@ export function useLibraryData(
   mediaTotalCountRef.current = mediaTotalCount;
   const loadedMediaRangesRef = useRef(loadedMediaRanges);
   loadedMediaRangesRef.current = loadedMediaRanges;
+  // Keyset cursors for windowed pagination: maps a window START index to the
+  // cursor that fetches the page beginning there (learned from the previous
+  // page's nextCursor). Sequential deep scroll then pages with an O(1) keyset
+  // cursor instead of an O(offset) OFFSET walk (~142ms at 650k rows -> ~16ms).
+  // Random jumps (no cached cursor for that start) fall back to OFFSET. Only
+  // valid for the non-search listMedia path; searchMedia stays OFFSET-based.
+  const mediaCursorByStartIndexRef = useRef<Map<number, string>>(new Map());
   const [thumbnailStatesByMediaId, setThumbnailStatesByMediaId] = useState<
     Record<number, ThumbnailResponse>
   >({});
@@ -1282,10 +1289,16 @@ export function useLibraryData(
       }
       const offset = Math.max(0, scope.offset);
       const limit = Math.max(1, Math.min(MEDIA_WINDOW_MAX_LIMIT, scope.limit));
+      // Prefer a keyset cursor when this window sequentially follows one we have
+      // already loaded (the common deep-scroll case): O(1) instead of O(offset).
+      // Search results are OFFSET-only, so never use a cursor there.
+      const keysetCursor = searchActiveRef.current
+        ? undefined
+        : mediaCursorByStartIndexRef.current.get(offset);
       const requestKey = mediaPageRequestKey(
         scope.rootId,
         scope.folderId,
-        `offset:${offset}:${limit}`,
+        keysetCursor ? `cursor:${keysetCursor}:${limit}` : `offset:${offset}:${limit}`,
         scope.includeDescendants,
         scope.requestGeneration
       );
@@ -1306,7 +1319,11 @@ export function useLibraryData(
           folderId: scope.folderId,
           includeDescendants: scope.includeDescendants,
           limit,
-          offset,
+          // Keyset when following a loaded page; OFFSET for the first page or a
+          // random jump with no cached cursor. Passing only one keeps the Core
+          // query on its intended path.
+          cursor: keysetCursor,
+          offset: keysetCursor ? undefined : offset,
           rootId: scope.rootId,
           signal: controller.signal
         });
@@ -1327,6 +1344,15 @@ export function useLibraryData(
         );
         loadedMediaPageKeys.current.add(requestKey);
         setMediaNextCursor(mediaPage.nextCursor);
+        // Remember the cursor that fetches the page right after this window, so
+        // the next sequential scroll step can keyset past it. Only meaningful on
+        // the non-search path (search cursors are not offset-addressable here).
+        if (!searchActiveRef.current && mediaPage.nextCursor) {
+          mediaCursorByStartIndexRef.current.set(
+            offset + mediaPage.items.length,
+            mediaPage.nextCursor
+          );
+        }
         if (scope.selectFirst) {
           selectMedia((current) => current ?? mediaPage.items[0]?.id ?? null);
         }
@@ -1438,6 +1464,7 @@ export function useLibraryData(
       setMediaSlots(new Map());
       setMediaTotalCount(0);
       setLoadedMediaRanges([]);
+      mediaCursorByStartIndexRef.current.clear();
       setMediaNextCursor(null);
       setError(null);
 
@@ -1574,6 +1601,7 @@ export function useLibraryData(
       setMediaSlots(new Map());
         setMediaTotalCount(0);
         setLoadedMediaRanges([]);
+        mediaCursorByStartIndexRef.current.clear();
         setMediaNextCursor(null);
         await loadMediaWindow({
           rootId: root.id,
@@ -1589,6 +1617,7 @@ export function useLibraryData(
         setMediaSlots(new Map());
         setMediaTotalCount(0);
         setLoadedMediaRanges([]);
+        mediaCursorByStartIndexRef.current.clear();
         setMediaNextCursor(null);
         selectMedia(null);
       }
