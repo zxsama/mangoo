@@ -1423,7 +1423,58 @@ export function useLibraryData(
       includeDescendants?: boolean;
       scanRefreshSelectionToken?: ScanRefreshSelectionToken;
       setLoadingState?: boolean;
+      // Background refresh (scan progress / task-status change): update the
+      // media total so the scrollable area grows to include newly-scanned
+      // files, but do NOT tear down loaded slots, abort in-flight windows, bump
+      // the page generation, or reset scroll. A full teardown here (the old
+      // behavior) blanked the grid and snapped scroll to top every 800ms during
+      // a scan, and dropped a user's just-issued folder load by invalidating its
+      // generation. The windowed pagination + thumbnail-state polling already
+      // fill in new/changed tiles in place as the user scrolls.
+      incremental?: boolean;
     }) => {
+      const incremental = scope?.incremental ?? false;
+      if (incremental) {
+        const rootId = scope?.rootId ?? selectedRootIdRef.current;
+        if (rootId === null || rootId === undefined) {
+          return;
+        }
+        const scanRefreshSelectionToken = scope?.scanRefreshSelectionToken;
+        if (
+          scanRefreshSelectionToken &&
+          !isCurrentScanRefreshSelection(scanRefreshSelectionToken)
+        ) {
+          return;
+        }
+        const folderId = scope && "folderId" in scope ? scope.folderId : selectedFolderIdRef.current;
+        const includeDescendants =
+          scope?.includeDescendants ?? showChildFolderContentsRef.current;
+        const folderFilter = folderId !== null && folderId !== undefined ? folderId : undefined;
+        // A limit=1 offset=0 read is the cheap first page: Core computes the
+        // fresh COUNT there, so we learn the new total without disturbing any
+        // loaded window. We never write its single item into slots (slot 0 is
+        // already loaded); we only lift the total upward so newly-scanned files
+        // become reachable by scrolling.
+        const page = await loadMediaPage({
+          folderId: folderFilter,
+          includeDescendants,
+          limit: 1,
+          offset: 0,
+          rootId,
+          signal: undefined
+        });
+        if (
+          scanRefreshSelectionToken &&
+          !isCurrentScanRefreshSelection(scanRefreshSelectionToken)
+        ) {
+          return;
+        }
+        if (typeof page.totalCount === "number") {
+          setMediaTotalCount((current) => Math.max(current, page.totalCount ?? current));
+        }
+        return;
+      }
+
       const requestGeneration = ++mediaPageGeneration.current;
       abortStaleMediaPageRequests();
       const rootId = scope?.rootId ?? selectedRootId;
@@ -1501,6 +1552,7 @@ export function useLibraryData(
     },
     [
       isCurrentScanRefreshSelection,
+      loadMediaPage,
       loadMediaWindow,
       abortStaleMediaPageRequests,
       roots,
@@ -1548,7 +1600,8 @@ export function useLibraryData(
       await reloadCurrentMedia({
         rootId: selectionToken.rootId,
         folderId: selectionToken.folderId ?? resolvedFolderId,
-        scanRefreshSelectionToken: selectionToken
+        scanRefreshSelectionToken: selectionToken,
+        incremental: true
       });
       return;
     }
@@ -1556,7 +1609,8 @@ export function useLibraryData(
     await reloadCurrentMedia({
       rootId: selectionToken.rootId,
       folderId: null,
-      scanRefreshSelectionToken: selectionToken
+      scanRefreshSelectionToken: selectionToken,
+      incremental: true
     });
   }, [
     createScanRefreshSelectionToken,
@@ -1953,7 +2007,8 @@ export function useLibraryData(
     if (interactiveRefreshScope) {
       void reloadCurrentMedia({
         rootId: interactiveRefreshScope.rootId,
-        folderId: interactiveRefreshScope.folderId
+        folderId: interactiveRefreshScope.folderId,
+        incremental: true
       }).catch((cause) => {
         setError(errorMessage(cause));
       });
