@@ -18,15 +18,17 @@ const TASK_PROGRESS_FLUSH_INTERVAL_ITEMS: i64 = 100;
 const THUMBNAIL_SOURCE_CHANGED_ERROR: &str = "thumbnail source changed while processing";
 const FFMPEG_NOT_AVAILABLE_ERROR: &str = "ffmpeg not available";
 const THUMBNAIL_SELECTED_WORKER_CONCURRENCY: usize = 1;
-// Every blob commit takes BEGIN IMMEDIATE on its own connection. Too many
-// concurrent blob writers thrash SQLite's busy-handler retry (a backoff-sleep
-// loop, not a fair queue), so an interactive scroll write can spin ~1s to
-// acquire the write lock even though every individual commit is ~1ms. Capping
-// foreground blob writers keeps WAL-writer contention low so interactive writes
-// acquire the lock promptly. Measured on a 650k-file library: 12/2 gave
-// priority-scope p95 ~190ms with 1-2s max stalls; 4/1 gave p95 ~30ms.
-const THUMBNAIL_FOREGROUND_WORKER_CONCURRENCY: usize = 4;
-const THUMBNAIL_BACKGROUND_WORKER_CONCURRENCY: usize = 1;
+// Foreground = the viewport thumbnails the user is actively waiting for
+// (visible/ahead priority). Keep this generous so opening a folder fills its
+// tiles quickly. It does NOT reintroduce the write-storm contention that forced
+// the cap earlier: that came from BULK/background blob commits (thousands, after
+// a "generate all"), which stay on the background bucket below and yield to
+// interactive writes via write_gate. A viewport is only a few dozen thumbnails,
+// so more foreground writers just clears them faster.
+const THUMBNAIL_FOREGROUND_WORKER_CONCURRENCY: usize = 10;
+// Background/bulk: the write-storm source. Kept low; these yield to interactive
+// writes (write_gate) before each blob commit.
+const THUMBNAIL_BACKGROUND_WORKER_CONCURRENCY: usize = 2;
 const IDLE_PENDING_TASK_DRAIN_INTERVAL_MS: u64 = 250;
 /// How often the dedicated checkpoint thread runs a WAL checkpoint pass. Short
 /// enough to keep the WAL small under heavy blob ingestion, long enough that the
