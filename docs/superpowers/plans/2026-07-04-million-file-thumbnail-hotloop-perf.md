@@ -1064,3 +1064,15 @@ After the API-layer perf work, driving the **actual Electron window** (not just 
 **Guards updated** (`2471419`): `tools/checks/validate-ui-design.mjs` pinned the old "adaptive/waterfall must not be windowed" shape; rewritten to assert the new full-total-windowing invariants. `npm test` green (all 8 gates, 254 Rust tests).
 
 Detailed root-cause notes: memory `interaction-bugs-scan-refresh`.
+
+### Phase 9 addendum — two more scan-period interaction bugs (`466edb5`)
+
+Follow-up user reports, both root-caused and real-window verified:
+
+4. **Empty-folder subfolder-strip flicker.** On a folder with no subfolders, at scroll top while scanning, the "显示子文件夹" header row appeared→disappeared every ~800ms. Cause: the Phase-9 sidebar fix (bug 3) force-refetches folder children every ~800ms during scan, toggling `loadingFolderIds`; `showSubfolderStrip = entries>0 || childFoldersLoading` made an empty folder's strip flip with the loading flag. Fix (`LibraryView.tsx`): a `childFoldersLoadedOnce` guard (`folderChildrenByParent[id] !== undefined`) so the loading flag only reveals the strip on the FIRST load; once children are known, emptiness is stable across background re-fetches. Verified on a real leaf folder (id 3, depth 2, 18 media, 0 subfolders): strip stayed hidden, 0 transitions over 10s of scanning.
+
+5. **Slow sidebar ("waiting for a refresh").** The folder tree waited behind `await loadTasks()` in both `loadLibrary` and `refreshCurrentScanView`; `GET /api/tasks` is slow mid-scan (large task table), so the sidebar structure lagged a full refresh cycle. Fix (`useLibraryData.ts`): load folder children BEFORE tasks and fire `void loadTasks()` without awaiting it (tasks/scan-progress aren't needed to render the tree). Verified: sidebar populated at +5ms from launch (was seconds).
+
+Guard `tools/checks/validate-web-client.mjs` "must incrementally refresh current folder media and children during scan" updated for the new refresh order (children force-refresh before tasks). `npm test` green (all 8 gates, 254 Rust tests).
+
+Note on the test library: Billfish `Artists` has no leaf folders in the first 60 top-level folders (Artist → collection → images); leaf folders start around depth 2 — use depth≥2 BFS to find one for leaf-folder tests.
