@@ -1084,3 +1084,17 @@ Note on the test library: Billfish `Artists` has no leaf folders in the first 60
 7. **Loaded thumbnail re-flashes 1-2× (background flash then re-shows).** `ReadyThumbnail`'s blob effect depended on `thumbnailUpdatedAt` and `resourcePriority`, so a live thumbnail-state settle (updatedAt null→timestamp during scan) or a viewport priority shift (visible↔ahead↔selected on scroll) re-ran the effect → re-fetched the blob → re-swapped the object URL → flashed the placeholder before the same image. The blob is content-identified by `cacheKey` (id:mtime:size), so those values must not trigger a re-fetch. Fix: key the effect only on `[cacheKey, fileId, retryToken]`; a genuine content change bumps mtime/size → cacheKey and re-runs correctly.
 
 `npm test` green (all 8 gates, 254 Rust, 6 web). Bug 6 real-window verified; bug 7 is a visual flash to confirm by eye.
+
+### Phase 9 addendum 3 — sidebar load speed + tree interaction bugs (`61c33ab`, `04f07a5`)
+
+From real use on the 299-folder library:
+
+8. **Sidebar fills in over minutes (structure-first scan).** The scan is a single depth-first `WalkDir` interleaving folders and files, so a top-level folder row was committed only after the walk finished that folder's entire media subtree (299 top-level folders appeared at ~1/sec). Fix: a structure-first breadth-first pass (`crates/core/src/scan/mod.rs`) commits the whole folder tree up front, batched, before any file indexing. All 299 top-level folders now appear in ~1.5s. Verified end-to-end (GUI tree count 300 at +12s).
+
+9. **Selection/expansion snaps back on rapid folder clicks.** The 800ms scan refresh called the full `loadRoots()`, which re-drove `selectRoot`/`selectFolder`/nav-history from a selection captured in a stale refresh token, reverting the user's just-made selection. Fix: `refreshRootsList()` refreshes only the roots list (no selection side effects). Verified 0 snap-backs across 6 rapid switches.
+
+10. **Empty folders show an expand chevron.** Render a non-clickable leaf marker once a folder's children are known-empty (`LibrarySidebar`). Verified. (A definitive "has children" before loading would need a Core `FolderRecord` field — deferred.)
+
+11. **Subfolder cover flashes/reloads on scroll.** `FolderCoverPreview`'s blob effect depended on the `coverMediaItem` object (re-created each viewport re-prioritization); keyed on `cacheKey` (content identity) only — same fix as the tile `ReadyThumbnail` re-flash.
+
+`npm test` green (all 8 gates, 254 Rust, 6 web). Bugs 8/9/10 real-window verified; 11 uses the proven analogous fix.
