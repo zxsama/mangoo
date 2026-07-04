@@ -461,11 +461,19 @@ if (
   !/const\s+uniformWindowLayoutMode\s*=\s*layoutMode\s*===\s*"grid"\s*\|\|\s*layoutMode\s*===\s*"list"/.test(
     mediaGrid
   ) ||
-  !/mediaSlots\s*!==\s*undefined\s*&&\s*\n?\s*uniformWindowLayoutMode/.test(mediaGrid) ||
-  !/justifiedFullTotal/.test(mediaGrid)
+  // The full-total justified layout is O(totalCount); above a cap it must fall
+  // back to the uniform windowed grid or the renderer freezes at million scale.
+  !/JUSTIFIED_FULL_TOTAL_MAX_ITEMS/.test(mediaGrid) ||
+  !/justifiedTooLargeForFullTotal\s*=\s*[\s\S]*?justifiedLayoutMode\s*&&\s*mediaItemCount\s*>\s*JUSTIFIED_FULL_TOTAL_MAX_ITEMS/.test(
+    mediaGrid
+  ) ||
+  !/windowedMedia\s*=\s*[\s\S]*?uniformWindowLayoutMode\s*\|\|\s*justifiedTooLargeForFullTotal/.test(
+    mediaGrid
+  ) ||
+  !/justifiedFullTotal\s*=\s*[\s\S]*?!justifiedTooLargeForFullTotal/.test(mediaGrid)
 ) {
   fail(
-    "MediaGrid must window grid/list via uniformWindowLayoutMode and adaptive/waterfall via justifiedFullTotal (full-total placeholder layout)"
+    "MediaGrid must window grid/list (and over-cap justified/masonry) via the uniform mediaWindow, and use the full-total justified layout only at or below JUSTIFIED_FULL_TOTAL_MAX_ITEMS"
   );
 }
 if (/Load more media/.test(mediaGrid) || /type:\s*"load-more"/.test(mediaGrid)) {

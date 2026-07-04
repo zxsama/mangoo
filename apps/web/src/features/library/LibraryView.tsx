@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FolderRecord, MediaRecord } from "@megle/core-client";
 import type { LibraryState } from "../../core/useLibraryData";
 import { MediaGrid } from "../media-grid/MediaGrid";
@@ -109,6 +109,15 @@ export function LibraryCenterPane({
   );
   const [folderCoverPriorityIndexes, setFolderCoverPriorityIndexes] = useState<number[]>([]);
   const [expandedSubfolderIds, setExpandedSubfolderIds] = useState<Set<number>>(() => new Set());
+  // Dedup which subfolders we've already asked to load children / paginate for.
+  // The probe + load-more effects below depend on the very state their loads
+  // mutate (folderChildrenByParent / loadingFolderIds / cursors), so without a
+  // request dedup every completed load re-triggers them and they re-issue —
+  // an unbounded feedback cascade that hit React's update-depth limit and froze
+  // the grid. These refs make effect re-runs idempotent: a folder/page is
+  // requested at most once, so re-runs do no work. Cleared on folder/mode change.
+  const probedChildFolderIdsRef = useRef<Set<number>>(new Set());
+  const requestedLoadMorePagesRef = useRef<Set<string>>(new Set());
   const currentFolderId = library.selectedFolderId ?? selectedRoot?.rootFolderId ?? null;
   const visibleSubfolderEntries = useMemo(
     () =>
@@ -267,6 +276,8 @@ export function LibraryCenterPane({
 
   useEffect(() => {
     setFolderCoverPriorityIndexes([]);
+    probedChildFolderIdsRef.current = new Set();
+    requestedLoadMorePagesRef.current = new Set();
   }, [currentFolderId, library.showChildFolderContents]);
 
   useEffect(() => {
@@ -293,6 +304,7 @@ export function LibraryCenterPane({
         continue;
       }
       if (
+        !probedChildFolderIdsRef.current.has(folder.id) &&
         library.folderChildrenByParent[folder.id] === undefined &&
         !library.loadingFolderIds.has(folder.id)
       ) {
@@ -303,7 +315,11 @@ export function LibraryCenterPane({
       }
     }
     for (const folderId of folderIds) {
-      void library.requestFolderChildren(folderId).catch(() => undefined);
+      probedChildFolderIdsRef.current.add(folderId);
+      void library.requestFolderChildren(folderId).catch(() => {
+        // Allow a genuine failure to be retried on a later viewport change.
+        probedChildFolderIdsRef.current.delete(folderId);
+      });
     }
   }, [
     folderCoverPriorityIndexes,
@@ -325,12 +341,20 @@ export function LibraryCenterPane({
       if (!entry) {
         continue;
       }
+      const cursor = library.folderChildNextCursorByParent[entry.parentId];
       if (
         entry.siblingIndex >= entry.siblingCount - 8 &&
-        library.folderChildNextCursorByParent[entry.parentId] &&
+        cursor &&
         !library.loadingMoreFolderIds.has(entry.parentId)
       ) {
-        parentIds.add(entry.parentId);
+        // Request each (parent, cursor) page at most once. The cursor advances
+        // after a page loads, so genuine pagination still proceeds; only the
+        // re-run re-issue that fed the render loop is suppressed.
+        const pageKey = `${entry.parentId}:${cursor}`;
+        if (!requestedLoadMorePagesRef.current.has(pageKey)) {
+          requestedLoadMorePagesRef.current.add(pageKey);
+          parentIds.add(entry.parentId);
+        }
       }
     }
     for (const parentId of parentIds) {

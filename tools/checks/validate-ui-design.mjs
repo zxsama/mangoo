@@ -619,9 +619,13 @@ if (
 if (
   !/const\s+uniformWindowLayoutMode\s*=\s*layoutMode\s*===\s*"grid"\s*\|\|\s*layoutMode\s*===\s*"list"/.test(mediaGrid) ||
   !/const\s+justifiedLayoutMode\s*=\s*layoutMode\s*===\s*"adaptive"\s*\|\|\s*layoutMode\s*===\s*"waterfall"/.test(mediaGrid) ||
-  !/mediaSlots\s*!==\s*undefined\s*&&\s*\n?\s*uniformWindowLayoutMode/.test(mediaGrid)
+  // The fixed-row uniform window serves grid/list, plus justified/masonry folders
+  // past JUSTIFIED_FULL_TOTAL_MAX_ITEMS (the O(totalCount) full-total layout would
+  // freeze the renderer at that scale). At or below the cap, adaptive/waterfall
+  // keep their justified full-total geometry.
+  !/mediaSlots\s*!==\s*undefined\s*&&\s*\n?\s*\(uniformWindowLayoutMode\s*\|\|\s*justifiedTooLargeForFullTotal\)/.test(mediaGrid)
 ) {
-  fail("MediaGrid must gate the fixed-row uniform window on grid/list only (uniformWindowLayoutMode); adaptive/waterfall use their own justified geometry");
+  fail("MediaGrid must gate the fixed-row uniform window on grid/list plus over-cap justified/masonry (uniformWindowLayoutMode || justifiedTooLargeForFullTotal); at-or-below-cap adaptive/waterfall use their own justified geometry");
 }
 
 if (

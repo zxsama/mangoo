@@ -45,6 +45,15 @@ const LIST_WINDOW_FRAME_HEIGHT_PX = 90;
 const LIST_WINDOW_THUMBNAIL_WIDTH_PX = 108;
 const LIST_WINDOW_THUMBNAIL_HEIGHT_PX = 72;
 const WINDOWED_MEDIA_COUNT_THRESHOLD = 1000;
+// The full-total justified/masonry layout materializes a placement + segment for
+// EVERY item in the folder (O(totalCount)) and the layout rebuilds on each
+// mediaSlots / estimatedRatio change while scrolling. That is fine for moderate
+// folders, but at hundreds of thousands of items it allocates that many objects
+// per scroll step and freezes the renderer — media-fetch callbacks starve, so
+// tiles blank out and never refresh. Above this cap, justified/masonry folders
+// fall back to the uniform windowed grid (O(viewport)), which already provides a
+// correct total scroll height and placeholder slots.
+const JUSTIFIED_FULL_TOTAL_MAX_ITEMS = 20000;
 const ORIGINAL_FALLBACK_IMAGE_EXTENSIONS = new Set([
   "avif",
   "bmp",
@@ -310,21 +319,30 @@ export function MediaGrid({
   // positions hold a placeholder, and real thumbnails fade in without repacking.
   const uniformWindowLayoutMode = layoutMode === "grid" || layoutMode === "list";
   const justifiedLayoutMode = layoutMode === "adaptive" || layoutMode === "waterfall";
-  // `windowedMedia` = the uniform absolute-index window path (grid/list). Kept
-  // narrow so the many render/virtual-row branches that switch on it still mean
-  // "uniform mediaWindow rows".
+  const largeMediaSet =
+    mediaItemCount > items.length || mediaItemCount > WINDOWED_MEDIA_COUNT_THRESHOLD;
+  // A justified/masonry folder past the cap cannot use the O(totalCount) full-
+  // total layout without freezing the renderer, so it renders through the uniform
+  // windowed grid instead (see JUSTIFIED_FULL_TOTAL_MAX_ITEMS).
+  const justifiedTooLargeForFullTotal =
+    justifiedLayoutMode && mediaItemCount > JUSTIFIED_FULL_TOTAL_MAX_ITEMS;
+  // `windowedMedia` = the uniform absolute-index window path (grid/list, plus
+  // over-cap justified folders). Kept narrow so the many render/virtual-row
+  // branches that switch on it still mean "uniform mediaWindow rows".
   const windowedMedia =
     mediaSlots !== undefined &&
-    uniformWindowLayoutMode &&
-    (mediaItemCount > items.length || mediaItemCount > WINDOWED_MEDIA_COUNT_THRESHOLD);
+    (uniformWindowLayoutMode || justifiedTooLargeForFullTotal) &&
+    largeMediaSet;
   // Justified/masonry full-total layout: drive the existing non-windowed
   // (layout.segments) render path, but over placements that span the whole
   // folder total (real ratio when loaded, estimate otherwise) and prefetch the
   // visible/ahead slot range so real thumbnails arrive before they scroll in.
+  // Only for folders at or below the cap; larger ones use windowedMedia above.
   const justifiedFullTotal =
     mediaSlots !== undefined &&
     justifiedLayoutMode &&
-    (mediaItemCount > items.length || mediaItemCount > WINDOWED_MEDIA_COUNT_THRESHOLD);
+    !justifiedTooLargeForFullTotal &&
+    largeMediaSet;
   // Estimated aspect ratio for not-yet-loaded slots: average of the loaded
   // slots' real ratios (falls back to 1). Keeps the justified/masonry rows
   // stable so a late-arriving real ratio does not reflow the layout.
@@ -351,9 +369,7 @@ export function MediaGrid({
     [items, mediaSlots, windowedMedia, justifiedFullTotal]
   );
   const layoutItems =
-    (uniformWindowLayoutMode && windowedMedia) || justifiedFullTotal
-      ? EMPTY_MEDIA_ITEMS
-      : orderedLoadedMedia;
+    windowedMedia || justifiedFullTotal ? EMPTY_MEDIA_ITEMS : orderedLoadedMedia;
   const layout = useMemo(
     () =>
       buildLayoutGeometry({
