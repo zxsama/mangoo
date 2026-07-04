@@ -1038,3 +1038,29 @@ _(Post-fix numbers appended after Phase 4.)_
 ### Deferred to runtime verification
 
 - Test B (desktop CDP scroll-trace, `tools/dev/desktop-scroll-trace.mjs`) needs a live Electron GUI; run the recipe in the driver's header against `MEGLE_AUTO_ADD_ROOT` to confirm render-thread health (no long tasks, no stuck tiles, no console errors) in the actual app.
+
+---
+
+## Phase 9 — Real-interaction bug fixes (follow-up, real-window verified)
+
+After the API-layer perf work, driving the **actual Electron window** (not just the Core API) surfaced interaction bugs the hot-loop test structurally cannot see — they live in the React render/refresh/layout path. These were root-caused with `superpowers:systematic-debugging` and verified in the running app (CDP + screenshots), not with unit tests.
+
+**New durable test infrastructure** (replaces the throwaway `_repro.mjs`-style harnesses):
+- `tools/dev/cdp-client.mjs` — reusable CDP-over-WebSocket client (evalJson / run / screenshot / console-error capture).
+- `tools/dev/desktop-interaction-test.mjs` — launches the real desktop app against the real library, BFS-discovers a diverse folder catalog across tree levels, then drives 30 folder switches covering **cold / hot / out-and-back / rapid** navigation across depths 0–2, interleaved with grid deep-scroll and preview open/close and sidebar-tree scroll. Asserts on the **live rendered `.tile-thumb-image` / `.subfolder-card-cover-image` count** (not the stale `data-thumb-state` row attribute), per-op latency, hangs, error strip, console errors. Run: `node tools/dev/desktop-interaction-test.mjs` (env `MEGLE_INTERACTION_ROOT`, `MEGLE_INTERACTION_OPS`, `MEGLE_KEEP_DATA=1`).
+
+**Bugs fixed (each real-window verified):**
+
+1. **Constant refresh: black flash + scroll snaps to top during scan** (`226f7a2`). Root cause: the 800ms scan-refresh (and the task-status-change refresh) called `reloadCurrentMedia`, which unconditionally blanked media/slots/ranges and reloaded from offset 0 — every 800ms the grid went empty and scroll reset, even when the folder was fully loaded, and a just-issued folder load could be dropped by the page-generation bump. Fix: an `incremental` mode that only re-reads the media total (so newly-scanned files become reachable) without tearing down slots, aborting in-flight windows, bumping generation, or resetting scroll; user navigation keeps the hard reset. Verified: scrollTop held steady 10.5s during scan, 0 grid-blanks, 0 scroll-snaps.
+
+2. **Adaptive/waterfall reorder-insert with no placeholder** (`0c1bb73`). Root cause: `windowedMedia` required `layoutMode === "grid" || "list"`, so justified (adaptive) and masonry (waterfall) laid out only the loaded items — the scroll height was capped at the loaded count (~3392px for 42 tiles in a 40k+ folder), you couldn't scroll past loaded content, and each late-arriving window repacked the layout. Fix: lay these modes out over the **full folder total** — each slot uses its real aspect ratio when loaded and a stable estimate (average of loaded ratios) when not, so scroll height is correct immediately and unloaded positions hold a `MediaTileSkeleton` placeholder; a prefetch effect requests the visible+ahead slot window so real thumbnails replace placeholders without repacking. Default layout mode is now `adaptive`. `buildLayoutGeometry` gained optional `totalCount`/`getItemAt`/`estimatedRatio`; `LayoutPlacement.item` is now optional (`undefined` = placeholder). Verified: deep-scrolled a 68k+ recursive folder — full scroll range (spacer ~1.5M px), placeholders fill in progressively, no reorder.
+
+3. **Sidebar showed only 2 of 299 first-level folders** (`e4ae585`). Root cause: `loadFolderChildren` short-circuits on its cache, so once the scan-refresh had cached the few siblings indexed early in the scan it never re-fetched as the rest were scanned in (a deep tree indexes one child's full contents before the next sibling appears). Fix: the scan-refresh now `loadFolderChildren(folderId, { force: true })` for the expanded/selected folder; the fetched page replaces the array atomically so already-shown folders don't flicker. Verified: sidebar folder count climbed 3 → 49+ toward 299 during scan (was frozen at 2–3).
+
+**Supporting change:** `perf(...)` raised `THUMBNAIL_FOREGROUND_WORKER_CONCURRENCY` 4 → 10 (background stays 2) — foreground = the viewport thumbnails the user awaits; safe because the write-storm came from bulk/background commits, which stay low and yield via `write_gate`.
+
+**Not a bug (test artifact, `ffa4ee7`):** an intermittent ~5s "preview hang" turned out to be the test double-clicking `.media-tile` on a subfolders-only view (the root with "show subfolder contents" on renders `.subfolder-card` covers, no media tile). CDP + screenshots confirmed the app opens previews reliably (13/13 in a media folder); the test now only previews when a media tile exists.
+
+**Guards updated** (`2471419`): `tools/checks/validate-ui-design.mjs` pinned the old "adaptive/waterfall must not be windowed" shape; rewritten to assert the new full-total-windowing invariants. `npm test` green (all 8 gates, 254 Rust tests).
+
+Detailed root-cause notes: memory `interaction-bugs-scan-refresh`.
