@@ -726,7 +726,13 @@ impl Database {
             // actually shrink the file. Give in-flight commits a brief moment to
             // reach that pause point, then truncate.
             let _checkpoint = crate::write_gate::interactive_write_gate().begin_checkpoint();
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            // Let in-flight blob commits drain and new ones park at the barrier
+            // before truncating, so the TRUNCATE has the best chance of resetting
+            // the file. (Short reads and worker-connection reads can still hold a
+            // frame mark and make TRUNCATE fall back to PASSIVE; that only bounds
+            // rather than fully resets the WAL, which is acceptable — the point is
+            // to keep it in the hundreds-of-MB range, never gigabytes.)
+            std::thread::sleep(std::time::Duration::from_millis(20));
             if self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)? {
                 return Ok(());
             }
