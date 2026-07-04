@@ -2129,7 +2129,20 @@ function ReadyThumbnail({
   // tile scrolled out of and back into view reuses its cached image instead of
   // re-fetching. A real content change (mtime/size) naturally busts it.
   const cacheKey = thumbnailObjectUrlCacheKey(fileId, contentSignature, null);
-  const [src, setSrc] = useState<string | null>(() => readCachedThumbnailObjectUrl(cacheKey));
+  // Bridge the fallback -> ready swap. While a thumbnail is still generating the
+  // tile shows OriginalFallbackThumbnail (the decoded original). When state
+  // flips to "ready" this ReadyThumbnail mounts; with no cached WebP its src
+  // would start null and the tile would blank to a placeholder/background until
+  // the WebP fetch+decode finishes — the "flash background then re-show" seen
+  // while scrolling a cold-start aggregated view. Seed the initial src from the
+  // original-fallback object URL the tile was already displaying so the decoded
+  // WebP is swapped in only once it is ready (via the decode-before-commit path
+  // below). The bridge URL is owned by originalFallbackObjectUrlCache and is
+  // never assigned to `objectUrl`, so this component never revokes it.
+  const originalBridgeUrl = originalFallbackObjectUrlCache.get(`original:${contentSignature}`) ?? null;
+  const [src, setSrc] = useState<string | null>(
+    () => readCachedThumbnailObjectUrl(cacheKey) ?? originalBridgeUrl
+  );
   const [error, setError] = useState(false);
   const [retryToken, setRetryToken] = useState(0);
   const objectUrlRef = useRef<string | null>(src);

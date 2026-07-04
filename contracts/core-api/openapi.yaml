@@ -1180,7 +1180,7 @@ components:
           nullable: true
     FolderRecord:
       type: object
-      required: [id, rootId, parentId, name, status]
+      required: [id, rootId, parentId, name, status, hasChildren]
       properties:
         id:
           type: integer
@@ -1193,6 +1193,12 @@ components:
           type: string
         status:
           type: string
+        hasChildren:
+          type: boolean
+          description: >-
+            True when the folder has at least one active child folder. Lets the
+            UI render an expand affordance up front instead of showing a chevron
+            that disappears once an empty child page loads.
     FolderListResponse:
       type: object
       required: [items, nextCursor]

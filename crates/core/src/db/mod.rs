@@ -296,6 +296,12 @@ pub struct FolderRecord {
     pub parent_id: Option<i64>,
     pub name: String,
     pub status: String,
+    /// Whether this folder has at least one active child folder. Lets the UI
+    /// decide up front whether to render an expand affordance, instead of
+    /// showing a chevron that vanishes once an empty child page loads. Computed
+    /// with an EXISTS probe over `idx_folders_parent_status_id` (one index seek
+    /// per row), so it stays cheap even for a full 500-folder page.
+    pub has_children: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3327,7 +3333,11 @@ impl Database {
                     JOIN descendant_folders ON folders.parent_id = descendant_folders.id
                     WHERE folders.status = 'active'
                 )
-                SELECT folders.id, folders.root_id, folders.parent_id, folders.name, folders.status
+                SELECT folders.id, folders.root_id, folders.parent_id, folders.name, folders.status,
+                    EXISTS(
+                        SELECT 1 FROM folders child
+                        WHERE child.parent_id = folders.id AND child.status = 'active'
+                    ) AS has_children
                 FROM folders
                 JOIN descendant_folders ON descendant_folders.id = folders.id
                 JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
@@ -3341,7 +3351,11 @@ impl Database {
         } else {
             format!(
                 r#"
-                SELECT folders.id, folders.root_id, folders.parent_id, folders.name, folders.status
+                SELECT folders.id, folders.root_id, folders.parent_id, folders.name, folders.status,
+                    EXISTS(
+                        SELECT 1 FROM folders child
+                        WHERE child.parent_id = folders.id AND child.status = 'active'
+                    ) AS has_children
                 FROM folders
                 JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
                 WHERE folders.parent_id = ?1 AND folders.status = 'active'
@@ -3369,6 +3383,7 @@ impl Database {
                 parent_id: row.get(2)?,
                 name: row.get(3)?,
                 status: row.get(4)?,
+                has_children: row.get(5)?,
             })
         })?;
 
@@ -7856,6 +7871,13 @@ mod tests {
         items.iter().map(|item| item.name.as_str()).collect()
     }
 
+    fn folder_named<'a>(items: &'a [FolderRecord], name: &str) -> &'a FolderRecord {
+        items
+            .iter()
+            .find(|item| item.name == name)
+            .unwrap_or_else(|| panic!("missing folder {name}"))
+    }
+
     const OLD_INITIAL_MIGRATION_WITHOUT_TASK_PROGRESS: &str = r#"
         PRAGMA foreign_keys = ON;
 
@@ -9207,6 +9229,18 @@ mod tests {
             .list_folder_children_page(root_folder_id, 10, None, false)
             .expect("list direct children");
         assert_eq!(folder_names(&direct_page.items), vec!["child", "sibling"]);
+        // `child` has a grandchild -> hasChildren; `sibling` is a leaf. The UI
+        // uses this to avoid flashing an expand chevron on childless folders.
+        let child = folder_named(&direct_page.items, "child");
+        let sibling = folder_named(&direct_page.items, "sibling");
+        assert!(
+            child.has_children,
+            "child folder should report has_children"
+        );
+        assert!(
+            !sibling.has_children,
+            "leaf sibling folder should report no children"
+        );
 
         let recursive_page = database
             .list_folder_children_page(root_folder_id, 10, None, true)
@@ -9214,6 +9248,14 @@ mod tests {
         assert_eq!(
             folder_names(&recursive_page.items),
             vec!["child", "grandchild", "sibling"]
+        );
+        assert!(
+            folder_named(&recursive_page.items, "child").has_children,
+            "child folder should report has_children in recursive listing"
+        );
+        assert!(
+            !folder_named(&recursive_page.items, "grandchild").has_children,
+            "leaf grandchild folder should report no children"
         );
     }
 

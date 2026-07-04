@@ -154,7 +154,8 @@ export function LibraryCenterPane({
     return folders;
   }, [folderCoverPriorityIndexes, visibleSubfolderEntries]);
   const coverMediaByFolderId = useFolderCovers(folderCoverPriorityFolders, {
-    disabled: library.loading
+    disabled: library.loading,
+    activeScan: library.scanActive
   });
   const contentCount = Math.max(library.mediaTotalCount, library.media.length);
   const contentCountLabel = `${contentCount}`;
@@ -415,7 +416,7 @@ export function LibraryInspectorPane({
   const selectedFolder = library.selectedFolderInfo;
   const selectedFolderCoverMediaByFolderId = useFolderCovers(
     selectedFolder ? [selectedFolder] : [],
-    { disabled: selectedFolder === null }
+    { disabled: selectedFolder === null, activeScan: library.scanActive }
   );
   const selectedFolderCoverMedia = selectedFolder
     ? selectedFolderCoverMediaByFolderId.get(selectedFolder.id) ?? []

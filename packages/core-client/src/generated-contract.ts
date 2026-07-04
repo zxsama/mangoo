@@ -110,6 +110,7 @@ export interface FolderRecord {
   parentId: number | null;
   name: string;
   status: string;
+  hasChildren: boolean;
 }
 
 export interface MediaRecord {

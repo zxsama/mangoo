@@ -536,13 +536,13 @@ if (
   fail("Folder cover probes must be bounded and abortable so they cannot starve visible media windows");
 }
 if (
-  !/export function useFolderCovers\(\s*folders:\s*FolderRecord\[\],\s*options:\s*\{\s*disabled\?:\s*boolean\s*\}\s*=\s*\{\}\s*\)/.test(
+  !/export function useFolderCovers\(\s*folders:\s*FolderRecord\[\],\s*options:\s*\{\s*disabled\?:\s*boolean;\s*activeScan\?:\s*boolean\s*\}\s*=\s*\{\}\s*\)/.test(
     read("apps/web/src/features/library/useFolderCovers.ts")
   ) ||
   !/if\s*\(\s*disabled\s*\)\s*\{[\s\S]*?abortAllControllers\(inFlightControllersByFolderId\.current\)/.test(
     read("apps/web/src/features/library/useFolderCovers.ts")
   ) ||
-  !/useFolderCovers\(folderCoverPriorityFolders,\s*\{\s*disabled:\s*library\.loading\s*\}\)/.test(
+  !/useFolderCovers\(folderCoverPriorityFolders,\s*\{\s*disabled:\s*library\.loading,\s*activeScan:\s*library\.scanActive\s*\}\)/.test(
     libraryView
   )
 ) {

@@ -237,12 +237,15 @@ function FolderNode({
   const children = library.folderChildrenByParent[folder.id] ?? [];
   const selected = library.selectedFolderId === folder.id;
   const loading = library.loadingFolderIds.has(folder.id);
-  // Hide the expand chevron for folders we KNOW have no subfolders (their
-  // children have been loaded and the list is empty). Until a folder's children
-  // are loaded we can't tell, so the chevron shows (clicking it loads them and
-  // then hides it if empty). A folder currently loading keeps the chevron.
+  // Hide the expand chevron for folders with no subfolders. Core reports
+  // `hasChildren` on every folder row, so a childless folder renders a leaf
+  // marker up front — no chevron that flashes in and then vanishes once an
+  // empty child page loads. The "loaded and empty" clause is a fallback that
+  // also collapses the affordance if a stale `hasChildren: true` turns out empty
+  // after loading. A folder still loading keeps the chevron.
   const knownChildless =
-    library.folderChildrenByParent[folder.id] !== undefined && children.length === 0 && !loading;
+    !folder.hasChildren ||
+    (library.folderChildrenByParent[folder.id] !== undefined && children.length === 0 && !loading);
 
   return (
     <div className="tree-branch">

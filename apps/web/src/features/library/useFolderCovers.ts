@@ -5,13 +5,15 @@ import { createCoreClient } from "../../core/client";
 const FOLDER_COVER_FETCH_LIMIT = 96;
 const FOLDER_COVER_CONCURRENT_FETCH_LIMIT = 8;
 const FOLDER_COVER_MEDIA_LIMIT = 1;
+const FOLDER_COVER_EMPTY_RETRY_MS = 3000;
 
 export function useFolderCovers(
   folders: FolderRecord[],
-  options: { disabled?: boolean } = {}
+  options: { disabled?: boolean; activeScan?: boolean } = {}
 ): Map<number, MediaRecord[]> {
   const client = useMemo(() => createCoreClient(), []);
   const disabled = options.disabled ?? false;
+  const activeScan = options.activeScan ?? false;
   const [coversByFolderId, setCoversByFolderId] = useState<Map<number, MediaRecord[]>>(() => new Map());
   const inFlightFolderIds = useRef<Set<number>>(new Set());
   const inFlightControllersByFolderId = useRef<Map<number, AbortController>>(new Map());
@@ -109,6 +111,35 @@ export function useFolderCovers(
         });
     }
   }, [client, coversByFolderId, disabled, folders, requestVersion]);
+
+  // A folder's cover is fetched once and cached — including an EMPTY result. But
+  // with the structure-first scan the folder tree is committed before its media
+  // is indexed, so a cover fetched early returns [] and, cached permanently,
+  // never picks up the images indexed moments later (the folder preview then
+  // "never refreshes"). While a scan is active, periodically drop cached-empty
+  // entries so they re-fetch and reveal covers as media lands. Once the scan is
+  // idle an empty result is final, so this stops and genuinely-empty folders are
+  // not re-polled.
+  useEffect(() => {
+    if (disabled || !activeScan) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setCoversByFolderId((current) => {
+        let next: Map<number, MediaRecord[]> | null = null;
+        for (const [folderId, media] of current) {
+          if (media.length === 0) {
+            if (!next) {
+              next = new Map(current);
+            }
+            next.delete(folderId);
+          }
+        }
+        return next ?? current;
+      });
+    }, FOLDER_COVER_EMPTY_RETRY_MS);
+    return () => window.clearInterval(timer);
+  }, [activeScan, disabled]);
 
   return coversByFolderId;
 }
