@@ -1580,23 +1580,21 @@ export function useLibraryData(
       setExpandedFolderIds((current) => new Set(current).add(resolvedFolderId));
     }
 
-    await loadTasks();
-    if (!isCurrentScanRefreshSelection(selectionToken)) {
-      return;
-    }
-
     if (selectionToken.folderId !== null || resolvedFolderId !== null) {
       const folderId = selectionToken.folderId ?? resolvedFolderId;
       if (folderId === null) {
         return;
       }
-      // Force a re-fetch during the scan: loadFolderChildren short-circuits on
-      // its cache, so once the sidebar cached the few sibling folders indexed
-      // early in the scan it would never pick up the rest as they are scanned
-      // in (a deep folder tree indexes its first child's contents fully before
-      // the next sibling appears). Re-fetching the expanded folder's children
-      // each refresh surfaces newly-scanned siblings; React reconciles by key so
-      // already-shown folders do not flicker.
+      // Refresh the folder tree FIRST, before tasks and media. The tree does not
+      // depend on tasks; awaiting loadTasks() first (GET /api/tasks can be slow
+      // with a large task table mid-scan) made the sidebar structure wait a full
+      // refresh cycle to update. Prioritize directory structure.
+      //
+      // Force a re-fetch: loadFolderChildren short-circuits on its cache, so once
+      // the sidebar cached the few sibling folders indexed early in the scan it
+      // would never pick up the rest as they are scanned in (a deep folder tree
+      // indexes its first child's contents fully before the next sibling appears).
+      // React reconciles by key so already-shown folders do not flicker.
       await loadFolderChildren(folderId, { force: true });
       if (!isCurrentScanRefreshSelection(selectionToken)) {
         return;
@@ -1604,6 +1602,9 @@ export function useLibraryData(
       if (root?.rootFolderId && root.rootFolderId !== folderId) {
         await loadFolderChildren(root.rootFolderId, { force: true });
       }
+      // Tasks/scan progress are not needed for the tree; refresh them after the
+      // structure is on screen (fire without blocking the media reload below).
+      void loadTasks();
       await reloadCurrentMedia({
         rootId: selectionToken.rootId,
         folderId: selectionToken.folderId ?? resolvedFolderId,
@@ -1613,6 +1614,7 @@ export function useLibraryData(
       return;
     }
 
+    void loadTasks();
     await reloadCurrentMedia({
       rootId: selectionToken.rootId,
       folderId: null,
@@ -1638,7 +1640,6 @@ export function useLibraryData(
     setError(null);
     try {
       const result = await loadRoots(scope);
-      await loadTasks();
       const root =
         result.roots.find((item) => item.id === selectedRootIdRef.current) ?? result.selectedRoot;
       const folderId =
@@ -1647,6 +1648,9 @@ export function useLibraryData(
           : result.selectedFolderId ?? root?.rootFolderId ?? null;
       const includeDescendants = showChildFolderContentsRef.current;
 
+      // Load the folder tree structure BEFORE tasks so the sidebar appears
+      // immediately; tasks (scan progress) are not needed to render it and
+      // GET /api/tasks can be slow mid-scan.
       if (folderId) {
         setExpandedFolderIds((current) => new Set(current).add(folderId));
         await loadFolderChildren(folderId);
@@ -1655,6 +1659,7 @@ export function useLibraryData(
         setFolderDescendantsByParent({});
         setFolderChildNextCursorByParent({});
       }
+      void loadTasks();
 
       if (root) {
         const folderFilter = folderId !== null && folderId !== undefined ? folderId : undefined;

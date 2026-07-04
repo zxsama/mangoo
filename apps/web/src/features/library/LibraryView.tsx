@@ -128,8 +128,17 @@ export function LibraryCenterPane({
   const childFoldersLoading = currentFolderId
     ? library.loadingFolderIds.has(currentFolderId)
     : false;
+  // "Loaded at least once" — folderChildrenByParent[id] is set (possibly to [])
+  // after the first successful load. During a scan the background refresh
+  // re-fetches children with `force`, which toggles loadingFolderIds on/off
+  // every ~800ms; showing the strip merely because a (repeating) load is in
+  // flight made an EMPTY folder's strip flicker in and out. So only let the
+  // loading flag reveal the strip on the FIRST load — once we know the folder's
+  // children, its emptiness is stable across background re-fetches.
+  const childFoldersLoadedOnce =
+    currentFolderId != null && library.folderChildrenByParent[currentFolderId] !== undefined;
   const showSubfolderStrip =
-    visibleSubfolderEntries.length > 0 || childFoldersLoading;
+    visibleSubfolderEntries.length > 0 || (childFoldersLoading && !childFoldersLoadedOnce);
   const folderCoverPriorityFolders = useMemo(() => {
     const indexes = folderCoverPriorityIndexes;
     const seen = new Set<number>();

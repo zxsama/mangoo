@@ -840,11 +840,11 @@ if (
   fail("useLibraryData must reload current folder media while scanning");
 }
 if (
-  !/refreshCurrentScanView\s*=\s*useCallback[\s\S]*?await\s+loadTasks\(\)[\s\S]*?(?:selectedFolderId|selectionToken\.folderId|resolvedFolderId|folderId)[\s\S]*?loadFolderChildren\((?:selectedFolderId|selectionToken\.folderId|selectionToken\.folderId\s*\?\?\s*resolvedFolderId|folderId)\)[\s\S]*?reloadCurrentMedia\(\{[\s\S]*?folderId:\s*(?:selectedFolderId|selectionToken\.folderId|selectionToken\.folderId\s*\?\?\s*resolvedFolderId|folderId)/.test(
+  !/refreshCurrentScanView\s*=\s*useCallback[\s\S]*?loadFolderChildren\((?:selectedFolderId|selectionToken\.folderId|selectionToken\.folderId\s*\?\?\s*resolvedFolderId|folderId),\s*\{\s*force:\s*true\s*\}\)[\s\S]*?reloadCurrentMedia\(\{[\s\S]*?folderId:\s*(?:selectedFolderId|selectionToken\.folderId|selectionToken\.folderId\s*\?\?\s*resolvedFolderId|folderId)[\s\S]*?incremental:\s*true/.test(
     useLibraryData
   )
 ) {
-  fail("useLibraryData must incrementally refresh current folder media and children during scan");
+  fail("useLibraryData must incrementally refresh current folder media and force-refresh children during scan");
 }
 if (!refreshCurrentScanViewBlock) {
   fail("useLibraryData must keep refreshCurrentScanView as an inspectable useCallback");
