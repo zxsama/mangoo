@@ -1112,3 +1112,13 @@ Real-window verified against the Billfish library (fresh DB, active scan, CDP):
 15. **Rapid-ops selection/expansion snap-back — NOT reproduced** after the P3 fix (commit `04f07a5`). `expandedFolderIds` is only `add`-ed during folder clicks (guarded by refresh-selection tokens + request aborts); three aggressive real-window bursts during an active scan produced 0 unforced reverts. Awaiting a repro/recording from the user. One latent bug noted (scan-refresh `force:true` discards >500-child "Load more" pages) but it is not the 299-folder library's trigger, so left unfixed pending repro.
 
 `npm test` green (all 8 gates, 254 rust incl. new `has_children` test).
+
+### Phase 9 addendum 5 — main-dir deep/jump-scroll freeze (`48cb312`)
+
+Real-window verified (warm 652k DB, root aggregated view, CDP):
+
+16. **Infinite render loop from subfolder-children effects.** The LibraryView probe + load-more effects depend on the state their loads mutate, so every load re-triggered them → React update-depth cap → tree froze. Fix: request-dedup refs make effect re-runs idempotent. A render-diff instrument proved it (one folder switch → ~60 renders, `loadingFolderIds` changed 57×). Verified: was firing every folder switch → 1 residual over a full scroll test.
+
+17. **Renderer freeze from the O(totalCount) justified layout.** `buildAdaptiveLayout`/`buildWaterfallLayout` allocate a placement+segment per item over the *whole* folder total, and the layout rebuilds on every `mediaSlots`/`estimatedRatio` change while scrolling — hundreds of thousands of objects per scroll step at 652k, freezing the event loop (a renderer fetch took 30s while curl was 0.1s). Fix: above `JUSTIFIED_FULL_TOTAL_MAX_ITEMS` (20000), justified/masonry folders render through the existing uniform windowed grid (O(viewport)). Verified: renderer 30s-frozen → 3ms-responsive; media wall (20.5M px) renders real tiles; post-jump recovery 1.7–5.9s.
+
+`npm test` green (all 8 gates, 254 rust). `check:web` + `check:ui` guards updated for cap-based windowing.
