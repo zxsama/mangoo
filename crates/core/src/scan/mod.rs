@@ -144,6 +144,103 @@ pub fn scan_root_with_options(
     emit_progress(&mut options, items_seen, &summary);
     check_scan_cancelled(&mut options)?;
 
+    // Structure-first pass: commit the whole folder tree up front (batched),
+    // BREADTH-FIRST, before indexing any files. This makes the directory tree —
+    // especially the top-level folders the user first sees — materialize in the
+    // sidebar within seconds. WalkDir is depth-first, so it (and even a
+    // dir-only WalkDir) commits one top-level folder's entire deep subtree before
+    // the next sibling — the sidebar filled in ~1 folder/second (minutes for a
+    // 300-folder root). A manual BFS queue commits every folder at depth N before
+    // descending to N+1, so all 300 top-level folders appear almost immediately.
+    // Folder upserts are idempotent, so the main pass below reuses these ids.
+    {
+        let mut pending_folders: Vec<(PathBuf, FolderUpsert)> = Vec::new();
+        let folder_batch_size = write_batch_size.max(256);
+        // Queue of directories to enumerate, in breadth-first order. The root's
+        // children are enumerated first, then their children, and so on.
+        let mut queue: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
+        queue.push_back(root_path.clone());
+        while let Some(dir) = queue.pop_front() {
+            check_scan_cancelled(&mut options)?;
+            let read_dir = match std::fs::read_dir(&dir) {
+                Ok(read_dir) => read_dir,
+                Err(error) => {
+                    tracing::warn!(%error, path = %dir.display(), "scan could not read directory during structure pass");
+                    continue;
+                }
+            };
+            let mut child_dirs: Vec<PathBuf> = Vec::new();
+            for entry in read_dir {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue,
+                };
+                if file_type.is_dir() {
+                    child_dirs.push(entry.path());
+                }
+            }
+            // Stable order so the sidebar list is deterministic.
+            child_dirs.sort();
+            for path in child_dirs {
+                // The parent (`dir`) is committed before its children are
+                // enqueued: flush the buffer if the parent id is not resolved yet.
+                if parent_folder_id(&path, &folder_ids).is_err() {
+                    flush_scan_folders(
+                        database,
+                        root.id,
+                        Some(scan_generation),
+                        &mut options,
+                        &mut pending_folders,
+                        &mut folder_ids,
+                        &mut summary,
+                        &mut items_seen,
+                    )?;
+                }
+                let parent_id = parent_folder_id(&path, &folder_ids)?;
+                let metadata = std::fs::metadata(&path).ok();
+                pending_folders.push((
+                    path.clone(),
+                    FolderUpsert {
+                        root_id: root.id,
+                        parent_id: Some(parent_id),
+                        name: file_name(&path),
+                        path_hash: hash_path(&path),
+                        mtime: metadata_time(metadata.as_ref(), TimeField::Modified),
+                    },
+                ));
+                queue.push_back(path);
+                if pending_folders.len() >= folder_batch_size {
+                    flush_scan_folders(
+                        database,
+                        root.id,
+                        Some(scan_generation),
+                        &mut options,
+                        &mut pending_folders,
+                        &mut folder_ids,
+                        &mut summary,
+                        &mut items_seen,
+                    )?;
+                }
+            }
+            // Flush at the end of each directory level's children so a folder's
+            // ids are committed before we descend into it on the next iteration.
+            flush_scan_folders(
+                database,
+                root.id,
+                Some(scan_generation),
+                &mut options,
+                &mut pending_folders,
+                &mut folder_ids,
+                &mut summary,
+                &mut items_seen,
+            )?;
+        }
+    }
+
     for entry in WalkDir::new(&root_path).min_depth(1) {
         check_scan_cancelled(&mut options)?;
         let entry = entry?;
@@ -152,26 +249,31 @@ pub fn scan_root_with_options(
         items_seen += 1;
 
         if metadata.is_dir() {
-            let parent_id = parent_folder_id(path, &folder_ids)?;
-            let batch = ScanWriteBatch {
-                folders: vec![FolderUpsert {
-                    root_id: root.id,
-                    parent_id: Some(parent_id),
-                    name: file_name(path),
-                    path_hash: hash_path(path),
-                    mtime: metadata_time(Some(&metadata), TimeField::Modified),
-                }],
-                files: Vec::new(),
-                scan_generation: Some(scan_generation),
-            };
-            observe_scan_batch(&options, batch.folders.len(), batch.files.len());
-            check_scan_cancelled(&mut options)?;
-            ensure_root_enabled(database, root.id)?;
-            let result = commit_scan_batch_with_optional_task_guard(database, batch, &options)?;
-            let folder_id = result.folder_ids[0];
-            folder_ids.insert(path.to_path_buf(), folder_id);
-            summary.folders_seen += 1;
-            emit_progress(&mut options, items_seen, &summary);
+            // Already committed in the structure-first pass; just ensure it is
+            // known (defensive — a folder created between passes falls through
+            // to a single-folder commit).
+            if !folder_ids.contains_key(path) {
+                let parent_id = parent_folder_id(path, &folder_ids)?;
+                let batch = ScanWriteBatch {
+                    folders: vec![FolderUpsert {
+                        root_id: root.id,
+                        parent_id: Some(parent_id),
+                        name: file_name(path),
+                        path_hash: hash_path(path),
+                        mtime: metadata_time(Some(&metadata), TimeField::Modified),
+                    }],
+                    files: Vec::new(),
+                    scan_generation: Some(scan_generation),
+                };
+                observe_scan_batch(&options, batch.folders.len(), batch.files.len());
+                check_scan_cancelled(&mut options)?;
+                ensure_root_enabled(database, root.id)?;
+                let result = commit_scan_batch_with_optional_task_guard(database, batch, &options)?;
+                let folder_id = result.folder_ids[0];
+                folder_ids.insert(path.to_path_buf(), folder_id);
+                summary.folders_seen += 1;
+                emit_progress(&mut options, items_seen, &summary);
+            }
             check_scan_cancelled(&mut options)?;
             continue;
         }
@@ -373,6 +475,47 @@ fn commit_scan_batch_with_optional_task_guard(
         );
     }
     database.commit_scan_batch(batch)
+}
+
+/// Commit a batch of folder rows (the structure-first pass) in one transaction
+/// and record their assigned ids by path so descendant folders/files resolve
+/// their parent. `commit_scan_batch` returns folder ids in the same order as the
+/// input folders, so we zip the buffered paths back to the returned ids.
+#[allow(clippy::too_many_arguments)]
+fn flush_scan_folders(
+    database: &mut Database,
+    root_id: i64,
+    scan_generation: Option<i64>,
+    options: &mut ScanOptions<'_>,
+    pending_folders: &mut Vec<(PathBuf, FolderUpsert)>,
+    folder_ids: &mut HashMap<PathBuf, i64>,
+    summary: &mut ScanSummary,
+    items_seen: &mut i64,
+) -> anyhow::Result<()> {
+    if pending_folders.is_empty() {
+        return Ok(());
+    }
+    let drained: Vec<(PathBuf, FolderUpsert)> = std::mem::take(pending_folders);
+    let (paths, folders): (Vec<PathBuf>, Vec<FolderUpsert>) = drained.into_iter().unzip();
+    let batch = ScanWriteBatch {
+        folders,
+        files: Vec::new(),
+        scan_generation,
+    };
+    observe_scan_batch(options, batch.folders.len(), 0);
+    check_scan_cancelled(options)?;
+    ensure_root_enabled(database, root_id)?;
+    let result = commit_scan_batch_with_optional_task_guard(database, batch, options)?;
+    for (path, folder_id) in paths.into_iter().zip(result.folder_ids.into_iter()) {
+        folder_ids.insert(path, folder_id);
+        summary.folders_seen += 1;
+    }
+    // `items_seen` is counted once per walked entry by the main file pass (which
+    // still walks every folder); the structure-first pass must NOT also count
+    // folders here or they would be double-counted.
+    emit_progress(options, *items_seen, summary);
+    check_scan_cancelled(options)?;
+    Ok(())
 }
 
 fn parent_folder_id(path: &Path, folder_ids: &HashMap<PathBuf, i64>) -> anyhow::Result<i64> {
