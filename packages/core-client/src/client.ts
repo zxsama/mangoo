@@ -102,6 +102,17 @@ let activeCoreInteractiveRequests = 0;
 let coreRequestSequence = 0;
 const coreRequestQueue: QueuedCoreRequest[] = [];
 
+// Dev diagnostic: read the live scheduler state (used by the regression suite).
+// Harmless: a local app with no untrusted pages.
+if (typeof window !== "undefined") {
+  (window as unknown as { __megleCoreScheduler: () => unknown }).__megleCoreScheduler = () => ({
+    active: activeCoreRequests,
+    interactive: activeCoreInteractiveRequests,
+    queued: coreRequestQueue.length,
+    max: MAX_CORE_REQUESTS
+  });
+}
+
 export function createCoreClient(config: CoreClientConfig) {
   async function request<T>(path: string, init: ScheduledRequestInit = {}): Promise<T> {
     const { requestPriority = "metadata", ...fetchInit } = init;

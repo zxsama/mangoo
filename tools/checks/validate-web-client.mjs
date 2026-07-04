@@ -1058,10 +1058,16 @@ if (
   fail("mediaResources must drop stale local non-ready thumbnail state once the media row itself is already ready");
 }
 if (
-  !/thumbnailRequestKey\(mediaRecord,\s*priority\)/.test(mediaResources) ||
+  // Coalesce in-flight thumbnail STATE requests by CONTENT identity only, never
+  // priority: the same record polled at visible-then-ahead must share one request
+  // (keying priority in fetched the same thing twice and helped exhaust the
+  // browser connection pool under scroll).
+  !/function thumbnailRequestKey\(mediaRecord: MediaRecord\): string \{[\s\S]*?mediaContentSignature\(mediaRecord\),\s*GRID_THUMBNAIL_TARGET\s*\]\.join/.test(
+    mediaResources
+  ) ||
   !/inFlightThumbnailRequests\.get\(requestKey\)/.test(mediaResources)
 ) {
-  fail("mediaResources must key in-flight thumbnail coalescing by media id plus thumbnail summary");
+  fail("mediaResources must key in-flight thumbnail coalescing by content identity only (media signature + target), not priority");
 }
 if (
   /failedThumbnailState\(mediaRecord\.id,\s*cause\)/.test(useLibraryData) ||

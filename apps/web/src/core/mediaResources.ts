@@ -90,7 +90,7 @@ export async function requestThumbnailState(
   options: ThumbnailStateRequestOptions = {}
 ): Promise<ThumbnailResponse> {
   const mediaId = mediaRecord.id;
-  const requestKey = thumbnailRequestKey(mediaRecord, priority);
+  const requestKey = thumbnailRequestKey(mediaRecord);
   const cached = thumbnailResourceCache.get(mediaId);
   if (cached) {
     if (isFreshCachedThumbnailForMediaRecord(mediaRecord, cached)) {
@@ -144,13 +144,13 @@ export async function requestThumbnailBlob(
   const resourcePriority = options.resourcePriority ?? "visible";
   const coreRequestPriority =
     options.requestPriority ?? foregroundResourceCoreRequestPriority(resourcePriority);
-  const requestKey = [
-    fileId,
-    GRID_THUMBNAIL_TARGET,
-    versionKey ?? "current",
-    resourcePriority,
-    coreRequestPriority
-  ].join(":");
+  // Dedup by the blob's CONTENT identity only (file + target + version), NOT the
+  // request priority. The same tile is often requested at "visible" and then
+  // "ahead" (or vice versa) as it scrolls; keying the priority into the dedup key
+  // fetched the SAME blob twice, doubling the request load and pinning the
+  // browser's 6-connection pool under scroll churn. The scheduler still uses the
+  // priority; only the dedup ignores it (the in-flight request's priority wins).
+  const requestKey = [fileId, GRID_THUMBNAIL_TARGET, versionKey ?? "current"].join(":");
   const inFlight = inFlightThumbnailBlobRequests.get(requestKey);
   if (inFlight && !inFlight.controller.signal.aborted) {
     return withSharedAbortSignal(inFlight, options.signal);
@@ -244,9 +244,7 @@ export function requestOriginalPreviewBlob(
   const coreRequestPriority =
     options.requestPriority ?? foregroundResourceCoreRequestPriority(resourcePriority);
   const requestKey = [
-    originalPreviewRequestKey(mediaRecord),
-    resourcePriority,
-    coreRequestPriority
+    originalPreviewRequestKey(mediaRecord)
   ].join(":");
   const inFlight = inFlightOriginalPreviewRequests.get(requestKey);
   if (inFlight && !inFlight.controller.signal.aborted) {
@@ -426,11 +424,11 @@ function normalizeMediaThumbnailState(value: string | null | undefined): Thumbna
   return "pending";
 }
 
-function thumbnailRequestKey(
-  mediaRecord: MediaRecord,
-  priority: ThumbnailRequestPriority
-): string {
-  return [mediaContentSignature(mediaRecord), GRID_THUMBNAIL_TARGET, priority].join(":");
+function thumbnailRequestKey(mediaRecord: MediaRecord): string {
+  // Dedup by content identity only, not priority (see requestThumbnailBlob): the
+  // same record polled at "visible" then "ahead" must share one in-flight state
+  // request, not fire two.
+  return [mediaContentSignature(mediaRecord), GRID_THUMBNAIL_TARGET].join(":");
 }
 
 function thumbnailStateSchedulerPriority(
