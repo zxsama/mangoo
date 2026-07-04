@@ -389,16 +389,18 @@ async function discoverFoldersWithMedia(rootId: number, rootFolderId: number, de
   return result;
 }
 
-async function verifyThumbnailBlob(fileId: number, thumb: ThumbnailResponse): Promise<void> {
+async function verifyThumbnailBlob(fileId: number, thumb: ThumbnailResponse): Promise<number> {
   if (thumb.fileId !== fileId) {
     throw new Error(`thumbnail response fileId=${thumb.fileId} did not match requested id=${fileId}`);
   }
   if (thumb.target !== "grid_320") {
     throw new Error(`ready thumbnail ${fileId} returned unexpected target: ${thumb.target}`);
   }
+  const t0 = performance.now();
   const response = await fetchResponse(`/media/${fileId}/thumbnail/blob?target=grid_320`);
-  const contentType = response.headers.get("content-type");
   const bytes = new Uint8Array(await response.arrayBuffer());
+  const elapsed = performance.now() - t0;
+  const contentType = response.headers.get("content-type");
   if (contentType !== "image/webp") {
     throw new Error(`thumbnail blob ${fileId} content-type=${contentType ?? "null"}`);
   }
@@ -410,16 +412,31 @@ async function verifyThumbnailBlob(fileId: number, thumb: ThumbnailResponse): Pr
   if (magic !== "RIFF" || subtype !== "WEBP") {
     throw new Error(`thumbnail ${fileId} has invalid header: ${magic}/${subtype} (${bytes.length} bytes)`);
   }
+  return elapsed;
 }
 
 // ---------------------------------------------------------------------------
 // Operation executors. Each returns elapsed ms for the single call it makes.
 // ---------------------------------------------------------------------------
 
+// Mirrors the UI's windowed keyset pagination: remembers the cursor that
+// fetches the page after each loaded window, so sequential deep scroll pages by
+// cursor (O(1)) instead of OFFSET (O(offset)). A scroll to an offset with no
+// recorded cursor (a random jump) falls back to OFFSET, exactly as the UI does.
+const scrollCursorByStartIndex = new Map<number, string>();
+
 async function opScroll(rootId: number, offset: number, limit: number): Promise<number> {
+  const cursor = scrollCursorByStartIndex.get(offset);
+  const query = cursor
+    ? `/media?rootId=${rootId}&limit=${limit}&sort=mtime_desc&cursor=${encodeURIComponent(cursor)}`
+    : `/media?rootId=${rootId}&limit=${limit}&offset=${offset}&sort=mtime_desc`;
   const t0 = performance.now();
-  await fetchJson(`/media?rootId=${rootId}&limit=${limit}&offset=${offset}&sort=mtime_desc`);
-  return performance.now() - t0;
+  const page = await fetchJson<Page<MediaRecord> & { nextCursor: string | null }>(query);
+  const elapsed = performance.now() - t0;
+  if (page.nextCursor) {
+    scrollCursorByStartIndex.set(offset + page.items.length, page.nextCursor);
+  }
+  return elapsed;
 }
 
 async function opFolderSwitch(rootId: number, folder: { id: number }): Promise<number> {
@@ -676,8 +693,15 @@ async function main() {
         }
         case "thumbnailBlob": {
           const ids = await idsNearWindow(op.windowStart, WINDOW_LIMIT);
-          // Prefer a ready id from the current window (its blob exists);
-          // fall back to the first id best-effort (may 404, which is fine).
+          // Ensure we have a known-ready id in this window before fetching a
+          // blob: a blob only exists once its thumbnail is ready, so poll the
+          // window's state first (this also populates readyFileIds) and target a
+          // ready id. This mirrors the UI, which only fetches a blob for a tile
+          // whose state is ready, and guarantees the blob op is actually
+          // measured in steady state instead of silently 404ing.
+          if (!ids.some((id) => readyFileIds.has(id))) {
+            await opThumbnailState(ids.slice(0, 8), "visible", readyFileIds);
+          }
           const targetId = ids.find((id) => readyFileIds.has(id)) ?? ids[0];
           if (targetId !== undefined) {
             const elapsed = await opThumbnailBlob(targetId);
@@ -734,7 +758,12 @@ async function main() {
 
       for (const thumbnail of terminalStates) {
         if (thumbnail.state === "ready") {
-          await verifyThumbnailBlob(thumbnail.fileId, thumbnail);
+          // Records real blob-fetch latency for a known-ready thumbnail: the
+          // in-loop thumbnailBlob op can legitimately find no ready id while
+          // generation is still in flight, so the settle pass (all ids ready)
+          // is where the blob-serve latency budget is reliably sampled.
+          const elapsed = await verifyThumbnailBlob(thumbnail.fileId, thumbnail);
+          record("thumbnailBlob", elapsed);
         }
       }
     }
