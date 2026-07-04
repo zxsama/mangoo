@@ -790,10 +790,16 @@ async fn get_thumbnail(
     }
 
     let (thumbnail, blob, queued_task) = {
-        // This on-demand promotion is a latency-sensitive interactive write;
-        // mark it so background blob workers yield the WAL writer to it.
+        // On-demand generation request. Run on a dedicated connection (like the
+        // foreground-promotion path above), NOT the shared write mutex: during a
+        // cold scroll every visible tile issues one of these writes, and
+        // serializing them all through the single Rust `state.database` mutex made
+        // them pile up for seconds under a scan + bulk-generation write storm,
+        // pinning the web client's request slots so the grid froze. A dedicated
+        // connection lets them proceed concurrently (serialized only by the WAL
+        // writer, which background blob workers yield via the interactive gate).
         let _interactive = crate::write_gate::interactive_write_gate().begin_interactive_write();
-        run_shared_database(state.clone(), move |database| {
+        run_dedicated_or_shared_database(state.clone(), move |database| {
             let thumbnail = database
                 .get_thumbnail(file_id, target)?
                 .ok_or_else(|| CoreError::not_found(format!("media item not found: {file_id}")))?;
@@ -902,7 +908,15 @@ async fn enqueue_thumbnail_cache(
     };
     let file_ids = body.file_ids.unwrap_or_default();
     let limit = body.limit.unwrap_or(256).clamp(1, 4096);
-    let (response, wakeup) = run_shared_database(state.clone(), move |database| {
+    // Run on a dedicated connection, NOT the shared write mutex. This bulk enqueue
+    // inserts up to `limit` (256-4096) task rows in one transaction; on the shared
+    // mutex that long hold blocked the per-scroll priority-scope write queued right
+    // behind it, and since both are client-"interactive" the two pinned the web
+    // client's interactive request slots and viewport prioritization stalled on a
+    // cold library. A dedicated connection lets it proceed without head-of-line
+    // blocking the smaller interactive writes (serialized only by the WAL writer,
+    // which the scan and background blob workers yield via the interactive gate).
+    let (response, wakeup) = run_dedicated_or_shared_database(state.clone(), move |database| {
         let result = if file_ids.is_empty() {
             database
                 .enqueue_thumbnail_cache_tasks(scope, refresh_mode, limit)
@@ -1081,10 +1095,13 @@ async fn sync_thumbnail_priority_scope(
     let selected_file_ids = payload.selected_file_ids;
     let visible_file_ids = payload.visible_file_ids;
     let ahead_file_ids = payload.ahead_file_ids;
-    // Mark this scroll write as interactive so background blob workers yield the
-    // WAL writer to it (see write_gate). Held across the shared-DB call.
+    // Mark this scroll write as interactive so the scan and background blob workers
+    // yield the WAL writer to it (see write_gate). Run on a dedicated connection,
+    // NOT the shared write mutex, so a slower API write (e.g. the bulk
+    // thumbnail-cache enqueue) can't head-of-line block this latency-critical
+    // per-scroll prioritization write on the mutex and freeze the viewport.
     let _interactive = crate::write_gate::interactive_write_gate().begin_interactive_write();
-    let promoted_tasks = run_shared_database(state.clone(), move |database| {
+    let promoted_tasks = run_dedicated_or_shared_database(state.clone(), move |database| {
         if database.get_root(root_id)?.is_none() {
             return Err(CoreError::not_found(format!("root not found: {}", root_id)));
         }

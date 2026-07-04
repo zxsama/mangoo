@@ -4007,6 +4007,17 @@ impl Database {
         // Use BEGIN IMMEDIATE rather than the default DEFERRED transaction
         // so the SQLite busy handler is engaged on transaction start; see
         // `commit_scan_batch` for the full rationale.
+        //
+        // This is the batch-commit path taken by the real root-scan *task*
+        // worker (the non-guarded `commit_scan_batch` is only used off the task
+        // path). It loops committing 256-row batches back-to-back; SQLite has no
+        // write-lock fairness, so without yielding, the tight scan loop starves
+        // latency-sensitive interactive writes (scroll priority-scope, on-demand
+        // thumbnail-state promotion) for seconds — measured ~4s begin-lock waits
+        // while browsing a cold library mid-scan. Yield the WAL writer to any
+        // pending interactive write before taking it, exactly like
+        // `commit_scan_batch` and the background blob workers.
+        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         ensure_task_attempt_running_in_transaction(&transaction, task_id, attempt_generation)?;

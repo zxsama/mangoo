@@ -1144,14 +1144,22 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
     // Captured from the decode this task already ran; persisted to media in the
     // publish transaction below so the layout engine gets real aspect ratios.
     let source_dimensions = Some((generated.source_width, generated.source_height));
-    // Background/bulk blob commits are the write-storm source during a
-    // "generate all". Yield the WAL writer to any pending interactive write
-    // (scroll priority-scope, on-demand thumbnail promotion) before taking this
-    // publish transaction, so browsing stays fluid while ingestion runs. Ahead/
-    // visible/selected thumbnails are user-awaited and never yield.
-    if task.priority <= crate::db::THUMBNAIL_BACKGROUND_PRIORITY {
-        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
-    }
+    // Blob commits are the write-storm source during generation. Yield the WAL
+    // writer to any pending interactive write (scroll priority-scope, on-demand
+    // thumbnail-state enqueue) before taking this publish transaction, so browsing
+    // stays fluid while ingestion runs.
+    //
+    // This now yields for ALL priorities, not just background/bulk. On a cold
+    // library the visible viewport promotes its thumbnails to foreground, so up to
+    // 12 *foreground* blob commits run concurrently — and while they held the
+    // writer without yielding, they starved the very priority-scope / on-demand
+    // thumbnail-state writes that drive that same viewport. The result was the
+    // client's request slots pinning and subfolder covers never loading on a
+    // rapid folder switch (measured: scheduler pinned at the cap for 18s+). The
+    // yield is bounded (~30ms) and only fires while an interactive write is
+    // actually pending, so briefly deferring a foreground blob commit to let a
+    // viewport write land is a net win for perceived responsiveness.
+    crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
     let blob = ThumbBlobRecord {
         file_id,
         profile: GRID_320_PROFILE.to_string(),

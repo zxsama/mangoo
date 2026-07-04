@@ -511,7 +511,13 @@ for (const name of [
   }
 }
 for (const name of ["get_thumbnail", "enqueue_interactive_folder_scan", "sync_thumbnail_priority_scope"]) {
-  if (!functionBody(name).includes("run_shared_database")) {
+  const body = functionBody(name);
+  // Either offload helper is acceptable: both run on tokio::spawn_blocking so the
+  // async handler thread is never blocked on synchronous SQLite work. The
+  // high-frequency browse writes (get_thumbnail on-demand enqueue,
+  // sync_thumbnail_priority_scope) use the dedicated-connection variant to avoid
+  // head-of-line blocking on the single shared write mutex under scan load.
+  if (!body.includes("run_shared_database") && !body.includes("run_dedicated_or_shared_database")) {
     fail(`${name} route must offload shared database writes from the async handler`);
   }
 }
@@ -521,7 +527,12 @@ for (const name of ["get_thumbnail_cache_stats"]) {
   }
 }
 for (const name of ["enqueue_thumbnail_cache", "clear_thumbnail_cache"]) {
-  if (!functionBody(name).includes("run_shared_database")) {
+  const body = functionBody(name);
+  // Either offload helper is acceptable (both use spawn_blocking).
+  // enqueue_thumbnail_cache uses the dedicated-connection variant so its bulk
+  // 256-4096-row task insert can't head-of-line block the per-scroll
+  // priority-scope write on the shared write mutex.
+  if (!body.includes("run_shared_database") && !body.includes("run_dedicated_or_shared_database")) {
     fail(`${name} route must offload shared database writes from the async handler`);
   }
 }
