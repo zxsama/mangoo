@@ -237,6 +237,12 @@ function FolderNode({
   const children = library.folderChildrenByParent[folder.id] ?? [];
   const selected = library.selectedFolderId === folder.id;
   const loading = library.loadingFolderIds.has(folder.id);
+  // Hide the expand chevron for folders we KNOW have no subfolders (their
+  // children have been loaded and the list is empty). Until a folder's children
+  // are loaded we can't tell, so the chevron shows (clicking it loads them and
+  // then hides it if empty). A folder currently loading keeps the chevron.
+  const knownChildless =
+    library.folderChildrenByParent[folder.id] !== undefined && children.length === 0 && !loading;
 
   return (
     <div className="tree-branch">
@@ -260,14 +266,18 @@ function FolderNode({
         }}
         style={{ "--tree-depth": String(depth) } as CSSProperties}
       >
-        <button
-          className="tree-disclosure"
-          onClick={() => library.toggleFolderExpanded(folder.id)}
-          type="button"
-          aria-label={expanded ? "Collapse folder" : "Expand folder"}
-        >
-          {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-        </button>
+        {knownChildless ? (
+          <span className="tree-disclosure tree-disclosure--leaf" aria-hidden="true" />
+        ) : (
+          <button
+            className="tree-disclosure"
+            onClick={() => library.toggleFolderExpanded(folder.id)}
+            type="button"
+            aria-label={expanded ? "Collapse folder" : "Expand folder"}
+          >
+            {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+          </button>
+        )}
         <button
           className="tree-label"
           onClick={() => library.setSelectedFolder(folder)}

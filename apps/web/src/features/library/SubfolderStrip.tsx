@@ -303,7 +303,13 @@ function FolderCoverPreview({
         objectUrlRef.current = null;
       }
     };
-  }, [cacheKey, coverMediaItem, retryTick]);
+    // Keyed on `cacheKey` (folder-cover content identity), NOT the `coverMediaItem`
+    // object: useFolderCovers hands back a fresh array/object on each viewport
+    // re-prioritization, so depending on the object identity re-ran this effect
+    // and re-fetched the cover on every scroll — the cover flashed its background
+    // and reloaded. cacheKey stays constant while the cover's content is the same.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cacheKey, retryTick]);
 
   if (!src || failed) {
     const coverStatus = failed ? "failed" : coverMediaItem ? "loading" : coverLoaded ? "empty" : "loading";

@@ -1203,6 +1203,17 @@ export function useLibraryData(
     return { roots: response.items, selectedRoot: nextRoot ?? null, selectedFolderId: nextFolderId };
   }, [client, initializeFolderNavigationHistory]);
 
+  // Refresh only the roots LIST (for status / lastScanAt display), WITHOUT
+  // re-driving selection or navigation history. The 800ms scan refresh used the
+  // full `loadRoots`, which re-applied a selection captured from a stale
+  // refresh token — if the user clicked a different folder mid-refresh, the
+  // in-flight refresh snapped the selection/expansion back to the old folder.
+  const refreshRootsList = useCallback(async () => {
+    const response = await client.listRoots();
+    setRoots(response.items);
+    return response.items;
+  }, [client]);
+
   const loadTasks = useCallback(async () => {
     if (loadTasksRequestRef.current) {
       return loadTasksRequestRef.current;
@@ -1567,17 +1578,21 @@ export function useLibraryData(
       return;
     }
 
-    const rootsScope =
-      selectionToken.folderId === null
-        ? { rootId: selectionToken.rootId }
-        : { rootId: selectionToken.rootId, folderId: selectionToken.folderId };
-    const rootsResult = await loadRoots(rootsScope);
-    const root =
-      rootsResult.roots.find((item) => item.id === selectionToken.rootId) ?? rootsResult.selectedRoot;
-    const resolvedFolderId =
-      selectionToken.folderId ?? root?.rootFolderId ?? rootsResult.selectedFolderId ?? null;
-    if (resolvedFolderId !== null) {
-      setExpandedFolderIds((current) => new Set(current).add(resolvedFolderId));
+    // Refresh only the roots LIST (status/lastScanAt) — do NOT re-select, or a
+    // refresh that started before a folder click would snap the selection and
+    // tree expansion back to the previously-selected folder.
+    const refreshedRoots = await refreshRootsList();
+    if (!isCurrentScanRefreshSelection(selectionToken)) {
+      return;
+    }
+    const root = refreshedRoots.find((item) => item.id === selectionToken.rootId) ?? null;
+    const resolvedFolderId = selectionToken.folderId ?? root?.rootFolderId ?? null;
+    // Only ensure the currently-selected folder stays expanded; never re-drive
+    // selection here.
+    if (resolvedFolderId !== null && selectionToken.folderId !== null) {
+      setExpandedFolderIds((current) =>
+        current.has(resolvedFolderId) ? current : new Set(current).add(resolvedFolderId)
+      );
     }
 
     if (selectionToken.folderId !== null || resolvedFolderId !== null) {
@@ -1625,7 +1640,7 @@ export function useLibraryData(
     createScanRefreshSelectionToken,
     isCurrentScanRefreshSelection,
     loadFolderChildren,
-    loadRoots,
+    refreshRootsList,
     loadTasks,
     reloadCurrentMedia
   ]);
