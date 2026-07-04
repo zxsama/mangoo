@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 
     let web_dir = resolve_web_dir();
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let listener = bind_with_retry(bind_addr).await?;
     axum::serve(
         listener,
         api::router_with_config(
@@ -97,6 +97,37 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// Bind the API listener, retrying briefly on transient "address in use"
+/// failures. The desktop shell allocates a free loopback port by opening and
+/// immediately closing a probe socket, then hands that port to Core; on Windows
+/// the just-closed socket can linger in TIME_WAIT so Core's first bind races and
+/// fails, which used to crash Core (exit 1) and force the desktop to retry the
+/// whole Core-start on a fresh port — a multi-second, user-visible startup
+/// stall. Retrying the bind here absorbs that race at the source.
+async fn bind_with_retry(bind_addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    const MAX_ATTEMPTS: usize = 20;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut last_error = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                tracing::warn!(
+                    %bind_addr,
+                    attempt,
+                    "port not yet free (likely TIME_WAIT after the desktop port probe); retrying bind"
+                );
+                last_error = Some(error);
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("failed to bind {bind_addr}")))
 }
 
 /// Resolve the directory holding the built web UI when static-serve mode is

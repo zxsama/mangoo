@@ -2232,7 +2232,15 @@ function ReadyThumbnail({
         objectUrlRef.current = null;
       }
     };
-  }, [cacheKey, fileId, requestPriority, resourcePriority, retryToken, thumbnailUpdatedAt]);
+    // Deliberately NOT keyed on `thumbnailUpdatedAt` or `resourcePriority`: the
+    // blob is identified by content identity (`cacheKey` = id:mtime:size), so a
+    // live thumbnail-state update (updatedAt null -> timestamp) or a viewport
+    // priority shift (visible <-> ahead <-> selected) must NOT re-fetch and
+    // re-swap the object URL — that made a loaded tile flash its background and
+    // reload 1-2x as its state settled during a scan. A genuine content change
+    // bumps mtime/size -> cacheKey, which re-runs this effect correctly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cacheKey, fileId, retryToken]);
 
   if (error && !src) {
     return (
