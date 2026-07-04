@@ -10,7 +10,7 @@ export const LIBRARY_LAYOUT_MODES: Array<{
   { value: "list", label: "List" }
 ];
 
-export const DEFAULT_LIBRARY_LAYOUT_MODE: LibraryLayoutMode = "grid";
+export const DEFAULT_LIBRARY_LAYOUT_MODE: LibraryLayoutMode = "adaptive";
 
 export function isLibraryLayoutMode(value: string | null | undefined): value is LibraryLayoutMode {
   return value === "adaptive" || value === "waterfall" || value === "grid" || value === "list";

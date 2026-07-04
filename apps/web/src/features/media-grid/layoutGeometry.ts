@@ -14,7 +14,11 @@ const WATERFALL_BAND_SCALE = 0.9;
 const WATERFALL_MIN_BAND_PX = 120;
 
 export interface LayoutPlacement {
-  item: MediaRecord;
+  // undefined when this slot's media has not been loaded yet: adaptive/waterfall
+  // lay out over the full folder total using a stable estimated aspect ratio for
+  // unloaded slots, so the scroll height is correct immediately and unloaded
+  // positions render a placeholder that fades into the real thumbnail on load.
+  item: MediaRecord | undefined;
   itemIndex: number;
   left: number;
   top: number;
@@ -69,6 +73,14 @@ interface LayoutBuildOptions {
   layoutMode: LibraryLayoutMode;
   viewportWidth: number;
   tileMinWidth: number;
+  // When provided, adaptive/waterfall lay out over the full folder total instead
+  // of only the loaded `items`: slot `index` uses `getItemAt(index)` when loaded
+  // (real aspect ratio) and a stable estimated ratio otherwise. This gives the
+  // correct scroll height + placeholder slots up front and avoids the
+  // reorder-on-load reflow of laying out only the loaded prefix.
+  totalCount?: number;
+  getItemAt?: (index: number) => MediaRecord | undefined;
+  estimatedRatio?: number;
 }
 
 export function buildLayoutGeometry(options: LayoutBuildOptions): LayoutGeometry {
@@ -176,18 +188,25 @@ export function collectScopedMediaInViewport(
     if (!placement) {
       continue;
     }
-    if (options.excludeMediaId === placement.item.id) {
+    const item = placement.item;
+    // Skip placeholder slots (unloaded media in the full-total justified layout):
+    // scoped media is used for thumbnail-state requests, which only apply to
+    // loaded records.
+    if (!item) {
+      continue;
+    }
+    if (options.excludeMediaId === item.id) {
       continue;
     }
     if (!intersectsRange(placement.top, placement.height, rangeStart, rangeEnd)) {
       continue;
     }
-    if (seenMediaIds.has(placement.item.id)) {
+    if (seenMediaIds.has(item.id)) {
       continue;
     }
-    seenMediaIds.add(placement.item.id);
-    ids.push(placement.item.id);
-    signatures.push(mediaContentSignature(placement.item));
+    seenMediaIds.add(item.id);
+    ids.push(item.id);
+    signatures.push(mediaContentSignature(item));
   }
 
   return {
@@ -394,16 +413,25 @@ function buildAdaptiveLayout({
   items,
   labelHeight,
   tileMinWidth,
-  viewportWidth
+  viewportWidth,
+  totalCount,
+  getItemAt,
+  estimatedRatio
 }: Omit<LayoutBuildOptions, "layoutMode">): LayoutGeometry {
   const contentWidth = normalizeViewportWidth(viewportWidth, tileMinWidth);
   const targetRowHeight = Math.max(ADAPTIVE_MIN_ROW_HEIGHT_PX, tileMinWidth * ADAPTIVE_TARGET_ROW_HEIGHT_SCALE);
   const placements: LayoutPlacement[] = [];
   const segments: LayoutSegment[] = [];
-  let rowItems: Array<{ item: MediaRecord; itemIndex: number; ratio: number }> = [];
+  let rowItems: Array<{ item: MediaRecord | undefined; itemIndex: number; ratio: number }> = [];
   let ratioSum = 0;
   let top = 0;
   let rowIndex = 0;
+
+  // Lay out over the full folder total when a getter is supplied; otherwise fall
+  // back to the loaded items (used by callers that do not window).
+  const count = totalCount ?? items.length;
+  const itemAt = getItemAt ?? ((index: number) => items[index]);
+  const fallbackRatio = estimatedRatio && estimatedRatio > 0 ? estimatedRatio : 1;
 
   const flushRow = (justify: boolean) => {
     if (rowItems.length === 0) {
@@ -452,17 +480,21 @@ function buildAdaptiveLayout({
     ratioSum = 0;
   };
 
-  items.forEach((item, itemIndex) => {
-    const ratio = resolveAspectRatio(item);
+  for (let itemIndex = 0; itemIndex < count; itemIndex += 1) {
+    const item = itemAt(itemIndex);
+    // Real ratio when the media is loaded; a stable estimate for unloaded slots
+    // so a later real ratio does not repack the row (the estimate keeps the row
+    // membership stable; only the arriving tile's own width adjusts slightly).
+    const ratio = item ? resolveAspectRatio(item) : fallbackRatio;
     rowItems.push({ item, itemIndex, ratio });
     ratioSum += ratio;
     const projectedWidth = ratioSum * targetRowHeight + gap * Math.max(0, rowItems.length - 1);
     const shouldFlush = projectedWidth >= contentWidth * ADAPTIVE_ROW_FILL_THRESHOLD;
-    const isFinalInputItem = itemIndex === items.length - 1;
+    const isFinalInputItem = itemIndex === count - 1;
     if (shouldFlush && !isFinalInputItem) {
       flushRow(true);
     }
-  });
+  }
 
   if (rowItems.length > 0) {
     flushRow(false);
@@ -486,7 +518,10 @@ function buildWaterfallLayout({
   items,
   labelHeight,
   tileMinWidth,
-  viewportWidth
+  viewportWidth,
+  totalCount,
+  getItemAt,
+  estimatedRatio
 }: Omit<LayoutBuildOptions, "layoutMode">): LayoutGeometry {
   const contentWidth = normalizeViewportWidth(viewportWidth, tileMinWidth);
   const columnCount = resolveColumnCount(contentWidth, tileMinWidth, gap);
@@ -494,8 +529,13 @@ function buildWaterfallLayout({
   const columnHeights = Array.from({ length: columnCount }, () => 0);
   const placements: LayoutPlacement[] = [];
 
-  items.forEach((item, itemIndex) => {
-    const ratio = resolveAspectRatio(item);
+  const count = totalCount ?? items.length;
+  const itemAt = getItemAt ?? ((index: number) => items[index]);
+  const fallbackRatio = estimatedRatio && estimatedRatio > 0 ? estimatedRatio : 1;
+
+  for (let itemIndex = 0; itemIndex < count; itemIndex += 1) {
+    const item = itemAt(itemIndex);
+    const ratio = item ? resolveAspectRatio(item) : fallbackRatio;
     const thumbHeight = Math.max(1, Math.round(tileWidth / ratio));
     const frameHeight = thumbHeight + labelHeight;
     const itemHeight = frameHeight + gap;
@@ -514,7 +554,7 @@ function buildWaterfallLayout({
       thumbHeight
     });
     columnHeights[columnIndex] += itemHeight;
-  });
+  }
 
   const totalSize = Math.max(0, ...columnHeights);
   const bandSize = Math.max(

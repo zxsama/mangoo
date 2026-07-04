@@ -303,20 +303,57 @@ export function MediaGrid({
   }, [savedScrollTop, scrollPositionKey]);
 
   const mediaItemCount = Math.max(items.length, totalCount ?? items.length);
-  const windowedLayoutMode = layoutMode === "grid" || layoutMode === "list";
+  // grid/list use the uniform absolute-index window (buildMediaWindowGeometry).
+  // adaptive/waterfall are justified/masonry: they now also lay out over the
+  // FULL folder total using real ratios for loaded slots and a stable estimate
+  // for unloaded ones, so the scroll height is correct immediately, unloaded
+  // positions hold a placeholder, and real thumbnails fade in without repacking.
+  const uniformWindowLayoutMode = layoutMode === "grid" || layoutMode === "list";
+  const justifiedLayoutMode = layoutMode === "adaptive" || layoutMode === "waterfall";
+  // `windowedMedia` = the uniform absolute-index window path (grid/list). Kept
+  // narrow so the many render/virtual-row branches that switch on it still mean
+  // "uniform mediaWindow rows".
   const windowedMedia =
     mediaSlots !== undefined &&
-    windowedLayoutMode &&
+    uniformWindowLayoutMode &&
     (mediaItemCount > items.length || mediaItemCount > WINDOWED_MEDIA_COUNT_THRESHOLD);
-  // Only the non-windowed (justified/masonry) layout needs the fully ordered
-  // media list. In windowed grid/list mode `layoutItems` is empty, so sorting
-  // every loaded slot on each window load is pure O(n log n) main-thread waste
-  // that grows with scroll depth — skip it there and read slots directly.
+  // Justified/masonry full-total layout: drive the existing non-windowed
+  // (layout.segments) render path, but over placements that span the whole
+  // folder total (real ratio when loaded, estimate otherwise) and prefetch the
+  // visible/ahead slot range so real thumbnails arrive before they scroll in.
+  const justifiedFullTotal =
+    mediaSlots !== undefined &&
+    justifiedLayoutMode &&
+    (mediaItemCount > items.length || mediaItemCount > WINDOWED_MEDIA_COUNT_THRESHOLD);
+  // Estimated aspect ratio for not-yet-loaded slots: average of the loaded
+  // slots' real ratios (falls back to 1). Keeps the justified/masonry rows
+  // stable so a late-arriving real ratio does not reflow the layout.
+  const estimatedRatio = useMemo(() => {
+    if (!mediaSlots || mediaSlots.size === 0) return 1;
+    let sum = 0;
+    let n = 0;
+    for (const item of mediaSlots.values()) {
+      if (item && item.width && item.height && item.width > 0 && item.height > 0) {
+        sum += item.width / item.height;
+        n += 1;
+      }
+    }
+    return n > 0 ? sum / n : 1;
+  }, [mediaSlots]);
+  // The uniform-window (grid/list) and justified-full-total paths both drive the
+  // layout without `layoutItems` (window rows / slot accessor respectively). Only
+  // the small-folder fallback (no windowing) uses the ordered loaded list.
   const orderedLoadedMedia = useMemo(
-    () => (mediaSlots !== undefined && !windowedMedia ? compactMediaSlots(mediaSlots) : items),
-    [items, mediaSlots, windowedMedia]
+    () =>
+      mediaSlots !== undefined && !windowedMedia && !justifiedFullTotal
+        ? compactMediaSlots(mediaSlots)
+        : items,
+    [items, mediaSlots, windowedMedia, justifiedFullTotal]
   );
-  const layoutItems = windowedMedia ? EMPTY_MEDIA_ITEMS : orderedLoadedMedia;
+  const layoutItems =
+    (uniformWindowLayoutMode && windowedMedia) || justifiedFullTotal
+      ? EMPTY_MEDIA_ITEMS
+      : orderedLoadedMedia;
   const layout = useMemo(
     () =>
       buildLayoutGeometry({
@@ -325,9 +362,26 @@ export function MediaGrid({
         labelHeight: gridPreferences.tileLabelHeight,
         layoutMode,
         viewportWidth: viewportSize.width,
-        tileMinWidth: workbenchLayout.tileMinWidth
+        tileMinWidth: workbenchLayout.tileMinWidth,
+        ...(justifiedFullTotal
+          ? {
+              totalCount: mediaItemCount,
+              getItemAt: (index: number) => mediaSlots?.get(index),
+              estimatedRatio
+            }
+          : {})
       }),
-    [gridPreferences.tileGap, gridPreferences.tileLabelHeight, layoutItems, layoutMode, viewportSize.width]
+    [
+      gridPreferences.tileGap,
+      gridPreferences.tileLabelHeight,
+      layoutItems,
+      layoutMode,
+      viewportSize.width,
+      justifiedFullTotal,
+      mediaItemCount,
+      mediaSlots,
+      estimatedRatio
+    ]
   );
   const mediaWindow = useMemo(
     () =>
@@ -713,7 +767,7 @@ export function MediaGrid({
   ]);
 
   const progressiveExactNextMissingIndex =
-    !windowedMedia && mediaSlots !== undefined
+    !windowedMedia && !justifiedFullTotal && mediaSlots !== undefined
       ? firstMissingMediaSlotIndex(mediaSlots, mediaItemCount)
       : null;
   const progressiveExactLayoutHasMore = progressiveExactNextMissingIndex !== null;
@@ -901,6 +955,38 @@ export function MediaGrid({
         return Array.from({ length: Math.max(0, end - start) }, (_, index) => start + index);
       })
     : [];
+  // Justified/masonry full-total prefetch: the rendered placement indices are
+  // absolute slot indices, so request the media window covering the visible
+  // range plus an ahead overscan. This loads real thumbnails before they scroll
+  // into view, so the estimated-ratio placeholders are replaced without a
+  // visible reflow.
+  const justifiedPrefetchRange = useMemo(() => {
+    if (!justifiedFullTotal || renderedPlacementIndexes.length === 0) {
+      return null;
+    }
+    let min = Infinity;
+    let max = -Infinity;
+    for (const index of renderedPlacementIndexes) {
+      if (index < min) min = index;
+      if (index > max) max = index;
+    }
+    if (min === Infinity) return null;
+    const span = Math.max(1, max - min + 1);
+    return {
+      start: Math.max(0, min),
+      end: Math.min(mediaItemCount, max + 1 + span) // one screenful of ahead overscan
+    };
+  }, [justifiedFullTotal, renderedPlacementIndexes, mediaItemCount]);
+  const justifiedPrefetchKey = justifiedPrefetchRange
+    ? `${justifiedPrefetchRange.start}:${justifiedPrefetchRange.end}`
+    : null;
+  useEffect(() => {
+    if (!justifiedFullTotal || !onRequestMediaWindow || !justifiedPrefetchRange) {
+      return;
+    }
+    onRequestMediaWindow(justifiedPrefetchRange.start, justifiedPrefetchRange.end);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [justifiedFullTotal, onRequestMediaWindow, justifiedPrefetchKey]);
   const renderedFolderSegmentIndexes = virtualItems
     .map((item) => resolveVirtualSegment(item.index))
     .filter((segment): segment is Extract<VirtualSegment, { type: "folder-row" }> =>
@@ -1276,9 +1362,32 @@ export function MediaGrid({
 
         {renderedPlacementIndexes.map((placementIndex) => {
           const placement = layout.placements[placementIndex];
-          const item = placement?.item;
-          if (!placement || !item) {
+          if (!placement) {
             return null;
+          }
+          const item = placement.item;
+          // Unloaded slot in the full-total justified/masonry layout: hold a
+          // placeholder at its estimated-ratio geometry so the row does not
+          // reflow and the real thumbnail can fade in once its window loads.
+          if (!item) {
+            return (
+              <div
+                className={`media-gridcell media-gridcell--${layoutMode}`}
+                key={`placement-placeholder-${placementIndex}`}
+                role="row"
+                style={{
+                  height: placement.height,
+                  left: placement.left,
+                  position: "absolute",
+                  top: mediaOffset + placement.top,
+                  width: placement.width
+                }}
+              >
+                <div className="media-gridcell-content" role="gridcell">
+                  <MediaTileSkeleton layoutMode={layoutMode} placement={placement} />
+                </div>
+              </div>
+            );
           }
           const selected = item.id === selectedMediaId;
           const thumbnailLoadPriority: ThumbnailRequestPriority = selected

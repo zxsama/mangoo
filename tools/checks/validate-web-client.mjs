@@ -458,12 +458,15 @@ if (
   fail("useLibraryData must flush selected/visible thumbnail scope changes immediately");
 }
 if (
-  !/const\s+windowedLayoutMode\s*=\s*layoutMode\s*===\s*"grid"\s*\|\|\s*layoutMode\s*===\s*"list"/.test(
+  !/const\s+uniformWindowLayoutMode\s*=\s*layoutMode\s*===\s*"grid"\s*\|\|\s*layoutMode\s*===\s*"list"/.test(
     mediaGrid
   ) ||
-  !/mediaSlots\s*!==\s*undefined\s*&&\s*windowedLayoutMode/.test(mediaGrid)
+  !/mediaSlots\s*!==\s*undefined\s*&&\s*\n?\s*uniformWindowLayoutMode/.test(mediaGrid) ||
+  !/justifiedFullTotal/.test(mediaGrid)
 ) {
-  fail("MediaGrid fixed-row viewport windowing must stay limited to grid/list layout modes");
+  fail(
+    "MediaGrid must window grid/list via uniformWindowLayoutMode and adaptive/waterfall via justifiedFullTotal (full-total placeholder layout)"
+  );
 }
 if (/Load more media/.test(mediaGrid) || /type:\s*"load-more"/.test(mediaGrid)) {
   fail("MediaGrid must expose the full media count through virtual rows instead of a Load more row");
@@ -481,7 +484,7 @@ if (!/media-grid-refresh-indicator/.test(mediaGrid) || !/aria-busy=\{loading/.te
   fail("MediaGrid must expose refresh progress through a non-blocking overlay indicator");
 }
 if (
-  !/isFinalInputItem\s*=\s*itemIndex\s*===\s*items\.length\s*-\s*1/.test(mediaGridLayoutGeometry) ||
+  !/isFinalInputItem\s*=\s*itemIndex\s*===\s*count\s*-\s*1/.test(mediaGridLayoutGeometry) ||
   !/if\s*\(\s*shouldFlush\s*&&\s*!isFinalInputItem\s*\)\s*\{\s*flushRow\(true\);/.test(mediaGridLayoutGeometry) ||
   /shouldFillRemainingWidth\s*=\s*justify\s*&&\s*entryIndex\s*===\s*rowItems\.length\s*-\s*1/.test(mediaGridLayoutGeometry) ||
   /entryIndex\s*===\s*rowItems\.length\s*-\s*1\s*\?\s*Math\.max\(1,\s*remainingWidth\)/.test(mediaGridLayoutGeometry)
