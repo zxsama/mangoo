@@ -420,6 +420,17 @@ export function MediaGrid({
   const activeMediaEstimatedSegmentSize = windowedMedia
     ? mediaWindow.rowHeight
     : layout.estimatedSegmentSize;
+  // Prefetch ~one screenful of rows in EACH direction (above + below the
+  // viewport) so thumbnails a full page out are already loaded before they
+  // scroll in — moving the load off the visible area for a smoother scroll.
+  const mediaPrefetchRowCount = useMemo(() => {
+    const base = Math.max(1, aheadRowCount);
+    if (!windowedMedia || mediaWindow.rowHeight <= 0 || viewportSize.height <= 0) {
+      return base;
+    }
+    const screenRows = Math.ceil(viewportSize.height / mediaWindow.rowHeight);
+    return Math.max(base, screenRows);
+  }, [aheadRowCount, mediaWindow.rowHeight, viewportSize.height, windowedMedia]);
   const folderWindow = useMemo(
     () =>
       buildFolderWindowGeometry({
@@ -597,7 +608,14 @@ export function MediaGrid({
     getScrollElement: () => parentRef.current,
     estimateSize: (index) => resolveVirtualSegment(index)?.size ?? activeMediaEstimatedSegmentSize,
     initialOffset: savedScrollTop,
-    overscan: layoutMode === "waterfall" ? 6 : 4,
+    // Render ~one screenful of rows beyond the viewport in the windowed grid so
+    // the prefetched off-screen tiles mount and load their thumbnails ahead of
+    // the scroll (they render as ready when they enter view).
+    overscan: windowedMedia
+      ? Math.max(6, mediaPrefetchRowCount)
+      : layoutMode === "waterfall"
+        ? 6
+        : 4,
   });
   const virtualItems = virtualRows.getVirtualItems();
 
@@ -689,18 +707,33 @@ export function MediaGrid({
   ]);
   const aheadMediaIndexRange = useMemo(() => {
     if (!windowedMedia || !visibleMediaIndexRange) return null;
-    const aheadRows = Math.max(1, aheadRowCount);
     return {
       start: visibleMediaIndexRange.end,
       end: Math.min(
         mediaItemCount,
-        visibleMediaIndexRange.end + aheadRows * mediaWindow.columnCount
+        visibleMediaIndexRange.end + mediaPrefetchRowCount * mediaWindow.columnCount
       )
     };
   }, [
-    aheadRowCount,
+    mediaPrefetchRowCount,
     mediaWindow.columnCount,
     mediaItemCount,
+    visibleMediaIndexRange,
+    windowedMedia
+  ]);
+  // The matching prefetch region ABOVE the viewport, so scrolling back up is just
+  // as smooth as scrolling down. Null when the viewport is already at the top.
+  const behindMediaIndexRange = useMemo(() => {
+    if (!windowedMedia || !visibleMediaIndexRange) return null;
+    const start = Math.max(
+      0,
+      visibleMediaIndexRange.start - mediaPrefetchRowCount * mediaWindow.columnCount
+    );
+    if (start >= visibleMediaIndexRange.start) return null;
+    return { start, end: visibleMediaIndexRange.start };
+  }, [
+    mediaPrefetchRowCount,
+    mediaWindow.columnCount,
     visibleMediaIndexRange,
     windowedMedia
   ]);
@@ -739,15 +772,22 @@ export function MediaGrid({
     if (windowedMedia && aheadMediaIndexRange) {
       const ids: number[] = [];
       const signatures: string[] = [];
-      for (let index = aheadMediaIndexRange.start; index < aheadMediaIndexRange.end; index += 1) {
-        const item = mediaSlots?.get(index);
-        if (!item || item.id === selectedMediaId) continue;
-        ids.push(item.id);
-        signatures.push(mediaContentSignature(item));
+      // Prefetch below (ahead) and above (behind) the viewport so thumbnails in
+      // both scroll directions are requested before they come into view.
+      const ranges = behindMediaIndexRange
+        ? [behindMediaIndexRange, aheadMediaIndexRange]
+        : [aheadMediaIndexRange];
+      for (const range of ranges) {
+        for (let index = range.start; index < range.end; index += 1) {
+          const item = mediaSlots?.get(index);
+          if (!item || item.id === selectedMediaId) continue;
+          ids.push(item.id);
+          signatures.push(mediaContentSignature(item));
+        }
       }
       return {
         ids,
-        key: `${aheadMediaIndexRange.start}:${aheadMediaIndexRange.end}`,
+        key: `${behindMediaIndexRange?.start ?? aheadMediaIndexRange.start}:${aheadMediaIndexRange.end}`,
         signatureKey: signatures.join("|")
       };
     }
@@ -759,6 +799,7 @@ export function MediaGrid({
   }, [
     activeMediaEstimatedSegmentSize,
     aheadMediaIndexRange,
+    behindMediaIndexRange,
     aheadRowCount,
     layout,
     mediaSlots,
@@ -771,12 +812,20 @@ export function MediaGrid({
     if (!windowedMedia || !onRequestMediaWindow || !visibleMediaIndexRange) {
       return;
     }
+    // Request ONE contiguous window covering one screen above through one screen
+    // below the viewport. It must be a single request: loadMediaWindow aborts any
+    // other in-flight media page, so issuing a separate "behind" request here
+    // would abort the visible one and leave the grid stuck on placeholders. The
+    // above-viewport rows are normally already loaded (you scrolled down through
+    // them), so this mostly extends the window downward; keyset pagination keeps
+    // the fetch cheap.
     onRequestMediaWindow(
-      visibleMediaIndexRange.start,
+      behindMediaIndexRange?.start ?? visibleMediaIndexRange.start,
       aheadMediaIndexRange?.end ?? visibleMediaIndexRange.end
     );
   }, [
     aheadMediaIndexRange,
+    behindMediaIndexRange,
     onRequestMediaWindow,
     visibleMediaIndexRange,
     windowedMedia

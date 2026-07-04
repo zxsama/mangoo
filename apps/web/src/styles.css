@@ -2192,6 +2192,7 @@ button:disabled {
   height: 100%;
   object-fit: cover;
   display: block;
+  animation: tileThumbImageFadeIn 0.1s ease-out both;
 }
 
 .tile-thumb-failed {
@@ -5505,6 +5506,25 @@ button:disabled {
 
 .tile-thumb-ready {
   background: rgba(7, 10, 13, 0.96);
+}
+
+/* A loading tile keeps the pale placeholder tone (matching the unloaded skeleton)
+   instead of the dark tile-thumb base, so a tile goes straight from the pale
+   placeholder to the faded-in image with no dark-box intermediate stage. */
+.tile-thumb-loading {
+  background:
+    linear-gradient(135deg, rgba(151, 219, 226, 0.1), rgba(239, 141, 127, 0.05)),
+    var(--surface-2);
+}
+
+/* Thumbnails fade in over 0.1s when they first paint instead of popping in. */
+@keyframes tileThumbImageFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .preview-stage .preview-placeholder.ready,

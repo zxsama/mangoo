@@ -57,7 +57,11 @@ export const inFlightOriginalPreviewRequests = new Map<string, SharedRequest<Blo
 export const DEFAULT_ORIGINAL_PREVIEW_BUFFER_LIMIT_BYTES = 1200 * 1024 * 1024;
 const MAX_FOREGROUND_RESOURCE_REQUESTS = 12;
 const MAX_INTERACTIVE_FOREGROUND_RESOURCE_REQUESTS = 2;
-const MAX_AHEAD_FOREGROUND_RESOURCE_REQUESTS = 2;
+// Off-screen prefetch (one screen above/below the viewport) is "ahead" priority.
+// Visible requests still win by scheduler rank, so a slightly higher ahead
+// concurrency lets the prefetched screen finish before it scrolls into view
+// without starving the visible tiles.
+const MAX_AHEAD_FOREGROUND_RESOURCE_REQUESTS = 6;
 const MAX_FALLBACK_FOREGROUND_RESOURCE_REQUESTS = 6;
 
 type ForegroundResourcePriority = ThumbnailRequestPriority | "preview" | "fallback";
