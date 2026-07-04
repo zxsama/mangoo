@@ -617,19 +617,22 @@ if (
 }
 
 if (
-  !/const\s+windowedLayoutMode\s*=\s*layoutMode\s*===\s*"grid"\s*\|\|\s*layoutMode\s*===\s*"list"/.test(mediaGrid) ||
-  !/mediaSlots\s*!==\s*undefined\s*&&\s*windowedLayoutMode/.test(mediaGrid)
+  !/const\s+uniformWindowLayoutMode\s*=\s*layoutMode\s*===\s*"grid"\s*\|\|\s*layoutMode\s*===\s*"list"/.test(mediaGrid) ||
+  !/const\s+justifiedLayoutMode\s*=\s*layoutMode\s*===\s*"adaptive"\s*\|\|\s*layoutMode\s*===\s*"waterfall"/.test(mediaGrid) ||
+  !/mediaSlots\s*!==\s*undefined\s*&&\s*\n?\s*uniformWindowLayoutMode/.test(mediaGrid)
 ) {
-  fail("MediaGrid must not route adaptive/waterfall layout modes through the fixed-row windowed grid geometry");
+  fail("MediaGrid must gate the fixed-row uniform window on grid/list only (uniformWindowLayoutMode); adaptive/waterfall use their own justified geometry");
 }
 
 if (
-  !mediaGrid.includes("compactMediaSlots") ||
-  !mediaGrid.includes("firstMissingMediaSlotIndex") ||
-  !/const\s+orderedLoadedMedia\s*=/.test(mediaGrid) ||
-  !/const\s+layoutItems\s*=\s*windowedMedia\s*\?\s*EMPTY_MEDIA_ITEMS\s*:\s*orderedLoadedMedia/.test(mediaGrid)
+  !/const\s+justifiedFullTotal\s*=/.test(mediaGrid) ||
+  !/justifiedLayoutMode\s*&&/.test(mediaGrid) ||
+  !/getItemAt:\s*\(index[^)]*\)\s*=>\s*mediaSlots/.test(mediaGrid) ||
+  !/totalCount:\s*mediaItemCount/.test(mediaGrid) ||
+  !mediaGrid.includes("MediaTileSkeleton") ||
+  !mediaGrid.includes("firstMissingMediaSlotIndex")
 ) {
-  fail("MediaGrid exact layout modes must preserve global mediaSlots order and request the first missing slot");
+  fail("MediaGrid adaptive/waterfall must lay out over the full total (getItemAt/totalCount) with placeholder skeletons for unloaded slots; exact modes still use firstMissingMediaSlotIndex");
 }
 
 if (!/--shell-left-width:\s*292px/.test(stylesForChecks) || !/--shell-right-width:\s*270px/.test(stylesForChecks)) {
