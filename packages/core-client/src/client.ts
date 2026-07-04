@@ -425,17 +425,33 @@ function pumpCoreRequests(): void {
     if (isInteractiveRequest) {
       activeCoreInteractiveRequests += 1;
     }
-    entry
-      .run()
-      .then(entry.resolve, entry.reject)
-      .finally(() => {
-        entry.signal?.removeEventListener("abort", entry.abort);
-        activeCoreRequests = Math.max(0, activeCoreRequests - 1);
-        if (isInteractiveRequest) {
-          activeCoreInteractiveRequests = Math.max(0, activeCoreInteractiveRequests - 1);
-        }
-        pumpCoreRequests();
-      });
+    // Release the slot exactly once, whichever comes first: the run settling, OR
+    // the signal aborting. Relying on run() (the fetch) to always reject on abort
+    // leaked a slot whenever that settlement was missed under heavy churn, and a
+    // handful of leaked slots deadlocked the whole scheduler (active pinned at the
+    // cap, nothing new can start). The abort watchdog guarantees the counter frees.
+    let released = false;
+    const releaseSlot = () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      entry.signal?.removeEventListener("abort", entry.abort);
+      entry.signal?.removeEventListener("abort", onAbort);
+      activeCoreRequests = Math.max(0, activeCoreRequests - 1);
+      if (isInteractiveRequest) {
+        activeCoreInteractiveRequests = Math.max(0, activeCoreInteractiveRequests - 1);
+      }
+      pumpCoreRequests();
+    };
+    const onAbort = () => {
+      // Free the slot immediately and settle the caller; the underlying fetch may
+      // continue but its result is ignored (release is idempotent).
+      releaseSlot();
+      entry.reject(createAbortError());
+    };
+    entry.signal?.addEventListener("abort", onAbort, { once: true });
+    entry.run().then(entry.resolve, entry.reject).finally(releaseSlot);
   }
 }
 
