@@ -1076,3 +1076,11 @@ Follow-up user reports, both root-caused and real-window verified:
 Guard `tools/checks/validate-web-client.mjs` "must incrementally refresh current folder media and children during scan" updated for the new refresh order (children force-refresh before tasks). `npm test` green (all 8 gates, 254 Rust tests).
 
 Note on the test library: Billfish `Artists` has no leaf folders in the first 60 top-level folders (Artist → collection → images); leaf folders start around depth 2 — use depth≥2 BFS to find one for leaf-folder tests.
+
+### Phase 9 addendum 2 — startup latency + thumbnail re-flash (`2812d7a`)
+
+6. **Slow sidebar / ~15s "waiting for a refresh."** Not a data/refresh-order issue. Root cause (warm-DB timing + startup logs): the desktop allocates a loopback port by opening+closing a probe socket then hands it to Core; on Windows the just-closed socket lingers in TIME_WAIT, so Core's first `TcpListener::bind` races and fails with AddrInUse → Core exits code 1 → the desktop retries the whole Core start on a fresh port → the app+sidebar wait for Core health the whole time. Core opens the 268MB/652k-media DB + migrations + legacy import in only 610ms — startup isn't slow; the retry loop was. Fix: `bind_with_retry` in `crates/core/src/main.rs` (up to 20×, 100ms backoff on AddrInUse). Verified on the warm DB: 0 Core-start retries across 3 launches (was failing attempt 1 every time); sidebar shows all 300 folders ~2.9s from launch.
+
+7. **Loaded thumbnail re-flashes 1-2× (background flash then re-shows).** `ReadyThumbnail`'s blob effect depended on `thumbnailUpdatedAt` and `resourcePriority`, so a live thumbnail-state settle (updatedAt null→timestamp during scan) or a viewport priority shift (visible↔ahead↔selected on scroll) re-ran the effect → re-fetched the blob → re-swapped the object URL → flashed the placeholder before the same image. The blob is content-identified by `cacheKey` (id:mtime:size), so those values must not trigger a re-fetch. Fix: key the effect only on `[cacheKey, fileId, retryToken]`; a genuine content change bumps mtime/size → cacheKey and re-runs correctly.
+
+`npm test` green (all 8 gates, 254 Rust, 6 web). Bug 6 real-window verified; bug 7 is a visual flash to confirm by eye.
