@@ -1230,8 +1230,9 @@ async fn list_file_operations(
 }
 
 async fn list_plugins(State(state): State<AppState>) -> ApiResult<Json<PluginListResponse>> {
-    let database = state.database.lock().expect("database mutex poisoned");
-    let items = database.list_plugins()?;
+    // Read on the dedicated WAL read connection so it never blocks behind a
+    // scan-time write holding the shared mutex (see get_user_metadata).
+    let items = run_read_database(state, |database| Ok(database.list_plugins()?)).await?;
     Ok(Json(PluginListResponse { items }))
 }
 
@@ -1344,8 +1345,9 @@ fn resolve_plugins_dir(state: &AppState) -> std::path::PathBuf {
 }
 
 async fn list_tags(State(state): State<AppState>) -> ApiResult<Json<ListResponse<TagRecord>>> {
-    let database = state.database.lock().expect("database mutex poisoned");
-    let items = database.list_tags()?;
+    // Read on the dedicated WAL read connection so it never blocks behind a
+    // scan-time write holding the shared mutex (see get_user_metadata).
+    let items = run_read_database(state, |database| Ok(database.list_tags()?)).await?;
     Ok(Json(ListResponse {
         items,
         next_cursor: None,
@@ -1381,10 +1383,19 @@ async fn get_user_metadata(
     State(state): State<AppState>,
     Path(file_id): Path<i64>,
 ) -> ApiResult<Json<UserMetadataRecord>> {
-    let database = state.database.lock().expect("database mutex poisoned");
-    let record = database
-        .get_user_metadata(file_id)?
-        .ok_or_else(|| CoreError::not_found(format!("media item not found: {file_id}")))?;
+    // Read via a dedicated WAL read connection (not the shared write mutex). WAL
+    // readers never block on the writer, so an inspector metadata fetch stays
+    // fast during a scan. The old `state.database.lock()` here hung for seconds
+    // under scroll+scan load (the per-scroll priority-scope write holds the
+    // mutex while it waits on the scan's SQLite writer), and because the client
+    // caps metadata requests as "interactive", two hung fetches pinned both
+    // interactive slots and the grid stopped re-prioritizing.
+    let record = run_read_database(state, move |database| {
+        database
+            .get_user_metadata(file_id)?
+            .ok_or_else(|| CoreError::not_found(format!("media item not found: {file_id}")))
+    })
+    .await?;
     Ok(Json(record))
 }
 

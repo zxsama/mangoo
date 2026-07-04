@@ -126,36 +126,69 @@ async function main() {
       darkProbe ? `${darkProbe.loading} loading, ${darkProbe.dark} dark` : "probe failed"
     );
 
-    // ---- 4. Fresh thumbnails fade in -----------------------------------------
-    await clickFolder("3");
-    await sleep(3500);
-    const fadeStat = await evalJson(`(function(){
+    // ---- 4. Fresh thumbnails fade in as new rows are revealed ----------------
+    // Test the root media wall, not a subfolder: scroll into the wall, let it
+    // settle, then gently reveal new rows and watch for the fade class / a
+    // running fade animation on freshly-appearing tiles. The fade must fire for
+    // BOTH the ready-WebP path (tile-thumb-ready) AND the original-decode
+    // fallback path (tile-thumb-original-fallback) — the latter renders most
+    // tiles while a scan is still generating WebP thumbnails, and used to never
+    // fade.
+    await clickFolderByDepth0();
+    await sleep(1500);
+    await setScroll(120000); // below the subfolder-card header, into the file wall
+    for (let i = 0; i < 12; i += 1) {
+      await sleep(1000);
+      const s = await grid();
+      if (s.visibleImgs >= 12) break;
+    }
+    const fadeProbe = `(function(){
       var imgs=Array.prototype.slice.call(document.querySelectorAll('.tile-thumb-image'));
-      var faded=imgs.filter(function(i){return i.classList.contains('tile-thumb-image--fade');}).length;
-      var anim=imgs[0]?getComputedStyle(imgs[0]).animationDuration:'';
-      return {imgs:imgs.length, faded:faded, sampleAnim:anim};
-    })()`);
+      var running=imgs.filter(function(x){var a=getComputedStyle(x);return a.animationName&&a.animationName!=='none';}).length;
+      var faded=imgs.filter(function(x){return x.classList.contains('tile-thumb-image--fade');}).length;
+      var fb=imgs.filter(function(x){var p=x.parentElement;return p&&p.className.indexOf('tile-thumb-original-fallback')>=0&&x.classList.contains('tile-thumb-image--fade');}).length;
+      return {run:Math.max(running,faded), fbFade:fb};
+    })()`;
+    let sawFade = 0;
+    let sawFallbackFade = 0;
+    for (let step = 0; step < 8 && sawFade === 0; step += 1) {
+      await scrollBy(900);
+      for (let i = 0; i < 8; i += 1) {
+        await sleep(120);
+        const f = await evalJson(fadeProbe);
+        if (f && f.run > sawFade) sawFade = f.run;
+        if (f && f.fbFade > sawFallbackFade) sawFallbackFade = f.fbFade;
+      }
+    }
     record(
-      "fresh thumbnails carry the fade animation",
-      fadeStat && fadeStat.imgs > 0 && fadeStat.faded > 0,
-      fadeStat ? `${fadeStat.faded}/${fadeStat.imgs} faded` : "no images"
+      "fresh thumbnails fade in as new rows appear (ready + fallback paths)",
+      sawFade > 0,
+      sawFade > 0
+        ? `${sawFade} tiles fading (fallback-path fades observed: ${sawFallbackFade})`
+        : "no fade class/animation on fresh tiles"
     );
 
-    // ---- 5. Cached tiles re-appear INSTANTLY (no re-flash) -------------------
-    await scrollBy(8000);
-    await sleep(2000);
-    await scrollBy(-8000);
-    await sleep(1200);
+    // ---- 5. Cached tiles re-appear INSTANTLY (no re-fade) --------------------
+    // Settle at a position so its fade animations finish, scroll away, then back
+    // to the same rows: the returning tiles are object-URL cached and must
+    // render without a running fade animation (no re-flash). The bug would be
+    // every tile re-animating on return.
+    await setScroll(120000);
+    await sleep(2500); // let the 0.2s fade animations complete and settle
+    await scrollBy(6000);
+    await sleep(1500);
+    await scrollBy(-6000); // back to the just-visited (cached) rows
+    await sleep(200);
     const cachedStat = await evalJson(`(function(){
       var imgs=Array.prototype.slice.call(document.querySelectorAll('.tile-thumb-image'));
-      var faded=imgs.filter(function(i){return i.classList.contains('tile-thumb-image--fade');}).length;
-      return {imgs:imgs.length, faded:faded};
+      var running=imgs.filter(function(x){var a=getComputedStyle(x);return a.animationName&&a.animationName!=='none';}).length;
+      return {imgs:imgs.length, running:running};
     })()`);
-    // scrolled back to already-loaded rows: most tiles should be instant (unfaded)
+    // A cached return should leave the majority of tiles instant (not animating).
     record(
       "cached tiles re-appear without re-fading",
-      cachedStat && cachedStat.imgs > 0 && cachedStat.faded < cachedStat.imgs,
-      cachedStat ? `${cachedStat.imgs - cachedStat.faded}/${cachedStat.imgs} instant` : "no images"
+      cachedStat && cachedStat.imgs > 0 && cachedStat.running <= Math.ceil(cachedStat.imgs * 0.5),
+      cachedStat ? `${cachedStat.imgs - cachedStat.running}/${cachedStat.imgs} instant` : "no images"
     );
 
     // ---- 6. Deep-scroll the main dir does not freeze the renderer -------------

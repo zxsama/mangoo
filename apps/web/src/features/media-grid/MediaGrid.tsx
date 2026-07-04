@@ -1993,6 +1993,13 @@ function OriginalFallbackThumbnail({
   const itemRef = useRef(item);
   const objectUrlRef = useRef<string | null>(src);
   itemRef.current = item;
+  // Fade in only when the image was NOT already available at mount. During a scan
+  // most visible tiles render through this original-decode fallback (the WebP
+  // thumbnail is still pending), so without this the "pale -> image" appearance
+  // never fades. A tile scrolling back in with its object URL still cached renders
+  // instantly (no re-flash); the later fallback -> ready WebP swap does not re-fade
+  // because ReadyThumbnail seeds its src from this same cached original URL.
+  const shouldFadeInRef = useRef(src === null);
 
   useEffect(() => {
     const cachedObjectUrl = originalFallbackObjectUrlCache.get(cacheKey);
@@ -2112,7 +2119,15 @@ function OriginalFallbackThumbnail({
 
   return (
     <div className={`${className} tile-thumb-original-fallback`} style={style}>
-      <img alt={alt} className="tile-thumb-image" decoding="async" loading="eager" src={src} />
+      <img
+        alt={alt}
+        className={
+          shouldFadeInRef.current ? "tile-thumb-image tile-thumb-image--fade" : "tile-thumb-image"
+        }
+        decoding="async"
+        loading="eager"
+        src={src}
+      />
       <ThumbnailInteractionRing />
     </div>
   );
