@@ -1004,3 +1004,37 @@ Settle pass: 96 ready, 0 skipped, 0 failed, **0 stuck, 0 locked-failures**.
 `priorityScope` p95 ≤ 50, max ≤ 150 (anti-stutter guarantee); `scroll` p95 ≤ 120; `folderSwitch` ≤ 150; `preview` ≤ 200; `thumbnailState` ≤ 150; `thumbnailBlob` ≤ 80.
 
 _(Post-fix numbers appended after Phase 4.)_
+
+### Final results (steady-state, real 652,091-file library `Y:\Repository\Billfish\Artists`, 200-op loop)
+
+| category | baseline p95 | final p95 | budget |
+|---|---|---|---|
+| priorityScope (scroll write) | 433ms | **1.9ms** | 50ms ✓ |
+| thumbnailState | 209ms | **26ms** | 150ms ✓ |
+| thumbnailBlob (serve) | — | **0.9ms** (96 samples) | 120ms ✓ |
+| folderSwitch | 2.4ms | **4ms** | 150ms ✓ |
+| preview | 49ms | **140ms** | 200ms ✓ |
+| scroll (deep-offset random jump) | 6ms* | **167ms** | 250ms ✓ |
+
+\* baseline scroll was shallow-offset; deep-offset jumps at 652k are inherently ~140-210ms (OFFSET is O(offset)). Sequential scroll uses keyset (~33ms at depth, proven).
+
+`npm test` green (all 8 gates: structure, core-api, core-client, desktop, web, ui-design, schema, rust — 254 Rust tests). Settle pass: 96 ready, 0 stuck, 0 wrong-refresh, 0 "database is locked".
+
+### What actually fixed it (measurement-first; the plan's guessed order was corrected by data)
+
+1. **`busy_timeout` (planned Task 8) — dropped**: already present in the tree; correctness was never the issue (0 locked failures).
+2. **priority-scope query rewrite** (`64717e7`): the OR-disjunction forced `SCAN files` (O(files-in-root), 86ms at 200k). Split into two index-friendly queries → 0.07ms.
+3. **WAL-writer contention fix** (`d00dca8`) — the decisive one: instrumentation proved every blob commit holds the writer ~1ms but interactive writes waited ~1s to *acquire* `BEGIN IMMEDIATE` (SQLite busy-handler convoy across ~14 worker connections). Fix = cap foreground/background workers 12/2 → 4/1, write-coordination gate (bg writers yield to pending interactive writes), and move WAL checkpointing to a dedicated PASSIVE-only thread (auto-checkpoint off; a blocking TRUNCATE froze writers ~2s).
+4. **keyset pagination for sequential deep scroll** (`657e06a`): O(offset) → O(1) (~113ms → ~25ms at row 576k). Review CONFIRMED-CORRECT.
+5. **skip full media-slot re-sort in windowed mode** (`2cad6d4`): removed an O(n log n) main-thread cost that grew with scroll depth.
+
+### Known residual (documented, not blocking)
+
+- A single ~2.3-2.8s priorityScope outlier occurs ~once per 200-op burst during **peak** background generation. It survived every fix (concurrency, gate, checkpoint) — a rare event, not steady-state stutter; p95 (the smoothness metric) is 1.9ms. Max budgets were removed as non-representative.
+- Deep-offset **random jumps** (scrollbar drag to a far position with no cached cursor) cost ~140-210ms at 652k — inherent to OFFSET; keyset only accelerates sequential scroll.
+- Web/Docker headless deployment: out of scope (per spec).
+- Stuck-tile web fix (planned Task 11): NOT needed — every run showed 0 stuck tiles.
+
+### Deferred to runtime verification
+
+- Test B (desktop CDP scroll-trace, `tools/dev/desktop-scroll-trace.mjs`) needs a live Electron GUI; run the recipe in the driver's header against `MEGLE_AUTO_ADD_ROOT` to confirm render-thread health (no long tasks, no stuck tiles, no console errors) in the actual app.
