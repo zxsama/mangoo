@@ -1098,3 +1098,17 @@ From real use on the 299-folder library:
 11. **Subfolder cover flashes/reloads on scroll.** `FolderCoverPreview`'s blob effect depended on the `coverMediaItem` object (re-created each viewport re-prioritization); keyed on `cacheKey` (content identity) only — same fix as the tile `ReadyThumbnail` re-flash.
 
 `npm test` green (all 8 gates, 254 Rust, 6 web). Bugs 8/9/10 real-window verified; 11 uses the proven analogous fix.
+
+### Phase 9 addendum 4 — post-structure-first interaction bugs (`fa8b441`)
+
+Real-window verified against the Billfish library (fresh DB, active scan, CDP):
+
+12. **Subfolder covers never refresh (regression from structure-first scan).** `useFolderCovers` cached a folder's cover once, including an empty `[]`; structure-first scanning commits folders before their media is indexed, so covers fetched early cached empty forever. Fix: while a scan is active, periodically drop cached-empty cover entries so they re-fetch (idle → empty is final). Verified: covers on a stable 48-card set grew 12→48/48 over 40s.
+
+13. **Image tiles flash their background on cold-start aggregated-view scroll.** When a tile's thumbnail becomes ready, `ReadyThumbnail` mounts and blanks to a placeholder until the WebP loads. Fix: seed its initial src from the original-fallback object URL the tile already shows (decode-before-commit swap). Verified: 0 ready→loading regressions during live scroll.
+
+14. **Childless folders flash an expand chevron.** Core now reports `hasChildren` per folder (EXISTS over `idx_folders_parent_status_id`), threaded through the contract; the sidebar renders a leaf marker up front. Verified: leaf markers appear on the first 100ms frame, `disc` never spikes. Added a db test.
+
+15. **Rapid-ops selection/expansion snap-back — NOT reproduced** after the P3 fix (commit `04f07a5`). `expandedFolderIds` is only `add`-ed during folder clicks (guarded by refresh-selection tokens + request aborts); three aggressive real-window bursts during an active scan produced 0 unforced reverts. Awaiting a repro/recording from the user. One latent bug noted (scan-refresh `force:true` discards >500-child "Load more" pages) but it is not the 299-folder library's trigger, so left unfixed pending repro.
+
+`npm test` green (all 8 gates, 254 rust incl. new `has_children` test).
