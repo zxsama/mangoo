@@ -85,6 +85,8 @@ const SNAP = `(() => {
     selectedFolderId: document.querySelector(".tree-item.selected")?.getAttribute("data-folder-id") || null,
     tiles: document.querySelectorAll(".media-tile").length,
     imgs: document.querySelectorAll(".tile-thumb-image").length,
+    subfolderCards: document.querySelectorAll(".subfolder-card").length,
+    subfolderCoverImgs: document.querySelectorAll(".subfolder-card-cover-image").length,
     skeletons: document.querySelectorAll(".media-tile.skeleton").length,
     ready: document.querySelectorAll(".tile-thumb-ready").length,
     loading: document.querySelectorAll(".tile-thumb-loading").length,
@@ -176,14 +178,23 @@ async function switchToFolder(cdp, snap, op, folderId, label) {
     return;
   }
   record(label, Date.now() - t0);
-  // Wait for thumbnails to render (or confirm the folder is genuinely empty).
+  // Wait for content to render: either media thumbnails (folders with direct
+  // media) or subfolder cover images (subfolders-only folders like the root).
   let s = await snap();
-  for (let i = 0; i < 70 && s.tiles > 0 && s.imgs < Math.min(s.tiles, 6); i += 1) {
+  for (
+    let i = 0;
+    i < 70 &&
+    ((s.tiles > 0 && s.imgs < Math.min(s.tiles, 6)) ||
+      (s.tiles === 0 && s.subfolderCards > 0 && s.subfolderCoverImgs === 0));
+    i += 1
+  ) {
     await delay(150);
     s = await snap();
   }
   if (s.tiles > 0 && s.imgs === 0) {
-    fail(op, `${label}: thumbnails never rendered`, `folder ${folderId} tiles=${s.tiles} imgs=0`);
+    fail(op, `${label}: media thumbnails never rendered`, `folder ${folderId} tiles=${s.tiles} imgs=0`);
+  } else if (s.tiles === 0 && s.subfolderCards > 0 && s.subfolderCoverImgs === 0) {
+    fail(op, `${label}: subfolder covers never rendered`, `folder ${folderId} cards=${s.subfolderCards} coverImgs=0`);
   }
 }
 
@@ -269,26 +280,38 @@ async function main() {
       op += 1;
     }
     if (i % 4 === 1) {
-      // Open + close a preview.
-      const t0 = Date.now();
-      await cdp.run(`document.querySelector(".media-tile")?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }))`);
-      let previewMs = null;
-      for (let k = 0; k < 70; k += 1) {
-        const s = await snap();
-        if (s.previewReady) {
-          previewMs = Date.now() - t0;
-          break;
+      // Open + close a preview — but only when the current view actually has a
+      // media tile. A subfolders-only view (e.g. the root with "show subfolder
+      // contents" on) renders .subfolder-card covers, not .media-tile, so there
+      // is nothing to preview; that is not a hang.
+      const hasTile = await cdp.evalJson(`Boolean(document.querySelector(".media-tile"))`);
+      if (hasTile) {
+        const t0 = Date.now();
+        // Double-click and confirm a tile actually received it (guards the race
+        // where a scan-refresh replaces tiles between the check and the click).
+        const clicked = await cdp.evalJson(
+          `(() => { const t = document.querySelector(".media-tile"); if (!t) return false; t.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`
+        );
+        if (clicked) {
+          let previewMs = null;
+          for (let k = 0; k < 70; k += 1) {
+            const s = await snap();
+            if (s.previewReady) {
+              previewMs = Date.now() - t0;
+              break;
+            }
+            await delay(60);
+          }
+          if (previewMs === null) fail(op, "preview never became ready", `${Date.now() - t0}ms`);
+          else {
+            record("previewOpen", previewMs);
+            if (previewMs > BUDGET.previewOpenMs) fail(op, "preview slow", `${previewMs}ms`);
+          }
+          await cdp.run(`document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
+          await delay(150);
+          op += 1;
         }
-        await delay(60);
       }
-      if (previewMs === null) fail(op, "preview never became ready", `${Date.now() - t0}ms`);
-      else {
-        record("previewOpen", previewMs);
-        if (previewMs > BUDGET.previewOpenMs) fail(op, "preview slow", `${previewMs}ms`);
-      }
-      await cdp.run(`document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
-      await delay(150);
-      op += 1;
     }
     if (i % 5 === 2) {
       await scrollTree(cdp, snap, op);
