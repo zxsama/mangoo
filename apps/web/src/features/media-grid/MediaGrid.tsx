@@ -308,9 +308,13 @@ export function MediaGrid({
     mediaSlots !== undefined &&
     windowedLayoutMode &&
     (mediaItemCount > items.length || mediaItemCount > WINDOWED_MEDIA_COUNT_THRESHOLD);
+  // Only the non-windowed (justified/masonry) layout needs the fully ordered
+  // media list. In windowed grid/list mode `layoutItems` is empty, so sorting
+  // every loaded slot on each window load is pure O(n log n) main-thread waste
+  // that grows with scroll depth — skip it there and read slots directly.
   const orderedLoadedMedia = useMemo(
-    () => (mediaSlots !== undefined ? compactMediaSlots(mediaSlots) : items),
-    [items, mediaSlots]
+    () => (mediaSlots !== undefined && !windowedMedia ? compactMediaSlots(mediaSlots) : items),
+    [items, mediaSlots, windowedMedia]
   );
   const layoutItems = windowedMedia ? EMPTY_MEDIA_ITEMS : orderedLoadedMedia;
   const layout = useMemo(
@@ -378,11 +382,21 @@ export function MediaGrid({
     for (const item of items) {
       map.set(item.id, item);
     }
-    for (const item of orderedLoadedMedia) {
-      map.set(item.id, item);
+    // Read slot records directly (order-independent) so windowed mode, which
+    // skips the sorted `orderedLoadedMedia`, still resolves loaded media by id.
+    if (mediaSlots !== undefined) {
+      for (const item of mediaSlots.values()) {
+        if (item) {
+          map.set(item.id, item);
+        }
+      }
+    } else {
+      for (const item of orderedLoadedMedia) {
+        map.set(item.id, item);
+      }
     }
     return map;
-  }, [items, orderedLoadedMedia]);
+  }, [items, mediaSlots, orderedLoadedMedia]);
   const layoutItemIndexById = useMemo(() => {
     const map = new Map<number, number>();
     layoutItems.forEach((item, index) => {
