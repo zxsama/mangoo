@@ -671,17 +671,20 @@ impl Database {
         Ok(())
     }
 
-    fn checkpoint_wal_if_larger_than(&self, threshold_bytes: u64) -> anyhow::Result<bool> {
+    fn wal_size_bytes(&self) -> anyhow::Result<u64> {
         let Some(path) = &self.path else {
-            return Ok(false);
+            return Ok(0);
         };
         let wal_path = Self::wal_path_for_db_path(path);
-        let wal_size = match std::fs::metadata(&wal_path) {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        if wal_size <= threshold_bytes {
+        match std::fs::metadata(&wal_path) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn checkpoint_wal_if_larger_than(&self, threshold_bytes: u64) -> anyhow::Result<bool> {
+        if self.wal_size_bytes()? <= threshold_bytes {
             return Ok(false);
         }
         let busy: i64 =
@@ -695,19 +698,39 @@ impl Database {
     /// freezes an in-flight interactive writer mid-scroll; instead a dedicated
     /// thread calls this periodically.
     ///
-    /// It runs ONLY a PASSIVE checkpoint, which never blocks concurrent
+    /// It normally runs a PASSIVE checkpoint, which never blocks concurrent
     /// readers/writers — it copies as many committed WAL frames back into the DB
-    /// as it can without waiting for the write lock. Run frequently this keeps
-    /// the WAL bounded under heavy blob ingestion. A blocking TRUNCATE/RESTART
-    /// checkpoint is deliberately avoided here: on a large WAL it takes an
-    /// exclusive lock and freezes every reader and writer for ~2s (the single
-    /// per-run stall this replaces). The WAL file settling at a steady size is
-    /// fine — mmap keeps reads cheap and `journal_size_limit` caps on-disk size.
+    /// as it can without waiting for the write lock.
+    ///
+    /// PASSIVE alone is NOT enough under sustained thumbnail generation: with
+    /// continuous overlapping readers a PASSIVE checkpoint can never advance the
+    /// WAL's backfill point to the end, so the WAL never resets to frame 0 and the
+    /// file grows without bound — measured multi-GB WALs during a large "generate
+    /// all", which makes every read and write crawl (the "thumbnails stop
+    /// refreshing" freeze). `journal_size_limit` cannot help because it only
+    /// truncates a WAL that a checkpoint has already emptied. So when the WAL has
+    /// grown past the truncate threshold, escalate to a TRUNCATE checkpoint to
+    /// reclaim it. That takes a brief exclusive lock, but only when the WAL is
+    /// already large (rare), and truncating a bounded WAL is far cheaper — and far
+    /// better — than letting it grow to gigabytes.
     pub fn run_periodic_wal_checkpoint(&self) -> anyhow::Result<()> {
         if self.path.is_none() {
             return Ok(());
         }
         crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
+        if self.wal_size_bytes()? > WAL_TRUNCATE_THRESHOLD_BYTES {
+            // The WAL has outgrown what a PASSIVE checkpoint can reclaim (under
+            // continuous blob commits it never gets to reset the WAL to frame 0).
+            // Signal blob workers to pause — they call `wait_for_pending_checkpoint`
+            // before committing — so this TRUNCATE gets an exclusive window and can
+            // actually shrink the file. Give in-flight commits a brief moment to
+            // reach that pause point, then truncate.
+            let _checkpoint = crate::write_gate::interactive_write_gate().begin_checkpoint();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            if self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)? {
+                return Ok(());
+            }
+        }
         self.connection
             .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
                 row.get::<_, i64>(0)
@@ -2956,6 +2979,9 @@ impl Database {
         // long background write; yield the WAL writer to any pending interactive
         // write (scroll priority-scope) before taking it so browsing stays fluid.
         crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
+        // Also pause for a pending WAL TRUNCATE so a long scan cannot starve the
+        // checkpoint and bloat the WAL (the "open a new directory" write storm).
+        crate::write_gate::interactive_write_gate().wait_for_pending_checkpoint();
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         for entry in &entries {
@@ -3961,6 +3987,9 @@ impl Database {
         // priority-scope, on-demand thumbnail promotion) before taking it, so
         // browsing stays fluid while a scan is still running.
         crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
+        // Also pause for a pending WAL TRUNCATE so a long scan cannot starve the
+        // checkpoint and bloat the WAL (the "open a new directory" write storm).
+        crate::write_gate::interactive_write_gate().wait_for_pending_checkpoint();
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let root_ids = scan_batch_root_ids(&batch);
@@ -4018,6 +4047,9 @@ impl Database {
         // pending interactive write before taking it, exactly like
         // `commit_scan_batch` and the background blob workers.
         crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
+        // Also pause for a pending WAL TRUNCATE so a long scan cannot starve the
+        // checkpoint and bloat the WAL (the "open a new directory" write storm).
+        crate::write_gate::interactive_write_gate().wait_for_pending_checkpoint();
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         ensure_task_attempt_running_in_transaction(&transaction, task_id, attempt_generation)?;

@@ -1160,6 +1160,10 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
     // actually pending, so briefly deferring a foreground blob commit to let a
     // viewport write land is a net win for perceived responsiveness.
     crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
+    // Also pause (longer, bounded) if the checkpoint thread needs to TRUNCATE a
+    // large WAL. Continuous blob commits otherwise prevent the checkpoint from
+    // ever resetting the WAL, so it grows to gigabytes and freezes the whole DB.
+    crate::write_gate::interactive_write_gate().wait_for_pending_checkpoint();
     let blob = ThumbBlobRecord {
         file_id,
         profile: GRID_320_PROFILE.to_string(),

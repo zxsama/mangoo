@@ -30,6 +30,16 @@ const YIELD_SLEEP: Duration = Duration::from_micros(250);
 /// only delays blob ingestion, never blocks it.
 const YIELD_MAX_WAIT: Duration = Duration::from_millis(30);
 
+/// Ceiling on how long a blob commit will wait for a pending WAL TRUNCATE
+/// checkpoint. Generous (unlike the 30ms interactive yield) because a TRUNCATE of
+/// a few-hundred-MB WAL needs an actual exclusive window to complete, and without
+/// it the WAL grows without bound under sustained generation (multi-GB WALs that
+/// freeze all reads/writes). Bounded so a stuck checkpoint can never starve
+/// ingestion — the worker proceeds after this and the checkpoint retries.
+const CHECKPOINT_YIELD_MAX_WAIT: Duration = Duration::from_millis(2000);
+/// Sleep between polls while a blob worker waits for a pending checkpoint.
+const CHECKPOINT_YIELD_SLEEP: Duration = Duration::from_millis(5);
+
 /// Process-global gate. The Core runs a single logical database, so a global is
 /// simpler than threading an `Arc` through `start_worker` and every API state.
 static INTERACTIVE_WRITE_GATE: LazyLock<InteractiveWriteGate> =
@@ -44,11 +54,45 @@ pub fn interactive_write_gate() -> &'static InteractiveWriteGate {
 #[derive(Default)]
 pub struct InteractiveWriteGate {
     pending: AtomicUsize,
+    checkpoint_pending: AtomicUsize,
 }
 
 impl InteractiveWriteGate {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Mark that the dedicated checkpoint thread is about to run a TRUNCATE
+    /// checkpoint that needs an exclusive window. Blob workers call
+    /// `wait_for_pending_checkpoint` and pause before their commit so the WAL can
+    /// actually be reset — under continuous blob commits an ordinary checkpoint
+    /// never gets the write lock and the WAL grows unbounded. The guard clears the
+    /// mark on drop.
+    pub fn begin_checkpoint(&self) -> CheckpointGuard<'_> {
+        self.checkpoint_pending.fetch_add(1, Ordering::SeqCst);
+        CheckpointGuard { gate: self }
+    }
+
+    fn checkpoint_pending(&self) -> bool {
+        self.checkpoint_pending.load(Ordering::SeqCst) > 0
+    }
+
+    /// Called by a blob worker just before it takes the WAL write lock. If a
+    /// TRUNCATE checkpoint is pending, pause (bounded) so the checkpoint gets an
+    /// exclusive window to reset the WAL. Unlike the interactive yield this waits
+    /// long enough for a real checkpoint to complete, because bounding the WAL is
+    /// what keeps the whole database fast.
+    pub fn wait_for_pending_checkpoint(&self) {
+        if !self.checkpoint_pending() {
+            return;
+        }
+        let deadline = Instant::now() + CHECKPOINT_YIELD_MAX_WAIT;
+        while self.checkpoint_pending() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(CHECKPOINT_YIELD_SLEEP);
+        }
     }
 
     /// Mark that an interactive (latency-sensitive) write is about to run. The
@@ -89,6 +133,16 @@ pub struct InteractiveWriteGuard<'a> {
 impl Drop for InteractiveWriteGuard<'_> {
     fn drop(&mut self) {
         self.gate.pending.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub struct CheckpointGuard<'a> {
+    gate: &'a InteractiveWriteGate,
+}
+
+impl Drop for CheckpointGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.checkpoint_pending.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -139,5 +193,43 @@ mod tests {
         let start = Instant::now();
         gate.yield_to_pending_interactive_writes();
         assert!(start.elapsed() < YIELD_MAX_WAIT + Duration::from_millis(20));
+    }
+
+    #[test]
+    fn no_pending_checkpoint_means_no_wait() {
+        let gate = InteractiveWriteGate::new();
+        let start = Instant::now();
+        gate.wait_for_pending_checkpoint();
+        assert!(start.elapsed() < Duration::from_millis(5));
+    }
+
+    #[test]
+    fn checkpoint_guard_marks_and_clears_pending() {
+        let gate = InteractiveWriteGate::new();
+        assert!(!gate.checkpoint_pending());
+        {
+            let _guard = gate.begin_checkpoint();
+            assert!(gate.checkpoint_pending());
+        }
+        assert!(!gate.checkpoint_pending());
+    }
+
+    #[test]
+    fn checkpoint_wait_is_bounded_when_checkpoint_stays_pending() {
+        let gate = InteractiveWriteGate::new();
+        let _guard = gate.begin_checkpoint();
+        // The checkpoint never clears during this call, so the wait must still
+        // return within the hard ceiling rather than block ingestion forever.
+        let start = Instant::now();
+        gate.wait_for_pending_checkpoint();
+        assert!(start.elapsed() < CHECKPOINT_YIELD_MAX_WAIT + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn interactive_and_checkpoint_gates_are_independent() {
+        let gate = InteractiveWriteGate::new();
+        let _interactive = gate.begin_interactive_write();
+        assert!(gate.interactive_write_pending());
+        assert!(!gate.checkpoint_pending());
     }
 }
