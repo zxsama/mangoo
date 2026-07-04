@@ -1859,7 +1859,11 @@ button:disabled {
   overflow: hidden;
   border: 0;
   border-radius: inherit;
-  background: transparent;
+  /* Pale placeholder tone (not transparent-over-dark) so that while the cover
+     image fades in, no dark card surface shows through. */
+  background:
+    linear-gradient(135deg, rgba(151, 219, 226, 0.1), rgba(239, 141, 127, 0.05)),
+    var(--surface-2);
   box-shadow: 0 8px 18px rgba(0, 0, 0, 0.2);
 }
 
@@ -5521,7 +5525,19 @@ button:disabled {
     var(--surface-2);
 }
 
-/* Freshly loaded thumbnails fade in over 0.2s (the --fade variant). A thumbnail
+/* The original-decode fallback container (shown while a WebP thumbnail is still
+   generating — most tiles on a cold library) must ALSO be the pale placeholder
+   tone, not the dark .tile-thumb base. Otherwise the dark base shows through
+   during the fade-in (opacity < 1) and for images with transparency — the brief
+   dark-box flash seen on some tiles while browsing a cold/scanning library. */
+.tile-thumb-original-fallback,
+.tile-thumb[data-preview-placeholder] {
+  background:
+    linear-gradient(135deg, rgba(151, 219, 226, 0.1), rgba(239, 141, 127, 0.05)),
+    var(--surface-2);
+}
+
+/* Freshly loaded thumbnails fade in over 0.33s (the --fade variant). A thumbnail
    that was already cached (a tile scrolled back into view) renders WITHOUT the
    fade so it appears instantly and never re-flashes a placeholder. */
 @keyframes tileThumbImageFadeIn {
@@ -5533,8 +5549,9 @@ button:disabled {
   }
 }
 
-.tile-thumb-image--fade {
-  animation: tileThumbImageFadeIn 0.2s ease-out both;
+.tile-thumb-image--fade,
+.subfolder-card-cover-image--fade {
+  animation: tileThumbImageFadeIn 0.33s ease-out both;
 }
 
 .preview-stage .preview-placeholder.ready,

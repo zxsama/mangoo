@@ -215,6 +215,10 @@ function FolderCoverPreview({
   const [retryTick, setRetryTick] = useState(0);
   const objectUrlRef = useRef<string | null>(src);
   const cacheOwnsObjectUrlRef = useRef(src !== null);
+  // Fade the cover in only when it was NOT already cached at mount, matching the
+  // media-grid tiles: a fresh cover fades in (0.33s), a cover scrolled back into
+  // view with its object URL still cached renders instantly with no re-flash.
+  const shouldFadeInRef = useRef(src === null);
 
   useEffect(() => {
     if (!coverMediaItem || !cacheKey) {
@@ -325,7 +329,16 @@ function FolderCoverPreview({
 
   return (
     <span className="subfolder-card-cover-image-frame" data-cover-status="ready">
-      <img alt="" className="subfolder-card-cover-image" loading="lazy" src={src} />
+      <img
+        alt=""
+        className={
+          shouldFadeInRef.current
+            ? "subfolder-card-cover-image subfolder-card-cover-image--fade"
+            : "subfolder-card-cover-image"
+        }
+        loading="lazy"
+        src={src}
+      />
     </span>
   );
 }

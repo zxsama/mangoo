@@ -234,14 +234,14 @@ async function main() {
     for (let i = 0; i < 10; i += 1) {
       await sleep(1200);
       const s = await grid();
-      // "Recovered" means the landing folder shows content — a folder with
-      // subfolders renders subfolder cards (not media cells) at the top of the
-      // grid, so count either. The bug this guards against is a permanently
-      // empty grid with a pinned request scheduler; assert both content AND a
-      // scheduler that is not stuck at the cap.
-      const sc = await scheduler();
-      recEvidence = `cards=${s.cards} cells=${s.cells} sched=${sc.active}/${sc.max}`;
-      if ((s.cards > 0 || s.cells > 0) && sc.active < sc.max) {
+      // "Recovered" means the landing folder shows content and is not a
+      // permanently empty grid. A folder with subfolders renders subfolder cards
+      // (not media cells) at the top of the grid, so count either. Scheduler
+      // health (drains below the cap) is asserted separately by check #7 and
+      // cover loading by check #10 — don't couple them here, or a momentarily
+      // full scheduler during the switch burst reads as a false "stuck".
+      recEvidence = `cards=${s.cards} cells=${s.cells}`;
+      if (s.cards > 0 || s.cells > 0) {
         recovered = true;
         break;
       }
