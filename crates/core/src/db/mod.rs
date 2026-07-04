@@ -16,7 +16,11 @@ use crate::thumbnails::{
 
 #[allow(dead_code)]
 pub const WAL_MODE: &str = "WAL";
-const WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
+// 0 disables SQLite's inline auto-checkpoint; a dedicated thread checkpoints
+// off the hot path (see `run_periodic_wal_checkpoint`). Keeping some inline
+// checkpointing as a safety net would reintroduce the mid-write freeze this
+// avoids, so it is fully off and the thread is responsible for bounding the WAL.
+const WAL_AUTOCHECKPOINT_PAGES: i64 = 0;
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 /// `synchronous=NORMAL` (1) is the recommended setting under WAL: it never
@@ -678,6 +682,31 @@ impl Database {
             self.connection
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
         Ok(busy == 0)
+    }
+
+    /// Run one WAL checkpoint pass on a dedicated (non-hot-path) connection.
+    /// Auto-checkpoint is disabled on file connections so a checkpoint never
+    /// freezes an in-flight interactive writer mid-scroll; instead a dedicated
+    /// thread calls this periodically.
+    ///
+    /// It runs ONLY a PASSIVE checkpoint, which never blocks concurrent
+    /// readers/writers — it copies as many committed WAL frames back into the DB
+    /// as it can without waiting for the write lock. Run frequently this keeps
+    /// the WAL bounded under heavy blob ingestion. A blocking TRUNCATE/RESTART
+    /// checkpoint is deliberately avoided here: on a large WAL it takes an
+    /// exclusive lock and freezes every reader and writer for ~2s (the single
+    /// per-run stall this replaces). The WAL file settling at a steady size is
+    /// fine — mmap keeps reads cheap and `journal_size_limit` caps on-disk size.
+    pub fn run_periodic_wal_checkpoint(&self) -> anyhow::Result<()> {
+        if self.path.is_none() {
+            return Ok(());
+        }
+        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
+        self.connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        Ok(())
     }
 
     fn wal_path_for_db_path(path: &Path) -> PathBuf {
@@ -2917,7 +2946,10 @@ impl Database {
         let mut task_id_to_wake = None;
         // Enqueue the whole batch under one transaction: "generate cache" can
         // touch thousands of files, and a per-file commit (plus a per-file
-        // get_thumbnail) was a large multiple of the necessary work.
+        // get_thumbnail) was a large multiple of the necessary work. This is a
+        // long background write; yield the WAL writer to any pending interactive
+        // write (scroll priority-scope) before taking it so browsing stays fluid.
+        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         for entry in &entries {
@@ -3908,6 +3940,12 @@ impl Database {
         // `busy_timeout`. Acquiring the write lock up front lets the busy
         // handler retry transparently and prevents transient "database is
         // locked" failures.
+        //
+        // A scan batch is a long background write (folders + files + media).
+        // Yield the WAL writer to any pending interactive write (scroll
+        // priority-scope, on-demand thumbnail promotion) before taking it, so
+        // browsing stays fluid while a scan is still running.
+        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let root_ids = scan_batch_root_ids(&batch);
@@ -7036,6 +7074,12 @@ fn configure_file_database_wal(connection: &Connection) -> anyhow::Result<()> {
     connection.pragma_update(None, "journal_mode", WAL_MODE)?;
     // Must follow journal_mode=WAL: NORMAL is only safe under WAL.
     connection.pragma_update(None, "synchronous", SQLITE_SYNCHRONOUS_NORMAL)?;
+    // Disable inline auto-checkpoint: SQLite's auto-checkpoint runs on the
+    // committing writer's own thread, so a checkpoint of a large WAL freezes
+    // whichever interactive scroll write or blob commit happened to trip the
+    // page threshold (measured ~1.8s stalls on a 650k-file library). A
+    // dedicated background thread (see `run_periodic_wal_checkpoint` +
+    // `start_wal_checkpoint_thread`) checkpoints off the hot path instead.
     connection.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
     connection.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
     connection.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)?;

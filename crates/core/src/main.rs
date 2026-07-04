@@ -7,6 +7,7 @@ mod scan;
 mod tasks;
 mod thumbnails;
 mod watch;
+mod write_gate;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

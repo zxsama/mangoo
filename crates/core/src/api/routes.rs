@@ -789,38 +789,43 @@ async fn get_thumbnail(
         return Ok((status, Json(thumbnail_response(thumbnail, blob))));
     }
 
-    let (thumbnail, blob, queued_task) = run_shared_database(state.clone(), move |database| {
-        let thumbnail = database
-            .get_thumbnail(file_id, target)?
-            .ok_or_else(|| CoreError::not_found(format!("media item not found: {file_id}")))?;
-        let (thumbnail, queued_task) = if is_pending_status(&thumbnail.state) {
-            let request = database
-                .request_thumbnail_task(file_id, target, priority)
-                .map_err(map_thumbnail_request_error)?;
-            let queued_task_id = if request.should_enqueue {
-                request.task_id
+    let (thumbnail, blob, queued_task) = {
+        // This on-demand promotion is a latency-sensitive interactive write;
+        // mark it so background blob workers yield the WAL writer to it.
+        let _interactive = crate::write_gate::interactive_write_gate().begin_interactive_write();
+        run_shared_database(state.clone(), move |database| {
+            let thumbnail = database
+                .get_thumbnail(file_id, target)?
+                .ok_or_else(|| CoreError::not_found(format!("media item not found: {file_id}")))?;
+            let (thumbnail, queued_task) = if is_pending_status(&thumbnail.state) {
+                let request = database
+                    .request_thumbnail_task(file_id, target, priority)
+                    .map_err(map_thumbnail_request_error)?;
+                let queued_task_id = if request.should_enqueue {
+                    request.task_id
+                } else {
+                    None
+                };
+                let queued_task = queued_task_id
+                    .map(|task_id| {
+                        database
+                            .current_task_attempt_generation(task_id)
+                            .map(|attempt| (task_id, attempt, requested_task_priority))
+                    })
+                    .transpose()?;
+                (request.thumbnail, queued_task)
+            } else {
+                (thumbnail, None)
+            };
+            let blob = if thumbnail.state.as_str() == "ready" {
+                database.get_thumb_blob(file_id, target)?
             } else {
                 None
             };
-            let queued_task = queued_task_id
-                .map(|task_id| {
-                    database
-                        .current_task_attempt_generation(task_id)
-                        .map(|attempt| (task_id, attempt, requested_task_priority))
-                })
-                .transpose()?;
-            (request.thumbnail, queued_task)
-        } else {
-            (thumbnail, None)
-        };
-        let blob = if thumbnail.state.as_str() == "ready" {
-            database.get_thumb_blob(file_id, target)?
-        } else {
-            None
-        };
-        Ok((thumbnail, blob, queued_task))
-    })
-    .await?;
+            Ok((thumbnail, blob, queued_task))
+        })
+        .await?
+    };
     if let Some((task_id, attempt_generation, task_priority)) = queued_task {
         enqueue_thumbnail_task_wakeup(&state, task_id, attempt_generation, task_priority, false)
             .await?;
@@ -1076,6 +1081,9 @@ async fn sync_thumbnail_priority_scope(
     let selected_file_ids = payload.selected_file_ids;
     let visible_file_ids = payload.visible_file_ids;
     let ahead_file_ids = payload.ahead_file_ids;
+    // Mark this scroll write as interactive so background blob workers yield the
+    // WAL writer to it (see write_gate). Held across the shared-DB call.
+    let _interactive = crate::write_gate::interactive_write_gate().begin_interactive_write();
     let promoted_tasks = run_shared_database(state.clone(), move |database| {
         if database.get_root(root_id)?.is_none() {
             return Err(CoreError::not_found(format!("root not found: {}", root_id)));

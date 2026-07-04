@@ -18,9 +18,33 @@ const TASK_PROGRESS_FLUSH_INTERVAL_ITEMS: i64 = 100;
 const THUMBNAIL_SOURCE_CHANGED_ERROR: &str = "thumbnail source changed while processing";
 const FFMPEG_NOT_AVAILABLE_ERROR: &str = "ffmpeg not available";
 const THUMBNAIL_SELECTED_WORKER_CONCURRENCY: usize = 1;
-const THUMBNAIL_FOREGROUND_WORKER_CONCURRENCY: usize = 12;
-const THUMBNAIL_BACKGROUND_WORKER_CONCURRENCY: usize = 2;
+// Every blob commit takes BEGIN IMMEDIATE on its own connection. Too many
+// concurrent blob writers thrash SQLite's busy-handler retry (a backoff-sleep
+// loop, not a fair queue), so an interactive scroll write can spin ~1s to
+// acquire the write lock even though every individual commit is ~1ms. Capping
+// foreground blob writers keeps WAL-writer contention low so interactive writes
+// acquire the lock promptly. Measured on a 650k-file library: 12/2 gave
+// priority-scope p95 ~190ms with 1-2s max stalls; 4/1 gave p95 ~30ms.
+const THUMBNAIL_FOREGROUND_WORKER_CONCURRENCY: usize = 4;
+const THUMBNAIL_BACKGROUND_WORKER_CONCURRENCY: usize = 1;
 const IDLE_PENDING_TASK_DRAIN_INTERVAL_MS: u64 = 250;
+/// How often the dedicated checkpoint thread runs a WAL checkpoint pass. Short
+/// enough to keep the WAL small under heavy blob ingestion, long enough that the
+/// PASSIVE checkpoints do not themselves become a source of writer contention.
+const WAL_CHECKPOINT_INTERVAL_MS: u64 = 500;
+
+/// Spawn the dedicated WAL-checkpoint thread. Owns its own connection so it
+/// never contends with the API write mutex or the worker's task connection, and
+/// checkpoints off the hot path (auto-checkpoint is disabled) so no interactive
+/// or blob write ever pays the checkpoint cost inline.
+fn start_wal_checkpoint_thread(checkpoint_database: Database) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(WAL_CHECKPOINT_INTERVAL_MS));
+        if let Err(error) = checkpoint_database.run_periodic_wal_checkpoint() {
+            tracing::warn!(%error, "periodic WAL checkpoint failed");
+        }
+    });
+}
 
 pub type TaskSender = mpsc::Sender<i64>;
 
@@ -206,6 +230,12 @@ pub fn start_worker_with_ffmpeg(worker_database: Database, ffmpeg_available: boo
     worker_database
         .reset_running_thumbnail_tasks_for_recovery()
         .expect("reset running thumbnail tasks for startup recovery");
+    // Auto-checkpoint is disabled (see configure_file_database_wal). Run WAL
+    // checkpoints on a dedicated connection/thread so a large checkpoint never
+    // freezes an interactive scroll write or a blob commit mid-transaction.
+    if let Ok(Some(checkpoint_database)) = worker_database.reopen() {
+        start_wal_checkpoint_thread(checkpoint_database);
+    }
     let (sender, mut receiver) = mpsc::channel(128);
     let (task_completion_sender, mut task_completion_receiver) = mpsc::unbounded_channel();
     let thumbnail_permits = ThumbnailWorkerPermits {
@@ -1112,6 +1142,14 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
     // Captured from the decode this task already ran; persisted to media in the
     // publish transaction below so the layout engine gets real aspect ratios.
     let source_dimensions = Some((generated.source_width, generated.source_height));
+    // Background/bulk blob commits are the write-storm source during a
+    // "generate all". Yield the WAL writer to any pending interactive write
+    // (scroll priority-scope, on-demand thumbnail promotion) before taking this
+    // publish transaction, so browsing stays fluid while ingestion runs. Ahead/
+    // visible/selected thumbnails are user-awaited and never yield.
+    if task.priority <= crate::db::THUMBNAIL_BACKGROUND_PRIORITY {
+        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
+    }
     let blob = ThumbBlobRecord {
         file_id,
         profile: GRID_320_PROFILE.to_string(),
