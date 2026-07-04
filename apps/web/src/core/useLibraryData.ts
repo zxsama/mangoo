@@ -1590,12 +1590,19 @@ export function useLibraryData(
       if (folderId === null) {
         return;
       }
-      await loadFolderChildren(folderId);
+      // Force a re-fetch during the scan: loadFolderChildren short-circuits on
+      // its cache, so once the sidebar cached the few sibling folders indexed
+      // early in the scan it would never pick up the rest as they are scanned
+      // in (a deep folder tree indexes its first child's contents fully before
+      // the next sibling appears). Re-fetching the expanded folder's children
+      // each refresh surfaces newly-scanned siblings; React reconciles by key so
+      // already-shown folders do not flicker.
+      await loadFolderChildren(folderId, { force: true });
       if (!isCurrentScanRefreshSelection(selectionToken)) {
         return;
       }
       if (root?.rootFolderId && root.rootFolderId !== folderId) {
-        await loadFolderChildren(root.rootFolderId);
+        await loadFolderChildren(root.rootFolderId, { force: true });
       }
       await reloadCurrentMedia({
         rootId: selectionToken.rootId,
