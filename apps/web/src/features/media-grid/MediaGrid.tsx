@@ -423,14 +423,26 @@ export function MediaGrid({
   // Prefetch ~one screenful of rows in EACH direction (above + below the
   // viewport) so thumbnails a full page out are already loaded before they
   // scroll in — moving the load off the visible area for a smoother scroll.
+  // Applies to both the uniform windowed grid and the justified full-total
+  // layout (the row height differs: fixed rows vs the estimated segment size).
   const mediaPrefetchRowCount = useMemo(() => {
     const base = Math.max(1, aheadRowCount);
-    if (!windowedMedia || mediaWindow.rowHeight <= 0 || viewportSize.height <= 0) {
+    if (viewportSize.height <= 0) {
       return base;
     }
-    const screenRows = Math.ceil(viewportSize.height / mediaWindow.rowHeight);
+    const rowHeight = windowedMedia ? mediaWindow.rowHeight : activeMediaEstimatedSegmentSize;
+    if (rowHeight <= 0) {
+      return base;
+    }
+    const screenRows = Math.ceil(viewportSize.height / rowHeight);
     return Math.max(base, screenRows);
-  }, [aheadRowCount, mediaWindow.rowHeight, viewportSize.height, windowedMedia]);
+  }, [
+    aheadRowCount,
+    activeMediaEstimatedSegmentSize,
+    mediaWindow.rowHeight,
+    viewportSize.height,
+    windowedMedia
+  ]);
   const folderWindow = useMemo(
     () =>
       buildFolderWindowGeometry({
@@ -608,14 +620,12 @@ export function MediaGrid({
     getScrollElement: () => parentRef.current,
     estimateSize: (index) => resolveVirtualSegment(index)?.size ?? activeMediaEstimatedSegmentSize,
     initialOffset: savedScrollTop,
-    // Render ~one screenful of rows beyond the viewport in the windowed grid so
-    // the prefetched off-screen tiles mount and load their thumbnails ahead of
-    // the scroll (they render as ready when they enter view).
-    overscan: windowedMedia
-      ? Math.max(6, mediaPrefetchRowCount)
-      : layoutMode === "waterfall"
-        ? 6
-        : 4,
+    // Render ~one screenful of rows beyond the viewport in BOTH directions for
+    // every media layout (windowed grid, justified full-total, and the loaded-
+    // list justified path), so the prefetched off-screen tiles mount and load
+    // their thumbnails ahead of the scroll and render as ready when they enter
+    // view.
+    overscan: Math.max(layoutMode === "waterfall" ? 6 : 4, mediaPrefetchRowCount),
   });
   const virtualItems = virtualRows.getVirtualItems();
 
@@ -2212,6 +2222,10 @@ function ReadyThumbnail({
   const [retryToken, setRetryToken] = useState(0);
   const objectUrlRef = useRef<string | null>(src);
   const cacheOwnsObjectUrlRef = useRef(src !== null);
+  // Fade in only when the image was NOT already available at mount. A tile that
+  // scrolls back into view with its object URL still cached renders instantly
+  // (no fade, no placeholder re-flash); a freshly fetched thumbnail fades in.
+  const shouldFadeInRef = useRef(src === null);
 
   useEffect(() => {
     const cachedObjectUrl = readCachedThumbnailObjectUrl(cacheKey);
@@ -2344,7 +2358,15 @@ function ReadyThumbnail({
 
   return (
     <div className={`${className} tile-thumb-ready`} style={style}>
-      <img alt={alt} className="tile-thumb-image" decoding="async" loading="eager" src={src} />
+      <img
+        alt={alt}
+        className={
+          shouldFadeInRef.current ? "tile-thumb-image tile-thumb-image--fade" : "tile-thumb-image"
+        }
+        decoding="async"
+        loading="eager"
+        src={src}
+      />
       <ThumbnailInteractionRing />
     </div>
   );
