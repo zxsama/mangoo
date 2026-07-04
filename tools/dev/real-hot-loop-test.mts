@@ -312,7 +312,14 @@ async function addRoot(): Promise<AcceptedRoot> {
 // root scan reaches a terminal status (whichever happens first). Returns the
 // last observed totalCount so the operation plan can be sized against real
 // data instead of guessing.
+//
+// With MEGLE_HOTLOOP_WAIT_SCAN_DONE=1 it instead waits for the root scan to
+// finish, so the 100-op loop measures STEADY-STATE browsing (background
+// thumbnail generation only) rather than browsing during the one-time initial
+// scan. Without it, the loop runs while the scan is still writing — the harsher
+// "browse while indexing" worst case.
 async function waitForIndexThreshold(rootId: number, scanTaskId: number): Promise<number> {
+  const waitScanDone = process.env.MEGLE_HOTLOOP_WAIT_SCAN_DONE === "1";
   const start = Date.now();
   let lastTotalCount = 0;
   while (Date.now() - start < INDEX_WAIT_TIMEOUT_MS) {
@@ -320,22 +327,24 @@ async function waitForIndexThreshold(rootId: number, scanTaskId: number): Promis
     if (typeof page.totalCount === "number") {
       lastTotalCount = page.totalCount;
     }
-    if (lastTotalCount >= INDEX_THRESHOLD) {
-      return lastTotalCount;
-    }
     const scanTask = await getTask(scanTaskId);
     if (scanTask && TERMINAL_TASK_STATUSES.has(scanTask.status)) {
       log(
-        `scan reached terminal status ${scanTask.status} before hitting the ${INDEX_THRESHOLD} index threshold ` +
+        `scan reached terminal status ${scanTask.status} ` +
           `(observed totalCount=${lastTotalCount})`
       );
       return lastTotalCount;
     }
-    log(`indexing... totalCount=${lastTotalCount} (threshold=${INDEX_THRESHOLD}, scan=${scanTask?.status ?? "unknown"})`);
+    if (!waitScanDone && lastTotalCount >= INDEX_THRESHOLD) {
+      return lastTotalCount;
+    }
+    const mode = waitScanDone ? "waiting for scan to finish" : `threshold=${INDEX_THRESHOLD}`;
+    log(`indexing... totalCount=${lastTotalCount} (${mode}, scan=${scanTask?.status ?? "unknown"})`);
     await delay(500);
   }
   throw new Error(
-    `index did not reach ${INDEX_THRESHOLD} media rows within ${INDEX_WAIT_TIMEOUT_MS}ms (last observed totalCount=${lastTotalCount})`
+    `index wait timed out after ${INDEX_WAIT_TIMEOUT_MS}ms (last observed totalCount=${lastTotalCount}, ` +
+      `waitScanDone=${waitScanDone})`
   );
 }
 
