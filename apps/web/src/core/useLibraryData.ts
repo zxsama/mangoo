@@ -207,6 +207,9 @@ type PendingInteractiveScanRequest = {
 
 type UseLibraryDataOptions = {
   persistentThumbnailCacheAutoRefresh: boolean;
+  // When true, enqueue background generation of ALL thumbnails once a root is
+  // available (whole-library). Default false: only viewport thumbnails persist.
+  thumbnailAutoGenerateAll?: boolean;
 };
 
 export function useLibraryData(
@@ -2699,6 +2702,26 @@ export function useLibraryData(
   const generateAllThumbnailCache = useCallback(async () => {
     await enqueueThumbnailCacheLoop({}, "staleOrMissing");
   }, [enqueueThumbnailCacheLoop]);
+
+  // Requirement: a setting to choose viewport-only vs. auto-generate-all in the
+  // background. When enabled, kick off whole-library generation once per root
+  // (the enqueue is idempotent server-side and bulk-priority, so it yields to
+  // interactive/viewport work). Default is viewport-only, so this stays off.
+  const autoGenerateAllTriggeredRootRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!options.thumbnailAutoGenerateAll) {
+      autoGenerateAllTriggeredRootRef.current = null;
+      return;
+    }
+    if (selectedRootId === null) {
+      return;
+    }
+    if (autoGenerateAllTriggeredRootRef.current === selectedRootId) {
+      return;
+    }
+    autoGenerateAllTriggeredRootRef.current = selectedRootId;
+    void generateAllThumbnailCache();
+  }, [options.thumbnailAutoGenerateAll, selectedRootId, generateAllThumbnailCache]);
 
   const retryThumbnailCacheFailures = useCallback(async () => {
     await enqueueThumbnailCacheLoop(currentThumbnailCacheScope() ?? {}, "retryFailedAndStale");

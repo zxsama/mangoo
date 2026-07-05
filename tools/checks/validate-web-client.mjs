@@ -90,7 +90,7 @@ const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const libraryView = read("apps/web/src/features/library/LibraryView.tsx");
 const librarySidebar = read("apps/web/src/features/library/LibrarySidebar.tsx");
 const subfolderStrip = read("apps/web/src/features/library/SubfolderStrip.tsx");
-const settingsView = read("apps/web/src/features/settings/SettingsView.tsx");
+const settingsView = read("apps/web/src/features/settings/SettingsDialog.tsx");
 const recentOpsPanel = read("apps/web/src/features/file-ops/RecentOpsPanel.tsx");
 const pluginsView = read("apps/web/src/features/plugins/PluginsView.tsx");
 const previewPanelPath = "apps/web/src/features/preview/PreviewPanel.tsx";
@@ -1271,8 +1271,8 @@ if (
   !/storePreviewPreferences/.test(app) ||
   !/configureOriginalPreviewBuffer/.test(app) ||
   !/previewPreferences\.previewBufferLimitMb/.test(app) ||
-  !/Preview browsing/.test(settingsView) ||
-  !/Preview buffer/.test(settingsView)
+  !/浏览缓存/.test(settingsView) ||
+  !/预览缓冲区/.test(settingsView)
 ) {
   fail("Preview browsing must expose a persisted 1200MB default original-image buffer preference in Settings");
 }
@@ -1282,7 +1282,7 @@ if (
   !/PREVIEW_PREFERENCE_LIMITS[\s\S]*?thumbnailCacheLimitMb/.test(previewPreferences) ||
   !/configureThumbnailCache/.test(app) ||
   !/previewPreferences\.thumbnailCacheLimitMb/.test(app) ||
-  !/Thumbnail cache/.test(settingsView) ||
+  !/缩略图缓存/.test(settingsView) ||
   !/thumbnailObjectUrlCacheBytes/.test(thumbnailObjectUrlCacheModule) ||
   !/configureThumbnailCache/.test(thumbnailObjectUrlCacheModule) ||
   /THUMBNAIL_OBJECT_URL_CACHE_LIMIT\s*=\s*512/.test(thumbnailObjectUrlCacheModule) ||
@@ -1306,20 +1306,34 @@ if (
   !/persistentThumbnailCacheAutoRefresh:\s*false/.test(previewPreferences) ||
   !/persistentThumbnailCacheAutoRefresh\s*===\s*true/.test(previewPreferences) ||
   !/persistentThumbnailCacheAutoRefresh/.test(app) ||
-  !/useLibraryData\(\{\s*persistentThumbnailCacheAutoRefresh/.test(app) ||
-  !/Persistent thumbnail cache/.test(settingsView) ||
-  !/Auto-refresh on folder open/.test(settingsView) ||
-  !/Generate current folder thumbnails/.test(settingsView) ||
-  !/Generate current tree thumbnails/.test(settingsView) ||
-  !/Generate all thumbnails/.test(settingsView) ||
-  !/Retry failed \/ stale thumbnails/.test(settingsView) ||
-  !/Clear persistent thumbnail cache/.test(settingsView) ||
+  !/useLibraryData\(\{[\s\S]*?persistentThumbnailCacheAutoRefresh/.test(app) ||
+  !/生成状况/.test(settingsView) ||
+  !/仅生成可见缩略图/.test(settingsView) ||
+  !/自动后台生成全部缩略图/.test(settingsView) ||
+  !/生成当前文件夹/.test(settingsView) ||
+  !/生成当前目录树/.test(settingsView) ||
+  !/生成全部缩略图/.test(settingsView) ||
+  !/重试失败/.test(settingsView) ||
+  !/清空持久缓存/.test(settingsView) ||
   !/getThumbnailCacheStats/.test(useLibraryData) ||
   !/enqueueThumbnailCache/.test(useLibraryData) ||
   !/clearThumbnailCache/.test(useLibraryData) ||
   !/refreshThumbnailCacheStats/.test(useLibraryData)
 ) {
   fail("Persistent thumbnail cache settings must expose stats, bulk actions, and a persisted auto-refresh preference through core-client");
+}
+if (
+  !/thumbnailAutoGenerateAll:\s*boolean/.test(previewPreferences) ||
+  !/thumbnailAutoGenerateAll:\s*false/.test(previewPreferences) ||
+  !/thumbnailAutoGenerateAll:\s*value\.thumbnailAutoGenerateAll\s*===\s*true/.test(
+    previewPreferences
+  ) ||
+  !/thumbnailAutoGenerateAll/.test(useLibraryData) ||
+  !/thumbnailAutoGenerateAll/.test(app)
+) {
+  fail(
+    "Thumbnail generation mode must expose a persisted viewport-only-vs-auto-generate-all preference (default viewport-only) wired through useLibraryData"
+  );
 }
 if (
   !/originalPreviewBlobCacheBytes/.test(mediaResources) ||

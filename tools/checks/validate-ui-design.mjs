@@ -65,7 +65,7 @@ const mediaPreview = read("apps/web/src/features/preview/MediaPreview.tsx");
 const centralPreviewStage = readOptional("apps/web/src/features/preview/CentralPreviewStage.tsx");
 const shortcutBindings = readOptional("apps/web/src/features/shortcuts/shortcutBindings.ts");
 const useShortcuts = read("apps/web/src/features/shortcuts/useShortcuts.ts");
-const settingsView = read("apps/web/src/features/settings/SettingsView.tsx");
+const settingsView = read("apps/web/src/features/settings/SettingsDialog.tsx");
 const interfaceStyle = read("apps/web/src/features/settings/interfaceStyle.ts");
 const taskPanel = read("apps/web/src/features/tasks/TaskPanel.tsx");
 const contextMenu = read("apps/web/src/features/file-ops/ContextMenu.tsx");
@@ -1496,17 +1496,17 @@ if (!/edgeHighlightBrightness:\s*(?:6|7|8)(?:\.\d+)?\b/.test(defaultInterfaceSty
   fail("default edge highlight brightness must be visibly stronger than the old 5x baseline");
 }
 
-if (!settingsView.includes("Interface style") || !settingsView.includes("Reset interface style")) {
+if (!settingsView.includes("恢复默认外观") || !settingsView.includes("AppearanceTab")) {
   fail("settings must expose Interface style controls and reset");
 }
 
 for (const value of [
-  "Shared shape",
-  "Side shell material",
-  "Center workbench material",
-  "Glass smoothness",
-  "Shared liquid glass interaction",
-  "Dialog material",
+  "圆角",
+  "侧栏材质",
+  "中央工作区材质",
+  "玻璃平滑度",
+  "交互高光",
+  "对话框材质",
   'id="window-corner-radius"',
   'id="surface-corner-radius"',
   'id="control-corner-radius"',
@@ -1573,11 +1573,11 @@ if (!shortcutBindings) {
 }
 
 for (const value of [
-  "ShortcutBindingsEditor",
+  "ShortcutsTab",
   "useShortcutBindings",
   "onReset",
   "shortcut-binding-capture",
-  "Reset shortcuts"
+  "恢复默认快捷键"
 ]) {
   if (!settingsView.includes(value)) {
     fail(`settings must include editable shortcut bindings: missing ${value}`);

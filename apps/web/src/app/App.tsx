@@ -65,7 +65,7 @@ import {
   storePreviewPreferences,
   type PreviewPreferences
 } from "../features/preview/previewPreferences";
-import { SettingsView } from "../features/settings/SettingsView";
+import { SettingsDialog } from "../features/settings/SettingsDialog";
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
 
 type AppView = ShellWorkspaceView;
@@ -84,6 +84,7 @@ const LIBRARY_LAYOUT_STORAGE_KEY = "megle.library.layout-mode";
 export function App() {
   useOverlayScrollbars();
   const [activeView, setActiveView] = useState<AppView>("library");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const interfaceStyle = useInterfaceStyle();
   const [menu, setMenu] = useState<ShellContextMenuState | null>(null);
   const [activeCompactPopover, setActiveCompactPopover] =
@@ -108,7 +109,8 @@ export function App() {
   );
   const library = useLibraryData({
     persistentThumbnailCacheAutoRefresh:
-      previewPreferences.persistentThumbnailCacheAutoRefresh
+      previewPreferences.persistentThumbnailCacheAutoRefresh,
+    thumbnailAutoGenerateAll: previewPreferences.thumbnailAutoGenerateAll
   });
   const fileOps = useFileOpsController(library);
   const orderedPreviewMedia = useMemo(() => {
@@ -562,24 +564,7 @@ export function App() {
       );
     }
 
-    if (activeView === "plugins") {
-      return <PluginsView />;
-    }
-
-    return (
-      <SettingsView
-        gridPreferences={gridPreferences}
-        interfaceStyle={interfaceStyle}
-        library={library}
-        onGridPreferencesChange={(patch) =>
-          setGridPreferences((current) => ({ ...current, ...patch }))
-        }
-        onPreviewPreferencesChange={(patch) =>
-          setPreviewPreferences((current) => ({ ...current, ...patch }))
-        }
-        previewPreferences={previewPreferences}
-      />
-    );
+    return <PluginsView />;
   }
 
   function renderRightPane() {
@@ -596,21 +581,47 @@ export function App() {
 
   function renderOverlays() {
     return (
-      <ShellOverlayHost
-        contextMenu={menu}
-        fileOps={fileOps}
-        library={library}
-        onCloseContextMenu={closeMenu}
-        onCloseRecentOps={closeRecentOps}
-        onCloseTaskPalette={closeTaskPalette}
-        onCloseTaskCenter={closeTaskCenter}
-        onOpenTaskCenter={openTaskCenter}
-        onRefreshRecentOps={() => void library.loadRecentOps()}
-        recentOpsOpen={recentOpsOpen}
-        taskCenterOpen={taskCenterOpen}
-        taskPaletteOpen={taskDrawerOpen}
-      />
+      <>
+        <ShellOverlayHost
+          contextMenu={menu}
+          fileOps={fileOps}
+          library={library}
+          onCloseContextMenu={closeMenu}
+          onCloseRecentOps={closeRecentOps}
+          onCloseTaskPalette={closeTaskPalette}
+          onCloseTaskCenter={closeTaskCenter}
+          onOpenTaskCenter={openTaskCenter}
+          onRefreshRecentOps={() => void library.loadRecentOps()}
+          recentOpsOpen={recentOpsOpen}
+          taskCenterOpen={taskCenterOpen}
+          taskPaletteOpen={taskDrawerOpen}
+        />
+        <SettingsDialog
+          open={settingsOpen}
+          gridPreferences={gridPreferences}
+          interfaceStyle={interfaceStyle}
+          library={library}
+          onClose={() => setSettingsOpen(false)}
+          onGridPreferencesChange={(patch) =>
+            setGridPreferences((current) => ({ ...current, ...patch }))
+          }
+          onPreviewPreferencesChange={(patch) =>
+            setPreviewPreferences((current) => ({ ...current, ...patch }))
+          }
+          previewPreferences={previewPreferences}
+        />
+      </>
     );
+  }
+
+  // Selecting "settings" opens the modal dialog instead of swapping the center
+  // pane; other tabs switch the workspace view as before.
+  function handleSelectView(view: AppView) {
+    if (view === "settings") {
+      setSettingsOpen(true);
+      return;
+    }
+    setActiveView(view);
   }
 
   return (
@@ -621,7 +632,7 @@ export function App() {
         titlebarLeft={
           <ShellPrimaryNav
             activeView={activeView}
-            onSelectView={setActiveView}
+            onSelectView={handleSelectView}
             onToggleSidebars={toggleSidebars}
           />
         }

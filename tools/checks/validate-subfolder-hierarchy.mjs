@@ -12,7 +12,7 @@ const liquidGlassSurfacePath = new URL(
   import.meta.url
 );
 const liquidGlassSurface = await readFile(liquidGlassSurfacePath, "utf8");
-const settingsSourcePath = new URL("../../apps/web/src/features/settings/SettingsView.tsx", import.meta.url);
+const settingsSourcePath = new URL("../../apps/web/src/features/settings/SettingsDialog.tsx", import.meta.url);
 const settingsSource = await readFile(settingsSourcePath, "utf8");
 const gridPreferencesSourcePath = new URL("../../apps/web/src/features/media-grid/gridPreferences.ts", import.meta.url);
 const gridPreferencesSource = await readFile(gridPreferencesSourcePath, "utf8");
@@ -289,7 +289,7 @@ assert.match(
 );
 assert.match(
   settingsSource,
-  /Folder area[\s\S]*library-folder-grid-gap[\s\S]*folderTileGap[\s\S]*library-folder-grid-label-height[\s\S]*folderTileLabelHeight[\s\S]*library-folder-edge-shadow-alpha[\s\S]*folderEdgeShadowAlpha/,
+  /文件夹网格[\s\S]*library-folder-grid-gap[\s\S]*folderTileGap[\s\S]*library-folder-grid-label-height[\s\S]*folderTileLabelHeight[\s\S]*library-folder-edge-shadow-alpha[\s\S]*folderEdgeShadowAlpha/,
   "Settings should expose separate folder-area thumbnail, name spacing, and edge shadow sliders"
 );
 assert.match(

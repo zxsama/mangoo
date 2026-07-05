@@ -7,6 +7,11 @@ export interface PreviewPreferences {
   previewBufferLimitMb: number;
   thumbnailCacheLimitMb: number;
   persistentThumbnailCacheAutoRefresh: boolean;
+  // When true, Megle automatically generates ALL thumbnails in the background
+  // (whole library) instead of only what enters the viewport. Default false:
+  // only thumbnails you actually see are persisted, keeping background write
+  // load low. See the thumbnail-status settings tab.
+  thumbnailAutoGenerateAll: boolean;
 }
 
 export const PREVIEW_PREFERENCE_LIMITS = {
@@ -17,7 +22,8 @@ export const PREVIEW_PREFERENCE_LIMITS = {
 export const DEFAULT_PREVIEW_PREFERENCES: PreviewPreferences = {
   previewBufferLimitMb: DEFAULT_PREVIEW_BUFFER_LIMIT_MB,
   thumbnailCacheLimitMb: DEFAULT_THUMBNAIL_CACHE_LIMIT_MB,
-  persistentThumbnailCacheAutoRefresh: false
+  persistentThumbnailCacheAutoRefresh: false,
+  thumbnailAutoGenerateAll: false
 };
 
 export function readStoredPreviewPreferences(): PreviewPreferences {
@@ -60,7 +66,8 @@ export function normalizePreviewPreferences(
       PREVIEW_PREFERENCE_LIMITS.thumbnailCacheLimitMb.max,
       DEFAULT_PREVIEW_PREFERENCES.thumbnailCacheLimitMb
     ),
-    persistentThumbnailCacheAutoRefresh: value.persistentThumbnailCacheAutoRefresh === true
+    persistentThumbnailCacheAutoRefresh: value.persistentThumbnailCacheAutoRefresh === true,
+    thumbnailAutoGenerateAll: value.thumbnailAutoGenerateAll === true
   };
 }
 
