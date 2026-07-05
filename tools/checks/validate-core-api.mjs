@@ -525,6 +525,16 @@ for (const name of ["get_thumbnail_cache_stats"]) {
   if (!functionBody(name).includes("run_read_database")) {
     fail(`${name} route must use the read database spawn_blocking helper`);
   }
+  // The cache-stats aggregate scans every file in scope and holds a WAL read
+  // snapshot while it runs. It is polled on an interval, and an aborted poll does
+  // not cancel the spawn_blocking query, so without single-flight + a TTL cache
+  // concurrent polls pile up and pin the WAL checkpoint (the WAL then grows to
+  // gigabytes and the whole DB crawls). Keep the single-flight cache in place.
+  if (!functionBody(name).includes("THUMBNAIL_CACHE_STATS_CACHE")) {
+    fail(
+      `${name} must single-flight + TTL-cache the aggregate (THUMBNAIL_CACHE_STATS_CACHE) so polled requests cannot pile up and pin the WAL`
+    );
+  }
 }
 for (const name of ["enqueue_thumbnail_cache", "clear_thumbnail_cache"]) {
   const body = functionBody(name);

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path as FilePath;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::api::AppState;
@@ -243,7 +243,7 @@ struct ThumbnailCacheTaskRequestBody {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThumbnailCacheStatsResponse {
     cached_count: i64,
@@ -874,20 +874,66 @@ async fn get_thumbnail_blob(
         .map_err(|err| CoreError::bad_request(format!("failed to build thumbnail response: {err}")))
 }
 
+#[derive(Default)]
+struct ThumbnailCacheStatsSlot {
+    computed_at: Option<Instant>,
+    value: Option<ThumbnailCacheStatsResponse>,
+}
+
+type ThumbnailCacheStatsKey = (Option<i64>, Option<i64>, bool);
+
+// Per-scope single-flight + TTL cache for the cache-stats aggregate. That query
+// scans every file in scope (652k on the test library, ~1.5s cold) and holds a
+// WAL read snapshot the whole time it runs. The UI polls it every ~2.5s while a
+// bulk generation runs, and an aborted HTTP poll does NOT cancel the underlying
+// spawn_blocking query — so slow polls piled up (measured 8 concurrent at ~11s
+// each), each pinning the WAL checkpoint at its start frame. The checkpoint then
+// reclaimed nothing, the WAL grew to gigabytes, and every read/write crawled
+// ("folder switching got slow after idle"). Single-flight serializes same-scope
+// requests so they can never pile up, and the short TTL serves a recent result
+// so the aggregate runs at most once per window, leaving the checkpoint gaps to
+// reclaim the WAL.
+static THUMBNAIL_CACHE_STATS_CACHE: LazyLock<
+    Mutex<HashMap<ThumbnailCacheStatsKey, Arc<tokio::sync::Mutex<ThumbnailCacheStatsSlot>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const THUMBNAIL_CACHE_STATS_TTL: Duration = Duration::from_millis(3000);
+
 async fn get_thumbnail_cache_stats(
     State(state): State<AppState>,
     Query(query): Query<ThumbnailCacheScopeQuery>,
 ) -> ApiResult<Json<ThumbnailCacheStatsResponse>> {
     let scope = thumbnail_cache_scope(query);
+    let key = (scope.root_id, scope.folder_id, scope.include_descendants);
+    let slot = {
+        let mut cache = THUMBNAIL_CACHE_STATS_CACHE
+            .lock()
+            .expect("thumbnail cache stats cache mutex poisoned");
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Mutex::new(ThumbnailCacheStatsSlot::default()))
+            })
+            .clone()
+    };
+    // Single-flight per scope: concurrent polls block here until the in-flight
+    // computation finishes, then observe the fresh cached value instead of
+    // launching their own (WAL-pinning) query.
+    let mut guard = slot.lock().await;
+    if let (Some(computed_at), Some(value)) = (guard.computed_at, guard.value.as_ref()) {
+        if computed_at.elapsed() < THUMBNAIL_CACHE_STATS_TTL {
+            return Ok(Json(value.clone()));
+        }
+    }
     let stats = run_read_database(state, move |database| {
         database
             .get_thumbnail_cache_stats(scope)
             .map(thumbnail_cache_stats_response)
-            .map(Json)
             .map_err(CoreError::from)
     })
     .await?;
-    Ok(stats)
+    guard.computed_at = Some(Instant::now());
+    guard.value = Some(stats.clone());
+    Ok(Json(stats))
 }
 
 async fn enqueue_thumbnail_cache(
