@@ -26,6 +26,7 @@ import {
 } from "../app-shell/ShellTopBar";
 import {
   copyText,
+  getDesktopBridge,
   getDesktopShellActions,
   notifyDesktopShellReady,
   openPath,
@@ -65,7 +66,7 @@ import {
   storePreviewPreferences,
   type PreviewPreferences
 } from "../features/preview/previewPreferences";
-import { SettingsDialog } from "../features/settings/SettingsDialog";
+import { subscribePreference } from "../core/preferenceSync";
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
 
 type AppView = ShellWorkspaceView;
@@ -84,7 +85,6 @@ const LIBRARY_LAYOUT_STORAGE_KEY = "megle.library.layout-mode";
 export function App() {
   useOverlayScrollbars();
   const [activeView, setActiveView] = useState<AppView>("library");
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const interfaceStyle = useInterfaceStyle();
   const [menu, setMenu] = useState<ShellContextMenuState | null>(null);
   const [activeCompactPopover, setActiveCompactPopover] =
@@ -112,6 +112,25 @@ export function App() {
       previewPreferences.persistentThumbnailCacheAutoRefresh,
     thumbnailAutoGenerateAll: previewPreferences.thumbnailAutoGenerateAll
   });
+
+  // Apply preference changes broadcast from the separate settings OS window so the
+  // main window updates live while that window is open. We only mirror into local
+  // state here (the settings window owns persistence) — no re-broadcast, so there
+  // is no echo loop.
+  useEffect(() => {
+    const unsubscribers = [
+      subscribePreference("grid", (value) =>
+        setGridPreferences(value as LibraryGridPreferences)
+      ),
+      subscribePreference("preview", (value) =>
+        setPreviewPreferences(value as PreviewPreferences)
+      ),
+      subscribePreference("interfaceStyle", (value) =>
+        interfaceStyle.setInterfaceStyle(value as Parameters<typeof interfaceStyle.setInterfaceStyle>[0])
+      )
+    ];
+    return () => unsubscribers.forEach((off) => off());
+  }, [interfaceStyle]);
   const fileOps = useFileOpsController(library);
   const orderedPreviewMedia = useMemo(() => {
     const orderedWindowMedia = orderedMediaSlots(library.mediaSlots);
@@ -581,44 +600,30 @@ export function App() {
 
   function renderOverlays() {
     return (
-      <>
-        <ShellOverlayHost
-          contextMenu={menu}
-          fileOps={fileOps}
-          library={library}
-          onCloseContextMenu={closeMenu}
-          onCloseRecentOps={closeRecentOps}
-          onCloseTaskPalette={closeTaskPalette}
-          onCloseTaskCenter={closeTaskCenter}
-          onOpenTaskCenter={openTaskCenter}
-          onRefreshRecentOps={() => void library.loadRecentOps()}
-          recentOpsOpen={recentOpsOpen}
-          taskCenterOpen={taskCenterOpen}
-          taskPaletteOpen={taskDrawerOpen}
-        />
-        <SettingsDialog
-          open={settingsOpen}
-          gridPreferences={gridPreferences}
-          interfaceStyle={interfaceStyle}
-          library={library}
-          onClose={() => setSettingsOpen(false)}
-          onGridPreferencesChange={(patch) =>
-            setGridPreferences((current) => ({ ...current, ...patch }))
-          }
-          onPreviewPreferencesChange={(patch) =>
-            setPreviewPreferences((current) => ({ ...current, ...patch }))
-          }
-          previewPreferences={previewPreferences}
-        />
-      </>
+      <ShellOverlayHost
+        contextMenu={menu}
+        fileOps={fileOps}
+        library={library}
+        onCloseContextMenu={closeMenu}
+        onCloseRecentOps={closeRecentOps}
+        onCloseTaskPalette={closeTaskPalette}
+        onCloseTaskCenter={closeTaskCenter}
+        onOpenTaskCenter={openTaskCenter}
+        onRefreshRecentOps={() => void library.loadRecentOps()}
+        recentOpsOpen={recentOpsOpen}
+        taskCenterOpen={taskCenterOpen}
+        taskPaletteOpen={taskDrawerOpen}
+      />
     );
   }
 
-  // Selecting "settings" opens the modal dialog instead of swapping the center
-  // pane; other tabs switch the workspace view as before.
+  // Selecting "settings" opens the SEPARATE settings OS window (a second
+  // frameless BrowserWindow, freely movable across the desktop). Other tabs
+  // switch the workspace view as before. In a browser (no desktop bridge) there
+  // is no second window, so fall back to keeping the current view.
   function handleSelectView(view: AppView) {
     if (view === "settings") {
-      setSettingsOpen(true);
+      void getDesktopBridge()?.openSettingsWindow?.();
       return;
     }
     setActiveView(view);

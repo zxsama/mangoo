@@ -16,6 +16,7 @@ import { startCoreProcess, waitForCoreHealth, type CoreProcessHandle } from "./c
 import { createCoreSession, type CoreSession } from "./core-session.js";
 
 let mainWindow: BrowserWindow | null = null;
+let settingsWindow: BrowserWindow | null = null;
 let coreProcess: CoreProcessHandle | null = null;
 let pendingCoreProcess: CoreProcessHandle | null = null;
 let coreSession: CoreSession | null = null;
@@ -228,6 +229,18 @@ ipcMain.handle("megle:shell-ready", async () => {
   }
 });
 
+ipcMain.handle("megle:open-settings-window", async () => {
+  await openSettingsWindow();
+  return true;
+});
+
+ipcMain.handle("megle:close-settings-window", () => {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.close();
+  }
+  return true;
+});
+
 ipcMain.handle("megle:visual-capture-page", async () => {
   if (!isVisualHarnessEnabled() || !mainWindow || mainWindow.isDestroyed()) {
     return null;
@@ -347,6 +360,66 @@ async function createWindow(): Promise<void> {
   } catch (error) {
     await revealMainWindowForLaunchFailure(window, "loadURL-rejected");
     console.warn("[megle] desktop renderer loadURL rejected:", error);
+  }
+}
+
+// A genuinely separate OS window for settings: its own frameless BrowserWindow,
+// freely draggable across the desktop (and to other monitors), not clipped to or
+// dimming the main window. It loads the SAME renderer bundle at the #/settings
+// route and shares this app's origin, so preference changes sync to the main
+// window over a BroadcastChannel (no per-setting IPC needed). Single-instance:
+// re-invoking focuses the existing window.
+async function openSettingsWindow(): Promise<void> {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    if (settingsWindow.isMinimized()) settingsWindow.restore();
+    settingsWindow.focus();
+    return;
+  }
+  const session = await ensureCoreReady();
+  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+  const window = new BrowserWindow({
+    title: "Megle 设置",
+    width: 900,
+    height: 640,
+    minWidth: 560,
+    minHeight: 420,
+    // Not a modal child: independent, always movable, does not block the main
+    // window. `parent` only keeps it above its opener and closed with it.
+    parent,
+    modal: false,
+    // Match the main window's frameless acrylic material so the settings window
+    // follows the same design language (and the native-window-options guard).
+    backgroundMaterial: "acrylic",
+    transparent: false,
+    backgroundColor: "#00000000",
+    roundedCorners: true,
+    show: false,
+    frame: false,
+    skipTaskbar: false,
+    webPreferences: {
+      preload: fileURLToPath(new URL("./preload.cjs", import.meta.url)),
+      contextIsolation: true,
+      nodeIntegration: false,
+      additionalArguments: [
+        `--megle-core-url=${session.baseUrl}`,
+        `--megle-session-token=${session.sessionToken}`,
+        "--megle-window=settings"
+      ]
+    }
+  });
+  settingsWindow = window;
+  applyWindowMaterial(window);
+  window.once("ready-to-show", () => window.show());
+  window.on("closed", () => {
+    settingsWindow = null;
+  });
+
+  const devServer = process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173";
+  try {
+    await window.loadURL(`${devServer}#/settings`);
+  } catch (error) {
+    console.warn("[megle] settings window loadURL rejected:", error);
+    if (!window.isDestroyed()) window.show();
   }
 }
 

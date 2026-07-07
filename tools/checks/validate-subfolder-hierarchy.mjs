@@ -12,7 +12,7 @@ const liquidGlassSurfacePath = new URL(
   import.meta.url
 );
 const liquidGlassSurface = await readFile(liquidGlassSurfacePath, "utf8");
-const settingsSourcePath = new URL("../../apps/web/src/features/settings/SettingsDialog.tsx", import.meta.url);
+const settingsSourcePath = new URL("../../apps/web/src/features/settings/settingsPanels.tsx", import.meta.url);
 const settingsSource = await readFile(settingsSourcePath, "utf8");
 const gridPreferencesSourcePath = new URL("../../apps/web/src/features/media-grid/gridPreferences.ts", import.meta.url);
 const gridPreferencesSource = await readFile(gridPreferencesSourcePath, "utf8");

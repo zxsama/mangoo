@@ -65,7 +65,7 @@ const mediaPreview = read("apps/web/src/features/preview/MediaPreview.tsx");
 const centralPreviewStage = readOptional("apps/web/src/features/preview/CentralPreviewStage.tsx");
 const shortcutBindings = readOptional("apps/web/src/features/shortcuts/shortcutBindings.ts");
 const useShortcuts = read("apps/web/src/features/shortcuts/useShortcuts.ts");
-const settingsView = read("apps/web/src/features/settings/SettingsDialog.tsx");
+const settingsView = read("apps/web/src/features/settings/settingsPanels.tsx");
 const interfaceStyle = read("apps/web/src/features/settings/interfaceStyle.ts");
 const taskPanel = read("apps/web/src/features/tasks/TaskPanel.tsx");
 const contextMenu = read("apps/web/src/features/file-ops/ContextMenu.tsx");
@@ -1541,8 +1541,12 @@ for (const value of [
   }
 }
 
-if (!app.includes("useInterfaceStyle") || !app.includes("interfaceStyle={interfaceStyle}")) {
-  fail("App must wire local Interface style settings into the renderer and Settings view");
+const settingsWindow = read("apps/web/src/features/settings/SettingsWindow.tsx");
+if (
+  !app.includes("useInterfaceStyle") ||
+  !settingsWindow.includes("interfaceStyle={interfaceStyle}")
+) {
+  fail("App must wire local Interface style settings into the renderer and the settings window must pass it to the panels");
 }
 
 if (!shortcutBindings) {

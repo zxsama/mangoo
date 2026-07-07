@@ -896,7 +896,7 @@ type ThumbnailCacheStatsKey = (Option<i64>, Option<i64>, bool);
 static THUMBNAIL_CACHE_STATS_CACHE: LazyLock<
     Mutex<HashMap<ThumbnailCacheStatsKey, Arc<tokio::sync::Mutex<ThumbnailCacheStatsSlot>>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
-const THUMBNAIL_CACHE_STATS_TTL: Duration = Duration::from_millis(3000);
+const THUMBNAIL_CACHE_STATS_TTL: Duration = Duration::from_millis(15000);
 
 async fn get_thumbnail_cache_stats(
     State(state): State<AppState>,

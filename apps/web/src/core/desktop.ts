@@ -37,9 +37,12 @@ export interface DesktopShellActions {
 export interface MegleDesktopBridge {
   coreUrl?: string;
   sessionToken?: string;
+  windowRole?: string;
   notifyShellReady?: () => Promise<boolean>;
   pickFolder?: () => Promise<string | null>;
   diagnostics?: () => Promise<DesktopDiagnostics>;
+  openSettingsWindow?: () => Promise<boolean>;
+  closeSettingsWindow?: () => Promise<boolean>;
   windowControls?: DesktopWindowControls;
   shell?: DesktopShellActions;
 }

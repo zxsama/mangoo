@@ -90,7 +90,7 @@ const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const libraryView = read("apps/web/src/features/library/LibraryView.tsx");
 const librarySidebar = read("apps/web/src/features/library/LibrarySidebar.tsx");
 const subfolderStrip = read("apps/web/src/features/library/SubfolderStrip.tsx");
-const settingsView = read("apps/web/src/features/settings/SettingsDialog.tsx");
+const settingsView = read("apps/web/src/features/settings/settingsPanels.tsx");
 const recentOpsPanel = read("apps/web/src/features/file-ops/RecentOpsPanel.tsx");
 const pluginsView = read("apps/web/src/features/plugins/PluginsView.tsx");
 const previewPanelPath = "apps/web/src/features/preview/PreviewPanel.tsx";
@@ -293,7 +293,7 @@ if (
   fail("notifyDesktopShellReady must reset its latch when notifyShellReady resolves false so later calls can retry");
 }
 
-if (!/import\s+\{\s*notifyDesktopShellReady\s*\}\s+from\s+"\.\/core\/desktop";/.test(main)) {
+if (!/import\s+\{[^}]*\bnotifyDesktopShellReady\b[^}]*\}\s+from\s+"\.\/core\/desktop";/.test(main)) {
   fail("web entrypoint must import notifyDesktopShellReady for the earliest desktop shell-ready handshake");
 }
 

@@ -4176,6 +4176,88 @@ button:disabled {
   padding: 0;
 }
 
+/* Standalone settings OS window (a separate frameless BrowserWindow). Fills the
+   whole window with a custom draggable titlebar + the shared settings panels. */
+.settings-window {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: rgba(18, 22, 28, 0.9);
+  color: var(--text-soft, #d5dbe2);
+}
+
+.settings-window-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 0 0 auto;
+  height: 40px;
+  padding: 0 8px 0 14px;
+  border-bottom: 1px solid var(--line);
+  cursor: move;
+  user-select: none;
+  -webkit-app-region: drag;
+}
+
+.settings-window-title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-soft);
+}
+
+.settings-window-close {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--control-corner-radius, 8px);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease;
+}
+
+.settings-window-close:hover {
+  color: #f4f7f9;
+  background: rgba(228, 124, 115, 0.18);
+}
+
+.settings-window-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
+/* In the standalone window the panels fill the remaining space (no dialog box). */
+.settings-window-body .settings-dialog-layout {
+  height: 100%;
+  width: 100%;
+}
+
+/* The settings surface is a floating, draggable window: a lighter backdrop
+   (it can be moved aside rather than strictly blocking), and a move cursor on
+   the drag handle (the header). Clicking the backdrop still closes it. */
+.settings-dialog-backdrop {
+  background: rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(1px);
+}
+
+.settings-dialog-drag {
+  cursor: move;
+  touch-action: none;
+  user-select: none;
+}
+
+.settings-dialog-drag .settings-dialog-heading {
+  cursor: move;
+}
+
 .settings-dialog-layout {
   display: grid;
   grid-template-columns: 208px 1fr;

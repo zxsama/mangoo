@@ -9,14 +9,11 @@ import {
   RefreshCw,
   Settings2,
   Trash2,
-  X,
   XCircle
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
 import type { LibraryState } from "../../core/useLibraryData";
-import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import type { InterfaceStyleController } from "../../design/liquid-glass";
-import { useFocusTrap } from "../file-ops/useFocusTrap";
 import {
   LIBRARY_GRID_PREFERENCE_LIMITS,
   type LibraryGridPreferences
@@ -46,12 +43,10 @@ const SHORTCUT_ACTION_LABELS: Record<string, string> = {
   toggleSidebars: "切换侧栏"
 };
 
-interface SettingsDialogProps {
-  open: boolean;
+interface SettingsPanelsProps {
   gridPreferences: LibraryGridPreferences;
   interfaceStyle: InterfaceStyleController;
   library: LibraryState;
-  onClose: () => void;
   onGridPreferencesChange: (patch: Partial<LibraryGridPreferences>) => void;
   onPreviewPreferencesChange: (patch: Partial<PreviewPreferences>) => void;
   previewPreferences: PreviewPreferences;
@@ -67,117 +62,64 @@ const TABS: Array<{ id: SettingsTabId; label: string; icon: typeof Settings2 }> 
   { id: "diagnostics", label: "诊断", icon: Gauge }
 ];
 
-export function SettingsDialog({
-  open,
+export function SettingsPanels({
   gridPreferences,
   interfaceStyle,
   library,
-  onClose,
   onGridPreferencesChange,
   onPreviewPreferencesChange,
   previewPreferences
-}: SettingsDialogProps) {
+}: SettingsPanelsProps) {
   const [activeTab, setActiveTab] = useState<SettingsTabId>("general");
-  const dialogRef = useRef<HTMLDivElement | null>(null);
-
-  useFocusTrap(open, dialogRef);
-
-  useEffect(() => {
-    if (!open) return;
-    function handleKey(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onClose();
-      }
-    }
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [open, onClose]);
-
-  if (!open) return null;
 
   return (
-    <div className="dialog-backdrop" role="presentation" onClick={onClose}>
-      <LiquidGlassSurface
-        as="div"
-        aria-labelledby="settings-dialog-title"
-        aria-modal="true"
-        className="dialog settings-dialog"
-        interactive
-        onClick={(event) => event.stopPropagation()}
-        ref={dialogRef}
-        role="dialog"
-        tone="elevated"
-        variant="clear"
-      >
-        <div className="settings-dialog-layout">
-          <aside className="settings-dialog-nav" aria-label="设置分类">
-            <div className="settings-dialog-nav-title" id="settings-dialog-title">
-              偏好设置
-            </div>
-            <nav className="settings-dialog-nav-list" role="tablist" aria-orientation="vertical">
-              {TABS.map((tab) => {
-                const Icon = tab.icon;
-                const active = tab.id === activeTab;
-                return (
-                  <button
-                    key={tab.id}
-                    aria-selected={active}
-                    className={
-                      active
-                        ? "settings-dialog-nav-item active"
-                        : "settings-dialog-nav-item"
-                    }
-                    onClick={() => setActiveTab(tab.id)}
-                    role="tab"
-                    type="button"
-                  >
-                    <Icon aria-hidden="true" size={16} />
-                    <span>{tab.label}</span>
-                  </button>
-                );
-              })}
-            </nav>
-          </aside>
-          <div className="settings-dialog-main">
-            <header className="settings-dialog-header">
-              <h2 className="settings-dialog-heading">
-                {TABS.find((tab) => tab.id === activeTab)?.label}
-              </h2>
+    <div className="settings-dialog-layout">
+      <aside className="settings-dialog-nav" aria-label="设置分类">
+        <div className="settings-dialog-nav-title" id="settings-dialog-title">
+          偏好设置
+        </div>
+        <nav className="settings-dialog-nav-list" role="tablist" aria-orientation="vertical">
+          {TABS.map((tab) => {
+            const Icon = tab.icon;
+            const active = tab.id === activeTab;
+            return (
               <button
-                aria-label="关闭"
-                className="settings-dialog-close"
-                onClick={onClose}
+                key={tab.id}
+                aria-selected={active}
+                className={active ? "settings-dialog-nav-item active" : "settings-dialog-nav-item"}
+                onClick={() => setActiveTab(tab.id)}
+                role="tab"
                 type="button"
               >
-                <X aria-hidden="true" size={18} />
+                <Icon aria-hidden="true" size={16} />
+                <span>{tab.label}</span>
               </button>
-            </header>
-            <div className="settings-dialog-content" role="tabpanel">
-              {activeTab === "general" ? (
-                <GeneralTab
-                  gridPreferences={gridPreferences}
-                  onGridPreferencesChange={onGridPreferencesChange}
-                  onPreviewPreferencesChange={onPreviewPreferencesChange}
-                  previewPreferences={previewPreferences}
-                />
-              ) : null}
-              {activeTab === "thumbnails" ? (
-                <ThumbnailsTab
-                  library={library}
-                  onPreviewPreferencesChange={onPreviewPreferencesChange}
-                  previewPreferences={previewPreferences}
-                />
-              ) : null}
-              {activeTab === "appearance" ? (
-                <AppearanceTab interfaceStyle={interfaceStyle} />
-              ) : null}
-              {activeTab === "shortcuts" ? <ShortcutsTab /> : null}
-              {activeTab === "diagnostics" ? <DiagnosticsTab library={library} /> : null}
-            </div>
-          </div>
+            );
+          })}
+        </nav>
+      </aside>
+      <div className="settings-dialog-main">
+        <div className="settings-dialog-content" role="tabpanel">
+          {activeTab === "general" ? (
+            <GeneralTab
+              gridPreferences={gridPreferences}
+              onGridPreferencesChange={onGridPreferencesChange}
+              onPreviewPreferencesChange={onPreviewPreferencesChange}
+              previewPreferences={previewPreferences}
+            />
+          ) : null}
+          {activeTab === "thumbnails" ? (
+            <ThumbnailsTab
+              library={library}
+              onPreviewPreferencesChange={onPreviewPreferencesChange}
+              previewPreferences={previewPreferences}
+            />
+          ) : null}
+          {activeTab === "appearance" ? <AppearanceTab interfaceStyle={interfaceStyle} /> : null}
+          {activeTab === "shortcuts" ? <ShortcutsTab /> : null}
+          {activeTab === "diagnostics" ? <DiagnosticsTab library={library} /> : null}
         </div>
-      </LiquidGlassSurface>
+      </div>
     </div>
   );
 }
@@ -305,15 +247,17 @@ function ThumbnailsTab({
   const busy = library.thumbnailCacheActionBusy;
   const activeBulk = stats?.activeBulkTaskCount ?? 0;
 
-  // Poll while a bulk generation is running (or an action is busy), then back
-  // off. Server-side single-flight + TTL keeps this cheap.
+  // The stats aggregate scans the whole library and briefly pins the WAL, so it
+  // must NOT be polled aggressively — the numbers are a reference, not live. Poll
+  // slowly (server also single-flights + TTL-caches). Only poll a bit faster
+  // while a bulk generation is actively running so the progress bar advances.
   useEffect(() => {
     void library.refreshThumbnailCacheStats();
     const interval = window.setInterval(
       () => {
         void library.refreshThumbnailCacheStats();
       },
-      busy || activeBulk > 0 ? 2500 : 10000
+      activeBulk > 0 || busy ? 8000 : 20000
     );
     return () => window.clearInterval(interval);
   }, [library.refreshThumbnailCacheStats, busy, activeBulk, library]);
@@ -799,5 +743,4 @@ function formatCacheBytes(value: number) {
   return `${rounded} ${units[unitIndex]}`;
 }
 
-// Keep the ReactNode import used even if lint tightens.
-export type { SettingsDialogProps };
+export type { SettingsPanelsProps };

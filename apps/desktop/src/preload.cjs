@@ -15,9 +15,15 @@ const visualHarnessEnabled = readArg("--megle-visual-harness=") === "1";
 contextBridge.exposeInMainWorld("megleDesktop", {
   coreUrl: readArg("--megle-core-url="),
   sessionToken: readArg("--megle-session-token="),
+  // Which window this renderer is: "settings" for the separate settings window,
+  // undefined/"main" for the primary window. The web entry uses this + the
+  // #/settings hash to render the standalone settings surface.
+  windowRole: readArg("--megle-window=") ?? "main",
   notifyShellReady: () => ipcRenderer.invoke("megle:shell-ready"),
   pickFolder: () => ipcRenderer.invoke("megle:pick-folder"),
   diagnostics: () => ipcRenderer.invoke("megle:diagnostics"),
+  openSettingsWindow: () => ipcRenderer.invoke("megle:open-settings-window"),
+  closeSettingsWindow: () => ipcRenderer.invoke("megle:close-settings-window"),
   windowControls: {
     minimize: () => ipcRenderer.invoke("megle:window-minimize"),
     maximize: () => ipcRenderer.invoke("megle:window-maximize"),
