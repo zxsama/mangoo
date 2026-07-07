@@ -5,8 +5,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::db::{
-    Database, TaskScanProgress, ThumbBlobRecord, ThumbnailStateUpsert, ROOT_SCAN_TASK_PRIORITY,
-    THUMBNAIL_SELECTED_PRIORITY,
+    Database, DbWriter, TaskScanProgress, ThumbBlobRecord, ThumbnailStateUpsert,
+    ROOT_SCAN_TASK_PRIORITY, THUMBNAIL_SELECTED_PRIORITY,
 };
 use crate::scan::{ScanOptions, TaskAttemptGuard};
 use crate::thumbnails::{
@@ -20,33 +20,13 @@ const FFMPEG_NOT_AVAILABLE_ERROR: &str = "ffmpeg not available";
 const THUMBNAIL_SELECTED_WORKER_CONCURRENCY: usize = 1;
 // Foreground = the viewport thumbnails the user is actively waiting for
 // (visible/ahead priority). Keep this generous so opening a folder fills its
-// tiles quickly. It does NOT reintroduce the write-storm contention that forced
-// the cap earlier: that came from BULK/background blob commits (thousands, after
-// a "generate all"), which stay on the background bucket below and yield to
-// interactive writes via write_gate. A viewport is only a few dozen thumbnails,
-// so more foreground writers just clears them faster.
+// tiles quickly. Decode/resize is CPU work that runs in parallel; the tiny blob
+// commit is serialized by the single writer actor, so more foreground workers
+// just clear the viewport faster without any writer contention.
 const THUMBNAIL_FOREGROUND_WORKER_CONCURRENCY: usize = 10;
-// Background/bulk: the write-storm source. Kept low; these yield to interactive
-// writes (write_gate) before each blob commit.
+// Background/bulk: kept low so a "generate all" storm does not swamp CPU.
 const THUMBNAIL_BACKGROUND_WORKER_CONCURRENCY: usize = 2;
 const IDLE_PENDING_TASK_DRAIN_INTERVAL_MS: u64 = 250;
-/// How often the dedicated checkpoint thread runs a WAL checkpoint pass. Short
-/// enough to keep the WAL small under heavy blob ingestion, long enough that the
-/// PASSIVE checkpoints do not themselves become a source of writer contention.
-const WAL_CHECKPOINT_INTERVAL_MS: u64 = 500;
-
-/// Spawn the dedicated WAL-checkpoint thread. Owns its own connection so it
-/// never contends with the API write mutex or the worker's task connection, and
-/// checkpoints off the hot path (auto-checkpoint is disabled) so no interactive
-/// or blob write ever pays the checkpoint cost inline.
-fn start_wal_checkpoint_thread(checkpoint_database: Database) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(WAL_CHECKPOINT_INTERVAL_MS));
-        if let Err(error) = checkpoint_database.run_periodic_wal_checkpoint() {
-            tracing::warn!(%error, "periodic WAL checkpoint failed");
-        }
-    });
-}
 
 pub type TaskSender = mpsc::Sender<i64>;
 
@@ -209,20 +189,31 @@ fn invoke_thumbnail_processing_checkpoint_hook(_task_id: i64, _database_path: Op
 #[cfg(not(test))]
 fn invoke_worker_task_hook(_kind: &str, _task_id: i64, _database_path: Option<&Path>) {}
 
-pub fn start_worker(worker_database: Database) -> TaskSender {
-    start_worker_with_ffmpeg(worker_database, crate::thumbnails::ffmpeg_available())
+pub fn start_worker(worker_database: Database, writer: DbWriter) -> TaskSender {
+    start_worker_with_ffmpeg(
+        worker_database,
+        writer,
+        crate::thumbnails::ffmpeg_available(),
+    )
 }
 
 /// Variant that lets callers (and tests) decide whether the worker should
 /// attempt video poster generation. Used by Core startup to detect ffmpeg
 /// once and forward the result without re-spawning per task.
-pub fn start_worker_with_ffmpeg(worker_database: Database, ffmpeg_available: bool) -> TaskSender {
+pub fn start_worker_with_ffmpeg(
+    worker_database: Database,
+    writer: DbWriter,
+    ffmpeg_available: bool,
+) -> TaskSender {
     if !ffmpeg_available {
         tracing::warn!(
             "ffmpeg binary not found on PATH; video thumbnail tasks will fail with \"{FFMPEG_NOT_AVAILABLE_ERROR}\""
         );
     }
     let mut worker_database = worker_database;
+    // Startup recovery runs once, before any task dispatch and before the writer
+    // actor handles concurrent work, so it is safe to run directly on the worker
+    // connection.
     worker_database
         .reset_running_root_scan_tasks_for_recovery()
         .expect("reset running root_scan tasks for startup recovery");
@@ -232,12 +223,13 @@ pub fn start_worker_with_ffmpeg(worker_database: Database, ffmpeg_available: boo
     worker_database
         .reset_running_thumbnail_tasks_for_recovery()
         .expect("reset running thumbnail tasks for startup recovery");
-    // Auto-checkpoint is disabled (see configure_file_database_wal). Run WAL
-    // checkpoints on a dedicated connection/thread so a large checkpoint never
-    // freezes an interactive scroll write or a blob commit mid-transaction.
-    if let Ok(Some(checkpoint_database)) = worker_database.reopen() {
-        start_wal_checkpoint_thread(checkpoint_database);
-    }
+    // WAL checkpoints are run by the single writer actor between job batches
+    // (see DbWriter), so no separate checkpoint thread/connection is needed.
+    //
+    // NOTE: worker blob commits still use `worker_database` directly for now;
+    // routing them through `writer` is the remaining step of the single-writer
+    // migration. Held here so the handle is threaded and ready.
+    let _writer = writer;
     let (sender, mut receiver) = mpsc::channel(128);
     let (task_completion_sender, mut task_completion_receiver) = mpsc::unbounded_channel();
     let thumbnail_permits = ThumbnailWorkerPermits {
@@ -1144,26 +1136,10 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
     // Captured from the decode this task already ran; persisted to media in the
     // publish transaction below so the layout engine gets real aspect ratios.
     let source_dimensions = Some((generated.source_width, generated.source_height));
-    // Blob commits are the write-storm source during generation. Yield the WAL
-    // writer to any pending interactive write (scroll priority-scope, on-demand
-    // thumbnail-state enqueue) before taking this publish transaction, so browsing
-    // stays fluid while ingestion runs.
-    //
-    // This now yields for ALL priorities, not just background/bulk. On a cold
-    // library the visible viewport promotes its thumbnails to foreground, so up to
-    // 12 *foreground* blob commits run concurrently — and while they held the
-    // writer without yielding, they starved the very priority-scope / on-demand
-    // thumbnail-state writes that drive that same viewport. The result was the
-    // client's request slots pinning and subfolder covers never loading on a
-    // rapid folder switch (measured: scheduler pinned at the cap for 18s+). The
-    // yield is bounded (~30ms) and only fires while an interactive write is
-    // actually pending, so briefly deferring a foreground blob commit to let a
-    // viewport write land is a net win for perceived responsiveness.
-    crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
-    // Also pause (longer, bounded) if the checkpoint thread needs to TRUNCATE a
-    // large WAL. Continuous blob commits otherwise prevent the checkpoint from
-    // ever resetting the WAL, so it grows to gigabytes and freezes the whole DB.
-    crate::write_gate::interactive_write_gate().wait_for_pending_checkpoint();
+    // Blob commits run on the single writer connection (submitted via the
+    // DbWriter by the caller), so they never contend with browsing writes and
+    // can never hit "database is locked". Decode/resize already happened above on
+    // this blocking thread; only the commit below is serialized by the writer.
     let blob = ThumbBlobRecord {
         file_id,
         profile: GRID_320_PROFILE.to_string(),
@@ -2086,7 +2062,8 @@ mod tests {
         let db_path = db_dir.join("missed-thumbnail-wakeup.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
-        let _sender = start_worker_with_ffmpeg(database, true);
+        let writer = crate::db::DbWriter::spawn(database.reopen().unwrap().unwrap());
+        let _sender = start_worker_with_ffmpeg(database, writer, true);
 
         let request_database = Database::open(&db_path).expect("open request database");
         request_database
@@ -3665,7 +3642,8 @@ mod tests {
                 }
             }));
 
-        let sender = start_worker_with_ffmpeg(database, true);
+        let writer = crate::db::DbWriter::spawn(database.reopen().unwrap().unwrap());
+        let sender = start_worker_with_ffmpeg(database, writer, true);
         let request_database = Database::open(&db_path).expect("open request database");
         request_database
             .apply_migrations()
@@ -3931,7 +3909,8 @@ mod tests {
                 }
             }));
 
-        let sender = start_worker_with_ffmpeg(database, true);
+        let writer = crate::db::DbWriter::spawn(database.reopen().unwrap().unwrap());
+        let sender = start_worker_with_ffmpeg(database, writer, true);
         sender
             .send(first_task_id)
             .await
@@ -4037,7 +4016,8 @@ mod tests {
                 }
             }));
 
-        let sender = start_worker_with_ffmpeg(database, true);
+        let writer = crate::db::DbWriter::spawn(database.reopen().unwrap().unwrap());
+        let sender = start_worker_with_ffmpeg(database, writer, true);
         sender
             .send(root_scan_task_id)
             .await

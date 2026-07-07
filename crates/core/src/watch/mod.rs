@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::db::{Database, FileUpsert, RootRecord};
+use crate::db::{Database, DbWriter, FileUpsert, RootRecord};
 use crate::tasks::TaskSender;
 
 const EVENT_COALESCE_WINDOW: Duration = Duration::from_millis(100);
@@ -19,11 +19,21 @@ pub struct WatcherHandle {
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
-pub fn start_watcher(database: Database, task_queue: TaskSender) -> WatcherHandle {
+pub fn start_watcher(
+    database: Database,
+    task_queue: TaskSender,
+    writer: DbWriter,
+) -> WatcherHandle {
     let (shutdown_sender, shutdown_receiver) = std_mpsc::channel();
     let (ready_sender, ready_receiver) = std_mpsc::channel();
     let join_handle = thread::spawn(move || {
-        if let Err(error) = run_watcher(database, task_queue, shutdown_receiver, ready_sender) {
+        if let Err(error) = run_watcher(
+            database,
+            task_queue,
+            writer,
+            shutdown_receiver,
+            ready_sender,
+        ) {
             tracing::warn!(%error, "watcher stopped unexpectedly");
         }
     });
@@ -59,6 +69,10 @@ impl Drop for WatcherHandle {
 struct WatcherState {
     database: Database,
     task_queue: TaskSender,
+    // Threaded for the single-writer migration; watcher upserts still use
+    // `database` directly for now (low-frequency, filesystem-event-driven).
+    #[allow(dead_code)]
+    writer: DbWriter,
     watcher: RecommendedWatcher,
     watched_roots: HashMap<i64, PathBuf>,
     pending_events: Vec<notify::Result<Event>>,
@@ -67,6 +81,7 @@ struct WatcherState {
 fn run_watcher(
     database: Database,
     task_queue: TaskSender,
+    writer: DbWriter,
     shutdown_receiver: std_mpsc::Receiver<()>,
     ready_sender: std_mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
@@ -77,6 +92,7 @@ fn run_watcher(
     let mut state = WatcherState {
         database,
         task_queue,
+        writer,
         watcher,
         watched_roots: HashMap::new(),
         pending_events: Vec::new(),
@@ -424,8 +440,9 @@ mod tests {
         scan_root(&mut database, &root).expect("seed scan");
 
         let watcher_db = Database::open(&db_path).expect("reopen watcher db");
+        let writer_db = Database::open(&db_path).expect("reopen writer db");
         let (task_sender, _task_receiver) = tokio::sync::mpsc::channel(8);
-        let _watcher = start_watcher(watcher_db, task_sender);
+        let _watcher = start_watcher(watcher_db, task_sender, DbWriter::spawn(writer_db));
 
         fs::write(temp_root.join("new.jpg"), b"new image").expect("write new image");
         wait_for_media_count(&db_path, root_id, 2, Duration::from_secs(2));
@@ -450,8 +467,9 @@ mod tests {
         scan_root(&mut database, &root).expect("seed scan");
 
         let watcher_db = Database::open(&db_path).expect("reopen watcher db");
+        let writer_db = Database::open(&db_path).expect("reopen writer db");
         let (task_sender, _task_receiver) = tokio::sync::mpsc::channel(8);
-        let _watcher = start_watcher(watcher_db, task_sender);
+        let _watcher = start_watcher(watcher_db, task_sender, DbWriter::spawn(writer_db));
 
         fs::remove_file(temp_root.join("seed.jpg")).expect("delete image");
         wait_for_media_count(&db_path, root_id, 0, Duration::from_secs(2));
@@ -476,8 +494,9 @@ mod tests {
         scan_root(&mut database, &root).expect("seed scan");
 
         let watcher_db = Database::open(&db_path).expect("reopen watcher db");
+        let writer_db = Database::open(&db_path).expect("reopen writer db");
         let (task_sender, _task_receiver) = tokio::sync::mpsc::channel(8);
-        let _watcher = start_watcher(watcher_db, task_sender);
+        let _watcher = start_watcher(watcher_db, task_sender, DbWriter::spawn(writer_db));
 
         fs::rename(temp_root.join("old.jpg"), temp_root.join("new.jpg")).expect("rename image");
         wait_for_media_names(&db_path, root_id, &["new.jpg"], Duration::from_secs(2));
@@ -517,8 +536,9 @@ mod tests {
         scan_root(&mut database, &root).expect("seed scan");
 
         let watcher_db = Database::open(&db_path).expect("reopen watcher db");
+        let writer_db = Database::open(&db_path).expect("reopen writer db");
         let (task_sender, _task_receiver) = tokio::sync::mpsc::channel(8);
-        let _watcher = start_watcher(watcher_db, task_sender);
+        let _watcher = start_watcher(watcher_db, task_sender, DbWriter::spawn(writer_db));
 
         fs::write(temp_root.join("notes.txt"), b"not media").expect("write text file");
         wait_for_media_count(&db_path, root_id, 0, Duration::from_secs(2));
@@ -541,8 +561,9 @@ mod tests {
         database.disable_root(root_id).expect("disable root");
 
         let watcher_db = Database::open(&db_path).expect("reopen watcher db");
+        let writer_db = Database::open(&db_path).expect("reopen writer db");
         let (task_sender, mut task_receiver) = tokio::sync::mpsc::channel(8);
-        let _watcher = start_watcher(watcher_db, task_sender);
+        let _watcher = start_watcher(watcher_db, task_sender, DbWriter::spawn(writer_db));
 
         fs::write(temp_root.join("disabled.jpg"), b"seed").expect("write image");
         std::thread::sleep(Duration::from_millis(200));
@@ -643,9 +664,11 @@ mod tests {
         })
         .expect("create watcher");
         let (task_sender, mut task_receiver) = tokio::sync::mpsc::channel(8);
+        let writer_db = Database::open(&db_path).expect("reopen writer db");
         let mut state = WatcherState {
             database,
             task_queue: task_sender,
+            writer: DbWriter::spawn(writer_db),
             watcher,
             watched_roots: HashMap::from([(root_id, temp_root.clone())]),
             pending_events: Vec::new(),
@@ -834,9 +857,16 @@ mod tests {
             let _ = event_tx.send(result);
         })
         .expect("create watcher");
+        let writer = DbWriter::spawn(
+            database
+                .reopen()
+                .expect("reopen writer db")
+                .expect("writer db"),
+        );
         WatcherState {
             database,
             task_queue,
+            writer,
             watcher,
             watched_roots: HashMap::from([(root_id, root_path)]),
             pending_events: Vec::new(),

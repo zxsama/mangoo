@@ -512,13 +512,17 @@ for (const name of [
 }
 for (const name of ["get_thumbnail", "enqueue_interactive_folder_scan", "sync_thumbnail_priority_scope"]) {
   const body = functionBody(name);
-  // Either offload helper is acceptable: both run on tokio::spawn_blocking so the
-  // async handler thread is never blocked on synchronous SQLite work. The
-  // high-frequency browse writes (get_thumbnail on-demand enqueue,
-  // sync_thumbnail_priority_scope) use the dedicated-connection variant to avoid
-  // head-of-line blocking on the single shared write mutex under scan load.
-  if (!body.includes("run_shared_database") && !body.includes("run_dedicated_or_shared_database")) {
-    fail(`${name} route must offload shared database writes from the async handler`);
+  // All writes go through the single writer actor. A route may submit writes
+  // via the `run_shared_database`/`run_dedicated_or_shared_database` helpers
+  // (which now route to the writer) or call `state.writer.write` directly.
+  // get_thumbnail reads on the read connection first, then submits only the
+  // pending-path enqueue through `writer.write`.
+  if (
+    !body.includes("run_shared_database") &&
+    !body.includes("run_dedicated_or_shared_database") &&
+    !/\.writer\s*\.\s*write/.test(body)
+  ) {
+    fail(`${name} route must submit writes through the single DbWriter (writer.write or a writer-backed helper)`);
   }
 }
 for (const name of ["get_thumbnail_cache_stats"]) {
@@ -719,8 +723,8 @@ for (const value of ["cancel_root_scan_tasks", "root_enabled", "fail_pending_roo
 if (tasksRs.includes("Arc<Mutex<Database>>")) {
   fail("background scan worker must not hold the API Arc<Mutex<Database>> during scans");
 }
-if (!tasksRs.includes("start_worker(worker_database: Database)")) {
-  fail("background scan worker must own a separate Database handle");
+if (!tasksRs.includes("start_worker(worker_database: Database, writer: DbWriter)")) {
+  fail("background scan worker must own a separate read/scheduling Database handle and receive the single DbWriter");
 }
 if (!/mark_task_failed_for_attempt\(\s*task_id,\s*attempt_generation,\s*&error\.to_string\(\),\s*\)/.test(routesRs)) {
   fail("enqueue failures must mark the created task failed through an attempt guard before returning an API error");

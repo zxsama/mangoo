@@ -1,4 +1,6 @@
 pub mod migrations;
+pub mod writer;
+pub use writer::DbWriter;
 
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
@@ -22,7 +24,7 @@ pub const WAL_MODE: &str = "WAL";
 // avoids, so it is fully off and the thread is responsible for bounding the WAL.
 const WAL_AUTOCHECKPOINT_PAGES: i64 = 0;
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
-const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 /// `synchronous=NORMAL` (1) is the recommended setting under WAL: it never
 /// corrupts the database and only risks losing the last few *committed*
 /// transactions on OS crash / power loss. Every Megle table (thumbnail
@@ -671,7 +673,7 @@ impl Database {
         Ok(())
     }
 
-    fn wal_size_bytes(&self) -> anyhow::Result<u64> {
+    pub(crate) fn wal_size_bytes(&self) -> anyhow::Result<u64> {
         let Some(path) = &self.path else {
             return Ok(0);
         };
@@ -683,7 +685,10 @@ impl Database {
         }
     }
 
-    fn checkpoint_wal_if_larger_than(&self, threshold_bytes: u64) -> anyhow::Result<bool> {
+    pub(crate) fn checkpoint_wal_if_larger_than(
+        &self,
+        threshold_bytes: u64,
+    ) -> anyhow::Result<bool> {
         if self.wal_size_bytes()? <= threshold_bytes {
             return Ok(false);
         }
@@ -693,49 +698,17 @@ impl Database {
         Ok(busy == 0)
     }
 
-    /// Run one WAL checkpoint pass on a dedicated (non-hot-path) connection.
-    /// Auto-checkpoint is disabled on file connections so a checkpoint never
-    /// freezes an in-flight interactive writer mid-scroll; instead a dedicated
-    /// thread calls this periodically.
-    ///
-    /// It normally runs a PASSIVE checkpoint, which never blocks concurrent
-    /// readers/writers — it copies as many committed WAL frames back into the DB
-    /// as it can without waiting for the write lock.
-    ///
-    /// PASSIVE alone is NOT enough under sustained thumbnail generation: with
-    /// continuous overlapping readers a PASSIVE checkpoint can never advance the
-    /// WAL's backfill point to the end, so the WAL never resets to frame 0 and the
-    /// file grows without bound — measured multi-GB WALs during a large "generate
-    /// all", which makes every read and write crawl (the "thumbnails stop
-    /// refreshing" freeze). `journal_size_limit` cannot help because it only
-    /// truncates a WAL that a checkpoint has already emptied. So when the WAL has
-    /// grown past the truncate threshold, escalate to a TRUNCATE checkpoint to
-    /// reclaim it. That takes a brief exclusive lock, but only when the WAL is
-    /// already large (rare), and truncating a bounded WAL is far cheaper — and far
-    /// better — than letting it grow to gigabytes.
-    pub fn run_periodic_wal_checkpoint(&self) -> anyhow::Result<()> {
+    /// Run one WAL checkpoint pass. Called by the writer actor between job
+    /// batches — the actor owns the ONLY write connection, so a TRUNCATE here
+    /// always gets its exclusive window (no other writer contends) and reliably
+    /// resets the WAL. Escalate to TRUNCATE when the WAL has grown past the
+    /// threshold (reclaims the file), otherwise run a cheap PASSIVE pass.
+    pub(crate) fn run_wal_checkpoint_pass(&self) -> anyhow::Result<()> {
         if self.path.is_none() {
             return Ok(());
         }
-        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
-        if self.wal_size_bytes()? > WAL_TRUNCATE_THRESHOLD_BYTES {
-            // The WAL has outgrown what a PASSIVE checkpoint can reclaim (under
-            // continuous blob commits it never gets to reset the WAL to frame 0).
-            // Signal blob workers to pause — they call `wait_for_pending_checkpoint`
-            // before committing — so this TRUNCATE gets an exclusive window and can
-            // actually shrink the file. Give in-flight commits a brief moment to
-            // reach that pause point, then truncate.
-            let _checkpoint = crate::write_gate::interactive_write_gate().begin_checkpoint();
-            // Let in-flight blob commits drain and new ones park at the barrier
-            // before truncating, so the TRUNCATE has the best chance of resetting
-            // the file. (Short reads and worker-connection reads can still hold a
-            // frame mark and make TRUNCATE fall back to PASSIVE; that only bounds
-            // rather than fully resets the WAL, which is acceptable — the point is
-            // to keep it in the hundreds-of-MB range, never gigabytes.)
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            if self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)? {
-                return Ok(());
-            }
+        if self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)? {
+            return Ok(());
         }
         self.connection
             .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
@@ -1602,6 +1575,7 @@ impl Database {
         Ok(rows.next()?.map(task_from_row).transpose()?)
     }
 
+    #[allow(dead_code)] // retained for potential foreground-promotion reuse
     pub fn active_thumbnail_task(&self, file_id: i64) -> anyhow::Result<Option<TaskRecord>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -1623,6 +1597,7 @@ impl Database {
         Ok(rows.next()?.map(task_from_row).transpose()?)
     }
 
+    #[allow(dead_code)] // retained for potential foreground-promotion reuse
     pub fn touch_pending_foreground_thumbnail_task(
         &self,
         task_id: i64,
@@ -2981,13 +2956,8 @@ impl Database {
         let mut task_id_to_wake = None;
         // Enqueue the whole batch under one transaction: "generate cache" can
         // touch thousands of files, and a per-file commit (plus a per-file
-        // get_thumbnail) was a large multiple of the necessary work. This is a
-        // long background write; yield the WAL writer to any pending interactive
-        // write (scroll priority-scope) before taking it so browsing stays fluid.
-        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
-        // Also pause for a pending WAL TRUNCATE so a long scan cannot starve the
-        // checkpoint and bloat the WAL (the "open a new directory" write storm).
-        crate::write_gate::interactive_write_gate().wait_for_pending_checkpoint();
+        // get_thumbnail) was a large multiple of the necessary work. Runs on the
+        // single writer connection, so it never contends with other writes.
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         for entry in &entries {
@@ -3988,14 +3958,9 @@ impl Database {
         // handler retry transparently and prevents transient "database is
         // locked" failures.
         //
-        // A scan batch is a long background write (folders + files + media).
-        // Yield the WAL writer to any pending interactive write (scroll
-        // priority-scope, on-demand thumbnail promotion) before taking it, so
-        // browsing stays fluid while a scan is still running.
-        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
-        // Also pause for a pending WAL TRUNCATE so a long scan cannot starve the
-        // checkpoint and bloat the WAL (the "open a new directory" write storm).
-        crate::write_gate::interactive_write_gate().wait_for_pending_checkpoint();
+        // A scan batch is a long background write (folders + files + media). It
+        // runs on the single writer connection, so it never contends with other
+        // writes; the writer actor checkpoints between batches.
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let root_ids = scan_batch_root_ids(&batch);
@@ -4044,18 +4009,9 @@ impl Database {
         // `commit_scan_batch` for the full rationale.
         //
         // This is the batch-commit path taken by the real root-scan *task*
-        // worker (the non-guarded `commit_scan_batch` is only used off the task
-        // path). It loops committing 256-row batches back-to-back; SQLite has no
-        // write-lock fairness, so without yielding, the tight scan loop starves
-        // latency-sensitive interactive writes (scroll priority-scope, on-demand
-        // thumbnail-state promotion) for seconds — measured ~4s begin-lock waits
-        // while browsing a cold library mid-scan. Yield the WAL writer to any
-        // pending interactive write before taking it, exactly like
-        // `commit_scan_batch` and the background blob workers.
-        crate::write_gate::interactive_write_gate().yield_to_pending_interactive_writes();
-        // Also pause for a pending WAL TRUNCATE so a long scan cannot starve the
-        // checkpoint and bloat the WAL (the "open a new directory" write storm).
-        crate::write_gate::interactive_write_gate().wait_for_pending_checkpoint();
+        // worker. It runs on the single writer connection, so its back-to-back
+        // 256-row batches never contend with browsing writes; the writer actor
+        // checkpoints between batches to keep the WAL bounded.
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         ensure_task_attempt_running_in_transaction(&transaction, task_id, attempt_generation)?;

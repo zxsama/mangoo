@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::Request;
 use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
@@ -12,7 +12,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::db::Database;
+use crate::db::{Database, DbWriter};
 use crate::tasks::{start_worker, TaskSender};
 use crate::watch::{start_watcher, WatcherHandle};
 
@@ -24,7 +24,16 @@ pub const SESSION_HEADER: &str = "X-Megle-Session";
 
 #[derive(Clone)]
 pub struct AppState {
-    pub database: Arc<Mutex<Database>>,
+    pub writer: DbWriter,
+    /// A separate write connection used ONLY by the infrequent, user-initiated
+    /// file operations (rename/move/delete) and plugin discovery, which take a
+    /// `&Mutex<Database>` and manage fine-grained lock/unlock around interleaved
+    /// filesystem work. These are single user actions (never bursts), so they do
+    /// not reintroduce the folder-switch write storm that the single `writer`
+    /// funnels; keeping them off the writer avoids blocking the actor on slow
+    /// cross-volume copies. `None` for in-memory/test DBs (they route through the
+    /// writer instead — see the fsops fallback).
+    pub fsops_database: Option<Arc<std::sync::Mutex<Database>>>,
     pub task_queue: TaskSender,
     read_database_path: Option<PathBuf>,
     /// Resolved at startup so route handlers (notably
@@ -42,10 +51,13 @@ impl AppState {
             return Self::new_with_worker(database, worker_database);
         }
 
+        // In-memory/test DB: no reopen possible, so the writer owns the sole
+        // connection and reads fall back to it (no read_database_path).
         let (task_queue, receiver) = tokio::sync::mpsc::channel(1);
         drop(receiver);
         Self {
-            database: Arc::new(Mutex::new(database)),
+            writer: DbWriter::spawn(database),
+            fsops_database: None,
             task_queue,
             read_database_path: None,
             plugins_dir: None,
@@ -56,12 +68,29 @@ impl AppState {
     pub fn new_with_worker(database: Database, worker_database: Database) -> Self {
         let read_database_path = database.path().map(Path::to_path_buf);
         let watcher_database = database.reopen().expect("reopen watcher database");
-        let database = Arc::new(Mutex::new(database));
-        let task_queue = start_worker(worker_database);
-        let watcher = watcher_database
-            .map(|watcher_database| Arc::new(start_watcher(watcher_database, task_queue.clone())));
+        // A dedicated connection for the infrequent fsops/plugin-discover writes,
+        // which take a `&Mutex<Database>`. Reopened before `database` is moved
+        // into the writer. `None` when reopen is unavailable (in-memory).
+        let fsops_database = database
+            .reopen()
+            .expect("reopen fsops database")
+            .map(|db| Arc::new(std::sync::Mutex::new(db)));
+        // The primary connection becomes the single writer. The worker + watcher
+        // keep their own connections for READ/scheduling only; every hot-path
+        // write goes through this handle, so there is one WAL writer for the
+        // contended path and no lock contention.
+        let writer = DbWriter::spawn(database);
+        let task_queue = start_worker(worker_database, writer.clone());
+        let watcher = watcher_database.map(|watcher_database| {
+            Arc::new(start_watcher(
+                watcher_database,
+                task_queue.clone(),
+                writer.clone(),
+            ))
+        });
         Self {
-            database,
+            writer,
+            fsops_database,
             task_queue,
             read_database_path,
             plugins_dir: None,
