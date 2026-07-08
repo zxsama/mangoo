@@ -199,12 +199,19 @@ export function thumbnailObjectUrlCacheKey(
 /// No-ops when the URL is already cached, when the media isn't a fresh ready
 /// thumbnail, or on any fetch/decode error (best-effort prefetch, never surfaces
 /// an error). `resourcePriority` defaults to "ahead" so it yields to visible
-/// tile fetches in the request scheduler.
+/// tile fetches in the request scheduler. `assumeReady` lets a caller that
+/// already knows the polled thumbnail state is "ready" bypass the record-based
+/// readiness check — needed for a freshly-scanned folder whose media records
+/// don't yet carry thumbnail state (readiness arrives via the state poll).
 export function prefetchThumbnailBlob(
   mediaRecord: MediaRecord,
-  options: { resourcePriority?: "visible" | "ahead"; signal?: AbortSignal } = {}
+  options: {
+    resourcePriority?: "visible" | "ahead";
+    signal?: AbortSignal;
+    assumeReady?: boolean;
+  } = {}
 ): void {
-  if (!isReadyThumbnailMediaRecord(mediaRecord)) {
+  if (!options.assumeReady && !isReadyThumbnailMediaRecord(mediaRecord)) {
     return;
   }
   const contentSignature = mediaFileContentSignature(mediaRecord);

@@ -58,7 +58,18 @@ export function rememberThumbnailObjectUrl(
   }
 
   if (previous) {
-    deleteThumbnailObjectUrlCacheEntry(cacheKey);
+    // A DIFFERENT object URL is already cached for this content key. Both point
+    // at the same bytes (the key is content-identified), so keep the existing
+    // entry and REJECT the new one — the caller revokes its own URL. Replacing
+    // (and revoking) the existing entry here caused the "scroll up re-loads"
+    // bug: the ahead-prefetch and the mounted tile race to cache the same key
+    // with different URLs; replacing revoked the URL the mounted tile still
+    // referenced, so scrolling that tile back in found no cache entry and
+    // re-fetched. Returning false (keep existing) makes the two paths converge
+    // on one durable cached URL. Mark most-recently-used so it survives pruning.
+    thumbnailObjectUrlCache.delete(cacheKey);
+    thumbnailObjectUrlCache.set(cacheKey, previous);
+    return false;
   }
   // Always retain the freshly loaded thumbnail (it is the most-recently-used
   // entry); pruning below enforces the byte budget but never drops below the

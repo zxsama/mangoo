@@ -866,6 +866,18 @@ export function MediaGrid({
       }),
     [aheadPriorityMediaIds, loadedMediaById, thumbnailStatesByMediaId]
   );
+  // Which ahead tiles are currently READY (either the record says so or the
+  // polled state does). Keyed so the prefetch effect below re-fires when a
+  // freshly-scanned folder's thumbnail states resolve to ready — otherwise
+  // ahead prefetch would never start for a new folder (the record carries no
+  // per-row thumbnail state; readiness only arrives via the state poll).
+  const aheadReadyStateKey = useMemo(
+    () =>
+      aheadPriorityMediaIds
+        .filter((mediaId) => thumbnailStatesByMediaId[mediaId]?.state === "ready")
+        .join(":"),
+    [aheadPriorityMediaIds, thumbnailStatesByMediaId]
+  );
 
   useEffect(() => {
     if (visiblePriorityMediaIds.length === 0) {
@@ -902,11 +914,16 @@ export function MediaGrid({
     }
     for (const mediaId of aheadPriorityMediaIds) {
       const item = loadedMediaById.get(mediaId);
-      if (item) {
-        prefetchThumbnailBlob(item, { resourcePriority: "ahead" });
+      if (!item) {
+        continue;
       }
+      // Prefetch when the record OR the polled state reports ready. Passing the
+      // polled state lets a fresh folder start prefetching as soon as its state
+      // poll resolves, without waiting for the record to carry thumbnail state.
+      const polledReady = thumbnailStatesByMediaId[mediaId]?.state === "ready";
+      prefetchThumbnailBlob(item, { resourcePriority: "ahead", assumeReady: polledReady });
     }
-  }, [aheadPriorityMediaKey, aheadMediaSignatureKey, loadedMediaById]);
+  }, [aheadPriorityMediaKey, aheadMediaSignatureKey, aheadReadyStateKey, loadedMediaById, thumbnailStatesByMediaId]);
 
   useEffect(() => {
     if (!hasVisiblePending && !hasAheadPending) {
