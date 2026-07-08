@@ -22,3 +22,25 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 walkdir = "2"
+
+# Optimize the image codec + hashing dependencies even in the DEV (debug) build.
+# `npm run dev` runs the debug Core (`cargo build -p megle-core`), and an
+# unoptimized `image`/`zune-jpeg`/`webp`/`sha2` decode+resize+encode is 3-5x
+# slower — the dominant cause of "a new folder's thumbnails take forever /
+# look like they keep reloading" while scrolling. Optimizing just these
+# dependency crates (not our own code) keeps fast incremental compiles for the
+# app while making thumbnail generation near-release-speed in dev.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.webp]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.jpeg-decoder]
+opt-level = 3
