@@ -42,6 +42,30 @@ interface LiquidGlassButtonProps extends ButtonHTMLAttributes<HTMLButtonElement>
 const POINTER_RESET = "50%";
 const POINTER_OPACITY_HIDDEN = "0";
 const GLASS_POINTER_EDGE_PROXIMITY_PX = 112;
+
+// Per-element bounding-rect cache for the interactive-affordance hover glow.
+// The glow recomputes on every pointer-move frame; without a cache it called
+// getBoundingClientRect() on EVERY affordance target (every .tile-thumb — hundreds
+// in the media grid) each frame, forcing a synchronous layout each time. During
+// thumbnail generation the grid mutates constantly, so those forced reflows were
+// never free — measured ~2s of getBoundingClientRect over a 6s span (~48% main-
+// thread blocked = the reported jank). Target POSITIONS only change on scroll or
+// resize (the grid is virtualized with fixed geometry), NOT when a tile's content
+// swaps loading->image, so caching rects and invalidating only on scroll/resize is
+// correct and turns the per-frame cost from O(targets) reflows into cheap math.
+let affordanceRectCache = new WeakMap<HTMLElement, DOMRect>();
+
+function invalidateAffordanceRectCache() {
+  affordanceRectCache = new WeakMap();
+}
+
+function cachedBoundingRect(target: HTMLElement): DOMRect {
+  const cached = affordanceRectCache.get(target);
+  if (cached) return cached;
+  const rect = target.getBoundingClientRect();
+  affordanceRectCache.set(target, rect);
+  return rect;
+}
 const WINDOW_EDGE_SURFACE_SELECTOR = '[data-window-edge-surface="true"]';
 const INTERACTIVE_POINTER_TARGET_SELECTOR_ATTRIBUTE = "data-interactive-pointer-target-selector";
 const INTERACTIVE_AFFORDANCE_OWNER_SELECTOR = [
@@ -105,6 +129,12 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
     window.addEventListener("mousemove", handleMouseMove, { passive: true });
     window.addEventListener("pointerleave", handlePointerExit);
     window.addEventListener("blur", handlePointerExit);
+    // Affordance target rects are cached across pointer-move frames; their
+    // POSITIONS only change on scroll (capture phase catches inner scrollers like
+    // the virtualized media grid) or resize, so invalidate the cache then. This
+    // keeps the per-frame hover glow O(1) instead of O(targets) forced reflows.
+    window.addEventListener("scroll", invalidateAffordanceRectCache, { capture: true, passive: true });
+    window.addEventListener("resize", invalidateAffordanceRectCache, { passive: true });
 
     return () => {
       clearPointerFrame();
@@ -112,6 +142,8 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("pointerleave", handlePointerExit);
       window.removeEventListener("blur", handlePointerExit);
+      window.removeEventListener("scroll", invalidateAffordanceRectCache, { capture: true });
+      window.removeEventListener("resize", invalidateAffordanceRectCache);
       hideWindowEdgePointers();
       hideLiquidGlassPointers();
       hideInteractiveAffordancePointers();
@@ -500,7 +532,7 @@ function updateInteractiveAffordancePointers(clientX: number, clientY: number) {
       hideInteractiveAffordancePointer(target);
       continue;
     }
-    const rect = target.getBoundingClientRect();
+    const rect = cachedBoundingRect(target);
     if (rect.width <= 0 || rect.height <= 0) {
       hideInteractiveAffordancePointer(target);
       continue;

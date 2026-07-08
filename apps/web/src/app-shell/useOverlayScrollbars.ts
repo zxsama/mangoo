@@ -161,6 +161,16 @@ export function useOverlayScrollbars() {
         return;
       }
 
+      // Fast path: while the pointer stays inside the currently-active
+      // scrollable, the answer can't change — skip the expensive hit-test
+      // (document.elementsFromPoint + a getComputedStyle walk), which otherwise
+      // ran on EVERY pointer-move and scaled with DOM size, contributing to the
+      // main-thread jank while the media grid mutates during thumbnail
+      // generation. `isPointInsideElement` is a cheap rect check.
+      if (activeElement && isPointInsideElement(activeElement, pointerX, pointerY)) {
+        return;
+      }
+
       const scrollable = findScrollableElementAtPoint(pointerX, pointerY);
       if (scrollable) {
         setActiveElement(scrollable);
