@@ -71,7 +71,11 @@ const INTERACTIVE_POINTER_TARGET_SELECTOR_ATTRIBUTE = "data-interactive-pointer-
 const INTERACTIVE_AFFORDANCE_OWNER_SELECTOR = [
   ".tree-item",
   ".tile-thumb",
-  ".settings-style-slider-control"
+  ".settings-style-slider-control",
+  // The column-resize divider: drive its edge highlight from the same
+  // pointer-distance calc as everything else (was a binary :hover) so its glow
+  // fades in with cursor proximity like the rest of the UI.
+  ".shell-column-resizer"
 ].join(",");
 const INTERACTIVE_AFFORDANCE_SELECTOR = [
   INTERACTIVE_AFFORDANCE_OWNER_SELECTOR,

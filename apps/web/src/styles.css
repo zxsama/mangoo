@@ -676,6 +676,38 @@ body {
   opacity: 1;
 }
 
+/* Drive the resizer highlight from the shared pointer-DISTANCE calc: the global
+   interactive-affordance system registers .shell-column-resizer and sets
+   --interactive-pointer-opacity by cursor proximity (same as tiles/buttons/tree
+   items), replacing the binary :hover above. Suppress the generic affordance
+   ::before fill glow; the resizer's own 1px-line ::after is the highlight, now
+   faded by distance. active/focus force it fully on. */
+.shell-column-resizer[data-interactive-pointer-target="true"]::before {
+  display: none;
+}
+.shell-column-resizer[data-interactive-pointer-target="true"]::after {
+  position: absolute;
+  inset: auto;
+  top: 58px;
+  bottom: 10px;
+  left: 50%;
+  width: 1px;
+  padding: 0;
+  border-radius: 999px;
+  background: rgba(222, 251, 255, 0.36);
+  box-shadow: 0 0 14px rgba(151, 219, 226, 0.22);
+  -webkit-mask: none;
+  mask: none;
+  opacity: var(--interactive-pointer-opacity, 0);
+  transform: translateX(-50%);
+  transition: width 120ms ease;
+}
+.shell-column-resizer.active[data-interactive-pointer-target="true"]::after,
+.shell-column-resizer:focus-visible[data-interactive-pointer-target="true"]::after {
+  width: 2px;
+  opacity: 1;
+}
+
 .shell-column-resizer:focus-visible {
   outline: none;
 }
@@ -978,7 +1010,6 @@ body {
 .toolbar-meta,
 .tile-label,
 .metadata-list,
-.tree-label small,
 .task-row small,
 .empty-panel,
 .counter small {
@@ -1034,6 +1065,12 @@ button:disabled {
   display: grid;
   gap: 3px;
   margin-top: 16px;
+  isolation: isolate;
+  position: relative;
+}
+
+.tree-branch {
+  min-width: 0;
 }
 
 .tree-item {
@@ -1044,6 +1081,17 @@ button:disabled {
   margin-left: calc(var(--tree-depth, 0) * 16px);
   border: 1px solid transparent;
   border-radius: 7px;
+}
+
+.tree-list .tree-item[role="treeitem"][aria-expanded="true"] {
+  position: sticky;
+  top: calc(var(--tree-sticky-offset, 0px) - var(--tree-sticky-scrollport-inset, 0px));
+  z-index: var(--tree-sticky-z, 1);
+}
+
+.tree-list .tree-item[role="treeitem"][data-tree-sticky-pinned="true"] {
+  background: rgba(4, 10, 14, 0.2);
+  border-color: rgba(221, 245, 248, 0.08);
 }
 
 .tree-item.selected,
@@ -1069,7 +1117,7 @@ button:disabled {
 
 .tree-label {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto;
+  grid-template-columns: 18px minmax(0, 1fr);
   gap: 8px;
   align-items: center;
   min-width: 0;
@@ -1293,7 +1341,7 @@ button:disabled {
   padding: 0 10px;
   color: var(--text-soft);
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 400;
   pointer-events: none;
   text-align: center;
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, SyntheticEvent } from "react";
 import { flushSync } from "react-dom";
 import type { MediaRecord, ThumbnailResponse } from "@megle/core-client";
 import {
@@ -12,6 +12,7 @@ import {
   requestThumbnailBlob,
   thumbnailObjectUrlCacheKey
 } from "../../core/mediaResources";
+import { videoPreviewNaturalSize } from "./videoPreviewSizing";
 
 const STALE_PREVIEW_OBJECT_URL_REVOKE_DELAY_MS = 8000;
 
@@ -486,13 +487,24 @@ function ReadyPreviewMedia({
   }
 
   if (source === "original" && kind === "video") {
+    const handleVideoMetadata = (event: SyntheticEvent<HTMLVideoElement>) => {
+      const naturalSize = videoPreviewNaturalSize(event.currentTarget);
+      if (naturalSize) {
+        onNaturalSize?.(naturalSize);
+        setContainedMediaStyle(undefined);
+        setNaturalFrameStyle(naturalFrameStyleForSize(naturalSize));
+      }
+      onLoadingChange?.(false);
+      onMediaReady?.();
+    };
+
     return (
       <div className="preview-placeholder ready" data-preview-source={source} style={effectiveFrameStyle}>
         <video
           aria-label={alt}
           className="preview-image preview-video"
           controls
-          onLoadedMetadata={onMediaReady}
+          onLoadedMetadata={handleVideoMetadata}
           preload="metadata"
           src={src}
         />

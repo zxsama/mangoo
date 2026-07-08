@@ -80,8 +80,6 @@ export function PreviewPanel({
             <dd>{selectedFolder.name}</dd>
             <dt>Kind</dt>
             <dd>folder</dd>
-            <dt>Status</dt>
-            <dd>{selectedFolder.status}</dd>
             <dt>Root</dt>
             <dd>{selectedFolder.rootId}</dd>
             <dt>Parent</dt>

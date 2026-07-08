@@ -7,8 +7,8 @@ import {
   RefreshCw,
   RotateCw
 } from "lucide-react";
-import type { CSSProperties } from "react";
-import { FormEvent, useState } from "react";
+import type { CSSProperties, RefObject } from "react";
+import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { FolderRecord, RootRecord } from "../../core/types";
 import { canPickNativeFolder, pickNativeFolder } from "../../core/desktop";
 import type { LibraryState } from "../../core/useLibraryData";
@@ -29,17 +29,22 @@ interface LibrarySidebarProps {
   }) => void;
 }
 
+const TREE_STICKY_ROW_HEIGHT = 32;
+const TREE_STICKY_TOLERANCE = 1;
+
 export function LibrarySidebar({
   library,
   onFolderContextMenu,
   onRootContextMenu
 }: LibrarySidebarProps) {
   const [rootPath, setRootPath] = useState("");
+  const sidebarRef = useRef<HTMLElement | null>(null);
   const canPickFolder = canPickNativeFolder();
   const selectedRootId = library.selectedRootId;
   const selectedRoot = library.roots.find((root) => root.id === selectedRootId) ?? null;
   const canRescan = selectedRootId !== null;
   const rescanning = selectedRootId !== null && library.rescanningRootIds.has(selectedRootId);
+  useTreeStickyOcclusion(sidebarRef);
 
   async function submitRoot(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -62,6 +67,7 @@ export function LibrarySidebar({
   return (
     <aside
       className="library-sidebar"
+      ref={sidebarRef}
       aria-label="Library folders"
     >
       <div className="sidebar-heading">
@@ -179,6 +185,7 @@ function RootNode({
             shiftKey: event.shiftKey
           });
         }}
+        style={treeItemStyle(0)}
       >
         <button
           className="tree-disclosure"
@@ -196,7 +203,6 @@ function RootNode({
         >
           {expanded ? <FolderOpen size={16} /> : <Folder size={16} />}
           <span>{root.displayName}</span>
-          <small>{root.rootFolderId ? "indexed" : "pending"}</small>
         </button>
       </div>
       {expanded ? (
@@ -267,7 +273,7 @@ function FolderNode({
             shiftKey: event.shiftKey
           });
         }}
-        style={{ "--tree-depth": String(depth) } as CSSProperties}
+        style={treeItemStyle(depth)}
       >
         {knownChildless ? (
           <span className="tree-disclosure tree-disclosure--leaf" aria-hidden="true" />
@@ -288,7 +294,6 @@ function FolderNode({
         >
           {expanded ? <FolderOpen size={16} /> : <Folder size={16} />}
           <span>{folder.name}</span>
-          <small aria-busy={loading}>{folder.status}</small>
         </button>
       </div>
       {expanded ? (
@@ -307,6 +312,225 @@ function FolderNode({
       ) : null}
     </div>
   );
+}
+
+function treeItemStyle(depth: number): CSSProperties {
+  return {
+    "--tree-depth": String(depth),
+    "--tree-sticky-offset": "0px",
+    "--tree-sticky-z": String(80 - Math.min(depth, 60))
+  } as CSSProperties;
+}
+
+function useTreeStickyOcclusion(sidebarRef: RefObject<HTMLElement | null>): void {
+  useLayoutEffect(() => {
+    const sidebar = sidebarRef.current;
+    if (!sidebar) return;
+    updateTreeStickyOcclusion(sidebar);
+  });
+
+  useEffect(() => {
+    const sidebar = sidebarRef.current;
+    if (!sidebar) return;
+
+    let frame = 0;
+    const scheduleUpdate = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        updateTreeStickyOcclusion(sidebar);
+      });
+    };
+
+    sidebar.addEventListener("scroll", scheduleUpdate, { passive: true });
+    window.addEventListener("resize", scheduleUpdate);
+
+    const resizeObserver =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleUpdate);
+    resizeObserver?.observe(sidebar);
+    const tree = sidebar.querySelector<HTMLElement>(".tree-list");
+    if (tree) {
+      resizeObserver?.observe(tree);
+    }
+
+    scheduleUpdate();
+
+    return () => {
+      sidebar.removeEventListener("scroll", scheduleUpdate);
+      window.removeEventListener("resize", scheduleUpdate);
+      resizeObserver?.disconnect();
+      if (frame) {
+        window.cancelAnimationFrame(frame);
+      }
+      clearTreeStickyOcclusion(sidebar);
+    };
+  }, [sidebarRef]);
+}
+
+function updateTreeStickyOcclusion(sidebar: HTMLElement): void {
+  const tree = sidebar.querySelector<HTMLElement>(".tree-list");
+  if (!tree) return;
+
+  const rows = Array.from(tree.querySelectorAll<HTMLElement>(".tree-item[role='treeitem']"));
+  if (rows.length === 0) return;
+
+  const sidebarRect = sidebar.getBoundingClientRect();
+  const sidebarStyle = window.getComputedStyle(sidebar);
+  const scrollportInsetTop = parseCssPixels(sidebarStyle.paddingTop);
+  const stickyBaseTop = sidebarRect.top;
+  sidebar.style.setProperty("--tree-sticky-scrollport-inset", `${scrollportInsetTop}px`);
+  const layouts = rows.map(resolveTreeRowLayout);
+  const pinnedLayouts = resolvePinnedTreeRows(layouts, stickyBaseTop);
+
+  if (pinnedLayouts.length === 0) {
+    rows.forEach(clearTreeRowState);
+    return;
+  }
+
+  const occlusionTop = pinnedLayouts.reduce(
+    (top, layout) => Math.min(top, layout.actualTop),
+    pinnedLayouts[0]?.actualTop ?? stickyBaseTop
+  );
+  const occlusionBottom = pinnedLayouts.reduce(
+    (bottom, layout) => Math.max(bottom, layout.actualBottom),
+    stickyBaseTop
+  );
+  const pinnedRows = new Set(pinnedLayouts.map((layout) => layout.row));
+  const pinnedClipTopByRow = resolvePinnedClipTops(pinnedLayouts);
+
+  layouts.forEach(({ row }) => {
+    if (pinnedRows.has(row)) {
+      applyTreeRowClip(row, pinnedClipTopByRow.get(row) ?? 0);
+      return;
+    }
+
+    const rowRect = row.getBoundingClientRect();
+    if (rowRect.bottom <= occlusionTop || rowRect.top >= occlusionBottom) {
+      clearTreeRowOcclusion(row);
+      return;
+    }
+
+    const clippedTop = Math.max(0, Math.min(rowRect.height, occlusionBottom - rowRect.top));
+    applyTreeRowClip(row, clippedTop);
+  });
+}
+
+type TreeRowLayout = {
+  branchBottom: number;
+  currentTop: number;
+  height: number;
+  row: HTMLElement;
+};
+
+type PinnedTreeRowLayout = TreeRowLayout & {
+  actualBottom: number;
+  actualTop: number;
+};
+
+function resolveTreeRowLayout(row: HTMLElement): TreeRowLayout {
+  const branch = row.closest<HTMLElement>(".tree-branch");
+  const rowRect = row.getBoundingClientRect();
+  const height = row.offsetHeight || TREE_STICKY_ROW_HEIGHT;
+  return {
+    branchBottom: branch
+      ? branch.getBoundingClientRect().bottom
+      : Number.POSITIVE_INFINITY,
+    currentTop: rowRect.top,
+    height,
+    row
+  };
+}
+
+function resolvePinnedTreeRows(
+  layouts: TreeRowLayout[],
+  stickyBaseTop: number
+): PinnedTreeRowLayout[] {
+  const pinned: PinnedTreeRowLayout[] = [];
+  let nextTop = stickyBaseTop;
+
+  layouts.forEach((layout) => {
+    const { height, row } = layout;
+    if (row.getAttribute("aria-expanded") !== "true") {
+      clearTreeRowPinned(row);
+      return;
+    }
+
+    if (layout.currentTop > nextTop + TREE_STICKY_TOLERANCE) {
+      clearTreeRowPinned(row);
+      return;
+    }
+
+    const latestTop = layout.branchBottom - height;
+    if (latestTop <= stickyBaseTop - height + TREE_STICKY_TOLERANCE) {
+      clearTreeRowPinned(row);
+      return;
+    }
+
+    const actualTop = Math.min(nextTop, latestTop);
+    const actualBottom = actualTop + height;
+    row.style.setProperty("--tree-sticky-offset", `${Math.round(actualTop - stickyBaseTop)}px`);
+    row.dataset.treeStickyPinned = "true";
+    pinned.push({ ...layout, actualBottom, actualTop });
+    nextTop = actualBottom;
+  });
+
+  return pinned;
+}
+
+function clearTreeRowPinned(row: HTMLElement): void {
+  row.removeAttribute("data-tree-sticky-pinned");
+  row.style.setProperty("--tree-sticky-offset", "0px");
+}
+
+function resolvePinnedClipTops(pinnedLayouts: PinnedTreeRowLayout[]): Map<HTMLElement, number> {
+  const clipTopByRow = new Map<HTMLElement, number>();
+  let previousBottom = Number.NEGATIVE_INFINITY;
+  pinnedLayouts.forEach((layout) => {
+    const clippedTop = Math.max(
+      0,
+      Math.min(layout.height, previousBottom - layout.actualTop)
+    );
+    clipTopByRow.set(layout.row, clippedTop);
+    previousBottom = Math.max(previousBottom, layout.actualBottom);
+  });
+  return clipTopByRow;
+}
+
+function clearTreeStickyOcclusion(sidebar: HTMLElement): void {
+  sidebar
+    .querySelectorAll<HTMLElement>(".tree-item[data-tree-sticky-occluded='true']")
+    .forEach(clearTreeRowOcclusion);
+  sidebar
+    .querySelectorAll<HTMLElement>(".tree-item[data-tree-sticky-pinned='true']")
+    .forEach(clearTreeRowPinned);
+}
+
+function clearTreeRowOcclusion(row: HTMLElement): void {
+  row.style.clipPath = "";
+  row.style.pointerEvents = "";
+  row.removeAttribute("data-tree-sticky-occluded");
+}
+
+function applyTreeRowClip(row: HTMLElement, clippedTop: number): void {
+  if (clippedTop <= 0) {
+    clearTreeRowOcclusion(row);
+    return;
+  }
+  const rowHeight = row.getBoundingClientRect().height || TREE_STICKY_ROW_HEIGHT;
+  const normalizedClipTop = Math.max(0, Math.min(rowHeight, clippedTop));
+  row.style.clipPath = `inset(${Math.ceil(normalizedClipTop)}px 0 0 0)`;
+  row.style.pointerEvents = normalizedClipTop >= rowHeight - 0.5 ? "none" : "";
+  row.dataset.treeStickyOccluded = "true";
+}
+
+function clearTreeRowState(row: HTMLElement): void {
+  clearTreeRowOcclusion(row);
+  clearTreeRowPinned(row);
+}
+
+function parseCssPixels(value: string): number {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function LoadMoreChildren({

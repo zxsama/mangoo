@@ -9,6 +9,7 @@ import {
   type ReactNode
 } from "react";
 import { useTitlebarPointerPlane } from "./useTitlebarPointerPlane";
+import { useDampedWheelScroll } from "./useDampedWheelScroll";
 import { LiquidGlassSurface } from "../design/liquid-glass";
 
 const SHELL_LEFT_WIDTH_STORAGE_KEY = "megle.shell.left-width";
@@ -50,6 +51,7 @@ export function AppShell({
 }: AppShellProps) {
   const shellRef = useRef<HTMLElement | null>(null);
   const { titlebarSurfaceProps } = useTitlebarPointerPlane(shellRef);
+  useDampedWheelScroll(shellRef);
   const [leftWidth, setLeftWidth] = useState(() =>
     readStoredShellColumnWidth(SHELL_LEFT_WIDTH_STORAGE_KEY, SHELL_LEFT_DEFAULT_WIDTH)
   );

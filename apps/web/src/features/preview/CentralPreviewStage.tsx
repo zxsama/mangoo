@@ -14,6 +14,7 @@ import {
   useShortcutBindings
 } from "../shortcuts/shortcutBindings";
 import { MediaPreview } from "./MediaPreview";
+import { DampedMotionAxis, normalizeWheelDelta } from "../../core/dampedMotion";
 
 interface CentralPreviewStageProps {
   selectedMedia: MediaRecord;
@@ -42,6 +43,16 @@ export function CentralPreviewStage({
 }: CentralPreviewStageProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
+  const scaleRef = useRef(1);
+  const wheelZoomAxisRef = useRef(
+    new DampedMotionAxis({
+      acceleration: 0.35,
+      accelerationDelta: 420,
+      friction: 0.84
+    })
+  );
+  const wheelZoomFrameRef = useRef(0);
+  const wheelZoomAnchorRef = useRef<{ x: number; y: number } | null>(null);
   const { bindings } = useShortcutBindings();
   const [scale, setScale] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -71,9 +82,12 @@ export function CentralPreviewStage({
     return fitScaleForDimensions(stage, width, height);
   }, [measuredNaturalSize, selectedMedia.height, selectedMedia.id, selectedMedia.width]);
   const resetTransform = useCallback(() => {
+    const nextScale = fitLongEdgeScaleForMedia() ?? 1;
     setPan({ x: 0, y: 0 });
+    viewModeRef.current = "fit-long-edge";
     setViewMode("fit-long-edge");
-    setScale(fitLongEdgeScaleForMedia() ?? 1);
+    scaleRef.current = nextScale;
+    setScale(nextScale);
     setFitSyncTick((value) => value + 1);
     dragRef.current = null;
   }, [fitLongEdgeScaleForMedia]);
@@ -90,6 +104,10 @@ export function CentralPreviewStage({
   useEffect(() => {
     viewModeRef.current = viewMode;
   }, [viewMode]);
+
+  useEffect(() => {
+    scaleRef.current = scale;
+  }, [scale]);
 
   useEffect(() => {
     fittedMediaIdRef.current = null;
@@ -115,10 +133,11 @@ export function CentralPreviewStage({
     }
 
     function syncFitLongEdge() {
-      if (cancelled || viewMode !== "fit-long-edge") return;
+      if (cancelled || viewModeRef.current !== "fit-long-edge") return;
       frame = 0;
       const nextScale = fitLongEdgeScale();
       if (nextScale !== null) {
+        scaleRef.current = nextScale;
         setScale(nextScale);
         setPan({ x: 0, y: 0 });
         return;
@@ -171,7 +190,9 @@ export function CentralPreviewStage({
       if (shouldResetTransform || viewModeRef.current === "fit-long-edge") {
         const nextScale =
           fitScaleForDimensions(stageRef.current, size.naturalWidth, size.naturalHeight) ?? 1;
+        viewModeRef.current = "fit-long-edge";
         setViewMode("fit-long-edge");
+        scaleRef.current = nextScale;
         setScale(nextScale);
         setPan({ x: 0, y: 0 });
         setFitSyncTick((value) => value + 1);
@@ -185,6 +206,7 @@ export function CentralPreviewStage({
       const stage = stageRef.current;
       if (!stage) return;
       const rect = stage.getBoundingClientRect();
+      const currentScale = scaleRef.current;
       const local = {
         x: clientX - rect.left - rect.width / 2,
         y: clientY - rect.top - rect.height / 2
@@ -194,18 +216,20 @@ export function CentralPreviewStage({
 
       setPan((current) => {
         const imagePoint = {
-          x: (local.x - current.x) / scale,
-          y: (local.y - current.y) / scale
+          x: (local.x - current.x) / currentScale,
+          y: (local.y - current.y) / currentScale
         };
         return {
           x: local.x - imagePoint.x * clampedScale,
           y: local.y - imagePoint.y * clampedScale
         };
       });
+      scaleRef.current = clampedScale;
+      viewModeRef.current = nextMode;
       setScale(clampedScale);
       setViewMode(nextMode);
     },
-    [scale, viewMode]
+    [viewMode]
   );
 
   const toggleActualSizeAt = useCallback(
@@ -237,6 +261,19 @@ export function CentralPreviewStage({
     onViewStateChange({ mode: viewMode, scale });
   }, [onViewStateChange, scale, viewMode]);
 
+  const stepDampedWheelZoom = useCallback(() => {
+    wheelZoomFrameRef.current = 0;
+    const step = wheelZoomAxisRef.current.step();
+    const anchor = wheelZoomAnchorRef.current ?? stageCenterPoint();
+    if (step !== 0 && anchor) {
+      const nextScale = scaleRef.current * Math.exp(-step * 0.0012);
+      zoomAtPoint(anchor.x, anchor.y, nextScale, "actual");
+    }
+    if (wheelZoomAxisRef.current.active) {
+      wheelZoomFrameRef.current = window.requestAnimationFrame(stepDampedWheelZoom);
+    }
+  }, [zoomAtPoint]);
+
   const onPreviewWheel = useCallback(
     (event: globalThis.WheelEvent) => {
       event.preventDefault();
@@ -244,19 +281,20 @@ export function CentralPreviewStage({
         Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
 
       if (event.ctrlKey) {
-        zoomAtPoint(
-          event.clientX,
-          event.clientY,
-          scale * (dominantDelta < 0 ? 1.12 : 0.89),
-          "actual"
+        wheelZoomAnchorRef.current = { x: event.clientX, y: event.clientY };
+        wheelZoomAxisRef.current.push(
+          normalizeWheelDelta(dominantDelta, event.deltaMode, 18, 800)
         );
+        if (!wheelZoomFrameRef.current) {
+          wheelZoomFrameRef.current = window.requestAnimationFrame(stepDampedWheelZoom);
+        }
         return;
       }
 
       if (dominantDelta > 0) onPreviewNext();
       else if (dominantDelta < 0) onPreviewPrevious();
     },
-    [onPreviewNext, onPreviewPrevious, scale, zoomAtPoint]
+    [onPreviewNext, onPreviewPrevious, stepDampedWheelZoom]
   );
 
   useEffect(() => {
@@ -267,12 +305,27 @@ export function CentralPreviewStage({
   }, [onPreviewWheel]);
 
   useEffect(() => {
+    return () => {
+      if (wheelZoomFrameRef.current) {
+        window.cancelAnimationFrame(wheelZoomFrameRef.current);
+      }
+      wheelZoomFrameRef.current = 0;
+      wheelZoomAxisRef.current.stop();
+    };
+  }, [selectedMedia.id]);
+
+  useEffect(() => {
     function handlePreviewZoom(event: Event) {
       const direction = previewZoomDirection(event);
       if (!direction) return;
       const point = stageCenterPoint();
       if (!point) return;
-      zoomAtPoint(point.x, point.y, scale * (direction === "in" ? 1.18 : 0.85), "actual");
+      zoomAtPoint(
+        point.x,
+        point.y,
+        scaleRef.current * (direction === "in" ? 1.18 : 0.85),
+        "actual"
+      );
     }
 
     window.addEventListener("megle:preview-zoom", handlePreviewZoom);
@@ -371,12 +424,12 @@ export function CentralPreviewStage({
       const point = stageCenterPoint();
       if (!point) return;
       event.preventDefault();
-      zoomAtPoint(point.x, point.y, scale * 1.18, "actual");
+      zoomAtPoint(point.x, point.y, scaleRef.current * 1.18, "actual");
     } else if (matchShortcut(event, bindings, "zoomOut")) {
       const point = stageCenterPoint();
       if (!point) return;
       event.preventDefault();
-      zoomAtPoint(point.x, point.y, scale * 0.85, "actual");
+      zoomAtPoint(point.x, point.y, scaleRef.current * 0.85, "actual");
     }
   }
 

@@ -68,6 +68,7 @@ import {
 } from "../features/preview/previewPreferences";
 import { subscribePreference } from "../core/preferenceSync";
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
+import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
 
 type AppView = ShellWorkspaceView;
 type CompactPopover = "tasks" | "recent" | "filter" | "sort" | null;
@@ -139,6 +140,12 @@ export function App() {
   const selectedMediaIndex = orderedPreviewMedia.findIndex(
     (item) => item.id === library.selectedMediaId
   );
+  const previewTitlePosition = resolvePreviewTitlePosition({
+    media: library.media,
+    mediaSlots: library.mediaSlots,
+    mediaTotalCount: library.mediaTotalCount,
+    selectedMediaId: library.selectedMediaId
+  });
   const previewNavigationReady =
     !previewOpen ||
     (library.selectedMediaId !== null && previewDisplayedMediaId === library.selectedMediaId);
@@ -472,7 +479,7 @@ export function App() {
           canGoPrevious={canPreviewPrevious}
           mode={previewViewState.mode}
           scale={previewViewState.scale}
-          selectedName={library.selectedMedia.name}
+          selectedName={formatPreviewTitle(library.selectedMedia.name, previewTitlePosition)}
           shellActions={sidebarsHidden ? shellRightActions : undefined}
           sidebarsHidden={sidebarsHidden}
           onBack={handleClosePreview}
