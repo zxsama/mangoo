@@ -45,6 +45,8 @@ export type {
   TaskRecord,
   TaskStatus,
   ThumbnailAsset,
+  ThumbnailGenerationMode,
+  ThumbnailPriorityScopeSyncRequest,
   ThumbnailResponse,
   UserMetadataRecord,
   UserMetadataUpdate

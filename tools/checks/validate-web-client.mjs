@@ -1326,10 +1326,12 @@ if (
 if (
   // Three-way generation mode (renderedOnly | allPersist | cacheOnly), default
   // renderedOnly (persist only already-rendered thumbnails), wired through
-  // useLibraryData and applied in the App shell.
-  !/thumbnailGenerationMode:\s*ThumbnailGenerationMode/.test(previewPreferences) ||
+  // useLibraryData and applied in the App shell. The union literal is the
+  // shared contract type; previewPreferences re-exports it (single source).
+  !/import type \{ ThumbnailGenerationMode \} from "@megle\/core-client"/.test(previewPreferences) ||
+  !/export type \{ ThumbnailGenerationMode \}/.test(previewPreferences) ||
   !/DEFAULT_THUMBNAIL_GENERATION_MODE[^=]*=\s*"renderedOnly"/.test(previewPreferences) ||
-  !/"renderedOnly"\s*\|\s*"allPersist"\s*\|\s*"cacheOnly"/.test(previewPreferences) ||
+  !/"renderedOnly"\s*\|\s*"allPersist"\s*\|\s*"cacheOnly"/.test(coreClientContract) ||
   !/thumbnailGenerationMode/.test(useLibraryData) ||
   !/thumbnailGenerationMode/.test(app)
 ) {

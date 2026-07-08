@@ -42,6 +42,14 @@ const SELECTED_THUMBNAIL_REPOLL_MS = 150;
 // latest viewport once the window elapses. `selected` stays off this path and
 // syncs near-immediately because it is a direct user action.
 const THUMBNAIL_SCOPE_SYNC_DEBOUNCE_MS = 120;
+// Grace window (ms) a file stays "retained" after it last left the viewport
+// scope. While retained, Core keeps its thumbnail task warm (demoted to
+// background, never cancelled), so scrolling back within the window does not
+// lose or regenerate the tile. Once elapsed, the file drops out of
+// `retainedFileIds` and Core may cancel its pending task (renderedOnly/cacheOnly)
+// or bulk-demote it (allPersist). This IS the "delay a few seconds before
+// cancelling" the user asked for.
+const THUMBNAIL_SCOPE_RETENTION_MS = 6000;
 const SHOW_SUBFOLDER_CONTENTS_STORAGE_KEY = "megle.library.subfolder-content-open";
 const SEEN_THUMBNAIL_PERSIST_BATCH_SIZE = 128;
 const SEEN_THUMBNAIL_PERSIST_DEBOUNCE_MS = 500;
@@ -312,6 +320,10 @@ export function useLibraryData(
   const selectedMediaSnapshotRef = useRef<MediaRecord | null>(null);
   const folderNavigationHistoryRef = useRef<FolderNavigationHistory>(folderNavigationHistory);
   const thumbnailPriorityScopeRef = useRef<ThumbnailPriorityScope>(emptyThumbnailPriorityScope());
+  // file id -> last time it was in the visible/ahead scope (ms). Drives the
+  // retention grace window: a file still within THUMBNAIL_SCOPE_RETENTION_MS is
+  // sent as `retainedFileIds` so Core keeps its task warm across scroll-back.
+  const thumbnailScopeRecencyRef = useRef<Map<number, number>>(new Map());
   const thumbnailPriorityScopeSyncKeyRef = useRef<string | null>(null);
   const thumbnailPriorityScopeSyncTimerRef = useRef<number | null>(null);
   const thumbnailPriorityScopeSyncTrailingPendingRef = useRef(false);
@@ -520,7 +532,10 @@ export function useLibraryData(
               signal: controller.signal
             }
           );
-          setThumbnailCacheStats(response);
+          // Don't feed the enqueue response into the shared stats state: it no
+          // longer computes whole-scope stats (that O(scope) query blocked the
+          // writer). The settings tab polls real whole-library stats separately.
+          // The loop terminates on acceptedCount / the derived pendingCandidateCount.
           const nothingLeft =
             response.pendingCandidateCount === 0 &&
             (refreshMode !== "retryFailedAndStale" || response.failedCount === 0);
@@ -538,9 +553,11 @@ export function useLibraryData(
           thumbnailCacheActionControllerRef.current = null;
         }
         setThumbnailCacheActionBusy(false);
+        // Refresh the real whole-library stats once the manual loop settles.
+        void refreshThumbnailCacheStats();
       }
     },
-    [client]
+    [client, refreshThumbnailCacheStats]
   );
 
   const abortStaleMediaPageRequests = useCallback((keepRequestKey?: string) => {
@@ -584,11 +601,30 @@ export function useLibraryData(
         return;
       }
 
+      const scope = thumbnailPriorityScopeRef.current;
+      // Compute the retention set: everything currently in scope plus every file
+      // still within the recency grace window. Prune expired recency entries
+      // here (the sync is the natural cadence for it).
+      const nowMs = Date.now();
+      const recency = thumbnailScopeRecencyRef.current;
+      for (const [fileId, seenAt] of recency) {
+        if (nowMs - seenAt > THUMBNAIL_SCOPE_RETENTION_MS) {
+          recency.delete(fileId);
+        }
+      }
+      const retained = new Set<number>([
+        ...scope.selected,
+        ...scope.visible,
+        ...scope.ahead,
+        ...recency.keys()
+      ]);
       const input = {
         rootId,
-        selectedFileIds: thumbnailPriorityScopeRef.current.selected,
-        visibleFileIds: thumbnailPriorityScopeRef.current.visible,
-        aheadFileIds: thumbnailPriorityScopeRef.current.ahead
+        selectedFileIds: scope.selected,
+        visibleFileIds: scope.visible,
+        aheadFileIds: scope.ahead,
+        retainedFileIds: Array.from(retained),
+        generationMode: generationModeRef.current
       };
       if (
         input.selectedFileIds.length === 0 &&
@@ -641,6 +677,15 @@ export function useLibraryData(
         mediaIds,
         selectedMediaIdRef.current
       );
+      // Stamp recency for every file that just entered a foreground tier so it
+      // stays "retained" (task kept warm) for the grace window after it later
+      // leaves the scope. selected/visible/ahead all count as "recently seen".
+      const nowMs = Date.now();
+      for (const mediaId of mediaIds) {
+        if (mediaId > 0) {
+          thumbnailScopeRecencyRef.current.set(mediaId, nowMs);
+        }
+      }
       if (selectedRootIdRef.current === null) {
         if (thumbnailPriorityScopeSyncTimerRef.current !== null) {
           window.clearTimeout(thumbnailPriorityScopeSyncTimerRef.current);
@@ -1956,8 +2001,10 @@ export function useLibraryData(
           },
           { requestPriority: "background" }
         )
-        .then((response) => {
-          setThumbnailCacheStats(response);
+        .then(() => {
+          // Refresh real whole-library stats (the enqueue response no longer
+          // carries whole-scope stats — that query blocked the writer).
+          void refreshThumbnailCacheStats();
         })
         .catch((cause) => {
           if (!isAbortError(cause)) {
@@ -1973,7 +2020,7 @@ export function useLibraryData(
         thumbnailCacheAutoRefreshTimerRef.current = null;
       }
     };
-  }, [client, currentThumbnailCacheScope, options.persistentThumbnailCacheAutoRefresh, selectedFolderId, selectedRootId, showChildFolderContents]);
+  }, [client, currentThumbnailCacheScope, options.persistentThumbnailCacheAutoRefresh, refreshThumbnailCacheStats, selectedFolderId, selectedRootId, showChildFolderContents]);
 
   useEffect(() => {
     interactiveFolderScanControllerRef.current?.abort();
@@ -3182,8 +3229,21 @@ function thumbnailPriorityScopeRequestKey(input: {
   selectedFileIds: number[];
   visibleFileIds: number[];
   aheadFileIds: number[];
+  retainedFileIds?: number[];
+  generationMode?: string;
 }): string {
-  return JSON.stringify(input);
+  // Sort each id list so a set-order difference doesn't look like a scope
+  // change (which would re-fire the sync needlessly). retained/mode are part of
+  // the key so a retention change or mode switch DOES re-sync.
+  const sorted = (ids: number[] | undefined) => [...(ids ?? [])].sort((a, b) => a - b);
+  return JSON.stringify({
+    rootId: input.rootId,
+    selectedFileIds: sorted(input.selectedFileIds),
+    visibleFileIds: sorted(input.visibleFileIds),
+    aheadFileIds: sorted(input.aheadFileIds),
+    retainedFileIds: sorted(input.retainedFileIds),
+    generationMode: input.generationMode ?? null
+  });
 }
 
 function mergeThumbnailStates(

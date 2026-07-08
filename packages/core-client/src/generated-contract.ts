@@ -33,7 +33,15 @@ export interface ThumbnailPriorityScopeSyncRequest {
   selectedFileIds: number[];
   visibleFileIds: number[];
   aheadFileIds: number[];
+  // Files to keep warm (never cancel) even when out of scope — the client's
+  // recency grace window so scrolling back does not lose/regenerate a tile.
+  retainedFileIds?: number[];
+  // Current generation mode: renderedOnly/cacheOnly cancel a pending task that
+  // has left the scope + retention window; allPersist demotes it to bulk.
+  generationMode?: "renderedOnly" | "allPersist" | "cacheOnly";
 }
+
+export type ThumbnailGenerationMode = "renderedOnly" | "allPersist" | "cacheOnly";
 
 export interface ThumbnailCacheScopeParams {
   rootId?: number;

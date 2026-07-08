@@ -1081,6 +1081,25 @@ components:
           items:
             type: integer
             minimum: 1
+        retainedFileIds:
+          type: array
+          description: >-
+            Files to keep warm (never cancel) even when out of the
+            selected/visible/ahead scope — the client's recency grace window
+            (recently-visible ids still within the sticky window) so scrolling
+            back does not lose or regenerate a tile. Absent ⇒ empty.
+          items:
+            type: integer
+            minimum: 1
+        generationMode:
+          type: string
+          description: >-
+            Current thumbnail generation mode. Governs what happens to a task
+            whose file has left the scope AND the retention window: renderedOnly
+            / cacheOnly cancel a pending task; allPersist demotes it to bulk
+            priority to keep whole-library generation going. Absent ⇒ allPersist
+            (never cancels — preserves pre-change behavior).
+          enum: [renderedOnly, allPersist, cacheOnly]
     ThumbnailPriority:
       type: string
       enum: [background, ahead, visible, selected]

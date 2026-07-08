@@ -1,9 +1,13 @@
+import type { ThumbnailGenerationMode } from "@megle/core-client";
+
 const PREVIEW_PREFERENCES_STORAGE_KEY = "megle.preview.preferences";
 
 export const DEFAULT_PREVIEW_BUFFER_LIMIT_MB = 1200;
 export const DEFAULT_THUMBNAIL_CACHE_LIMIT_MB = 5120;
 
-// How Megle generates and persists grid thumbnails.
+// How Megle generates and persists grid thumbnails. The type is the shared
+// contract type (`@megle/core-client`) so it stays aligned with the
+// priority-scope sync request that carries the mode to Core.
 //   - "renderedOnly" (default): only thumbnails that were actually generated and
 //     shown on screen get written to the DB. Off-screen tiles are not generated
 //     ahead into the persistent store; background write load is minimal.
@@ -12,7 +16,7 @@ export const DEFAULT_THUMBNAIL_CACHE_LIMIT_MB = 5120;
 //   - "cacheOnly": thumbnails are generated for display and kept in the
 //     in-memory object-URL cache for this session only — never written to the
 //     SQLite thumb_blobs store, so the library file does not grow.
-export type ThumbnailGenerationMode = "renderedOnly" | "allPersist" | "cacheOnly";
+export type { ThumbnailGenerationMode };
 
 export const DEFAULT_THUMBNAIL_GENERATION_MODE: ThumbnailGenerationMode = "renderedOnly";
 

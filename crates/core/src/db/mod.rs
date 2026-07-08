@@ -216,6 +216,23 @@ pub enum ThumbnailTaskPriority {
     Selected,
 }
 
+/// What to do with a thumbnail task whose file has left the viewport scope AND
+/// the client's retention grace window. Chosen by the caller from the current
+/// generation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailScopeLeaverPolicy {
+    /// renderedOnly / cacheOnly: cancel a pending leaver (running ones finish on
+    /// their own). The user isn't looking at it and doesn't want whole-library
+    /// generation, so it should stop being active work.
+    Cancel,
+    /// allPersist: demote a leaver to bulk priority so whole-library generation
+    /// keeps making progress behind all viewport work.
+    DemoteToBulk,
+    /// Legacy / non-viewport callers: demote a leaver only to background
+    /// priority (the pre-change behavior), never cancelling or bulk-demoting.
+    DemoteToBackground,
+}
+
 impl ThumbnailTaskPriority {
     pub fn from_query_value(value: Option<&str>) -> Option<Self> {
         match value.unwrap_or("background") {
@@ -3070,9 +3087,23 @@ impl Database {
                 task_id_to_wake = Some(task_id);
             }
         }
-        let stats = crate::debug::timed("enqueue_cache/stats", || {
-            self.get_thumbnail_cache_stats(scope)
-        })?;
+        // Do NOT run the O(scope) whole-stats aggregate here — on a large
+        // descendant scope it was a multi-second query holding the single
+        // writer (a 13s writer job = frozen grid). The only consumer of this
+        // response's stats is the "generate current folder/tree" loop, which
+        // terminates on `accepted_count == 0`; it also reads
+        // `pending_candidate_count`, which we derive cheaply from the candidate
+        // entries already in memory (candidates matching the refresh mode that
+        // this batch did not accept). Whole-library stats are polled separately
+        // by the settings tab (TTL-cached, off the writer).
+        let pending_candidate_count = entries
+            .iter()
+            .filter(|entry| thumbnail_cache_entry_matches_refresh_mode(entry, refresh_mode))
+            .count() as i64;
+        let stats = ThumbnailCacheStats {
+            pending_candidate_count,
+            ..ThumbnailCacheStats::default()
+        };
         Ok(ThumbnailCacheEnqueueResult {
             accepted_count,
             task_id_to_wake,
@@ -3330,12 +3361,17 @@ impl Database {
         visible_file_ids: &[i64],
         ahead_file_ids: &[i64],
     ) -> anyhow::Result<usize> {
+        // Backward-compatible wrapper: no retention set and DemoteToBackground
+        // means leavers are only demoted to background, never cancelled or
+        // bulk-demoted — the pre-change behavior.
         Ok(self
             .sync_thumbnail_priority_scope_with_promotions(
                 root_id,
                 selected_file_ids,
                 visible_file_ids,
                 ahead_file_ids,
+                &[],
+                ThumbnailScopeLeaverPolicy::DemoteToBackground,
             )?
             .updated)
     }
@@ -3346,6 +3382,8 @@ impl Database {
         selected_file_ids: &[i64],
         visible_file_ids: &[i64],
         ahead_file_ids: &[i64],
+        retained_file_ids: &[i64],
+        leaver_policy: ThumbnailScopeLeaverPolicy,
     ) -> anyhow::Result<ThumbnailPriorityScopeSyncResult> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -3361,6 +3399,13 @@ impl Database {
         let selected_file_ids = dedupe_scope_file_ids(selected_file_ids);
         let visible_file_ids = dedupe_scope_file_ids(visible_file_ids);
         let ahead_file_ids = dedupe_scope_file_ids(ahead_file_ids);
+        // Files to keep warm even when out of scope (client recency grace
+        // window). A leaver in this set is demoted to background, never
+        // cancelled/bulk-demoted, so scrolling back within a few seconds keeps
+        // its task alive.
+        let retained_file_ids: HashSet<i64> = dedupe_scope_file_ids(retained_file_ids)
+            .into_iter()
+            .collect();
         let now = unix_timestamp();
         let mut updated = 0;
         // Bound the rescan to tasks that can actually change priority on this
@@ -3464,7 +3509,62 @@ impl Database {
         }
 
         let mut promoted_pending_task_ids = Vec::new();
+        let mut cancelled_leaver_count = 0usize;
         for (task_id, file_id, current_priority, status) in pending_tasks {
+            let in_scope = selected_file_ids.contains(&file_id)
+                || visible_file_ids.contains(&file_id)
+                || ahead_file_ids.contains(&file_id);
+
+            // A leaver (out of scope) outside the retention grace window is a
+            // candidate for cancel/bulk-demote per the mode. In scope, or still
+            // retained, or under the DemoteToBackground (legacy) policy → fall
+            // through to the normal re-rank (out-of-scope resolves to
+            // background, keeping it warm). A task already at/below bulk is left
+            // alone. DemoteToBackground never cancels/bulk-demotes.
+            let is_cancellable_leaver = !in_scope
+                && !retained_file_ids.contains(&file_id)
+                && current_priority > THUMBNAIL_BULK_PRIORITY
+                && leaver_policy != ThumbnailScopeLeaverPolicy::DemoteToBackground;
+            if is_cancellable_leaver {
+                match leaver_policy {
+                    ThumbnailScopeLeaverPolicy::Cancel if status == "pending" => {
+                        updated += transaction.execute(
+                            r#"
+                            UPDATE tasks
+                            SET status = 'cancelled',
+                                updated_at = ?1
+                            WHERE id = ?2
+                              AND kind = 'thumbnail'
+                              AND status = 'pending'
+                            "#,
+                            (now, task_id),
+                        )?;
+                        cancelled_leaver_count += 1;
+                        continue;
+                    }
+                    ThumbnailScopeLeaverPolicy::Cancel => {
+                        // Running: let it finish (bounded, self-completing);
+                        // demote so it doesn't hold an elevated slot afterward.
+                    }
+                    ThumbnailScopeLeaverPolicy::DemoteToBulk => {}
+                    ThumbnailScopeLeaverPolicy::DemoteToBackground => unreachable!(),
+                }
+                if current_priority != THUMBNAIL_BULK_PRIORITY {
+                    updated += transaction.execute(
+                        r#"
+                        UPDATE tasks
+                        SET priority = ?1,
+                            updated_at = ?2
+                        WHERE id = ?3
+                          AND kind = 'thumbnail'
+                          AND status IN ('pending', 'running')
+                        "#,
+                        (THUMBNAIL_BULK_PRIORITY, now, task_id),
+                    )?;
+                }
+                continue;
+            }
+
             let next_priority = thumbnail_scope_priority_for_file(
                 file_id,
                 &selected_file_ids,
@@ -3490,6 +3590,12 @@ impl Database {
             }
         }
         transaction.commit()?;
+        if cancelled_leaver_count > 0 {
+            debug_log!(
+                "priority-scope: cancelled {} out-of-scope pending leaver task(s)",
+                cancelled_leaver_count
+            );
+        }
         Ok(ThumbnailPriorityScopeSyncResult {
             updated,
             promoted_pending_task_ids,
@@ -12730,6 +12836,10 @@ mod tests {
                 &[new_viewport_file_id],
                 &[],
                 &[],
+                // Retain the stale file so it demotes to background (kept warm),
+                // exercising the re-rank path this test asserts.
+                &[stale_elevated_file_id],
+                ThumbnailScopeLeaverPolicy::DemoteToBulk,
             )
             .expect("sync thumbnail scope");
 
@@ -12750,6 +12860,94 @@ mod tests {
 
         assert_eq!(stale_task.priority, THUMBNAIL_BACKGROUND_PRIORITY);
         assert_eq!(new_viewport_task.priority, THUMBNAIL_SELECTED_PRIORITY);
+    }
+
+    #[test]
+    fn thumbnail_scope_leaver_is_cancelled_in_rendered_only_but_retained_or_bulk_otherwise() {
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_media_page_fixture(&database);
+
+        let make_visible_task = |name: &str, key: &str| {
+            let file_id = database
+                .upsert_file(FileUpsert {
+                    root_id,
+                    folder_id,
+                    name: name.to_string(),
+                    ext: ".jpg".to_string(),
+                    size: 100,
+                    mtime: 20,
+                    ctime: None,
+                    file_key: Some(key.to_string()),
+                })
+                .expect("insert file");
+            database
+                .upsert_media_kind(file_id, "image")
+                .expect("insert media kind");
+            let task = database
+                .request_thumbnail_task(
+                    file_id,
+                    crate::thumbnails::GRID_320_PROFILE,
+                    ThumbnailTaskPriority::Visible,
+                )
+                .expect("queue visible thumbnail");
+            (file_id, task.task_id.expect("task id"))
+        };
+
+        // Two visible tasks for the renderedOnly check.
+        let (leaver_file, leaver_task) = make_visible_task("leaver.jpg", "leaver-a");
+        let (retained_file, retained_task) = make_visible_task("retained.jpg", "retained-a");
+
+        // renderedOnly: an out-of-scope, non-retained leaver's pending task is
+        // cancelled; a retained one is only demoted to background.
+        database
+            .sync_thumbnail_priority_scope_with_promotions(
+                root_id,
+                &[],
+                &[],
+                &[],
+                &[retained_file],
+                ThumbnailScopeLeaverPolicy::Cancel,
+            )
+            .expect("sync renderedOnly scope");
+        assert_eq!(
+            database.get_task(leaver_task).unwrap().unwrap().status,
+            "cancelled",
+            "non-retained leaver cancelled in renderedOnly"
+        );
+        assert_eq!(
+            database.get_task(retained_task).unwrap().unwrap().priority,
+            THUMBNAIL_BACKGROUND_PRIORITY,
+            "retained leaver demoted to background, not cancelled"
+        );
+        assert_eq!(
+            database.get_task(retained_task).unwrap().unwrap().status,
+            "pending",
+            "retained leaver stays pending"
+        );
+
+        // allPersist: a FRESH out-of-scope leaver is demoted to bulk, not
+        // cancelled. (Created after the renderedOnly sync so that pass doesn't
+        // touch it.)
+        let (bulk_file, bulk_task) = make_visible_task("bulk.jpg", "bulk-a");
+        database
+            .sync_thumbnail_priority_scope_with_promotions(
+                root_id,
+                &[],
+                &[],
+                &[],
+                &[],
+                ThumbnailScopeLeaverPolicy::DemoteToBulk,
+            )
+            .expect("sync allPersist scope");
+        let bulk = database.get_task(bulk_task).unwrap().unwrap();
+        assert_eq!(bulk.status, "pending", "allPersist leaver not cancelled");
+        assert_eq!(
+            bulk.priority, THUMBNAIL_BULK_PRIORITY,
+            "allPersist leaver demoted to bulk"
+        );
+        // The file ids kept for reference; no further assertion needed.
+        let _ = bulk_file;
+        let _ = leaver_file;
     }
 
     #[test]

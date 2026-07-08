@@ -17,8 +17,8 @@ use crate::db::{
     Database, FolderRecord, MediaPageQuery, MediaRecord, NewRoot, PluginRecord, RootRecord,
     SearchQuery, TagError, TagRecord, TaskRecord, ThumbBlobRecord, ThumbnailCacheClearResult,
     ThumbnailCacheEnqueueResult, ThumbnailCacheRefreshMode, ThumbnailCacheScope,
-    ThumbnailCacheStats, ThumbnailRecord, ThumbnailTaskPriority, UserMetadataPatch,
-    UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
+    ThumbnailCacheStats, ThumbnailRecord, ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority,
+    UserMetadataPatch, UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
 };
 use crate::fsops::{
     self, DeleteRequest, FileOperationRecord, FsOpsError, FsOpsErrorCode, MoveRequest,
@@ -191,6 +191,14 @@ struct ThumbnailPriorityScopeSyncRequest {
     visible_file_ids: Vec<i64>,
     #[serde(default)]
     ahead_file_ids: Vec<i64>,
+    /// Files to keep warm (never cancel) even when out of scope — the client's
+    /// recency grace window so scrolling back does not lose/regenerate a tile.
+    #[serde(default)]
+    retained_file_ids: Vec<i64>,
+    /// Current generation mode. Absent ⇒ `allPersist` (never cancels), which
+    /// preserves the pre-change behavior for any caller that omits it.
+    #[serde(default)]
+    generation_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1160,6 +1168,13 @@ async fn sync_thumbnail_priority_scope(
     let selected_file_ids = payload.selected_file_ids;
     let visible_file_ids = payload.visible_file_ids;
     let ahead_file_ids = payload.ahead_file_ids;
+    let retained_file_ids = payload.retained_file_ids;
+    // Map the wire mode to the leaver policy. Absent / unknown ⇒ Demote (the
+    // allPersist behavior), which never cancels — the safe default.
+    let leaver_policy = match payload.generation_mode.as_deref() {
+        Some("renderedOnly") | Some("cacheOnly") => ThumbnailScopeLeaverPolicy::Cancel,
+        _ => ThumbnailScopeLeaverPolicy::DemoteToBulk,
+    };
     // Per-scroll prioritization write. It goes through the single writer actor
     // (like every write), so it is serialized with — never blocked by — other
     // writes; the actor checkpoints between jobs.
@@ -1172,6 +1187,8 @@ async fn sync_thumbnail_priority_scope(
             &selected_file_ids,
             &visible_file_ids,
             &ahead_file_ids,
+            &retained_file_ids,
+            leaver_policy,
         )?;
         Ok(result
             .promoted_pending_task_ids
