@@ -92,7 +92,10 @@ function repoRoot(): string {
 
 function coreBinaryPath(): string {
   const binaryName = process.platform === "win32" ? "megle-core.exe" : "megle-core";
-  return path.join(repoRoot(), "target", "debug", binaryName);
+  // MEGLE_CORE_PROFILE selects the cargo build profile directory. Defaults to
+  // "debug" (the `npm run dev` flow). The production launcher sets "release".
+  const profile = process.env.MEGLE_CORE_PROFILE === "release" ? "release" : "debug";
+  return path.join(repoRoot(), "target", profile, binaryName);
 }
 
 function ensureTrailingSlash(value: string): string {
