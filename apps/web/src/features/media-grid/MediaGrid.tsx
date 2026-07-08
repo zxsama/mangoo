@@ -32,7 +32,12 @@ import {
 const AHEAD_THUMBNAIL_ROW_COUNT = 4;
 const VISIBLE_THUMBNAIL_REPOLL_MS = 150;
 const AHEAD_THUMBNAIL_REPOLL_MS = 1000;
-const AHEAD_PRIORITY_ITEM_LIMIT = 10;
+// Cap on ahead/behind tiles state-requested per sync. Sized to cover the full
+// symmetric retention band (aheadRows above + below the viewport). The actual
+// concurrent blob fetches are separately bounded by the foreground-resource
+// scheduler (ahead=6), so a larger list here just means more tiles get their
+// state tracked, not a request storm.
+const AHEAD_PRIORITY_ITEM_LIMIT = 48;
 const RECENT_VISIBLE_THUMBNAIL_STICKY_ITEM_LIMIT = 1024;
 const RECENT_VISIBLE_THUMBNAIL_STICKY_MS = 10 * 60_000;
 const ORIGINAL_FALLBACK_OBJECT_URL_CACHE_LIMIT = 128;
@@ -598,7 +603,13 @@ export function MediaGrid({
     getScrollElement: () => parentRef.current,
     estimateSize: (index) => resolveVirtualSegment(index)?.size ?? activeMediaEstimatedSegmentSize,
     initialOffset: savedScrollTop,
-    overscan: layoutMode === "waterfall" ? 6 : 4,
+    // Keep more rows mounted beyond the viewport so a small scroll-up/-down does
+    // not unmount+remount tiles. A remounted <img> — even with a cached blob src
+    // — must RE-DECODE before it paints, which is the brief blank "reload" flash.
+    // Larger overscan means the working set stays mounted (already decoded), so
+    // back-and-forth scrolling never re-decodes. Bounded (the virtualizer only
+    // ever mounts viewport+overscan), so memory stays capped — not permanent.
+    overscan: layoutMode === "waterfall" ? 10 : 8,
   });
   const virtualItems = virtualRows.getVirtualItems();
 
@@ -691,12 +702,20 @@ export function MediaGrid({
   const aheadMediaIndexRange = useMemo(() => {
     if (!windowedMedia || !visibleMediaIndexRange) return null;
     const aheadRows = Math.max(1, aheadRowCount);
+    // Symmetric retention band: `aheadRows` both BELOW and ABOVE the viewport.
+    // Without the "behind" band, tiles just scrolled past (above the viewport)
+    // left the visible/ahead scope, so their prioritized tasks were demoted and
+    // their thumbnails re-fetched on scroll-back ("already-loaded images
+    // reload"). Symmetric coverage means scrolling either way finds tiles warm.
+    // Safe to be full-symmetric now: the concurrent fetch set is bounded by the
+    // foreground-resource scheduler (MAX_FOREGROUND_RESOURCE_REQUESTS=12,
+    // ahead=6) and the client request scheduler has a hard timeout + no slot
+    // leak, so this no longer risks the 6-connection-pool deadlock that forced
+    // the earlier one-directional prefetch (memory UPDATE 10/11, since fixed).
+    const columns = mediaWindow.columnCount;
     return {
-      start: visibleMediaIndexRange.end,
-      end: Math.min(
-        mediaItemCount,
-        visibleMediaIndexRange.end + aheadRows * mediaWindow.columnCount
-      )
+      start: Math.max(0, visibleMediaIndexRange.start - aheadRows * columns),
+      end: Math.min(mediaItemCount, visibleMediaIndexRange.end + aheadRows * columns)
     };
   }, [
     aheadRowCount,
@@ -1756,7 +1775,20 @@ function ThumbnailStateView({
   const state = thumbnail?.state ?? rowState;
   const previewPlaceholderUrl = previewPlaceholderDataUrl(item);
   const hasLiveReadyThumbnail = thumbnail?.state === "ready" && thumbnail.updatedAt !== null;
-  const canLoadCurrentThumbnailBlob = hasLiveReadyThumbnail || rowState === "ready";
+  // If the decoded thumbnail is ALREADY in the object-URL cache, the thumbnail
+  // is definitively ready and instantly displayable — render ReadyThumbnail even
+  // when neither the polled state nor the media record reports "ready". This is
+  // the fix for "already-loaded tiles reload on scroll-back": /api/media omits
+  // per-row thumbnail state and the polled state is not retained after a tile
+  // unmounts, so a remounted tile used to fall through to the loading
+  // placeholder and re-request — showing a reload — even though its blob was
+  // cached. Trusting the cache lets it render the cached image immediately.
+  const hasCachedThumbnailBlob =
+    readCachedThumbnailObjectUrl(
+      thumbnailObjectUrlCacheKey(item.id, mediaFileContentSignature(item), null)
+    ) !== null;
+  const canLoadCurrentThumbnailBlob =
+    hasLiveReadyThumbnail || rowState === "ready" || hasCachedThumbnailBlob;
   const presentationStyle = thumbnailPresentationStyle(layoutMode, thumbWidth, thumbHeight);
   const resourcePriority = selected
     ? "preview"
@@ -2238,14 +2270,32 @@ function ReadyThumbnail({
 
     requestThumbnailBlob(fileId, thumbnailUpdatedAt, {
       requestPriority,
-      resourcePriority,
-      signal: controller.signal
+      resourcePriority
+      // Deliberately NO abort signal: if the tile scrolls out of view mid-fetch
+      // we let the (small) thumbnail fetch COMPLETE and cache it (the `revoked`
+      // branch below), instead of aborting and re-fetching on scroll-back. That
+      // abort+re-fetch was the "flashes once or twice then settles" churn — a
+      // tile scrolled past before its blob arrived discarded the in-flight fetch,
+      // so returning to it re-fetched. The scheduler (12 slots) + the client's
+      // request timeout bound the in-flight set; the `revoked` flag still guards
+      // against setState after unmount.
     })
       .then((blob) => {
         objectUrl = URL.createObjectURL(blob);
         const nextObjectUrl = objectUrl;
         if (revoked) {
-          URL.revokeObjectURL(nextObjectUrl);
+          // The tile unmounted while the fetch was in flight (scrolled past
+          // fast). DON'T throw the blob away — cache it so the next mount of
+          // this tile hits instead of re-fetching. Re-fetch-on-unmount was the
+          // "flashes once or twice then settles" churn: a tile scrolled past
+          // mid-fetch discarded its result, so scrolling back re-fetched. The
+          // cache owns the URL's lifetime (LRU + count floor); we only revoke
+          // our redundant URL if the cache already holds one for this content.
+          const owns = rememberThumbnailObjectUrl(cacheKey, nextObjectUrl, blob.size);
+          if (!owns) {
+            URL.revokeObjectURL(nextObjectUrl);
+          }
+          objectUrl = null; // cache (or revoke) owns it; cleanup must not touch it
           return;
         }
 

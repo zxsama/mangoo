@@ -148,13 +148,15 @@ export async function requestThumbnailBlob(
   const resourcePriority = options.resourcePriority ?? "visible";
   const coreRequestPriority =
     options.requestPriority ?? foregroundResourceCoreRequestPriority(resourcePriority);
-  // Dedup by the blob's CONTENT identity only (file + target + version), NOT the
-  // request priority. The same tile is often requested at "visible" and then
-  // "ahead" (or vice versa) as it scrolls; keying the priority into the dedup key
-  // fetched the SAME blob twice, doubling the request load and pinning the
-  // browser's 6-connection pool under scroll churn. The scheduler still uses the
-  // priority; only the dedup ignores it (the in-flight request's priority wins).
-  const requestKey = [fileId, GRID_THUMBNAIL_TARGET, versionKey ?? "current"].join(":");
+  // Dedup by FILE + target only — NOT priority and NOT versionKey. The same
+  // tile is requested at different priorities (visible/ahead) as it scrolls, and
+  // at different versionKeys as its thumbnail-state poll resolves
+  // (thumbnailUpdatedAt null -> timestamp). All of these fetch the SAME current
+  // thumbnail bytes for the file, so keying priority or version into the dedup
+  // key fetched the same blob 2-3x under scroll churn (the residual "reload"
+  // flashes). Coalescing on file+target means the first in-flight request is
+  // reused; the version stays in the actual URL only as an HTTP cache-buster.
+  const requestKey = [fileId, GRID_THUMBNAIL_TARGET].join(":");
   const inFlight = inFlightThumbnailBlobRequests.get(requestKey);
   if (inFlight && !inFlight.controller.signal.aborted) {
     return withSharedAbortSignal(inFlight, options.signal);
