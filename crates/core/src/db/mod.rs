@@ -11,6 +11,7 @@ use rusqlite::types::Value;
 use rusqlite::{params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 
+use crate::debug_log;
 use crate::thumbnails::{
     is_safe_cache_key, source_fingerprint_for, CacheIdentity, ThumbnailDecision, ThumbnailPolicy,
     GENERATED_FORMAT, GRID_320_PROFILE, GRID_320_SHORT_SIDE_PX,
@@ -168,7 +169,7 @@ impl ThumbnailCacheRefreshMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ThumbnailCacheStats {
     pub cached_count: i64,
     pub missing_count: i64,
@@ -184,6 +185,11 @@ pub struct ThumbnailCacheEnqueueResult {
     pub accepted_count: usize,
     pub task_id_to_wake: Option<i64>,
     pub stats: ThumbnailCacheStats,
+    /// In windowed (keyset) mode, the `file_id` to resume from on the next
+    /// batch, or `None` once the scan reaches the end of the scope. Always
+    /// `None` in the non-windowed (whole-scope) enqueue path, where the caller
+    /// re-issues the same scope until nothing is accepted.
+    pub next_cursor: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2707,6 +2713,91 @@ impl Database {
         Ok(entries)
     }
 
+    /// List up to `limit` scoped thumbnail-cache entries whose `file_id` is
+    /// greater than `after_file_id`, ordered by `file_id`. Unlike
+    /// [`Self::list_thumbnail_cache_candidate_entries`], this does NOT filter to
+    /// refresh candidates — it returns every scoped entry in the keyset window
+    /// so the caller can advance a cursor past cached files it visited.
+    ///
+    /// This is the driver of the whole-library "generate all" pass: a candidate
+    /// query with `ORDER BY file_id LIMIT candidates` re-scans from the start on
+    /// every batch (each pass skips already-enqueued files via a per-row task
+    /// lookup), which is O(files) *per batch* and monopolizes the single writer
+    /// for seconds at a time on a large library. A bounded keyset window scans
+    /// exactly `limit` files per batch and the caller advances the cursor, so
+    /// the whole library costs one scan total, split into short writer jobs that
+    /// interleave with interactive writes.
+    fn list_thumbnail_cache_window_entries(
+        &self,
+        scope: ThumbnailCacheScope,
+        after_file_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ThumbnailCacheEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut parts = thumbnail_cache_scope_query_parts(scope);
+        parts.params.push(Value::Integer(after_file_id));
+        let cursor_param = parts.params.len();
+        parts.params.push(Value::Integer(limit as i64));
+        let limit_param = parts.params.len();
+        let select = format!(
+            r#"
+            SELECT
+                files.id,
+                files.root_id,
+                files.folder_id,
+                files.name,
+                files.size,
+                files.mtime,
+                files.file_key,
+                media.kind,
+                media.width,
+                media.height,
+                media.metadata_status,
+                thumbs.profile,
+                thumbs.state,
+                thumbs.short_side_px,
+                thumbs.output_format,
+                thumbs.cache_key,
+                thumbs.width,
+                thumbs.height,
+                thumbs.byte_size,
+                thumbs.error,
+                thumbs.source_fingerprint,
+                thumbs.served_by,
+                thumbs.updated_at,
+                CASE WHEN thumb_blobs.file_id IS NULL THEN 0 ELSE 1 END,
+                COALESCE(thumb_blobs.byte_size, 0)
+            FROM files
+            JOIN roots ON roots.id = files.root_id
+            LEFT JOIN media ON media.file_id = files.id
+            LEFT JOIN thumbs ON thumbs.file_id = files.id AND thumbs.profile = '{GRID_320_PROFILE}'
+            LEFT JOIN thumb_blobs ON thumb_blobs.file_id = files.id AND thumb_blobs.profile = '{GRID_320_PROFILE}'
+            WHERE {where_clause}
+              AND files.id > ?{cursor_param}
+            ORDER BY files.id ASC
+            LIMIT ?{limit_param}
+            "#,
+            where_clause = parts.where_clause
+        );
+        let sql = if parts.prefix.is_empty() {
+            select
+        } else {
+            format!("{} {select}", parts.prefix)
+        };
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter(parts.params),
+            thumbnail_cache_entry_from_row,
+        )?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
     pub fn request_thumbnail_task(
         &self,
         file_id: i64,
@@ -2950,18 +3041,107 @@ impl Database {
         scope: ThumbnailCacheScope,
         refresh_mode: ThumbnailCacheRefreshMode,
         limit: usize,
+        after_file_id: Option<i64>,
     ) -> anyhow::Result<ThumbnailCacheEnqueueResult> {
-        let entries = self.list_thumbnail_cache_candidate_entries(scope, refresh_mode, limit)?;
+        if let Some(cursor) = after_file_id {
+            return self.enqueue_thumbnail_cache_window(scope, refresh_mode, limit, cursor);
+        }
+        let entries = crate::debug::timed("enqueue_cache/candidate_query", || {
+            self.list_thumbnail_cache_candidate_entries(scope, refresh_mode, limit)
+        })?;
+        let loop_start = std::time::Instant::now();
+        let (accepted_count, mut task_id_to_wake) =
+            self.enqueue_thumbnail_cache_entries(&entries, refresh_mode, limit)?;
+        debug_log!(
+            "enqueue_cache/loop: {}ms ({} candidates, {} accepted)",
+            loop_start.elapsed().as_millis(),
+            entries.len(),
+            accepted_count
+        );
+        if task_id_to_wake.is_none() && limit > 0 {
+            if let Some((task_id, file_id, status)) =
+                self.first_scoped_pending_bulk_thumbnail_task_to_wake(scope, refresh_mode)?
+            {
+                if refresh_mode == ThumbnailCacheRefreshMode::RetryFailedAndStale
+                    && status == "failed"
+                {
+                    self.reset_failed_thumbnail_for_manual_retry(file_id, GRID_320_PROFILE)?;
+                }
+                task_id_to_wake = Some(task_id);
+            }
+        }
+        let stats = crate::debug::timed("enqueue_cache/stats", || {
+            self.get_thumbnail_cache_stats(scope)
+        })?;
+        Ok(ThumbnailCacheEnqueueResult {
+            accepted_count,
+            task_id_to_wake,
+            stats,
+            next_cursor: None,
+        })
+    }
+
+    /// Windowed (keyset) variant used by the whole-library "generate all" pass.
+    /// Scans exactly one bounded window of `limit` files past `after_file_id`,
+    /// enqueues the candidates found in it, and reports the cursor to resume
+    /// from. It deliberately skips the O(scope) work the whole-scope path does
+    /// per call — the candidate pre-filter that re-scans from the start every
+    /// batch, the pending-task wake fallback, and the full stats aggregate — so
+    /// each writer job stays short (bounded by the window) and interleaves with
+    /// interactive writes. Progress is surfaced by the separate cached stats
+    /// route, so omitting stats here costs the caller nothing.
+    fn enqueue_thumbnail_cache_window(
+        &self,
+        scope: ThumbnailCacheScope,
+        refresh_mode: ThumbnailCacheRefreshMode,
+        limit: usize,
+        after_file_id: i64,
+    ) -> anyhow::Result<ThumbnailCacheEnqueueResult> {
+        let window_start = std::time::Instant::now();
+        let entries = self.list_thumbnail_cache_window_entries(scope, after_file_id, limit)?;
+        let scanned = entries.len();
+        let last_file_id = entries.last().map(|entry| entry.source.file_id);
+        // `usize::MAX` cap: the window itself bounds the batch, so enqueue every
+        // candidate the window surfaced rather than stopping at an accept count.
+        let (accepted_count, task_id_to_wake) =
+            self.enqueue_thumbnail_cache_entries(&entries, refresh_mode, usize::MAX)?;
+        // A short window means we reached the end of the scope; otherwise resume
+        // after the last file we scanned (candidate or not).
+        let next_cursor = if scanned == limit { last_file_id } else { None };
+        debug_log!(
+            "enqueue_cache/window: {}ms (cursor {} -> {:?}, {} scanned, {} accepted)",
+            window_start.elapsed().as_millis(),
+            after_file_id,
+            next_cursor,
+            scanned,
+            accepted_count
+        );
+        Ok(ThumbnailCacheEnqueueResult {
+            accepted_count,
+            task_id_to_wake,
+            stats: ThumbnailCacheStats::default(),
+            next_cursor,
+        })
+    }
+
+    /// Enqueue thumbnail tasks for the refresh-mode-matching entries in `entries`
+    /// under one `BEGIN IMMEDIATE`/`COMMIT`, stopping once `accept_limit`
+    /// candidates are accepted. Returns `(accepted_count, task_id_to_wake)`.
+    /// Shared by the whole-scope and windowed enqueue paths. Batching under one
+    /// transaction (rather than a commit + `get_thumbnail` per file) keeps the
+    /// single writer's hold short.
+    fn enqueue_thumbnail_cache_entries(
+        &self,
+        entries: &[ThumbnailCacheEntry],
+        refresh_mode: ThumbnailCacheRefreshMode,
+        accept_limit: usize,
+    ) -> anyhow::Result<(usize, Option<i64>)> {
         let mut accepted_count = 0usize;
         let mut task_id_to_wake = None;
-        // Enqueue the whole batch under one transaction: "generate cache" can
-        // touch thousands of files, and a per-file commit (plus a per-file
-        // get_thumbnail) was a large multiple of the necessary work. Runs on the
-        // single writer connection, so it never contends with other writes.
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        for entry in &entries {
-            if accepted_count >= limit {
+        for entry in entries {
+            if accepted_count >= accept_limit {
                 break;
             }
             if !thumbnail_cache_entry_matches_refresh_mode(entry, refresh_mode) {
@@ -2990,29 +3170,9 @@ impl Database {
             if outcome.should_enqueue && task_id_to_wake.is_none() {
                 task_id_to_wake = outcome.task_id;
             }
-            if accepted_count >= limit {
-                break;
-            }
         }
         transaction.commit()?;
-        if task_id_to_wake.is_none() && limit > 0 {
-            if let Some((task_id, file_id, status)) =
-                self.first_scoped_pending_bulk_thumbnail_task_to_wake(scope, refresh_mode)?
-            {
-                if refresh_mode == ThumbnailCacheRefreshMode::RetryFailedAndStale
-                    && status == "failed"
-                {
-                    self.reset_failed_thumbnail_for_manual_retry(file_id, GRID_320_PROFILE)?;
-                }
-                task_id_to_wake = Some(task_id);
-            }
-        }
-        let stats = self.get_thumbnail_cache_stats(scope)?;
-        Ok(ThumbnailCacheEnqueueResult {
-            accepted_count,
-            task_id_to_wake,
-            stats,
-        })
+        Ok((accepted_count, task_id_to_wake))
     }
 
     pub fn enqueue_thumbnail_cache_tasks_for_file_ids(
@@ -3072,6 +3232,7 @@ impl Database {
             accepted_count,
             task_id_to_wake,
             stats,
+            next_cursor: None,
         })
     }
 
@@ -3132,6 +3293,33 @@ impl Database {
             deleted_blob_count,
             reset_thumbnail_count,
         })
+    }
+
+    /// Cancel every *pending* bulk-priority (whole-library) thumbnail task,
+    /// leaving higher-priority (viewport/selected/ahead) work and already
+    /// generated blobs untouched. Used when the user is in a generation mode
+    /// that does NOT do whole-library background generation ("renderedOnly" /
+    /// "cacheOnly"): any leftover bulk queue from a previous "generate all" /
+    /// "allPersist" session should not keep the worker busy on files the user
+    /// isn't looking at. Returns the number of tasks cancelled.
+    ///
+    /// Only `pending` bulk tasks are cancelled — a `running` one is already
+    /// decoding and finishes on its own. The matching `thumbs` rows are left in
+    /// `queued`; the next viewport request re-drives them, and the cache-status
+    /// query treats queued-without-a-task as `missing`, so nothing is lost.
+    pub fn cancel_pending_bulk_thumbnail_tasks(&self) -> anyhow::Result<usize> {
+        let cancelled = self.connection.execute(
+            r#"
+            UPDATE tasks
+            SET status = 'cancelled',
+                updated_at = ?1
+            WHERE kind = 'thumbnail'
+              AND status = 'pending'
+              AND priority = ?2
+            "#,
+            (unix_timestamp(), THUMBNAIL_BULK_PRIORITY),
+        )?;
+        Ok(cancelled)
     }
 
     #[allow(dead_code)]
@@ -6354,8 +6542,10 @@ fn thumbnail_cache_scope_query_parts(scope: ThumbnailCacheScope) -> ThumbnailCac
         "roots.enabled = 1".to_string(),
         "COALESCE(media.kind, '') IN ('image', 'video')".to_string(),
     ];
+    let mut descendant_folder_scope = false;
     let prefix = if let Some(folder_id) = scope.folder_id {
         if scope.include_descendants {
+            descendant_folder_scope = true;
             params.push(Value::Integer(folder_id));
             where_clauses.push("files.folder_id IN (SELECT id FROM scoped_folders)".to_string());
             "WITH RECURSIVE scoped_folders(id) AS (
@@ -6374,14 +6564,35 @@ fn thumbnail_cache_scope_query_parts(scope: ThumbnailCacheScope) -> ThumbnailCac
     } else {
         String::new()
     };
-    if let Some(root_id) = scope.root_id {
-        params.push(Value::Integer(root_id));
-        where_clauses.push(format!("files.root_id = ?{}", params.len()));
+    // A descendant folder scope already confines the query to one root's
+    // subtree (folders never span roots), so `files.root_id = ?` is redundant
+    // here. Worse, keeping it lets SQLite's planner pick the whole-root index
+    // (`idx_files_root_status_*`) and scan every active file in the root
+    // (millions), bloom-filtering down to the handful in scope — a
+    // multi-second scan. Omitting it steers the planner onto the folder index
+    // so it touches only the scoped files. See `push_root_id_scope`.
+    if !descendant_folder_scope {
+        push_root_id_scope(scope, &mut params, &mut where_clauses);
     }
     ThumbnailCacheScopeQueryParts {
         prefix,
         where_clause: where_clauses.join(" AND "),
         params,
+    }
+}
+
+/// Append `files.root_id = ?` to a thumbnail-cache scope query unless the scope
+/// has no root filter. Callers omit this for descendant folder scopes, where
+/// the root predicate is redundant and harms the query plan (see
+/// [`thumbnail_cache_scope_query_parts`]).
+fn push_root_id_scope(
+    scope: ThumbnailCacheScope,
+    params: &mut Vec<Value>,
+    where_clauses: &mut Vec<String>,
+) {
+    if let Some(root_id) = scope.root_id {
+        params.push(Value::Integer(root_id));
+        where_clauses.push(format!("files.root_id = ?{}", params.len()));
     }
 }
 
@@ -6393,8 +6604,10 @@ fn thumbnail_cache_active_task_scope_query_parts(
         "files.status = 'active'".to_string(),
         "roots.enabled = 1".to_string(),
     ];
+    let mut descendant_folder_scope = false;
     let prefix = if let Some(folder_id) = scope.folder_id {
         if scope.include_descendants {
+            descendant_folder_scope = true;
             params.push(Value::Integer(folder_id));
             where_clauses.push("files.folder_id IN (SELECT id FROM scoped_folders)".to_string());
             "WITH RECURSIVE scoped_folders(id) AS (
@@ -6413,9 +6626,10 @@ fn thumbnail_cache_active_task_scope_query_parts(
     } else {
         String::new()
     };
-    if let Some(root_id) = scope.root_id {
-        params.push(Value::Integer(root_id));
-        where_clauses.push(format!("files.root_id = ?{}", params.len()));
+    // Redundant with a descendant folder scope and harmful to the plan — see
+    // `thumbnail_cache_scope_query_parts`.
+    if !descendant_folder_scope {
+        push_root_id_scope(scope, &mut params, &mut where_clauses);
     }
     ThumbnailCacheScopeQueryParts {
         prefix,
@@ -6437,32 +6651,70 @@ fn thumbnail_cache_skipped_small_sql() -> String {
 }
 
 fn thumbnail_cache_status_sql_expression() -> String {
-    let current_fingerprint = thumbnail_cache_current_fingerprint_sql();
-    let skipped_small = thumbnail_cache_skipped_small_sql();
+    thumbnail_cache_status_sql_expression_with_columns(&ThumbnailCacheStatusColumns::direct())
+}
+
+/// The column references the cache-status CASE expression reads. Callers that
+/// precompute the current fingerprint once per row (the stats query) supply
+/// aliased column names pointing at an inner subquery; the default uses the live
+/// table columns and the per-row UDF.
+struct ThumbnailCacheStatusColumns {
+    thumb_state: String,
+    thumb_source_fingerprint: String,
+    thumb_blob_present: String,
+    current_fingerprint: String,
+    skipped_small: String,
+}
+
+impl ThumbnailCacheStatusColumns {
+    /// Read directly from the joined tables, computing the fingerprint UDF inline
+    /// (re-invoked per comparison). Used by the candidate/pending queries which
+    /// are already bounded (LIMIT / single row) so the repeated UDF is cheap.
+    fn direct() -> Self {
+        Self {
+            thumb_state: "thumbs.state".to_string(),
+            thumb_source_fingerprint: "thumbs.source_fingerprint".to_string(),
+            thumb_blob_present: "thumb_blobs.file_id IS NOT NULL".to_string(),
+            current_fingerprint: thumbnail_cache_current_fingerprint_sql(),
+            skipped_small: thumbnail_cache_skipped_small_sql(),
+        }
+    }
+}
+
+fn thumbnail_cache_status_sql_expression_with_columns(
+    columns: &ThumbnailCacheStatusColumns,
+) -> String {
+    let ThumbnailCacheStatusColumns {
+        thumb_state,
+        thumb_source_fingerprint,
+        thumb_blob_present,
+        current_fingerprint,
+        skipped_small,
+    } = columns;
     format!(
         r#"
         CASE
           WHEN {skipped_small} THEN 'skipped'
-          WHEN thumbs.state IS NULL THEN 'missing'
-          WHEN thumbs.state = 'ready' THEN
+          WHEN {thumb_state} IS NULL THEN 'missing'
+          WHEN {thumb_state} = 'ready' THEN
             CASE
-              WHEN thumbs.source_fingerprint = {current_fingerprint} AND thumb_blobs.file_id IS NOT NULL THEN 'cached'
-              WHEN thumbs.source_fingerprint = {current_fingerprint} THEN 'missing'
+              WHEN {thumb_source_fingerprint} = {current_fingerprint} AND {thumb_blob_present} THEN 'cached'
+              WHEN {thumb_source_fingerprint} = {current_fingerprint} THEN 'missing'
               ELSE 'stale'
             END
-          WHEN thumbs.state = 'failed' THEN
+          WHEN {thumb_state} = 'failed' THEN
             CASE
-              WHEN thumbs.source_fingerprint = {current_fingerprint} THEN 'failed'
+              WHEN {thumb_source_fingerprint} = {current_fingerprint} THEN 'failed'
               ELSE 'stale'
             END
-          WHEN thumbs.state = 'skipped_small' THEN
+          WHEN {thumb_state} = 'skipped_small' THEN
             CASE
-              WHEN thumbs.source_fingerprint = {current_fingerprint} AND {skipped_small} THEN 'skipped'
+              WHEN {thumb_source_fingerprint} = {current_fingerprint} AND {skipped_small} THEN 'skipped'
               ELSE 'stale'
             END
-          WHEN thumbs.state IN ('pending', 'queued') THEN
+          WHEN {thumb_state} IN ('pending', 'queued') THEN
             CASE
-              WHEN thumbs.source_fingerprint = {current_fingerprint} THEN 'missing'
+              WHEN {thumb_source_fingerprint} = {current_fingerprint} THEN 'missing'
               ELSE 'stale'
             END
           ELSE 'missing'
@@ -6492,18 +6744,41 @@ fn thumbnail_cache_candidate_query(
     let status_expression = thumbnail_cache_status_sql_expression();
     let refresh_condition = thumbnail_cache_refresh_mode_sql_condition(refresh_mode);
     let terminal_current_ready = "COALESCE(thumb_state = 'ready' AND source_fingerprint = current_source_fingerprint AND has_blob = 1, 0)";
-    let active_equal_or_higher_priority_task = format!(
-        r#"
+    // "Already has an active bulk-or-higher task" — this enqueue runs at
+    // `THUMBNAIL_BULK_PRIORITY`, which is the *lowest* priority, so any active
+    // (pending/running) thumbnail task for the file is by definition at
+    // bulk-or-higher priority. We therefore DO NOT add a `priority >= ...`
+    // predicate: a `priority >= THUMBNAIL_BULK_PRIORITY` filter is always true
+    // yet forces SQLite off the `(kind, file_id, status)` covering index and
+    // onto `(kind, status, priority)`, which lacks `file_id` — turning this
+    // correlated subquery into a full scan of every pending thumbnail task per
+    // scoped file (seconds on a large library). Omitting it keeps the O(1)
+    // per-file index seek. If a priority tier below bulk is ever introduced,
+    // reinstate an explicit filter here.
+    debug_assert_eq!(
+        THUMBNAIL_BULK_PRIORITY,
+        [
+            THUMBNAIL_BULK_PRIORITY,
+            THUMBNAIL_BACKGROUND_PRIORITY,
+            THUMBNAIL_AHEAD_PRIORITY,
+            THUMBNAIL_VISIBLE_PRIORITY,
+            THUMBNAIL_SELECTED_PRIORITY,
+        ]
+        .into_iter()
+        .min()
+        .unwrap(),
+        "bulk must remain the lowest thumbnail priority for this query's index assumption",
+    );
+    let active_equal_or_higher_priority_task = r#"
         EXISTS (
           SELECT 1
           FROM tasks active_tasks
           WHERE active_tasks.kind = 'thumbnail'
             AND active_tasks.file_id = scoped_entries.file_id
             AND active_tasks.status IN ('pending', 'running')
-            AND active_tasks.priority >= {THUMBNAIL_BULK_PRIORITY}
         )
         "#
-    );
+    .to_string();
     parts.params.push(Value::Integer(limit as i64));
     let limit_param = parts.params.len();
     let select = format!(
@@ -6628,7 +6903,25 @@ fn thumbnail_cache_pending_bulk_task_query(
 
 fn thumbnail_cache_stats_query(scope: ThumbnailCacheScope) -> (String, Vec<Value>) {
     let parts = thumbnail_cache_scope_query_parts(scope);
-    let status_expression = thumbnail_cache_status_sql_expression();
+    // Compute the current source fingerprint exactly ONCE per row (only for rows
+    // that actually have a thumb row — `missing` rows, the overwhelming majority
+    // in a cold library, skip the UDF entirely via the CASE guard). The status
+    // CASE then compares against this precomputed column instead of re-invoking
+    // the SHA256 UDF ~3-6 times per row. On a 650k-file library this turned a
+    // ~53s whole-library stats query (237k+ UDF calls) into a ~0.5s scan.
+    let fingerprint_column = format!(
+        "CASE WHEN thumbs.state IS NOT NULL THEN {} END",
+        thumbnail_cache_current_fingerprint_sql()
+    );
+    let status_columns = ThumbnailCacheStatusColumns {
+        thumb_state: "thumb_state".to_string(),
+        thumb_source_fingerprint: "thumb_source_fingerprint".to_string(),
+        thumb_blob_present: "thumb_blob_present".to_string(),
+        current_fingerprint: "current_source_fingerprint".to_string(),
+        skipped_small: "is_skipped_small".to_string(),
+    };
+    let status_expression = thumbnail_cache_status_sql_expression_with_columns(&status_columns);
+    let skipped_small = thumbnail_cache_skipped_small_sql();
     let select = format!(
         r#"
         SELECT
@@ -6640,13 +6933,22 @@ fn thumbnail_cache_stats_query(scope: ThumbnailCacheScope) -> (String, Vec<Value
         FROM (
             SELECT
                 {status_expression} AS cache_status,
-                COALESCE(thumb_blobs.byte_size, 0) AS blob_byte_size
-            FROM files
-            JOIN roots ON roots.id = files.root_id
-            LEFT JOIN media ON media.file_id = files.id
-            LEFT JOIN thumbs ON thumbs.file_id = files.id AND thumbs.profile = '{GRID_320_PROFILE}'
-            LEFT JOIN thumb_blobs ON thumb_blobs.file_id = files.id AND thumb_blobs.profile = '{GRID_320_PROFILE}'
-            WHERE {where_clause}
+                blob_byte_size
+            FROM (
+                SELECT
+                    thumbs.state AS thumb_state,
+                    thumbs.source_fingerprint AS thumb_source_fingerprint,
+                    (thumb_blobs.file_id IS NOT NULL) AS thumb_blob_present,
+                    ({skipped_small}) AS is_skipped_small,
+                    {fingerprint_column} AS current_source_fingerprint,
+                    COALESCE(thumb_blobs.byte_size, 0) AS blob_byte_size
+                FROM files
+                JOIN roots ON roots.id = files.root_id
+                LEFT JOIN media ON media.file_id = files.id
+                LEFT JOIN thumbs ON thumbs.file_id = files.id AND thumbs.profile = '{GRID_320_PROFILE}'
+                LEFT JOIN thumb_blobs ON thumb_blobs.file_id = files.id AND thumb_blobs.profile = '{GRID_320_PROFILE}'
+                WHERE {where_clause}
+            ) scoped_rows
         ) scoped_entries
         "#,
         where_clause = parts.where_clause
@@ -10528,6 +10830,7 @@ mod tests {
                 },
                 ThumbnailCacheRefreshMode::StaleOrMissing,
                 2,
+                None,
             )
             .expect("enqueue stale or missing candidates");
         assert_eq!(enqueue_missing_or_stale.accepted_count, 2);
@@ -10552,6 +10855,7 @@ mod tests {
                 },
                 ThumbnailCacheRefreshMode::RetryFailedAndStale,
                 4,
+                None,
             )
             .expect("enqueue stale and failed candidates");
         assert!(retry_failed.accepted_count >= 1);
@@ -10610,6 +10914,70 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect bounded candidates");
         assert_eq!(entries.len(), 7);
+    }
+
+    #[test]
+    fn thumbnail_cache_windowed_enqueue_advances_cursor_and_completes() {
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_thumbnail_cache_scope_fixture(&database, "cache-window");
+        // 10 missing candidates. A window of 4 must walk them in file_id order,
+        // enqueue every candidate it scans (no accept cap), advance the cursor
+        // past the last file scanned, and report scan-complete (next_cursor
+        // None) once a window comes back short.
+        let mut file_ids = Vec::new();
+        for index in 0..10 {
+            file_ids.push(seed_thumbnail_cache_candidate(
+                &database,
+                root_id,
+                folder_id,
+                &format!("window-{index:03}.jpg"),
+                Some(&format!("window-key-{index:03}")),
+                "absent",
+                false,
+                None,
+                None,
+            ));
+        }
+        file_ids.sort_unstable();
+
+        let scope = ThumbnailCacheScope {
+            root_id: Some(root_id),
+            folder_id: Some(folder_id),
+            include_descendants: false,
+        };
+        let mut cursor = Some(0);
+        let mut total_accepted = 0usize;
+        let mut batches = 0;
+        while let Some(after) = cursor {
+            let result = database
+                .enqueue_thumbnail_cache_tasks(
+                    scope,
+                    ThumbnailCacheRefreshMode::StaleOrMissing,
+                    4,
+                    Some(after),
+                )
+                .expect("windowed enqueue batch");
+            total_accepted += result.accepted_count;
+            batches += 1;
+            assert!(batches <= 6, "windowed enqueue must terminate");
+            cursor = result.next_cursor;
+        }
+
+        // Full windows of 4 over 10 files: cursors after 4 and 8, then a short
+        // window of 2 that ends the scan.
+        assert_eq!(batches, 3);
+        assert_eq!(total_accepted, 10);
+        let bulk_file_ids: Vec<i64> = database
+            .list_tasks()
+            .expect("list tasks")
+            .into_iter()
+            .filter(|task| task.kind == "thumbnail" && task.priority == THUMBNAIL_BULK_PRIORITY)
+            .filter_map(|task| task.file_id)
+            .collect();
+        assert_eq!(bulk_file_ids.len(), 10);
+        for file_id in &file_ids {
+            assert!(bulk_file_ids.contains(file_id));
+        }
     }
 
     #[test]
@@ -10723,6 +11091,90 @@ mod tests {
         assert_eq!(tree_stats.failed_count, 1);
         assert_eq!(tree_stats.pending_candidate_count, 3);
         assert_eq!(tree_stats.total_blob_bytes, 30);
+    }
+
+    #[test]
+    fn cancel_pending_bulk_thumbnail_tasks_only_drops_bulk_pending() {
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_thumbnail_cache_scope_fixture(&database, "cancel-bulk");
+        // Two missing candidates -> two bulk pending tasks.
+        for index in 0..2 {
+            seed_thumbnail_cache_candidate(
+                &database,
+                root_id,
+                folder_id,
+                &format!("bulk-{index}.jpg"),
+                Some(&format!("cancel-bulk-{index}")),
+                "absent",
+                false,
+                None,
+                None,
+            );
+        }
+        let bulk = database
+            .enqueue_thumbnail_cache_tasks(
+                ThumbnailCacheScope {
+                    root_id: Some(root_id),
+                    folder_id: Some(folder_id),
+                    include_descendants: false,
+                },
+                ThumbnailCacheRefreshMode::StaleOrMissing,
+                8,
+                None,
+            )
+            .expect("enqueue bulk candidates");
+        assert_eq!(bulk.accepted_count, 2);
+
+        // A higher-priority (visible) task for a different file must survive.
+        let visible_file_id = seed_thumbnail_cache_candidate(
+            &database,
+            root_id,
+            folder_id,
+            "visible.jpg",
+            Some("cancel-bulk-visible"),
+            "absent",
+            false,
+            None,
+            None,
+        );
+        database
+            .request_thumbnail_task(
+                visible_file_id,
+                GRID_320_PROFILE,
+                ThumbnailTaskPriority::Visible,
+            )
+            .expect("request visible thumbnail");
+
+        let cancelled = database
+            .cancel_pending_bulk_thumbnail_tasks()
+            .expect("cancel pending bulk tasks");
+        assert_eq!(cancelled, 2, "both bulk pending tasks cancelled");
+
+        let remaining_bulk_pending = database
+            .list_tasks()
+            .expect("list tasks")
+            .into_iter()
+            .filter(|task| {
+                task.kind == "thumbnail"
+                    && task.priority == THUMBNAIL_BULK_PRIORITY
+                    && task.status == "pending"
+            })
+            .count();
+        assert_eq!(remaining_bulk_pending, 0, "no bulk pending tasks remain");
+
+        // The visible task is untouched.
+        let visible_pending = database
+            .list_tasks()
+            .expect("list tasks")
+            .into_iter()
+            .filter(|task| {
+                task.kind == "thumbnail"
+                    && task.priority == THUMBNAIL_VISIBLE_PRIORITY
+                    && task.status == "pending"
+                    && task.file_id == Some(visible_file_id)
+            })
+            .count();
+        assert_eq!(visible_pending, 1, "visible task must survive cancel-bulk");
     }
 
     #[test]
@@ -10849,7 +11301,12 @@ mod tests {
         assert_eq!(stats.pending_candidate_count, 1);
 
         let enqueue_result = database
-            .enqueue_thumbnail_cache_tasks(scope, ThumbnailCacheRefreshMode::StaleOrMissing, 16)
+            .enqueue_thumbnail_cache_tasks(
+                scope,
+                ThumbnailCacheRefreshMode::StaleOrMissing,
+                16,
+                None,
+            )
             .expect("enqueue scoped ready row without blob");
 
         assert_eq!(enqueue_result.accepted_count, 1);

@@ -5,6 +5,7 @@ export type {
   AddFileTagRequest,
   CreateTagRequest,
   DeletePluginResponse,
+  ThumbnailCacheCancelBulkResponse,
   ThumbnailCacheClearResponse,
   ThumbnailCacheEnqueueResponse,
   ThumbnailCacheRefreshMode,

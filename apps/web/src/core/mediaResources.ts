@@ -1,5 +1,9 @@
 import type { CoreRequestPriority, MediaRecord, ThumbnailResponse } from "@megle/core-client";
 import { createCoreClient } from "./client";
+import {
+  readCachedThumbnailObjectUrl as readCachedThumbnailObjectUrlInternal,
+  rememberThumbnailObjectUrl as rememberThumbnailObjectUrlInternal
+} from "./thumbnailObjectUrlCache";
 
 // The durable thumbnail object-URL cache is an isolated, unit-tested unit;
 // re-export it so existing consumers keep importing it from here.
@@ -184,6 +188,62 @@ export function thumbnailObjectUrlCacheKey(
   return `${fileId}:${GRID_THUMBNAIL_TARGET}:${versionKey ?? mediaSignature}`;
 }
 
+/// Prefetch a ready thumbnail's WebP bytes into the decoded object-URL cache so
+/// a tile that later scrolls into view renders instantly — no blob fetch, no
+/// decode, no placeholder flash or fade-in at mount. This is the "ahead"
+/// counterpart to `ReadyThumbnail`'s own on-mount fetch: it uses the SAME
+/// content-keyed cache (`thumbnailObjectUrlCacheKey`) and the same shared,
+/// deduped `requestThumbnailBlob`, so when the tile mounts,
+/// `readCachedThumbnailObjectUrl` already returns the URL.
+///
+/// No-ops when the URL is already cached, when the media isn't a fresh ready
+/// thumbnail, or on any fetch/decode error (best-effort prefetch, never surfaces
+/// an error). `resourcePriority` defaults to "ahead" so it yields to visible
+/// tile fetches in the request scheduler.
+export function prefetchThumbnailBlob(
+  mediaRecord: MediaRecord,
+  options: { resourcePriority?: "visible" | "ahead"; signal?: AbortSignal } = {}
+): void {
+  if (!isReadyThumbnailMediaRecord(mediaRecord)) {
+    return;
+  }
+  const contentSignature = mediaFileContentSignature(mediaRecord);
+  const cacheKey = thumbnailObjectUrlCacheKey(mediaRecord.id, contentSignature, null);
+  if (readCachedThumbnailObjectUrlInternal(cacheKey)) {
+    return;
+  }
+  const resourcePriority = options.resourcePriority ?? "ahead";
+  void requestThumbnailBlob(mediaRecord.id, null, {
+    requestPriority: "resource",
+    resourcePriority,
+    signal: options.signal
+  })
+    .then((blob) => {
+      // Re-check under the async boundary: the tile may have mounted and cached
+      // it, or the media content may have changed. Only cache a still-missing,
+      // still-valid entry.
+      if (readCachedThumbnailObjectUrlInternal(cacheKey)) {
+        return;
+      }
+      const objectUrl = URL.createObjectURL(blob);
+      // Decode before publishing so the tile's <img> paints synchronously on
+      // mount instead of decoding on the main thread mid-scroll.
+      void preloadImageObjectUrl(objectUrl)
+        .then(() => {
+          if (!rememberThumbnailObjectUrlInternal(cacheKey, objectUrl, blob.size)) {
+            URL.revokeObjectURL(objectUrl);
+          }
+        })
+        .catch(() => {
+          URL.revokeObjectURL(objectUrl);
+        });
+    })
+    .catch(() => {
+      // Best-effort prefetch: swallow aborts and fetch failures. The tile's own
+      // on-mount fetch will retry if it actually scrolls into view.
+    });
+}
+
 export function preloadImageObjectUrl(
   objectUrl: string
 ): Promise<{ naturalHeight: number; naturalWidth: number }> {
@@ -309,6 +369,22 @@ export function shouldRequestThumbnailState(mediaRecord: MediaRecord): boolean {
     return false;
   }
   return true;
+}
+
+/// Whether this media has a ready thumbnail worth prefetching. True when either
+/// the record itself reports "ready" or the polled thumbnail-state cache has a
+/// fresh "ready" entry for it. Used to gate ahead-of-viewport blob prefetch so
+/// we never fetch blobs for pending/failed/skipped tiles.
+function isReadyThumbnailMediaRecord(mediaRecord: MediaRecord): boolean {
+  if (explicitMediaThumbnailState(mediaRecord.thumbnailState) === "ready") {
+    return true;
+  }
+  const cached = thumbnailResourceCache.get(mediaRecord.id);
+  return Boolean(
+    cached &&
+      cached.thumbnail.state === "ready" &&
+      isFreshCachedThumbnailForMediaRecord(mediaRecord, cached)
+  );
 }
 
 export function isFreshThumbnailForMediaRecord(

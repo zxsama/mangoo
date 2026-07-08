@@ -9,6 +9,7 @@ import {
   preloadImageObjectUrl,
   previewPlaceholderDataUrl,
   prefetchOriginalPreview,
+  prefetchThumbnailBlob,
   readCachedThumbnailObjectUrl,
   rememberThumbnailObjectUrl,
   requestOriginalPreviewBlob,
@@ -887,6 +888,25 @@ export function MediaGrid({
     aheadMediaSignatureKey,
     onRequestThumbnailStates
   ]);
+
+  // Prefetch the actual thumbnail BYTES for ahead tiles into the decoded
+  // object-URL cache, so a tile that scrolls into view renders instantly
+  // instead of blob-fetching + decoding + fading in at mount. Requesting only
+  // the thumbnail STATE (above) is not enough — that leaves the image fetch to
+  // fire on mount, which is exactly the "loads only once it scrolls in" the
+  // user reported. Blob prefetch runs at "ahead" resource priority so it yields
+  // to visible tiles in the request scheduler.
+  useEffect(() => {
+    if (aheadPriorityMediaIds.length === 0) {
+      return;
+    }
+    for (const mediaId of aheadPriorityMediaIds) {
+      const item = loadedMediaById.get(mediaId);
+      if (item) {
+        prefetchThumbnailBlob(item, { resourcePriority: "ahead" });
+      }
+    }
+  }, [aheadPriorityMediaKey, aheadMediaSignatureKey, loadedMediaById]);
 
   useEffect(() => {
     if (!hasVisiblePending && !hasAheadPending) {

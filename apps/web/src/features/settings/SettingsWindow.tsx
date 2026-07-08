@@ -35,7 +35,7 @@ export function SettingsWindow() {
   // gets its own Core client from the preload bridge.
   const library = useLibraryData({
     persistentThumbnailCacheAutoRefresh: previewPreferences.persistentThumbnailCacheAutoRefresh,
-    thumbnailAutoGenerateAll: previewPreferences.thumbnailAutoGenerateAll
+    thumbnailGenerationMode: previewPreferences.thumbnailGenerationMode
   });
 
   const handleGridChange = useCallback((patch: Partial<LibraryGridPreferences>) => {

@@ -163,6 +163,22 @@ pub fn router(database: Database) -> Router {
 pub fn router_with_config(database: Database, config: ApiConfig) -> Router {
     let mut state = AppState::new(database);
     state.plugins_dir = config.plugins_dir.clone();
+    // Debug self-test: submit a trivial write through the writer actor right at
+    // startup (independent of any client) and log the outcome, so a deadlocked
+    // actor is diagnosable without the renderer. Gated by the master debug flag.
+    if crate::debug::enabled() {
+        let writer = state.writer.clone();
+        tokio::spawn(async move {
+            crate::debug_log!("writer-selftest submitting startup probe write");
+            let started = std::time::Instant::now();
+            let result = writer.write(|db| Ok(db.list_tags()?.len())).await;
+            crate::debug_log!(
+                "writer-selftest probe write returned in {}ms: {:?}",
+                started.elapsed().as_millis(),
+                result.as_ref().map(|n| *n).map_err(|e| e.to_string())
+            );
+        });
+    }
     let api_router = routes::router(state).layer(middleware::from_fn_with_state(
         config.clone(),
         require_session_token,

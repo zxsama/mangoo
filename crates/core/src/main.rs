@@ -1,5 +1,7 @@
 mod api;
 mod db;
+#[macro_use]
+mod debug;
 mod fsops;
 mod plugins;
 mod roots;

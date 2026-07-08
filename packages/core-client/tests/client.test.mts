@@ -109,6 +109,44 @@ async function waitForRequestCount(requests: DeferredRecordedRequest[], count: n
   assert.fail(`timed out waiting for ${count} requests; saw ${requests.length}`);
 }
 
+// A fetch mock that models real Chromium/Electron behaviour where an aborted
+// fetch can leave its promise PENDING (it neither resolves nor rejects). Used to
+// prove the scheduler frees a request's slot on abort without depending on the
+// fetch promise ever settling.
+function mockHangOnAbortFetch() {
+  const requests: DeferredRecordedRequest[] = [];
+  deferredFetchKeepAlive = setInterval(() => undefined, 1000);
+  globalThis.fetch = (async (input: Request | string | URL, init?: RequestInit) => {
+    const url =
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    return new Promise<Response>((resolve) => {
+      const request: DeferredRecordedRequest = {
+        url,
+        method: init?.method ?? "GET",
+        headers: {},
+        body: null,
+        signal: init?.signal ?? null,
+        settled: false,
+        resolveJson: (responseBody: unknown, status = 200) => {
+          if (request.settled) return;
+          request.settled = true;
+          resolve(
+            new Response(JSON.stringify(responseBody), {
+              status,
+              headers: { "content-type": "application/json" }
+            })
+          );
+        },
+        reject: () => undefined // deliberately never rejects on abort
+      };
+      requests.push(request);
+      // Note: no "abort" listener — the promise stays pending forever on abort,
+      // exactly the failure mode observed in the live renderer.
+    });
+  }) as typeof fetch;
+  return requests;
+}
+
 function requestPath(request: RecordedRequest) {
   return new URL(request.url).pathname;
 }
@@ -259,6 +297,95 @@ describe("createCoreClient", () => {
       request.resolveJson("thumbnail bytes");
     }
     await Promise.all(blockers);
+  });
+
+  test("aborting active requests frees their slots even if the fetch never settles", async () => {
+    // Real Chromium/Electron can leave an aborted fetch's promise pending. The
+    // scheduler must still free the slot from the abort signal, so a later
+    // request is not blocked forever behind abandoned in-flight fetches.
+    const requests = mockHangOnAbortFetch();
+    const resourcesClient = createCoreClient({ baseUrl: BASE_URL, sessionToken: "secret" });
+    const controller = new AbortController();
+    const blockers = Array.from({ length: CORE_RESOURCE_SLOT_COUNT }, (_value, index) =>
+      resourcesClient
+        .getThumbnailBlob(6000 + index, "grid_320", {
+          requestPriority: "resource",
+          signal: controller.signal
+        })
+        .catch(() => undefined)
+    );
+    await waitForRequestCount(requests, CORE_RESOURCE_SLOT_COUNT);
+
+    // Abort all in-flight requests at once (like a rapid folder switch). The
+    // mock fetch does NOT settle on abort, so slot release must come from the
+    // scheduler's own abort handling.
+    controller.abort();
+    await Promise.all(blockers);
+
+    // A fresh request must now get a slot and actually reach fetch. If any slot
+    // leaked, this request stays queued and never appears.
+    const followUp = resourcesClient.getThumbnailBlob(7000, "grid_320", {
+      requestPriority: "resource"
+    });
+    await waitForRequestCount(requests, CORE_RESOURCE_SLOT_COUNT + 1);
+    assert.equal(
+      requests.some((request) => requestPath(request) === "/api/media/7000/thumbnail/blob"),
+      true,
+      "follow-up request must reach fetch, proving aborted slots were freed"
+    );
+
+    for (const request of requests) {
+      request.resolveJson("thumbnail bytes");
+    }
+    await followUp.catch(() => undefined);
+  });
+
+  test("a request that resolves and is aborted in the same tick frees exactly one slot", async () => {
+    // Live signature: the blob arrives just as the tile scrolls away, so the
+    // fetch resolves AND the signal aborts. Both the settle path and the abort
+    // path run; the slot must be released exactly once (not leaked, not double).
+    const requests = mockDeferredFetch();
+    const resourcesClient = createCoreClient({ baseUrl: BASE_URL, sessionToken: "secret" });
+    const controllers = Array.from(
+      { length: CORE_RESOURCE_SLOT_COUNT },
+      () => new AbortController()
+    );
+    const blockers = controllers.map((controller, index) =>
+      resourcesClient
+        .getThumbnailBlob(8000 + index, "grid_320", {
+          requestPriority: "resource",
+          signal: controller.signal
+        })
+        .catch(() => undefined)
+    );
+    await waitForRequestCount(requests, CORE_RESOURCE_SLOT_COUNT);
+
+    // Resolve each request AND abort its signal in the same synchronous batch.
+    for (let index = 0; index < requests.length; index += 1) {
+      requests[index].resolveJson("thumbnail bytes");
+      controllers[index].abort();
+    }
+    await Promise.all(blockers);
+
+    // All slots must be free: a fresh full batch of 12 must all reach fetch.
+    const followUps = Array.from({ length: CORE_RESOURCE_SLOT_COUNT }, (_value, index) =>
+      resourcesClient
+        .getThumbnailBlob(9000 + index, "grid_320", { requestPriority: "resource" })
+        .catch(() => undefined)
+    );
+    await waitForRequestCount(requests, CORE_RESOURCE_SLOT_COUNT * 2);
+    const followUpPaths = requests
+      .map(requestPath)
+      .filter((path) => path.startsWith("/api/media/9"));
+    assert.equal(
+      followUpPaths.length,
+      CORE_RESOURCE_SLOT_COUNT,
+      "all 12 follow-up requests must reach fetch, proving no slot leaked"
+    );
+    for (const request of requests) {
+      request.resolveJson("thumbnail bytes");
+    }
+    await Promise.all(followUps);
   });
 
   test("listMedia serializes filters, offset window, and sort", async () => {

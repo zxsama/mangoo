@@ -110,7 +110,7 @@ export function App() {
   const library = useLibraryData({
     persistentThumbnailCacheAutoRefresh:
       previewPreferences.persistentThumbnailCacheAutoRefresh,
-    thumbnailAutoGenerateAll: previewPreferences.thumbnailAutoGenerateAll
+    thumbnailGenerationMode: previewPreferences.thumbnailGenerationMode
   });
 
   // Apply preference changes broadcast from the separate settings OS window so the

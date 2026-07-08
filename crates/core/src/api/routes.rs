@@ -85,6 +85,7 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/media/{fileId}/thumbnail/blob",
     "/api/thumbnails/cache/stats",
     "/api/thumbnails/cache/clear",
+    "/api/thumbnails/cache/cancel-bulk",
     "/api/media/{fileId}/preview",
     "/api/media/{fileId}/metadata",
     "/api/media/{fileId}/tags",
@@ -241,6 +242,11 @@ struct ThumbnailCacheTaskRequestBody {
     file_ids: Option<Vec<i64>>,
     refresh_mode: String,
     limit: Option<usize>,
+    /// Keyset cursor for the whole-library "generate all" pass: scan one window
+    /// of files past this id and return `nextCursor`. Omit for the
+    /// folder-scoped / explicit-id enqueues.
+    #[serde(rename = "afterFileId")]
+    after_file_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,6 +272,11 @@ struct ThumbnailCacheEnqueueResponse {
     pending_candidate_count: i64,
     total_blob_bytes: i64,
     active_bulk_task_count: i64,
+    /// Keyset cursor to resume the whole-library "generate all" pass from, or
+    /// `null` once the scan reaches the end of the scope. Always `null` for the
+    /// folder-scoped / explicit-id enqueues.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,6 +285,12 @@ struct ThumbnailCacheClearResponse {
     cleared: bool,
     deleted_blob_count: usize,
     reset_thumbnail_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailCacheCancelBulkResponse {
+    cancelled_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -471,6 +488,10 @@ pub fn router(state: AppState) -> Router {
             get(get_thumbnail_cache_stats),
         )
         .route("/api/thumbnails/cache/clear", post(clear_thumbnail_cache))
+        .route(
+            "/api/thumbnails/cache/cancel-bulk",
+            post(cancel_bulk_thumbnail_cache),
+        )
         .route("/api/media/:file_id/preview", get(get_preview))
         .route(
             "/api/media/:file_id/metadata",
@@ -930,6 +951,14 @@ async fn enqueue_thumbnail_cache(
     };
     let file_ids = body.file_ids.unwrap_or_default();
     let limit = body.limit.unwrap_or(256).clamp(1, 4096);
+    // Keyset cursor for the whole-library "generate all" pass. When present,
+    // the enqueue scans one bounded window of `limit` files past this id and
+    // returns `nextCursor`; the client advances it batch by batch. This keeps
+    // each writer job short (bounded by the window) so it interleaves with
+    // interactive writes, and makes the whole-library scan O(files) total
+    // instead of re-scanning from the start on every batch. Absent for the
+    // folder-scoped/explicit-id paths, which stay on the whole-scope enqueue.
+    let after_file_id = body.after_file_id;
     // Run on a dedicated connection, NOT the shared write mutex. This bulk enqueue
     // inserts up to `limit` (256-4096) task rows in one transaction; on the shared
     // mutex that long hold blocked the per-scroll priority-scope write queued right
@@ -941,7 +970,7 @@ async fn enqueue_thumbnail_cache(
     let (response, wakeup) = run_dedicated_or_shared_database(state.clone(), move |database| {
         let result = if file_ids.is_empty() {
             database
-                .enqueue_thumbnail_cache_tasks(scope, refresh_mode, limit)
+                .enqueue_thumbnail_cache_tasks(scope, refresh_mode, limit, after_file_id)
                 .map_err(CoreError::from)?
         } else {
             database
@@ -981,6 +1010,19 @@ async fn clear_thumbnail_cache(
             .clear_thumbnail_cache()
             .map(thumbnail_cache_clear_response)
             .map(Json)
+            .map_err(CoreError::from)
+    })
+    .await?;
+    Ok(response)
+}
+
+async fn cancel_bulk_thumbnail_cache(
+    State(state): State<AppState>,
+) -> ApiResult<Json<ThumbnailCacheCancelBulkResponse>> {
+    let response = run_shared_database(state, move |database| {
+        database
+            .cancel_pending_bulk_thumbnail_tasks()
+            .map(|cancelled_count| Json(ThumbnailCacheCancelBulkResponse { cancelled_count }))
             .map_err(CoreError::from)
     })
     .await?;
@@ -1672,6 +1714,7 @@ fn thumbnail_cache_enqueue_response(
         pending_candidate_count: result.stats.pending_candidate_count,
         total_blob_bytes: result.stats.total_blob_bytes,
         active_bulk_task_count: result.stats.active_bulk_task_count,
+        next_cursor: result.next_cursor,
     }
 }
 

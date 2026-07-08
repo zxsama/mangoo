@@ -67,6 +67,7 @@ impl DbWriter {
 
     /// Blocking variant for non-async callers (the watcher runs on a plain
     /// `std::thread`). Same serialization + error guarantees as `write`.
+    #[allow(dead_code)] // Reserved for the watcher/worker write migration.
     pub fn write_blocking<T, F>(&self, op: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
@@ -102,23 +103,33 @@ fn downcast<T: 'static>(boxed: Box<dyn Any + Send>) -> anyhow::Result<T> {
 }
 
 fn run_writer_actor(mut database: Database, mut receiver: mpsc::UnboundedReceiver<QueuedJob>) {
-    // Block for the next job; run it and any already-queued jobs; then, when the
-    // queue momentarily drains, run one checkpoint pass before blocking again.
-    // Batching keeps the checkpoint off the per-write hot path while guaranteeing
-    // it runs — and since this is the only writer, its TRUNCATE always wins.
+    crate::debug_log!("writer actor started");
     while let Some(first) = receiver.blocking_recv() {
+        crate::debug_log!("writer running a job");
         run_one(&mut database, first);
         while let Ok(next) = receiver.try_recv() {
             run_one(&mut database, next);
         }
+        let checkpoint_start = std::time::Instant::now();
         if let Err(error) = database.run_wal_checkpoint_pass() {
             tracing::warn!(%error, "writer actor checkpoint pass failed");
         }
+        let elapsed = checkpoint_start.elapsed();
+        if elapsed > std::time::Duration::from_millis(200) {
+            crate::debug_log!("writer checkpoint slow: {}ms", elapsed.as_millis());
+        }
     }
+    crate::debug_log!("writer actor exited (channel closed)");
 }
 
 fn run_one(database: &mut Database, queued: QueuedJob) {
+    let started = std::time::Instant::now();
     let result = (queued.job)(database);
+    crate::debug_log!(
+        "writer job closure returned in {}ms (ok={})",
+        started.elapsed().as_millis(),
+        result.is_ok()
+    );
     // Ignore send failure: the caller may have been aborted/dropped.
     let _ = queued.reply.send(result);
 }
@@ -127,6 +138,38 @@ fn run_one(database: &mut Database, queued: QueuedJob) {
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_completes_over_a_file_db_with_a_concurrent_writer_connection() {
+        // Reproduces Core's real setup: a FILE-backed db where the writer actor
+        // owns one connection while another connection (like the worker) also
+        // writes. A write submitted to the actor must complete, not hang.
+        let dir = std::env::temp_dir().join(format!("megle-writer-repro-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("repro.sqlite");
+        let _ = std::fs::remove_file(&db_path);
+        let database = Database::open(&db_path).expect("open file db");
+        database.apply_migrations().expect("apply migrations");
+        // Seed a root+folder so create_interactive_folder_scan_task-style writes
+        // have something to reference is unnecessary; a trivial write suffices.
+        let second = database.reopen().expect("reopen").expect("second conn");
+        let writer = DbWriter::spawn(database);
+
+        // Second connection does a quick write (holds the write lock briefly),
+        // mirroring a worker blob commit racing the actor.
+        second
+            .create_tag("concurrent", None)
+            .expect("second connection write");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            writer.write(|db| Ok(db.list_tags()?.len())),
+        )
+        .await
+        .expect("writer.write must not hang over a file db");
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn write_returns_typed_result() {

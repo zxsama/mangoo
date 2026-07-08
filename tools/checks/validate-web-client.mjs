@@ -185,8 +185,8 @@ if (
   fail("core-client must globally schedule Core fetches with reserved navigation/interactive slots");
 }
 if (
-  !/const\s+response\s*=\s*await\s+scheduleCoreRequest\([\s\S]*?fetch\(resolveUrl/.test(coreClient) ||
-  !/async\s+function\s+fetchBlob[\s\S]*?scheduleCoreRequest\([\s\S]*?fetch\(resolveUrl/.test(coreClient)
+  !/const\s+response\s*=\s*await\s+scheduleCoreRequest\([\s\S]*?fetchWithTimeout\(\s*resolveUrl/.test(coreClient) ||
+  !/async\s+function\s+fetchBlob[\s\S]*?scheduleCoreRequest\([\s\S]*?fetchWithTimeout\(\s*resolveUrl/.test(coreClient)
 ) {
   fail("core-client JSON and blob helpers must both route through the global request scheduler");
 }
@@ -1308,8 +1308,9 @@ if (
   !/persistentThumbnailCacheAutoRefresh/.test(app) ||
   !/useLibraryData\(\{[\s\S]*?persistentThumbnailCacheAutoRefresh/.test(app) ||
   !/生成状况/.test(settingsView) ||
-  !/仅生成可见缩略图/.test(settingsView) ||
+  !/仅已刷新缩略图入库/.test(settingsView) ||
   !/自动后台生成全部缩略图/.test(settingsView) ||
+  !/只缓存不入库/.test(settingsView) ||
   !/生成当前文件夹/.test(settingsView) ||
   !/生成当前目录树/.test(settingsView) ||
   !/生成全部缩略图/.test(settingsView) ||
@@ -1323,16 +1324,17 @@ if (
   fail("Persistent thumbnail cache settings must expose stats, bulk actions, and a persisted auto-refresh preference through core-client");
 }
 if (
-  !/thumbnailAutoGenerateAll:\s*boolean/.test(previewPreferences) ||
-  !/thumbnailAutoGenerateAll:\s*false/.test(previewPreferences) ||
-  !/thumbnailAutoGenerateAll:\s*value\.thumbnailAutoGenerateAll\s*===\s*true/.test(
-    previewPreferences
-  ) ||
-  !/thumbnailAutoGenerateAll/.test(useLibraryData) ||
-  !/thumbnailAutoGenerateAll/.test(app)
+  // Three-way generation mode (renderedOnly | allPersist | cacheOnly), default
+  // renderedOnly (persist only already-rendered thumbnails), wired through
+  // useLibraryData and applied in the App shell.
+  !/thumbnailGenerationMode:\s*ThumbnailGenerationMode/.test(previewPreferences) ||
+  !/DEFAULT_THUMBNAIL_GENERATION_MODE[^=]*=\s*"renderedOnly"/.test(previewPreferences) ||
+  !/"renderedOnly"\s*\|\s*"allPersist"\s*\|\s*"cacheOnly"/.test(previewPreferences) ||
+  !/thumbnailGenerationMode/.test(useLibraryData) ||
+  !/thumbnailGenerationMode/.test(app)
 ) {
   fail(
-    "Thumbnail generation mode must expose a persisted viewport-only-vs-auto-generate-all preference (default viewport-only) wired through useLibraryData"
+    "Thumbnail generation mode must expose a persisted three-way preference (renderedOnly default, allPersist, cacheOnly) wired through useLibraryData"
   );
 }
 if (

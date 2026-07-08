@@ -3,6 +3,7 @@ import type {
   AddFileTagRequest,
   CreateTagRequest,
   DeletePluginResponse,
+  ThumbnailCacheCancelBulkResponse,
   ThumbnailCacheClearResponse,
   ThumbnailCacheEnqueueResponse,
   ThumbnailCacheScopeParams,
@@ -87,6 +88,7 @@ type QueuedCoreRequest = {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   abort: () => void;
+  debugPath: string;
 };
 
 type QueryParams = Partial<ListMediaParams & ListFolderChildrenParams> & {
@@ -97,20 +99,59 @@ type QueryParams = Partial<ListMediaParams & ListFolderChildrenParams> & {
 
 const MAX_CORE_REQUESTS = 12;
 const MAX_CORE_INTERACTIVE_REQUESTS = 2;
+// Hard ceiling on how long a single Core request may stay in flight. A dropped
+// connection (e.g. Core restart during dev, or a half-open socket) can leave a
+// `fetch` pending forever; without a timeout its scheduler slot is never
+// released and, once MAX_CORE_REQUESTS such requests accumulate, the whole
+// scheduler wedges and NOTHING new loads (the "grid stuck on placeholders" bug).
+// This bound guarantees every request settles — success, error, or timeout — so
+// its slot is always freed. Generous so it never trips a legitimately slow query.
+const CORE_REQUEST_TIMEOUT_MS = 60_000;
 let activeCoreRequests = 0;
 let activeCoreInteractiveRequests = 0;
 let coreRequestSequence = 0;
 const coreRequestQueue: QueuedCoreRequest[] = [];
 
-// Dev diagnostic: read the live scheduler state (used by the regression suite).
-// Harmless: a local app with no untrusted pages.
+// ── Debug facility ─────────────────────────────────────────────────────────
+// One global switch gates all client-scheduler diagnostics so they can stay in
+// the code (default off, zero overhead) and be flipped on live for debugging:
+//   window.__megleDebug = true   // then read window.__megleCoreScheduler()
+// When on, each in-flight request is tracked with metadata (path, priority,
+// whether it has an abort signal, how long it has been active) so a stuck slot
+// is immediately visible via the scheduler snapshot.
+interface CoreDebugEntry {
+  sequence: number;
+  priority: CoreRequestPriority;
+  path: string;
+  hasSignal: boolean;
+  startedAt: number;
+}
+const coreDebugActive = new Map<number, CoreDebugEntry>();
+function coreDebugEnabled(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    (window as unknown as { __megleDebug?: boolean }).__megleDebug === true
+  );
+}
+
 if (typeof window !== "undefined") {
-  (window as unknown as { __megleCoreScheduler: () => unknown }).__megleCoreScheduler = () => ({
-    active: activeCoreRequests,
-    interactive: activeCoreInteractiveRequests,
-    queued: coreRequestQueue.length,
-    max: MAX_CORE_REQUESTS
-  });
+  (window as unknown as { __megleCoreScheduler: () => unknown }).__megleCoreScheduler = () => {
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    return {
+      active: activeCoreRequests,
+      interactive: activeCoreInteractiveRequests,
+      queued: coreRequestQueue.length,
+      max: MAX_CORE_REQUESTS,
+      // Populated only while window.__megleDebug is on.
+      inFlight: Array.from(coreDebugActive.values()).map((entry) => ({
+        sequence: entry.sequence,
+        priority: entry.priority,
+        path: entry.path,
+        hasSignal: entry.hasSignal,
+        ageMs: Math.round(now - entry.startedAt)
+      }))
+    };
+  };
 }
 
 export function createCoreClient(config: CoreClientConfig) {
@@ -124,11 +165,16 @@ export function createCoreClient(config: CoreClientConfig) {
       headers.set("x-megle-session", config.sessionToken);
     }
 
-    const response = await scheduleCoreRequest(requestPriority, init.signal, () =>
-      fetch(resolveUrl(config.baseUrl, path), {
-        ...fetchInit,
-        headers
-      })
+    const response = await scheduleCoreRequest(
+      requestPriority,
+      init.signal,
+      () =>
+        fetchWithTimeout(
+          resolveUrl(config.baseUrl, path),
+          { ...fetchInit, headers },
+          init.signal
+        ),
+      path
     );
     if (!response.ok) {
       const body = await readResponseBody(response);
@@ -143,11 +189,16 @@ export function createCoreClient(config: CoreClientConfig) {
     if (config.sessionToken) {
       headers.set("x-megle-session", config.sessionToken);
     }
-    const response = await scheduleCoreRequest(options.requestPriority ?? "resource", options.signal, () =>
-      fetch(resolveUrl(config.baseUrl, path), {
-        headers,
-        signal: options.signal
-      })
+    const response = await scheduleCoreRequest(
+      options.requestPriority ?? "resource",
+      options.signal,
+      () =>
+        fetchWithTimeout(
+          resolveUrl(config.baseUrl, path),
+          { headers },
+          options.signal
+        ),
+      path
     );
     if (!response.ok) {
       const body = await readResponseBody(response);
@@ -217,6 +268,12 @@ export function createCoreClient(config: CoreClientConfig) {
       }),
     clearThumbnailCache: (options: CoreRequestOptions = {}) =>
       request<ThumbnailCacheClearResponse>("/thumbnails/cache/clear", {
+        method: "POST",
+        requestPriority: options.requestPriority ?? "interactive",
+        signal: options.signal
+      }),
+    cancelBulkThumbnailCache: (options: CoreRequestOptions = {}) =>
+      request<ThumbnailCacheCancelBulkResponse>("/thumbnails/cache/cancel-bulk", {
         method: "POST",
         requestPriority: options.requestPriority ?? "interactive",
         signal: options.signal
@@ -370,7 +427,8 @@ export function createCoreClient(config: CoreClientConfig) {
 function scheduleCoreRequest<T>(
   priority: CoreRequestPriority,
   signal: AbortSignal | null | undefined,
-  run: () => Promise<T>
+  run: () => Promise<T>,
+  debugPath = ""
 ): Promise<T> {
   if (signal?.aborted) {
     return Promise.reject(createAbortError());
@@ -384,7 +442,8 @@ function scheduleCoreRequest<T>(
       run: run as () => Promise<unknown>,
       resolve: resolve as (value: unknown) => void,
       reject,
-      abort: () => undefined
+      abort: () => undefined,
+      debugPath
     };
     entry.abort = () => {
       const queuedIndex = coreRequestQueue.indexOf(entry);
@@ -436,18 +495,26 @@ function pumpCoreRequests(): void {
     if (isInteractiveRequest) {
       activeCoreInteractiveRequests += 1;
     }
-    // Release the slot exactly once, whichever comes first: the run settling, OR
-    // the signal aborting. Relying on run() (the fetch) to always reject on abort
-    // leaked a slot whenever that settlement was missed under heavy churn, and a
-    // handful of leaked slots deadlocked the whole scheduler (active pinned at the
-    // cap, nothing new can start). The abort watchdog guarantees the counter frees.
+    if (coreDebugEnabled()) {
+      coreDebugActive.set(entry.sequence, {
+        sequence: entry.sequence,
+        priority: entry.priority,
+        path: entry.debugPath,
+        hasSignal: entry.signal !== undefined,
+        startedAt: typeof performance !== "undefined" ? performance.now() : Date.now()
+      });
+    }
+    // Release the slot exactly once, whichever comes first: the run settling OR
+    // the signal aborting. Both paths funnel through `releaseSlot`, which is
+    // idempotent, so a request that aborts mid-flight (its fetch also rejecting)
+    // still decrements the counter exactly once.
     let released = false;
     const releaseSlot = () => {
       if (released) {
         return;
       }
       released = true;
-      entry.signal?.removeEventListener("abort", entry.abort);
+      coreDebugActive.delete(entry.sequence);
       entry.signal?.removeEventListener("abort", onAbort);
       activeCoreRequests = Math.max(0, activeCoreRequests - 1);
       if (isInteractiveRequest) {
@@ -456,8 +523,8 @@ function pumpCoreRequests(): void {
       pumpCoreRequests();
     };
     const onAbort = () => {
-      // Free the slot immediately and settle the caller; the underlying fetch may
-      // continue but its result is ignored (release is idempotent).
+      // Abort while active: free the slot and settle the caller. The underlying
+      // fetch also rejects on the same signal, but `releaseSlot` is idempotent.
       releaseSlot();
       entry.reject(createAbortError());
     };
@@ -514,6 +581,33 @@ function createAbortError(): Error {
   const error = new Error("The operation was aborted.");
   error.name = "AbortError";
   return error;
+}
+
+/// Run `fetch` with a safety timeout for requests that have NO caller abort
+/// signal. Those are the ones that can leak a scheduler slot forever if their
+/// connection hangs (e.g. a background cache enqueue during a Core restart):
+/// nothing else will ever abort them, so without a timeout their slot is never
+/// released and enough of them wedge the whole scheduler ("grid stuck on
+/// placeholders"). Requests that DO pass a signal are already abortable by their
+/// owner (the grid aborts stale tile fetches on scroll), so we forward their
+/// signal unchanged — preserving the caller's exact signal reference.
+function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  callerSignal: AbortSignal | null | undefined
+): Promise<Response> {
+  if (callerSignal) {
+    // Owner-managed lifetime: forward the caller's signal as-is.
+    return fetch(url, { ...init, signal: callerSignal });
+  }
+  // No owner: bound the request so a hung connection can't pin its slot forever.
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => {
+    timeoutController.abort(new Error("Core request timed out"));
+  }, CORE_REQUEST_TIMEOUT_MS);
+  return fetch(url, { ...init, signal: timeoutController.signal }).finally(() => {
+    clearTimeout(timer);
+  });
 }
 
 function resolveUrl(baseUrl: string, path: string): string {

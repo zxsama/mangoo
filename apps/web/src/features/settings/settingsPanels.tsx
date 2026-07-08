@@ -246,21 +246,32 @@ function ThumbnailsTab({
   const stats = library.thumbnailCacheStats;
   const busy = library.thumbnailCacheActionBusy;
   const activeBulk = stats?.activeBulkTaskCount ?? 0;
+  const refreshThumbnailCacheStats = library.refreshThumbnailCacheStats;
+  // Poll faster only while a bulk generation is active; otherwise slowly.
+  const statsPollActive = activeBulk > 0 || busy;
 
-  // The stats aggregate scans the whole library and briefly pins the WAL, so it
-  // must NOT be polled aggressively — the numbers are a reference, not live. Poll
-  // slowly (server also single-flights + TTL-caches). Only poll a bit faster
-  // while a bulk generation is actively running so the progress bar advances.
+  // The stats aggregate scans the whole library, so it must NOT be polled
+  // aggressively — the numbers are a reference, not live. Poll on a fixed timer.
+  //
+  // CRITICAL: depend ONLY on the stable `refreshThumbnailCacheStats` callback and
+  // the boolean `statsPollActive` — NOT on `library` (a fresh object every
+  // render) or `stats` (which this effect's own polling updates). Depending on
+  // those re-ran the effect on every render, and since each run kicks off an
+  // immediate whole-library stats query, opening the thumbnail tab spun a
+  // positive-feedback loop: poll -> setStats -> re-render -> effect re-runs ->
+  // poll again. On a 650k-file library that piled up dozens of concurrent
+  // multi-second whole-library scans, exhausting the blocking-thread pool
+  // (thumbnails stopped refreshing) and ballooning Core memory.
   useEffect(() => {
-    void library.refreshThumbnailCacheStats();
+    void refreshThumbnailCacheStats();
     const interval = window.setInterval(
       () => {
-        void library.refreshThumbnailCacheStats();
+        void refreshThumbnailCacheStats();
       },
-      activeBulk > 0 || busy ? 8000 : 20000
+      statsPollActive ? 8000 : 20000
     );
     return () => window.clearInterval(interval);
-  }, [library.refreshThumbnailCacheStats, busy, activeBulk, library]);
+  }, [refreshThumbnailCacheStats, statsPollActive]);
 
   // Progress estimate: cached / (cached + missing + stale). failed excluded from
   // the "done" fraction but shown separately.
@@ -270,28 +281,35 @@ function ThumbnailsTab({
   const total = cached + remaining;
   const percent = total > 0 ? Math.min(100, Math.round((cached / total) * 100)) : stats ? 100 : 0;
 
-  const autoAll = previewPreferences.thumbnailAutoGenerateAll;
+  const generationMode = previewPreferences.thumbnailGenerationMode;
   const currentFolderDisabled = library.selectedFolderId === null || busy;
 
   return (
     <>
       <SettingsGroup title="生成模式">
         <p className="settings-note">
-          默认仅将你实际看到的缩略图入库，后台写入压力最小；也可以选择自动在后台生成整个库的全部缩略图。
+          默认仅将你实际看到并已生成的缩略图入库，后台写入压力最小；也可以让后台自动生成整个库的全部缩略图，或只在本次会话缓存而不写入数据库。
         </p>
         <RadioOption
-          checked={!autoAll}
-          description="只有进入可视区域的缩略图才会生成并入库（推荐，默认）。"
-          label="仅生成可见缩略图"
+          checked={generationMode === "renderedOnly"}
+          description="只有已经在界面上生成并显示出来的缩略图才会入库（推荐，默认）。"
+          label="仅已刷新缩略图入库"
           name="thumbnail-generate-mode"
-          onSelect={() => onPreviewPreferencesChange({ thumbnailAutoGenerateAll: false })}
+          onSelect={() => onPreviewPreferencesChange({ thumbnailGenerationMode: "renderedOnly" })}
         />
         <RadioOption
-          checked={autoAll}
-          description="打开库后在后台自动生成全部缩略图（低优先级，浏览时让路）。"
+          checked={generationMode === "allPersist"}
+          description="打开库后在后台自动生成全部缩略图并入库（低优先级，浏览时让路）。"
           label="自动后台生成全部缩略图"
           name="thumbnail-generate-mode"
-          onSelect={() => onPreviewPreferencesChange({ thumbnailAutoGenerateAll: true })}
+          onSelect={() => onPreviewPreferencesChange({ thumbnailGenerationMode: "allPersist" })}
+        />
+        <RadioOption
+          checked={generationMode === "cacheOnly"}
+          description="缩略图仅在本次会话内存缓存中显示，不写入数据库，库文件不会变大。"
+          label="只缓存不入库"
+          name="thumbnail-generate-mode"
+          onSelect={() => onPreviewPreferencesChange({ thumbnailGenerationMode: "cacheOnly" })}
         />
       </SettingsGroup>
 

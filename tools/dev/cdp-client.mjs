@@ -71,9 +71,16 @@ export function connectCdp(pageWsUrl) {
 }
 
 // Resolve the real page target (not omnibox/devtools internals) on a CDP port.
+// Prefers the MAIN library window: the standalone settings window (route
+// `#/settings`) has no media grid/tree, so tests that expect the library UI must
+// skip it. Falls back to any non-internal page if the main window isn't found.
 export async function resolvePageWsUrl(debugPort) {
   const response = await fetch(`http://127.0.0.1:${debugPort}/json`);
   const targets = await response.json();
-  const page = targets.find((t) => t.type === "page" && !/omnibox|devtools/.test(t.url));
-  return page?.webSocketDebuggerUrl ?? null;
+  const pages = targets.filter(
+    (t) => t.type === "page" && !/omnibox|devtools/.test(t.url)
+  );
+  const mainWindow = pages.find((t) => !/#\/settings/.test(t.url));
+  return (mainWindow ?? pages[0])?.webSocketDebuggerUrl ?? null;
 }
+

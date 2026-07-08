@@ -253,6 +253,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ThumbnailCacheClearResponse"
+  /thumbnails/cache/cancel-bulk:
+    post:
+      operationId: cancelBulkThumbnailCache
+      description: >-
+        Cancel every pending whole-library (bulk-priority) thumbnail task,
+        leaving viewport/selected/ahead tasks and generated blobs untouched.
+        Used when the generation mode is not whole-library ("renderedOnly" /
+        "cacheOnly") to drop a leftover bulk queue from a previous session.
+      responses:
+        "200":
+          description: Pending bulk thumbnail tasks cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ThumbnailCacheCancelBulkResponse"
   /media/{fileId}/preview:
     get:
       operationId: getPreview
@@ -1364,6 +1379,14 @@ components:
             limit:
               type: integer
               minimum: 1
+            afterFileId:
+              type: integer
+              minimum: 0
+              description: >-
+                Keyset cursor for the whole-library "generate all" pass. When
+                set, Core scans one bounded window of files past this id and
+                returns nextCursor; the client advances it batch by batch. Omit
+                for folder-scoped or explicit-fileIds enqueues.
     ThumbnailCacheStatsResponse:
       type: object
       required:
@@ -1407,6 +1430,13 @@ components:
             acceptedCount:
               type: integer
               minimum: 0
+            nextCursor:
+              type: integer
+              minimum: 0
+              description: >-
+                Keyset cursor to resume the whole-library "generate all" pass
+                from, or omitted once the scan reaches the end of the scope.
+                Absent for folder-scoped or explicit-fileIds enqueues.
     ThumbnailCacheClearResponse:
       type: object
       required: [cleared, deletedBlobCount, resetThumbnailCount]
@@ -1417,6 +1447,13 @@ components:
           type: integer
           minimum: 0
         resetThumbnailCount:
+          type: integer
+          minimum: 0
+    ThumbnailCacheCancelBulkResponse:
+      type: object
+      required: [cancelledCount]
+      properties:
+        cancelledCount:
           type: integer
           minimum: 0
     MediaListResponse:

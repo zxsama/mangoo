@@ -50,6 +50,7 @@ export interface ThumbnailCacheTaskRequest extends ThumbnailCacheScopeParams {
   fileIds?: number[];
   refreshMode: ThumbnailCacheRefreshMode;
   limit?: number;
+  afterFileId?: number;
 }
 
 export interface ThumbnailCacheStatsResponse {
@@ -64,12 +65,17 @@ export interface ThumbnailCacheStatsResponse {
 
 export interface ThumbnailCacheEnqueueResponse extends ThumbnailCacheStatsResponse {
   acceptedCount: number;
+  nextCursor?: number;
 }
 
 export interface ThumbnailCacheClearResponse {
   cleared: boolean;
   deletedBlobCount: number;
   resetThumbnailCount: number;
+}
+
+export interface ThumbnailCacheCancelBulkResponse {
+  cancelledCount: number;
 }
 
 export type ThumbnailPriority = "background" | "ahead" | "visible" | "selected";
