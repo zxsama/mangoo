@@ -10,14 +10,14 @@
 //      so thumbnails exist to load):
 //        MEGLE_DB_PATH=... MEGLE_REMOTE_DEBUG=1 npm run dev
 //   2. Run this suite:  node tools/dev/regression-suite.mjs
-//      (optional: REG_PORT=9222 to override the CDP port)
+//      (optional: REG_PORT=9500 to override the CDP port)
 //
 // Exits 0 if every check passes, 1 otherwise. Each check prints PASS/FAIL with
 // the observed evidence so a failure is self-explanatory.
 
 import { connectCdp, resolvePageWsUrl } from "./cdp-client.mjs";
 
-const PORT = Number(process.env.REG_PORT ?? 9222);
+const PORT = Number(process.env.REG_PORT ?? 9500);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const results = [];

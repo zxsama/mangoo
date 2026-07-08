@@ -145,7 +145,11 @@ if (process.env.MEGLE_ELECTRON_USER_DATA_DIR) {
   electronArgs.unshift(`--user-data-dir=${path.resolve(process.env.MEGLE_ELECTRON_USER_DATA_DIR)}`);
 }
 if (process.env.MEGLE_REMOTE_DEBUG === "1") {
-  electronArgs.unshift(`--remote-debugging-port=${process.env.MEGLE_REMOTE_DEBUG_PORT ?? "9222"}`);
+  // Default 9500, NOT 9222: on Windows 9222 falls inside a reserved excluded TCP
+  // port range (netsh excludedportrange lists 9181-9280), so Electron fails to
+  // bind it ("Cannot start http server for devtools" / WSAEACCES) and CDP is
+  // unavailable. 9500 sits in a free gap. Override with MEGLE_REMOTE_DEBUG_PORT.
+  electronArgs.unshift(`--remote-debugging-port=${process.env.MEGLE_REMOTE_DEBUG_PORT ?? "9500"}`);
 }
 if (process.env.MEGLE_VISUAL_HARNESS === "1") {
   electronArgs.push("--megle-visual-harness=1");

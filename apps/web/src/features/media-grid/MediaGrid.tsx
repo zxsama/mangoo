@@ -2253,12 +2253,32 @@ function ReadyThumbnail({
           if (revoked) {
             return;
           }
+          const owns = rememberThumbnailObjectUrl(cacheKey, nextObjectUrl, blob.size);
+          if (owns) {
+            // The cache adopted OUR url — display and own it.
+            objectUrlRef.current = nextObjectUrl;
+            cacheOwnsObjectUrlRef.current = true;
+            setSrc(nextObjectUrl);
+            return;
+          }
+          // The cache already holds a URL for this content (a racing tile or the
+          // ahead-prefetch cached it first). Adopt the DURABLE cached url, revoke
+          // our now-redundant one immediately, and display the cached one. This
+          // stops the fast-scroll churn where a tile displayed its own url,
+          // revoked it on unmount, and re-fetched on scroll-back: now the tile
+          // always ends up pointing at the single cached url that outlives it.
+          const cached = readCachedThumbnailObjectUrl(cacheKey);
+          if (cached && cached !== nextObjectUrl) {
+            URL.revokeObjectURL(nextObjectUrl);
+            objectUrl = null;
+            objectUrlRef.current = cached;
+            cacheOwnsObjectUrlRef.current = true; // cache owns it; we never revoke it
+            setSrc(cached);
+            return;
+          }
+          // Fallback (cache empty despite reject — shouldn't happen): keep ours.
           objectUrlRef.current = nextObjectUrl;
-          cacheOwnsObjectUrlRef.current = rememberThumbnailObjectUrl(
-            cacheKey,
-            nextObjectUrl,
-            blob.size
-          );
+          cacheOwnsObjectUrlRef.current = true;
           setSrc(nextObjectUrl);
         };
 
