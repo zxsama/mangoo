@@ -459,45 +459,57 @@ function distanceToGlassEdge(clientX: number, clientY: number, rect: DOMRect) {
 }
 
 
+// Targets lit (opacity > 0) on the previous pointer frame. We only write style to
+// targets that ENTER, STAY IN, or LEAVE the ignite radius — the hundreds of
+// off-screen affordances (virtualized tree rows, tiles below the fold) are never
+// touched, so a pointer-move frame costs O(near-cursor targets), not O(all
+// targets). data-interactive-pointer-target is a static marker set once; the live
+// glow is driven purely by the --interactive-pointer-* vars (no per-frame
+// attribute writes — nothing reads data-interactive-pointer).
+let litAffordanceTargets = new Set<HTMLElement>();
+
 function updateInteractiveAffordancePointers(clientX: number, clientY: number) {
   const targets = interactiveAffordanceTargets();
   const maxDistance = pointerEdgeProximity();
+  const nextLit = new Set<HTMLElement>();
   for (const target of targets) {
-    if (target.closest('[data-titlebar-search="true"]')) {
-      target.removeAttribute("data-interactive-pointer-target");
-      target.removeAttribute("data-interactive-pointer");
-      target.style.setProperty("--interactive-pointer-opacity", POINTER_OPACITY_HIDDEN);
-      continue;
-    }
-    target.dataset.interactivePointerTarget = "true";
-    if (interactiveAffordanceDisabled(target)) {
-      hideInteractiveAffordancePointer(target);
-      continue;
+    if (!target.dataset.interactivePointerTarget) {
+      target.dataset.interactivePointerTarget = "true";
     }
     const rect = cachedBoundingRect(target);
     if (rect.width <= 0 || rect.height <= 0) {
-      hideInteractiveAffordancePointer(target);
       continue;
     }
     const distance = distanceToGlassEdge(clientX, clientY, rect);
-    if (distance > maxDistance) {
-      target.dataset.interactivePointer = "idle";
-      target.style.setProperty("--interactive-pointer-opacity", POINTER_OPACITY_HIDDEN);
+    if (distance > maxDistance || interactiveAffordanceDisabled(target)) {
       continue;
     }
     const pointer = interactiveAffordancePointerPercent(target, clientX, clientY, rect);
     const opacity = Math.pow(1 - distance / maxDistance, 1.55);
-    target.dataset.interactivePointer = "active";
     target.style.setProperty("--interactive-pointer-x", `${pointer.x}%`);
     target.style.setProperty("--interactive-pointer-y", `${pointer.y}%`);
     target.style.setProperty("--interactive-pointer-opacity", opacity.toFixed(3));
+    nextLit.add(target);
   }
+  // Extinguish targets that were lit last frame but are no longer in range.
+  for (const target of litAffordanceTargets) {
+    if (!nextLit.has(target)) {
+      target.style.setProperty("--interactive-pointer-opacity", POINTER_OPACITY_HIDDEN);
+    }
+  }
+  litAffordanceTargets = nextLit;
 }
 
 function interactiveAffordanceTargets() {
   const candidates = document.querySelectorAll<HTMLElement>(INTERACTIVE_AFFORDANCE_SELECTOR);
   const targets = new Set<HTMLElement>();
   for (const candidate of candidates) {
+    // Titlebar search opts out of the pointer glow entirely (it has its own
+    // self-contained focus treatment); never route it or its inner controls here.
+    if (candidate.closest('[data-titlebar-search="true"]')) {
+      clearInteractiveAffordancePointer(candidate);
+      continue;
+    }
     const owner = candidate.closest<HTMLElement>(INTERACTIVE_AFFORDANCE_OWNER_SELECTOR);
     let target = candidate;
     if (owner && owner !== candidate) {
@@ -541,21 +553,22 @@ function interactiveAffordancePointerPercent(target: HTMLElement, clientX: numbe
 }
 
 function hideInteractiveAffordancePointers() {
-  const targets = document.querySelectorAll<HTMLElement>("[data-interactive-pointer-target='true']");
-  for (const target of targets) {
-    hideInteractiveAffordancePointer(target);
+  for (const target of litAffordanceTargets) {
+    target.style.setProperty("--interactive-pointer-opacity", POINTER_OPACITY_HIDDEN);
   }
-}
-
-function hideInteractiveAffordancePointer(target: HTMLElement) {
-  target.dataset.interactivePointer = "idle";
-  target.style.setProperty("--interactive-pointer-opacity", POINTER_OPACITY_HIDDEN);
+  litAffordanceTargets = new Set();
 }
 
 function clearInteractiveAffordancePointer(target: HTMLElement) {
+  // Steady-state no-op: only touch the DOM the first time we demote an element
+  // (e.g. an inner tree button that redirects to its row owner), so re-running
+  // this every frame over hundreds of child candidates costs nothing.
+  if (!target.hasAttribute("data-interactive-pointer-target")) {
+    return;
+  }
   target.removeAttribute("data-interactive-pointer-target");
-  target.removeAttribute("data-interactive-pointer");
   target.style.setProperty("--interactive-pointer-opacity", POINTER_OPACITY_HIDDEN);
+  litAffordanceTargets.delete(target);
 }
 
 function pointerEdgeProximity() {

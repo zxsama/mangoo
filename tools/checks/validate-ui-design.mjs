@@ -1852,7 +1852,7 @@ for (const value of [
 
 const pointerHideBody = extractFirstRequiredFunctionBody(
   liquidGlassSurface,
-  ["hideInteractiveAffordancePointer", "resetPointer"],
+  ["hideInteractiveAffordancePointers", "resetPointer"],
   "interactive affordance pointer hide/reset"
 );
 if (pointerHideBody.includes("--interactive-pointer-x") || pointerHideBody.includes("--interactive-pointer-y")) {
