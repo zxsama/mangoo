@@ -10,7 +10,7 @@
     "build": "tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('src/preload.cjs', 'dist/preload.cjs')\""
   },
   "dependencies": {
-    "electron": "34.3.0"
+    "electron": "43.1.0"
   },
   "devDependencies": {
     "typescript": "^5.6.0",
