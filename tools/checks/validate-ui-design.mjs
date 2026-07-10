@@ -397,7 +397,6 @@ if (!shellTitlebar.includes("WindowChrome")) {
 }
 
 for (const value of [
-  "useTitlebarPointerPlane",
   "data-titlebar-control",
   "data-titlebar-search"
 ]) {
@@ -405,24 +404,25 @@ for (const value of [
     !appShell.includes(value) &&
     !shellTitlebar.includes(value) &&
     !windowChrome.includes(value) &&
-    !searchBar.includes(value) &&
-    !titlebarPointerPlane.includes(value)
+    !searchBar.includes(value)
   ) {
-    fail(`titlebar interaction plane contract missing ${value}`);
+    fail(`titlebar interaction contract missing ${value}`);
   }
 }
 
+// Titlebar controls are unified into the single interactive-affordance pointer
+// glow (data-liquid-glass="button" is an affordance owner) — no separate
+// titlebar pointer plane. These pins assert the controls still exist and stay
+// no-drag; the glow itself is the shared affordance system.
 for (const [source, value, message] of [
-  [titlebarPointerPlane, "TITLEBAR_PLANE_HALO_PX", "shared titlebar pointer plane must include a halo-zone radius instead of relying on direct hover only"],
-  [titlebarPointerPlane, "data-titlebar-surface", "shared titlebar pointer plane must route over annotated titlebar surfaces"],
-  [appShell, "titlebarSurfaceProps", "AppShell must consume the shared titlebar pointer plane helper"],
-  [shellTitlebar, "tasks-palette", "titlebar tasks control must participate in the shared titlebar pointer plane"],
-  [shellTitlebar, "recent-operations", "titlebar recent-operations control must participate in the shared titlebar pointer plane"],
-  [filterMenu ?? "", "library-filter", "library filter trigger must participate in the shared titlebar pointer plane"],
-  [sortMenu, "library-sort", "library sort trigger must participate in the shared titlebar pointer plane"],
-  [searchBar, "library-search", "search field must participate in the shared titlebar pointer plane"],
-  [windowChrome, "window-minimize", "window chrome controls must participate in the shared titlebar pointer plane"],
-  [stylesForChecks, ".shell-titlebar [data-titlebar-control]", "titlebar control annotations must stay no-drag in CSS"]
+  [shellTitlebar, "tasks-palette", "titlebar tasks control must exist"],
+  [shellTitlebar, "recent-operations", "titlebar recent-operations control must exist"],
+  [filterMenu ?? "", "library-filter", "library filter trigger must exist"],
+  [sortMenu, "library-sort", "library sort trigger must exist"],
+  [searchBar, "library-search", "search field must exist"],
+  [windowChrome, "window-minimize", "window chrome controls must exist"],
+  [stylesForChecks, ".shell-titlebar [data-titlebar-control]", "titlebar control annotations must stay no-drag in CSS"],
+  [liquidGlassSurface, '[data-liquid-glass="button"]', "glass buttons must be unified into the interactive-affordance glow system"]
 ]) {
   if (!source.includes(value)) {
     fail(message);
@@ -431,8 +431,7 @@ for (const [source, value, message] of [
 
 // Native window drag: the titlebar bar is `-webkit-app-region: drag` and its
 // interactive children are restored to no-drag, so Windows owns the drag
-// (correct cursor offset + Aero Snap + double-click maximize). Guard that the
-// former JS setPosition drag is not reintroduced.
+// (correct cursor offset + Aero Snap + double-click maximize).
 const shellTitlebarDragBlocks = cssBlocksForExactSelector(stylesForChecks, ".shell-titlebar");
 if (
   !shellTitlebarDragBlocks.some(
@@ -440,9 +439,6 @@ if (
   )
 ) {
   fail("integrated titlebar must be a native OS drag region (-webkit-app-region: drag)");
-}
-if (titlebarPointerPlane.includes("moveDrag") || titlebarPointerPlane.includes("beginDrag")) {
-  fail("titlebar drag must be native (-webkit-app-region: drag), not a JS setPosition/moveDrag reimplementation");
 }
 
 for (const [source, value, message] of [
@@ -1746,29 +1742,11 @@ for (const value of [
 }
 
 const glassEdgeBlocks = cssBlocksForExactSelector(stylesForChecks, ".liquid-glass-edge");
-if (
-  !glassEdgeBlocks.some(
-    (block) =>
-      block.includes("--glass-pointer-x") &&
-      block.includes("--glass-pointer-y")
-  )
-) {
-  fail("liquid glass edge highlights must use the same real cursor coordinates as the background glow");
-}
-
 if (!liquidGlassSurface.includes("pointerPercentForRect")) {
   fail("liquid glass pointer routing must write real cursor coordinates via pointerPercentForRect");
 }
 if (!liquidGlassSurface.includes("style.setProperty(\"--interactive-pointer-x\"")) {
   fail("affordance pointer routing must write real cursor coordinates: missing --interactive-pointer-x");
-}
-// The titlebar control plane still drives --glass-pointer-* on titlebar controls
-// (its own kept system); the shared .liquid-glass-edge CSS reads those vars.
-if (
-  titlebarPointerPlane &&
-  !titlebarPointerPlane.includes("style.setProperty(\"--glass-pointer-x\"")
-) {
-  fail("titlebar control pointer routing must write real cursor coordinates: missing --glass-pointer-x");
 }
 
 if (
@@ -1820,18 +1798,6 @@ for (const functionName of [
   ) {
     fail(`${functionName} must not snap highlight coordinates to the nearest edge; use the real cursor position`);
   }
-}
-
-const titlebarControlPointerBody = extractFunctionBody(
-  titlebarPointerPlane,
-  "updateTitlebarControlPointers"
-);
-if (
-  /const\s+edgePoint\s*=\s*nearestPointOnRect/.test(titlebarControlPointerBody) ||
-  /\(\(edgePoint\.x\s*-\s*rect\.left\)/.test(titlebarControlPointerBody) ||
-  /\(\(edgePoint\.y\s*-\s*rect\.top\)/.test(titlebarControlPointerBody)
-) {
-  fail("titlebar control pointer highlights must use the real cursor position, not snapped edge coordinates");
 }
 
 const glassBackdropBlocks = cssBlocksForExactSelector(stylesForChecks, ".liquid-glass-backdrop");

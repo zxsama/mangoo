@@ -8,7 +8,6 @@ import {
   type PointerEvent,
   type ReactNode
 } from "react";
-import { useTitlebarPointerPlane } from "./useTitlebarPointerPlane";
 import { useDampedWheelScroll } from "./useDampedWheelScroll";
 import { LiquidGlassSurface } from "../design/liquid-glass";
 
@@ -50,7 +49,6 @@ export function AppShell({
   overlays
 }: AppShellProps) {
   const shellRef = useRef<HTMLElement | null>(null);
-  const { titlebarSurfaceProps } = useTitlebarPointerPlane(shellRef);
   useDampedWheelScroll(shellRef);
   const [leftWidth, setLeftWidth] = useState(() =>
     readStoredShellColumnWidth(SHELL_LEFT_WIDTH_STORAGE_KEY, SHELL_LEFT_DEFAULT_WIDTH)
@@ -199,7 +197,6 @@ export function AppShell({
         <header
           className="shell-titlebar shell-titlebar-left"
           aria-label="Primary navigation"
-          {...titlebarSurfaceProps}
         >
           {titlebarLeft}
         </header>
@@ -218,7 +215,6 @@ export function AppShell({
         <header
           className="shell-titlebar shell-titlebar-center"
           aria-label="Workspace toolbar"
-          {...titlebarSurfaceProps}
         >
           {titlebarCenter}
         </header>
@@ -237,7 +233,6 @@ export function AppShell({
         <header
           className="shell-titlebar shell-titlebar-right"
           aria-label="Window actions"
-          {...titlebarSurfaceProps}
         >
           {titlebarRight}
         </header>

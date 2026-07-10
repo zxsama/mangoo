@@ -74,7 +74,12 @@ const INTERACTIVE_AFFORDANCE_OWNER_SELECTOR = [
   // The column-resize divider: drive its edge highlight from the same
   // pointer-distance calc as everything else (was a binary :hover) so its glow
   // fades in with cursor proximity like the rest of the UI.
-  ".shell-column-resizer"
+  ".shell-column-resizer",
+  // Glass BUTTONS (LiquidGlassButton renders data-liquid-glass="button"). They
+  // are unified into the single circular pointer-distance glow like every other
+  // control. Glass SURFACES/panels (data-liquid-glass="surface") are NOT included
+  // — panels/background never glow, only clickable elements do.
+  '[data-liquid-glass="button"]'
 ].join(",");
 const INTERACTIVE_AFFORDANCE_SELECTOR = [
   INTERACTIVE_AFFORDANCE_OWNER_SELECTOR,
