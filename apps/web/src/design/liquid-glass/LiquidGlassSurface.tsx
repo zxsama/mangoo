@@ -41,6 +41,9 @@ interface LiquidGlassButtonProps extends ButtonHTMLAttributes<HTMLButtonElement>
 
 const POINTER_RESET = "50%";
 const POINTER_OPACITY_HIDDEN = "0";
+// Fallback cursor-proximity radius (px) used only before interfaceStyle writes the
+// `--glass-pointer-sensing-distance` var. The live, settings-adjustable radius is
+// read from that var each frame in pointerEdgeProximity().
 const GLASS_POINTER_EDGE_PROXIMITY_PX = 112;
 
 // Per-element bounding-rect cache for the interactive-affordance hover glow.
@@ -75,6 +78,15 @@ const INTERACTIVE_AFFORDANCE_OWNER_SELECTOR = [
   // pointer-distance calc as everything else (was a binary :hover) so its glow
   // fades in with cursor proximity like the rest of the UI.
   ".shell-column-resizer",
+  // Clickable list rows / cards. These were previously highlighted by their own
+  // rectangular :hover border+background; they now route through the single
+  // circular pointer-distance glow like every other interactive element. Disabled
+  // move rows opt out via :not(.move-row-disabled).
+  ".move-row:not(.move-row-disabled)",
+  ".plugin-card",
+  ".task-card",
+  ".settings-dialog-nav-item",
+  ".settings-radio",
   // Glass BUTTONS (LiquidGlassButton renders data-liquid-glass="button"). They
   // are unified into the single circular pointer-distance glow like every other
   // control. Glass SURFACES/panels (data-liquid-glass="surface") are NOT included
@@ -449,6 +461,7 @@ function distanceToGlassEdge(clientX: number, clientY: number, rect: DOMRect) {
 
 function updateInteractiveAffordancePointers(clientX: number, clientY: number) {
   const targets = interactiveAffordanceTargets();
+  const maxDistance = pointerEdgeProximity();
   for (const target of targets) {
     if (target.closest('[data-titlebar-search="true"]')) {
       target.removeAttribute("data-interactive-pointer-target");
@@ -466,7 +479,6 @@ function updateInteractiveAffordancePointers(clientX: number, clientY: number) {
       hideInteractiveAffordancePointer(target);
       continue;
     }
-    const maxDistance = pointerEdgeProximity(target);
     const distance = distanceToGlassEdge(clientX, clientY, rect);
     if (distance > maxDistance) {
       target.dataset.interactivePointer = "idle";
@@ -546,8 +558,14 @@ function clearInteractiveAffordancePointer(target: HTMLElement) {
   target.style.setProperty("--interactive-pointer-opacity", POINTER_OPACITY_HIDDEN);
 }
 
-function pointerEdgeProximity(target: HTMLElement) {
-  return GLASS_POINTER_EDGE_PROXIMITY_PX;
+function pointerEdgeProximity() {
+  // Read the sensing distance from the inline CSS var that interfaceStyle writes
+  // onto <html>. Reading an inline style property is cheap (no getComputedStyle,
+  // no reflow); we call this once per pointer frame, not per target. Falls back to
+  // the base radius when the var is unset (e.g. before styles apply).
+  const raw = document.documentElement.style.getPropertyValue("--glass-pointer-sensing-distance");
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : GLASS_POINTER_EDGE_PROXIMITY_PX;
 }
 
 function pointerEventInsideViewport(event: Event) {

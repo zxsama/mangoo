@@ -2,6 +2,12 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 export const INTERFACE_STYLE_STORAGE_KEY = "megle.interfaceStyle";
 
+// Base cursor-proximity radius (px) at which an interactive affordance's circular
+// glow first ignites. The `pointerSensingDistance` preference scales this base, and
+// LiquidGlassSurface reads the resulting `--glass-pointer-sensing-distance` var per
+// frame instead of hardcoding the radius.
+export const POINTER_SENSING_DISTANCE_BASE_PX = 112;
+
 export interface InterfaceStylePreference {
   windowCornerRadius: number;
   surfaceCornerRadius: number;
@@ -26,6 +32,7 @@ export interface InterfaceStylePreference {
   haloBrightness: number;
   haloFalloff: number;
   pointerResponseRadius: number;
+  pointerSensingDistance: number;
   refractionStrength: number;
   dialogBlur: number;
   dialogOpacity: number;
@@ -57,6 +64,7 @@ export const DEFAULT_INTERFACE_STYLE: InterfaceStylePreference = {
   haloBrightness: 1.45,
   haloFalloff: 1,
   pointerResponseRadius: 1,
+  pointerSensingDistance: 1,
   refractionStrength: 1,
   dialogBlur: 1,
   dialogOpacity: 1,
@@ -86,6 +94,7 @@ export const INTERFACE_STYLE_LIMITS = {
   haloBrightness: { min: 0, max: 2, step: 0.05 },
   haloFalloff: { min: 0.4, max: 2, step: 0.05 },
   pointerResponseRadius: { min: 0.4, max: 2, step: 0.05 },
+  pointerSensingDistance: { min: 0.4, max: 2.5, step: 0.05 },
   refractionStrength: { min: 0, max: 2, step: 0.05 },
   dialogBlur: { min: 0, max: 2, step: 0.05 },
   dialogOpacity: { min: 0, max: 2, step: 0.05 },
@@ -215,6 +224,11 @@ export function normalizeInterfaceStyle(input: unknown): InterfaceStylePreferenc
       INTERFACE_STYLE_LIMITS.pointerResponseRadius,
       DEFAULT_INTERFACE_STYLE.pointerResponseRadius
     ),
+    pointerSensingDistance: clampNumber(
+      source.pointerSensingDistance,
+      INTERFACE_STYLE_LIMITS.pointerSensingDistance,
+      DEFAULT_INTERFACE_STYLE.pointerSensingDistance
+    ),
     refractionStrength: clampNumber(
       source.refractionStrength,
       INTERFACE_STYLE_LIMITS.refractionStrength,
@@ -301,6 +315,7 @@ export function interfaceStyleToCssVariables(
   const pointerGlowSize = 150 * normalized.pointerResponseRadius;
   const pointerLensSize = 124 * normalized.pointerResponseRadius * normalized.refractionStrength;
   const pointerAuraSize = 176 * normalized.pointerResponseRadius * normalized.haloFalloff;
+  const pointerSensingDistance = POINTER_SENSING_DISTANCE_BASE_PX * normalized.pointerSensingDistance;
   const pointerFillOpacity = 0.028 * normalized.haloBrightness;
   const pointerPressOpacity = 0.03 * normalized.haloBrightness;
   const borderHighlightSize = 92 * normalized.edgeHighlightSize;
@@ -354,6 +369,7 @@ export function interfaceStyleToCssVariables(
     "--glass-pointer-glow-size": `${roundCssNumber(pointerGlowSize)}px`,
     "--glass-pointer-lens-size": `${roundCssNumber(pointerLensSize)}px`,
     "--glass-pointer-aura-size": `${roundCssNumber(pointerAuraSize)}px`,
+    "--glass-pointer-sensing-distance": `${roundCssNumber(pointerSensingDistance)}px`,
     "--glass-pointer-fill-opacity": String(roundCssNumber(pointerFillOpacity)),
     "--glass-pointer-press-opacity": String(roundCssNumber(pointerPressOpacity))
   };

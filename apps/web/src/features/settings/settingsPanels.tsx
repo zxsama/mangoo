@@ -524,6 +524,7 @@ function AppearanceTab({ interfaceStyle }: { interfaceStyle: InterfaceStyleContr
         <StyleSlider id="halo-brightness" label="光晕亮度" max={limits.haloBrightness.max} min={limits.haloBrightness.min} onChange={(haloBrightness) => setInterfaceStyle({ haloBrightness })} step={limits.haloBrightness.step} value={value.haloBrightness} />
         <StyleSlider id="halo-falloff" label="光晕衰减" max={limits.haloFalloff.max} min={limits.haloFalloff.min} onChange={(haloFalloff) => setInterfaceStyle({ haloFalloff })} step={limits.haloFalloff.step} value={value.haloFalloff} />
         <StyleSlider id="pointer-response-radius" label="指针响应半径" max={limits.pointerResponseRadius.max} min={limits.pointerResponseRadius.min} onChange={(pointerResponseRadius) => setInterfaceStyle({ pointerResponseRadius })} step={limits.pointerResponseRadius.step} value={value.pointerResponseRadius} />
+        <StyleSlider id="pointer-sensing-distance" label="感应距离" max={limits.pointerSensingDistance.max} min={limits.pointerSensingDistance.min} onChange={(pointerSensingDistance) => setInterfaceStyle({ pointerSensingDistance })} step={limits.pointerSensingDistance.step} value={value.pointerSensingDistance} />
         <StyleSlider id="refraction-strength" label="折射强度" max={limits.refractionStrength.max} min={limits.refractionStrength.min} onChange={(refractionStrength) => setInterfaceStyle({ refractionStrength })} step={limits.refractionStrength.step} value={value.refractionStrength} />
       </SettingsGroup>
       <SettingsGroup title="对话框材质">

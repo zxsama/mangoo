@@ -3586,7 +3586,7 @@ button:disabled {
 }
 
 .sort-menu-item:hover {
-  background: rgba(255, 255, 255, 0.06);
+  color: #f4f7f9;
 }
 
 .layout-menu-item {
@@ -3641,7 +3641,6 @@ button:disabled {
 }
 
 .filter-chip:hover {
-  border-color: rgba(255, 255, 255, 0.2);
   color: rgba(255, 255, 255, 0.95);
 }
 
@@ -3825,7 +3824,6 @@ button:disabled {
 
 .favorite-toggle:hover {
   color: rgba(255, 255, 255, 0.95);
-  border-color: rgba(255, 255, 255, 0.2);
 }
 
 .favorite-toggle-active {
@@ -4362,7 +4360,6 @@ button:disabled {
 
 .settings-dialog-nav-item:hover {
   color: #f4f7f9;
-  background: rgba(255, 255, 255, 0.05);
 }
 
 .settings-dialog-nav-item.active {
@@ -4474,7 +4471,7 @@ button:disabled {
 }
 
 .settings-radio:hover {
-  background: rgba(255, 255, 255, 0.03);
+  color: #f4f7f9;
 }
 
 .settings-radio.checked {
@@ -5954,11 +5951,10 @@ button:disabled {
   border: var(--library-thumbnail-hover-ring);
 }
 
-.tree-item:hover:not(.selected),
-.move-row:hover:not(.move-row-selected),
-.plugin-card:hover,
-.task-card:hover,
-.settings-row:hover,
+/* Interactive rows/cards get their hover feedback from the unified circular
+   pointer-distance glow (see INTERACTIVE_AFFORDANCE_OWNER_SELECTOR) — they no
+   longer draw their own rectangular hover border/background, which used to
+   double up on the glow. Only non-interactive display rows keep a plain hover. */
 .recent-op-row:hover {
   background: rgba(151, 219, 226, 0.08);
   border-color: rgba(151, 219, 226, 0.26);
@@ -6214,10 +6210,17 @@ button:disabled {
     0 0 0 5px rgba(151, 219, 226, 0.12);
 }
 
+/* Chips / stars / favorite are affordance-target buttons: their hover feedback is
+   the unified circular pointer glow, so they no longer draw a competing border+bg
+   box — only the functional text brightening remains. Search focus keeps a clear
+   box since search fields opt out of the pointer glow. */
 .tag-chip-clickable:hover,
 .filter-chip:hover,
 .rating-star:hover,
-.favorite-toggle:hover:not(:disabled),
+.favorite-toggle:hover:not(:disabled) {
+  color: #f8fdff;
+}
+
 .search-bar:focus-within {
   border-color: var(--line-strong);
   background: var(--interactive-hover);
@@ -6556,45 +6559,53 @@ button:disabled {
   -webkit-app-region: no-drag;
 }
 
+/* Titlebar search is a text field, not a spotlight target: it opts out of the
+   pointer-distance affordance glow (see the data-titlebar-search guard in
+   LiquidGlassSurface) and uses a clean, self-contained resting/hover/focus
+   treatment driven purely by :hover / :focus-within — no --glass-pointer-* vars. */
 .search-bar[data-titlebar-search="true"] {
   --glass-fill: transparent;
   --glass-border-current: rgba(255, 255, 255, 0.14);
+  --search-fill: rgba(5, 9, 13, 0.42);
+  --search-glow: 0;
   padding-inline-end: 6px;
   background: transparent;
   border: 0;
   box-shadow: none;
+  transition: color 140ms ease;
 }
 
-.search-bar[data-titlebar-search="true"] > .liquid-glass-edge {
-  opacity: calc(var(--glass-pointer-opacity, 0) * var(--glass-border-highlight-opacity) * var(--glass-edge-highlight-brightness));
-}
-
+/* Suppress the inner refractive glass layers; the field renders a flat readable
+   fill + a single ::after border/glow instead. */
 .search-bar[data-titlebar-search="true"] > .liquid-glass-backdrop,
 .search-bar[data-titlebar-search="true"] > .liquid-glass-lens,
+.search-bar[data-titlebar-search="true"] > .liquid-glass-edge,
 .search-bar[data-titlebar-search="true"] > .liquid-glass-dim,
 .search-bar[data-titlebar-search="true"]::before {
   display: none;
 }
 
 .search-bar[data-titlebar-search="true"]::after {
-  border-color: var(--glass-border-current);
-  box-shadow: none;
+  border: 1px solid var(--glass-border-current);
+  background: var(--search-fill);
+  box-shadow: 0 0 0 calc(var(--search-glow) * 3px) rgba(151, 219, 226, calc(var(--search-glow) * 0.22));
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    box-shadow 160ms ease;
 }
 
-.search-bar[data-titlebar-search="true"]:hover,
-.search-bar[data-titlebar-search="true"][data-glass-pointer="active"],
-.search-bar[data-titlebar-search="true"]:focus-within {
-  --glass-border-current: rgba(151, 219, 226, 0.52);
+.search-bar[data-titlebar-search="true"]:hover {
+  --glass-border-current: rgba(151, 219, 226, 0.4);
+  --search-fill: rgba(8, 14, 20, 0.5);
   color: #f8fdff;
-  background: transparent;
-  border-color: transparent;
-  box-shadow: none;
 }
 
 .search-bar[data-titlebar-search="true"]:focus-within {
-  --glass-pointer-x: 50%;
-  --glass-pointer-y: 50%;
-  --glass-pointer-opacity: 0.82;
+  --glass-border-current: rgba(151, 219, 226, 0.62);
+  --search-fill: rgba(8, 14, 20, 0.56);
+  --search-glow: 1;
+  color: #f8fdff;
 }
 
 @media (max-width: 720px) {
