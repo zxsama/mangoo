@@ -23,10 +23,6 @@
   --glass-center-fill-strong: rgba(8, 12, 16, 0.5);
   --glass-center-saturation: 1.55;
   --glass-center-stroke: rgba(255, 255, 255, 0.14);
-  --glass-halo-brightness: 1.45;
-  --glass-halo-falloff: 1;
-  --glass-pointer-response-radius: 1;
-  --glass-refraction-strength: 1;
   --glass-dialog-blur: 34px;
   --glass-dialog-fill: rgba(8, 12, 16, 0.5);
   --dialog-blur: 18px;
@@ -43,15 +39,9 @@
   --glass-background-glow-brightness: 1;
   --glass-edge-light: rgba(255, 255, 255, 0.34);
   --glass-inner-light: rgba(255, 255, 255, 0.12);
-  --glass-pointer-light: rgba(206, 249, 255, 0.2);
-  --glass-pointer-glow-brightness: 1.45;
   --glass-edge-highlight-brightness: 6.5;
   --glass-pointer-glow-size: 150px;
-  --glass-pointer-lens-size: 124px;
-  --glass-pointer-aura-size: 176px;
   --glass-pointer-fill-opacity: 0.028;
-  --glass-pointer-press-opacity: 0.03;
-  --glass-pointer-illumination-opacity: 0.12;
   --glass-border-highlight-size: 92px;
   --glass-border-highlight-opacity: 0.28;
   --glass-dither-opacity: 0.055;
@@ -207,10 +197,6 @@ body {
   --glass-fill: var(--glass-panel);
   --glass-blur-current: var(--glass-blur);
   --glass-border-current: var(--glass-border);
-  --glass-background-glow-strength: 0;
-  --glass-illumination: 0;
-  --glass-lens-opacity: 0.28;
-  --glass-pointer-opacity: 0;
   position: relative;
   isolation: isolate;
   overflow: hidden;
@@ -267,33 +253,23 @@ body {
 
 .liquid-glass-backdrop {
   z-index: 0;
-  background:
-    radial-gradient(
-      circle var(--glass-pointer-glow-size) at var(--glass-pointer-x, 50%) var(--glass-pointer-y, 50%),
-      rgba(255, 255, 255, calc(var(--glass-background-glow-strength) * var(--glass-pointer-opacity, 0) * var(--glass-background-glow-brightness) * (var(--glass-pointer-fill-opacity) + (var(--glass-pressure, 0) * var(--glass-pointer-press-opacity))))),
-      transparent 100%
-    ),
-    var(--glass-fill);
+  background: var(--glass-fill);
   -webkit-backdrop-filter: blur(var(--glass-blur-current)) saturate(var(--glass-saturation));
   backdrop-filter: blur(var(--glass-blur-current)) saturate(var(--glass-saturation));
   filter: url("#megle-liquid-glass-refraction");
 }
 
+/* The lens sheen, ::before aura, and edge trace were part of the retired
+   --glass-pointer-* surface-glow plane; they were always invisible (gated by the
+   now-removed --glass-pointer-opacity, permanently 0) and are superseded by the
+   unified [data-interactive-pointer-target] glow. Kept as inert layers (opacity 0)
+   so the SVG refraction/edge filter wiring the design checks pin stays intact. */
 .liquid-glass-lens {
   z-index: 1;
-  opacity: calc(var(--glass-background-glow-strength) * var(--glass-lens-opacity) * var(--glass-pointer-opacity, 0) * var(--glass-pointer-glow-brightness) * var(--glass-refraction-strength));
-  background:
-    radial-gradient(
-      circle var(--glass-pointer-lens-size) at var(--glass-pointer-x, 50%) var(--glass-pointer-y, 50%),
-      var(--glass-pointer-light),
-      transparent 100%
-    ),
-    linear-gradient(115deg, rgba(255, 255, 255, 0.24), transparent 18% 76%, rgba(255, 255, 255, 0.12));
+  opacity: 0;
+  background: linear-gradient(115deg, rgba(255, 255, 255, 0.24), transparent 18% 76%, rgba(255, 255, 255, 0.12));
   filter: url("#megle-liquid-glass-edge");
   mix-blend-mode: screen;
-  transition:
-    opacity 150ms ease,
-    transform 150ms ease;
 }
 
 .liquid-glass-dither {
@@ -316,15 +292,7 @@ body {
 
 .liquid-glass::before {
   z-index: 1;
-  opacity: calc(var(--glass-background-glow-strength) * var(--glass-illumination) * var(--glass-pointer-opacity, 0) * var(--glass-background-glow-brightness));
-  background:
-    radial-gradient(
-      circle var(--glass-pointer-aura-size) at var(--glass-pointer-x, 50%) var(--glass-pointer-y, 50%),
-      rgba(205, 247, 255, var(--glass-pointer-illumination-opacity)),
-      rgba(151, 219, 226, 0.06) 42%,
-      transparent 100%
-    );
-  transition: opacity 150ms ease;
+  opacity: 0;
 }
 
 .liquid-glass::after {
@@ -339,15 +307,7 @@ body {
 .liquid-glass-edge {
   z-index: 4;
   padding: 1px;
-  background:
-    radial-gradient(
-      circle var(--glass-border-highlight-size) at var(--glass-pointer-x, 50%) var(--glass-pointer-y, 50%),
-      rgba(222, 251, 255, 1),
-      rgba(151, 219, 226, 0.34) 38%,
-      transparent 70%
-    );
-  opacity: calc(var(--glass-pointer-opacity, 0) * var(--glass-border-highlight-opacity) * var(--glass-edge-highlight-brightness));
-  transition: opacity 110ms ease;
+  opacity: 0;
   -webkit-mask:
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
@@ -360,20 +320,6 @@ body {
     border-color 160ms ease,
     box-shadow 160ms ease,
     transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
-}
-
-.liquid-glass[data-glass-background-glow="true"] {
-  --glass-background-glow-strength: 1;
-}
-
-.liquid-glass[data-glass-interactive-background="false"] {
-  --glass-background-glow-strength: 0;
-}
-
-.liquid-glass[data-glass-interactive="true"]:hover,
-.liquid-glass[data-glass-pointer="active"] {
-  --glass-illumination: 0.24;
-  --glass-lens-opacity: 0.2;
 }
 
 .liquid-glass[data-glass-outline-only="true"]::before,
@@ -6423,7 +6369,6 @@ button:disabled {
 .shell-titlebar-center .sort-menu-trigger {
   --glass-fill: transparent;
   --glass-border-current: transparent;
-  --glass-background-glow-strength: 1;
   display: inline-flex;
   width: 34px;
   min-width: 34px;
@@ -6462,20 +6407,6 @@ button:disabled {
   box-shadow: none;
 }
 
-.shell-titlebar-center .titlebar-tool-button > .liquid-glass-lens,
-.shell-titlebar-center .titlebar-icon-button > .liquid-glass-lens,
-.shell-titlebar-center .filter-menu-trigger > .liquid-glass-lens,
-.shell-titlebar-center .sort-menu-trigger > .liquid-glass-lens {
-  opacity: calc(var(--glass-lens-opacity) * var(--glass-pointer-opacity, 0) * var(--glass-pointer-glow-brightness));
-}
-
-.shell-titlebar-center .titlebar-tool-button > .liquid-glass-edge,
-.shell-titlebar-center .titlebar-icon-button > .liquid-glass-edge,
-.shell-titlebar-center .filter-menu-trigger > .liquid-glass-edge,
-.shell-titlebar-center .sort-menu-trigger > .liquid-glass-edge {
-  opacity: calc(var(--glass-pointer-opacity, 0) * var(--glass-border-highlight-opacity) * var(--glass-edge-highlight-brightness));
-}
-
 .shell-titlebar-center .titlebar-tool-button::after,
 .shell-titlebar-center .titlebar-icon-button::after,
 .shell-titlebar-center .filter-menu-trigger::after,
@@ -6485,22 +6416,18 @@ button:disabled {
   box-shadow: none;
 }
 
+/* Titlebar tool buttons get their hover glow from the unified pointer-distance
+   system (they are [data-liquid-glass="button"] affordance targets). These states
+   only add the persistent selected/focus affordances the glow can't express:
+   a brighter icon on hover, a focus ring, and a steady fill for the open menu. */
 .shell-titlebar-center .titlebar-tool-button:hover:not(:disabled),
 .shell-titlebar-center .titlebar-icon-button:hover:not(:disabled),
 .shell-titlebar-center .filter-menu-trigger:hover:not(:disabled),
 .shell-titlebar-center .sort-menu-trigger:hover:not(:disabled),
-.shell-titlebar-center .titlebar-tool-button[data-glass-pointer="active"],
-.shell-titlebar-center .titlebar-icon-button[data-glass-pointer="active"],
-.shell-titlebar-center .filter-menu-trigger[data-glass-pointer="active"],
-.shell-titlebar-center .sort-menu-trigger[data-glass-pointer="active"],
 .shell-titlebar-center .titlebar-tool-button[data-glass-active="true"],
 .shell-titlebar-center .titlebar-icon-button[data-glass-active="true"],
 .shell-titlebar-center .filter-menu-trigger[data-glass-active="true"],
 .shell-titlebar-center .sort-menu-trigger-open {
-  --glass-pointer-opacity: 0.76;
-  --glass-illumination: 0.22;
-  --glass-lens-opacity: 0.2;
-  --glass-border-current: rgba(151, 219, 226, 0.52);
   color: #f8fdff;
   background: transparent;
   border: 0;
@@ -6511,12 +6438,6 @@ button:disabled {
 .shell-titlebar-center .titlebar-icon-button:focus-visible,
 .shell-titlebar-center .filter-menu-trigger:focus-visible,
 .shell-titlebar-center .sort-menu-trigger:focus-visible {
-  --glass-pointer-opacity: 0.82;
-  --glass-illumination: 0.24;
-  --glass-lens-opacity: 0.22;
-  --glass-border-current: rgba(151, 219, 226, 0.58);
-  --glass-pointer-x: 50%;
-  --glass-pointer-y: 50%;
   color: #d9fbff;
   background: transparent;
   border: 0;
@@ -6525,30 +6446,14 @@ button:disabled {
   outline-offset: -4px;
 }
 
-.shell-titlebar-center .titlebar-tool-button:hover:not(:disabled) > .liquid-glass-backdrop,
-.shell-titlebar-center .titlebar-icon-button:hover:not(:disabled) > .liquid-glass-backdrop,
-.shell-titlebar-center .filter-menu-trigger:hover:not(:disabled) > .liquid-glass-backdrop,
-.shell-titlebar-center .sort-menu-trigger:hover:not(:disabled) > .liquid-glass-backdrop,
-.shell-titlebar-center .titlebar-tool-button[data-glass-pointer="active"] > .liquid-glass-backdrop,
-.shell-titlebar-center .titlebar-icon-button[data-glass-pointer="active"] > .liquid-glass-backdrop,
-.shell-titlebar-center .filter-menu-trigger[data-glass-pointer="active"] > .liquid-glass-backdrop,
-.shell-titlebar-center .sort-menu-trigger[data-glass-pointer="active"] > .liquid-glass-backdrop,
-.shell-titlebar-center .titlebar-tool-button:focus-visible > .liquid-glass-backdrop,
-.shell-titlebar-center .titlebar-icon-button:focus-visible > .liquid-glass-backdrop,
-.shell-titlebar-center .filter-menu-trigger:focus-visible > .liquid-glass-backdrop,
-.shell-titlebar-center .sort-menu-trigger:focus-visible > .liquid-glass-backdrop,
+/* Open menu / active tool keeps a steady readable fill so it reads as selected
+   even when the cursor (and its glow) is elsewhere. */
 .shell-titlebar-center .titlebar-tool-button[data-glass-active="true"] > .liquid-glass-backdrop,
 .shell-titlebar-center .titlebar-icon-button[data-glass-active="true"] > .liquid-glass-backdrop,
 .shell-titlebar-center .filter-menu-trigger[data-glass-active="true"] > .liquid-glass-backdrop,
 .shell-titlebar-center .sort-menu-trigger-open > .liquid-glass-backdrop {
   opacity: 1;
-  background:
-    radial-gradient(
-      circle var(--glass-pointer-glow-size) at var(--glass-pointer-x, 50%) var(--glass-pointer-y, 50%),
-      rgba(255, 255, 255, calc(var(--glass-pointer-opacity, 0) * var(--glass-pointer-glow-brightness) * var(--glass-pointer-fill-opacity))),
-      transparent 100%
-    ),
-    rgba(255, 255, 255, 0.018);
+  background: rgba(255, 255, 255, 0.06);
   -webkit-backdrop-filter: blur(var(--glass-control-blur)) saturate(var(--glass-saturation));
   backdrop-filter: blur(var(--glass-control-blur)) saturate(var(--glass-saturation));
   filter: url("#megle-liquid-glass-refraction");

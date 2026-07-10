@@ -39,7 +39,6 @@ interface LiquidGlassButtonProps extends ButtonHTMLAttributes<HTMLButtonElement>
   active?: boolean;
 }
 
-const POINTER_RESET = "50%";
 const POINTER_OPACITY_HIDDEN = "0";
 // Fallback cursor-proximity radius (px) used only before interfaceStyle writes the
 // `--glass-pointer-sensing-distance` var. The live, settings-adjustable radius is
@@ -224,7 +223,7 @@ export const LiquidGlassSurface = forwardRef<HTMLElement, LiquidGlassSurfaceProp
         "data-glass-variant": variant,
         "data-liquid-glass": "surface",
         ref,
-        style: withInitialPointer(style)
+        style: withInitialPressure(style)
       },
       <LiquidGlassMaterialLayers outlineOnly={outlineOnly} variant={variant} />,
       scrollable ? <div className="liquid-glass-content">{children}</div> : children
@@ -278,7 +277,7 @@ export const LiquidGlassButton = forwardRef<HTMLButtonElement, LiquidGlassButton
         data-glass-variant={variant}
         data-liquid-glass="button"
         ref={ref}
-        style={withInitialPointer(style)}
+        style={withInitialPressure(style)}
         type={type}
       >
         <LiquidGlassMaterialLayers variant={variant} />
@@ -643,11 +642,12 @@ function liquidGlassClassName(
     .join(" ");
 }
 
-function withInitialPointer(style: CSSProperties | undefined): CSSProperties {
+// Seed the press-feedback var so the first pointerdown has a value to animate
+// from. (The old pointer-glow surface plane — --glass-pointer-x/y/opacity — was
+// removed; the hover glow now lives entirely on the --interactive-pointer-* vars
+// driven by the global affordance loop.)
+function withInitialPressure(style: CSSProperties | undefined): CSSProperties {
   return {
-    "--glass-pointer-x": POINTER_RESET,
-    "--glass-pointer-y": POINTER_RESET,
-    "--glass-pointer-opacity": 0,
     "--glass-pressure": 0,
     ...style
   } as CSSProperties;

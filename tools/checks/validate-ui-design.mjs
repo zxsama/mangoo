@@ -1289,9 +1289,7 @@ const middleTitlebarToolRootBlocks = cssRuleBlocksForMatchingSelectors(stylesFor
   isMiddleTitlebarToolRootSelector(selector)
 );
 assertMiddleTitlebarToolRulesDoNotFrame(middleTitlebarToolRootBlocks, "middle titlebar tool state");
-assertMiddleTitlebarGlassLayersRemainAvailable();
-assertMiddleTitlebarToolStatesActivateGlassLayers();
-assertMiddleTitlebarToolStateBackdropsKeepRefraction();
+assertMiddleTitlebarButtonsUseUnifiedGlow();
 assertMiddleTitlebarFocusUsesInsetOutline();
 
 const middleTitlebarToolGuardEnd = Math.max(
@@ -1420,10 +1418,8 @@ for (const value of [
   "edgeHighlightBrightness",
   "edgeHighlightSize",
   "haloBrightness",
-  "haloFalloff",
   "pointerResponseRadius",
   "pointerSensingDistance",
-  "refractionStrength",
   "dialogBlur",
   "dialogOpacity",
   "dialogOverlayStrength",
@@ -1450,11 +1446,7 @@ for (const value of [
   "--glass-center-stroke",
   "--glass-dither-opacity",
   "--glass-backdrop-gradient-opacity",
-  "--glass-halo-brightness",
-  "--glass-halo-falloff",
-  "--glass-pointer-response-radius",
   "--glass-pointer-sensing-distance",
-  "--glass-refraction-strength",
   "--glass-edge-highlight-brightness",
   "--glass-border-highlight-size",
   "--glass-dialog-blur",
@@ -1518,9 +1510,8 @@ for (const value of [
   'id="edge-highlight-brightness"',
   'id="edge-highlight-size"',
   'id="halo-brightness"',
-  'id="halo-falloff"',
   'id="pointer-response-radius"',
-  'id="refraction-strength"',
+  'id="pointer-sensing-distance"',
   'id="dialog-blur"',
   'id="dialog-opacity"',
   'id="dialog-overlay-strength"',
@@ -1625,14 +1616,6 @@ for (const value of [
   }
 }
 
-if (!liquidGlassSurface.includes("--glass-pointer-opacity")) {
-  fail("global shell/overlay contract missing --glass-pointer-opacity in LiquidGlassSurface");
-}
-
-if (!stylesForChecks.includes("--glass-pointer-opacity")) {
-  fail("global shell/overlay contract missing --glass-pointer-opacity in styles.css");
-}
-
 if (!stylesForChecks.includes("--glass-dither-opacity")) {
   fail("global glass material contract missing --glass-dither-opacity for anti-banding control");
 }
@@ -1718,7 +1701,6 @@ if (
 
 for (const [token, minValue] of [
   ["--glass-pointer-fill-opacity", 0.024],
-  ["--glass-pointer-illumination-opacity", 0.1],
   ["--glass-border-highlight-opacity", 0.24]
 ]) {
   const value = cssVariableNumber(stylesForChecks, token);
@@ -1729,10 +1711,7 @@ for (const [token, minValue] of [
 
 for (const value of [
   "--glass-pointer-glow-size",
-  "--glass-pointer-lens-size",
-  "--glass-pointer-aura-size",
   "--glass-pointer-fill-opacity",
-  "--glass-pointer-illumination-opacity",
   "--glass-border-highlight-size",
   "--glass-border-highlight-opacity",
   "liquid-glass-edge",
@@ -1964,8 +1943,6 @@ for (const value of [
   "onPointerDown",
   "onPointerUp",
   "onPointerLeave",
-  "--glass-pointer-x",
-  "--glass-pointer-y",
   "data-glass-pressed",
   "target === currentTarget",
   "pressable"
@@ -2968,85 +2945,28 @@ function assertMiddleTitlebarFocusUsesInsetOutline() {
   }
 }
 
-function assertMiddleTitlebarGlassLayersRemainAvailable() {
-  const layerSelectorPattern =
-    /\.shell-titlebar-center\s+\.(?:titlebar-tool-button|titlebar-icon-button|filter-menu-trigger|sort-menu-trigger)\s*>\s*\.(?:liquid-glass-lens|liquid-glass-edge)/;
-  const layerRules = cssRuleBlocksForMatchingSelectors(stylesForChecks, (selector) =>
-    layerSelectorPattern.test(selector)
-  );
-
-  if (layerRules.length === 0) {
-    fail("middle titlebar tool buttons must keep lens/edge layer rules available for hover and pointer highlights");
+function assertMiddleTitlebarButtonsUseUnifiedGlow() {
+  // Middle titlebar tool buttons are LiquidGlassButtons (data-liquid-glass="button")
+  // and therefore affordance targets of the single circular pointer-distance glow —
+  // they must NOT reintroduce a per-button pointer-glow plane (the retired
+  // --glass-pointer-*/data-glass-pointer system).
+  if (!liquidGlassSurface.includes('[data-liquid-glass="button"]')) {
+    fail("titlebar tool buttons must be unified affordance targets: INTERACTIVE_AFFORDANCE_OWNER_SELECTOR must include [data-liquid-glass=\"button\"]");
   }
-
-  for (const { block, selectorList } of layerRules) {
-    if (latestDeclarationValue(block, "display") === "none") {
-      fail(`middle titlebar tool buttons must not display:none liquid glass lens/edge layers: ${selectorList}`);
-    }
-    if (latestDeclarationValue(block, "visibility") === "hidden") {
-      fail(`middle titlebar tool buttons must not hide liquid glass lens/edge layers: ${selectorList}`);
-    }
-    if (latestDeclarationValue(block, "opacity") === "0") {
-      fail(`middle titlebar tool buttons must not force liquid glass lens/edge opacity to 0: ${selectorList}`);
+  if (stylesForChecks.includes('data-glass-pointer')) {
+    fail("the retired data-glass-pointer surface-glow plane must not be referenced; titlebar buttons glow via the unified [data-interactive-pointer-target] system");
+  }
+  for (const deadVar of ["--glass-pointer-x", "--glass-pointer-y", "--glass-pointer-opacity"]) {
+    if (stylesForChecks.includes(deadVar)) {
+      fail(`retired surface-glow variable ${deadVar} must be removed from styles.css`);
     }
   }
 
-  if (!stylesForChecks.includes('[data-glass-pointer="active"]')) {
-    fail("middle titlebar tool buttons must support local pointer-proximity glass highlights, not only direct hover");
-  }
-
-  if (!/\.shell-titlebar-center\s+\.(?:titlebar-tool-button|titlebar-icon-button|filter-menu-trigger|sort-menu-trigger)(?::(?:hover|focus-visible)|\[data-glass-pointer="active"\]|\[data-glass-active="true"\]|:not\()/.test(stylesForChecks)) {
-    fail("middle titlebar tool buttons must keep state selectors for hover, focus, pointer proximity, or active glass highlights");
-  }
-}
-
-function assertMiddleTitlebarToolStatesActivateGlassLayers() {
+  // The open menu / active tool keeps a steady refracted backdrop so it reads as
+  // selected even when the cursor's glow is elsewhere.
   for (const selector of [
-    ".shell-titlebar-center .titlebar-tool-button:hover:not(:disabled)",
-    ".shell-titlebar-center .titlebar-icon-button:hover:not(:disabled)",
-    ".shell-titlebar-center .filter-menu-trigger:hover:not(:disabled)",
-    ".shell-titlebar-center .sort-menu-trigger:hover:not(:disabled)",
-    '.shell-titlebar-center .titlebar-tool-button[data-glass-pointer="active"]',
-    '.shell-titlebar-center .titlebar-icon-button[data-glass-pointer="active"]',
-    '.shell-titlebar-center .filter-menu-trigger[data-glass-pointer="active"]',
-    '.shell-titlebar-center .sort-menu-trigger[data-glass-pointer="active"]',
-    ".shell-titlebar-center .titlebar-tool-button:focus-visible",
-    ".shell-titlebar-center .titlebar-icon-button:focus-visible",
-    ".shell-titlebar-center .filter-menu-trigger:focus-visible",
-    ".shell-titlebar-center .sort-menu-trigger:focus-visible"
-  ]) {
-    const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
-    if (blocks.length === 0) {
-      fail(`middle titlebar glass state selector missing ${selector}`);
-      continue;
-    }
-    if (
-      !blocks.some(
-        (block) =>
-          positiveCssNumber(latestDeclarationValue(block, "--glass-pointer-opacity")) &&
-          positiveCssNumber(latestDeclarationValue(block, "--glass-lens-opacity")) &&
-          positiveCssNumber(latestDeclarationValue(block, "--glass-illumination"))
-      )
-    ) {
-      fail(`${selector} must activate liquid-glass pointer/lens illumination without adding a persistent frame`);
-    }
-  }
-}
-
-function assertMiddleTitlebarToolStateBackdropsKeepRefraction() {
-  for (const selector of [
-    ".shell-titlebar-center .titlebar-tool-button:hover:not(:disabled) > .liquid-glass-backdrop",
-    ".shell-titlebar-center .titlebar-icon-button:hover:not(:disabled) > .liquid-glass-backdrop",
-    ".shell-titlebar-center .filter-menu-trigger:hover:not(:disabled) > .liquid-glass-backdrop",
-    ".shell-titlebar-center .sort-menu-trigger:hover:not(:disabled) > .liquid-glass-backdrop",
-    '.shell-titlebar-center .titlebar-tool-button[data-glass-pointer="active"] > .liquid-glass-backdrop',
-    '.shell-titlebar-center .titlebar-icon-button[data-glass-pointer="active"] > .liquid-glass-backdrop',
-    '.shell-titlebar-center .filter-menu-trigger[data-glass-pointer="active"] > .liquid-glass-backdrop',
-    '.shell-titlebar-center .sort-menu-trigger[data-glass-pointer="active"] > .liquid-glass-backdrop',
-    ".shell-titlebar-center .titlebar-tool-button:focus-visible > .liquid-glass-backdrop",
-    ".shell-titlebar-center .titlebar-icon-button:focus-visible > .liquid-glass-backdrop",
-    ".shell-titlebar-center .filter-menu-trigger:focus-visible > .liquid-glass-backdrop",
-    ".shell-titlebar-center .sort-menu-trigger:focus-visible > .liquid-glass-backdrop"
+    '.shell-titlebar-center .titlebar-tool-button[data-glass-active="true"] > .liquid-glass-backdrop',
+    '.shell-titlebar-center .sort-menu-trigger-open > .liquid-glass-backdrop'
   ]) {
     const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
     if (
@@ -3057,7 +2977,7 @@ function assertMiddleTitlebarToolStateBackdropsKeepRefraction() {
           /filter:\s*url\("#megle-liquid-glass-refraction"\)/.test(block)
       )
     ) {
-      fail(`${selector} must restore renderer refraction/backdrop filtering for active titlebar tool glass`);
+      fail(`${selector} must keep a refracted steady backdrop for the active/open titlebar tool`);
     }
   }
 }

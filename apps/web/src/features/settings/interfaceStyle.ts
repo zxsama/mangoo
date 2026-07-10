@@ -30,10 +30,8 @@ export interface InterfaceStylePreference {
   edgeHighlightBrightness: number;
   edgeHighlightSize: number;
   haloBrightness: number;
-  haloFalloff: number;
   pointerResponseRadius: number;
   pointerSensingDistance: number;
-  refractionStrength: number;
   dialogBlur: number;
   dialogOpacity: number;
   dialogOverlayStrength: number;
@@ -62,10 +60,8 @@ export const DEFAULT_INTERFACE_STYLE: InterfaceStylePreference = {
   edgeHighlightBrightness: 6.5,
   edgeHighlightSize: 1,
   haloBrightness: 1.45,
-  haloFalloff: 1,
   pointerResponseRadius: 1,
   pointerSensingDistance: 1,
-  refractionStrength: 1,
   dialogBlur: 1,
   dialogOpacity: 1,
   dialogOverlayStrength: 1,
@@ -92,10 +88,8 @@ export const INTERFACE_STYLE_LIMITS = {
   edgeHighlightBrightness: { min: 0, max: 8, step: 0.25 },
   edgeHighlightSize: { min: 0.4, max: 2, step: 0.05 },
   haloBrightness: { min: 0, max: 2, step: 0.05 },
-  haloFalloff: { min: 0.4, max: 2, step: 0.05 },
   pointerResponseRadius: { min: 0.4, max: 2, step: 0.05 },
   pointerSensingDistance: { min: 0.4, max: 2.5, step: 0.05 },
-  refractionStrength: { min: 0, max: 2, step: 0.05 },
   dialogBlur: { min: 0, max: 2, step: 0.05 },
   dialogOpacity: { min: 0, max: 2, step: 0.05 },
   dialogOverlayStrength: { min: 0, max: 2, step: 0.05 },
@@ -214,11 +208,6 @@ export function normalizeInterfaceStyle(input: unknown): InterfaceStylePreferenc
       INTERFACE_STYLE_LIMITS.haloBrightness,
       DEFAULT_INTERFACE_STYLE.haloBrightness
     ),
-    haloFalloff: clampNumber(
-      source.haloFalloff,
-      INTERFACE_STYLE_LIMITS.haloFalloff,
-      DEFAULT_INTERFACE_STYLE.haloFalloff
-    ),
     pointerResponseRadius: clampNumber(
       legacyValue(source, "pointerResponseRadius", "pointerGlowSize"),
       INTERFACE_STYLE_LIMITS.pointerResponseRadius,
@@ -228,11 +217,6 @@ export function normalizeInterfaceStyle(input: unknown): InterfaceStylePreferenc
       source.pointerSensingDistance,
       INTERFACE_STYLE_LIMITS.pointerSensingDistance,
       DEFAULT_INTERFACE_STYLE.pointerSensingDistance
-    ),
-    refractionStrength: clampNumber(
-      source.refractionStrength,
-      INTERFACE_STYLE_LIMITS.refractionStrength,
-      DEFAULT_INTERFACE_STYLE.refractionStrength
     ),
     dialogBlur: clampNumber(
       legacyValue(source, "dialogBlur", "glassBlur"),
@@ -313,11 +297,8 @@ export function interfaceStyleToCssVariables(
   const controlAlpha = 0.085 * normalized.centerOpacity;
   const clearDimAlpha = 0.52 * normalized.centerOverlayStrength;
   const pointerGlowSize = 150 * normalized.pointerResponseRadius;
-  const pointerLensSize = 124 * normalized.pointerResponseRadius * normalized.refractionStrength;
-  const pointerAuraSize = 176 * normalized.pointerResponseRadius * normalized.haloFalloff;
   const pointerSensingDistance = POINTER_SENSING_DISTANCE_BASE_PX * normalized.pointerSensingDistance;
   const pointerFillOpacity = 0.028 * normalized.haloBrightness;
-  const pointerPressOpacity = 0.03 * normalized.haloBrightness;
   const borderHighlightSize = 92 * normalized.edgeHighlightSize;
   const dialogFill = colorWithAlpha(
     normalized.centerOverlayColor,
@@ -344,10 +325,6 @@ export function interfaceStyleToCssVariables(
     "--glass-center-stroke": rgbWithAlpha(255, 255, 255, 0.14 * normalized.centerStrokeOpacity),
     "--glass-dither-opacity": String(roundCssNumber(ditherOpacity)),
     "--glass-backdrop-gradient-opacity": String(roundCssNumber(normalized.backdropGradientStrength)),
-    "--glass-halo-brightness": String(roundCssNumber(normalized.haloBrightness)),
-    "--glass-halo-falloff": String(roundCssNumber(normalized.haloFalloff)),
-    "--glass-pointer-response-radius": String(roundCssNumber(normalized.pointerResponseRadius)),
-    "--glass-refraction-strength": String(roundCssNumber(normalized.refractionStrength)),
     "--glass-edge-highlight-brightness": String(
       roundCssNumber(normalized.edgeHighlightBrightness)
     ),
@@ -365,13 +342,9 @@ export function interfaceStyleToCssVariables(
     "--glass-readable-surface": centerOverlay,
     "--glass-readable-surface-strong": centerOverlayStrong,
     "--glass-clear-dim": rgbWithAlpha(2, 5, 8, clearDimAlpha),
-    "--glass-pointer-glow-brightness": String(roundCssNumber(normalized.haloBrightness)),
     "--glass-pointer-glow-size": `${roundCssNumber(pointerGlowSize)}px`,
-    "--glass-pointer-lens-size": `${roundCssNumber(pointerLensSize)}px`,
-    "--glass-pointer-aura-size": `${roundCssNumber(pointerAuraSize)}px`,
     "--glass-pointer-sensing-distance": `${roundCssNumber(pointerSensingDistance)}px`,
-    "--glass-pointer-fill-opacity": String(roundCssNumber(pointerFillOpacity)),
-    "--glass-pointer-press-opacity": String(roundCssNumber(pointerPressOpacity))
+    "--glass-pointer-fill-opacity": String(roundCssNumber(pointerFillOpacity))
   };
 }
 
