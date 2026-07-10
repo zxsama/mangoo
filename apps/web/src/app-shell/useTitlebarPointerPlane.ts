@@ -1,179 +1,11 @@
-import { useEffect, useRef, type HTMLAttributes, type MouseEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
-import { getWindowControls } from "../core/desktop";
+import { useEffect, type HTMLAttributes, type RefObject } from "react";
 
 const TITLEBAR_CONTROL_SELECTOR = "[data-titlebar-control]";
 const TITLEBAR_SURFACE_SELECTOR = '[data-titlebar-surface="true"]';
 const TITLEBAR_PLANE_HALO_PX = 24;
-const TITLEBAR_DRAG_START_THRESHOLD_PX = 5;
 const TITLEBAR_CONTROL_POINTER_EDGE_PROXIMITY_PX = 156;
-const TITLEBAR_NO_DRAG_SELECTOR = [
-  ".no-drag",
-  '[data-no-drag="true"]',
-  TITLEBAR_CONTROL_SELECTOR,
-  "button",
-  "input",
-  "select",
-  "textarea",
-  "a",
-  '[role="button"]',
-  '[role="tab"]',
-  '[role="tablist"]',
-  '[role="group"]'
-].join(",");
-
-interface DragState {
-  pointerId: number;
-  pointerOffsetX: number;
-  pointerOffsetY: number;
-}
-
-interface PendingDragState {
-  pointerId: number;
-  startClientX: number;
-  startClientY: number;
-  startScreenX: number;
-  startScreenY: number;
-  titlebarOffsetY: number;
-  viewportWidth: number;
-  starting: boolean;
-}
 
 export function useTitlebarPointerPlane(rootRef: RefObject<HTMLElement | null>) {
-  const dragStateRef = useRef<DragState | null>(null);
-  const pendingDragStateRef = useRef<PendingDragState | null>(null);
-  const pointerCaptureRef = useRef<HTMLElement | null>(null);
-  const dragFrameRef = useRef<number>(0);
-  const pendingDragMoveRef = useRef(false);
-
-  function releasePointerCapture(pointerId?: number) {
-    const trackedPointerId =
-      pointerId ?? dragStateRef.current?.pointerId ?? pendingDragStateRef.current?.pointerId;
-    const captureTarget = pointerCaptureRef.current;
-    if (!captureTarget || trackedPointerId === undefined) {
-      pointerCaptureRef.current = null;
-      return;
-    }
-    if (captureTarget.hasPointerCapture(trackedPointerId)) {
-      captureTarget.releasePointerCapture(trackedPointerId);
-    }
-    pointerCaptureRef.current = null;
-  }
-
-  function clearDrag(pointerId?: number) {
-    const drag = dragStateRef.current;
-    const pending = pendingDragStateRef.current;
-    const trackedPointerId = drag?.pointerId ?? pending?.pointerId;
-    if (trackedPointerId === undefined || (pointerId !== undefined && trackedPointerId !== pointerId)) {
-      return;
-    }
-    dragStateRef.current = null;
-    pendingDragStateRef.current = null;
-    pendingDragMoveRef.current = false;
-    if (dragFrameRef.current) {
-      window.cancelAnimationFrame(dragFrameRef.current);
-      dragFrameRef.current = 0;
-    }
-    void getWindowControls()?.endDrag?.();
-    releasePointerCapture(trackedPointerId);
-  }
-
-  function scheduleNativeDragMove() {
-    pendingDragMoveRef.current = true;
-    if (dragFrameRef.current) {
-      return;
-    }
-    dragFrameRef.current = window.requestAnimationFrame(() => {
-      dragFrameRef.current = 0;
-      const controls = getWindowControls();
-      if (!pendingDragMoveRef.current || !controls?.moveDrag) return;
-      pendingDragMoveRef.current = false;
-      void controls.moveDrag();
-    });
-  }
-
-  async function startNativeDrag(
-    pending: PendingDragState,
-    point: { clientX: number; clientY: number; screenX: number; screenY: number; buttons: number }
-  ) {
-    const controls = getWindowControls();
-    if (!controls?.moveDrag || !controls.beginDrag || pending.starting) {
-      return;
-    }
-
-    pending.starting = true;
-    const bounds = await controls.beginDrag({
-      clientX: pending.startClientX,
-      screenX: point.screenX,
-      screenY: point.screenY,
-      titlebarOffsetY: pending.titlebarOffsetY,
-      viewportWidth: pending.viewportWidth
-    });
-    if (
-      !bounds ||
-      pendingDragStateRef.current !== pending ||
-      (point.buttons & 1) === 0
-    ) {
-      clearDrag(pending.pointerId);
-      return;
-    }
-
-    pendingDragStateRef.current = null;
-    const drag: DragState = {
-      pointerId: pending.pointerId,
-      pointerOffsetX: bounds.restoredFromMaximized
-        ? Math.max(0, point.screenX - bounds.x)
-        : Math.max(0, pending.startScreenX - bounds.x),
-      pointerOffsetY: bounds.restoredFromMaximized
-        ? Math.max(0, point.screenY - bounds.y)
-        : Math.max(0, pending.startScreenY - bounds.y)
-    };
-    dragStateRef.current = drag;
-    scheduleNativeDragMove();
-  }
-
-  function handlePointerPlaneMove(
-    clientX: number,
-    clientY: number,
-    pointerId: number,
-    buttons: number,
-    screenX: number,
-    screenY: number
-  ) {
-    updateTitlebarPointerPlane(rootRef.current, clientX, clientY);
-    const pending = pendingDragStateRef.current;
-    if (pending?.pointerId === pointerId) {
-      if ((buttons & 1) === 0) {
-        clearDrag(pointerId);
-        return;
-      }
-      const distance = Math.hypot(clientX - pending.startClientX, clientY - pending.startClientY);
-      if (distance < TITLEBAR_DRAG_START_THRESHOLD_PX) {
-        return;
-      }
-      void startNativeDrag(pending, { clientX, clientY, screenX, screenY, buttons });
-      return;
-    }
-
-    const drag = dragStateRef.current;
-    const controls = getWindowControls();
-    if (!drag || drag.pointerId !== pointerId || !controls?.moveDrag) {
-      if (drag && (buttons & 1) === 0) {
-        clearDrag(drag.pointerId);
-      }
-      return;
-    }
-    if ((buttons & 1) === 0) {
-      clearDrag(pointerId);
-      return;
-    }
-    scheduleNativeDragMove();
-  }
-
-  function handlePointerPlaneExit(pointerId?: number) {
-    clearDrag(pointerId);
-    hideTitlebarControlPointers(rootRef.current);
-  }
-
   useEffect(() => {
     let animationFrame = 0;
     let latestPointer: { x: number; y: number } | null = null;
@@ -196,115 +28,42 @@ export function useTitlebarPointerPlane(rootRef: RefObject<HTMLElement | null>) 
     }
 
     function handleWindowPointerMove(event: globalThis.PointerEvent) {
-      if (dragStateRef.current) {
-        handlePointerPlaneMove(
-          event.clientX,
-          event.clientY,
-          event.pointerId,
-          event.buttons,
-          event.screenX,
-          event.screenY
-        );
-        return;
-      }
       requestPlaneUpdate(event.clientX, event.clientY);
     }
 
     function handleWindowPointerExit() {
       cancelPendingFrame();
-      handlePointerPlaneExit();
-    }
-
-    function handleWindowPointerUp(event: globalThis.PointerEvent) {
-      clearDrag(event.pointerId);
-    }
-
-    function handleWindowPointerCancel(event: globalThis.PointerEvent) {
-      clearDrag(event.pointerId);
       hideTitlebarControlPointers(rootRef.current);
     }
 
     window.addEventListener("pointermove", handleWindowPointerMove, { passive: true });
     window.addEventListener("pointerleave", handleWindowPointerExit);
     window.addEventListener("blur", handleWindowPointerExit);
-    window.addEventListener("pointerup", handleWindowPointerUp);
-    window.addEventListener("pointercancel", handleWindowPointerCancel);
 
     return () => {
       cancelPendingFrame();
-      clearDrag();
       window.removeEventListener("pointermove", handleWindowPointerMove);
       window.removeEventListener("pointerleave", handleWindowPointerExit);
       window.removeEventListener("blur", handleWindowPointerExit);
-      window.removeEventListener("pointerup", handleWindowPointerUp);
-      window.removeEventListener("pointercancel", handleWindowPointerCancel);
       hideTitlebarControlPointers(rootRef.current);
     };
   }, [rootRef]);
 
-  function handleTitlebarDoubleClick(event: MouseEvent<HTMLElement>) {
-    const target = event.target;
-    if (!(target instanceof Element) || target.closest(TITLEBAR_NO_DRAG_SELECTOR)) return;
-    void getWindowControls()?.maximize();
-  }
-
-  async function handleTitlebarPointerDown(event: ReactPointerEvent<HTMLElement>) {
-    const target = event.target;
-    if (
-      event.button !== 0 ||
-      !(target instanceof Element) ||
-      target.closest(TITLEBAR_NO_DRAG_SELECTOR)
-    ) {
-      return;
-    }
-
-    const controls = getWindowControls();
-    if (!controls?.moveDrag || !controls.beginDrag) {
-      return;
-    }
-
-    event.preventDefault();
-    const captureTarget = event.currentTarget;
-    captureTarget.setPointerCapture(event.pointerId);
-    pointerCaptureRef.current = captureTarget;
-
-    const titlebarRect = captureTarget.getBoundingClientRect();
-    pendingDragStateRef.current = {
-      pointerId: event.pointerId,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-      startScreenX: event.screenX,
-      startScreenY: event.screenY,
-      titlebarOffsetY: event.clientY - titlebarRect.top,
-      viewportWidth: window.innerWidth,
-      starting: false
-    };
-  }
-
   const titlebarSurfaceProps: Pick<
     HTMLAttributes<HTMLElement>,
-    "onDoubleClick" | "onPointerCancel" | "onPointerDown" | "onPointerMove" | "onPointerUp"
+    "onPointerCancel" | "onPointerMove"
   > & { "data-titlebar-surface": "true" } = {
     "data-titlebar-surface": "true",
-    onDoubleClick: handleTitlebarDoubleClick,
-    onPointerDown: (event) => {
-      void handleTitlebarPointerDown(event);
-    },
+    // Window drag + double-click-maximize + Aero Snap are handled NATIVELY via
+    // `-webkit-app-region: drag` on .shell-titlebar (see styles.css). We only
+    // keep the pointer-move highlight here; the former JS setPosition drag (which
+    // offset the cursor after restoring from maximized and had no edge snapping)
+    // is gone. Titlebar controls stay clickable via `-webkit-app-region: no-drag`.
     onPointerMove: (event) => {
-      handlePointerPlaneMove(
-        event.clientX,
-        event.clientY,
-        event.pointerId,
-        event.buttons,
-        event.screenX,
-        event.screenY
-      );
+      updateTitlebarPointerPlane(rootRef.current, event.clientX, event.clientY);
     },
-    onPointerUp: (event) => {
-      clearDrag(event.pointerId);
-    },
-    onPointerCancel: (event) => {
-      handlePointerPlaneExit(event.pointerId);
+    onPointerCancel: () => {
+      hideTitlebarControlPointers(rootRef.current);
     }
   };
 

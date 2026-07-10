@@ -150,8 +150,6 @@ export function AppShell({
       <div className="shell-backdrop-canvas" aria-hidden="true" />
       <div
         className="window-edge-frame"
-        data-window-edge-surface="true"
-        data-window-edge-pointer="idle"
         aria-hidden="true"
       />
       {sidebarsHidden ? null : (
@@ -199,7 +197,7 @@ export function AppShell({
         tone="chrome"
       >
         <header
-          className="shell-titlebar shell-titlebar-left shell-drag"
+          className="shell-titlebar shell-titlebar-left"
           aria-label="Primary navigation"
           {...titlebarSurfaceProps}
         >
@@ -218,7 +216,7 @@ export function AppShell({
         tone="chrome"
       >
         <header
-          className="shell-titlebar shell-titlebar-center shell-drag"
+          className="shell-titlebar shell-titlebar-center"
           aria-label="Workspace toolbar"
           {...titlebarSurfaceProps}
         >
@@ -237,7 +235,7 @@ export function AppShell({
         tone="chrome"
       >
         <header
-          className="shell-titlebar shell-titlebar-right shell-drag"
+          className="shell-titlebar shell-titlebar-right"
           aria-label="Window actions"
           {...titlebarSurfaceProps}
         >

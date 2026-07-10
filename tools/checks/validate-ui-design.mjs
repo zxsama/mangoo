@@ -359,15 +359,6 @@ if (!stylesForChecks.includes("-webkit-app-region: no-drag")) {
 assertExactSelectorHelperContracts();
 assertCssCommentStrippingContracts();
 
-const shellDragBlocks = cssBlocksForExactSelector(stylesForChecks, ".shell-drag");
-if (
-  !shellDragBlocks.some(
-    (block) => latestDeclarationValue(block, "-webkit-app-region") === "no-drag"
-  )
-) {
-  fail("integrated titlebar must expose pointer events across the full titlebar surface");
-}
-
 const noDragBlocks = cssBlocksForExactSelector(stylesForChecks, ".no-drag");
 if (
   !noDragBlocks.some(
@@ -423,11 +414,6 @@ for (const value of [
 
 for (const [source, value, message] of [
   [titlebarPointerPlane, "TITLEBAR_PLANE_HALO_PX", "shared titlebar pointer plane must include a halo-zone radius instead of relying on direct hover only"],
-  [titlebarPointerPlane, "TITLEBAR_DRAG_START_THRESHOLD_PX", "titlebar drag must wait for movement threshold so a maximized click does not restore the window"],
-  [titlebarPointerPlane, "pendingDragStateRef", "titlebar drag must keep a pending drag state before restoring or moving the native window"],
-  [titlebarPointerPlane, "moveDrag", "titlebar drag movement must be owned by the desktop main process cursor coordinate system"],
-  [desktopMain, 'ipcMain.handle("megle:window-drag-move"', "desktop main must own window drag movement using native cursor coordinates"],
-  [desktopMain, "screen.getCursorScreenPoint", "desktop drag must use Electron's native screen cursor point instead of renderer PointerEvent screen coordinates"],
   [titlebarPointerPlane, "data-titlebar-surface", "shared titlebar pointer plane must route over annotated titlebar surfaces"],
   [appShell, "titlebarSurfaceProps", "AppShell must consume the shared titlebar pointer plane helper"],
   [shellTitlebar, "tasks-palette", "titlebar tasks control must participate in the shared titlebar pointer plane"],
@@ -443,12 +429,20 @@ for (const [source, value, message] of [
   }
 }
 
-const titlebarPointerDownBody = extractFunctionBody(
-  titlebarPointerPlane,
-  "handleTitlebarPointerDown"
-);
-if (/\.beginDrag\s*\(/.test(titlebarPointerDownBody)) {
-  fail("titlebar pointerdown must only arm a pending drag; native restore/move begins after drag threshold is crossed");
+// Native window drag: the titlebar bar is `-webkit-app-region: drag` and its
+// interactive children are restored to no-drag, so Windows owns the drag
+// (correct cursor offset + Aero Snap + double-click maximize). Guard that the
+// former JS setPosition drag is not reintroduced.
+const shellTitlebarDragBlocks = cssBlocksForExactSelector(stylesForChecks, ".shell-titlebar");
+if (
+  !shellTitlebarDragBlocks.some(
+    (block) => latestDeclarationValue(block, "-webkit-app-region") === "drag"
+  )
+) {
+  fail("integrated titlebar must be a native OS drag region (-webkit-app-region: drag)");
+}
+if (titlebarPointerPlane.includes("moveDrag") || titlebarPointerPlane.includes("beginDrag")) {
+  fail("titlebar drag must be native (-webkit-app-region: drag), not a JS setPosition/moveDrag reimplementation");
 }
 
 for (const [source, value, message] of [
@@ -690,28 +684,26 @@ if (/\.workbench-column\s*>\s*\.liquid-glass-edge[\s\S]*?display:\s*none/.test(s
 
 const windowEdgeFrameBlock = cssBlocksForSelector(stylesForChecks, ".window-edge-frame").join("\n");
 const windowEdgeFrameBeforeBlock = cssBlocksForSelector(stylesForChecks, ".window-edge-frame::before").join("\n");
-const windowEdgeFrameAfterBlock = cssBlocksForSelector(stylesForChecks, ".window-edge-frame::after").join("\n");
 if (
   !appShell.includes('className="window-edge-frame"') ||
-  !appShell.includes('data-window-edge-surface="true"') ||
-  !liquidGlassSurface.includes('WINDOW_EDGE_SURFACE_SELECTOR = \'[data-window-edge-surface="true"]\'') ||
-  !liquidGlassSurface.includes("querySelectorAll<HTMLElement>(WINDOW_EDGE_SURFACE_SELECTOR)") ||
-  !liquidGlassSurface.includes("updateWindowEdgePointers") ||
-  !liquidGlassSurface.includes("hideWindowEdgePointers") ||
   !/inset:\s*1px/.test(windowEdgeFrameBlock) ||
   !/border-radius:\s*calc\(var\(--radius-window\)\s*-\s*1px\)/.test(windowEdgeFrameBlock) ||
   !/background:\s*var\(--glass-window-stroke\)/.test(windowEdgeFrameBeforeBlock) ||
   !/padding:\s*1px/.test(windowEdgeFrameBeforeBlock) ||
   !/-webkit-mask-composite:\s*xor/.test(windowEdgeFrameBeforeBlock) ||
-  !/mask-composite:\s*exclude/.test(windowEdgeFrameBeforeBlock) ||
-  !/border-radius:\s*inherit/.test(windowEdgeFrameAfterBlock) ||
-  !/padding:\s*1px/.test(windowEdgeFrameAfterBlock) ||
-  !/radial-gradient\([\s\S]*var\(--glass-border-highlight-size\)[\s\S]*var\(--glass-pointer-x/.test(windowEdgeFrameAfterBlock) ||
-  !/opacity:\s*calc\(var\(--glass-pointer-opacity,\s*0\)\s*\*\s*var\(--glass-border-highlight-opacity\)\s*\*\s*var\(--glass-edge-highlight-brightness\)\)/.test(windowEdgeFrameAfterBlock) ||
-  !/-webkit-mask-composite:\s*xor/.test(windowEdgeFrameAfterBlock) ||
-  !/mask-composite:\s*exclude/.test(windowEdgeFrameAfterBlock)
+  !/mask-composite:\s*exclude/.test(windowEdgeFrameBeforeBlock)
 ) {
-  fail("app shell outer stroke must be a dedicated top-level pointer-driven window edge frame, not a pane override or static border");
+  fail("app shell outer stroke must be a dedicated top-level window edge frame (static masked border), not a pane override or plain border");
+}
+// The window edge frame must NOT re-introduce a pointer-follow glow: the mouse
+// highlight is unified into the interactive-affordance system only (elements),
+// never on the window frame / background. Guard against regression.
+const windowEdgeFrameAfterBlock = cssBlocksForSelector(stylesForChecks, ".window-edge-frame::after").join("\n");
+if (
+  windowEdgeFrameAfterBlock.includes("--glass-pointer-x") ||
+  liquidGlassSurface.includes("updateWindowEdgePointers")
+) {
+  fail("window edge frame must not have a pointer-follow glow (unified highlight lives on interactive affordance targets only)");
 }
 
 if (
@@ -1764,14 +1756,19 @@ if (
   fail("liquid glass edge highlights must use the same real cursor coordinates as the background glow");
 }
 
-for (const value of [
-  "pointerPercentForRect",
-  "style.setProperty(\"--glass-pointer-x\"",
-  "style.setProperty(\"--interactive-pointer-x\""
-]) {
-  if (!liquidGlassSurface.includes(value)) {
-    fail(`liquid glass pointer routing must write real cursor coordinates instead of snapped edge coordinates: missing ${value}`);
-  }
+if (!liquidGlassSurface.includes("pointerPercentForRect")) {
+  fail("liquid glass pointer routing must write real cursor coordinates via pointerPercentForRect");
+}
+if (!liquidGlassSurface.includes("style.setProperty(\"--interactive-pointer-x\"")) {
+  fail("affordance pointer routing must write real cursor coordinates: missing --interactive-pointer-x");
+}
+// The titlebar control plane still drives --glass-pointer-* on titlebar controls
+// (its own kept system); the shared .liquid-glass-edge CSS reads those vars.
+if (
+  titlebarPointerPlane &&
+  !titlebarPointerPlane.includes("style.setProperty(\"--glass-pointer-x\"")
+) {
+  fail("titlebar control pointer routing must write real cursor coordinates: missing --glass-pointer-x");
 }
 
 if (
@@ -1813,8 +1810,6 @@ if (
 }
 
 for (const functionName of [
-  "updateWindowEdgePointers",
-  "updateLiquidGlassPointer",
   "updateInteractiveAffordancePointers"
 ]) {
   const body = extractFunctionBody(liquidGlassSurface, functionName);
@@ -1889,21 +1884,24 @@ for (const value of [
 
 const pointerHideBody = extractFirstRequiredFunctionBody(
   liquidGlassSurface,
-  ["hideGlassPointer", "resetPointer"],
-  "liquid glass pointer hide/reset"
+  ["hideInteractiveAffordancePointer", "resetPointer"],
+  "interactive affordance pointer hide/reset"
 );
-if (pointerHideBody.includes("--glass-pointer-x") || pointerHideBody.includes("--glass-pointer-y")) {
-  fail("liquid glass pointer leave must hide opacity without resetting x/y to a visible center drift");
+if (pointerHideBody.includes("--interactive-pointer-x") || pointerHideBody.includes("--interactive-pointer-y")) {
+  fail("affordance pointer leave must hide opacity without resetting x/y to a visible center drift");
 }
 
+// The pointer highlight is a SINGLE global proximity system: one pointermove
+// listener drives updateInteractiveAffordancePointers over affordance targets.
+// (The former per-surface window-edge and liquid-glass-surface sweeps were
+// unified away — the mouse glow lives only on interactive affordance targets.)
 for (const value of [
   "useEffect",
   "window.addEventListener(\"pointermove\"",
   "window.addEventListener(\"mousemove\"",
-  "querySelectorAll<HTMLElement>(\"[data-liquid-glass]\"",
   "GLASS_POINTER_EDGE_PROXIMITY_PX",
-  "updateLiquidGlassPointer",
-  "hideLiquidGlassPointers"
+  "updateInteractiveAffordancePointers",
+  "hideInteractiveAffordancePointers"
 ]) {
   if (!liquidGlassSurface.includes(value)) {
     fail(`liquid glass pointer highlight must be global/proximity-based: missing ${value}`);

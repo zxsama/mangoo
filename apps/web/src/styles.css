@@ -723,24 +723,19 @@ body {
 }
 
 .window-edge-frame,
-.window-edge-frame::before,
-.window-edge-frame::after {
+.window-edge-frame::before {
   position: absolute;
   content: "";
   pointer-events: none;
 }
 
 .window-edge-frame {
-  --glass-pointer-x: 50%;
-  --glass-pointer-y: 50%;
-  --glass-pointer-opacity: 0;
   inset: 1px;
   z-index: 80;
   border-radius: calc(var(--radius-window) - 1px);
 }
 
-.window-edge-frame::before,
-.window-edge-frame::after {
+.window-edge-frame::before {
   inset: 0;
   border-radius: inherit;
   padding: 1px;
@@ -752,23 +747,8 @@ body {
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
   mask-composite: exclude;
-}
-
-.window-edge-frame::before {
   background: var(--glass-window-stroke);
   opacity: 0.72;
-}
-
-.window-edge-frame::after {
-  background:
-    radial-gradient(
-      circle var(--glass-border-highlight-size) at var(--glass-pointer-x, 50%) var(--glass-pointer-y, 50%),
-      rgba(222, 251, 255, 1),
-      rgba(151, 219, 226, 0.34) 38%,
-      transparent 70%
-    );
-  opacity: calc(var(--glass-pointer-opacity, 0) * var(--glass-border-highlight-opacity) * var(--glass-edge-highlight-brightness));
-  transition: opacity 110ms ease;
 }
 
 .shell-backdrop-canvas {
@@ -872,6 +852,31 @@ body {
   border: 0;
   box-shadow: none;
   overflow: visible;
+  /* Native OS window drag: correct cursor offset + Windows Aero Snap (drag to
+     an edge maximizes/half-tiles) + double-click-to-maximize, all handled by the
+     OS. Interactive children (buttons, search, tabs) are restored to no-drag by
+     the rule below, so only the empty bar area drags the window. This replaces
+     the former JS setPosition drag, which offset the cursor after restoring from
+     maximized and had no edge snapping. */
+  -webkit-app-region: drag;
+}
+/* Everything interactive inside the titlebar stays clickable (not a drag handle). */
+.shell-titlebar :where(
+    button,
+    input,
+    select,
+    textarea,
+    a,
+    [role="button"],
+    [role="tab"],
+    [role="tablist"],
+    [role="group"],
+    [role="textbox"],
+    [role="searchbox"],
+    [data-no-drag="true"]
+  ),
+.shell-titlebar [data-no-drag="true"] * {
+  -webkit-app-region: no-drag;
 }
 
 .shell-titlebar-left {
