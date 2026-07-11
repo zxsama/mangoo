@@ -138,6 +138,13 @@ function isLoopbackOrIpLiteral(host: string): boolean {
   return ipVersion !== 0;
 }
 
+// Build a session for a different database file that reuses the same bind
+// address + session token, so a Core restart does not require the renderer to
+// re-read its coreUrl/token (spec Decision 6).
+export function sessionForDbPath(base: CoreSession, dbPath: string): CoreSession {
+  return { ...base, dbPath };
+}
+
 function requireEnv(name: string, message: string): string {
   const value = process.env[name];
   if (!value) {
