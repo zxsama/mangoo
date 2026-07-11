@@ -10,10 +10,14 @@ import {
 } from "electron";
 import { spawn } from "node:child_process";
 import { promises as fsp } from "node:fs";
+import fsSync from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startCoreProcess, waitForCoreHealth, type CoreProcessHandle } from "./core-process.js";
 import { createCoreSession, type CoreSession } from "./core-session.js";
+import * as libraryRegistry from "./library-registry.js";
+import { sessionForDbPath } from "./core-session.js";
 
 let mainWindow: BrowserWindow | null = null;
 let settingsWindow: BrowserWindow | null = null;
@@ -21,6 +25,7 @@ let coreProcess: CoreProcessHandle | null = null;
 let pendingCoreProcess: CoreProcessHandle | null = null;
 let coreSession: CoreSession | null = null;
 let coreReadyPromise: Promise<CoreSession> | null = null;
+let cachedRegistry: libraryRegistry.LibraryRegistry | null = null;
 let cachedFfmpegAvailable: boolean | null = null;
 let persisted = false;
 let persistDebounceTimer: NodeJS.Timeout | null = null;
@@ -64,6 +69,34 @@ const DEFAULT_WINDOW_STATE: WindowState = {
   height: 920,
   maximized: false
 };
+
+function userDataDir(): string {
+  return app.getPath("userData");
+}
+function getRegistry(): libraryRegistry.LibraryRegistry {
+  if (!cachedRegistry) cachedRegistry = libraryRegistry.loadRegistry(userDataDir());
+  return cachedRegistry;
+}
+function persistRegistry(next: libraryRegistry.LibraryRegistry): void {
+  cachedRegistry = next;
+  libraryRegistry.saveRegistry(userDataDir(), next);
+}
+function pushLibraryPhase(phase: unknown): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("megle:library-load-phase", phase);
+  }
+}
+function toSummaries(reg: libraryRegistry.LibraryRegistry): Array<{
+  id: string; name: string; dbPath: string; available: boolean; active: boolean;
+}> {
+  return reg.libraries.map((l) => ({
+    id: l.id,
+    name: l.name,
+    dbPath: l.dbPath,
+    available: fsSync.existsSync(l.dbPath),
+    active: l.id === reg.activeLibraryId
+  }));
+}
 
 ipcMain.handle("megle:pick-folder", async () => {
   const options: OpenDialogOptions = { properties: ["openDirectory"] };
@@ -265,6 +298,85 @@ ipcMain.handle("megle:visual-capture-page", async () => {
   return image.toPNG().toString("base64");
 });
 
+ipcMain.handle("megle:list-libraries", () => toSummaries(getRegistry()));
+ipcMain.handle("megle:get-active-library-id", () => getRegistry().activeLibraryId);
+
+ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
+  const reg = getRegistry();
+  const target = reg.libraries.find((l) => l.id === libraryId);
+  if (!target) return { ok: false, error: "library not found" };
+  if (!fsSync.existsSync(target.dbPath)) return { ok: false, error: "library file missing" };
+  try {
+    await restartCoreForLibrary(target.dbPath);
+    persistRegistry(libraryRegistry.setActive(reg, libraryId, Date.now()));
+    pushLibraryPhase("loading-media"); // renderer takes over from here
+    return { ok: true };
+  } catch (error) {
+    pushLibraryPhase({ kind: "error", message: String(error) });
+    return { ok: false, error: String(error) };
+  }
+});
+
+ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath: string }) => {
+  const reg = getRegistry();
+  try {
+    // A brand-new empty file: Core builds the schema on first open.
+    if (!fsSync.existsSync(input.dbPath)) {
+      fsSync.writeFileSync(input.dbPath, ""); // touch; Core opens + migrates
+    }
+    const added = libraryRegistry.addLibrary(reg, { name: input.name, dbPath: input.dbPath, now: Date.now() });
+    await restartCoreForLibrary(added.entry.dbPath);
+    persistRegistry(libraryRegistry.setActive(added.registry, added.entry.id, Date.now()));
+    pushLibraryPhase("loading-media");
+    const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
+    return { ok: true, library: summary };
+  } catch (error) {
+    pushLibraryPhase({ kind: "error", message: String(error) });
+    return { ok: false, error: String(error) };
+  }
+});
+
+ipcMain.handle("megle:open-library", async (_e, dbPath: string) => {
+  const reg = getRegistry();
+  if (!fsSync.existsSync(dbPath)) return { ok: false, error: "file not found" };
+  try {
+    const name = path.basename(dbPath).replace(/\.sqlite$/i, "");
+    const added = libraryRegistry.addLibrary(reg, { name, dbPath, now: Date.now() });
+    await restartCoreForLibrary(added.entry.dbPath);
+    persistRegistry(libraryRegistry.setActive(added.registry, added.entry.id, Date.now()));
+    pushLibraryPhase("loading-media");
+    const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
+    return { ok: true, library: summary };
+  } catch (error) {
+    pushLibraryPhase({ kind: "error", message: String(error) });
+    return { ok: false, error: String(error) };
+  }
+});
+
+ipcMain.handle("megle:remove-library-from-list", (_e, libraryId: string) => {
+  persistRegistry(libraryRegistry.removeLibrary(getRegistry(), libraryId));
+  return { ok: true };
+});
+
+ipcMain.handle("megle:rename-library", (_e, libraryId: string, name: string) => {
+  persistRegistry(libraryRegistry.renameLibrary(getRegistry(), libraryId, name));
+  return { ok: true };
+});
+
+ipcMain.handle("megle:pick-library-file", async () => {
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, { properties: ["openFile"], filters: [{ name: "Megle Library", extensions: ["sqlite"] }] })
+    : await dialog.showOpenDialog({ properties: ["openFile"], filters: [{ name: "Megle Library", extensions: ["sqlite"] }] });
+  return result.canceled ? null : (result.filePaths[0] ?? null);
+});
+
+ipcMain.handle("megle:pick-new-library-path", async (_e, defaultName?: string) => {
+  const result = mainWindow
+    ? await dialog.showSaveDialog(mainWindow, { defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Megle Library", extensions: ["sqlite"] }] })
+    : await dialog.showSaveDialog({ defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Megle Library", extensions: ["sqlite"] }] });
+  return result.canceled ? null : (result.filePath ?? null);
+});
+
 async function createWindow(): Promise<void> {
   const session = await ensureCoreReady();
   const state = await loadWindowState();
@@ -442,7 +554,7 @@ async function startCoreSession(): Promise<CoreSession> {
     let pendingProcess: CoreProcessHandle | null = null;
 
     try {
-      const session = await createCoreSession();
+      const session = await createColdStartSession();
       pendingProcess = startCoreProcess(session);
       pendingCoreProcess = pendingProcess;
       await waitForCoreHealth(session.baseUrl, session.sessionToken);
@@ -475,6 +587,64 @@ async function startCoreSession(): Promise<CoreSession> {
 
   coreReadyPromise = null;
   throw new Error("Core startup retry loop exited without a session");
+}
+
+// On cold start, point Core at the active library from the registry (if any),
+// otherwise fall back to createCoreSession()'s default dbPath (first-run / dev).
+async function createColdStartSession(): Promise<CoreSession> {
+  const base = await createCoreSession();
+  const reg = getRegistry();
+  const active = reg.libraries.find((l) => l.id === reg.activeLibraryId);
+  if (active && fsSync.existsSync(active.dbPath)) {
+    return sessionForDbPath(base, active.dbPath);
+  }
+  // No active library yet: register the default dbPath as the first library so
+  // the switcher has something to show, and make it active.
+  const added = libraryRegistry.addLibrary(reg, {
+    name: "Default",
+    dbPath: base.dbPath,
+    now: Date.now()
+  });
+  persistRegistry(libraryRegistry.setActive(added.registry, added.entry.id, Date.now()));
+  return base;
+}
+
+// Gracefully restart Core pointed at a new database file, reusing the same
+// bind address + session token so the renderer keeps its injected coreUrl/token
+// (spec Decision 6). Pushes load phases to the renderer as it goes.
+async function restartCoreForLibrary(dbPath: string): Promise<void> {
+  pushLibraryPhase("starting-core");
+  const base = coreSession ?? (await createCoreSession());
+  // Stop the current Core and wait for the port to free up.
+  coreProcess?.stop();
+  coreProcess = null;
+  await waitForPortFree(base.bindAddress);
+
+  const session = sessionForDbPath(base, dbPath);
+  const handle = startCoreProcess(session);
+  pushLibraryPhase("opening-library");
+  await waitForCoreHealth(session.baseUrl, session.sessionToken);
+  coreProcess = handle;
+  coreSession = session;
+}
+
+// Poll until the host:port can be bound again (Core's listener has closed),
+// guarding the known probe-and-close race. Bounded; throws on timeout.
+async function waitForPortFree(bindAddress: string): Promise<void> {
+  const [host, portStr] = bindAddress.split(":");
+  const port = Number(portStr);
+  const deadline = Date.now() + 5000;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const free = await new Promise<boolean>((resolve) => {
+      const probe = net.createServer();
+      probe.once("error", () => resolve(false));
+      probe.listen(port, host, () => probe.close(() => resolve(true)));
+    });
+    if (free) return;
+    if (Date.now() > deadline) throw new Error(`Port ${bindAddress} did not free up`);
+    await new Promise((r) => setTimeout(r, 80));
+  }
 }
 
 function shouldRetryAutoCoreStartup(): boolean {

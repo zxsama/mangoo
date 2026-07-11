@@ -156,9 +156,33 @@ if (!/run\(\s*findCargoCommand\(\)\s*,\s*\[\s*"build"\s*,\s*"-p"\s*,\s*"megle-co
   fail("dev runner must use cargo build -p megle-core instead of leaving Core build to Electron startup");
 }
 
+// Core is started from exactly two call sites: the initial cold-start/retry
+// loop in startCoreSession, and the library-switch restart routine in
+// restartCoreForLibrary (which stops the old process and reuses the same
+// bind address + session token per spec Decision 6). Any other count means a
+// stray/duplicate startup path snuck in.
 const startCoreCalls = [...main.matchAll(/\bstartCoreProcess\(/g)].length;
-if (startCoreCalls !== 1) {
-  fail(`desktop main must start Core exactly once per app lifecycle; found ${startCoreCalls} calls`);
+if (startCoreCalls !== 2) {
+  fail(
+    `desktop main must start Core from exactly two call sites (startCoreSession + restartCoreForLibrary); found ${startCoreCalls} calls`
+  );
+}
+const restartCoreForLibraryBody = functionBody(
+  main,
+  "async function restartCoreForLibrary(dbPath: string): Promise<void>"
+);
+if (!restartCoreForLibraryBody) {
+  fail("desktop main must expose restartCoreForLibrary to restart Core for a library switch");
+} else {
+  if (!restartCoreForLibraryBody.includes("startCoreProcess(")) {
+    fail("desktop main restartCoreForLibrary must start a new Core process for the target library");
+  }
+  if (!restartCoreForLibraryBody.includes("waitForPortFree(")) {
+    fail("desktop main restartCoreForLibrary must wait for the old Core's port to free before rebinding");
+  }
+  if (!restartCoreForLibraryBody.includes("sessionForDbPath(")) {
+    fail("desktop main restartCoreForLibrary must reuse the existing bind address/session token via sessionForDbPath");
+  }
 }
 if (!main.includes("ensureCoreReady")) {
   fail("desktop main must centralize Core startup outside createWindow");
