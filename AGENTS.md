@@ -73,8 +73,10 @@ The approved UI direction is documented in `docs/superpowers/specs/2026-05-16-me
 - Use one Liquid Glass design language across Library, Settings, Plugins, Tasks, menus, dialogs, context menus, inspectors, and desktop chrome.
 - Windows desktop must use real behind-window transparency/acrylic where required; do not fake it with a full-window renderer backing plate.
 - Liquid Glass belongs on chrome, control, floating, and overlay layers. Media grids, preview canvases, and heavy content surfaces should remain sharp and stable.
+- All interactive elements share ONE hover highlight: a single cursor-centred circular glow driven globally by `apps/web/src/design/liquid-glass/LiquidGlassSurface.tsx` (`updateInteractiveAffordancePointers`), styled on `[data-interactive-pointer-target]::before/::after` in `styles.css`, with params in `features/settings/interfaceStyle.ts`. Never add a per-element `:hover` border/background or a second glow subsystem. Opt an element out with `data-pointer-glow="off"`. Selection/active state uses a background fill, not a border ring. See CLAUDE.md → "Unified Pointer-Highlight System" for the full contract (the mask-composite corner-AA limitation and the O(near-cursor) driver design are documented there).
 - Popup and dialog work must use the shared glass popup surface conventions rather than ad hoc transparency. Titlebar menus, task drawers, recent-op drawers, and modal surfaces should sit above shell chrome with blur, fill, and z-index behavior that stays consistent across the app.
 - Shell, pointer highlight, titlebar drag, acrylic, rounded-corner, and dialog material changes must be guarded by `npm run check:ui-design` and the desktop visual regression harness.
+- CDP `Page.captureScreenshot` does not reflect real on-display anti-aliasing (screenshots look smoother than the physical compositor at dpr=1). For AA-sensitive UI, verify on the real window with the user; screenshots stay reliable for layout, state, and whether elements rendered. Electron is pinned to `43.1.0` to keep acrylic on drag-maximize — do not downgrade without re-testing.
 
 ## Testing Guidelines
 
