@@ -28,6 +28,7 @@ import {
   copyText,
   getDesktopBridge,
   getDesktopShellActions,
+  listLibraries,
   notifyDesktopShellReady,
   openPath,
   revealPath,
@@ -48,6 +49,7 @@ import {
 } from "../features/file-ops/useFileOps";
 import { LibraryLoadingOverlay } from "../features/library/LibraryLoadingOverlay";
 import { LibrarySidebar } from "../features/library/LibrarySidebar";
+import { LibrarySwitcher } from "../features/library/LibrarySwitcher";
 import {
   LibraryCenterPane,
   LibraryInspectorPane
@@ -113,6 +115,8 @@ export function App() {
   );
   const [libraryPhase, setLibraryPhase] = useState<LibraryLoadPhase>("starting-core");
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [activeLibraryName, setActiveLibraryName] = useState<string>("Library");
+  const hasLoadedActiveLibraryNameRef = useRef(false);
   const library = useLibraryData({
     persistentThumbnailCacheAutoRefresh:
       previewPreferences.persistentThumbnailCacheAutoRefresh,
@@ -197,6 +201,26 @@ export function App() {
   }, []);
 
   useEffect(() => subscribeLibraryPhase(setLibraryPhase), []);
+
+  // Derive the sidebar's displayed library name from the registry: fetch it on
+  // mount (the initial render may predate any "ready" transition) and again
+  // whenever the library phase settles to "ready" (create/switch/open all land
+  // there), so the name follows the active library across switches.
+  useEffect(() => {
+    if (hasLoadedActiveLibraryNameRef.current && libraryPhase !== "ready") {
+      return;
+    }
+    hasLoadedActiveLibraryNameRef.current = true;
+    let cancelled = false;
+    void listLibraries().then((libraries) => {
+      if (cancelled) return;
+      const active = libraries.find((entry) => entry.active);
+      setActiveLibraryName(active?.name ?? "Library");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [libraryPhase]);
 
   useEffect(() => {
     if (!library.loading && library.roots.length >= 0) {
@@ -571,6 +595,8 @@ export function App() {
     return (
       <LibrarySidebar
         library={library}
+        activeLibraryName={activeLibraryName}
+        onOpenSwitcher={() => setSwitcherOpen(true)}
         onFolderContextMenu={handleFolderContextMenu}
         onRootContextMenu={handleRootContextMenu}
       />
@@ -621,20 +647,27 @@ export function App() {
 
   function renderOverlays() {
     return (
-      <ShellOverlayHost
-        contextMenu={menu}
-        fileOps={fileOps}
-        library={library}
-        onCloseContextMenu={closeMenu}
-        onCloseRecentOps={closeRecentOps}
-        onCloseTaskPalette={closeTaskPalette}
-        onCloseTaskCenter={closeTaskCenter}
-        onOpenTaskCenter={openTaskCenter}
-        onRefreshRecentOps={() => void library.loadRecentOps()}
-        recentOpsOpen={recentOpsOpen}
-        taskCenterOpen={taskCenterOpen}
-        taskPaletteOpen={taskDrawerOpen}
-      />
+      <>
+        <ShellOverlayHost
+          contextMenu={menu}
+          fileOps={fileOps}
+          library={library}
+          onCloseContextMenu={closeMenu}
+          onCloseRecentOps={closeRecentOps}
+          onCloseTaskPalette={closeTaskPalette}
+          onCloseTaskCenter={closeTaskCenter}
+          onOpenTaskCenter={openTaskCenter}
+          onRefreshRecentOps={() => void library.loadRecentOps()}
+          recentOpsOpen={recentOpsOpen}
+          taskCenterOpen={taskCenterOpen}
+          taskPaletteOpen={taskDrawerOpen}
+        />
+        <LibrarySwitcher
+          open={switcherOpen}
+          onClose={() => setSwitcherOpen(false)}
+          library={library}
+        />
+      </>
     );
   }
 

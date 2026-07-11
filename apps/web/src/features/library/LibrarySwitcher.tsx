@@ -24,10 +24,15 @@ export function LibrarySwitcher({
 }) {
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [query, setQuery] = useState("");
+  const [removeMenuLibraryId, setRemoveMenuLibraryId] = useState<string | null>(null);
 
   const reload = () => void listLibraries().then(setLibs);
   useEffect(() => {
-    if (open) reload();
+    if (open) {
+      reload();
+    } else {
+      setRemoveMenuLibraryId(null);
+    }
   }, [open]);
   if (!open) return null;
 
@@ -61,6 +66,12 @@ export function LibrarySwitcher({
   async function onAddFolder() {
     const folder = await pickNativeFolder();
     if (folder) await library.addRoot(folder);
+    reload();
+  }
+
+  async function onRemoveRoot(rootId: number) {
+    await library.removeRoot(rootId);
+    setRemoveMenuLibraryId(null);
     reload();
   }
 
@@ -113,16 +124,38 @@ export function LibrarySwitcher({
                 >
                   <FolderPlus size={14} />
                 </button>
-                <button
-                  type="button"
-                  aria-label="Remove folder"
-                  disabled={!l.active}
-                  onClick={() => {
-                    // Wired to a root-picker submenu in the integration task.
-                  }}
-                >
-                  <FolderMinus size={14} />
-                </button>
+                <div className="library-switcher-remove-menu-anchor">
+                  <button
+                    type="button"
+                    aria-label="Remove folder"
+                    disabled={!l.active}
+                    onClick={() =>
+                      setRemoveMenuLibraryId((current) => (current === l.id ? null : l.id))
+                    }
+                  >
+                    <FolderMinus size={14} />
+                  </button>
+                  {l.active && removeMenuLibraryId === l.id ? (
+                    <ul className="library-switcher-remove-menu">
+                      {library.roots.length === 0 ? (
+                        <li className="library-switcher-remove-menu-empty">No folders</li>
+                      ) : (
+                        library.roots.map((root) => (
+                          <li key={root.id}>
+                            <button
+                              type="button"
+                              className="library-switcher-remove-menu-item"
+                              onClick={() => void onRemoveRoot(root.id)}
+                            >
+                              <span>{root.displayName}</span>
+                              <FolderMinus size={12} aria-hidden="true" />
+                            </button>
+                          </li>
+                        ))
+                      )}
+                    </ul>
+                  ) : null}
+                </div>
               </div>
             </li>
           ))}

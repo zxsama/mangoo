@@ -161,6 +161,7 @@ export interface LibraryState {
   loadMoreFolderChildren: (folderId: number) => Promise<void>;
   loadMoreMedia: () => Promise<void>;
   rescanRoot: (rootId: number) => Promise<void>;
+  removeRoot: (rootId: number) => Promise<void>;
   cancelTask: (taskId: number) => Promise<void>;
   retryTask: (taskId: number) => Promise<void>;
   refreshTasks: () => Promise<void>;
@@ -2335,6 +2336,19 @@ export function useLibraryData(
     [client, loadTasks]
   );
 
+  const removeRoot = useCallback(
+    async (rootId: number) => {
+      setError(null);
+      try {
+        await client.removeRoot(rootId);
+        await loadLibrary({ rootId: null, folderId: null });
+      } catch (cause) {
+        setError(errorMessage(cause));
+      }
+    },
+    [client, loadLibrary]
+  );
+
   const markTaskBusy = useCallback((taskId: number, busy: boolean) => {
     setBusyTaskIds((current) => {
       const next = new Set(current);
@@ -3024,6 +3038,7 @@ export function useLibraryData(
     loadMoreFolderChildren,
     loadMoreMedia,
     rescanRoot,
+    removeRoot,
     cancelTask,
     retryTask,
     refreshTasks,
