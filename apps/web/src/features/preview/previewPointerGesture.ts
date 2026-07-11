@@ -7,6 +7,10 @@ export function pointerDistance(startX: number, startY: number, x: number, y: nu
   return Math.hypot(x - startX, y - startY);
 }
 
+export function dragActivationDelta(startX: number, startY: number, x: number, y: number) {
+  return { x: x - startX, y: y - startY };
+}
+
 export function shouldStartVideoDrag(elapsedMs: number, distancePx: number): boolean {
   return elapsedMs >= VIDEO_DRAG_HOLD_MS && distancePx > VIDEO_DRAG_DISTANCE_PX;
 }

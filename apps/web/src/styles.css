@@ -2651,26 +2651,47 @@ button:disabled {
 .video-playback-controls {
   z-index: 4;
   display: grid;
-  grid-template-columns: auto auto minmax(90px, 1fr) auto auto minmax(68px, 104px) auto;
+  grid-template-columns: auto auto minmax(90px, 1fr) auto auto minmax(64px, 96px) auto;
   align-items: center;
-  gap: 9px;
+  gap: 6px;
   min-width: 0;
-  min-height: 54px;
-  margin: 0 12px 10px;
-  padding: 7px 10px;
-  border-radius: 15px;
+  min-height: 38px;
+  margin: 0;
+  padding: 3px 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .video-playback-button {
-  width: 34px;
-  height: 34px;
+  --glass-fill: transparent;
+  --glass-border-current: transparent;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
   padding: 0;
+  color: var(--text-muted);
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.video-playback-button > .liquid-glass-backdrop,
+.video-playback-button > .liquid-glass-dim {
+  opacity: 0;
+  background: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  filter: none;
+  box-shadow: none;
 }
 
 .video-playback-time {
-  min-width: 38px;
+  min-width: 34px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
   text-align: center;
 }
@@ -2679,26 +2700,79 @@ button:disabled {
 .video-volume-range-control {
   display: flex;
   min-width: 0;
+  height: 24px;
   align-items: center;
+  padding: 0 4px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
 }
 
 .video-playback-range-control input[type="range"],
 .video-volume-range-control input[type="range"] {
+  position: relative;
+  z-index: 1;
+  display: block;
   width: 100%;
-  height: 18px;
+  height: 100%;
   margin: 0;
   padding: 0;
   border: 0;
-  outline: 0;
   background: transparent;
-  accent-color: rgba(225, 247, 249, 0.92);
+  box-shadow: none;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
 }
 
 .video-playback-range-control input[type="range"]:focus-visible,
 .video-volume-range-control input[type="range"]:focus-visible {
   outline: 1px solid rgba(222, 247, 249, 0.72);
-  outline-offset: 2px;
-  border-radius: 999px;
+  outline-offset: 1px;
+  border-radius: var(--radius-pill);
+  box-shadow: none;
+}
+
+.video-playback-range-control input[type="range"]::-webkit-slider-runnable-track,
+.video-volume-range-control input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background:
+    linear-gradient(90deg, rgba(151, 219, 226, 0.32), rgba(255, 255, 255, 0.12)),
+    rgba(255, 255, 255, 0.08);
+}
+
+.video-playback-range-control input[type="range"]::-webkit-slider-thumb,
+.video-volume-range-control input[type="range"]::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border: 1px solid rgba(222, 251, 255, 0.7);
+  border-radius: 50%;
+  background: rgba(236, 253, 255, 0.88);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.video-playback-range-control input[type="range"]::-moz-range-track,
+.video-volume-range-control input[type="range"]::-moz-range-track {
+  height: 4px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background:
+    linear-gradient(90deg, rgba(151, 219, 226, 0.32), rgba(255, 255, 255, 0.12)),
+    rgba(255, 255, 255, 0.08);
+}
+
+.video-playback-range-control input[type="range"]::-moz-range-thumb,
+.video-volume-range-control input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: 1px solid rgba(222, 251, 255, 0.7);
+  border-radius: 50%;
+  background: rgba(236, 253, 255, 0.88);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
 .video-autoplay-status {
@@ -4274,7 +4348,13 @@ button:disabled {
   width: 100vw;
   height: 100vh;
   overflow: hidden;
-  background: rgba(18, 22, 28, 0.9);
+  /* Frosted glass matching the sidebar: a translucent side-material fill over the
+     window's acrylic backdrop, blurred + saturated by the same "侧栏材质" settings
+     vars the sidebar uses (--glass-side-*). Previously a near-opaque
+     rgba(18,22,28,0.9) fill hid the acrylic once content mounted. */
+  background: var(--glass-side-fill, rgba(8, 12, 16, 0.38));
+  -webkit-backdrop-filter: blur(var(--glass-side-blur, 26px)) saturate(var(--glass-side-saturation, 1.55));
+  backdrop-filter: blur(var(--glass-side-blur, 26px)) saturate(var(--glass-side-saturation, 1.55));
   color: var(--text-soft, #d5dbe2);
 }
 

@@ -1,5 +1,5 @@
 import { Pause, Play, Volume2, VolumeX } from "lucide-react";
-import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
+import { LiquidGlassButton } from "../../design/liquid-glass";
 import {
   formatMediaTime,
   playbackProgress,
@@ -25,23 +25,22 @@ export function VideoPlaybackControls({
   const progress = playbackProgress(state.currentTime, duration);
 
   return (
-    <LiquidGlassSurface
+    <div
       aria-label="Video playback controls"
       className="video-playback-controls"
       data-skip-preview-pan="true"
       role="group"
-      tone="control"
-      variant="clear"
     >
       <LiquidGlassButton
         aria-label={state.playing ? "Pause video" : "Play video"}
-        className="video-playback-button"
+        className="titlebar-icon-button video-playback-button"
         disabled={disabled}
         onClick={onTogglePlayback}
         title={state.playing ? "Pause" : "Play"}
+        tone="control"
         variant="clear"
       >
-        {state.playing ? <Pause aria-hidden="true" size={17} /> : <Play aria-hidden="true" size={17} />}
+        {state.playing ? <Pause aria-hidden="true" size={15} /> : <Play aria-hidden="true" size={15} />}
       </LiquidGlassButton>
 
       <span className="video-playback-time">{formatMediaTime(state.currentTime)}</span>
@@ -61,16 +60,17 @@ export function VideoPlaybackControls({
 
       <LiquidGlassButton
         aria-label={state.muted ? "Unmute video" : "Mute video"}
-        className="video-playback-button"
+        className="titlebar-icon-button video-playback-button"
         disabled={disabled}
         onClick={onToggleMuted}
         title={state.muted ? "Unmute" : "Mute"}
+        tone="control"
         variant="clear"
       >
         {state.muted || state.volume === 0 ? (
-          <VolumeX aria-hidden="true" size={17} />
+          <VolumeX aria-hidden="true" size={15} />
         ) : (
-          <Volume2 aria-hidden="true" size={17} />
+          <Volume2 aria-hidden="true" size={15} />
         )}
       </LiquidGlassButton>
       <label className="video-volume-range-control" data-pointer-glow="off">
@@ -88,6 +88,6 @@ export function VideoPlaybackControls({
       {state.autoplayBlocked ? (
         <span className="video-autoplay-status" role="status">Click play to start</span>
       ) : null}
-    </LiquidGlassSurface>
+    </div>
   );
 }

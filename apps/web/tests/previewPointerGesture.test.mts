@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 
 import {
   classifyVideoPointerGesture,
+  dragActivationDelta,
   shouldStartVideoDrag
 } from "../src/features/preview/previewPointerGesture.ts";
 
@@ -16,6 +17,11 @@ describe("video preview pointer gestures", () => {
     assert.equal(shouldStartVideoDrag(220, 5), false);
     assert.equal(shouldStartVideoDrag(220, 6), true);
     assert.equal(classifyVideoPointerGesture({ dragging: true, elapsedMs: 260, distancePx: 18 }), "drag");
+  });
+
+  test("preserves the full pointer displacement on the drag activation frame", () => {
+    assert.deepEqual(dragActivationDelta(120, 80, 151, 96), { x: 31, y: 16 });
+    assert.deepEqual(dragActivationDelta(120, 80, 101, 62), { x: -19, y: -18 });
   });
 
   test("does not turn a long hold or quick slip into playback", () => {

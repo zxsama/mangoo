@@ -26,6 +26,7 @@ import {
 } from "./videoPlayback";
 import {
   classifyVideoPointerGesture,
+  dragActivationDelta,
   pointerDistance,
   shouldStartVideoDrag
 } from "./previewPointerGesture";
@@ -529,10 +530,20 @@ export function CentralPreviewStage({
       );
       if (!videoPress.dragging) {
         if (!shouldStartVideoDrag(event.timeStamp - videoPress.downTime, distance)) return;
+        const activationDelta = dragActivationDelta(
+          videoPress.startX,
+          videoPress.startY,
+          event.clientX,
+          event.clientY
+        );
         videoPress.dragging = true;
         videoPress.lastX = event.clientX;
         videoPress.lastY = event.clientY;
         setPreviewDragging(true);
+        setPan((current) => ({
+          x: current.x + activationDelta.x,
+          y: current.y + activationDelta.y
+        }));
         return;
       }
       const dx = event.clientX - videoPress.lastX;
