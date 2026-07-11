@@ -7766,6 +7766,19 @@ mod tests {
     }
 
     #[test]
+    fn brand_new_empty_file_migrates_and_lists_no_roots() {
+        let db_dir = unique_db_temp_dir("fresh-empty-migrate");
+        std::fs::create_dir_all(&db_dir).expect("create db dir");
+        let db_path = db_dir.join("fresh.sqlite");
+        let database = Database::open(&db_path).expect("open database");
+        database
+            .apply_migrations()
+            .expect("apply migrations on a fresh empty file");
+        let roots = database.list_roots().expect("list roots on fresh db");
+        assert!(roots.is_empty(), "a brand-new library must have no roots");
+    }
+
+    #[test]
     fn file_database_can_truncate_oversized_wal_on_startup_maintenance() {
         let db_dir = unique_db_temp_dir("truncate-oversized-wal");
         std::fs::create_dir_all(&db_dir).expect("create db dir");
