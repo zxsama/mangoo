@@ -30,8 +30,10 @@ import {
   getDesktopShellActions,
   notifyDesktopShellReady,
   openPath,
-  revealPath
+  revealPath,
+  subscribeLibraryPhase
 } from "../core/desktop";
+import { type LibraryLoadPhase } from "../core/libraryTypes";
 import {
   configureOriginalPreviewBuffer,
   configureThumbnailCache,
@@ -44,6 +46,7 @@ import {
   useFileOpsController,
   type FileOpsController
 } from "../features/file-ops/useFileOps";
+import { LibraryLoadingOverlay } from "../features/library/LibraryLoadingOverlay";
 import { LibrarySidebar } from "../features/library/LibrarySidebar";
 import {
   LibraryCenterPane,
@@ -108,6 +111,8 @@ export function App() {
   const [previewPreferences, setPreviewPreferences] = useState<PreviewPreferences>(() =>
     readStoredPreviewPreferences()
   );
+  const [libraryPhase, setLibraryPhase] = useState<LibraryLoadPhase>("starting-core");
+  const [switcherOpen, setSwitcherOpen] = useState(false);
   const library = useLibraryData({
     persistentThumbnailCacheAutoRefresh:
       previewPreferences.persistentThumbnailCacheAutoRefresh,
@@ -190,6 +195,15 @@ export function App() {
   useEffect(() => {
     void notifyDesktopShellReady();
   }, []);
+
+  useEffect(() => subscribeLibraryPhase(setLibraryPhase), []);
+
+  useEffect(() => {
+    if (!library.loading && library.roots.length >= 0) {
+      // data settled (roots resolved, even if empty) → overlay can clear.
+      setLibraryPhase((p) => (p === "loading-media" ? "ready" : p));
+    }
+  }, [library.loading, library.roots.length]);
 
   useEffect(() => {
     try {
@@ -651,7 +665,16 @@ export function App() {
         titlebarCenter={renderCenterTitlebar()}
         titlebarRight={sidebarsHidden ? null : shellRightActions}
         sidebar={renderSidebar()}
-        centerPane={renderCenterPane()}
+        centerPane={
+          <>
+            {renderCenterPane()}
+            <LibraryLoadingOverlay
+              phase={library.loading && libraryPhase === "ready" ? "loading-media" : libraryPhase}
+              onRetry={() => window.location.reload()}
+              onSwitchLibrary={() => setSwitcherOpen(true)}
+            />
+          </>
+        }
         rightPane={renderRightPane()}
         overlays={renderOverlays()}
       />
