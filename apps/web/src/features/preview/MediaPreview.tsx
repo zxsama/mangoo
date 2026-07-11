@@ -12,7 +12,7 @@ import {
   requestThumbnailBlob,
   thumbnailObjectUrlCacheKey
 } from "../../core/mediaResources";
-import { videoPreviewNaturalSize } from "./videoPreviewSizing";
+import { resolveVideoPreviewNaturalSize } from "./videoPreviewSizing";
 
 const STALE_PREVIEW_OBJECT_URL_REVOKE_DELAY_MS = 8000;
 
@@ -32,6 +32,7 @@ export function MediaPreview({
   onLoadingChange,
   onMediaReady,
   onNaturalSize,
+  onVideoElementChange,
   preferOriginalWhilePending = false,
   preserveNaturalFrame,
   source = "thumbnail",
@@ -42,6 +43,7 @@ export function MediaPreview({
   onLoadingChange?: (loading: boolean) => void;
   onMediaReady?: () => void;
   onNaturalSize?: (size: { naturalHeight: number; naturalWidth: number }) => void;
+  onVideoElementChange?: (element: HTMLVideoElement | null) => void;
   preferOriginalWhilePending?: boolean;
   preserveNaturalFrame?: boolean;
   source?: "thumbnail" | "original";
@@ -79,6 +81,7 @@ export function MediaPreview({
         onLoadingChange={onLoadingChange}
         onMediaReady={onMediaReady}
         onNaturalSize={onNaturalSize}
+        onVideoElementChange={onVideoElementChange}
         preserveNaturalFrame={shouldPreserveNaturalFrame}
         source="original"
         versionKey={originalVersionKey}
@@ -229,6 +232,7 @@ function ReadyPreviewMedia({
   onLoadingChange,
   onMediaReady,
   onNaturalSize,
+  onVideoElementChange,
   preserveNaturalFrame,
   source,
   versionKey
@@ -241,6 +245,7 @@ function ReadyPreviewMedia({
   onLoadingChange?: (loading: boolean) => void;
   onMediaReady?: () => void;
   onNaturalSize?: (size: { naturalHeight: number; naturalWidth: number }) => void;
+  onVideoElementChange?: (element: HTMLVideoElement | null) => void;
   preserveNaturalFrame: boolean;
   source: "thumbnail" | "original";
   versionKey?: number | string | null;
@@ -352,8 +357,14 @@ function ReadyPreviewMedia({
         }
         const previousObjectUrl = objectUrlRef.current;
         objectUrlRef.current = nextObjectUrl;
+        if (source === "original" && kind === "video") {
+          setNaturalFrameStyle(undefined);
+          setContainedMediaStyle(undefined);
+        }
         setSrc(nextObjectUrl);
-        onLoadingChange?.(false);
+        if (!(source === "original" && kind === "video")) {
+          onLoadingChange?.(false);
+        }
         if (previousObjectUrl) {
           schedulePreviewObjectUrlRevoke(previousObjectUrl);
         }
@@ -417,6 +428,10 @@ function ReadyPreviewMedia({
   const effectiveFrameStyle = shouldUseBufferedSwap
     ? naturalFrameStyle ?? frameStyle
     : frameStyle ?? naturalFrameStyle;
+  const renderedFrameStyle =
+    source === "original" && kind === "video"
+      ? naturalFrameStyle ?? effectiveFrameStyle
+      : effectiveFrameStyle;
   const pendingImage = pendingPreview ? (
     <img
       alt=""
@@ -461,7 +476,7 @@ function ReadyPreviewMedia({
   if (error && !src) {
     return (
       <>
-        <div className="preview-placeholder failed" style={effectiveFrameStyle}>
+        <div className="preview-placeholder failed" style={renderedFrameStyle}>
           <span>load error</span>
         </div>
         {pendingImage}
@@ -473,14 +488,14 @@ function ReadyPreviewMedia({
     if (fallbackUrl) {
       return (
         <>
-          <PreviewFallbackImage alt={alt} frameStyle={effectiveFrameStyle} src={fallbackUrl} state="pending" />
+          <PreviewFallbackImage alt={alt} frameStyle={renderedFrameStyle} src={fallbackUrl} state="pending" />
           {pendingImage}
         </>
       );
     }
     return (
       <>
-        <div className="preview-placeholder pending preview-placeholder-empty" style={effectiveFrameStyle} />
+        <div className="preview-placeholder pending preview-placeholder-empty" style={renderedFrameStyle} />
         {pendingImage}
       </>
     );
@@ -488,7 +503,11 @@ function ReadyPreviewMedia({
 
   if (source === "original" && kind === "video") {
     const handleVideoMetadata = (event: SyntheticEvent<HTMLVideoElement>) => {
-      const naturalSize = videoPreviewNaturalSize(event.currentTarget);
+      const posterSize =
+        media.width && media.height && media.width > 0 && media.height > 0
+          ? { naturalHeight: media.height, naturalWidth: media.width }
+          : null;
+      const naturalSize = resolveVideoPreviewNaturalSize(event.currentTarget, posterSize);
       if (naturalSize) {
         onNaturalSize?.(naturalSize);
         setContainedMediaStyle(undefined);
@@ -499,13 +518,21 @@ function ReadyPreviewMedia({
     };
 
     return (
-      <div className="preview-placeholder ready" data-preview-source={source} style={effectiveFrameStyle}>
+      <div className="preview-placeholder ready" data-preview-source={source} style={renderedFrameStyle}>
         <video
           aria-label={alt}
           className="preview-image preview-video"
-          controls
+          data-preview-media-id={media.id}
+          key={src}
+          onError={() => {
+            setError(true);
+            onLoadingChange?.(false);
+            onMediaReady?.();
+          }}
           onLoadedMetadata={handleVideoMetadata}
-          preload="metadata"
+          playsInline
+          preload="auto"
+          ref={onVideoElementChange}
           src={src}
         />
       </div>
@@ -514,7 +541,7 @@ function ReadyPreviewMedia({
 
   return (
     <>
-      <div className="preview-placeholder ready" data-preview-source={source} style={effectiveFrameStyle}>
+      <div className="preview-placeholder ready" data-preview-source={source} style={renderedFrameStyle}>
         <img
           alt={alt}
           className="preview-image"

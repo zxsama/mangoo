@@ -15,6 +15,20 @@ import {
 } from "../shortcuts/shortcutBindings";
 import { MediaPreview } from "./MediaPreview";
 import { DampedMotionAxis, normalizeWheelDelta } from "../../core/dampedMotion";
+import { VideoPlaybackControls } from "./VideoPlaybackControls";
+import {
+  attemptVideoAutoplay,
+  clampSeekTime,
+  EMPTY_VIDEO_PLAYBACK_SNAPSHOT,
+  isAutoplayPolicyError,
+  normalizeVolume,
+  type VideoPlaybackSnapshot
+} from "./videoPlayback";
+import {
+  classifyVideoPointerGesture,
+  pointerDistance,
+  shouldStartVideoDrag
+} from "./previewPointerGesture";
 
 interface CentralPreviewStageProps {
   selectedMedia: MediaRecord;
@@ -31,6 +45,16 @@ interface CentralPreviewStageProps {
 
 type PreviewViewMode = "fit-long-edge" | "actual";
 
+type VideoPress = {
+  downTime: number;
+  dragging: boolean;
+  lastX: number;
+  lastY: number;
+  pointerId: number;
+  startX: number;
+  startY: number;
+};
+
 export function CentralPreviewStage({
   selectedMedia,
   thumbnail,
@@ -43,6 +67,9 @@ export function CentralPreviewStage({
 }: CentralPreviewStageProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
+  const videoPressRef = useRef<VideoPress | null>(null);
+  const lastVideoTapTimeRef = useRef(0);
+  const autoplayAttemptRef = useRef<{ element: HTMLVideoElement; mediaId: number } | null>(null);
   const scaleRef = useRef(1);
   const wheelZoomAxisRef = useRef(
     new DampedMotionAxis({
@@ -60,6 +87,11 @@ export function CentralPreviewStage({
   const [fitSyncTick, setFitSyncTick] = useState(0);
   const [previewReadyTick, setPreviewReadyTick] = useState(0);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewDragging, setPreviewDragging] = useState(false);
+  const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
+  const [videoPlayback, setVideoPlayback] = useState<VideoPlaybackSnapshot>({
+    ...EMPTY_VIDEO_PLAYBACK_SNAPSHOT
+  });
   const [measuredNaturalSize, setMeasuredNaturalSize] = useState<{
     mediaId: number;
     naturalHeight: number;
@@ -91,11 +123,15 @@ export function CentralPreviewStage({
     setScale(nextScale);
     setFitSyncTick((value) => value + 1);
     dragRef.current = null;
+    videoPressRef.current = null;
+    setPreviewDragging(false);
   }, [fitLongEdgeScaleForMedia]);
 
   useLayoutEffect(() => {
     stageRef.current?.focus({ preventScroll: true });
     dragRef.current = null;
+    videoPressRef.current = null;
+    setPreviewDragging(false);
   }, [selectedMedia.id]);
 
   useEffect(() => {
@@ -112,6 +148,9 @@ export function CentralPreviewStage({
 
   useEffect(() => {
     fittedMediaIdRef.current = null;
+    autoplayAttemptRef.current = null;
+    lastVideoTapTimeRef.current = 0;
+    setVideoPlayback({ ...EMPTY_VIDEO_PLAYBACK_SNAPSHOT });
     setMeasuredNaturalSize((current) =>
       current?.mediaId === selectedMedia.id ? current : null
     );
@@ -120,6 +159,100 @@ export function CentralPreviewStage({
         ? measuredNaturalSizeRef.current
         : null;
   }, [selectedMedia.id]);
+
+  const handleVideoElementChange = useCallback((element: HTMLVideoElement | null) => {
+    setVideoElement(element);
+  }, []);
+
+  const syncVideoPlayback = useCallback((element: HTMLVideoElement) => {
+    setVideoPlayback((current) => ({
+      autoplayBlocked: current.autoplayBlocked,
+      currentTime: Number.isFinite(element.currentTime) ? Math.max(0, element.currentTime) : 0,
+      duration: Number.isFinite(element.duration) ? Math.max(0, element.duration) : 0,
+      muted: element.muted,
+      playing: !element.paused && !element.ended,
+      volume: normalizeVolume(element.volume)
+    }));
+  }, []);
+
+  useEffect(() => {
+    if (!videoElement) return undefined;
+    const sync = () => syncVideoPlayback(videoElement);
+    const events = [
+      "canplay",
+      "durationchange",
+      "ended",
+      "loadedmetadata",
+      "pause",
+      "play",
+      "timeupdate",
+      "volumechange"
+    ] as const;
+    events.forEach((eventName) => videoElement.addEventListener(eventName, sync));
+    sync();
+    return () => events.forEach((eventName) => videoElement.removeEventListener(eventName, sync));
+  }, [syncVideoPlayback, videoElement]);
+
+  useEffect(() => {
+    if (!videoElement || selectedMedia.kind !== "video") return;
+    if (Number(videoElement.dataset.previewMediaId) !== selectedMedia.id) return;
+    if (
+      autoplayAttemptRef.current?.element === videoElement &&
+      autoplayAttemptRef.current.mediaId === selectedMedia.id
+    ) {
+      return;
+    }
+    autoplayAttemptRef.current = { element: videoElement, mediaId: selectedMedia.id };
+    let cancelled = false;
+    void attemptVideoAutoplay(videoElement).then((result) => {
+      if (cancelled || autoplayAttemptRef.current?.element !== videoElement) return;
+      syncVideoPlayback(videoElement);
+      setVideoPlayback((current) => ({
+        ...current,
+        autoplayBlocked: result === "blocked"
+      }));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedMedia.id, selectedMedia.kind, syncVideoPlayback, videoElement]);
+
+  const toggleVideoPlayback = useCallback(async () => {
+    if (!videoElement) return;
+    if (!videoElement.paused && !videoElement.ended) {
+      videoElement.pause();
+      return;
+    }
+    try {
+      await videoElement.play();
+      setVideoPlayback((current) => ({ ...current, autoplayBlocked: false }));
+    } catch (error) {
+      setVideoPlayback((current) => ({
+        ...current,
+        autoplayBlocked: isAutoplayPolicyError(error)
+      }));
+    }
+  }, [videoElement]);
+
+  const seekVideo = useCallback((time: number) => {
+    if (!videoElement) return;
+    videoElement.currentTime = clampSeekTime(time, videoElement.duration);
+    syncVideoPlayback(videoElement);
+  }, [syncVideoPlayback, videoElement]);
+
+  const toggleVideoMuted = useCallback(() => {
+    if (!videoElement) return;
+    videoElement.muted = !videoElement.muted;
+    syncVideoPlayback(videoElement);
+  }, [syncVideoPlayback, videoElement]);
+
+  const changeVideoVolume = useCallback((volume: number) => {
+    if (!videoElement) return;
+    const nextVolume = normalizeVolume(volume);
+    videoElement.volume = nextVolume;
+    videoElement.muted = nextVolume === 0;
+    syncVideoPlayback(videoElement);
+  }, [syncVideoPlayback, videoElement]);
 
   useEffect(() => {
     let cancelled = false;
@@ -136,7 +269,7 @@ export function CentralPreviewStage({
     function syncFitLongEdge() {
       if (cancelled || viewModeRef.current !== "fit-long-edge") return;
       frame = 0;
-      const nextScale = fitLongEdgeScale();
+      const nextScale = fitLongEdgeScaleForMedia();
       if (nextScale !== null) {
         scaleRef.current = nextScale;
         setScale(nextScale);
@@ -170,7 +303,7 @@ export function CentralPreviewStage({
       window.removeEventListener("resize", requestSync);
       window.cancelAnimationFrame(frame);
     };
-  }, [fitSyncTick, previewReadyTick, viewMode]);
+  }, [fitLongEdgeScaleForMedia, fitSyncTick, previewReadyTick, viewMode]);
 
   const handleMediaReady = useCallback(() => {
     setPreviewReadyTick((value) => value + 1);
@@ -236,12 +369,12 @@ export function CentralPreviewStage({
   const toggleActualSizeAt = useCallback(
     (clientX: number, clientY: number) => {
       if (viewMode === "actual") {
-        zoomAtPoint(clientX, clientY, fitLongEdgeScale() ?? 1, "fit-long-edge");
+        zoomAtPoint(clientX, clientY, fitLongEdgeScaleForMedia() ?? 1, "fit-long-edge");
         return;
       }
       zoomAtPoint(clientX, clientY, actualSizeScale(), "actual");
     },
-    [viewMode, zoomAtPoint]
+    [fitLongEdgeScaleForMedia, viewMode, zoomAtPoint]
   );
 
   const toggleActualSizeAtCenter = useCallback(() => {
@@ -346,41 +479,6 @@ export function CentralPreviewStage({
     return 1;
   }
 
-  function fitLongEdgeScale() {
-    const stage = stageRef.current;
-    const metrics = stage ? previewMetrics(stage) : null;
-    if (!metrics) {
-      return fitLongEdgeScaleForMedia();
-    }
-    return clampFitScale(
-      Math.min(
-        metrics.stageRect.width / metrics.naturalWidth,
-        metrics.stageRect.height / metrics.naturalHeight
-      )
-    );
-  }
-
-  function previewMetrics(stage: HTMLDivElement) {
-    const mediaElement = stage.querySelector<HTMLImageElement | HTMLVideoElement>(
-      ".preview-placeholder.ready .preview-image"
-    );
-    if (!stage || !mediaElement) {
-      return null;
-    }
-    const naturalWidth =
-      mediaElement instanceof HTMLVideoElement
-        ? mediaElement.videoWidth
-        : mediaElement.naturalWidth;
-    const naturalHeight =
-      mediaElement instanceof HTMLVideoElement
-        ? mediaElement.videoHeight
-        : mediaElement.naturalHeight;
-    if (naturalWidth <= 0 || naturalHeight <= 0) return null;
-    const stageRect = stage.getBoundingClientRect();
-    if (stageRect.width <= 0 || stageRect.height <= 0) return null;
-    return { naturalWidth, naturalHeight, stageRect };
-  }
-
   function stageCenterPoint() {
     const stage = stageRef.current;
     if (!stage) return null;
@@ -393,18 +491,57 @@ export function CentralPreviewStage({
 
   function handleDoubleClick(event: MouseEvent<HTMLDivElement>) {
     event.preventDefault();
+    if (isVideoSurface(event.target, event.currentTarget)) return;
     toggleActualSizeAt(event.clientX, event.clientY);
   }
 
   function handlePointerDown(event: PointerEvent<HTMLDivElement>) {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || !event.isPrimary) return;
+    if (isVideoSurface(event.target, event.currentTarget)) {
+      event.preventDefault();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      videoPressRef.current = {
+        downTime: event.timeStamp,
+        dragging: false,
+        lastX: event.clientX,
+        lastY: event.clientY,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY
+      };
+      return;
+    }
     if (shouldSkipPreviewPan(event.target, event.currentTarget)) return;
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
     dragRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+    setPreviewDragging(true);
   }
 
   function handlePointerMove(event: PointerEvent<HTMLDivElement>) {
+    const videoPress = videoPressRef.current;
+    if (videoPress?.pointerId === event.pointerId) {
+      const distance = pointerDistance(
+        videoPress.startX,
+        videoPress.startY,
+        event.clientX,
+        event.clientY
+      );
+      if (!videoPress.dragging) {
+        if (!shouldStartVideoDrag(event.timeStamp - videoPress.downTime, distance)) return;
+        videoPress.dragging = true;
+        videoPress.lastX = event.clientX;
+        videoPress.lastY = event.clientY;
+        setPreviewDragging(true);
+        return;
+      }
+      const dx = event.clientX - videoPress.lastX;
+      const dy = event.clientY - videoPress.lastY;
+      videoPress.lastX = event.clientX;
+      videoPress.lastY = event.clientY;
+      setPan((current) => ({ x: current.x + dx, y: current.y + dy }));
+      return;
+    }
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     const dx = event.clientX - drag.x;
@@ -414,10 +551,47 @@ export function CentralPreviewStage({
   }
 
   function handlePointerUp(event: PointerEvent<HTMLDivElement>) {
+    const videoPress = videoPressRef.current;
+    if (videoPress?.pointerId === event.pointerId) {
+      const distance = pointerDistance(
+        videoPress.startX,
+        videoPress.startY,
+        event.clientX,
+        event.clientY
+      );
+      const gesture = classifyVideoPointerGesture({
+        dragging: videoPress.dragging,
+        elapsedMs: event.timeStamp - videoPress.downTime,
+        distancePx: distance
+      });
+      videoPressRef.current = null;
+      setPreviewDragging(false);
+      releasePointerCapture(event.currentTarget, event.pointerId);
+      if (
+        gesture === "tap" &&
+        (lastVideoTapTimeRef.current === 0 || event.timeStamp - lastVideoTapTimeRef.current >= 300)
+      ) {
+        lastVideoTapTimeRef.current = event.timeStamp;
+        void toggleVideoPlayback();
+      }
+      return;
+    }
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     dragRef.current = null;
-    event.currentTarget.releasePointerCapture(event.pointerId);
+    setPreviewDragging(false);
+    releasePointerCapture(event.currentTarget, event.pointerId);
+  }
+
+  function handlePointerCancel(event: PointerEvent<HTMLDivElement>) {
+    if (videoPressRef.current?.pointerId === event.pointerId) {
+      videoPressRef.current = null;
+    }
+    if (dragRef.current?.pointerId === event.pointerId) {
+      dragRef.current = null;
+    }
+    setPreviewDragging(false);
+    releasePointerCapture(event.currentTarget, event.pointerId);
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
@@ -443,44 +617,61 @@ export function CentralPreviewStage({
     }
   }
 
+  const isVideo = selectedMedia.kind === "video";
+
   return (
     <section className="central-preview" aria-label={`Preview for ${selectedMedia.name}`}>
-      <div
-        aria-label={`Preview image for ${selectedMedia.name}`}
-        className="central-preview-stage"
-        data-preview-mode={viewMode}
-        onDoubleClick={handleDoubleClick}
-        onKeyDown={handleKeyDown}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerUp}
-        ref={stageRef}
-        role="img"
-        tabIndex={0}
-      >
+      <div className="central-preview-stage" data-preview-video={isVideo ? "true" : undefined}>
         <div
-          className="central-preview-transform"
-          style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale}) translate(-50%, -50%)` }}
+          aria-label={`Preview media for ${selectedMedia.name}`}
+          className="central-preview-viewport"
+          data-preview-dragging={previewDragging ? "true" : undefined}
+          data-preview-mode={viewMode}
+          onDoubleClick={handleDoubleClick}
+          onKeyDown={handleKeyDown}
+          onLostPointerCapture={handlePointerCancel}
+          onPointerCancel={handlePointerCancel}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          ref={stageRef}
+          role="img"
+          tabIndex={0}
         >
-          <MediaPreview
-            media={selectedMedia}
-            onLoadingChange={handleMediaLoadingChange}
-            onMediaReady={handleMediaReady}
-            onNaturalSize={handleNaturalSize}
-            source="original"
-            stableFrame
-            thumbnail={thumbnail}
-          />
-        </div>
-        {previewLoading ? (
           <div
-            aria-label="Loading preview"
-            className="central-preview-loading-indicator"
-            role="status"
+            className="central-preview-transform"
+            style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale}) translate(-50%, -50%)` }}
           >
-            <span className="central-preview-loading-spinner" aria-hidden="true" />
+            <MediaPreview
+              media={selectedMedia}
+              source="original"
+              thumbnail={thumbnail}
+              onLoadingChange={handleMediaLoadingChange}
+              onMediaReady={handleMediaReady}
+              onNaturalSize={handleNaturalSize}
+              onVideoElementChange={handleVideoElementChange}
+              stableFrame
+            />
           </div>
+          {previewLoading ? (
+            <div
+              aria-label="Loading preview"
+              className="central-preview-loading-indicator"
+              role="status"
+            >
+              <span className="central-preview-loading-spinner" aria-hidden="true" />
+            </div>
+          ) : null}
+        </div>
+        {isVideo ? (
+          <VideoPlaybackControls
+            disabled={!videoElement}
+            onSeek={seekVideo}
+            onToggleMuted={toggleVideoMuted}
+            onTogglePlayback={() => void toggleVideoPlayback()}
+            onVolumeChange={changeVideoVolume}
+            state={videoPlayback}
+          />
         ) : null}
       </div>
     </section>
@@ -514,7 +705,6 @@ function clampFitScale(value: number) {
 }
 
 const PREVIEW_PAN_SKIP_SELECTOR = [
-  "video",
   "audio",
   "button",
   "input",
@@ -525,6 +715,18 @@ const PREVIEW_PAN_SKIP_SELECTOR = [
   "a",
   "[data-skip-preview-pan]"
 ].join(",");
+
+function isVideoSurface(eventTarget: EventTarget | null, currentTarget: HTMLElement) {
+  if (!(eventTarget instanceof Element)) return false;
+  const video = eventTarget.closest(".preview-video");
+  return video !== null && currentTarget.contains(video);
+}
+
+function releasePointerCapture(target: HTMLElement, pointerId: number) {
+  if (target.hasPointerCapture(pointerId)) {
+    target.releasePointerCapture(pointerId);
+  }
+}
 
 function shouldSkipPreviewPan(eventTarget: EventTarget | null, currentTarget: HTMLElement) {
   if (!(eventTarget instanceof Element)) return false;

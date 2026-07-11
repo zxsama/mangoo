@@ -19,3 +19,10 @@ export function videoPreviewNaturalSize(
     naturalWidth: Math.trunc(video.videoWidth)
   };
 }
+
+export function resolveVideoPreviewNaturalSize(
+  video: VideoMetadataSize,
+  poster: { naturalHeight: number; naturalWidth: number } | null
+): { naturalHeight: number; naturalWidth: number } | null {
+  return videoPreviewNaturalSize(video) ?? poster;
+}
