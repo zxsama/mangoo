@@ -1,3 +1,5 @@
+import type { LibrarySummary, LibraryLoadPhase } from "./libraryTypes";
+
 export interface DesktopDiagnostics {
   ffmpegAvailable: boolean;
   dbPath: string | null;
@@ -45,6 +47,16 @@ export interface MegleDesktopBridge {
   closeSettingsWindow?: () => Promise<boolean>;
   windowControls?: DesktopWindowControls;
   shell?: DesktopShellActions;
+  listLibraries?: () => Promise<LibrarySummary[]>;
+  getActiveLibraryId?: () => Promise<string | null>;
+  switchLibrary?: (libraryId: string) => Promise<{ ok: boolean; error?: string }>;
+  createLibrary?: (input: { name: string; dbPath: string }) => Promise<{ ok: boolean; library?: LibrarySummary; error?: string }>;
+  openLibrary?: (dbPath: string) => Promise<{ ok: boolean; library?: LibrarySummary; error?: string }>;
+  removeLibraryFromList?: (libraryId: string) => Promise<{ ok: boolean }>;
+  renameLibrary?: (libraryId: string, name: string) => Promise<{ ok: boolean }>;
+  pickLibraryFile?: () => Promise<string | null>;
+  pickNewLibraryPath?: (defaultName?: string) => Promise<string | null>;
+  onLibraryPhase?: (cb: (phase: LibraryLoadPhase) => void) => () => void;
 }
 
 declare global {
@@ -127,4 +139,39 @@ export async function readDesktopDiagnostics(): Promise<DesktopDiagnostics | nul
   } catch {
     return null;
   }
+}
+
+export async function listLibraries(): Promise<LibrarySummary[]> {
+  return (await getDesktopBridge()?.listLibraries?.()) ?? [];
+}
+export async function getActiveLibraryId(): Promise<string | null> {
+  return (await getDesktopBridge()?.getActiveLibraryId?.()) ?? null;
+}
+export async function switchLibrary(libraryId: string): Promise<{ ok: boolean; error?: string }> {
+  return (await getDesktopBridge()?.switchLibrary?.(libraryId)) ?? { ok: false, error: "no desktop bridge" };
+}
+export async function createLibrary(
+  input: { name: string; dbPath: string }
+): Promise<{ ok: boolean; library?: LibrarySummary; error?: string }> {
+  return (await getDesktopBridge()?.createLibrary?.(input)) ?? { ok: false, error: "no desktop bridge" };
+}
+export async function openLibrary(
+  dbPath: string
+): Promise<{ ok: boolean; library?: LibrarySummary; error?: string }> {
+  return (await getDesktopBridge()?.openLibrary?.(dbPath)) ?? { ok: false, error: "no desktop bridge" };
+}
+export async function removeLibraryFromList(libraryId: string): Promise<{ ok: boolean }> {
+  return (await getDesktopBridge()?.removeLibraryFromList?.(libraryId)) ?? { ok: false };
+}
+export async function renameLibraryEntry(libraryId: string, name: string): Promise<{ ok: boolean }> {
+  return (await getDesktopBridge()?.renameLibrary?.(libraryId, name)) ?? { ok: false };
+}
+export async function pickLibraryFile(): Promise<string | null> {
+  return (await getDesktopBridge()?.pickLibraryFile?.()) ?? null;
+}
+export async function pickNewLibraryPath(defaultName?: string): Promise<string | null> {
+  return (await getDesktopBridge()?.pickNewLibraryPath?.(defaultName)) ?? null;
+}
+export function subscribeLibraryPhase(cb: (phase: LibraryLoadPhase) => void): () => void {
+  return getDesktopBridge()?.onLibraryPhase?.(cb) ?? (() => undefined);
 }

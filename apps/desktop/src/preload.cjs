@@ -40,6 +40,20 @@ contextBridge.exposeInMainWorld("megleDesktop", {
     openPath: (path) => ipcRenderer.invoke("megle:shell-open-path", path),
     copyText: (text) => ipcRenderer.invoke("megle:clipboard-write-text", text)
   },
+  listLibraries: () => ipcRenderer.invoke("megle:list-libraries"),
+  getActiveLibraryId: () => ipcRenderer.invoke("megle:get-active-library-id"),
+  switchLibrary: (libraryId) => ipcRenderer.invoke("megle:switch-library", libraryId),
+  createLibrary: (input) => ipcRenderer.invoke("megle:create-library", input),
+  openLibrary: (dbPath) => ipcRenderer.invoke("megle:open-library", dbPath),
+  removeLibraryFromList: (libraryId) => ipcRenderer.invoke("megle:remove-library-from-list", libraryId),
+  renameLibrary: (libraryId, name) => ipcRenderer.invoke("megle:rename-library", libraryId, name),
+  pickLibraryFile: () => ipcRenderer.invoke("megle:pick-library-file"),
+  pickNewLibraryPath: (defaultName) => ipcRenderer.invoke("megle:pick-new-library-path", defaultName),
+  onLibraryPhase: (cb) => {
+    const listener = (_event, phase) => cb(phase);
+    ipcRenderer.on("megle:library-load-phase", listener);
+    return () => ipcRenderer.removeListener("megle:library-load-phase", listener);
+  },
   ...(visualHarnessEnabled
     ? {
         visual: {
