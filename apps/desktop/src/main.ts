@@ -87,14 +87,16 @@ function pushLibraryPhase(phase: unknown): void {
   }
 }
 function toSummaries(reg: libraryRegistry.LibraryRegistry): Array<{
-  id: string; name: string; dbPath: string; available: boolean; active: boolean;
+  id: string; name: string; dbPath: string; available: boolean; active: boolean; icon?: string; color?: string;
 }> {
   return reg.libraries.map((l) => ({
     id: l.id,
     name: l.name,
     dbPath: l.dbPath,
     available: fsSync.existsSync(l.dbPath),
-    active: l.id === reg.activeLibraryId
+    active: l.id === reg.activeLibraryId,
+    icon: l.icon,
+    color: l.color
   }));
 }
 
@@ -363,6 +365,11 @@ ipcMain.handle("megle:remove-library-from-list", (_e, libraryId: string) => {
 
 ipcMain.handle("megle:rename-library", (_e, libraryId: string, name: string) => {
   persistRegistry(libraryRegistry.renameLibrary(getRegistry(), libraryId, name));
+  return { ok: true };
+});
+
+ipcMain.handle("megle:set-library-icon", (_e, libraryId: string, icon: string, color: string) => {
+  persistRegistry(libraryRegistry.setLibraryIcon(getRegistry(), libraryId, icon, color));
   return { ok: true };
 });
 

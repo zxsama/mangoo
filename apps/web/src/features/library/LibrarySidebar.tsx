@@ -3,18 +3,20 @@ import {
   ChevronRight,
   ChevronsUpDown,
   Folder,
-  FolderOpen,
-  RefreshCw
+  FolderOpen
 } from "lucide-react";
 import type { CSSProperties, RefObject } from "react";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import type { FolderRecord, RootRecord } from "../../core/types";
 import type { LibraryState } from "../../core/useLibraryData";
+import { LibraryGlyph } from "./libraryGlyph";
 
 interface LibrarySidebarProps {
   library: LibraryState;
   onOpenSwitcher?: () => void;
   activeLibraryName?: string;
+  activeLibraryIcon?: string;
+  activeLibraryColor?: string;
   onRootContextMenu?: (event: {
     root: RootRecord;
     x: number;
@@ -36,6 +38,8 @@ export function LibrarySidebar({
   library,
   onOpenSwitcher = () => {},
   activeLibraryName = "Library",
+  activeLibraryIcon,
+  activeLibraryColor,
   onFolderContextMenu,
   onRootContextMenu
 }: LibrarySidebarProps) {
@@ -55,16 +59,9 @@ export function LibrarySidebar({
           data-pointer-glow="off"
           onClick={onOpenSwitcher}
         >
+          <LibraryGlyph icon={activeLibraryIcon} color={activeLibraryColor} size={15} />
           <span className="library-switch-name">{activeLibraryName ?? "Library"}</span>
           <ChevronsUpDown size={14} aria-hidden="true" />
-        </button>
-        <button
-          type="button"
-          className="library-refresh-button"
-          aria-label="Refresh library"
-          onClick={() => void library.refresh()}
-        >
-          <RefreshCw size={14} aria-hidden="true" />
         </button>
       </header>
 

@@ -54,6 +54,7 @@ export interface MegleDesktopBridge {
   openLibrary?: (dbPath: string) => Promise<{ ok: boolean; library?: LibrarySummary; error?: string }>;
   removeLibraryFromList?: (libraryId: string) => Promise<{ ok: boolean }>;
   renameLibrary?: (libraryId: string, name: string) => Promise<{ ok: boolean }>;
+  setLibraryIcon?: (libraryId: string, icon: string, color: string) => Promise<{ ok: boolean }>;
   pickLibraryFile?: () => Promise<string | null>;
   pickNewLibraryPath?: (defaultName?: string) => Promise<string | null>;
   onLibraryPhase?: (cb: (phase: LibraryLoadPhase) => void) => () => void;
@@ -165,6 +166,9 @@ export async function removeLibraryFromList(libraryId: string): Promise<{ ok: bo
 }
 export async function renameLibraryEntry(libraryId: string, name: string): Promise<{ ok: boolean }> {
   return (await getDesktopBridge()?.renameLibrary?.(libraryId, name)) ?? { ok: false };
+}
+export async function setLibraryIcon(libraryId: string, icon: string, color: string): Promise<{ ok: boolean }> {
+  return (await getDesktopBridge()?.setLibraryIcon?.(libraryId, icon, color)) ?? { ok: false };
 }
 export async function pickLibraryFile(): Promise<string | null> {
   return (await getDesktopBridge()?.pickLibraryFile?.()) ?? null;

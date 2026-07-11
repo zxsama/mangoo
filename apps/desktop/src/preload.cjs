@@ -47,6 +47,7 @@ contextBridge.exposeInMainWorld("megleDesktop", {
   openLibrary: (dbPath) => ipcRenderer.invoke("megle:open-library", dbPath),
   removeLibraryFromList: (libraryId) => ipcRenderer.invoke("megle:remove-library-from-list", libraryId),
   renameLibrary: (libraryId, name) => ipcRenderer.invoke("megle:rename-library", libraryId, name),
+  setLibraryIcon: (libraryId, icon, color) => ipcRenderer.invoke("megle:set-library-icon", libraryId, icon, color),
   pickLibraryFile: () => ipcRenderer.invoke("megle:pick-library-file"),
   pickNewLibraryPath: (defaultName) => ipcRenderer.invoke("megle:pick-new-library-path", defaultName),
   onLibraryPhase: (cb) => {

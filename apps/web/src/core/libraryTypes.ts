@@ -4,6 +4,10 @@ export interface LibrarySummary {
   dbPath: string;
   available: boolean;
   active: boolean;
+  // Optional visual identity (preset Lucide icon name + color) shown left of the
+  // library name; absent → a default icon/color.
+  icon?: string;
+  color?: string;
 }
 
 export type LibraryLoadPhase =

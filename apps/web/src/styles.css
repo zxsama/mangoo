@@ -6989,8 +6989,10 @@ button:disabled {
 }
 
 .library-sidebar-heading { display: flex; align-items: center; gap: 8px; padding: 8px 4px; }
-.library-switch-button { flex: 1; display: flex; align-items: center; justify-content: space-between; gap: 8px; background: transparent; border: 0; color: inherit; cursor: pointer; padding: 6px 8px; border-radius: var(--radius-control); }
-.library-switch-name { font-size: 14px; font-weight: 650; }
+.library-switch-button { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; background: transparent; border: 0; color: inherit; cursor: pointer; padding: 6px 8px; border-radius: var(--radius-control); transition: background 120ms ease; }
+.library-switch-button:hover { background: var(--glass-hover-fill, rgba(255, 255, 255, 0.06)); }
+.library-switch-name { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.library-switch-button > svg:last-child { flex: 0 0 auto; opacity: 0.7; }
 
 .library-loading-overlay {
   position: absolute;
@@ -7014,21 +7016,60 @@ button:disabled {
 .library-loading-error-text { font-size: 13px; color: var(--text-soft); }
 .library-loading-actions { display: flex; gap: 10px; margin-top: 4px; }
 
+/* Switch popup anchored near the sidebar (top-left), not a centred modal. The
+   backdrop stays click-to-close; the panel sits just below the titlebar aligned
+   to the left edge so it reads as "beside the library". */
 .library-switcher-backdrop {
   position: fixed; inset: 0; z-index: 40;
-  display: grid; place-items: start center; padding-top: 64px;
+  display: grid; place-items: start start; padding: 48px 0 0 10px;
 }
-.library-switcher { width: 460px; max-height: 70vh; display: flex; flex-direction: column; overflow: hidden; }
-.library-switcher-search { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
-.library-switcher-search input { flex: 1; background: transparent; border: 0; outline: 0; color: inherit; }
-.library-switcher-list { list-style: none; margin: 0; padding: 4px; overflow-y: auto; }
-.library-switcher-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-control); }
+/* Frosted settings-page look: the same translucent side-material fill + blur the
+   settings window and sidebar use (driven by the "侧栏材质" vars), a hairline
+   border and elevation — not the near-invisible elevated glass surface. */
+.library-switcher {
+  width: 460px; max-height: 72vh; display: flex; flex-direction: column; overflow: hidden;
+  background: var(--glass-side-fill, rgba(18, 22, 28, 0.82));
+  -webkit-backdrop-filter: blur(var(--glass-side-blur, 26px)) saturate(var(--glass-side-saturation, 1.55));
+  backdrop-filter: blur(var(--glass-side-blur, 26px)) saturate(var(--glass-side-saturation, 1.55));
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow-elevated, 0 18px 48px rgba(0, 0, 0, 0.45));
+  color: var(--text-soft);
+}
+.library-switcher-search { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--text-muted); }
+.library-switcher-search input { flex: 1; background: transparent; border: 0; outline: 0; color: var(--text-soft); font-size: 13px; }
+.library-switcher-search button { display: grid; place-items: center; background: transparent; border: 0; color: var(--text-muted); cursor: pointer; }
+.library-switcher-list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; display: grid; gap: 2px; }
+.library-switcher-row { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: var(--radius-control); }
+.library-switcher-row:hover { background: var(--glass-hover-fill, rgba(255, 255, 255, 0.05)); }
+.library-switcher-row.active { background: var(--glass-hover-fill, rgba(255, 255, 255, 0.07)); }
 .library-switcher-row.unavailable { opacity: 0.5; }
-.library-switcher-main { flex: 1; display: flex; flex-direction: column; align-items: flex-start; background: transparent; border: 0; cursor: pointer; color: inherit; }
-.library-switcher-name { font-size: 13px; }
-.library-switcher-path { font-size: 11px; color: var(--text-muted); }
-.library-switcher-actions { display: flex; gap: 4px; }
+.library-switcher-icon-anchor { position: relative; flex: 0 0 auto; }
+.library-switcher-icon { display: grid; place-items: center; width: 28px; height: 28px; background: transparent; border: 1px solid transparent; border-radius: var(--radius-control); color: inherit; cursor: pointer; }
+.library-switcher-icon:hover { background: var(--glass-control, rgba(255, 255, 255, 0.06)); border-color: var(--line); }
+.library-switcher-main { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 1px; background: transparent; border: 0; cursor: pointer; color: inherit; }
+.library-switcher-name { font-size: 13px; font-weight: 600; }
+.library-switcher-path { max-width: 100%; font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.library-switcher-check { flex: 0 0 auto; color: var(--accent, #7cc4ff); }
+.library-switcher-actions { display: flex; gap: 2px; flex: 0 0 auto; }
+.library-switcher-actions button { display: grid; place-items: center; width: 28px; height: 28px; background: transparent; border: 1px solid transparent; border-radius: var(--radius-control); color: var(--text-muted); cursor: pointer; }
+.library-switcher-actions button:hover:not(:disabled) { background: var(--glass-control, rgba(255, 255, 255, 0.06)); border-color: var(--line); color: var(--text-soft); }
 .library-switcher-actions button:disabled { opacity: 0.35; cursor: default; }
+/* Preset icon + color picker, anchored under the row's icon button. */
+.library-icon-picker {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 12;
+  width: 208px; padding: 8px;
+  display: grid; gap: 8px;
+  background: var(--surface-elevated, #1c1c1e); border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: var(--shadow-elevated, 0 12px 32px rgba(0, 0, 0, 0.45));
+}
+.library-icon-picker-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; }
+.library-icon-picker-cell { display: grid; place-items: center; width: 22px; height: 22px; background: transparent; border: 1px solid transparent; border-radius: 6px; cursor: pointer; }
+.library-icon-picker-cell:hover { background: var(--glass-control, rgba(255, 255, 255, 0.08)); }
+.library-icon-picker-cell.selected { border-color: var(--accent, #7cc4ff); background: rgba(124, 196, 255, 0.14); }
+.library-icon-picker-colors { display: flex; flex-wrap: wrap; gap: 4px; padding-top: 6px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
+.library-icon-picker-swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(255, 255, 255, 0.2); cursor: pointer; padding: 0; }
+.library-icon-picker-swatch.selected { outline: 2px solid var(--text-soft); outline-offset: 1px; }
 .library-switcher-remove-menu-anchor { position: relative; }
 .library-switcher-remove-menu {
   position: absolute; top: calc(100% + 4px); right: 0; z-index: 10;
@@ -7044,5 +7085,6 @@ button:disabled {
   padding: 6px 8px; border-radius: var(--radius-control); cursor: pointer; font-size: 12px;
 }
 .library-switcher-remove-menu-item:hover { background: var(--surface-hover, rgba(255, 255, 255, 0.06)); }
-.library-switcher-footer { display: flex; flex-direction: column; padding: 8px; gap: 4px; border-top: 1px solid var(--line); }
-.library-switcher-footer button { text-align: left; background: transparent; border: 0; color: inherit; padding: 8px; border-radius: var(--radius-control); cursor: pointer; }
+.library-switcher-footer { display: flex; flex-direction: column; padding: 8px; gap: 2px; border-top: 1px solid var(--line); }
+.library-switcher-footer button { text-align: left; background: transparent; border: 1px solid transparent; color: var(--text-soft); padding: 8px; border-radius: var(--radius-control); cursor: pointer; font-size: 13px; }
+.library-switcher-footer button:hover { background: var(--glass-hover-fill, rgba(255, 255, 255, 0.05)); border-color: var(--line); }

@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { Check, FolderPlus, FolderMinus, Search, X } from "lucide-react";
-import { LiquidGlassSurface } from "../../design/liquid-glass";
 import {
   listLibraries,
   switchLibrary,
@@ -9,9 +8,17 @@ import {
   pickLibraryFile,
   pickNewLibraryPath,
   pickNativeFolder,
+  setLibraryIcon,
 } from "../../core/desktop";
 import type { LibrarySummary } from "../../core/libraryTypes";
 import type { LibraryState } from "../../core/useLibraryData";
+import {
+  LibraryGlyph,
+  LIBRARY_ICONS,
+  LIBRARY_COLORS,
+  DEFAULT_LIBRARY_ICON,
+  DEFAULT_LIBRARY_COLOR,
+} from "./libraryGlyph";
 
 export function LibrarySwitcher({
   open,
@@ -25,6 +32,7 @@ export function LibrarySwitcher({
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [query, setQuery] = useState("");
   const [removeMenuLibraryId, setRemoveMenuLibraryId] = useState<string | null>(null);
+  const [iconMenuLibraryId, setIconMenuLibraryId] = useState<string | null>(null);
 
   const reload = () => void listLibraries().then(setLibs);
   useEffect(() => {
@@ -32,6 +40,7 @@ export function LibrarySwitcher({
       reload();
     } else {
       setRemoveMenuLibraryId(null);
+      setIconMenuLibraryId(null);
     }
   }, [open]);
   if (!open) return null;
@@ -75,12 +84,17 @@ export function LibrarySwitcher({
     reload();
   }
 
+  async function applyIcon(l: LibrarySummary, icon: string, color: string) {
+    await setLibraryIcon(l.id, icon, color);
+    reload();
+  }
+
   return (
     <div className="library-switcher-backdrop" onClick={onClose}>
-      <LiquidGlassSurface
-        as="div"
+      <div
         className="library-switcher"
-        tone="elevated"
+        role="dialog"
+        aria-label="资源库"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="library-switcher-search">
@@ -95,70 +109,115 @@ export function LibrarySwitcher({
           </button>
         </div>
         <ul className="library-switcher-list">
-          {filtered.map((l) => (
-            <li
-              key={l.id}
-              className={`library-switcher-row${l.active ? " active" : ""}${l.available ? "" : " unavailable"}`}
-            >
-              <button
-                type="button"
-                className="library-switcher-main"
-                onClick={() => onSwitch(l)}
+          {filtered.map((l) => {
+            const icon = l.icon ?? DEFAULT_LIBRARY_ICON;
+            const color = l.color ?? DEFAULT_LIBRARY_COLOR;
+            return (
+              <li
+                key={l.id}
+                className={`library-switcher-row${l.active ? " active" : ""}${l.available ? "" : " unavailable"}`}
               >
-                <span className="library-switcher-name">{l.name}</span>
-                <span className="library-switcher-path">{l.dbPath}</span>
-              </button>
-              {l.active ? (
-                <Check
-                  size={14}
-                  className="library-switcher-check"
-                  aria-hidden="true"
-                />
-              ) : null}
-              <div className="library-switcher-actions">
-                <button
-                  type="button"
-                  aria-label="Add folder"
-                  disabled={!l.active}
-                  onClick={onAddFolder}
-                >
-                  <FolderPlus size={14} />
-                </button>
-                <div className="library-switcher-remove-menu-anchor">
+                <div className="library-switcher-icon-anchor">
                   <button
                     type="button"
-                    aria-label="Remove folder"
-                    disabled={!l.active}
+                    className="library-switcher-icon"
+                    aria-label="更改图标"
                     onClick={() =>
-                      setRemoveMenuLibraryId((current) => (current === l.id ? null : l.id))
+                      setIconMenuLibraryId((current) => (current === l.id ? null : l.id))
                     }
                   >
-                    <FolderMinus size={14} />
+                    <LibraryGlyph icon={l.icon} color={l.color} size={16} />
                   </button>
-                  {l.active && removeMenuLibraryId === l.id ? (
-                    <ul className="library-switcher-remove-menu">
-                      {library.roots.length === 0 ? (
-                        <li className="library-switcher-remove-menu-empty">No folders</li>
-                      ) : (
-                        library.roots.map((root) => (
-                          <li key={root.id}>
-                            <button
-                              type="button"
-                              className="library-switcher-remove-menu-item"
-                              onClick={() => void onRemoveRoot(root.id)}
-                            >
-                              <span>{root.displayName}</span>
-                              <FolderMinus size={12} aria-hidden="true" />
-                            </button>
-                          </li>
-                        ))
-                      )}
-                    </ul>
+                  {iconMenuLibraryId === l.id ? (
+                    <div className="library-icon-picker">
+                      <div className="library-icon-picker-grid">
+                        {LIBRARY_ICONS.map(({ key }) => (
+                          <button
+                            key={key}
+                            type="button"
+                            className={`library-icon-picker-cell${key === icon ? " selected" : ""}`}
+                            aria-label={key}
+                            onClick={() => void applyIcon(l, key, color)}
+                          >
+                            <LibraryGlyph icon={key} color={color} size={16} />
+                          </button>
+                        ))}
+                      </div>
+                      <div className="library-icon-picker-colors">
+                        {LIBRARY_COLORS.map((c) => (
+                          <button
+                            key={c}
+                            type="button"
+                            className={`library-icon-picker-swatch${c === color ? " selected" : ""}`}
+                            aria-label={c}
+                            style={{ background: c }}
+                            onClick={() => void applyIcon(l, icon, c)}
+                          />
+                        ))}
+                      </div>
+                    </div>
                   ) : null}
                 </div>
-              </div>
-            </li>
-          ))}
+                <button
+                  type="button"
+                  className="library-switcher-main"
+                  onClick={() => onSwitch(l)}
+                >
+                  <span className="library-switcher-name">{l.name}</span>
+                  <span className="library-switcher-path">{l.dbPath}</span>
+                </button>
+                {l.active ? (
+                  <Check
+                    size={14}
+                    className="library-switcher-check"
+                    aria-hidden="true"
+                  />
+                ) : null}
+                <div className="library-switcher-actions">
+                  <button
+                    type="button"
+                    aria-label="Add folder"
+                    disabled={!l.active}
+                    onClick={onAddFolder}
+                  >
+                    <FolderPlus size={14} />
+                  </button>
+                  <div className="library-switcher-remove-menu-anchor">
+                    <button
+                      type="button"
+                      aria-label="Remove folder"
+                      disabled={!l.active}
+                      onClick={() =>
+                        setRemoveMenuLibraryId((current) => (current === l.id ? null : l.id))
+                      }
+                    >
+                      <FolderMinus size={14} />
+                    </button>
+                    {l.active && removeMenuLibraryId === l.id ? (
+                      <ul className="library-switcher-remove-menu">
+                        {library.roots.length === 0 ? (
+                          <li className="library-switcher-remove-menu-empty">No folders</li>
+                        ) : (
+                          library.roots.map((root) => (
+                            <li key={root.id}>
+                              <button
+                                type="button"
+                                className="library-switcher-remove-menu-item"
+                                onClick={() => void onRemoveRoot(root.id)}
+                              >
+                                <span>{root.displayName}</span>
+                                <FolderMinus size={12} aria-hidden="true" />
+                              </button>
+                            </li>
+                          ))
+                        )}
+                      </ul>
+                    ) : null}
+                  </div>
+                </div>
+              </li>
+            );
+          })}
         </ul>
         <div className="library-switcher-footer">
           <button type="button" onClick={onCreate}>
@@ -168,7 +227,7 @@ export function LibrarySwitcher({
             打开其它资源库…
           </button>
         </div>
-      </LiquidGlassSurface>
+      </div>
     </div>
   );
 }

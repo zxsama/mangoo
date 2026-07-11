@@ -7,6 +7,10 @@ export interface LibraryEntry {
   name: string;
   dbPath: string;
   lastOpenedAt: number;
+  // Optional visual identity: a preset Lucide icon name + a color, shown left of
+  // the library name in the sidebar/switcher. Absent → a default icon/color.
+  icon?: string;
+  color?: string;
 }
 
 export interface LibraryRegistry {
@@ -83,5 +87,17 @@ export function renameLibrary(registry: LibraryRegistry, id: string, name: strin
   return {
     ...registry,
     libraries: registry.libraries.map((l) => (l.id === id ? { ...l, name } : l))
+  };
+}
+
+export function setLibraryIcon(
+  registry: LibraryRegistry,
+  id: string,
+  icon: string,
+  color: string
+): LibraryRegistry {
+  return {
+    ...registry,
+    libraries: registry.libraries.map((l) => (l.id === id ? { ...l, icon, color } : l))
   };
 }

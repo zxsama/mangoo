@@ -116,6 +116,8 @@ export function App() {
   const [libraryPhase, setLibraryPhase] = useState<LibraryLoadPhase>("starting-core");
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [activeLibraryName, setActiveLibraryName] = useState<string>("Library");
+  const [activeLibraryIcon, setActiveLibraryIcon] = useState<string | undefined>(undefined);
+  const [activeLibraryColor, setActiveLibraryColor] = useState<string | undefined>(undefined);
   const hasLoadedActiveLibraryNameRef = useRef(false);
   const library = useLibraryData({
     persistentThumbnailCacheAutoRefresh:
@@ -216,6 +218,8 @@ export function App() {
       if (cancelled) return;
       const active = libraries.find((entry) => entry.active);
       setActiveLibraryName(active?.name ?? "Library");
+      setActiveLibraryIcon(active?.icon);
+      setActiveLibraryColor(active?.color);
     });
     return () => {
       cancelled = true;
@@ -602,6 +606,8 @@ export function App() {
       <LibrarySidebar
         library={library}
         activeLibraryName={activeLibraryName}
+        activeLibraryIcon={activeLibraryIcon}
+        activeLibraryColor={activeLibraryColor}
         onOpenSwitcher={() => setSwitcherOpen(true)}
         onFolderContextMenu={handleFolderContextMenu}
         onRootContextMenu={handleRootContextMenu}
