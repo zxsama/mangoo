@@ -320,10 +320,13 @@ ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
 ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath: string }) => {
   const reg = getRegistry();
   try {
-    // A brand-new empty file: Core builds the schema on first open.
-    if (!fsSync.existsSync(input.dbPath)) {
-      fsSync.writeFileSync(input.dbPath, ""); // touch; Core opens + migrates
+    // A brand-new empty file: Core builds the schema on first open. Never
+    // silently degrade "create" into "open" of an existing file — that would
+    // discard the typed name via addLibrary's dbPath dedupe.
+    if (fsSync.existsSync(input.dbPath)) {
+      return { ok: false, error: 'A file already exists at that path; use "Open other library" instead.' };
     }
+    fsSync.writeFileSync(input.dbPath, ""); // touch; Core opens + migrates
     const added = libraryRegistry.addLibrary(reg, { name: input.name, dbPath: input.dbPath, now: Date.now() });
     await restartCoreForLibrary(added.entry.dbPath);
     persistRegistry(libraryRegistry.setActive(added.registry, added.entry.id, Date.now()));
@@ -622,9 +625,17 @@ async function restartCoreForLibrary(dbPath: string): Promise<void> {
 
   const session = sessionForDbPath(base, dbPath);
   const handle = startCoreProcess(session);
-  pushLibraryPhase("opening-library");
-  await waitForCoreHealth(session.baseUrl, session.sessionToken);
+  pendingCoreProcess = handle;
+  try {
+    pushLibraryPhase("opening-library");
+    await waitForCoreHealth(session.baseUrl, session.sessionToken);
+  } catch (error) {
+    handle.stop();
+    pendingCoreProcess = null;
+    throw error;
+  }
   coreProcess = handle;
+  pendingCoreProcess = null;
   coreSession = session;
 }
 
