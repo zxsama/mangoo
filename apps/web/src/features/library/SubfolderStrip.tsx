@@ -70,8 +70,8 @@ export function SubfolderStrip({
         <button
           aria-label={collapsed ? "Expand child folders" : "Collapse child folders"}
           className="subfolder-strip-header-button subfolder-strip-heading-button"
+          data-pointer-glow="off"
           onClick={onToggleCollapsed}
-          title={collapsed ? "Expand child folders" : "Collapse child folders"}
           type="button"
         >
           <span className="subfolder-strip-title">{title}</span>

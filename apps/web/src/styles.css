@@ -6366,11 +6366,14 @@ button:disabled {
   transform: none;
 }
 
-/* Center titlebar tools are icon-only; search remains the only visible glass input. */
+/* Center titlebar tools are icon-only; search remains the only visible glass input.
+   The left-region sidebar toggle shares the exact same transparent-glass treatment
+   so it matches the center tool buttons. */
 .shell-titlebar-center .titlebar-tool-button,
 .shell-titlebar-center .titlebar-icon-button,
 .shell-titlebar-center .filter-menu-trigger,
-.shell-titlebar-center .sort-menu-trigger {
+.shell-titlebar-center .sort-menu-trigger,
+.shell-sidebar-toggle {
   --glass-fill: transparent;
   --glass-border-current: transparent;
   display: inline-flex;
@@ -6411,10 +6414,21 @@ button:disabled {
   box-shadow: none;
 }
 
+.shell-sidebar-toggle > .liquid-glass-backdrop,
+.shell-sidebar-toggle > .liquid-glass-dim {
+  opacity: 0;
+  background: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  filter: none;
+  box-shadow: none;
+}
+
 .shell-titlebar-center .titlebar-tool-button::after,
 .shell-titlebar-center .titlebar-icon-button::after,
 .shell-titlebar-center .filter-menu-trigger::after,
-.shell-titlebar-center .sort-menu-trigger::after {
+.shell-titlebar-center .sort-menu-trigger::after,
+.shell-sidebar-toggle::after {
   opacity: 0;
   border-color: transparent;
   box-shadow: none;

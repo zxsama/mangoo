@@ -554,9 +554,14 @@ function interactiveAffordanceTargets() {
   const candidates = document.querySelectorAll<HTMLElement>(INTERACTIVE_AFFORDANCE_SELECTOR);
   const targets = new Set<HTMLElement>();
   for (const candidate of candidates) {
-    // Titlebar search opts out of the pointer glow entirely (it has its own
-    // self-contained focus treatment); never route it or its inner controls here.
-    if (candidate.closest('[data-titlebar-search="true"]')) {
+    // Explicit opt-out: elements (or their subtree) marked data-pointer-glow="off"
+    // — and the titlebar search, which has its own self-contained focus treatment —
+    // never get the circular pointer glow. Used for text-like controls / plain
+    // heading buttons where a rectangular hover ring reads as noise.
+    if (
+      candidate.closest('[data-titlebar-search="true"]') ||
+      candidate.closest('[data-pointer-glow="off"]')
+    ) {
       clearInteractiveAffordancePointer(candidate);
       continue;
     }
