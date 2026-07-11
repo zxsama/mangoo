@@ -26,9 +26,8 @@ import {
 } from "./videoPlayback";
 import {
   classifyVideoPointerGesture,
-  dragActivationDelta,
-  pointerDistance,
-  shouldStartVideoDrag
+  pointerDisplacement,
+  pointerDistance
 } from "./previewPointerGesture";
 
 interface CentralPreviewStageProps {
@@ -47,11 +46,11 @@ interface CentralPreviewStageProps {
 type PreviewViewMode = "fit-long-edge" | "actual";
 
 type VideoPress = {
-  downTime: number;
-  dragging: boolean;
   lastX: number;
   lastY: number;
   pointerId: number;
+  startPanX: number;
+  startPanY: number;
   startX: number;
   startY: number;
 };
@@ -69,7 +68,6 @@ export function CentralPreviewStage({
   const stageRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const videoPressRef = useRef<VideoPress | null>(null);
-  const lastVideoTapTimeRef = useRef(0);
   const autoplayAttemptRef = useRef<{ element: HTMLVideoElement; mediaId: number } | null>(null);
   const scaleRef = useRef(1);
   const wheelZoomAxisRef = useRef(
@@ -150,7 +148,6 @@ export function CentralPreviewStage({
   useEffect(() => {
     fittedMediaIdRef.current = null;
     autoplayAttemptRef.current = null;
-    lastVideoTapTimeRef.current = 0;
     setVideoPlayback({ ...EMPTY_VIDEO_PLAYBACK_SNAPSHOT });
     setMeasuredNaturalSize((current) =>
       current?.mediaId === selectedMedia.id ? current : null
@@ -502,11 +499,11 @@ export function CentralPreviewStage({
       event.preventDefault();
       event.currentTarget.setPointerCapture(event.pointerId);
       videoPressRef.current = {
-        downTime: event.timeStamp,
-        dragging: false,
         lastX: event.clientX,
         lastY: event.clientY,
         pointerId: event.pointerId,
+        startPanX: pan.x,
+        startPanY: pan.y,
         startX: event.clientX,
         startY: event.clientY
       };
@@ -522,35 +519,20 @@ export function CentralPreviewStage({
   function handlePointerMove(event: PointerEvent<HTMLDivElement>) {
     const videoPress = videoPressRef.current;
     if (videoPress?.pointerId === event.pointerId) {
-      const distance = pointerDistance(
+      const delta = pointerDisplacement(
         videoPress.startX,
         videoPress.startY,
         event.clientX,
         event.clientY
       );
-      if (!videoPress.dragging) {
-        if (!shouldStartVideoDrag(event.timeStamp - videoPress.downTime, distance)) return;
-        const activationDelta = dragActivationDelta(
-          videoPress.startX,
-          videoPress.startY,
-          event.clientX,
-          event.clientY
-        );
-        videoPress.dragging = true;
-        videoPress.lastX = event.clientX;
-        videoPress.lastY = event.clientY;
-        setPreviewDragging(true);
-        setPan((current) => ({
-          x: current.x + activationDelta.x,
-          y: current.y + activationDelta.y
-        }));
-        return;
-      }
-      const dx = event.clientX - videoPress.lastX;
-      const dy = event.clientY - videoPress.lastY;
       videoPress.lastX = event.clientX;
       videoPress.lastY = event.clientY;
-      setPan((current) => ({ x: current.x + dx, y: current.y + dy }));
+      if (delta.x === 0 && delta.y === 0) return;
+      setPreviewDragging(true);
+      setPan({
+        x: videoPress.startPanX + delta.x,
+        y: videoPress.startPanY + delta.y
+      });
       return;
     }
     const drag = dragRef.current;
@@ -571,18 +553,26 @@ export function CentralPreviewStage({
         event.clientY
       );
       const gesture = classifyVideoPointerGesture({
-        dragging: videoPress.dragging,
-        elapsedMs: event.timeStamp - videoPress.downTime,
         distancePx: distance
       });
+      const finalDelta = pointerDisplacement(
+        videoPress.startX,
+        videoPress.startY,
+        event.clientX,
+        event.clientY
+      );
+      setPan(
+        gesture === "tap"
+          ? { x: videoPress.startPanX, y: videoPress.startPanY }
+          : {
+              x: videoPress.startPanX + finalDelta.x,
+              y: videoPress.startPanY + finalDelta.y
+            }
+      );
       videoPressRef.current = null;
       setPreviewDragging(false);
       releasePointerCapture(event.currentTarget, event.pointerId);
-      if (
-        gesture === "tap" &&
-        (lastVideoTapTimeRef.current === 0 || event.timeStamp - lastVideoTapTimeRef.current >= 300)
-      ) {
-        lastVideoTapTimeRef.current = event.timeStamp;
+      if (gesture === "tap") {
         void toggleVideoPlayback();
       }
       return;
@@ -595,7 +585,17 @@ export function CentralPreviewStage({
   }
 
   function handlePointerCancel(event: PointerEvent<HTMLDivElement>) {
-    if (videoPressRef.current?.pointerId === event.pointerId) {
+    const videoPress = videoPressRef.current;
+    if (videoPress?.pointerId === event.pointerId) {
+      const distance = pointerDistance(
+        videoPress.startX,
+        videoPress.startY,
+        videoPress.lastX,
+        videoPress.lastY
+      );
+      if (classifyVideoPointerGesture({ distancePx: distance }) === "tap") {
+        setPan({ x: videoPress.startPanX, y: videoPress.startPanY });
+      }
       videoPressRef.current = null;
     }
     if (dragRef.current?.pointerId === event.pointerId) {

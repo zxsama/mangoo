@@ -2664,23 +2664,37 @@ button:disabled {
   box-shadow: none;
 }
 
+.video-playback-controls > * {
+  align-self: center;
+}
+
 .video-playback-button {
   --glass-fill: transparent;
   --glass-border-current: transparent;
+  display: inline-flex;
   width: 30px;
   min-width: 30px;
   height: 30px;
+  align-items: center;
+  justify-content: center;
   padding: 0;
   color: var(--text-muted);
   border: 0;
   border-radius: 10px;
   background: transparent;
   box-shadow: none;
+  line-height: 0;
+  outline: 0;
+  vertical-align: middle;
 }
 
 .video-playback-button > .liquid-glass-backdrop,
-.video-playback-button > .liquid-glass-dim {
+.video-playback-button > .liquid-glass-dim,
+.video-playback-button > .liquid-glass-dither,
+.video-playback-button > .liquid-glass-edge,
+.video-playback-button > .liquid-glass-lens {
   opacity: 0;
+  border: 0;
   background: transparent;
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
@@ -2688,11 +2702,45 @@ button:disabled {
   box-shadow: none;
 }
 
+.video-playback-button::after {
+  border: 0;
+  box-shadow: none;
+}
+
+.video-playback-button:hover:not(:disabled),
+.video-playback-button:active:not(:disabled),
+.video-playback-button:focus-visible {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  outline: 0;
+  transform: none;
+}
+
+.video-playback-button > .liquid-glass-content {
+  display: inline-flex;
+  width: 100%;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+.video-playback-button svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
 .video-playback-time {
+  display: inline-flex;
   min-width: 34px;
+  min-height: 24px;
+  align-items: center;
+  justify-content: center;
   color: var(--text-muted);
   font-size: 10.5px;
   font-variant-numeric: tabular-nums;
+  line-height: 1;
   text-align: center;
 }
 
@@ -2776,10 +2824,14 @@ button:disabled {
 }
 
 .video-autoplay-status {
+  display: inline-flex;
   max-width: 120px;
+  min-height: 24px;
   overflow: hidden;
+  align-items: center;
   color: var(--text-muted);
   font-size: 11px;
+  line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
