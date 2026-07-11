@@ -104,6 +104,11 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
   useEffect(() => {
     let animationFrame = 0;
     let latestPointer: { x: number; y: number } | null = null;
+    // The last cursor position we saw, retained across frames. Layout changes
+    // (scroll / resize / folder expand) move the affordances under a stationary
+    // cursor, so we re-run the driver at this position after invalidating the rect
+    // cache — otherwise the glow stays anchored to where the rows used to be.
+    let lastCursor: { x: number; y: number } | null = null;
 
     function clearPointerFrame() {
       latestPointer = null;
@@ -115,6 +120,7 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
 
     function requestPointerUpdate(x: number, y: number) {
       latestPointer = { x, y };
+      lastCursor = { x, y };
       if (animationFrame) return;
         animationFrame = window.requestAnimationFrame(() => {
           animationFrame = 0;
@@ -122,6 +128,28 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
             updateInteractiveAffordancePointers(latestPointer.x, latestPointer.y);
           }
         });
+    }
+
+    // A layout shift moved the affordances under the cursor; re-anchor the glow to
+    // the same cursor against the fresh geometry. We wait TWO animation frames
+    // before re-measuring: the first frame lets the browser finish the reflow the
+    // shift triggered (including sticky tree-header repositioning, which resolves a
+    // frame after the row insert), so getBoundingClientRect returns settled values
+    // instead of stale-by-a-row coordinates.
+    let layoutSettleFrame = 0;
+    function handleLayoutShift() {
+      invalidateAffordanceRectCache();
+      if (!lastCursor) return;
+      if (layoutSettleFrame) return;
+      layoutSettleFrame = window.requestAnimationFrame(() => {
+        layoutSettleFrame = window.requestAnimationFrame(() => {
+          layoutSettleFrame = 0;
+          invalidateAffordanceRectCache();
+          if (lastCursor) {
+            updateInteractiveAffordancePointers(lastCursor.x, lastCursor.y);
+          }
+        });
+      });
     }
 
     function handlePointerMove(event: globalThis.PointerEvent) {
@@ -136,6 +164,7 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
       if (event && pointerEventInsideViewport(event)) {
         return;
       }
+      lastCursor = null;
       clearPointerFrame();
       hideInteractiveAffordancePointers();
     }
@@ -144,12 +173,23 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
     window.addEventListener("mousemove", handleMouseMove, { passive: true });
     window.addEventListener("pointerleave", handlePointerExit);
     window.addEventListener("blur", handlePointerExit);
-    // Affordance target rects are cached across pointer-move frames; their
-    // POSITIONS only change on scroll (capture phase catches inner scrollers like
-    // the virtualized media grid) or resize, so invalidate the cache then. This
-    // keeps the per-frame hover glow O(1) instead of O(targets) forced reflows.
-    window.addEventListener("scroll", invalidateAffordanceRectCache, { capture: true, passive: true });
-    window.addEventListener("resize", invalidateAffordanceRectCache, { passive: true });
+    // Affordance target rects are cached across pointer-move frames; their POSITIONS
+    // change on scroll (capture phase catches inner scrollers like the media grid
+    // and the sidebar tree), on resize, and on any LAYOUT change that shifts rows —
+    // expanding/collapsing a folder inserts/removes rows and moves everything below
+    // it WITHOUT firing scroll or resizing <body> (the tree scrolls inside its own
+    // overflow container, so body height is unchanged). A MutationObserver on the
+    // subtree catches those row insert/removes; a ResizeObserver catches container
+    // reflows. Both route through handleLayoutShift, which re-anchors the glow to
+    // the stationary cursor against fresh geometry. Invalidating is O(1).
+    window.addEventListener("scroll", handleLayoutShift, { capture: true, passive: true });
+    window.addEventListener("resize", handleLayoutShift, { passive: true });
+    const resizeObserver =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(handleLayoutShift);
+    resizeObserver?.observe(document.body);
+    const mutationObserver =
+      typeof MutationObserver === "undefined" ? null : new MutationObserver(handleLayoutShift);
+    mutationObserver?.observe(document.body, { childList: true, subtree: true });
 
     return () => {
       clearPointerFrame();
@@ -157,8 +197,11 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("pointerleave", handlePointerExit);
       window.removeEventListener("blur", handlePointerExit);
-      window.removeEventListener("scroll", invalidateAffordanceRectCache, { capture: true });
-      window.removeEventListener("resize", invalidateAffordanceRectCache);
+      window.removeEventListener("scroll", handleLayoutShift, { capture: true });
+      window.removeEventListener("resize", handleLayoutShift);
+      resizeObserver?.disconnect();
+      mutationObserver?.disconnect();
+      if (layoutSettleFrame) window.cancelAnimationFrame(layoutSettleFrame);
       hideInteractiveAffordancePointers();
     };
   }, []);
@@ -483,11 +526,24 @@ function updateInteractiveAffordancePointers(clientX: number, clientY: number) {
     if (distance > maxDistance || interactiveAffordanceDisabled(target)) {
       continue;
     }
-    const pointer = interactiveAffordancePointerPercent(target, clientX, clientY, rect);
-    const opacity = Math.pow(1 - distance / maxDistance, 1.55);
-    target.style.setProperty("--interactive-pointer-x", `${pointer.x}%`);
-    target.style.setProperty("--interactive-pointer-y", `${pointer.y}%`);
-    target.style.setProperty("--interactive-pointer-opacity", opacity.toFixed(3));
+    // Single screen-space circle model: every target renders the SAME circle
+    // (centred on the real cursor, radius = sensing distance in absolute px). We
+    // write the cursor position in this element's LOCAL pixel space — it can fall
+    // outside the element (negative / larger than the box), which is what lets the
+    // one circle span neighbouring rows/buttons instead of each element lighting
+    // up on its own. The radial gradient in CSS does ALL the falloff, so the
+    // element-level opacity is just an on/off gate (no per-element dimming that
+    // would flatten the circle into a vertical band).
+    const localX = clientX - rect.left;
+    // Sliders keep the glow vertically centred on the track (the cursor rides the
+    // thumb but the highlight should hug the pill), everything else uses the real
+    // cursor Y so the single circle stays continuous across the element.
+    const localY = target.matches(".settings-style-slider-control")
+      ? rect.height / 2
+      : clientY - rect.top;
+    target.style.setProperty("--interactive-pointer-x", `${localX.toFixed(1)}px`);
+    target.style.setProperty("--interactive-pointer-y", `${localY.toFixed(1)}px`);
+    target.style.setProperty("--interactive-pointer-opacity", "1");
     nextLit.add(target);
   }
   // Extinguish targets that were lit last frame but are no longer in range.
@@ -543,14 +599,6 @@ function interactiveAffordanceDisabled(target: HTMLElement) {
   return target.matches(".settings-style-slider-control") && Boolean(target.querySelector("input:disabled"));
 }
 
-function interactiveAffordancePointerPercent(target: HTMLElement, clientX: number, clientY: number, rect: DOMRect) {
-  const pointer = pointerPercentForRect(clientX, clientY, rect);
-  if (target.matches(".settings-style-slider-control")) {
-    return { ...pointer, y: 50 };
-  }
-  return pointer;
-}
-
 function hideInteractiveAffordancePointers() {
   for (const target of litAffordanceTargets) {
     target.style.setProperty("--interactive-pointer-opacity", POINTER_OPACITY_HIDDEN);
@@ -596,21 +644,8 @@ function pointerEventInsideViewport(event: Event) {
   );
 }
 
-function pointerPercentForRect(clientX: number, clientY: number, rect: DOMRect) {
-  const x = ((clamp(clientX, rect.left, rect.right) - rect.left) / rect.width) * 100;
-  const y = ((clamp(clientY, rect.top, rect.bottom) - rect.top) / rect.height) * 100;
-  return {
-    x: clampPercent(x),
-    y: clampPercent(y)
-  };
-}
-
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
-}
-
-function clampPercent(value: number) {
-  return Math.min(100, Math.max(0, value));
 }
 
 function liquidGlassClassName(

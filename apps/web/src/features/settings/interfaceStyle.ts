@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 export const INTERFACE_STYLE_STORAGE_KEY = "megle.interfaceStyle";
 
-// Base cursor-proximity radius (px) at which an interactive affordance's circular
-// glow first ignites. The `pointerSensingDistance` preference scales this base, and
-// LiquidGlassSurface reads the resulting `--glass-pointer-sensing-distance` var per
-// frame instead of hardcoding the radius.
-export const POINTER_SENSING_DISTANCE_BASE_PX = 112;
+// Single screen-space circle model. The hover glow is ONE circle centred on the
+// cursor: full strength inside the bright core, fading to nothing at the sensing
+// distance (outer boundary). Both radii are absolute px so the circle stays the
+// same real size across every affordance it overlaps.
+//   - sensing distance (detection/gate radius): base * pointerSensingDistance
+//   - glow radius (visible halo, ≤ sensing):     sensing * pointerResponseRadius
+export const POINTER_SENSING_DISTANCE_BASE_PX = 80;
 
 export interface InterfaceStylePreference {
   windowCornerRadius: number;
@@ -28,10 +30,10 @@ export interface InterfaceStylePreference {
   ditherOpacity: number;
   backdropGradientStrength: number;
   edgeHighlightBrightness: number;
-  edgeHighlightSize: number;
   haloBrightness: number;
   pointerResponseRadius: number;
   pointerSensingDistance: number;
+  pointerFalloff: number;
   dialogBlur: number;
   dialogOpacity: number;
   dialogOverlayStrength: number;
@@ -58,10 +60,10 @@ export const DEFAULT_INTERFACE_STYLE: InterfaceStylePreference = {
   ditherOpacity: 1,
   backdropGradientStrength: 0.75,
   edgeHighlightBrightness: 6.5,
-  edgeHighlightSize: 1,
   haloBrightness: 1.45,
   pointerResponseRadius: 1,
   pointerSensingDistance: 1,
+  pointerFalloff: 2.2,
   dialogBlur: 1,
   dialogOpacity: 1,
   dialogOverlayStrength: 1,
@@ -86,10 +88,10 @@ export const INTERFACE_STYLE_LIMITS = {
   ditherOpacity: { min: 0, max: 2, step: 0.05 },
   backdropGradientStrength: { min: 0, max: 1.5, step: 0.05 },
   edgeHighlightBrightness: { min: 0, max: 8, step: 0.25 },
-  edgeHighlightSize: { min: 0.4, max: 2, step: 0.05 },
   haloBrightness: { min: 0, max: 2, step: 0.05 },
   pointerResponseRadius: { min: 0.4, max: 2, step: 0.05 },
   pointerSensingDistance: { min: 0.4, max: 2.5, step: 0.05 },
+  pointerFalloff: { min: 1, max: 4, step: 0.1 },
   dialogBlur: { min: 0, max: 2, step: 0.05 },
   dialogOpacity: { min: 0, max: 2, step: 0.05 },
   dialogOverlayStrength: { min: 0, max: 2, step: 0.05 },
@@ -198,11 +200,6 @@ export function normalizeInterfaceStyle(input: unknown): InterfaceStylePreferenc
       INTERFACE_STYLE_LIMITS.edgeHighlightBrightness,
       DEFAULT_INTERFACE_STYLE.edgeHighlightBrightness
     ),
-    edgeHighlightSize: clampNumber(
-      source.edgeHighlightSize,
-      INTERFACE_STYLE_LIMITS.edgeHighlightSize,
-      DEFAULT_INTERFACE_STYLE.edgeHighlightSize
-    ),
     haloBrightness: clampNumber(
       legacyValue(source, "haloBrightness", "pointerGlowBrightness"),
       INTERFACE_STYLE_LIMITS.haloBrightness,
@@ -217,6 +214,11 @@ export function normalizeInterfaceStyle(input: unknown): InterfaceStylePreferenc
       source.pointerSensingDistance,
       INTERFACE_STYLE_LIMITS.pointerSensingDistance,
       DEFAULT_INTERFACE_STYLE.pointerSensingDistance
+    ),
+    pointerFalloff: clampNumber(
+      source.pointerFalloff,
+      INTERFACE_STYLE_LIMITS.pointerFalloff,
+      DEFAULT_INTERFACE_STYLE.pointerFalloff
     ),
     dialogBlur: clampNumber(
       legacyValue(source, "dialogBlur", "glassBlur"),
@@ -296,10 +298,33 @@ export function interfaceStyleToCssVariables(
   );
   const controlAlpha = 0.085 * normalized.centerOpacity;
   const clearDimAlpha = 0.52 * normalized.centerOverlayStrength;
-  const pointerGlowSize = 150 * normalized.pointerResponseRadius;
   const pointerSensingDistance = POINTER_SENSING_DISTANCE_BASE_PX * normalized.pointerSensingDistance;
+  // The visible glow radius. Sensing distance is the detection/gate radius (how far
+  // from an element the glow ignites); the glow itself is drawn at this radius,
+  // scaled by pointerResponseRadius so the halo can be tighter or wider than the
+  // detection range. Clamped to the sensing distance so the gradient never extends
+  // past where the element is still a target.
+  const pointerGlowRadius = Math.min(
+    pointerSensingDistance,
+    pointerSensingDistance * normalized.pointerResponseRadius
+  );
   const pointerFillOpacity = 0.028 * normalized.haloBrightness;
-  const borderHighlightSize = 92 * normalized.edgeHighlightSize;
+  // Build the glow's radial-gradient color stops with a pow() falloff that decays
+  // from the centre (see pointerFalloffGradient). We sample alpha(d)=(1-d)^falloff
+  // across the circle and emit explicit stops; CSS interpolates linearly between
+  // them, approximating the curve.
+  const pointerFillGradient = pointerFalloffGradient(
+    (t) => `rgba(205, 240, 255, ${roundCssNumber(pointerFillOpacity * 3.4 * t)})`,
+    pointerGlowRadius,
+    normalized.pointerFalloff,
+    "transparent"
+  );
+  const pointerBorderGradient = pointerFalloffGradient(
+    (t) => `rgba(200, 244, 252, ${roundCssNumber(t)})`,
+    pointerGlowRadius,
+    normalized.pointerFalloff,
+    "transparent"
+  );
   const dialogFill = colorWithAlpha(
     normalized.centerOverlayColor,
     0.5 * normalized.dialogOverlayStrength * normalized.dialogOpacity
@@ -328,7 +353,6 @@ export function interfaceStyleToCssVariables(
     "--glass-edge-highlight-brightness": String(
       roundCssNumber(normalized.edgeHighlightBrightness)
     ),
-    "--glass-border-highlight-size": `${roundCssNumber(borderHighlightSize)}px`,
     "--glass-dialog-blur": `${roundCssNumber(34 * normalized.dialogBlur)}px`,
     "--glass-dialog-fill": dialogFill,
     "--dialog-blur": `${roundCssNumber(18 * normalized.dialogBlur)}px`,
@@ -342,9 +366,11 @@ export function interfaceStyleToCssVariables(
     "--glass-readable-surface": centerOverlay,
     "--glass-readable-surface-strong": centerOverlayStrong,
     "--glass-clear-dim": rgbWithAlpha(2, 5, 8, clearDimAlpha),
-    "--glass-pointer-glow-size": `${roundCssNumber(pointerGlowSize)}px`,
+    "--glass-pointer-glow-radius": `${roundCssNumber(pointerGlowRadius)}px`,
     "--glass-pointer-sensing-distance": `${roundCssNumber(pointerSensingDistance)}px`,
-    "--glass-pointer-fill-opacity": String(roundCssNumber(pointerFillOpacity))
+    "--glass-pointer-fill-opacity": String(roundCssNumber(pointerFillOpacity)),
+    "--glass-pointer-fill-stops": pointerFillGradient,
+    "--glass-pointer-border-stops": pointerBorderGradient
   };
 }
 
@@ -425,6 +451,32 @@ function hexToRgb(color: string) {
 
 function clampRounded(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+// Produce the color-stop list for a pointer-glow radial gradient with a pow()
+// falloff that decays from the CENTRE — full strength only at the exact cursor
+// point (distance 0), then alpha(d) = (1 - d/R)^falloff all the way out to the
+// sensing distance R where it reaches `outerColor` (transparent). There is no
+// solid inner core, so the glow is brightest dead-centre and fades continuously.
+// `colorAt(t)` maps the curve value t∈[0,1] (1 = full strength) to a color string.
+// Returns the stop list only (the `circle R at X Y,` prefix lives in CSS so the
+// cursor position can update per frame without recomputing the curve).
+function pointerFalloffGradient(
+  colorAt: (t: number) => string,
+  sensingDistance: number,
+  falloff: number,
+  outerColor: string
+) {
+  const SAMPLES = 6;
+  const stops: string[] = [`${colorAt(1)} 0`];
+  for (let i = 1; i <= SAMPLES; i += 1) {
+    const d = i / SAMPLES; // normalized distance from centre to boundary
+    const t = Math.pow(1 - d, falloff);
+    const position = roundCssNumber(d * sensingDistance);
+    const color = i === SAMPLES ? outerColor : colorAt(t);
+    stops.push(`${color} ${position}px`);
+  }
+  return stops.join(", ");
 }
 
 function rgbWithAlpha(red: number, green: number, blue: number, alpha: number) {

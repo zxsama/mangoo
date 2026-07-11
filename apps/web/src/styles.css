@@ -40,9 +40,28 @@
   --glass-edge-light: rgba(255, 255, 255, 0.34);
   --glass-inner-light: rgba(255, 255, 255, 0.12);
   --glass-edge-highlight-brightness: 6.5;
-  --glass-pointer-glow-size: 150px;
+  --glass-pointer-glow-radius: 80px;
+  --glass-pointer-sensing-distance: 80px;
   --glass-pointer-fill-opacity: 0.028;
-  --glass-border-highlight-size: 92px;
+  /* Fallback pow(2.2) falloff stops (interfaceStyle recomputes these from the
+     pointerFalloff setting). Decays from the centre — brightest at distance 0,
+     then a pow curve out to transparent at the glow radius. */
+  --glass-pointer-fill-stops:
+    rgba(205, 240, 255, 0.138) 0,
+    rgba(205, 240, 255, 0.092) 13.3px,
+    rgba(205, 240, 255, 0.056) 26.7px,
+    rgba(205, 240, 255, 0.03) 40px,
+    rgba(205, 240, 255, 0.012) 53.3px,
+    rgba(205, 240, 255, 0.003) 66.7px,
+    transparent 80px;
+  --glass-pointer-border-stops:
+    rgba(200, 244, 252, 1) 0,
+    rgba(200, 244, 252, 0.665) 13.3px,
+    rgba(200, 244, 252, 0.408) 26.7px,
+    rgba(200, 244, 252, 0.218) 40px,
+    rgba(200, 244, 252, 0.088) 53.3px,
+    rgba(200, 244, 252, 0.018) 66.7px,
+    transparent 80px;
   --glass-border-highlight-opacity: 0.28;
   --glass-dither-opacity: 0.055;
   --glass-backdrop-gradient-opacity: 0.75;
@@ -352,25 +371,9 @@ body {
   z-index: -1;
   opacity: calc(var(--interactive-pointer-opacity, 0) * var(--glass-background-glow-brightness));
   background:
-    var(--glass-dither-texture),
     radial-gradient(
-      circle var(--glass-pointer-glow-size) at var(--interactive-pointer-x, 50%) var(--interactive-pointer-y, 50%),
-      rgba(255, 255, 255, var(--glass-pointer-fill-opacity)),
-      transparent 100%
-    );
-  background-blend-mode: soft-light, normal;
-  background-size: 128px 128px, auto;
-  -webkit-mask-image:
-    radial-gradient(
-      circle var(--glass-pointer-glow-size) at var(--interactive-pointer-x, 50%) var(--interactive-pointer-y, 50%),
-      #000,
-      transparent 100%
-    );
-  mask-image:
-    radial-gradient(
-      circle var(--glass-pointer-glow-size) at var(--interactive-pointer-x, 50%) var(--interactive-pointer-y, 50%),
-      #000,
-      transparent 100%
+      circle var(--glass-pointer-glow-radius) at var(--interactive-pointer-x, 50%) var(--interactive-pointer-y, 50%),
+      var(--glass-pointer-fill-stops)
     );
 }
 
@@ -379,10 +382,8 @@ body {
   padding: 1px;
   background:
     radial-gradient(
-      circle var(--glass-border-highlight-size) at var(--interactive-pointer-x, 50%) var(--interactive-pointer-y, 50%),
-      rgba(222, 251, 255, 1),
-      rgba(151, 219, 226, 0.34) 38%,
-      transparent 68%
+      circle var(--glass-pointer-glow-radius) at var(--interactive-pointer-x, 50%) var(--interactive-pointer-y, 50%),
+      var(--glass-pointer-border-stops)
     );
   opacity: calc(var(--interactive-pointer-opacity, 0) * var(--glass-border-highlight-opacity) * var(--glass-edge-highlight-brightness));
   -webkit-mask:

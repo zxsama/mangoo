@@ -520,10 +520,10 @@ function AppearanceTab({ interfaceStyle }: { interfaceStyle: InterfaceStyleContr
       </SettingsGroup>
       <SettingsGroup title="交互高光">
         <StyleSlider id="edge-highlight-brightness" label="边缘高光亮度" max={limits.edgeHighlightBrightness.max} min={limits.edgeHighlightBrightness.min} onChange={(edgeHighlightBrightness) => setInterfaceStyle({ edgeHighlightBrightness })} step={limits.edgeHighlightBrightness.step} value={value.edgeHighlightBrightness} />
-        <StyleSlider id="edge-highlight-size" label="边缘高光大小" max={limits.edgeHighlightSize.max} min={limits.edgeHighlightSize.min} onChange={(edgeHighlightSize) => setInterfaceStyle({ edgeHighlightSize })} step={limits.edgeHighlightSize.step} value={value.edgeHighlightSize} />
         <StyleSlider id="halo-brightness" label="光晕亮度" max={limits.haloBrightness.max} min={limits.haloBrightness.min} onChange={(haloBrightness) => setInterfaceStyle({ haloBrightness })} step={limits.haloBrightness.step} value={value.haloBrightness} />
         <StyleSlider id="pointer-response-radius" label="指针响应半径" max={limits.pointerResponseRadius.max} min={limits.pointerResponseRadius.min} onChange={(pointerResponseRadius) => setInterfaceStyle({ pointerResponseRadius })} step={limits.pointerResponseRadius.step} value={value.pointerResponseRadius} />
         <StyleSlider id="pointer-sensing-distance" label="感应距离" max={limits.pointerSensingDistance.max} min={limits.pointerSensingDistance.min} onChange={(pointerSensingDistance) => setInterfaceStyle({ pointerSensingDistance })} step={limits.pointerSensingDistance.step} value={value.pointerSensingDistance} />
+        <StyleSlider id="pointer-falloff" label="衰减曲线" max={limits.pointerFalloff.max} min={limits.pointerFalloff.min} onChange={(pointerFalloff) => setInterfaceStyle({ pointerFalloff })} step={limits.pointerFalloff.step} value={value.pointerFalloff} />
       </SettingsGroup>
       <SettingsGroup title="对话框材质">
         <StyleSlider id="dialog-blur" label="对话框模糊" max={limits.dialogBlur.max} min={limits.dialogBlur.min} onChange={(dialogBlur) => setInterfaceStyle({ dialogBlur })} step={limits.dialogBlur.step} value={value.dialogBlur} />

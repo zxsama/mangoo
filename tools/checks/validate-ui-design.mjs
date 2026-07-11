@@ -1416,10 +1416,10 @@ for (const value of [
   "ditherOpacity",
   "backdropGradientStrength",
   "edgeHighlightBrightness",
-  "edgeHighlightSize",
   "haloBrightness",
   "pointerResponseRadius",
   "pointerSensingDistance",
+  "pointerFalloff",
   "dialogBlur",
   "dialogOpacity",
   "dialogOverlayStrength",
@@ -1447,8 +1447,8 @@ for (const value of [
   "--glass-dither-opacity",
   "--glass-backdrop-gradient-opacity",
   "--glass-pointer-sensing-distance",
+  "--glass-pointer-glow-radius",
   "--glass-edge-highlight-brightness",
-  "--glass-border-highlight-size",
   "--glass-dialog-blur",
   "--glass-dialog-fill",
   "--dialog-blur",
@@ -1508,10 +1508,10 @@ for (const value of [
   'id="dither-opacity"',
   'id="backdrop-gradient-strength"',
   'id="edge-highlight-brightness"',
-  'id="edge-highlight-size"',
   'id="halo-brightness"',
   'id="pointer-response-radius"',
   'id="pointer-sensing-distance"',
+  'id="pointer-falloff"',
   'id="dialog-blur"',
   'id="dialog-opacity"',
   'id="dialog-overlay-strength"',
@@ -1678,11 +1678,11 @@ const interactivePointerBackgroundBlocks = cssBlocksForExactSelector(
 if (
   !interactivePointerBackgroundBlocks.some(
     (block) =>
-      block.includes("--glass-dither-texture") &&
-      /background-blend-mode:\s*(?:soft-light|overlay),\s*normal/.test(block)
+      block.includes("--glass-pointer-fill-stops") &&
+      block.includes("--glass-pointer-glow-radius")
   )
 ) {
-  fail("interactive pointer background glow must include the global dither texture instead of drawing a clean banded radial gradient");
+  fail("interactive pointer background glow must draw the single screen-space circle (centre-decaying falloff stops within the glow radius, centred on the real cursor)");
 }
 
 const interactivePointerEdgeBlocks = cssBlocksForExactSelector(
@@ -1710,9 +1710,9 @@ for (const [token, minValue] of [
 }
 
 for (const value of [
-  "--glass-pointer-glow-size",
+  "--glass-pointer-glow-radius",
+  "--glass-pointer-sensing-distance",
   "--glass-pointer-fill-opacity",
-  "--glass-border-highlight-size",
   "--glass-border-highlight-opacity",
   "liquid-glass-edge",
   "mask-composite: exclude"
@@ -1723,8 +1723,8 @@ for (const value of [
 }
 
 const glassEdgeBlocks = cssBlocksForExactSelector(stylesForChecks, ".liquid-glass-edge");
-if (!liquidGlassSurface.includes("pointerPercentForRect")) {
-  fail("liquid glass pointer routing must write real cursor coordinates via pointerPercentForRect");
+if (!liquidGlassSurface.includes("clientX - rect.left")) {
+  fail("liquid glass pointer routing must write the real cursor position in element-local pixels (single screen-space circle model)");
 }
 if (!liquidGlassSurface.includes("style.setProperty(\"--interactive-pointer-x\"")) {
   fail("affordance pointer routing must write real cursor coordinates: missing --interactive-pointer-x");
