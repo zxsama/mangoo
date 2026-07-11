@@ -3,6 +3,7 @@ import { DampedMotionAxis, normalizeWheelDelta } from "../core/dampedMotion";
 
 type DampedScrollState = {
   frame: number;
+  lastFrameTime: number;
   x: DampedMotionAxis;
   y: DampedMotionAxis;
 };
@@ -58,15 +59,20 @@ export function useDampedWheelScroll(rootRef: RefObject<HTMLElement | null>): vo
         state.y.push(deltaY);
       }
       if (!state.frame) {
-        state.frame = window.requestAnimationFrame(() => stepScroll(target, state));
+        state.lastFrameTime = 0;
+        state.frame = window.requestAnimationFrame((frameTime) =>
+          stepScroll(target, state, frameTime)
+        );
       }
     }
 
-    function stepScroll(element: HTMLElement, state: DampedScrollState) {
+    function stepScroll(element: HTMLElement, state: DampedScrollState, frameTime: number) {
       state.frame = 0;
       let moved = false;
-      const xStep = state.x.step();
-      const yStep = state.y.step();
+      const elapsedMs = state.lastFrameTime > 0 ? frameTime - state.lastFrameTime : undefined;
+      state.lastFrameTime = frameTime;
+      const xStep = state.x.step(elapsedMs);
+      const yStep = state.y.step(elapsedMs);
 
       if (xStep !== 0) {
         const before = element.scrollLeft;
@@ -87,7 +93,11 @@ export function useDampedWheelScroll(rootRef: RefObject<HTMLElement | null>): vo
       }
 
       if (moved && (state.x.active || state.y.active)) {
-        state.frame = window.requestAnimationFrame(() => stepScroll(element, state));
+        state.frame = window.requestAnimationFrame((nextFrameTime) =>
+          stepScroll(element, state, nextFrameTime)
+        );
+      } else {
+        state.lastFrameTime = 0;
       }
     }
 
@@ -113,7 +123,8 @@ function stateForElement(
     return existing;
   }
   const state = {
-      frame: 0,
+    frame: 0,
+    lastFrameTime: 0,
     x: new DampedMotionAxis({
       acceleration: 0.42,
       accelerationDelta: 520,

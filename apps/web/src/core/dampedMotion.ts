@@ -11,6 +11,8 @@ const DEFAULT_ACCELERATION = 0;
 const DEFAULT_ACCELERATION_DELTA = 480;
 const DEFAULT_MAX_STEP = 900;
 const DEFAULT_STOP_THRESHOLD = 0.1;
+const REFERENCE_FRAME_MS = 1000 / 60;
+const MAX_FRAME_UNITS = 4;
 
 export class DampedMotionAxis {
   private acceleration: number;
@@ -46,13 +48,15 @@ export class DampedMotionAxis {
     );
   }
 
-  step(): number {
+  step(elapsedMs = REFERENCE_FRAME_MS): number {
     if (!this.active) {
       this.velocity = 0;
       return 0;
     }
-    const output = this.velocity;
-    this.velocity *= this.friction;
+    const frameUnits = normalizeFrameUnits(elapsedMs);
+    const decay = Math.pow(this.friction, frameUnits);
+    const output = this.velocity * ((1 - decay) / (1 - this.friction));
+    this.velocity *= decay;
     if (Math.abs(this.velocity) < this.stopThreshold) {
       this.velocity = 0;
     }
@@ -92,4 +96,11 @@ export function normalizeWheelDelta(
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function normalizeFrameUnits(elapsedMs: number): number {
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+    return 1;
+  }
+  return clamp(elapsedMs / REFERENCE_FRAME_MS, 0.25, MAX_FRAME_UNITS);
 }

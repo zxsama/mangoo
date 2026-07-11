@@ -44,6 +44,23 @@ describe("damped wheel motion", () => {
     );
   });
 
+  test("keeps damping duration stable across 60Hz and 120Hz frame intervals", () => {
+    const referenceFrameMs = 1000 / 60;
+    const wholeFrame = new DampedMotionAxis({ friction: 0.84 });
+    const halfFrames = new DampedMotionAxis({ friction: 0.84 });
+    wholeFrame.push(100);
+    halfFrames.push(100);
+
+    const wholeOutput = wholeFrame.step(referenceFrameMs);
+    const splitOutput =
+      halfFrames.step(referenceFrameMs / 2) + halfFrames.step(referenceFrameMs / 2);
+
+    assert.ok(
+      Math.abs(wholeOutput - splitOutput) < 0.000001,
+      `two 120Hz half-steps should match one 60Hz step ${splitOutput} ~= ${wholeOutput}`
+    );
+  });
+
   test("can make large wheel deltas respond with stronger initial acceleration", () => {
     const slow = new DampedMotionAxis({
       acceleration: 0.5,

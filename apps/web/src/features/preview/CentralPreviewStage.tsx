@@ -52,6 +52,7 @@ export function CentralPreviewStage({
     })
   );
   const wheelZoomFrameRef = useRef(0);
+  const wheelZoomLastFrameTimeRef = useRef(0);
   const wheelZoomAnchorRef = useRef<{ x: number; y: number } | null>(null);
   const { bindings } = useShortcutBindings();
   const [scale, setScale] = useState(1);
@@ -261,9 +262,14 @@ export function CentralPreviewStage({
     onViewStateChange({ mode: viewMode, scale });
   }, [onViewStateChange, scale, viewMode]);
 
-  const stepDampedWheelZoom = useCallback(() => {
+  const stepDampedWheelZoom = useCallback((frameTime: number) => {
     wheelZoomFrameRef.current = 0;
-    const step = wheelZoomAxisRef.current.step();
+    const elapsedMs =
+      wheelZoomLastFrameTimeRef.current > 0
+        ? frameTime - wheelZoomLastFrameTimeRef.current
+        : undefined;
+    wheelZoomLastFrameTimeRef.current = frameTime;
+    const step = wheelZoomAxisRef.current.step(elapsedMs);
     const anchor = wheelZoomAnchorRef.current ?? stageCenterPoint();
     if (step !== 0 && anchor) {
       const nextScale = scaleRef.current * Math.exp(-step * 0.0012);
@@ -271,6 +277,8 @@ export function CentralPreviewStage({
     }
     if (wheelZoomAxisRef.current.active) {
       wheelZoomFrameRef.current = window.requestAnimationFrame(stepDampedWheelZoom);
+    } else {
+      wheelZoomLastFrameTimeRef.current = 0;
     }
   }, [zoomAtPoint]);
 
@@ -286,6 +294,7 @@ export function CentralPreviewStage({
           normalizeWheelDelta(dominantDelta, event.deltaMode, 18, 800)
         );
         if (!wheelZoomFrameRef.current) {
+          wheelZoomLastFrameTimeRef.current = 0;
           wheelZoomFrameRef.current = window.requestAnimationFrame(stepDampedWheelZoom);
         }
         return;
@@ -310,6 +319,7 @@ export function CentralPreviewStage({
         window.cancelAnimationFrame(wheelZoomFrameRef.current);
       }
       wheelZoomFrameRef.current = 0;
+      wheelZoomLastFrameTimeRef.current = 0;
       wheelZoomAxisRef.current.stop();
     };
   }, [selectedMedia.id]);
