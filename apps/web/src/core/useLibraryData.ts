@@ -16,7 +16,7 @@ import type {
 } from "@megle/core-client";
 import { CoreApiError } from "@megle/core-client";
 import { createCoreClient } from "./client";
-import { readDesktopDiagnostics, type DesktopDiagnostics } from "./desktop";
+import { readDesktopDiagnostics, subscribeLibraryPhase, type DesktopDiagnostics } from "./desktop";
 import {
   isFreshThumbnailForMediaRecord,
   isLiveThumbnailResponseForMediaRecord,
@@ -1812,6 +1812,15 @@ export function useLibraryData(
 
   useEffect(() => {
     void loadLibrary();
+  }, [loadLibrary]);
+
+  useEffect(() => {
+    const unsubscribe = subscribeLibraryPhase((phase) => {
+      if (phase === "loading-media") {
+        void loadLibrary({ rootId: null, folderId: null });
+      }
+    });
+    return unsubscribe;
   }, [loadLibrary]);
 
   useEffect(() => {
