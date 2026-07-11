@@ -6763,6 +6763,10 @@ button:disabled {
   }
 }
 
+.library-sidebar-heading { display: flex; align-items: center; gap: 8px; padding: 8px 4px; }
+.library-switch-button { flex: 1; display: flex; align-items: center; justify-content: space-between; gap: 8px; background: transparent; border: 0; color: inherit; cursor: pointer; padding: 6px 8px; border-radius: var(--radius-control); }
+.library-switch-name { font-size: 14px; font-weight: 650; }
+
 .library-loading-overlay {
   position: absolute;
   inset: 0;

@@ -1,20 +1,20 @@
 import {
   ChevronDown,
   ChevronRight,
+  ChevronsUpDown,
   Folder,
   FolderOpen,
-  FolderPlus,
-  RefreshCw,
-  RotateCw
+  RefreshCw
 } from "lucide-react";
 import type { CSSProperties, RefObject } from "react";
-import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import type { FolderRecord, RootRecord } from "../../core/types";
-import { canPickNativeFolder, pickNativeFolder } from "../../core/desktop";
 import type { LibraryState } from "../../core/useLibraryData";
 
 interface LibrarySidebarProps {
   library: LibraryState;
+  onOpenSwitcher?: () => void;
+  activeLibraryName?: string;
   onRootContextMenu?: (event: {
     root: RootRecord;
     x: number;
@@ -34,35 +34,13 @@ const TREE_STICKY_TOLERANCE = 1;
 
 export function LibrarySidebar({
   library,
+  onOpenSwitcher = () => {},
+  activeLibraryName = "Library",
   onFolderContextMenu,
   onRootContextMenu
 }: LibrarySidebarProps) {
-  const [rootPath, setRootPath] = useState("");
   const sidebarRef = useRef<HTMLElement | null>(null);
-  const canPickFolder = canPickNativeFolder();
-  const selectedRootId = library.selectedRootId;
-  const selectedRoot = library.roots.find((root) => root.id === selectedRootId) ?? null;
-  const canRescan = selectedRootId !== null;
-  const rescanning = selectedRootId !== null && library.rescanningRootIds.has(selectedRootId);
   useTreeStickyOcclusion(sidebarRef);
-
-  async function submitRoot(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    await library.addRoot(rootPath);
-    setRootPath("");
-  }
-
-  async function chooseFolder() {
-    const folder = await pickNativeFolder();
-    if (folder) {
-      setRootPath(folder);
-    }
-  }
-
-  async function rescanSelectedRoot() {
-    if (selectedRootId === null) return;
-    await library.rescanRoot(selectedRootId);
-  }
 
   return (
     <aside
@@ -70,58 +48,25 @@ export function LibrarySidebar({
       ref={sidebarRef}
       aria-label="Library folders"
     >
-      <div className="sidebar-heading">
-        <div>
-          <div className="panel-title">Library</div>
-          <div className="panel-subtitle">{library.roots.length} roots</div>
-        </div>
+      <header className="library-sidebar-heading">
         <button
-          className="icon-button"
-          onClick={() => void library.refresh()}
-          title="Refresh"
           type="button"
+          className="library-switch-button"
+          data-pointer-glow="off"
+          onClick={onOpenSwitcher}
+        >
+          <span className="library-switch-name">{activeLibraryName ?? "Library"}</span>
+          <ChevronsUpDown size={14} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="library-refresh-button"
           aria-label="Refresh library"
+          onClick={() => void library.refresh()}
         >
-          <RefreshCw size={16} />
+          <RefreshCw size={14} aria-hidden="true" />
         </button>
-      </div>
-
-      <form className="root-form" onSubmit={submitRoot}>
-        <input
-          aria-label="Root path"
-          disabled={library.addingRoot}
-          onChange={(event) => setRootPath(event.target.value)}
-          placeholder="D:\\Pictures"
-          value={rootPath}
-        />
-        <button
-          className="icon-button"
-          disabled={!canPickFolder || library.addingRoot}
-          onClick={() => void chooseFolder()}
-          title={canPickFolder ? "Choose folder" : "Use path input"}
-          type="button"
-          aria-label="Choose folder"
-        >
-          <FolderPlus size={16} />
-        </button>
-        <button disabled={library.addingRoot || rootPath.trim().length === 0} type="submit">
-          Add
-        </button>
-        <button
-          className="icon-button"
-          disabled={!canRescan || rescanning}
-          onClick={() => void rescanSelectedRoot()}
-          title={
-            canRescan
-              ? `Rescan ${selectedRoot?.displayName ?? "selected root"}`
-              : "Select a root to rescan"
-          }
-          type="button"
-          aria-label="Rescan selected root"
-        >
-          <RotateCw size={16} />
-        </button>
-      </form>
+      </header>
 
       <div className="tree-list" role="tree" aria-label="Folder tree">
         {library.roots.map((root) => (
