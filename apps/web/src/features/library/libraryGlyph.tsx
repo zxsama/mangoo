@@ -80,3 +80,50 @@ export function LibraryGlyph({
     />
   );
 }
+
+// Preset icon + color grid, anchored under whatever opens it. Shared by the
+// library switcher popup and the Settings library-management tab so both edit
+// the same preset set identically. `onPick` receives the full (icon, color)
+// pair each click — icons keep the current color, swatches keep the current
+// icon — so the parent just persists it.
+export function LibraryIconPicker({
+  icon,
+  color,
+  onPick
+}: {
+  icon?: string;
+  color?: string;
+  onPick: (icon: string, color: string) => void;
+}) {
+  const currentIcon = icon ?? DEFAULT_LIBRARY_ICON;
+  const currentColor = color ?? DEFAULT_LIBRARY_COLOR;
+  return (
+    <div className="library-icon-picker">
+      <div className="library-icon-picker-grid">
+        {LIBRARY_ICONS.map(({ key }) => (
+          <button
+            key={key}
+            type="button"
+            className={`library-icon-picker-cell${key === currentIcon ? " selected" : ""}`}
+            aria-label={key}
+            onClick={() => onPick(key, currentColor)}
+          >
+            <LibraryGlyph icon={key} color={currentColor} size={16} />
+          </button>
+        ))}
+      </div>
+      <div className="library-icon-picker-colors">
+        {LIBRARY_COLORS.map((c) => (
+          <button
+            key={c}
+            type="button"
+            className={`library-icon-picker-swatch${c === currentColor ? " selected" : ""}`}
+            aria-label={c}
+            style={{ background: c }}
+            onClick={() => onPick(currentIcon, c)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}

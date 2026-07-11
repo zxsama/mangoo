@@ -1,19 +1,39 @@
 import {
+  Check,
   CheckCircle2,
   Database,
   FolderCog,
+  FolderMinus,
+  FolderPlus,
   Gauge,
   Images,
   Keyboard,
+  Library,
   Palette,
+  Pencil,
   RefreshCw,
   Settings2,
   Trash2,
   XCircle
 } from "lucide-react";
 import { useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
+import {
+  createLibrary,
+  deleteLibraryFile,
+  listLibraries,
+  openLibrary,
+  pickLibraryFile,
+  pickNativeFolder,
+  pickNewLibraryPath,
+  removeLibraryFromList,
+  renameLibraryEntry,
+  setLibraryIcon,
+  switchLibrary
+} from "../../core/desktop";
+import type { LibrarySummary } from "../../core/libraryTypes";
 import type { LibraryState } from "../../core/useLibraryData";
 import type { InterfaceStyleController } from "../../design/liquid-glass";
+import { LibraryGlyph, LibraryIconPicker } from "../library/libraryGlyph";
 import {
   LIBRARY_GRID_PREFERENCE_LIMITS,
   type LibraryGridPreferences
@@ -52,10 +72,17 @@ interface SettingsPanelsProps {
   previewPreferences: PreviewPreferences;
 }
 
-type SettingsTabId = "general" | "thumbnails" | "appearance" | "shortcuts" | "diagnostics";
+type SettingsTabId =
+  | "general"
+  | "libraries"
+  | "thumbnails"
+  | "appearance"
+  | "shortcuts"
+  | "diagnostics";
 
 const TABS: Array<{ id: SettingsTabId; label: string; icon: typeof Settings2 }> = [
   { id: "general", label: "常用", icon: Settings2 },
+  { id: "libraries", label: "资源库", icon: Library },
   { id: "thumbnails", label: "缩略图", icon: Images },
   { id: "appearance", label: "外观", icon: Palette },
   { id: "shortcuts", label: "快捷键", icon: Keyboard },
@@ -108,6 +135,7 @@ export function SettingsPanels({
               previewPreferences={previewPreferences}
             />
           ) : null}
+          {activeTab === "libraries" ? <LibrariesTab library={library} /> : null}
           {activeTab === "thumbnails" ? (
             <ThumbnailsTab
               library={library}
@@ -594,6 +622,263 @@ function ShortcutsTab() {
           );
         })}
       </div>
+    </>
+  );
+}
+
+// ---- Libraries tab: full library management (superset of the switcher) -----
+
+function LibrariesTab({ library }: { library: LibraryState }) {
+  const [libs, setLibs] = useState<LibrarySummary[]>([]);
+  const [iconMenuId, setIconMenuId] = useState<string | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const reload = () => void listLibraries().then(setLibs);
+  useEffect(() => {
+    reload();
+  }, []);
+
+  async function onSwitch(l: LibrarySummary) {
+    if (l.active || !l.available) return;
+    setIconMenuId(null);
+    setConfirmDeleteId(null);
+    const res = await switchLibrary(l.id);
+    if (!res.ok) setError(res.error ?? "切换失败");
+    reload();
+  }
+
+  async function onIconPick(l: LibrarySummary, icon: string, color: string) {
+    await setLibraryIcon(l.id, icon, color);
+    setIconMenuId(null);
+    reload();
+  }
+
+  async function commitRename(l: LibrarySummary) {
+    const name = renameValue.trim();
+    if (name && name !== l.name) {
+      await renameLibraryEntry(l.id, name);
+    }
+    setRenamingId(null);
+    reload();
+  }
+
+  async function onRemove(l: LibrarySummary) {
+    if (l.active) return;
+    await removeLibraryFromList(l.id);
+    reload();
+  }
+
+  async function onDeleteFile(l: LibrarySummary) {
+    if (l.active) return;
+    const res = await deleteLibraryFile(l.id);
+    if (!res.ok) setError(res.error ?? "删除失败");
+    setConfirmDeleteId(null);
+    setDeleteConfirmText("");
+    reload();
+  }
+
+  async function onCreate() {
+    const p = await pickNewLibraryPath("library");
+    if (!p) return;
+    const name = p.split(/[\\/]/).pop()?.replace(/\.sqlite$/i, "") ?? "library";
+    const res = await createLibrary({ name, dbPath: p });
+    if (!res.ok) setError(res.error ?? "创建失败");
+    reload();
+  }
+
+  async function onOpen() {
+    const p = await pickLibraryFile();
+    if (!p) return;
+    const res = await openLibrary(p);
+    if (!res.ok) setError(res.error ?? "打开失败");
+    reload();
+  }
+
+  async function onAddFolder() {
+    const folder = await pickNativeFolder();
+    if (folder) await library.addRoot(folder);
+  }
+
+  return (
+    <>
+      {error ? <div className="settings-inline-error">{error}</div> : null}
+      <SettingsGroup title="资源库列表">
+        <ul className="settings-library-list">
+          {libs.map((l) => (
+            <li
+              key={l.id}
+              className={`settings-library-row${l.active ? " active" : ""}${
+                l.available ? "" : " unavailable"
+              }`}
+            >
+              <div className="settings-library-main">
+                <div className="settings-library-icon-anchor">
+                  <button
+                    type="button"
+                    className="settings-library-icon"
+                    aria-label="更改图标"
+                    onClick={() => setIconMenuId((cur) => (cur === l.id ? null : l.id))}
+                  >
+                    <LibraryGlyph icon={l.icon} color={l.color} size={18} />
+                  </button>
+                  {iconMenuId === l.id ? (
+                    <LibraryIconPicker
+                      icon={l.icon}
+                      color={l.color}
+                      onPick={(icon, color) => void onIconPick(l, icon, color)}
+                    />
+                  ) : null}
+                </div>
+                <div className="settings-library-info">
+                  {renamingId === l.id ? (
+                    <input
+                      className="settings-library-rename"
+                      autoFocus
+                      value={renameValue}
+                      onChange={(event) => setRenameValue(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") void commitRename(l);
+                        if (event.key === "Escape") setRenamingId(null);
+                      }}
+                      onBlur={() => void commitRename(l)}
+                    />
+                  ) : (
+                    <div className="settings-library-name">
+                      <span>{l.name}</span>
+                      {l.active ? (
+                        <span className="settings-library-badge active">
+                          <Check size={12} aria-hidden="true" /> 当前
+                        </span>
+                      ) : null}
+                      {!l.available ? (
+                        <span className="settings-library-badge missing">文件缺失</span>
+                      ) : null}
+                    </div>
+                  )}
+                  <div className="settings-library-path" title={l.dbPath}>
+                    {l.dbPath}
+                  </div>
+                </div>
+                <div className="settings-library-actions">
+                  <button
+                    type="button"
+                    disabled={l.active || !l.available}
+                    onClick={() => void onSwitch(l)}
+                  >
+                    切换
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="重命名"
+                    title="重命名"
+                    onClick={() => {
+                      setRenamingId(l.id);
+                      setRenameValue(l.name);
+                    }}
+                  >
+                    <Pencil size={14} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    disabled={l.active}
+                    title={l.active ? "无法移除当前资源库" : "从列表移除（保留文件）"}
+                    onClick={() => void onRemove(l)}
+                  >
+                    移除
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-library-danger"
+                    disabled={l.active}
+                    aria-label="删除库文件"
+                    title={l.active ? "无法删除当前资源库" : "删除库文件（不可撤销）"}
+                    onClick={() => {
+                      setConfirmDeleteId((cur) => (cur === l.id ? null : l.id));
+                      setDeleteConfirmText("");
+                    }}
+                  >
+                    <Trash2 size={14} aria-hidden="true" />
+                  </button>
+                </div>
+              </div>
+              {confirmDeleteId === l.id ? (
+                <div className="settings-library-delete-confirm">
+                  <p>
+                    永久删除库文件并从磁盘移除，此操作不可撤销。输入库名{" "}
+                    <code>{l.name}</code> 以确认。
+                  </p>
+                  <div className="settings-library-delete-confirm-row">
+                    <input
+                      autoFocus
+                      value={deleteConfirmText}
+                      placeholder={l.name}
+                      onChange={(event) => setDeleteConfirmText(event.target.value)}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmDeleteId(null);
+                        setDeleteConfirmText("");
+                      }}
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      className="settings-library-danger"
+                      disabled={deleteConfirmText.trim() !== l.name}
+                      onClick={() => void onDeleteFile(l)}
+                    >
+                      删除
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+        <div className="settings-library-footer">
+          <button type="button" onClick={() => void onCreate()}>
+            创建资源库…
+          </button>
+          <button type="button" onClick={() => void onOpen()}>
+            打开其它资源库…
+          </button>
+        </div>
+      </SettingsGroup>
+
+      <SettingsGroup title="当前资源库的文件夹">
+        <ul className="settings-root-list">
+          {library.roots.length === 0 ? (
+            <li className="settings-root-empty">当前资源库还没有文件夹</li>
+          ) : (
+            library.roots.map((root) => (
+              <li key={root.id} className="settings-root-row">
+                <div className="settings-root-info">
+                  <div className="settings-root-name">{root.displayName}</div>
+                  <div className="settings-root-path" title={root.path}>
+                    {root.path}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="settings-root-remove"
+                  onClick={() => void library.removeRoot(root.id)}
+                >
+                  <FolderMinus size={14} aria-hidden="true" /> 移除
+                </button>
+              </li>
+            ))
+          )}
+        </ul>
+        <button type="button" className="settings-root-add" onClick={() => void onAddFolder()}>
+          <FolderPlus size={14} aria-hidden="true" /> 添加文件夹…
+        </button>
+      </SettingsGroup>
     </>
   );
 }

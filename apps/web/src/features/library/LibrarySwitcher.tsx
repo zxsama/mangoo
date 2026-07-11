@@ -14,8 +14,7 @@ import type { LibrarySummary } from "../../core/libraryTypes";
 import type { LibraryState } from "../../core/useLibraryData";
 import {
   LibraryGlyph,
-  LIBRARY_ICONS,
-  LIBRARY_COLORS,
+  LibraryIconPicker,
   DEFAULT_LIBRARY_ICON,
   DEFAULT_LIBRARY_COLOR,
 } from "./libraryGlyph";
@@ -129,33 +128,11 @@ export function LibrarySwitcher({
                     <LibraryGlyph icon={l.icon} color={l.color} size={16} />
                   </button>
                   {iconMenuLibraryId === l.id ? (
-                    <div className="library-icon-picker">
-                      <div className="library-icon-picker-grid">
-                        {LIBRARY_ICONS.map(({ key }) => (
-                          <button
-                            key={key}
-                            type="button"
-                            className={`library-icon-picker-cell${key === icon ? " selected" : ""}`}
-                            aria-label={key}
-                            onClick={() => void applyIcon(l, key, color)}
-                          >
-                            <LibraryGlyph icon={key} color={color} size={16} />
-                          </button>
-                        ))}
-                      </div>
-                      <div className="library-icon-picker-colors">
-                        {LIBRARY_COLORS.map((c) => (
-                          <button
-                            key={c}
-                            type="button"
-                            className={`library-icon-picker-swatch${c === color ? " selected" : ""}`}
-                            aria-label={c}
-                            style={{ background: c }}
-                            onClick={() => void applyIcon(l, icon, c)}
-                          />
-                        ))}
-                      </div>
-                    </div>
+                    <LibraryIconPicker
+                      icon={icon}
+                      color={color}
+                      onPick={(nextIcon, nextColor) => void applyIcon(l, nextIcon, nextColor)}
+                    />
                   ) : null}
                 </div>
                 <button

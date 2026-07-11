@@ -4829,6 +4829,263 @@ button:disabled {
   color: var(--text-muted);
 }
 
+/* ---- Libraries tab: full library management ---- */
+.settings-inline-error {
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  color: #ffb4a8;
+  background: rgba(228, 124, 115, 0.12);
+  border: 1px solid rgba(228, 124, 115, 0.3);
+  border-radius: var(--radius-control);
+}
+.settings-library-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.settings-library-row {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--glass-control, rgba(255, 255, 255, 0.03));
+}
+.settings-library-row.active {
+  border-color: rgba(124, 196, 255, 0.4);
+  background: rgba(124, 196, 255, 0.08);
+}
+.settings-library-row.unavailable {
+  opacity: 0.6;
+}
+.settings-library-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.settings-library-icon-anchor {
+  position: relative;
+  flex: 0 0 auto;
+}
+.settings-library-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  color: inherit;
+  cursor: pointer;
+}
+.settings-library-icon:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--line);
+}
+.settings-library-info {
+  flex: 1;
+  min-width: 0;
+}
+.settings-library-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+.settings-library-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: var(--radius-pill);
+}
+.settings-library-badge.active {
+  color: #cbe6ff;
+  background: rgba(124, 196, 255, 0.18);
+}
+.settings-library-badge.missing {
+  color: #ffb4a8;
+  background: rgba(228, 124, 115, 0.16);
+}
+.settings-library-path {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.settings-library-rename {
+  width: 100%;
+  padding: 4px 8px;
+  font-size: 13px;
+  color: var(--text-soft);
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--accent, #7cc4ff);
+  border-radius: var(--radius-control);
+  outline: 0;
+}
+.settings-library-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.settings-library-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+.settings-library-actions button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+.settings-library-actions button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.settings-library-danger {
+  color: #ffb4a8 !important;
+}
+.settings-library-danger:hover:not(:disabled) {
+  background: rgba(228, 124, 115, 0.16) !important;
+  border-color: rgba(228, 124, 115, 0.4) !important;
+}
+.settings-library-delete-confirm {
+  margin-top: 8px;
+  padding: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+.settings-library-delete-confirm p {
+  margin: 0 0 8px;
+  line-height: 1.5;
+}
+.settings-library-delete-confirm code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 11.5px;
+}
+.settings-library-delete-confirm-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.settings-library-delete-confirm-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  color: var(--text-soft);
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  outline: 0;
+}
+.settings-library-delete-confirm-row button {
+  min-height: 30px;
+  padding: 0 12px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+.settings-library-delete-confirm-row button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.settings-library-footer {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.settings-library-footer button {
+  flex: 1;
+  min-height: 32px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+.settings-library-footer button:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.settings-root-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+.settings-root-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+}
+.settings-root-info {
+  flex: 1;
+  min-width: 0;
+}
+.settings-root-name {
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+.settings-root-path {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.settings-root-empty {
+  padding: 10px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  text-align: center;
+}
+.settings-root-remove,
+.settings-root-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+.settings-root-remove:hover,
+.settings-root-add:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.settings-root-add {
+  margin-top: 10px;
+}
+
 @media (max-width: 620px) {
   .settings-dialog-layout {
     grid-template-columns: 1fr;

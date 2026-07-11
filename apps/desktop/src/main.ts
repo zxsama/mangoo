@@ -82,8 +82,14 @@ function persistRegistry(next: libraryRegistry.LibraryRegistry): void {
   libraryRegistry.saveRegistry(userDataDir(), next);
 }
 function pushLibraryPhase(phase: unknown): void {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("megle:library-load-phase", phase);
+  // Broadcast to BOTH windows: the main window drives the loading overlay, but
+  // the separate settings window runs its own useLibraryData (Libraries tab +
+  // thumbnail stats). Without this, switching a library from Settings would
+  // leave the settings window's roots/media pointed at the pre-restart state.
+  for (const win of [mainWindow, settingsWindow]) {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("megle:library-load-phase", phase);
+    }
   }
 }
 function toSummaries(reg: libraryRegistry.LibraryRegistry): Array<{
@@ -371,6 +377,31 @@ ipcMain.handle("megle:rename-library", (_e, libraryId: string, name: string) => 
 ipcMain.handle("megle:set-library-icon", (_e, libraryId: string, icon: string, color: string) => {
   persistRegistry(libraryRegistry.setLibraryIcon(getRegistry(), libraryId, icon, color));
   return { ok: true };
+});
+
+// Destructive: delete the library's .sqlite (plus its WAL/SHM sidecars) from
+// disk AND drop it from the registry. Forbidden on the active library — Core
+// holds that file open (Windows would fail the unlink anyway), and the UI greys
+// the action. The renderer performs its own second confirmation before calling.
+ipcMain.handle("megle:delete-library-file", (_e, libraryId: string) => {
+  const reg = getRegistry();
+  const target = reg.libraries.find((l) => l.id === libraryId);
+  if (!target) return { ok: false, error: "library not found" };
+  if (reg.activeLibraryId === libraryId) {
+    return { ok: false, error: "cannot delete the active library" };
+  }
+  try {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const filePath = target.dbPath + suffix;
+      if (fsSync.existsSync(filePath)) {
+        fsSync.rmSync(filePath, { force: true });
+      }
+    }
+    persistRegistry(libraryRegistry.removeLibrary(reg, libraryId));
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error) };
+  }
 });
 
 ipcMain.handle("megle:pick-library-file", async () => {
