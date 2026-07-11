@@ -297,6 +297,20 @@ export function LibraryCenterPane({
         : visibleSubfolderEntries
             .slice(0, SUBFOLDER_CHILD_PROBE_LIMIT)
             .map((_, index) => index);
+    // SUBFOLDER_CHILD_PROBE_LIMIT is a *concurrency* cap, not a per-pass cap.
+    // Count folder-child loads already in flight and only probe up to the
+    // remaining budget. Without this, each pass probed a fresh batch of LIMIT
+    // and the synchronous `setLoadingFolderIds` inside requestFolderChildren
+    // re-ran this effect (loadingFolderIds is a dep), which probed the NEXT
+    // batch, and so on — a synchronous nested-update cascade that walked the
+    // whole priority list and tripped React's "maximum update depth" guard on
+    // libraries with many subfolders. Gating on in-flight count bounds the
+    // cascade: once LIMIT loads are outstanding a re-run probes nothing and
+    // waits for async completions to free budget.
+    const probeBudget = SUBFOLDER_CHILD_PROBE_LIMIT - library.loadingFolderIds.size;
+    if (probeBudget <= 0) {
+      return;
+    }
     const folderIds = new Set<number>();
     for (const index of probeIndexes) {
       const folder = visibleSubfolderEntries[index]?.folder;
@@ -310,7 +324,7 @@ export function LibraryCenterPane({
       ) {
         folderIds.add(folder.id);
       }
-      if (folderIds.size >= SUBFOLDER_CHILD_PROBE_LIMIT) {
+      if (folderIds.size >= probeBudget) {
         break;
       }
     }
