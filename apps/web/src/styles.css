@@ -6762,3 +6762,25 @@ button:disabled {
     display: none;
   }
 }
+
+.library-loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  z-index: 5;
+  pointer-events: none;
+}
+.library-loading-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 28px 40px;
+  pointer-events: auto;
+}
+.library-loading-spinner { animation: library-loading-spin 900ms linear infinite; }
+@keyframes library-loading-spin { to { transform: rotate(360deg); } }
+.library-loading-text,
+.library-loading-error-text { font-size: 13px; color: var(--text-soft); }
+.library-loading-actions { display: flex; gap: 10px; margin-top: 4px; }
