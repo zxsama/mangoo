@@ -1529,9 +1529,10 @@ if (!librarySidebar.includes("loadMoreFolderChildren") || !librarySidebar.includ
 if (!/rescanRoot:\s*\(rootId:\s*number\)\s*=>\s*Promise<void>/.test(useLibraryData)) {
   fail("useLibraryData must expose a typed rescanRoot action");
 }
-if (!librarySidebar.includes("rescanRoot") || librarySidebar.includes("Rescan is not available from the current Core API")) {
-  fail("LibrarySidebar must wire rescan to the supported Core enqueueScan capability");
-}
+// Rescan is no longer wired in LibrarySidebar: the multi-library redesign moved
+// root management (add/remove/rescan) out of the sidebar into the library switcher
+// popup + Settings. The rescanRoot capability must still exist on useLibraryData
+// (checked above) for those surfaces to call; it just isn't in the sidebar anymore.
 for (const value of ["addingRoot", "scanActive"]) {
   if (!useLibraryData.includes(value)) {
     fail(`useLibraryData must keep separate ${value} state`);
