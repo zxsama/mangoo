@@ -1765,7 +1765,7 @@ if (
       block.includes("var(--glass-control)")
   )
 ) {
-  fail("Interface style slider controls must expose a single global visual stroke owner for local pointer highlights");
+  fail("Interface style slider controls must reserve a 1px border box (transparent by default) so the local pointer highlight has a stroke to trace");
 }
 
 for (const functionName of [

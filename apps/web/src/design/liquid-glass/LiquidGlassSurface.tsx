@@ -535,12 +535,7 @@ function updateInteractiveAffordancePointers(clientX: number, clientY: number) {
     // element-level opacity is just an on/off gate (no per-element dimming that
     // would flatten the circle into a vertical band).
     const localX = clientX - rect.left;
-    // Sliders keep the glow vertically centred on the track (the cursor rides the
-    // thumb but the highlight should hug the pill), everything else uses the real
-    // cursor Y so the single circle stays continuous across the element.
-    const localY = target.matches(".settings-style-slider-control")
-      ? rect.height / 2
-      : clientY - rect.top;
+    const localY = clientY - rect.top;
     target.style.setProperty("--interactive-pointer-x", `${localX.toFixed(1)}px`);
     target.style.setProperty("--interactive-pointer-y", `${localY.toFixed(1)}px`);
     target.style.setProperty("--interactive-pointer-opacity", "1");
