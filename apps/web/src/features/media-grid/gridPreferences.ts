@@ -3,25 +3,36 @@ const LIBRARY_GRID_PREFERENCES_STORAGE_KEY = "megle.library.grid-preferences";
 export interface LibraryGridPreferences {
   folderEdgeShadowAlpha: number;
   folderTileGap: number;
-  folderTileLabelHeight: number;
+  // Real CSS line-height (px) for a folder tile's name — the name renders on up
+  // to two lines with that line-height, so descenders are never clipped.
+  folderTileLabelLineHeight: number;
+  // Vertical gap (px) between a folder thumbnail and its name block.
+  folderTileLabelGap: number;
   tileGap: number;
-  tileLabelHeight: number;
+  // Real CSS line-height (px) for a media tile's name (two-line clamp).
+  tileLabelLineHeight: number;
+  // Vertical gap (px) between a media thumbnail and its name block.
+  tileLabelGap: number;
 }
 
 export const DEFAULT_LIBRARY_GRID_PREFERENCES: LibraryGridPreferences = {
   folderEdgeShadowAlpha: 25,
   folderTileGap: 7,
-  folderTileLabelHeight: 17,
+  folderTileLabelLineHeight: 15,
+  folderTileLabelGap: 4,
   tileGap: 7,
-  tileLabelHeight: 17
+  tileLabelLineHeight: 15,
+  tileLabelGap: 4
 };
 
 export const LIBRARY_GRID_PREFERENCE_LIMITS = {
   folderEdgeShadowAlpha: { min: 0, max: 75, step: 1 },
   folderTileGap: { min: 4, max: 20, step: 1 },
-  folderTileLabelHeight: { min: 14, max: 40, step: 1 },
+  folderTileLabelLineHeight: { min: 12, max: 26, step: 1 },
+  folderTileLabelGap: { min: 0, max: 16, step: 1 },
   tileGap: { min: 4, max: 20, step: 1 },
-  tileLabelHeight: { min: 14, max: 40, step: 1 }
+  tileLabelLineHeight: { min: 12, max: 26, step: 1 },
+  tileLabelGap: { min: 0, max: 16, step: 1 }
 } as const;
 
 export function readStoredLibraryGridPreferences(): LibraryGridPreferences {
@@ -51,40 +62,30 @@ export function storeLibraryGridPreferences(value: LibraryGridPreferences) {
 export function normalizeLibraryGridPreferences(
   value: Partial<LibraryGridPreferences>
 ): LibraryGridPreferences {
-  const tileGap = clampPreference(
-    value.tileGap,
-    LIBRARY_GRID_PREFERENCE_LIMITS.tileGap.min,
-    LIBRARY_GRID_PREFERENCE_LIMITS.tileGap.max,
-    DEFAULT_LIBRARY_GRID_PREFERENCES.tileGap
-  );
-  const tileLabelHeight = clampPreference(
-    value.tileLabelHeight,
-    LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelHeight.min,
-    LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelHeight.max,
-    DEFAULT_LIBRARY_GRID_PREFERENCES.tileLabelHeight
-  );
+  const tileGap = clampField(value.tileGap, "tileGap");
+  const tileLabelLineHeight = clampField(value.tileLabelLineHeight, "tileLabelLineHeight");
+  const tileLabelGap = clampField(value.tileLabelGap, "tileLabelGap");
   return {
-    folderEdgeShadowAlpha: clampPreference(
-      value.folderEdgeShadowAlpha,
-      LIBRARY_GRID_PREFERENCE_LIMITS.folderEdgeShadowAlpha.min,
-      LIBRARY_GRID_PREFERENCE_LIMITS.folderEdgeShadowAlpha.max,
-      DEFAULT_LIBRARY_GRID_PREFERENCES.folderEdgeShadowAlpha
+    folderEdgeShadowAlpha: clampField(value.folderEdgeShadowAlpha, "folderEdgeShadowAlpha"),
+    folderTileGap: clampField(value.folderTileGap, "folderTileGap"),
+    folderTileLabelLineHeight: clampField(
+      value.folderTileLabelLineHeight,
+      "folderTileLabelLineHeight"
     ),
-    folderTileGap: clampPreference(
-      value.folderTileGap,
-      LIBRARY_GRID_PREFERENCE_LIMITS.folderTileGap.min,
-      LIBRARY_GRID_PREFERENCE_LIMITS.folderTileGap.max,
-      tileGap
-    ),
-    folderTileLabelHeight: clampPreference(
-      value.folderTileLabelHeight,
-      LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelHeight.min,
-      LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelHeight.max,
-      tileLabelHeight
-    ),
+    folderTileLabelGap: clampField(value.folderTileLabelGap, "folderTileLabelGap"),
     tileGap,
-    tileLabelHeight
+    tileLabelLineHeight,
+    tileLabelGap
   };
+}
+
+function clampField(value: number | undefined, key: keyof LibraryGridPreferences) {
+  return clampPreference(
+    value,
+    LIBRARY_GRID_PREFERENCE_LIMITS[key].min,
+    LIBRARY_GRID_PREFERENCE_LIMITS[key].max,
+    DEFAULT_LIBRARY_GRID_PREFERENCES[key]
+  );
 }
 
 function clampPreference(

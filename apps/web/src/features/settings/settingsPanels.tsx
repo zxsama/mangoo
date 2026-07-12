@@ -129,8 +129,6 @@ export function SettingsPanels({
         <div className="settings-dialog-content" role="tabpanel">
           {activeTab === "general" ? (
             <GeneralTab
-              gridPreferences={gridPreferences}
-              onGridPreferencesChange={onGridPreferencesChange}
               onPreviewPreferencesChange={onPreviewPreferencesChange}
               previewPreferences={previewPreferences}
             />
@@ -143,7 +141,13 @@ export function SettingsPanels({
               previewPreferences={previewPreferences}
             />
           ) : null}
-          {activeTab === "appearance" ? <AppearanceTab interfaceStyle={interfaceStyle} /> : null}
+          {activeTab === "appearance" ? (
+            <AppearanceTab
+              interfaceStyle={interfaceStyle}
+              gridPreferences={gridPreferences}
+              onGridPreferencesChange={onGridPreferencesChange}
+            />
+          ) : null}
           {activeTab === "shortcuts" ? <ShortcutsTab /> : null}
           {activeTab === "diagnostics" ? <DiagnosticsTab library={library} /> : null}
         </div>
@@ -164,72 +168,14 @@ function SettingsGroup({ title, children }: { title: string; children: ReactNode
 // ---- General tab: browsing + grid spacing + memory buffers -----------------
 
 function GeneralTab({
-  gridPreferences,
-  onGridPreferencesChange,
   onPreviewPreferencesChange,
   previewPreferences
 }: {
-  gridPreferences: LibraryGridPreferences;
-  onGridPreferencesChange: (patch: Partial<LibraryGridPreferences>) => void;
   onPreviewPreferencesChange: (patch: Partial<PreviewPreferences>) => void;
   previewPreferences: PreviewPreferences;
 }) {
   return (
     <>
-      <SettingsGroup title="媒体网格">
-        <StyleSlider
-          id="library-grid-gap"
-          label="缩略图间距"
-          max={LIBRARY_GRID_PREFERENCE_LIMITS.tileGap.max}
-          min={LIBRARY_GRID_PREFERENCE_LIMITS.tileGap.min}
-          onChange={(tileGap) => onGridPreferencesChange({ tileGap })}
-          step={LIBRARY_GRID_PREFERENCE_LIMITS.tileGap.step}
-          unit="px"
-          value={gridPreferences.tileGap}
-        />
-        <StyleSlider
-          id="library-grid-label-height"
-          label="名称行高"
-          max={LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelHeight.max}
-          min={LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelHeight.min}
-          onChange={(tileLabelHeight) => onGridPreferencesChange({ tileLabelHeight })}
-          step={LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelHeight.step}
-          unit="px"
-          value={gridPreferences.tileLabelHeight}
-        />
-      </SettingsGroup>
-      <SettingsGroup title="文件夹网格">
-        <StyleSlider
-          id="library-folder-grid-gap"
-          label="文件夹缩略图间距"
-          max={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileGap.max}
-          min={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileGap.min}
-          onChange={(folderTileGap) => onGridPreferencesChange({ folderTileGap })}
-          step={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileGap.step}
-          unit="px"
-          value={gridPreferences.folderTileGap}
-        />
-        <StyleSlider
-          id="library-folder-grid-label-height"
-          label="文件夹名称行高"
-          max={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelHeight.max}
-          min={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelHeight.min}
-          onChange={(folderTileLabelHeight) => onGridPreferencesChange({ folderTileLabelHeight })}
-          step={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelHeight.step}
-          unit="px"
-          value={gridPreferences.folderTileLabelHeight}
-        />
-        <StyleSlider
-          id="library-folder-edge-shadow-alpha"
-          label="文件夹边缘阴影"
-          max={LIBRARY_GRID_PREFERENCE_LIMITS.folderEdgeShadowAlpha.max}
-          min={LIBRARY_GRID_PREFERENCE_LIMITS.folderEdgeShadowAlpha.min}
-          onChange={(folderEdgeShadowAlpha) => onGridPreferencesChange({ folderEdgeShadowAlpha })}
-          step={LIBRARY_GRID_PREFERENCE_LIMITS.folderEdgeShadowAlpha.step}
-          unit="%"
-          value={gridPreferences.folderEdgeShadowAlpha}
-        />
-      </SettingsGroup>
       <SettingsGroup title="浏览缓存 (内存)">
         <p className="settings-note">
           控制浏览时 Megle 在内存中保留的原图与缩略图数据量。持久缩略图缓存存储在 SQLite
@@ -473,7 +419,15 @@ function StatCell({ label, value }: { label: string; value: string }) {
 
 // ---- Appearance tab: liquid-glass interface style --------------------------
 
-function AppearanceTab({ interfaceStyle }: { interfaceStyle: InterfaceStyleController }) {
+function AppearanceTab({
+  interfaceStyle,
+  gridPreferences,
+  onGridPreferencesChange
+}: {
+  interfaceStyle: InterfaceStyleController;
+  gridPreferences: LibraryGridPreferences;
+  onGridPreferencesChange: (patch: Partial<LibraryGridPreferences>) => void;
+}) {
   const { limits, value, resetInterfaceStyle, setInterfaceStyle } = interfaceStyle;
   return (
     <>
@@ -483,6 +437,82 @@ function AppearanceTab({ interfaceStyle }: { interfaceStyle: InterfaceStyleContr
           恢复默认外观
         </button>
       </div>
+      <SettingsGroup title="媒体网格">
+        <StyleSlider
+          id="library-grid-gap"
+          label="缩略图间距"
+          max={LIBRARY_GRID_PREFERENCE_LIMITS.tileGap.max}
+          min={LIBRARY_GRID_PREFERENCE_LIMITS.tileGap.min}
+          onChange={(tileGap) => onGridPreferencesChange({ tileGap })}
+          step={LIBRARY_GRID_PREFERENCE_LIMITS.tileGap.step}
+          unit="px"
+          value={gridPreferences.tileGap}
+        />
+        <StyleSlider
+          id="library-grid-label-line-height"
+          label="名称行高"
+          max={LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelLineHeight.max}
+          min={LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelLineHeight.min}
+          onChange={(tileLabelLineHeight) => onGridPreferencesChange({ tileLabelLineHeight })}
+          step={LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelLineHeight.step}
+          unit="px"
+          value={gridPreferences.tileLabelLineHeight}
+        />
+        <StyleSlider
+          id="library-grid-label-gap"
+          label="文件名距离"
+          max={LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelGap.max}
+          min={LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelGap.min}
+          onChange={(tileLabelGap) => onGridPreferencesChange({ tileLabelGap })}
+          step={LIBRARY_GRID_PREFERENCE_LIMITS.tileLabelGap.step}
+          unit="px"
+          value={gridPreferences.tileLabelGap}
+        />
+      </SettingsGroup>
+      <SettingsGroup title="文件夹网格">
+        <StyleSlider
+          id="library-folder-grid-gap"
+          label="文件夹缩略图间距"
+          max={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileGap.max}
+          min={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileGap.min}
+          onChange={(folderTileGap) => onGridPreferencesChange({ folderTileGap })}
+          step={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileGap.step}
+          unit="px"
+          value={gridPreferences.folderTileGap}
+        />
+        <StyleSlider
+          id="library-folder-grid-label-line-height"
+          label="文件夹名称行高"
+          max={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelLineHeight.max}
+          min={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelLineHeight.min}
+          onChange={(folderTileLabelLineHeight) =>
+            onGridPreferencesChange({ folderTileLabelLineHeight })
+          }
+          step={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelLineHeight.step}
+          unit="px"
+          value={gridPreferences.folderTileLabelLineHeight}
+        />
+        <StyleSlider
+          id="library-folder-grid-label-gap"
+          label="文件夹文件名距离"
+          max={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelGap.max}
+          min={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelGap.min}
+          onChange={(folderTileLabelGap) => onGridPreferencesChange({ folderTileLabelGap })}
+          step={LIBRARY_GRID_PREFERENCE_LIMITS.folderTileLabelGap.step}
+          unit="px"
+          value={gridPreferences.folderTileLabelGap}
+        />
+        <StyleSlider
+          id="library-folder-edge-shadow-alpha"
+          label="文件夹边缘阴影"
+          max={LIBRARY_GRID_PREFERENCE_LIMITS.folderEdgeShadowAlpha.max}
+          min={LIBRARY_GRID_PREFERENCE_LIMITS.folderEdgeShadowAlpha.min}
+          onChange={(folderEdgeShadowAlpha) => onGridPreferencesChange({ folderEdgeShadowAlpha })}
+          step={LIBRARY_GRID_PREFERENCE_LIMITS.folderEdgeShadowAlpha.step}
+          unit="%"
+          value={gridPreferences.folderEdgeShadowAlpha}
+        />
+      </SettingsGroup>
       <SettingsGroup title="圆角">
         <StyleSlider
           id="window-corner-radius"

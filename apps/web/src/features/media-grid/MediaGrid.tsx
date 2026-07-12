@@ -76,11 +76,11 @@ const originalFallbackObjectUrlCache = new Map<string, string>();
 const EMPTY_MEDIA_ITEMS: MediaRecord[] = [];
 type MediaGridCssVariables = CSSProperties & {
   "--library-tile-label-gap": string;
-  "--library-tile-label-visible-height": string;
+  "--library-tile-label-line-height": string;
   "--subfolder-edge-shadow-alpha": string;
   "--subfolder-label-gap": string;
   "--subfolder-label-height": string;
-  "--subfolder-label-visible-height": string;
+  "--subfolder-label-line-height": string;
   "--subfolder-cover-height": string;
   "--subfolder-row-gap": string;
   "--subfolder-tile-gap": string;
@@ -376,12 +376,20 @@ export function MediaGrid({
   );
   const layoutItems =
     windowedMedia || justifiedFullTotal ? EMPTY_MEDIA_ITEMS : orderedLoadedMedia;
+  // The name occupies a fixed two-line block: the thumbnail→name gap plus two
+  // lines at the configured line-height. Reserving exactly this keeps the
+  // virtualizer row height stable while letting descenders render (names use a
+  // real line-height + 2-line clamp instead of a clipped single-line box).
+  const tileLabelBlockHeight =
+    gridPreferences.tileLabelGap + gridPreferences.tileLabelLineHeight * 2;
+  const folderTileLabelBlockHeight =
+    gridPreferences.folderTileLabelGap + gridPreferences.folderTileLabelLineHeight * 2;
   const layout = useMemo(
     () =>
       buildLayoutGeometry({
         gap: gridPreferences.tileGap,
         items: layoutItems,
-        labelHeight: gridPreferences.tileLabelHeight,
+        labelHeight: tileLabelBlockHeight,
         layoutMode,
         viewportWidth: viewportSize.width,
         tileMinWidth: workbenchLayout.tileMinWidth,
@@ -395,7 +403,7 @@ export function MediaGrid({
       }),
     [
       gridPreferences.tileGap,
-      gridPreferences.tileLabelHeight,
+      tileLabelBlockHeight,
       layoutItems,
       layoutMode,
       viewportSize.width,
@@ -410,14 +418,14 @@ export function MediaGrid({
       buildMediaWindowGeometry({
         count: mediaItemCount,
         gap: gridPreferences.tileGap,
-        labelHeight: gridPreferences.tileLabelHeight,
+        labelHeight: tileLabelBlockHeight,
         layoutMode,
         tileMinWidth: workbenchLayout.tileMinWidth,
         viewportWidth: viewportSize.width
       }),
     [
       gridPreferences.tileGap,
-      gridPreferences.tileLabelHeight,
+      tileLabelBlockHeight,
       layoutMode,
       mediaItemCount,
       viewportSize.width
@@ -431,7 +439,7 @@ export function MediaGrid({
       buildFolderWindowGeometry({
         count: folderSection && !folderSection.collapsed ? folderSection.itemCount : 0,
         gap: gridPreferences.folderTileGap,
-        labelHeight: gridPreferences.folderTileLabelHeight,
+        labelHeight: folderTileLabelBlockHeight,
         tileMinWidth: workbenchLayout.tileMinWidth,
         viewportWidth: viewportSize.width
       }),
@@ -439,7 +447,7 @@ export function MediaGrid({
       folderSection?.collapsed,
       folderSection?.itemCount,
       gridPreferences.folderTileGap,
-      gridPreferences.folderTileLabelHeight,
+      folderTileLabelBlockHeight,
       viewportSize.width
     ]
   );
@@ -971,38 +979,29 @@ export function MediaGrid({
     visibleMediaSignatureKey
   ]);
 
-  const tileLabelGap = resolveTileLabelGap(gridPreferences.tileLabelHeight);
-  const tileLabelVisibleHeight = Math.max(
-    12,
-    gridPreferences.tileLabelHeight - tileLabelGap
-  );
-  const folderTileLabelGap = resolveTileLabelGap(gridPreferences.folderTileLabelHeight);
-  const folderTileLabelVisibleHeight = Math.max(
-    12,
-    gridPreferences.folderTileLabelHeight - folderTileLabelGap
-  );
   const gridStyle = useMemo<MediaGridCssVariables>(
     () => ({
-      "--library-tile-label-gap": `${tileLabelGap}px`,
-      "--library-tile-label-visible-height": `${tileLabelVisibleHeight}px`,
+      "--library-tile-label-gap": `${gridPreferences.tileLabelGap}px`,
+      "--library-tile-label-line-height": `${gridPreferences.tileLabelLineHeight}px`,
       "--subfolder-edge-shadow-alpha": `${gridPreferences.folderEdgeShadowAlpha / 100}`,
-      "--subfolder-label-gap": `${folderTileLabelGap}px`,
-      "--subfolder-label-height": `${gridPreferences.folderTileLabelHeight}px`,
-      "--subfolder-label-visible-height": `${folderTileLabelVisibleHeight}px`,
+      "--subfolder-label-gap": `${gridPreferences.folderTileLabelGap}px`,
+      "--subfolder-label-line-height": `${gridPreferences.folderTileLabelLineHeight}px`,
+      "--subfolder-label-height": `${folderTileLabelBlockHeight}px`,
       "--subfolder-cover-height": `${folderWindow.coverHeight}px`,
       "--subfolder-row-gap": `${folderWindow.rowGap}px`,
       "--subfolder-tile-gap": `${gridPreferences.folderTileGap}px`
     }),
     [
-      folderTileLabelGap,
-      folderTileLabelVisibleHeight,
+      folderTileLabelBlockHeight,
       folderWindow.coverHeight,
       folderWindow.rowGap,
       gridPreferences.folderEdgeShadowAlpha,
       gridPreferences.folderTileGap,
-      gridPreferences.folderTileLabelHeight,
-      tileLabelGap,
-      tileLabelVisibleHeight
+      gridPreferences.folderTileLabelGap,
+      gridPreferences.folderTileLabelLineHeight,
+      gridPreferences.tileLabelGap,
+      gridPreferences.tileLabelLineHeight,
+      tileLabelBlockHeight
     ]
   );
 
@@ -1382,7 +1381,7 @@ export function MediaGrid({
             mediaWindow,
             layoutMode,
             gridPreferences.tileGap,
-            gridPreferences.tileLabelHeight
+            tileLabelBlockHeight
           );
           const selected = item ? item.id === selectedMediaId : false;
           const thumbnailLoadPriority: ThumbnailRequestPriority = selected
@@ -1411,7 +1410,7 @@ export function MediaGrid({
               >
                 {item ? (
                   <MediaTile
-                    labelGap={tileLabelGap}
+                    labelGap={gridPreferences.tileLabelGap}
                     item={item}
                     layoutMode={layoutMode}
                     onContextMenu={onContextMenu}
@@ -1487,7 +1486,7 @@ export function MediaGrid({
                 role="gridcell"
               >
                 <MediaTile
-                  labelGap={tileLabelGap}
+                  labelGap={gridPreferences.tileLabelGap}
                   item={item}
                   layoutMode={layoutMode}
                   onContextMenu={onContextMenu}
@@ -1730,9 +1729,6 @@ function MediaTileSkeleton({
   );
 }
 
-function resolveTileLabelGap(tileLabelHeight: number) {
-  return Math.max(1, Math.round(tileLabelHeight / 6));
-}
 
 function compactMediaSlots(mediaSlots: Map<number, MediaRecord>) {
   return Array.from(mediaSlots.entries())
