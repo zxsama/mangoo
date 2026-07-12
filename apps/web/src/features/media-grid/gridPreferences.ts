@@ -1,38 +1,34 @@
 const LIBRARY_GRID_PREFERENCES_STORAGE_KEY = "megle.library.grid-preferences";
 
+// One unified set of grid controls shared by BOTH the media tile grid and the
+// folder cover grid (they used to be two parallel sets). Only the folder edge
+// shadow is folder-specific.
 export interface LibraryGridPreferences {
-  folderEdgeShadowAlpha: number;
-  folderTileGap: number;
-  // Real CSS line-height (px) for a folder tile's name — the name renders on up
-  // to two lines with that line-height, so descenders are never clipped.
-  folderTileLabelLineHeight: number;
-  // Vertical gap (px) between a folder thumbnail and its name block.
-  folderTileLabelGap: number;
+  // Gap (px) between tiles/covers in the grid.
   tileGap: number;
-  // Real CSS line-height (px) for a media tile's name (two-line clamp).
-  tileLabelLineHeight: number;
-  // Vertical gap (px) between a media thumbnail and its name block.
-  tileLabelGap: number;
+  // Real CSS line-height (px) for a name line. Names render on up to two lines
+  // with this line-height; it controls line spacing ONLY and never moves the
+  // name toward or away from the thumbnail (that is labelGap's job).
+  labelLineHeight: number;
+  // Vertical distance (px) between a thumbnail/cover and its name. Controls the
+  // name's position ONLY; independent of line-height.
+  labelGap: number;
+  // Folder-cover edge shadow strength (%), folder grid only.
+  folderEdgeShadowAlpha: number;
 }
 
 export const DEFAULT_LIBRARY_GRID_PREFERENCES: LibraryGridPreferences = {
-  folderEdgeShadowAlpha: 25,
-  folderTileGap: 7,
-  folderTileLabelLineHeight: 15,
-  folderTileLabelGap: 4,
   tileGap: 7,
-  tileLabelLineHeight: 15,
-  tileLabelGap: 4
+  labelLineHeight: 15,
+  labelGap: 4,
+  folderEdgeShadowAlpha: 25
 };
 
 export const LIBRARY_GRID_PREFERENCE_LIMITS = {
-  folderEdgeShadowAlpha: { min: 0, max: 75, step: 1 },
-  folderTileGap: { min: 4, max: 20, step: 1 },
-  folderTileLabelLineHeight: { min: 12, max: 26, step: 1 },
-  folderTileLabelGap: { min: 0, max: 16, step: 1 },
   tileGap: { min: 4, max: 20, step: 1 },
-  tileLabelLineHeight: { min: 12, max: 26, step: 1 },
-  tileLabelGap: { min: 0, max: 16, step: 1 }
+  labelLineHeight: { min: 12, max: 26, step: 1 },
+  labelGap: { min: 0, max: 16, step: 1 },
+  folderEdgeShadowAlpha: { min: 0, max: 75, step: 1 }
 } as const;
 
 export function readStoredLibraryGridPreferences(): LibraryGridPreferences {
@@ -62,20 +58,11 @@ export function storeLibraryGridPreferences(value: LibraryGridPreferences) {
 export function normalizeLibraryGridPreferences(
   value: Partial<LibraryGridPreferences>
 ): LibraryGridPreferences {
-  const tileGap = clampField(value.tileGap, "tileGap");
-  const tileLabelLineHeight = clampField(value.tileLabelLineHeight, "tileLabelLineHeight");
-  const tileLabelGap = clampField(value.tileLabelGap, "tileLabelGap");
   return {
-    folderEdgeShadowAlpha: clampField(value.folderEdgeShadowAlpha, "folderEdgeShadowAlpha"),
-    folderTileGap: clampField(value.folderTileGap, "folderTileGap"),
-    folderTileLabelLineHeight: clampField(
-      value.folderTileLabelLineHeight,
-      "folderTileLabelLineHeight"
-    ),
-    folderTileLabelGap: clampField(value.folderTileLabelGap, "folderTileLabelGap"),
-    tileGap,
-    tileLabelLineHeight,
-    tileLabelGap
+    tileGap: clampField(value.tileGap, "tileGap"),
+    labelLineHeight: clampField(value.labelLineHeight, "labelLineHeight"),
+    labelGap: clampField(value.labelGap, "labelGap"),
+    folderEdgeShadowAlpha: clampField(value.folderEdgeShadowAlpha, "folderEdgeShadowAlpha")
   };
 }
 

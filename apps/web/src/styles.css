@@ -1921,6 +1921,8 @@ button:disabled {
   width: 100%;
   max-width: 100%;
   height: calc(var(--subfolder-label-line-height, 15px) * 2);
+  /* Same line-height/position decoupling as .tile-label (font-size 12.5px). */
+  margin-top: calc((12.5px - var(--subfolder-label-line-height, 15px)) / 2);
   overflow: hidden;
   text-overflow: ellipsis;
   overflow-wrap: anywhere;
@@ -2236,7 +2238,12 @@ button:disabled {
   max-width: 100%;
   min-width: 0;
   height: calc(var(--library-tile-label-line-height, 15px) * 2);
-  margin-top: 0;
+  /* Decouple line-height from position: the thumbnail→name distance is the tile's
+     flex gap (名称距离). A larger line-height would otherwise push the first line
+     down by its half-leading; cancel that half-leading here so the name's top
+     stays put and 名称行距 only changes the spacing between the two lines.
+     (13px = this label's font-size.) */
+  margin-top: calc((13px - var(--library-tile-label-line-height, 15px)) / 2);
   line-height: var(--library-tile-label-line-height, 15px);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2284,7 +2291,7 @@ button:disabled {
 .media-tile--waterfall .tile-label {
   height: calc(var(--library-tile-label-line-height, 15px) * 2);
   min-height: 0;
-  margin-top: 0;
+  margin-top: calc((13px - var(--library-tile-label-line-height, 15px)) / 2);
   line-height: var(--library-tile-label-line-height, 15px);
   text-align: center;
 }
