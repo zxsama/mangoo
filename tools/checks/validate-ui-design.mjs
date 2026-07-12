@@ -678,28 +678,14 @@ if (/\.workbench-column\s*>\s*\.liquid-glass-edge[\s\S]*?display:\s*none/.test(s
   fail("workbench columns must keep pointer-driven liquid-glass edge layers active");
 }
 
-const windowEdgeFrameBlock = cssBlocksForSelector(stylesForChecks, ".window-edge-frame").join("\n");
-const windowEdgeFrameBeforeBlock = cssBlocksForSelector(stylesForChecks, ".window-edge-frame::before").join("\n");
-if (
-  !appShell.includes('className="window-edge-frame"') ||
-  !/inset:\s*1px/.test(windowEdgeFrameBlock) ||
-  !/border-radius:\s*calc\(var\(--radius-window\)\s*-\s*1px\)/.test(windowEdgeFrameBlock) ||
-  !/background:\s*var\(--glass-window-stroke\)/.test(windowEdgeFrameBeforeBlock) ||
-  !/padding:\s*1px/.test(windowEdgeFrameBeforeBlock) ||
-  !/-webkit-mask-composite:\s*xor/.test(windowEdgeFrameBeforeBlock) ||
-  !/mask-composite:\s*exclude/.test(windowEdgeFrameBeforeBlock)
-) {
-  fail("app shell outer stroke must be a dedicated top-level window edge frame (static masked border), not a pane override or plain border");
-}
-// The window edge frame must NOT re-introduce a pointer-follow glow: the mouse
-// highlight is unified into the interactive-affordance system only (elements),
-// never on the window frame / background. Guard against regression.
-const windowEdgeFrameAfterBlock = cssBlocksForSelector(stylesForChecks, ".window-edge-frame::after").join("\n");
-if (
-  windowEdgeFrameAfterBlock.includes("--glass-pointer-x") ||
-  liquidGlassSurface.includes("updateWindowEdgePointers")
-) {
-  fail("window edge frame must not have a pointer-follow glow (unified highlight lives on interactive affordance targets only)");
+// The window edge is the clip-path rounded corner only (html/body/#root/.app-shell
+// clip to --radius-window); there is no separate masked edge-frame layer. The old
+// .window-edge-frame drew a 1px mask-composite stroke at calc(--radius-window - 1px)
+// whose rounded corners could not coincide with the clip on the realtime
+// compositor. Guard against a pointer-follow glow regression on any reintroduced
+// window frame — the mouse highlight lives only on interactive affordance targets.
+if (liquidGlassSurface.includes("updateWindowEdgePointers")) {
+  fail("window edge must not have a pointer-follow glow (unified highlight lives on interactive affordance targets only)");
 }
 
 if (
@@ -1782,24 +1768,19 @@ for (const functionName of [
 }
 
 const glassBackdropBlocks = cssBlocksForExactSelector(stylesForChecks, ".liquid-glass-backdrop");
-if (
-  !glassBackdropBlocks.some(
-    (block) =>
-      /filter:\s*url\("#megle-liquid-glass-refraction"\)/.test(block) &&
-      hasNonNoneDeclaration(block, "backdrop-filter")
-  )
-) {
-  fail("liquid glass surfaces must keep CSS backdrop blur plus SVG refraction active in the renderer");
+// The glass backdrop composites exactly like the settings window: a translucent
+// fill plus a real backdrop-filter blur over the Electron acrylic.
+if (!glassBackdropBlocks.some((block) => hasNonNoneDeclaration(block, "backdrop-filter"))) {
+  fail("liquid glass backdrop must apply a real backdrop-filter blur over the window backdrop");
 }
 
-if (
-  glassBackdropBlocks.some(
-    (block) =>
-      /filter:\s*url\("#megle-liquid-glass-refraction"\)/.test(block) &&
-      /box-shadow\s*:/.test(block)
-  )
-) {
-  fail("liquid glass refraction backdrop must not draw 1px edge shadows; filtered edge lines create jagged/noisy borders");
+// It must NOT carry an isolating `filter:` (e.g. the retired SVG refraction). A
+// filter renders the layer into an offscreen buffer and neutralizes
+// backdrop-filter, so the frost stops sampling the acrylic backdrop — that is
+// the "not layered the normal way" bug this replaced. (backdrop-filter and
+// -webkit-backdrop-filter are allowed; a bare filter: is not.)
+if (glassBackdropBlocks.some((block) => /(?<![\w-])filter\s*:\s*url\(/.test(block))) {
+  fail("liquid glass backdrop must not apply an isolating filter: url() (breaks backdrop-filter compositing over acrylic)");
 }
 
 const glassStructureBorderBlocks = cssBlocksForExactSelector(stylesForChecks, ".liquid-glass::after");
@@ -2962,8 +2943,10 @@ function assertMiddleTitlebarButtonsUseUnifiedGlow() {
     }
   }
 
-  // The open menu / active tool keeps a steady refracted backdrop so it reads as
-  // selected even when the cursor's glow is elsewhere.
+  // The open menu / active tool keeps a steady readable backdrop (opacity 1 + a
+  // real backdrop-filter blur) so it reads as selected even when the cursor's
+  // glow is elsewhere. It composites like the settings frost — no isolating
+  // filter: url() (that neutralized backdrop-filter over the acrylic).
   for (const selector of [
     '.shell-titlebar-center .titlebar-tool-button[data-glass-active="true"] > .liquid-glass-backdrop',
     '.shell-titlebar-center .sort-menu-trigger-open > .liquid-glass-backdrop'
@@ -2973,11 +2956,10 @@ function assertMiddleTitlebarButtonsUseUnifiedGlow() {
       !blocks.some(
         (block) =>
           latestDeclarationValue(block, "opacity") === "1" &&
-          hasNonNoneDeclaration(block, "backdrop-filter") &&
-          /filter:\s*url\("#megle-liquid-glass-refraction"\)/.test(block)
+          hasNonNoneDeclaration(block, "backdrop-filter")
       )
     ) {
-      fail(`${selector} must keep a refracted steady backdrop for the active/open titlebar tool`);
+      fail(`${selector} must keep a steady readable backdrop for the active/open titlebar tool`);
     }
   }
 }

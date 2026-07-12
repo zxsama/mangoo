@@ -11,7 +11,6 @@
   --glass-control: rgba(246, 252, 255, 0.085);
   --glass-elevated: transparent;
   --glass-border: rgba(255, 255, 255, 0.14);
-  --glass-window-stroke: rgba(255, 255, 255, 0.22);
   --glass-border-strong: rgba(151, 219, 226, 0.42);
   --glass-side-blur: 26px;
   --glass-side-fill: rgba(8, 12, 16, 0.38);
@@ -275,7 +274,12 @@ body {
   background: var(--glass-fill);
   -webkit-backdrop-filter: blur(var(--glass-blur-current)) saturate(var(--glass-saturation));
   backdrop-filter: blur(var(--glass-blur-current)) saturate(var(--glass-saturation));
-  filter: url("#megle-liquid-glass-refraction");
+  /* Composite exactly like the settings window: a translucent fill plus a real
+     backdrop-filter blur over the Electron acrylic. Do NOT add an SVG `filter:`
+     here — a filter renders this layer into an isolated offscreen buffer, which
+     neutralizes backdrop-filter so the frost stops sampling the window backdrop.
+     That isolating refraction filter was the reason the main window's glass did
+     not layer the normal way. The SVG refraction is retired (design pivoted). */
 }
 
 /* The lens sheen, ::before aura, and edge trace were part of the retired
@@ -669,35 +673,11 @@ body {
   transform: translateX(50%);
 }
 
-.window-edge-frame,
-.window-edge-frame::before {
-  position: absolute;
-  content: "";
-  pointer-events: none;
-}
-
-.window-edge-frame {
-  inset: 1px;
-  z-index: 80;
-  border-radius: calc(var(--radius-window) - 1px);
-}
-
-.window-edge-frame::before {
-  inset: 0;
-  border-radius: inherit;
-  padding: 1px;
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  mask-composite: exclude;
-  background: var(--glass-window-stroke);
-  opacity: 0.72;
-}
-
+/* The window edge is the clean clip-path rounded corner (html/body/#root/.app-shell
+   all clip to --radius-window). The old .window-edge-frame drew an extra 1px
+   mask-composite outline at calc(--radius-window - 1px); its rounded corners could
+   not perfectly coincide with the clip on the realtime compositor, leaving a seam.
+   The settings window (the frost target) has no such stroke, so it was removed. */
 .shell-backdrop-canvas {
   position: absolute;
   inset: 0;
@@ -6985,7 +6965,6 @@ button:disabled {
   background: rgba(255, 255, 255, 0.06);
   -webkit-backdrop-filter: blur(var(--glass-control-blur)) saturate(var(--glass-saturation));
   backdrop-filter: blur(var(--glass-control-blur)) saturate(var(--glass-saturation));
-  filter: url("#megle-liquid-glass-refraction");
   box-shadow: none;
 }
 

@@ -146,10 +146,6 @@ export function AppShell({
       style={shellStyle}
     >
       <div className="shell-backdrop-canvas" aria-hidden="true" />
-      <div
-        className="window-edge-frame"
-        aria-hidden="true"
-      />
       {sidebarsHidden ? null : (
         <>
           <div
