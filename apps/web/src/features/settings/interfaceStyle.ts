@@ -41,7 +41,10 @@ export interface InterfaceStylePreference {
 }
 
 export const DEFAULT_INTERFACE_STYLE: InterfaceStylePreference = {
-  windowCornerRadius: 12,
+  // Match the Windows 11 native frameless window corner (DWM rounds top-level
+  // windows at 8px). The CSS content clip must equal the native radius, else a
+  // larger CSS radius curves inside the native corner and shows a double corner.
+  windowCornerRadius: 8,
   surfaceCornerRadius: 18,
   controlCornerRadius: 10,
   contentCornerRadius: 8,
@@ -71,7 +74,7 @@ export const DEFAULT_INTERFACE_STYLE: InterfaceStylePreference = {
 };
 
 export const INTERFACE_STYLE_LIMITS = {
-  windowCornerRadius: { min: 12, max: 12, step: 1 },
+  windowCornerRadius: { min: 0, max: 16, step: 1 },
   surfaceCornerRadius: { min: 10, max: 28, step: 1 },
   controlCornerRadius: { min: 6, max: 20, step: 1 },
   contentCornerRadius: { min: 0, max: 18, step: 1 },

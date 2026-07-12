@@ -482,7 +482,6 @@ function AppearanceTab({
       <SettingsGroup title="圆角">
         <StyleSlider
           id="window-corner-radius"
-          disabled
           label="窗口圆角"
           max={limits.windowCornerRadius.max}
           min={limits.windowCornerRadius.min}

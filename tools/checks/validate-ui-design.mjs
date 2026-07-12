@@ -666,8 +666,12 @@ if (stylesForChecks.includes("--radius-window-host")) {
   fail("window radius must use a single global --radius-window parameter, not separate host/window radius tokens");
 }
 
-if (!/--radius-window:\s*12px/.test(stylesForChecks)) {
-  fail("global window radius must be fixed to 12px to match the native DWM host corner");
+// The CSS fallback (before interfaceStyle writes the live --radius-window) must
+// default to 8px — the native Windows 11 DWM host corner. The value is
+// user-adjustable at runtime (窗口圆角); a value larger than the native corner
+// curves the CSS content inside it and shows a double corner.
+if (!/--radius-window:\s*8px/.test(stylesForChecks)) {
+  fail("global window radius fallback must default to 8px to match the native Windows 11 DWM host corner");
 }
 
 if (/\.workbench-column::after[\s\S]*?border-color:\s*transparent/.test(stylesForChecks)) {
@@ -1452,8 +1456,8 @@ for (const value of [
 }
 
 const defaultInterfaceStyleBody = extractObjectBody(interfaceStyle, "DEFAULT_INTERFACE_STYLE");
-if (!/windowCornerRadius:\s*12\b/.test(defaultInterfaceStyleBody)) {
-  fail("default window corner radius must be fixed to 12px to match Windows DWM's native host radius");
+if (!/windowCornerRadius:\s*8\b/.test(defaultInterfaceStyleBody)) {
+  fail("default window corner radius must default to 8 to match Windows DWM's native host radius (user-adjustable at runtime)");
 }
 
 if (!/haloBrightness:\s*(?:1\.[2-9]\d*|[2-9](?:\.\d+)?)\b/.test(defaultInterfaceStyleBody)) {
