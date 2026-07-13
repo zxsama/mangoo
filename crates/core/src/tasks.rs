@@ -226,10 +226,10 @@ pub fn start_worker_with_ffmpeg(
     // WAL checkpoints are run by the single writer actor between job batches
     // (see DbWriter), so no separate checkpoint thread/connection is needed.
     //
-    // NOTE: worker blob commits still use `worker_database` directly for now;
-    // routing them through `writer` is the remaining step of the single-writer
-    // migration. Held here so the handle is threaded and ready.
-    let _writer = writer;
+    // Thumbnail blob commits are routed through `writer` (see
+    // try_spawn_thumbnail_task): decode/resize stays parallel on the
+    // spawn_blocking thread, only the tiny publish write is serialized by the
+    // single writer actor, which checkpoints the WAL between batches.
     let (sender, mut receiver) = mpsc::channel(128);
     let (task_completion_sender, mut task_completion_receiver) = mpsc::unbounded_channel();
     let thumbnail_permits = ThumbnailWorkerPermits {
@@ -243,6 +243,7 @@ pub fn start_worker_with_ffmpeg(
         let mut in_flight_non_thumbnail_task_ids = HashSet::new();
         schedule_pending_worker_tasks_with_concurrency(
             &mut worker_database,
+            &writer,
             ffmpeg_available,
             &thumbnail_permits,
             &non_thumbnail_permit,
@@ -271,6 +272,7 @@ pub fn start_worker_with_ffmpeg(
                         in_flight_non_thumbnail_task_ids.remove(&completed_task_id);
                         schedule_pending_worker_tasks_with_concurrency(
                             &mut worker_database,
+                            &writer,
                             ffmpeg_available,
                             &thumbnail_permits,
                             &non_thumbnail_permit,
@@ -285,6 +287,7 @@ pub fn start_worker_with_ffmpeg(
                         Some(task_id) => {
                             dispatch_worker_task_with_concurrency(
                                 &mut worker_database,
+                                &writer,
                                 task_id,
                                 ffmpeg_available,
                                 &thumbnail_permits,
@@ -295,6 +298,7 @@ pub fn start_worker_with_ffmpeg(
                             );
                             schedule_pending_worker_tasks_with_concurrency(
                                 &mut worker_database,
+                                &writer,
                                 ffmpeg_available,
                                 &thumbnail_permits,
                                 &non_thumbnail_permit,
@@ -311,6 +315,7 @@ pub fn start_worker_with_ffmpeg(
                 _ = idle_drain_interval.tick() => {
                     schedule_pending_worker_tasks_with_concurrency(
                         &mut worker_database,
+                        &writer,
                         ffmpeg_available,
                         &thumbnail_permits,
                         &non_thumbnail_permit,
@@ -333,7 +338,7 @@ fn replay_startup_recovery_task_ids_with_after_each(
     mut after_each: impl FnMut(&mut Database, i64),
 ) {
     for &task_id in task_ids {
-        run_task(database, task_id, ffmpeg_available);
+        run_task(database, None, task_id, ffmpeg_available);
         after_each(database, task_id);
         drain_pending_persisted_tasks(database, ffmpeg_available);
     }
@@ -362,7 +367,7 @@ fn drain_pending_persisted_tasks(database: &mut Database, ffmpeg_available: bool
         }
     };
     for task_id in pending_task_ids {
-        run_task(database, task_id, ffmpeg_available);
+        run_task(database, None, task_id, ffmpeg_available);
     }
 }
 
@@ -394,6 +399,7 @@ fn reconcile_in_flight_non_thumbnail_task_ids(
 
 fn schedule_pending_worker_tasks_with_concurrency(
     database: &mut Database,
+    writer: &DbWriter,
     ffmpeg_available: bool,
     thumbnail_permits: &ThumbnailWorkerPermits,
     non_thumbnail_permit: &Arc<Semaphore>,
@@ -413,6 +419,7 @@ fn schedule_pending_worker_tasks_with_concurrency(
     for task_id in pending_task_ids {
         dispatch_worker_task_with_concurrency(
             database,
+            writer,
             task_id,
             ffmpeg_available,
             thumbnail_permits,
@@ -427,6 +434,7 @@ fn schedule_pending_worker_tasks_with_concurrency(
 #[cfg(test)]
 fn schedule_pending_tasks_with_thumbnail_concurrency(
     database: &mut Database,
+    writer: &DbWriter,
     ffmpeg_available: bool,
     thumbnail_permits: &ThumbnailWorkerPermits,
     thumbnail_completion_sender: &mpsc::UnboundedSender<i64>,
@@ -443,6 +451,7 @@ fn schedule_pending_tasks_with_thumbnail_concurrency(
     for task_id in pending_task_ids {
         dispatch_task_with_thumbnail_concurrency(
             database,
+            writer,
             task_id,
             ffmpeg_available,
             thumbnail_permits,
@@ -455,6 +464,7 @@ fn schedule_pending_tasks_with_thumbnail_concurrency(
 #[cfg(test)]
 fn dispatch_task_with_thumbnail_concurrency(
     database: &mut Database,
+    writer: &DbWriter,
     task_id: i64,
     ffmpeg_available: bool,
     thumbnail_permits: &ThumbnailWorkerPermits,
@@ -463,6 +473,7 @@ fn dispatch_task_with_thumbnail_concurrency(
 ) {
     match try_spawn_thumbnail_task(
         database,
+        writer,
         task_id,
         ffmpeg_available,
         thumbnail_permits,
@@ -472,11 +483,12 @@ fn dispatch_task_with_thumbnail_concurrency(
         ThumbnailSpawnResult::Spawned | ThumbnailSpawnResult::Deferred => return,
         ThumbnailSpawnResult::NotThumbnail => {}
     }
-    run_task(database, task_id, ffmpeg_available);
+    run_task(database, None, task_id, ffmpeg_available);
 }
 
 fn dispatch_worker_task_with_concurrency(
     database: &mut Database,
+    writer: &DbWriter,
     task_id: i64,
     ffmpeg_available: bool,
     thumbnail_permits: &ThumbnailWorkerPermits,
@@ -487,6 +499,7 @@ fn dispatch_worker_task_with_concurrency(
 ) {
     match try_spawn_thumbnail_task(
         database,
+        writer,
         task_id,
         ffmpeg_available,
         thumbnail_permits,
@@ -507,7 +520,7 @@ fn dispatch_worker_task_with_concurrency(
         ThumbnailSpawnResult::Spawned | ThumbnailSpawnResult::Deferred => return,
         ThumbnailSpawnResult::NotThumbnail => {}
     }
-    run_task(database, task_id, ffmpeg_available);
+    run_task(database, None, task_id, ffmpeg_available);
 }
 
 enum ThumbnailSpawnResult {
@@ -518,6 +531,7 @@ enum ThumbnailSpawnResult {
 
 fn try_spawn_thumbnail_task(
     database: &Database,
+    writer: &DbWriter,
     task_id: i64,
     ffmpeg_available: bool,
     thumbnail_permits: &ThumbnailWorkerPermits,
@@ -551,9 +565,18 @@ fn try_spawn_thumbnail_task(
 
     in_flight_thumbnail_task_ids.insert(task_id);
     let thumbnail_completion_sender = thumbnail_completion_sender.clone();
+    // Decode/resize runs on this blocking thread; only the tiny blob publish is
+    // routed onto the single writer actor (which checkpoints the WAL), so the
+    // per-task worker connection never grows an unbounded WAL.
+    let writer = writer.clone();
     tokio::task::spawn_blocking(move || {
         let _thumbnail_permit = thumbnail_permit;
-        run_task(&mut thumbnail_database, task_id, ffmpeg_available);
+        run_task(
+            &mut thumbnail_database,
+            Some(&writer),
+            task_id,
+            ffmpeg_available,
+        );
         let _ = thumbnail_completion_sender.send(task_id);
     });
     ThumbnailSpawnResult::Spawned
@@ -589,15 +612,20 @@ fn try_spawn_non_thumbnail_task(
     let task_completion_sender = task_completion_sender.clone();
     tokio::task::spawn_blocking(move || {
         let _non_thumbnail_permit = non_thumbnail_permit;
-        run_task(&mut task_database, task_id, ffmpeg_available);
+        run_task(&mut task_database, None, task_id, ffmpeg_available);
         let _ = task_completion_sender.send(task_id);
     });
     ThumbnailSpawnResult::Spawned
 }
 
-fn run_task(database: &mut Database, task_id: i64, ffmpeg_available: bool) {
+fn run_task(
+    database: &mut Database,
+    writer: Option<&DbWriter>,
+    task_id: i64,
+    ffmpeg_available: bool,
+) {
     let attempt_generation = database.current_task_attempt_generation(task_id).ok();
-    if let Err(error) = run_task_with_database(database, task_id, ffmpeg_available) {
+    if let Err(error) = run_task_with_database(database, writer, task_id, ffmpeg_available) {
         if error.downcast_ref::<CooperativeRootScanYield>().is_some() {
             return;
         }
@@ -705,6 +733,7 @@ fn run_thumbnail_processing_checkpoint(
 
 fn run_task_with_database(
     database: &mut Database,
+    writer: Option<&DbWriter>,
     task_id: i64,
     ffmpeg_available: bool,
 ) -> anyhow::Result<()> {
@@ -925,6 +954,7 @@ fn run_task_with_database(
             let cache_root = database.default_thumbnail_cache_dir();
             run_thumbnail_task_with_cache_for_attempt(
                 database,
+                writer,
                 task_id,
                 attempt_generation,
                 &cache_root,
@@ -964,6 +994,7 @@ fn interactive_scan_options<'a>(
 #[cfg(test)]
 fn run_thumbnail_task_with_cache(
     database: &mut Database,
+    writer: Option<&DbWriter>,
     task_id: i64,
     cache_root: &Path,
     ffmpeg_available: bool,
@@ -971,6 +1002,7 @@ fn run_thumbnail_task_with_cache(
     let attempt_generation = database.current_task_attempt_generation(task_id)?;
     run_thumbnail_task_with_cache_for_attempt(
         database,
+        writer,
         task_id,
         attempt_generation,
         cache_root,
@@ -980,6 +1012,7 @@ fn run_thumbnail_task_with_cache(
 
 fn run_thumbnail_task_with_cache_for_attempt(
     database: &mut Database,
+    writer: Option<&DbWriter>,
     task_id: i64,
     attempt_generation: i64,
     cache_root: &Path,
@@ -987,6 +1020,7 @@ fn run_thumbnail_task_with_cache_for_attempt(
 ) -> anyhow::Result<()> {
     run_thumbnail_task_with_cache_and_before_publish_for_attempt(
         database,
+        writer,
         task_id,
         attempt_generation,
         cache_root,
@@ -998,6 +1032,7 @@ fn run_thumbnail_task_with_cache_for_attempt(
 #[cfg(test)]
 fn run_thumbnail_task_with_cache_and_before_publish(
     database: &mut Database,
+    writer: Option<&DbWriter>,
     task_id: i64,
     cache_root: &Path,
     ffmpeg_available: bool,
@@ -1006,6 +1041,7 @@ fn run_thumbnail_task_with_cache_and_before_publish(
     let attempt_generation = database.current_task_attempt_generation(task_id)?;
     run_thumbnail_task_with_cache_and_before_publish_for_attempt(
         database,
+        writer,
         task_id,
         attempt_generation,
         cache_root,
@@ -1016,6 +1052,7 @@ fn run_thumbnail_task_with_cache_and_before_publish(
 
 fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
     database: &mut Database,
+    writer: Option<&DbWriter>,
     task_id: i64,
     attempt_generation: i64,
     _cache_root: &Path,
@@ -1136,40 +1173,75 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
     // Captured from the decode this task already ran; persisted to media in the
     // publish transaction below so the layout engine gets real aspect ratios.
     let source_dimensions = Some((generated.source_width, generated.source_height));
+    // Copy the scalar outputs before `generated.data` is moved into the blob so
+    // the moved-into-writer closure and the inline path can both build the state
+    // row without borrowing `generated` after the move.
+    let generated_width = generated.width;
+    let generated_height = generated.height;
+    let generated_byte_size = generated.byte_size;
     // Blob commits run on the single writer connection (submitted via the
-    // DbWriter by the caller), so they never contend with browsing writes and
-    // can never hit "database is locked". Decode/resize already happened above on
-    // this blocking thread; only the commit below is serialized by the writer.
+    // DbWriter). Decode/resize already happened above on this blocking thread;
+    // only the commit below is serialized by the writer, so the per-task worker
+    // connection never grows an unbounded WAL and can never hit
+    // "database is locked".
     let blob = ThumbBlobRecord {
         file_id,
         profile: GRID_320_PROFILE.to_string(),
         data: generated.data,
-        width: generated.width,
-        height: generated.height,
-        byte_size: generated.byte_size,
+        width: generated_width,
+        height: generated_height,
+        byte_size: generated_byte_size,
         output_format: GENERATED_FORMAT.to_string(),
         created_at: now,
         updated_at: now,
     };
-    let published = database
-        .publish_thumbnail_and_succeed_task_if_source_fingerprint_and_task_attempt_current(
-            ThumbnailStateUpsert {
+    let state = ThumbnailStateUpsert {
+        file_id,
+        profile: GRID_320_PROFILE.to_string(),
+        state: "ready".to_string(),
+        cache_key: None,
+        width: Some(generated_width),
+        height: Some(generated_height),
+        byte_size: Some(generated_byte_size),
+        error: None,
+        source_fingerprint: Some(source_fingerprint.clone()),
+    };
+    let published = match writer {
+        Some(writer) => {
+            // Production path: route the write onto the single writer actor so it
+            // is serialized and the WAL is checkpointed between batches.
+            crate::debug_log!(
+                "thumbnail publish -> writer: task {} file {} blob {} bytes",
+                task_id,
                 file_id,
-                profile: GRID_320_PROFILE.to_string(),
-                state: "ready".to_string(),
-                cache_key: None,
-                width: Some(generated.width),
-                height: Some(generated.height),
-                byte_size: Some(generated.byte_size),
-                error: None,
-                source_fingerprint: Some(source_fingerprint.clone()),
-            },
-            blob,
-            source_dimensions,
-            &source_fingerprint,
-            task_id,
-            attempt_generation,
-        )?;
+                blob.byte_size
+            );
+            let fingerprint = source_fingerprint.clone();
+            writer.write_blocking(move |db| {
+                db.publish_thumbnail_and_succeed_task_if_source_fingerprint_and_task_attempt_current(
+                    state,
+                    blob,
+                    source_dimensions,
+                    &fingerprint,
+                    task_id,
+                    attempt_generation,
+                )
+            })?
+        }
+        None => {
+            // No writer (in-memory tests): publish inline on the per-task
+            // connection exactly as before.
+            database
+                .publish_thumbnail_and_succeed_task_if_source_fingerprint_and_task_attempt_current(
+                    state,
+                    blob,
+                    source_dimensions,
+                    &source_fingerprint,
+                    task_id,
+                    attempt_generation,
+                )?
+        }
+    };
     if !published {
         return Err(anyhow::anyhow!(
             "{THUMBNAIL_SOURCE_CHANGED_ERROR}: {file_id}"
@@ -1355,7 +1427,7 @@ mod tests {
             .expect("request thumbnail task");
 
         let task_id = request.task_id.expect("thumbnail task id");
-        run_thumbnail_task_with_cache(&mut database, task_id, &cache_root, true)
+        run_thumbnail_task_with_cache(&mut database, None, task_id, &cache_root, true)
             .expect("run thumbnail task");
 
         let task = database
@@ -1429,7 +1501,7 @@ mod tests {
             .expect("request thumbnail task")
             .task_id
             .expect("thumbnail task id");
-        run_thumbnail_task_with_cache(&mut database, task_id, &cache_root, true)
+        run_thumbnail_task_with_cache(&mut database, None, task_id, &cache_root, true)
             .expect("run thumbnail task");
 
         let after = database
@@ -1461,7 +1533,7 @@ mod tests {
             )
             .expect("request thumbnail");
 
-        run_task(&mut database, request.task_id.expect("task id"), true);
+        run_task(&mut database, None, request.task_id.expect("task id"), true);
 
         let blob = database
             .get_thumb_blob(file_id, crate::thumbnails::GRID_320_PROFILE)
@@ -1499,7 +1571,7 @@ mod tests {
             .expect("request thumbnail task");
         let task_id = request.task_id.expect("thumbnail task id");
 
-        run_task(&mut database, task_id, false);
+        run_task(&mut database, None, task_id, false);
 
         let task = database
             .get_task(task_id)
@@ -1596,7 +1668,7 @@ mod tests {
             .expect("list pending thumbnails")
             .is_empty());
 
-        run_task(&mut database, task_id, true);
+        run_task(&mut database, None, task_id, true);
 
         let task = database
             .get_task(task_id)
@@ -1639,6 +1711,7 @@ mod tests {
 
         let error = run_thumbnail_task_with_cache_and_before_publish(
             &mut database,
+            None,
             task_id,
             &cache_root,
             true,
@@ -2139,7 +2212,7 @@ mod tests {
             .create_interactive_folder_scan_task(folder_id)
             .expect("create interactive folder scan task");
 
-        run_task(&mut database, task_id, true);
+        run_task(&mut database, None, task_id, true);
 
         let task = database
             .get_task(task_id)
@@ -2226,7 +2299,7 @@ mod tests {
             .has_pending_interactive_folder_scan_task(root_id)
             .expect("reopened connection sees pending interactive task"));
 
-        run_task(&mut database, root_task_id, true);
+        run_task(&mut database, None, root_task_id, true);
 
         let root_task = database
             .get_task(root_task_id)
@@ -2299,7 +2372,7 @@ mod tests {
             .has_pending_interactive_folder_scan_task(root_id)
             .expect("main connection sees pending interactive task"));
 
-        run_task(&mut database, root_task_id, true);
+        run_task(&mut database, None, root_task_id, true);
 
         let root_task = database
             .get_task(root_task_id)
@@ -2311,7 +2384,7 @@ mod tests {
             .list_pending_interactive_folder_scan_task_ids()
             .expect("list pending interactive tasks")
         {
-            run_task(&mut database, task_id, true);
+            run_task(&mut database, None, task_id, true);
         }
 
         let selected_media = database
@@ -2335,7 +2408,7 @@ mod tests {
             .expect("root task exists after interactive scan");
         assert_eq!(root_task.status, "pending");
 
-        run_task(&mut database, root_task_id, true);
+        run_task(&mut database, None, root_task_id, true);
 
         let final_root_media = database
             .list_media_page(crate::db::MediaPageQuery {
@@ -2421,7 +2494,7 @@ mod tests {
             .task_id
             .expect("foreground thumbnail task id");
 
-        run_task(&mut database, interactive_task_id, true);
+        run_task(&mut database, None, interactive_task_id, true);
 
         let interactive_task = database
             .get_task(interactive_task_id)
@@ -2467,7 +2540,7 @@ mod tests {
         let initial_interactive_task_id = database
             .create_interactive_folder_scan_task(folder_id)
             .expect("create initial interactive task");
-        run_task(&mut database, initial_interactive_task_id, true);
+        run_task(&mut database, None, initial_interactive_task_id, true);
 
         let initially_published = database
             .list_media_page(crate::db::MediaPageQuery {
@@ -2499,7 +2572,7 @@ mod tests {
             .has_pending_interactive_folder_scan_task(root_id)
             .expect("main connection sees pending interactive task"));
 
-        run_task(&mut database, root_task_id, true);
+        run_task(&mut database, None, root_task_id, true);
 
         let root_task = database
             .get_task(root_task_id)
@@ -2604,7 +2677,7 @@ mod tests {
             .expect("request thumbnail");
         let thumbnail_task_id = thumb_request.task_id.expect("thumbnail task id");
 
-        run_task(&mut database, root_task_id, true);
+        run_task(&mut database, None, root_task_id, true);
 
         let root_task = database
             .get_task(root_task_id)
@@ -2689,9 +2762,14 @@ mod tests {
             .task_id
             .expect("selected task id");
 
-        let error =
-            run_thumbnail_task_with_cache(&mut database, background_task_id, &cache_root, true)
-                .expect_err("background thumbnail should yield before generation");
+        let error = run_thumbnail_task_with_cache(
+            &mut database,
+            None,
+            background_task_id,
+            &cache_root,
+            true,
+        )
+        .expect_err("background thumbnail should yield before generation");
 
         assert!(
             error.to_string().contains("yield"),
@@ -2795,6 +2873,7 @@ mod tests {
             .expect("background task id");
         run_thumbnail_task_with_cache_and_before_publish(
             &mut database,
+            None,
             background_task_id,
             &cache_root,
             true,
@@ -2912,6 +2991,7 @@ mod tests {
             .expect("bulk task id");
         run_thumbnail_task_with_cache_and_before_publish(
             &mut database,
+            None,
             bulk_task_id,
             &cache_root,
             true,
@@ -2988,6 +3068,7 @@ mod tests {
 
         run_thumbnail_task_with_cache_and_before_publish(
             &mut database,
+            None,
             background_task_id,
             &cache_root,
             true,
@@ -3137,9 +3218,14 @@ mod tests {
             },
         ));
 
-        let error =
-            run_thumbnail_task_with_cache(&mut database, old_visible_task_id, &cache_root, true)
-                .expect_err("old visible thumbnail should yield after scope demotion");
+        let error = run_thumbnail_task_with_cache(
+            &mut database,
+            None,
+            old_visible_task_id,
+            &cache_root,
+            true,
+        )
+        .expect_err("old visible thumbnail should yield after scope demotion");
 
         assert!(
             error.to_string().contains("yield"),
@@ -3286,8 +3372,10 @@ mod tests {
         let (completion_sender, mut completion_receiver) = mpsc::unbounded_channel();
         let mut in_flight_thumbnail_task_ids = HashSet::new();
         let mut database = database;
+        let writer = crate::db::DbWriter::spawn(database.reopen().unwrap().unwrap());
         dispatch_task_with_thumbnail_concurrency(
             &mut database,
+            &writer,
             first_task_id,
             true,
             &thumbnail_permits,
@@ -3296,6 +3384,7 @@ mod tests {
         );
         dispatch_task_with_thumbnail_concurrency(
             &mut database,
+            &writer,
             second_task_id,
             true,
             &thumbnail_permits,
@@ -3441,8 +3530,10 @@ mod tests {
         let (completion_sender, mut completion_receiver) = mpsc::unbounded_channel();
         let mut in_flight_thumbnail_task_ids = HashSet::new();
         let mut database = database;
+        let writer = crate::db::DbWriter::spawn(database.reopen().unwrap().unwrap());
         dispatch_task_with_thumbnail_concurrency(
             &mut database,
+            &writer,
             background_task_id,
             true,
             &thumbnail_permits,
@@ -3451,6 +3542,7 @@ mod tests {
         );
         dispatch_task_with_thumbnail_concurrency(
             &mut database,
+            &writer,
             foreground_task_id,
             true,
             &thumbnail_permits,
@@ -3519,9 +3611,11 @@ mod tests {
         let mut in_flight_thumbnail_task_ids = HashSet::new();
         in_flight_thumbnail_task_ids.insert(task_id);
         let mut database = database;
+        let writer = crate::db::DbWriter::spawn(database.reopen().unwrap().unwrap());
 
         schedule_pending_tasks_with_thumbnail_concurrency(
             &mut database,
+            &writer,
             true,
             &thumbnail_permits,
             &completion_sender,
@@ -3792,9 +3886,11 @@ mod tests {
         let (completion_sender, mut completion_receiver) = mpsc::unbounded_channel();
         let mut in_flight_thumbnail_task_ids = HashSet::new();
         let mut database = database;
+        let writer = crate::db::DbWriter::spawn(database.reopen().unwrap().unwrap());
         for task_id in &visible_task_ids {
             dispatch_task_with_thumbnail_concurrency(
                 &mut database,
+                &writer,
                 *task_id,
                 true,
                 &thumbnail_permits,
@@ -3804,6 +3900,7 @@ mod tests {
         }
         dispatch_task_with_thumbnail_concurrency(
             &mut database,
+            &writer,
             selected_task_id,
             true,
             &thumbnail_permits,
@@ -4154,7 +4251,7 @@ mod tests {
             )
             .expect("request first foreground thumbnail");
 
-        run_task(&mut database, root_task_id, true);
+        run_task(&mut database, None, root_task_id, true);
 
         let yielded_task = database
             .get_task(root_task_id)
@@ -4175,7 +4272,7 @@ mod tests {
             )
             .expect("request second foreground thumbnail");
 
-        run_task(&mut database, root_task_id, true);
+        run_task(&mut database, None, root_task_id, true);
 
         let resumed_task = database
             .get_task(root_task_id)
@@ -4260,6 +4357,97 @@ mod tests {
 
         fs::remove_dir_all(&temp_root).expect("cleanup temp root");
         let _ = fs::remove_dir_all(db_dir);
+    }
+
+    struct TestThumbCtx {
+        task_id: i64,
+        file_id: i64,
+    }
+
+    /// Seed a root + folder + one real on-disk image + a pending grid_320
+    /// thumbnail task, returning the ids the writer-publish test needs.
+    fn seed_one_pending_thumbnail_task(database: &Database, media_root: &Path) -> TestThumbCtx {
+        let file_id = seed_media_file(database, media_root, "writer-publish.jpg");
+        let task_id = database
+            .request_thumbnail_task(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                crate::db::ThumbnailTaskPriority::Visible,
+            )
+            .expect("request thumbnail task")
+            .task_id
+            .expect("thumbnail task id");
+        TestThumbCtx { task_id, file_id }
+    }
+
+    /// Drive the real thumbnail leaf with the writer path (`Some(writer)`), so
+    /// the blob commit is routed through the single writer actor exactly as
+    /// production does. Runs on a blocking thread (as the real worker does),
+    /// because `write_blocking` cannot block a runtime worker thread. Returns
+    /// the owned worker connection so the caller can read it back.
+    async fn publish_thumbnail_for_test(
+        mut worker_db: Database,
+        writer: DbWriter,
+        task_id: i64,
+    ) -> (Database, anyhow::Result<()>) {
+        tokio::task::spawn_blocking(move || {
+            let cache_root = unique_temp_dir("writer-publish-cache");
+            let result = run_thumbnail_task_with_cache(
+                &mut worker_db,
+                Some(&writer),
+                task_id,
+                &cache_root,
+                true,
+            );
+            (worker_db, result)
+        })
+        .await
+        .expect("join publish blocking task")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn thumbnail_publish_routes_through_writer_and_bounds_wal() {
+        use crate::db::{Database, DbWriter};
+        let media_root = unique_temp_dir("thumb-writer-media");
+        fs::create_dir_all(&media_root).expect("create media root");
+        write_test_image(&media_root.join("writer-publish.jpg"), 800, 400);
+
+        let dir = unique_temp_dir("thumb-writer");
+        fs::create_dir_all(&dir).expect("create db dir");
+        let db_path = dir.join("thumb.sqlite");
+        let seed = Database::open(&db_path).expect("open");
+        seed.apply_migrations().expect("migrate");
+        // Seed a root + folder + one image file + a pending thumbnail task.
+        let ctx = seed_one_pending_thumbnail_task(&seed, &media_root);
+
+        let worker_db = seed.reopen().expect("reopen").expect("worker conn");
+        let writer = DbWriter::spawn(seed);
+
+        // Publish through the writer (the code path under test).
+        let (worker_db, result) = publish_thumbnail_for_test(worker_db, writer, ctx.task_id).await;
+        result.expect("publish via writer");
+
+        // Blob landed.
+        let blob = worker_db
+            .get_thumb_blob(ctx.file_id, crate::thumbnails::GRID_320_PROFILE)
+            .expect("read blob");
+        assert!(blob.is_some(), "blob must be retrievable after publish");
+
+        // The task completed in the same publish transaction on the writer.
+        let task = worker_db
+            .get_task(ctx.task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(task.status, "succeeded");
+
+        // The worker connection's WAL is bounded (writer checkpointed it).
+        assert!(
+            worker_db.wal_size_bytes() < 64 * 1024 * 1024,
+            "WAL must stay under the 64MiB journal_size_limit, got {}",
+            worker_db.wal_size_bytes()
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&media_root);
     }
 
     fn seed_media_file(database: &Database, root_path: &Path, name: &str) -> i64 {
