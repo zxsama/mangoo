@@ -69,9 +69,8 @@ impl Drop for WatcherHandle {
 struct WatcherState {
     database: Database,
     task_queue: TaskSender,
-    // Threaded for the single-writer migration; watcher upserts still use
-    // `database` directly for now (low-frequency, filesystem-event-driven).
-    #[allow(dead_code)]
+    // File upserts route through this single-writer actor so the watcher
+    // never contends the WAL write lock with the scan/thumbnail writers.
     writer: DbWriter,
     watcher: RecommendedWatcher,
     watched_roots: HashMap<i64, PathBuf>,
@@ -271,7 +270,8 @@ fn upsert_media_file(
         state
             .database
             .ensure_folder_chain_for_path(root.id, Path::new(&root.path), parent)?;
-    let file_id = state.database.upsert_file(FileUpsert {
+    crate::debug_log!("watcher upsert -> writer: {}", path.display());
+    let file_upsert = FileUpsert {
         root_id: root.id,
         folder_id,
         name: file_name(path),
@@ -280,8 +280,13 @@ fn upsert_media_file(
         mtime: metadata_time(Some(metadata)),
         ctime: metadata_created_time(Some(metadata)),
         file_key: None,
+    };
+    let kind_owned = kind.to_owned();
+    state.writer.write_blocking(move |db| {
+        let file_id = db.upsert_file(file_upsert)?;
+        db.upsert_media_kind(file_id, &kind_owned)?;
+        Ok(file_id)
     })?;
-    state.database.upsert_media_kind(file_id, kind)?;
     Ok(())
 }
 
@@ -830,6 +835,34 @@ mod tests {
         let _ = fs::remove_dir_all(db_dir);
     }
 
+    #[test]
+    fn watcher_upserts_route_through_writer_and_land() {
+        let (mut state, worker_db, temp_root, db_dir, root, path, metadata) =
+            watcher_state_with_one_file();
+
+        upsert_media_file(&mut state, &root, &path, &metadata).expect("upsert via writer");
+
+        // Read back on an independent connection to the same file-backed DB —
+        // the row must be committed and queryable, not merely buffered.
+        let page = worker_db
+            .list_media_page(MediaPageQuery {
+                root_id: Some(root.id),
+                folder_id: None,
+                include_descendants: false,
+                limit: 10,
+                offset: None,
+                cursor: None,
+                sort: "name_asc".to_string(),
+                kind: None,
+            })
+            .expect("list media");
+        assert_eq!(page.items.len(), 1, "watched file must be upserted");
+        assert_eq!(page.items[0].name, "new.jpg");
+
+        let _ = fs::remove_dir_all(&temp_root);
+        let _ = fs::remove_dir_all(&db_dir);
+    }
+
     fn add_root(database: &Database, temp_root: &Path, display_name: &str) -> i64 {
         database
             .add_root(NewRoot {
@@ -871,6 +904,41 @@ mod tests {
             watched_roots: HashMap::from([(root_id, root_path)]),
             pending_events: Vec::new(),
         }
+    }
+
+    /// Builds a `WatcherState` with a real file-backed DB + a `DbWriter`, plus
+    /// an independent connection (`worker_db`) to the same file for verifying
+    /// writes landed. Mirrors `test_watcher_state`'s setup.
+    fn watcher_state_with_one_file() -> (
+        WatcherState,
+        Database,
+        PathBuf,
+        PathBuf,
+        RootRecord,
+        PathBuf,
+        fs::Metadata,
+    ) {
+        let temp_root = unique_temp_dir("root");
+        fs::create_dir_all(&temp_root).expect("create root dir");
+        let file_path = temp_root.join("new.jpg");
+        fs::write(&file_path, b"new image").expect("write image");
+
+        let db_dir = unique_temp_dir("db");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+        let db_path = db_dir.join("watch.sqlite");
+        let database = Database::open(&db_path).expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = add_root(&database, &temp_root, "watch-root");
+        let root = test_root(&database, root_id);
+
+        let (task_sender, _task_receiver) = tokio::sync::mpsc::channel(8);
+        let state = test_watcher_state(database, task_sender, root_id, temp_root.clone());
+
+        let worker_db = Database::open(&db_path).expect("open worker db for verification");
+        let metadata = fs::metadata(&file_path).expect("file metadata");
+        (
+            state, worker_db, temp_root, db_dir, root, file_path, metadata,
+        )
     }
 
     fn wait_for_media_count(db_path: &Path, root_id: i64, expected: usize, timeout: Duration) {
