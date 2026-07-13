@@ -35,6 +35,11 @@ pub struct ScanOptions<'a> {
     pub progress_callback: Option<&'a mut dyn FnMut(TaskScanProgress)>,
     pub cancellation_callback: Option<&'a mut dyn FnMut() -> anyhow::Result<()>>,
     pub task_attempt_guard: Option<TaskAttemptGuard>,
+    /// When present, batch commits run on the single writer connection instead
+    /// of the caller's `&mut Database`, so the WAL is checkpointed and stays
+    /// bounded. `None` in unit tests that call `scan_root(&mut db, ...)`
+    /// directly (those commit inline on the passed connection).
+    pub writer: Option<crate::db::DbWriter>,
     #[cfg(test)]
     pub batch_observer: Option<std::rc::Rc<dyn Fn(ScanBatchStats)>>,
 }
@@ -56,6 +61,7 @@ impl<'a> ScanOptions<'a> {
             progress_callback: None,
             cancellation_callback: None,
             task_attempt_guard: None,
+            writer: None,
             #[cfg(test)]
             batch_observer: None,
         }
@@ -467,7 +473,33 @@ fn commit_scan_batch_with_optional_task_guard(
     batch: ScanWriteBatch,
     options: &ScanOptions<'_>,
 ) -> anyhow::Result<crate::db::ScanWriteBatchResult> {
-    if let Some(guard) = options.task_attempt_guard {
+    crate::debug_log!(
+        "scan batch commit ({} folders, {} files){}",
+        batch.folders.len(),
+        batch.files.len(),
+        if options.writer.is_some() {
+            " -> writer"
+        } else {
+            " (inline)"
+        }
+    );
+    let guard = options.task_attempt_guard;
+    match options.writer.as_ref() {
+        Some(writer) => writer.write_blocking(move |db| commit_scan_batch(db, batch, guard)),
+        None => commit_scan_batch(database, batch, guard),
+    }
+}
+
+/// Commit one scan batch (folders and/or files) against the given connection,
+/// routing through the task-attempt-guarded write when a guard is present.
+/// Shared by the `Some(writer)` (routed through the single writer actor) and
+/// `None` (inline on the caller's connection) branches above.
+fn commit_scan_batch(
+    database: &mut Database,
+    batch: ScanWriteBatch,
+    guard: Option<TaskAttemptGuard>,
+) -> anyhow::Result<crate::db::ScanWriteBatchResult> {
+    if let Some(guard) = guard {
         return database.commit_scan_batch_for_task_attempt(
             batch,
             guard.task_id,
@@ -735,6 +767,7 @@ mod tests {
                 progress_callback: None,
                 cancellation_callback: None,
                 task_attempt_guard: None,
+                writer: None,
                 batch_observer: None,
             },
         )
@@ -1016,6 +1049,7 @@ mod tests {
                 progress_callback: None,
                 cancellation_callback: None,
                 task_attempt_guard: None,
+                writer: None,
                 batch_observer: Some(Rc::new(move |stats| {
                     observed_batches.borrow_mut().push(stats);
                 })),
@@ -1069,6 +1103,7 @@ mod tests {
                 progress_callback: Some(&mut progress_callback),
                 cancellation_callback: None,
                 task_attempt_guard: None,
+                writer: None,
                 batch_observer: None,
             },
         )
@@ -1142,6 +1177,7 @@ mod tests {
                     task_id,
                     attempt_generation: old_attempt,
                 }),
+                writer: None,
                 batch_observer: None,
             },
         )
@@ -1206,6 +1242,7 @@ mod tests {
                 progress_callback: Some(&mut progress_callback),
                 cancellation_callback: Some(&mut cancellation_callback),
                 task_attempt_guard: None,
+                writer: None,
                 batch_observer: None,
             },
         )
@@ -1490,6 +1527,73 @@ mod tests {
         assert_eq!(source.metadata_status.as_deref(), Some("pending"));
 
         fs::remove_dir_all(temp_root).expect("cleanup temp root");
+    }
+
+    /// Drive the real scan leaf with the writer path (`Some(writer)`), so
+    /// batch commits are routed through the single writer actor exactly as
+    /// production does. Runs on a blocking thread (as the real worker does),
+    /// because `write_blocking` cannot block a runtime worker thread. Returns
+    /// the owned worker connection so the caller can read it back.
+    async fn scan_root_via_writer_for_test(
+        mut worker_database: Database,
+        writer: crate::db::DbWriter,
+        root: RootRecord,
+    ) -> (Database, anyhow::Result<ScanSummary>) {
+        tokio::task::spawn_blocking(move || {
+            let result = scan_root_with_options(
+                &mut worker_database,
+                &root,
+                ScanOptions {
+                    write_batch_size: 2,
+                    progress_callback: None,
+                    cancellation_callback: None,
+                    task_attempt_guard: None,
+                    writer: Some(writer),
+                    batch_observer: None,
+                },
+            );
+            (worker_database, result)
+        })
+        .await
+        .expect("join scan blocking task")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scan_commits_through_writer_keep_wal_bounded() {
+        use crate::db::DbWriter;
+
+        let media_root = unique_temp_dir();
+        fs::create_dir_all(&media_root).expect("create media root");
+        for index in 0..40 {
+            fs::write(media_root.join(format!("image_{index}.jpg")), b"fake jpg")
+                .expect("write image");
+        }
+
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("create db dir");
+        let db_path = dir.join("scan-writer.sqlite");
+        let seed = Database::open(&db_path).expect("open");
+        seed.apply_migrations().expect("migrate");
+        let root_id = add_test_root(&seed, &media_root, "scan-writer-test");
+        let root = test_root(&seed, root_id);
+
+        let worker_database = seed.reopen().expect("reopen").expect("worker conn");
+        let writer = DbWriter::spawn(seed);
+
+        // Scan routed through the writer (the code path under test).
+        let (worker_database, result) =
+            scan_root_via_writer_for_test(worker_database, writer, root).await;
+        result.expect("scan via writer");
+
+        // The worker connection's WAL is bounded (writer checkpointed it).
+        assert!(
+            worker_database.wal_size_bytes() < 64 * 1024 * 1024,
+            "scan WAL must stay bounded, got {}",
+            worker_database.wal_size_bytes()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&media_root);
     }
 
     fn single_media(database: &Database, root_id: i64) -> crate::db::MediaRecord {

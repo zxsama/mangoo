@@ -511,6 +511,7 @@ fn dispatch_worker_task_with_concurrency(
     }
     match try_spawn_non_thumbnail_task(
         database,
+        writer,
         task_id,
         ffmpeg_available,
         non_thumbnail_permit,
@@ -584,6 +585,7 @@ fn try_spawn_thumbnail_task(
 
 fn try_spawn_non_thumbnail_task(
     database: &Database,
+    writer: &DbWriter,
     task_id: i64,
     ffmpeg_available: bool,
     non_thumbnail_permit: &Arc<Semaphore>,
@@ -610,9 +612,14 @@ fn try_spawn_non_thumbnail_task(
 
     in_flight_non_thumbnail_task_ids.insert(task_id);
     let task_completion_sender = task_completion_sender.clone();
+    // root_scan / interactive_folder_scan batch commits are routed onto the
+    // single writer actor (see root_scan_options/interactive_scan_options),
+    // which checkpoints the WAL between batches, so the per-task worker
+    // connection never grows an unbounded WAL.
+    let writer = writer.clone();
     tokio::task::spawn_blocking(move || {
         let _non_thumbnail_permit = non_thumbnail_permit;
-        run_task(&mut task_database, None, task_id, ffmpeg_available);
+        run_task(&mut task_database, Some(&writer), task_id, ffmpeg_available);
         let _ = task_completion_sender.send(task_id);
     });
     ThumbnailSpawnResult::Spawned
@@ -828,6 +835,7 @@ fn run_task_with_database(
                         task_id,
                         attempt_generation,
                     },
+                    writer,
                 ),
             )?;
             drop(progress_callback);
@@ -926,6 +934,7 @@ fn run_task_with_database(
                         task_id,
                         attempt_generation,
                     },
+                    writer,
                 ),
             )?;
             drop(progress_callback);
@@ -969,11 +978,13 @@ fn root_scan_options<'a>(
     progress_callback: &'a mut dyn FnMut(TaskScanProgress),
     cancellation_callback: &'a mut dyn FnMut() -> anyhow::Result<()>,
     task_attempt_guard: TaskAttemptGuard,
+    writer: Option<&DbWriter>,
 ) -> ScanOptions<'a> {
     ScanOptions {
         progress_callback: Some(progress_callback),
         cancellation_callback: Some(cancellation_callback),
         task_attempt_guard: Some(task_attempt_guard),
+        writer: writer.cloned(),
         ..ScanOptions::background()
     }
 }
@@ -982,11 +993,13 @@ fn interactive_scan_options<'a>(
     progress_callback: &'a mut dyn FnMut(TaskScanProgress),
     cancellation_callback: &'a mut dyn FnMut() -> anyhow::Result<()>,
     task_attempt_guard: TaskAttemptGuard,
+    writer: Option<&DbWriter>,
 ) -> ScanOptions<'a> {
     ScanOptions {
         progress_callback: Some(progress_callback),
         cancellation_callback: Some(cancellation_callback),
         task_attempt_guard: Some(task_attempt_guard),
+        writer: writer.cloned(),
         ..ScanOptions::interactive()
     }
 }
@@ -1281,7 +1294,12 @@ mod tests {
             attempt_generation: 9,
         };
 
-        let options = root_scan_options(&mut progress_callback, &mut cancellation_callback, guard);
+        let options = root_scan_options(
+            &mut progress_callback,
+            &mut cancellation_callback,
+            guard,
+            None,
+        );
 
         assert_eq!(
             options.write_batch_size,
@@ -1290,6 +1308,7 @@ mod tests {
         assert!(options.progress_callback.is_some());
         assert!(options.cancellation_callback.is_some());
         assert_eq!(options.task_attempt_guard, Some(guard));
+        assert!(options.writer.is_none());
     }
 
     #[test]
