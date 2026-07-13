@@ -336,9 +336,51 @@ pub fn scan_root_with_options(
     )?;
     check_scan_cancelled(&mut options)?;
     ensure_root_enabled(database, root.id)?;
-    if let Some(guard) = options.task_attempt_guard {
+    reconcile_scan_completion_with_optional_writer(database, root.id, scan_generation, &options)?;
+    Ok(summary)
+}
+
+/// Reconcile+mark-scanned the completed scan, routing through the single
+/// writer actor when present (bulk UPDATEs across files/folders plus
+/// thumbnail cleanup — the largest remaining un-migrated write before this),
+/// falling back to the caller's connection inline for tests that call
+/// `scan_root`/`scan_folder` directly with `writer: None`.
+fn reconcile_scan_completion_with_optional_writer(
+    database: &mut Database,
+    root_id: i64,
+    scan_generation: i64,
+    options: &ScanOptions<'_>,
+) -> anyhow::Result<()> {
+    crate::debug_log!(
+        "scan completion reconcile (root {}){}",
+        root_id,
+        if options.writer.is_some() {
+            " -> writer"
+        } else {
+            " (inline)"
+        }
+    );
+    let guard = options.task_attempt_guard;
+    match options.writer.as_ref() {
+        Some(writer) => writer.write_blocking(move |db| {
+            reconcile_scan_completion(db, root_id, scan_generation, guard)
+        }),
+        None => reconcile_scan_completion(database, root_id, scan_generation, guard),
+    }
+}
+
+/// Shared reconcile+mark-scanned body for the `Some(writer)` (routed through
+/// the single writer actor) and `None` (inline on the caller's connection)
+/// branches above.
+fn reconcile_scan_completion(
+    database: &mut Database,
+    root_id: i64,
+    scan_generation: i64,
+    guard: Option<TaskAttemptGuard>,
+) -> anyhow::Result<()> {
+    if let Some(guard) = guard {
         let reconciled = database.reconcile_root_scan_completion_for_task_attempt(
-            root.id,
+            root_id,
             scan_generation,
             guard.task_id,
             guard.attempt_generation,
@@ -350,15 +392,47 @@ pub fn scan_root_with_options(
             ));
         }
         database.mark_root_scanned_for_task_attempt(
-            root.id,
+            root_id,
             guard.task_id,
             guard.attempt_generation,
         )?;
     } else {
-        database.reconcile_root_scan_completion(root.id, scan_generation)?;
-        database.mark_root_scanned(root.id)?;
+        database.reconcile_root_scan_completion(root_id, scan_generation)?;
+        database.mark_root_scanned(root_id)?;
     }
-    Ok(summary)
+    Ok(())
+}
+
+/// Resolve/create the folder chain for `folder_path` under `root_path`,
+/// routing through the single writer actor when present, falling back to the
+/// caller's connection inline for tests that call `scan_folder` directly with
+/// `writer: None`.
+fn ensure_folder_chain_with_optional_writer(
+    database: &mut Database,
+    root_id: i64,
+    root_path: &Path,
+    folder_path: &Path,
+    options: &ScanOptions<'_>,
+) -> anyhow::Result<i64> {
+    crate::debug_log!(
+        "scan ensure folder chain ({}){}",
+        folder_path.display(),
+        if options.writer.is_some() {
+            " -> writer"
+        } else {
+            " (inline)"
+        }
+    );
+    match options.writer.as_ref() {
+        Some(writer) => {
+            let root_path = root_path.to_path_buf();
+            let folder_path = folder_path.to_path_buf();
+            writer.write_blocking(move |db| {
+                db.ensure_folder_chain_for_path(root_id, &root_path, &folder_path)
+            })
+        }
+        None => database.ensure_folder_chain_for_path(root_id, root_path, folder_path),
+    }
 }
 
 pub fn scan_folder_with_options(
@@ -371,8 +445,13 @@ pub fn scan_folder_with_options(
     let root_path = PathBuf::from(&root.path);
     check_scan_cancelled(&mut options)?;
     ensure_root_enabled(database, root.id)?;
-    let selected_folder_id =
-        database.ensure_folder_chain_for_path(root.id, &root_path, folder_path)?;
+    let selected_folder_id = ensure_folder_chain_with_optional_writer(
+        database,
+        root.id,
+        &root_path,
+        folder_path,
+        &options,
+    )?;
     if selected_folder_id != folder_id {
         return Err(anyhow::anyhow!(
             "folder path resolved to unexpected folder id: expected {folder_id}, got {selected_folder_id}"
@@ -1594,6 +1673,72 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&media_root);
+    }
+
+    /// Drive `scan_folder_with_options` (the interactive-folder-scan leaf)
+    /// with `Some(writer)`, mirroring `scan_root_via_writer_for_test` above.
+    /// Before this task, `scan_folder_with_options` called
+    /// `ensure_folder_chain_for_path` directly on the caller's connection
+    /// regardless of `options.writer`; this proves the writer-routed branch
+    /// (which production's `run_task` exercises via `interactive_scan_options`
+    /// feeding a real `DbWriter`) resolves the folder and completes the scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scan_folder_routes_folder_chain_through_writer() {
+        use crate::db::DbWriter;
+
+        let temp_root = unique_temp_dir();
+        let folder_path = temp_root.join("selected");
+        fs::create_dir_all(&folder_path).expect("create selected folder");
+        fs::write(folder_path.join("image.jpg"), b"fake jpg").expect("write image");
+
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("create db dir");
+        let db_path = dir.join("scan-folder-writer.sqlite");
+        let seed = Database::open(&db_path).expect("open");
+        seed.apply_migrations().expect("migrate");
+        let root_id = add_test_root(&seed, &temp_root, "scan-folder-writer-test");
+        let root = test_root(&seed, root_id);
+
+        // Resolve the selected folder id up front on a throwaway connection,
+        // mirroring how the API resolves `folder_id` before enqueuing an
+        // interactive folder scan task.
+        let folder_id = seed
+            .ensure_folder_chain_for_path(root_id, &temp_root, &folder_path)
+            .expect("resolve selected folder id");
+
+        let worker_database = seed.reopen().expect("reopen").expect("worker conn");
+        let writer = DbWriter::spawn(seed);
+
+        let writer_for_task = writer.clone();
+        let (worker_database, result) = tokio::task::spawn_blocking(move || {
+            let mut worker_database = worker_database;
+            let result = scan_folder_with_options(
+                &mut worker_database,
+                &root,
+                folder_id,
+                &folder_path,
+                ScanOptions {
+                    writer: Some(writer_for_task),
+                    ..ScanOptions::interactive()
+                },
+            );
+            (worker_database, result)
+        })
+        .await
+        .expect("join scan_folder blocking task");
+        result.expect("interactive folder scan via writer");
+
+        assert!(
+            worker_database.wal_size_bytes() < 64 * 1024 * 1024,
+            "scan_folder WAL must stay bounded, got {}",
+            worker_database.wal_size_bytes()
+        );
+
+        let media = single_media(&worker_database, root_id);
+        assert_eq!(media.name, "image.jpg");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&temp_root);
     }
 
     fn single_media(database: &Database, root_id: i64) -> crate::db::MediaRecord {

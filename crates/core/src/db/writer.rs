@@ -67,7 +67,6 @@ impl DbWriter {
 
     /// Blocking variant for non-async callers (the watcher runs on a plain
     /// `std::thread`). Same serialization + error guarantees as `write`.
-    #[allow(dead_code)] // Reserved for the watcher/worker write migration.
     pub fn write_blocking<T, F>(&self, op: F) -> anyhow::Result<T>
     where
         T: Send + 'static,

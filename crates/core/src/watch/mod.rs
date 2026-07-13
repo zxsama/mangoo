@@ -224,10 +224,13 @@ fn handle_modify_path(state: &mut WatcherState, path: &Path) -> anyhow::Result<(
     };
 
     if metadata.is_dir() {
-        let _ =
-            state
-                .database
-                .ensure_folder_chain_for_path(root.id, Path::new(&root.path), path)?;
+        let root_id = root.id;
+        let root_path = PathBuf::from(&root.path);
+        let dir_path = path.to_path_buf();
+        crate::debug_log!("watcher folder-chain -> writer: {}", dir_path.display());
+        let _ = state.writer.write_blocking(move |db| {
+            db.ensure_folder_chain_for_path(root_id, &root_path, &dir_path)
+        })?;
         return Ok(());
     }
 
@@ -266,10 +269,13 @@ fn upsert_media_file(
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    let folder_id =
-        state
-            .database
-            .ensure_folder_chain_for_path(root.id, Path::new(&root.path), parent)?;
+    let root_id = root.id;
+    let root_path = PathBuf::from(&root.path);
+    let parent_path = parent.to_path_buf();
+    crate::debug_log!("watcher folder-chain -> writer: {}", parent_path.display());
+    let folder_id = state.writer.write_blocking(move |db| {
+        db.ensure_folder_chain_for_path(root_id, &root_path, &parent_path)
+    })?;
     crate::debug_log!("watcher upsert -> writer: {}", path.display());
     let file_upsert = FileUpsert {
         root_id: root.id,
