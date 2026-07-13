@@ -115,9 +115,11 @@ fn run_writer_actor(mut database: Database, mut receiver: mpsc::UnboundedReceive
             tracing::warn!(%error, "writer actor checkpoint pass failed");
         }
         let elapsed = checkpoint_start.elapsed();
-        if elapsed > std::time::Duration::from_millis(200) {
-            crate::debug_log!("writer checkpoint slow: {}ms", elapsed.as_millis());
-        }
+        crate::debug_log!(
+            "writer checkpoint pass done in {}ms, wal now {} bytes",
+            elapsed.as_millis(),
+            database.wal_size_bytes()
+        );
     }
     crate::debug_log!("writer actor exited (channel closed)");
 }

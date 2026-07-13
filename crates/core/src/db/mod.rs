@@ -696,23 +696,24 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn wal_size_bytes(&self) -> anyhow::Result<u64> {
+    /// Size in bytes of the `-wal` sidecar for this database's file, or 0 for
+    /// in-memory databases or when the WAL file is absent. Used for checkpoint
+    /// diagnostics and to assert the WAL stays bounded in tests.
+    pub fn wal_size_bytes(&self) -> u64 {
         let Some(path) = &self.path else {
-            return Ok(0);
+            return 0;
         };
         let wal_path = Self::wal_path_for_db_path(path);
-        match std::fs::metadata(&wal_path) {
-            Ok(metadata) => Ok(metadata.len()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(error.into()),
-        }
+        std::fs::metadata(&wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
     }
 
     pub(crate) fn checkpoint_wal_if_larger_than(
         &self,
         threshold_bytes: u64,
     ) -> anyhow::Result<bool> {
-        if self.wal_size_bytes()? <= threshold_bytes {
+        if self.wal_size_bytes() <= threshold_bytes {
             return Ok(false);
         }
         let busy: i64 =
@@ -7776,6 +7777,27 @@ mod tests {
             .expect("apply migrations on a fresh empty file");
         let roots = database.list_roots().expect("list roots on fresh db");
         assert!(roots.is_empty(), "a brand-new library must have no roots");
+    }
+
+    #[test]
+    fn wal_size_bytes_reports_zero_for_in_memory_and_reads_file_wal() {
+        // In-memory DB has no WAL sidecar.
+        let mem = Database::open_in_memory().expect("open in-memory");
+        assert_eq!(mem.wal_size_bytes(), 0);
+
+        // File-backed DB in WAL mode: after a write (no checkpoint), the -wal
+        // sidecar exists and is non-empty.
+        let dir = unique_db_temp_dir("wal-size");
+        std::fs::create_dir_all(&dir).expect("create db dir");
+        let db_path = dir.join("wal.sqlite");
+        let db = Database::open(&db_path).expect("open file db");
+        db.apply_migrations().expect("apply migrations");
+        db.create_tag("t", None).expect("write");
+        assert!(
+            db.wal_size_bytes() > 0,
+            "expected a non-empty -wal after a write in WAL mode"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
