@@ -525,8 +525,15 @@ fn dispatch_worker_task_with_concurrency(
 }
 
 enum ThumbnailSpawnResult {
+    /// This dispatcher does not own the task (wrong kind, missing, or not
+    /// pending) — caller should try the next dispatcher / fall through.
     NotThumbnail,
     Spawned,
+    /// Confirmed to be this dispatcher's kind of task, but it cannot run right
+    /// now (permit exhausted, already in flight, or the per-task `reopen()`
+    /// failed). The task is left `pending` and will be retried on the next
+    /// scheduler tick — callers must `return` on this, never fall through to
+    /// an inline run.
     Deferred,
 }
 
@@ -561,7 +568,16 @@ fn try_spawn_thumbnail_task(
         return ThumbnailSpawnResult::Deferred;
     };
     let Ok(Some(mut thumbnail_database)) = database.reopen() else {
-        return ThumbnailSpawnResult::NotThumbnail;
+        // This IS a genuine pending thumbnail task (kind/status already
+        // confirmed above) — a reopen failure here must not fall through to
+        // an inline run on the shared worker connection (that would bypass
+        // the single writer actor and reintroduce unbounded WAL growth).
+        // Leave it pending; it is retried on the next scheduler tick.
+        crate::debug_log!(
+            "thumbnail dispatch: reopen() failed for task {}, leaving pending for retry",
+            task_id
+        );
+        return ThumbnailSpawnResult::Deferred;
     };
 
     in_flight_thumbnail_task_ids.insert(task_id);
@@ -607,7 +623,14 @@ fn try_spawn_non_thumbnail_task(
         return ThumbnailSpawnResult::Deferred;
     };
     let Ok(Some(mut task_database)) = database.reopen() else {
-        return ThumbnailSpawnResult::NotThumbnail;
+        // Same reasoning as try_spawn_thumbnail_task: this is a confirmed
+        // pending non-thumbnail (root_scan / interactive_folder_scan) task,
+        // so a reopen failure must never fall through to an inline run.
+        crate::debug_log!(
+            "non-thumbnail dispatch: reopen() failed for task {}, leaving pending for retry",
+            task_id
+        );
+        return ThumbnailSpawnResult::Deferred;
     };
 
     in_flight_non_thumbnail_task_ids.insert(task_id);
@@ -4602,5 +4625,164 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    fn dispatch_worker_task_never_falls_through_to_inline_run_when_reopen_fails_for_thumbnail_task()
+    {
+        // Regression: `try_spawn_thumbnail_task` used to return
+        // `NotThumbnail` when `database.reopen()` failed even for a
+        // CONFIRMED pending thumbnail task, which made
+        // `dispatch_worker_task_with_concurrency` fall through to
+        // `run_task(database, None, ...)` -- an inline run on the shared
+        // worker connection that bypasses the single writer actor (the
+        // exact pre-fix WAL-growth bug). `Database::open_in_memory()` has no
+        // `path`, so `reopen()` deterministically returns `Ok(None)`,
+        // reproducing the failure without needing to fake a filesystem
+        // error.
+        let database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Reopen Failure".to_string(),
+                display_name: "Reopen Failure".to_string(),
+            })
+            .expect("add root");
+        let root_folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "reopen-failure-root".to_string(),
+                mtime: Some(1),
+            })
+            .expect("insert root folder");
+        let file_id = insert_pending_thumbnail_file(
+            &database,
+            root_id,
+            root_folder_id,
+            "reopen-failure.jpg",
+            "reopen-failure-file",
+        );
+        let task_id = database
+            .request_thumbnail_task(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                crate::db::ThumbnailTaskPriority::Background,
+            )
+            .expect("create pending thumbnail task")
+            .task_id
+            .expect("task id");
+
+        // Separate writer connection over a real file path so `DbWriter::spawn`
+        // can open it. The writer is never exercised on the Deferred path
+        // this test targets, but dispatch requires a live handle.
+        let writer_db_dir = unique_temp_dir("reopen_failure_writer_db");
+        fs::create_dir_all(&writer_db_dir).expect("create writer db dir");
+        let writer_database =
+            Database::open(writer_db_dir.join("writer.sqlite")).expect("open writer database");
+        writer_database
+            .apply_migrations()
+            .expect("apply writer migrations");
+        let writer = crate::db::DbWriter::spawn(writer_database);
+
+        let thumbnail_permits = ThumbnailWorkerPermits {
+            selected: Arc::new(Semaphore::new(THUMBNAIL_SELECTED_WORKER_CONCURRENCY)),
+            foreground: Arc::new(Semaphore::new(THUMBNAIL_FOREGROUND_WORKER_CONCURRENCY)),
+            background: Arc::new(Semaphore::new(THUMBNAIL_BACKGROUND_WORKER_CONCURRENCY)),
+        };
+        let (completion_sender, _completion_receiver) = mpsc::unbounded_channel();
+        let mut in_flight_thumbnail_task_ids = HashSet::new();
+
+        let result = try_spawn_thumbnail_task(
+            &database,
+            &writer,
+            task_id,
+            true,
+            &thumbnail_permits,
+            &completion_sender,
+            &mut in_flight_thumbnail_task_ids,
+        );
+
+        assert!(
+            matches!(result, ThumbnailSpawnResult::Deferred),
+            "a confirmed pending thumbnail task with a failing reopen() must defer, not fall through to an inline run"
+        );
+        assert!(
+            !in_flight_thumbnail_task_ids.contains(&task_id),
+            "a deferred task must not be tracked as in-flight"
+        );
+
+        let task = database
+            .get_task(task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(
+            task.status, "pending",
+            "task must remain pending, not be run inline on the shared worker connection"
+        );
+
+        let _ = fs::remove_dir_all(&writer_db_dir);
+    }
+
+    #[test]
+    fn dispatch_worker_task_never_falls_through_to_inline_run_when_reopen_fails_for_root_scan_task()
+    {
+        // Same regression as above but for the non-thumbnail dispatcher
+        // path (root_scan / interactive_folder_scan tasks).
+        let database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Reopen Failure Scan".to_string(),
+                display_name: "Reopen Failure Scan".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task(root_id)
+            .expect("persist pending root scan task");
+
+        let writer_db_dir = unique_temp_dir("reopen_failure_scan_writer_db");
+        fs::create_dir_all(&writer_db_dir).expect("create writer db dir");
+        let writer_database =
+            Database::open(writer_db_dir.join("writer.sqlite")).expect("open writer database");
+        writer_database
+            .apply_migrations()
+            .expect("apply writer migrations");
+        let writer = crate::db::DbWriter::spawn(writer_database);
+
+        let non_thumbnail_permit = Arc::new(Semaphore::new(1));
+        let (completion_sender, _completion_receiver) = mpsc::unbounded_channel();
+        let mut in_flight_non_thumbnail_task_ids = HashSet::new();
+
+        let result = try_spawn_non_thumbnail_task(
+            &database,
+            &writer,
+            task_id,
+            true,
+            &non_thumbnail_permit,
+            &completion_sender,
+            &mut in_flight_non_thumbnail_task_ids,
+        );
+
+        assert!(
+            matches!(result, ThumbnailSpawnResult::Deferred),
+            "a confirmed pending root_scan task with a failing reopen() must defer, not fall through to an inline run"
+        );
+        assert!(
+            !in_flight_non_thumbnail_task_ids.contains(&task_id),
+            "a deferred task must not be tracked as in-flight"
+        );
+
+        let task = database
+            .get_task(task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(
+            task.status, "pending",
+            "task must remain pending, not be run inline on the shared worker connection"
+        );
+
+        let _ = fs::remove_dir_all(&writer_db_dir);
     }
 }
