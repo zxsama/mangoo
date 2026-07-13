@@ -217,4 +217,98 @@ mod tests {
         results.sort_unstable();
         assert_eq!(results, (0..25).collect::<Vec<_>>());
     }
+
+    /// Insert a root + a root folder + `n` file rows and return their file ids,
+    /// so blob writes below have a real FK target. Mirrors
+    /// `db::tests::seed_media_page_fixture`.
+    fn seed_files_for_blobs(database: &Database, n: usize) -> Vec<i64> {
+        use crate::db::{FileUpsert, FolderUpsert, NewRoot};
+        let root_id = database
+            .add_root(NewRoot {
+                path: format!("D:/megle-wal-bound-{}", std::process::id()),
+                display_name: "wal-bound-root".to_string(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "root-hash".to_string(),
+                mtime: Some(0),
+            })
+            .expect("insert root folder");
+        (0..n)
+            .map(|i| {
+                database
+                    .upsert_file(FileUpsert {
+                        root_id,
+                        folder_id,
+                        name: format!("file-{i}.jpg"),
+                        ext: ".jpg".to_string(),
+                        size: 4096,
+                        mtime: i as i64,
+                        ctime: None,
+                        file_key: Some(format!("wal-bound-file-{i}")),
+                    })
+                    .expect("insert file")
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sustained_blob_writes_through_writer_keep_wal_bounded() {
+        use crate::db::Database;
+        let dir = std::env::temp_dir().join(format!("megle-wal-bound-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("bound.sqlite");
+        let _ = std::fs::remove_file(&db_path);
+        let seed = Database::open(&db_path).expect("open");
+        seed.apply_migrations().expect("migrate");
+        // Seed enough files to attach blobs to (satisfy FK if any).
+        //
+        // NOTE: N=400 (~25MB) as suggested in the task brief does not clear the
+        // 128MiB bound even with checkpointing fully disabled (writes are
+        // sequential/awaited one at a time, and 25MB alone can't exceed 128MB).
+        // Bumped to 3000 (~192MB of raw blob payload) so the no-checkpoint case
+        // clearly overshoots the bound while the checkpointed case still drains
+        // back near zero after each job.
+        let file_ids = seed_files_for_blobs(&seed, 3000);
+        let probe = seed.reopen().expect("reopen").expect("probe conn");
+        let writer = DbWriter::spawn(seed);
+
+        // Write ~3000 64KB blobs through the writer (≈192MB of data). Without
+        // checkpointing this pushes the WAL well past the 128MiB bound; the
+        // writer checkpoints between batches so it stays bounded instead.
+        let payload = vec![0u8; 64 * 1024];
+        for (i, file_id) in file_ids.into_iter().enumerate() {
+            let data = payload.clone();
+            writer
+                .write(move |db| {
+                    db.upsert_thumb_blob(crate::db::ThumbBlobRecord {
+                        file_id,
+                        profile: "grid_320".to_string(),
+                        data,
+                        width: 320,
+                        height: 240,
+                        byte_size: (64 * 1024) as i64,
+                        output_format: "image/webp".to_string(),
+                        created_at: i as i64,
+                        updated_at: i as i64,
+                    })
+                })
+                .await
+                .expect("blob write");
+        }
+        // Give the actor a moment to drain + checkpoint the final batch.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let wal = probe.wal_size_bytes();
+        assert!(
+            wal < 128 * 1024 * 1024,
+            "WAL must stay bounded well under repeated-blob growth, got {} bytes",
+            wal
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
