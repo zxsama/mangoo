@@ -1183,7 +1183,7 @@ components:
           nullable: true
     RootRecord:
       type: object
-      required: [id, path, displayName, enabled, createdAt, lastScanAt, rootFolderId]
+      required: [id, path, displayName, enabled, createdAt, lastScanAt, rootFolderId, mediaCount]
       properties:
         id:
           type: integer
@@ -1201,6 +1201,10 @@ components:
         rootFolderId:
           type: integer
           nullable: true
+        mediaCount:
+          type: integer
+          minimum: 0
+          description: Total active media files in this root, including every descendant folder.
     RootListResponse:
       type: object
       required: [items, nextCursor]
@@ -1214,7 +1218,7 @@ components:
           nullable: true
     FolderRecord:
       type: object
-      required: [id, rootId, parentId, name, status, hasChildren]
+      required: [id, rootId, parentId, name, status, hasChildren, mediaCount]
       properties:
         id:
           type: integer
@@ -1233,6 +1237,10 @@ components:
             True when the folder has at least one active child folder. Lets the
             UI render an expand affordance up front instead of showing a chevron
             that disappears once an empty child page loads.
+        mediaCount:
+          type: integer
+          minimum: 0
+          description: Total active media files in this folder and all descendant folders.
     FolderListResponse:
       type: object
       required: [items, nextCursor]

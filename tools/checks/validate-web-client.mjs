@@ -781,6 +781,16 @@ if (
 if (!/setSelectedFolder\(folder\)/.test(librarySidebar)) {
   fail("LibrarySidebar must pass the full FolderRecord when selecting folders");
 }
+if (
+  !/root\.mediaCount\.toLocaleString\(\)/.test(librarySidebar) ||
+  !/folder\.mediaCount\.toLocaleString\(\)/.test(librarySidebar) ||
+  !/className="tree-media-count"/.test(librarySidebar)
+) {
+  fail("LibrarySidebar must render Core-provided recursive media counts for root and folder rows");
+}
+if (!/className="library-sidebar"[\s\S]*?data-pointer-glow="off"/.test(librarySidebar)) {
+  fail("LibrarySidebar must opt its controls and tree rows out of the unified pointer glow");
+}
 if (/loadAllPages/.test(useLibraryData)) {
   fail("useLibraryData must not exhaust all cursor pages into React state");
 }

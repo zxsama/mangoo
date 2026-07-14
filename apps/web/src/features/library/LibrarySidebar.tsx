@@ -49,6 +49,7 @@ export function LibrarySidebar({
   return (
     <aside
       className="library-sidebar"
+      data-pointer-glow="off"
       ref={sidebarRef}
       aria-label="Library folders"
     >
@@ -146,6 +147,13 @@ function RootNode({
           {expanded ? <FolderOpen size={16} /> : <Folder size={16} />}
           <span>{root.displayName}</span>
         </button>
+        <span
+          aria-label={`${root.mediaCount} media files`}
+          className="tree-media-count"
+          title={`${root.mediaCount.toLocaleString()} media files including subfolders`}
+        >
+          {root.mediaCount.toLocaleString()}
+        </span>
       </div>
       {expanded ? (
         <div role="group">
@@ -237,6 +245,13 @@ function FolderNode({
           {expanded ? <FolderOpen size={16} /> : <Folder size={16} />}
           <span>{folder.name}</span>
         </button>
+        <span
+          aria-label={`${folder.mediaCount} media files`}
+          className="tree-media-count"
+          title={`${folder.mediaCount.toLocaleString()} media files including subfolders`}
+        >
+          {folder.mediaCount.toLocaleString()}
+        </span>
       </div>
       {expanded ? (
         <div role="group">

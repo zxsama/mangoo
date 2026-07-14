@@ -22,7 +22,7 @@ import { SortMenu } from "../features/library/SortMenu";
 import { type LibraryLayoutMode } from "../features/media-grid/layoutMode";
 import { WindowChrome } from "../features/window-chrome/WindowChrome";
 
-export type ShellWorkspaceView = "library" | "plugins" | "settings";
+export type ShellWorkspaceView = "library" | "plugins";
 
 type FilterMenuProps = ComponentProps<typeof FilterMenu>;
 type SearchBarProps = ComponentProps<typeof SearchBar>;
@@ -43,6 +43,7 @@ interface LibraryTitlebarToolbarProps {
   onLayoutModeChange: (mode: LibraryLayoutMode) => void;
   onNavigateFolderBack: () => void;
   onNavigateFolderForward: () => void;
+  onOpenSettings: () => void;
   onSetKind: FilterMenuProps["onSetKind"];
   onSetMinRating: FilterMenuProps["onSetMinRating"];
   onSetQ: SearchBarProps["onChange"];
@@ -74,6 +75,7 @@ interface PreviewTitlebarToolbarProps {
   onBack: () => void;
   onGoNext: () => void;
   onGoPrevious: () => void;
+  onOpenSettings: () => void;
   onToggleSidebars: () => void;
   onToggleActualSize: () => void;
 }
@@ -89,8 +91,7 @@ interface ShellRightActionsProps {
 
 const tabs = [
   { id: "library", label: "Library", caption: "Library", icon: Images },
-  { id: "plugins", label: "Plugins", caption: "Plugins", icon: Package },
-  { id: "settings", label: "Settings", caption: "Settings", icon: Settings }
+  { id: "plugins", label: "Plugins", caption: "Plugins", icon: Package }
 ] satisfies Array<{
   id: ShellWorkspaceView;
   label: string;
@@ -112,7 +113,7 @@ export function ShellSidebarToggle({
     <LiquidGlassButton
       aria-label={label}
       aria-pressed={sidebarsHidden}
-      className="titlebar-icon-button shell-sidebar-toggle no-drag"
+      className="titlebar-icon-button shell-titlebar-utility-button shell-sidebar-toggle no-drag"
       data-titlebar-control="toggle-sidebars"
       onClick={onToggleSidebars}
       title={`${label} (Tab)`}
@@ -124,17 +125,57 @@ export function ShellSidebarToggle({
   );
 }
 
+function ShellTitlebarUtilities({
+  sidebarsHidden,
+  onOpenSettings,
+  onToggleSidebars
+}: {
+  sidebarsHidden: boolean;
+  onOpenSettings: () => void;
+  onToggleSidebars: () => void;
+}) {
+  return (
+    <div
+      className="shell-titlebar-utilities no-drag"
+      data-no-drag="true"
+      data-pointer-glow="off"
+    >
+      <LiquidGlassButton
+        aria-label="Open settings"
+        className="titlebar-icon-button shell-titlebar-utility-button shell-settings-button no-drag"
+        data-titlebar-control="open-settings"
+        onClick={onOpenSettings}
+        title="Settings"
+        tone="control"
+        type="button"
+      >
+        <Settings aria-hidden="true" size={16} />
+      </LiquidGlassButton>
+      <ShellSidebarToggle
+        sidebarsHidden={sidebarsHidden}
+        onToggleSidebars={onToggleSidebars}
+      />
+    </div>
+  );
+}
+
 export function ShellPrimaryNav({
   activeView,
+  onOpenSettings,
   onToggleSidebars,
   onSelectView
 }: {
   activeView: ShellWorkspaceView;
+  onOpenSettings: () => void;
   onToggleSidebars: () => void;
   onSelectView: (view: ShellWorkspaceView) => void;
 }) {
   return (
-    <div className="shell-primary-nav-row no-drag" data-no-drag="true">
+    <div
+      className="shell-primary-nav-row no-drag"
+      data-no-drag="true"
+      data-pointer-glow="off"
+    >
       <nav className="shell-primary-nav no-drag" aria-label="Workbench sections" role="tablist">
         {tabs.map((tab) => {
           const Icon = tab.icon;
@@ -163,18 +204,24 @@ export function ShellPrimaryNav({
           );
         })}
       </nav>
-      <ShellSidebarToggle sidebarsHidden={false} onToggleSidebars={onToggleSidebars} />
+      <ShellTitlebarUtilities
+        sidebarsHidden={false}
+        onOpenSettings={onOpenSettings}
+        onToggleSidebars={onToggleSidebars}
+      />
     </div>
   );
 }
 
 export function ShellTitlebarPlaceholder({
   label,
+  onOpenSettings,
   onToggleSidebars,
   shellActions,
   sidebarsHidden = false
 }: {
   label?: string;
+  onOpenSettings?: () => void;
   onToggleSidebars?: () => void;
   shellActions?: ReactNode;
   sidebarsHidden?: boolean;
@@ -183,13 +230,17 @@ export function ShellTitlebarPlaceholder({
     return <div className="shell-titlebar-placeholder" aria-hidden="true" />;
   }
 
-  if (!sidebarsHidden || !onToggleSidebars) {
+  if (!sidebarsHidden || !onToggleSidebars || !onOpenSettings) {
     return <div className="shell-titlebar-summary">{label}</div>;
   }
 
   return (
     <div className="titlebar-workspace-toolbar titlebar-placeholder-toolbar has-shell-actions">
-      <ShellSidebarToggle sidebarsHidden onToggleSidebars={onToggleSidebars} />
+      <ShellTitlebarUtilities
+        sidebarsHidden
+        onOpenSettings={onOpenSettings}
+        onToggleSidebars={onToggleSidebars}
+      />
       <div className="shell-titlebar-summary">{label}</div>
       {shellActions ? <div className="titlebar-shell-actions no-drag">{shellActions}</div> : null}
     </div>
@@ -210,6 +261,7 @@ export function LibraryTitlebarToolbar({
   onLayoutModeChange,
   onNavigateFolderBack,
   onNavigateFolderForward,
+  onOpenSettings,
   onSetKind,
   onSetMinRating,
   onSetQ,
@@ -238,7 +290,11 @@ export function LibraryTitlebarToolbar({
       }
     >
       {sidebarsHidden ? (
-        <ShellSidebarToggle sidebarsHidden onToggleSidebars={onToggleSidebars} />
+        <ShellTitlebarUtilities
+          sidebarsHidden
+          onOpenSettings={onOpenSettings}
+          onToggleSidebars={onToggleSidebars}
+        />
       ) : null}
       <div className="titlebar-workspace-controls titlebar-library-controls no-drag" data-no-drag="true">
         <LiquidGlassButton
@@ -320,6 +376,7 @@ export function PreviewTitlebarToolbar({
   onBack,
   onGoNext,
   onGoPrevious,
+  onOpenSettings,
   onToggleSidebars,
   onToggleActualSize
 }: PreviewTitlebarToolbarProps) {
@@ -337,7 +394,11 @@ export function PreviewTitlebarToolbar({
     >
       <div className="titlebar-workspace-controls titlebar-preview-controls no-drag" data-no-drag="true">
         {sidebarsHidden ? (
-          <ShellSidebarToggle sidebarsHidden onToggleSidebars={onToggleSidebars} />
+          <ShellTitlebarUtilities
+            sidebarsHidden
+            onOpenSettings={onOpenSettings}
+            onToggleSidebars={onToggleSidebars}
+          />
         ) : null}
         <LiquidGlassButton
           aria-label="Back to library"

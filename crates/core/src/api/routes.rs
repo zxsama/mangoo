@@ -2150,6 +2150,7 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["items"].as_array().expect("items").len(), 1);
         assert_eq!(body["items"][0]["displayName"], "Integration Root");
+        assert_eq!(body["items"][0]["mediaCount"], 2);
         assert!(body["items"][0]["lastScanAt"].as_i64().is_some());
         let root_folder_id = body["items"][0]["rootFolderId"]
             .as_i64()
@@ -2170,6 +2171,7 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["items"].as_array().expect("items").len(), 1);
         assert_eq!(body["items"][0]["name"], "photos");
+        assert_eq!(body["items"][0]["mediaCount"], 1);
 
         let response = app
             .clone()

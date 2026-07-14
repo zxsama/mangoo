@@ -1585,6 +1585,9 @@ for (const [source, value, message] of [
   [appShell, "sidebarsHidden", "AppShell must receive hidden-sidebar shell state"],
   [appShell, "data-sidebars-hidden", "AppShell must expose hidden-sidebar state to CSS"],
   [shellTitlebar, "ShellSidebarToggle", "titlebar must expose the sidebar toggle control"],
+  [shellTitlebar, "shell-titlebar-utilities", "settings and sidebar toggle must share one titlebar utility group"],
+  [shellTitlebar, "shell-settings-button", "settings must have a standalone utility button beside the sidebar toggle"],
+  [shellTitlebar, 'data-pointer-glow="off"', "left titlebar controls must opt out of the unified pointer glow"],
   [shellTitlebar, "titlebar-shell-actions", "center titlebar must host right shell actions when sidebars are hidden"],
   [stylesForChecks, ".app-shell[data-sidebars-hidden=\"true\"]", "styles must define the hidden-sidebar shell layout"],
   [stylesForChecks, ".shell-sidebar-toggle", "styles must define the sidebar toggle affordance"],
@@ -1593,6 +1596,10 @@ for (const [source, value, message] of [
   if (!source.includes(value)) {
     fail(message);
   }
+}
+
+if (/\{\s*id:\s*"settings"[\s\S]*?caption:\s*"Settings"/.test(shellTitlebar)) {
+  fail("settings must not remain duplicated inside the primary workspace tab group");
 }
 
 for (const value of [

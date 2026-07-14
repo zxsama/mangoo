@@ -533,6 +533,7 @@ export function App() {
           onBack={handleClosePreview}
           onGoNext={handlePreviewNext}
           onGoPrevious={handlePreviewPrevious}
+          onOpenSettings={handleOpenSettings}
           onToggleSidebars={toggleSidebars}
           onToggleActualSize={() => previewViewCommands?.toggleActualSize()}
         />
@@ -560,6 +561,7 @@ export function App() {
           onLayoutModeChange={setLayoutMode}
           onNavigateFolderBack={library.navigateFolderBack}
           onNavigateFolderForward={library.navigateFolderForward}
+          onOpenSettings={handleOpenSettings}
           onSetKind={library.setKind}
           onSetMinRating={library.setMinRating}
           onSetQ={library.setQ}
@@ -581,19 +583,10 @@ export function App() {
         />
       );
     }
-    if (activeView === "plugins") {
-      return (
-        <ShellTitlebarPlaceholder
-          label="Plugins"
-          shellActions={sidebarsHidden ? shellRightActions : undefined}
-          sidebarsHidden={sidebarsHidden}
-          onToggleSidebars={toggleSidebars}
-        />
-      );
-    }
     return (
       <ShellTitlebarPlaceholder
-        label="Settings"
+        label="Plugins"
+        onOpenSettings={handleOpenSettings}
         shellActions={sidebarsHidden ? shellRightActions : undefined}
         sidebarsHidden={sidebarsHidden}
         onToggleSidebars={toggleSidebars}
@@ -683,15 +676,11 @@ export function App() {
     );
   }
 
-  // Selecting "settings" opens the SEPARATE settings OS window (a second
-  // frameless BrowserWindow, freely movable across the desktop). Other tabs
-  // switch the workspace view as before. In a browser (no desktop bridge) there
-  // is no second window, so fall back to keeping the current view.
+  function handleOpenSettings() {
+    void getDesktopBridge()?.openSettingsWindow?.();
+  }
+
   function handleSelectView(view: AppView) {
-    if (view === "settings") {
-      void getDesktopBridge()?.openSettingsWindow?.();
-      return;
-    }
     setActiveView(view);
   }
 
@@ -703,6 +692,7 @@ export function App() {
         titlebarLeft={
           <ShellPrimaryNav
             activeView={activeView}
+            onOpenSettings={handleOpenSettings}
             onSelectView={handleSelectView}
             onToggleSidebars={toggleSidebars}
           />

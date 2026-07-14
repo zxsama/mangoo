@@ -95,6 +95,7 @@ export interface RootRecord {
   createdAt: number;
   lastScanAt: number | null;
   rootFolderId: number | null;
+  mediaCount: number;
 }
 
 export type TaskKind = "root_scan" | "interactive_folder_scan" | "thumbnail";
@@ -125,6 +126,7 @@ export interface FolderRecord {
   name: string;
   status: string;
   hasChildren: boolean;
+  mediaCount: number;
 }
 
 export interface MediaRecord {

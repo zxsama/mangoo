@@ -2,7 +2,7 @@ pub mod migrations;
 pub mod writer;
 pub use writer::DbWriter;
 
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -64,6 +64,7 @@ pub struct RootRecord {
     pub created_at: i64,
     pub last_scan_at: Option<i64>,
     pub root_folder_id: Option<i64>,
+    pub media_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +328,9 @@ pub struct FolderRecord {
     /// with an EXISTS probe over `idx_folders_parent_status_id` (one index seek
     /// per row), so it stays cheap even for a full 500-folder page.
     pub has_children: bool,
+    /// Active media in this folder and every active descendant folder. Folder
+    /// pages compute all row counts in one shared recursive scope.
+    pub media_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1026,7 +1030,12 @@ impl Database {
             r#"
             SELECT roots.id, roots.path, roots.display_name, roots.enabled, roots.created_at,
                    roots.last_scan_at,
-                   root_folder.id AS root_folder_id
+                   root_folder.id AS root_folder_id,
+                   (
+                       SELECT COUNT(*)
+                       FROM files
+                       WHERE files.root_id = roots.id AND files.status = 'active'
+                   ) AS media_count
             FROM roots
             LEFT JOIN folders root_folder
               ON root_folder.root_id = roots.id
@@ -1050,7 +1059,12 @@ impl Database {
             r#"
             SELECT roots.id, roots.path, roots.display_name, roots.enabled, roots.created_at,
                    roots.last_scan_at,
-                   root_folder.id AS root_folder_id
+                   root_folder.id AS root_folder_id,
+                   (
+                       SELECT COUNT(*)
+                       FROM files
+                       WHERE files.root_id = roots.id AND files.status = 'active'
+                   ) AS media_count
             FROM roots
             LEFT JOIN folders root_folder
               ON root_folder.root_id = roots.id
@@ -3681,6 +3695,7 @@ impl Database {
                 name: row.get(3)?,
                 status: row.get(4)?,
                 has_children: row.get(5)?,
+                media_count: 0,
             })
         })?;
 
@@ -3688,12 +3703,17 @@ impl Database {
         for row in rows {
             folders.push(row?);
         }
+        drop(statement);
         let next_cursor = if folders.len() > limit as usize {
             folders.pop();
             folders.last().map(encode_folder_cursor)
         } else {
             None
         };
+        let media_counts = self.folder_subtree_media_counts(folder_id)?;
+        for folder in &mut folders {
+            folder.media_count = media_counts.get(&folder.id).copied().unwrap_or(0);
+        }
         Ok(Page {
             items: folders,
             next_cursor,
@@ -3706,6 +3726,54 @@ impl Database {
         Ok(self
             .list_folder_children_page(folder_id, 500, None, false)?
             .items)
+    }
+
+    fn folder_subtree_media_counts(&self, folder_id: i64) -> anyhow::Result<HashMap<i64, i64>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            WITH RECURSIVE folder_scope(id, parent_id, depth) AS (
+                SELECT folders.id, folders.parent_id, 0
+                FROM folders
+                JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
+                WHERE folders.id = ?1 AND folders.status = 'active'
+                UNION ALL
+                SELECT child.id, child.parent_id, folder_scope.depth + 1
+                FROM folder_scope
+                JOIN folders child
+                  ON child.parent_id = folder_scope.id
+                 AND child.status = 'active'
+            )
+            SELECT folder_scope.id, folder_scope.parent_id, folder_scope.depth,
+                   COUNT(files.id) AS direct_media_count
+            FROM folder_scope
+            LEFT JOIN files
+              ON files.folder_id = folder_scope.id
+             AND files.status = 'active'
+            GROUP BY folder_scope.id, folder_scope.parent_id, folder_scope.depth
+            ORDER BY folder_scope.depth DESC
+            "#,
+        )?;
+        let rows = statement.query_map([folder_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+
+        let mut media_counts = HashMap::new();
+        for row in rows {
+            let (id, parent_id, depth, direct_media_count) = row?;
+            let total = direct_media_count + media_counts.get(&id).copied().unwrap_or(0);
+            media_counts.insert(id, total);
+            if depth > 0 {
+                if let Some(parent_id) = parent_id {
+                    *media_counts.entry(parent_id).or_insert(0) += total;
+                }
+            }
+        }
+        Ok(media_counts)
     }
 
     pub(crate) fn get_folder_id_by_path(
@@ -6198,6 +6266,7 @@ fn root_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RootRecord> {
         created_at: row.get(4)?,
         last_scan_at: row.get(5)?,
         root_folder_id: row.get(6)?,
+        media_count: row.get(7)?,
     })
 }
 
@@ -9654,7 +9723,7 @@ mod tests {
                 mtime: Some(2),
             })
             .expect("insert child folder");
-        database
+        let grandchild_folder_id = database
             .upsert_folder(FolderUpsert {
                 root_id,
                 parent_id: Some(child_folder_id),
@@ -9663,7 +9732,7 @@ mod tests {
                 mtime: Some(3),
             })
             .expect("insert grandchild folder");
-        database
+        let sibling_folder_id = database
             .upsert_folder(FolderUpsert {
                 root_id,
                 parent_id: Some(root_folder_id),
@@ -9672,6 +9741,32 @@ mod tests {
                 mtime: Some(4),
             })
             .expect("insert sibling folder");
+
+        for (folder_id, name, mtime) in [
+            (root_folder_id, "root.jpg", 10),
+            (child_folder_id, "child.jpg", 20),
+            (grandchild_folder_id, "grandchild.jpg", 30),
+            (sibling_folder_id, "sibling.jpg", 40),
+        ] {
+            let file_id = database
+                .upsert_file(FileUpsert {
+                    root_id,
+                    folder_id,
+                    name: name.to_string(),
+                    ext: ".jpg".to_string(),
+                    size: 1024,
+                    mtime,
+                    ctime: None,
+                    file_key: None,
+                })
+                .expect("insert folder count test file");
+            database
+                .upsert_media_kind(file_id, "image")
+                .expect("insert folder count test media");
+        }
+
+        let roots = database.list_roots().expect("list counted roots");
+        assert_eq!(roots[0].media_count, 4);
 
         let direct_page = database
             .list_folder_children_page(root_folder_id, 10, None, false)
@@ -9689,6 +9784,8 @@ mod tests {
             !sibling.has_children,
             "leaf sibling folder should report no children"
         );
+        assert_eq!(child.media_count, 2);
+        assert_eq!(sibling.media_count, 1);
 
         let recursive_page = database
             .list_folder_children_page(root_folder_id, 10, None, true)
@@ -9704,6 +9801,15 @@ mod tests {
         assert!(
             !folder_named(&recursive_page.items, "grandchild").has_children,
             "leaf grandchild folder should report no children"
+        );
+        assert_eq!(folder_named(&recursive_page.items, "child").media_count, 2);
+        assert_eq!(
+            folder_named(&recursive_page.items, "grandchild").media_count,
+            1
+        );
+        assert_eq!(
+            folder_named(&recursive_page.items, "sibling").media_count,
+            1
         );
     }
 
