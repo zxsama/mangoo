@@ -138,7 +138,6 @@ function ShellTitlebarUtilities({
     <div
       className="shell-titlebar-utilities no-drag"
       data-no-drag="true"
-      data-pointer-glow="off"
     >
       <LiquidGlassButton
         aria-label="Open settings"
@@ -174,7 +173,6 @@ export function ShellPrimaryNav({
     <div
       className="shell-primary-nav-row no-drag"
       data-no-drag="true"
-      data-pointer-glow="off"
     >
       <nav className="shell-primary-nav no-drag" aria-label="Workbench sections" role="tablist">
         {tabs.map((tab) => {

@@ -1587,7 +1587,6 @@ for (const [source, value, message] of [
   [shellTitlebar, "ShellSidebarToggle", "titlebar must expose the sidebar toggle control"],
   [shellTitlebar, "shell-titlebar-utilities", "settings and sidebar toggle must share one titlebar utility group"],
   [shellTitlebar, "shell-settings-button", "settings must have a standalone utility button beside the sidebar toggle"],
-  [shellTitlebar, 'data-pointer-glow="off"', "left titlebar controls must opt out of the unified pointer glow"],
   [shellTitlebar, "titlebar-shell-actions", "center titlebar must host right shell actions when sidebars are hidden"],
   [stylesForChecks, ".app-shell[data-sidebars-hidden=\"true\"]", "styles must define the hidden-sidebar shell layout"],
   [stylesForChecks, ".shell-sidebar-toggle", "styles must define the sidebar toggle affordance"],
@@ -1600,6 +1599,10 @@ for (const [source, value, message] of [
 
 if (/\{\s*id:\s*"settings"[\s\S]*?caption:\s*"Settings"/.test(shellTitlebar)) {
   fail("settings must not remain duplicated inside the primary workspace tab group");
+}
+
+if (/data-pointer-glow="off"/.test(shellTitlebar)) {
+  fail("primary navigation, settings, and sidebar-toggle controls must use the unified pointer highlight");
 }
 
 for (const value of [
@@ -1736,12 +1739,70 @@ if (
 
 for (const value of [
   "INTERACTIVE_AFFORDANCE_OWNER_SELECTOR",
+  ".tree-item",
+  '[data-liquid-glass="button"]',
   ".settings-style-slider-control",
   'input:not([type="range"]):not([data-liquid-glass])',
   "interactiveAffordanceTargets"
 ]) {
   if (!liquidGlassSurface.includes(value)) {
     fail(`interactive affordance routing must resolve pointer highlights to visual owner elements: missing ${value}`);
+  }
+}
+
+const legacyButtonHoverBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  ':where(button, [role="button"]):hover:not(:disabled)'
+);
+if (
+  legacyButtonHoverBlocks.some(
+    (block) =>
+      hasNonTransparentBackground(block) ||
+      hasNonNoneDeclaration(block, "background-image") ||
+      hasNonzeroBorderDeclaration(block, "border") ||
+      hasVisibleBorderDeclaration(block, "border-color")
+  )
+) {
+  fail("generic button hover must not paint a full-control background or border over the unified pointer highlight");
+}
+if (!legacyButtonHoverBlocks.some((block) => latestDeclarationValue(block, "transform") === "translateY(-1px)")) {
+  fail("generic button hover must preserve the existing one-pixel lift feedback");
+}
+
+const sidebarPointerScopeClasses = [
+  ".library-sidebar",
+  ".tree-item",
+  ".tree-label",
+  ".tree-disclosure",
+  ".tree-load-more",
+  ".library-switch-button",
+  ".library-switcher",
+  ".library-switcher-search",
+  ".library-switcher-row",
+  ".library-switcher-icon",
+  ".library-switcher-main",
+  ".library-switcher-actions",
+  ".library-icon-picker-cell",
+  ".library-switcher-remove-menu-item",
+  ".library-switcher-footer",
+  ".shell-primary-nav-row",
+  ".shell-nav-button",
+  ".shell-titlebar-utilities",
+  ".shell-titlebar-utility-button",
+  ".shell-sidebar-toggle"
+];
+const sidebarHoverPaintBlocks = cssRuleBlocksForMatchingSelectors(stylesForChecks, (selector) =>
+  selector.includes(":hover") &&
+  sidebarPointerScopeClasses.some((classSelector) => cssSelectorContainsClass(selector, classSelector))
+);
+for (const { block, selectorList } of sidebarHoverPaintBlocks) {
+  if (
+    hasNonTransparentBackground(block) ||
+    hasNonzeroBorderDeclaration(block, "border") ||
+    hasVisibleBorderDeclaration(block, "border-color") ||
+    hasNonNoneDeclaration(block, "background-image")
+  ) {
+    fail(`sidebar hover must defer full-control paint to the unified pointer highlight: ${selectorList}`);
   }
 }
 

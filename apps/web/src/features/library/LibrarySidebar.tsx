@@ -49,7 +49,6 @@ export function LibrarySidebar({
   return (
     <aside
       className="library-sidebar"
-      data-pointer-glow="off"
       ref={sidebarRef}
       aria-label="Library folders"
     >
@@ -57,7 +56,6 @@ export function LibrarySidebar({
         <button
           type="button"
           className="library-switch-button"
-          data-pointer-glow="off"
           onClick={onOpenSwitcher}
         >
           <LibraryGlyph icon={activeLibraryIcon} color={activeLibraryColor} size={15} />

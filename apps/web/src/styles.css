@@ -524,8 +524,7 @@ body {
 }
 
 :where(button, [role="button"]):hover:not(:disabled) {
-  border-color: var(--line-strong);
-  background: linear-gradient(180deg, var(--interactive-hover), rgba(255, 255, 255, 0.04));
+  /* Shape and edge illumination come from the unified cursor-centred pointer target. */
   color: #f8fdff;
   transform: translateY(-1px);
 }
@@ -1095,7 +1094,6 @@ button:disabled {
 
 .tree-load-more:hover:not(:disabled) {
   color: #f4f7f9;
-  background: var(--surface-2);
 }
 
 .workspace {
@@ -6939,9 +6937,7 @@ button:disabled {
 .shell-titlebar-center .titlebar-tool-button::after,
 .shell-titlebar-center .titlebar-icon-button::after,
 .shell-titlebar-center .filter-menu-trigger::after,
-.shell-titlebar-center .sort-menu-trigger::after,
-.shell-titlebar-utility-button::after,
-.shell-sidebar-toggle::after {
+.shell-titlebar-center .sort-menu-trigger::after {
   opacity: 0;
   border-color: transparent;
   box-shadow: none;
@@ -6955,6 +6951,8 @@ button:disabled {
 .shell-titlebar-center .titlebar-icon-button:hover:not(:disabled),
 .shell-titlebar-center .filter-menu-trigger:hover:not(:disabled),
 .shell-titlebar-center .sort-menu-trigger:hover:not(:disabled),
+.shell-titlebar-utility-button:hover:not(:disabled),
+.shell-sidebar-toggle:hover:not(:disabled),
 .shell-titlebar-center .titlebar-tool-button[data-glass-active="true"],
 .shell-titlebar-center .titlebar-icon-button[data-glass-active="true"],
 .shell-titlebar-center .filter-menu-trigger[data-glass-active="true"],
@@ -6968,7 +6966,9 @@ button:disabled {
 .shell-titlebar-center .titlebar-tool-button:focus-visible,
 .shell-titlebar-center .titlebar-icon-button:focus-visible,
 .shell-titlebar-center .filter-menu-trigger:focus-visible,
-.shell-titlebar-center .sort-menu-trigger:focus-visible {
+.shell-titlebar-center .sort-menu-trigger:focus-visible,
+.shell-titlebar-utility-button:focus-visible,
+.shell-sidebar-toggle:focus-visible {
   color: #d9fbff;
   background: transparent;
   border: 0;
@@ -7276,8 +7276,7 @@ button:disabled {
 }
 
 .library-sidebar-heading { display: flex; align-items: center; gap: 8px; padding: 8px 4px; }
-.library-switch-button { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; background: transparent; border: 0; color: inherit; cursor: pointer; padding: 6px 8px; border-radius: var(--radius-control); transition: background 120ms ease; }
-.library-switch-button:hover { background: var(--glass-hover-fill, rgba(255, 255, 255, 0.06)); }
+.library-switch-button { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; background: transparent; border: 0; color: inherit; cursor: pointer; padding: 6px 8px; border-radius: var(--radius-control); transition: color 120ms ease; }
 .library-switch-name { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .library-switch-button > svg:last-child { flex: 0 0 auto; opacity: 0.7; }
 
@@ -7328,19 +7327,17 @@ button:disabled {
 .library-switcher-search button { display: grid; place-items: center; background: transparent; border: 0; color: var(--text-muted); cursor: pointer; }
 .library-switcher-list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; display: grid; gap: 2px; }
 .library-switcher-row { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: var(--radius-control); }
-.library-switcher-row:hover { background: var(--glass-hover-fill, rgba(255, 255, 255, 0.05)); }
 .library-switcher-row.active { background: var(--glass-hover-fill, rgba(255, 255, 255, 0.07)); }
 .library-switcher-row.unavailable { opacity: 0.5; }
 .library-switcher-icon-anchor { position: relative; flex: 0 0 auto; }
 .library-switcher-icon { display: grid; place-items: center; width: 28px; height: 28px; background: transparent; border: 1px solid transparent; border-radius: var(--radius-control); color: inherit; cursor: pointer; }
-.library-switcher-icon:hover { background: var(--glass-control, rgba(255, 255, 255, 0.06)); border-color: var(--line); }
 .library-switcher-main { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 1px; background: transparent; border: 0; cursor: pointer; color: inherit; }
 .library-switcher-name { font-size: 13px; font-weight: 600; }
 .library-switcher-path { max-width: 100%; font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .library-switcher-check { flex: 0 0 auto; color: var(--accent, #7cc4ff); }
 .library-switcher-actions { display: flex; gap: 2px; flex: 0 0 auto; }
 .library-switcher-actions button { display: grid; place-items: center; width: 28px; height: 28px; background: transparent; border: 1px solid transparent; border-radius: var(--radius-control); color: var(--text-muted); cursor: pointer; }
-.library-switcher-actions button:hover:not(:disabled) { background: var(--glass-control, rgba(255, 255, 255, 0.06)); border-color: var(--line); color: var(--text-soft); }
+.library-switcher-actions button:hover:not(:disabled) { color: var(--text-soft); }
 .library-switcher-actions button:disabled { opacity: 0.35; cursor: default; }
 /* Preset icon + color picker, anchored under the row's icon button. */
 .library-icon-picker {
@@ -7352,7 +7349,6 @@ button:disabled {
 }
 .library-icon-picker-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; }
 .library-icon-picker-cell { display: grid; place-items: center; width: 22px; height: 22px; background: transparent; border: 1px solid transparent; border-radius: 6px; cursor: pointer; }
-.library-icon-picker-cell:hover { background: var(--glass-control, rgba(255, 255, 255, 0.08)); }
 .library-icon-picker-cell.selected { border-color: var(--accent, #7cc4ff); background: rgba(124, 196, 255, 0.14); }
 .library-icon-picker-colors { display: flex; flex-wrap: wrap; gap: 4px; padding-top: 6px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
 .library-icon-picker-swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(255, 255, 255, 0.2); cursor: pointer; padding: 0; }
@@ -7371,7 +7367,5 @@ button:disabled {
   width: 100%; text-align: left; background: transparent; border: 0; color: inherit;
   padding: 6px 8px; border-radius: var(--radius-control); cursor: pointer; font-size: 12px;
 }
-.library-switcher-remove-menu-item:hover { background: var(--surface-hover, rgba(255, 255, 255, 0.06)); }
 .library-switcher-footer { display: flex; flex-direction: column; padding: 8px; gap: 2px; border-top: 1px solid var(--line); }
 .library-switcher-footer button { text-align: left; background: transparent; border: 1px solid transparent; color: var(--text-soft); padding: 8px; border-radius: var(--radius-control); cursor: pointer; font-size: 13px; }
-.library-switcher-footer button:hover { background: var(--glass-hover-fill, rgba(255, 255, 255, 0.05)); border-color: var(--line); }

@@ -788,8 +788,8 @@ if (
 ) {
   fail("LibrarySidebar must render Core-provided recursive media counts for root and folder rows");
 }
-if (!/className="library-sidebar"[\s\S]*?data-pointer-glow="off"/.test(librarySidebar)) {
-  fail("LibrarySidebar must opt its controls and tree rows out of the unified pointer glow");
+if (/data-pointer-glow="off"/.test(librarySidebar)) {
+  fail("LibrarySidebar controls and tree rows must remain unified pointer-highlight targets");
 }
 if (/loadAllPages/.test(useLibraryData)) {
   fail("useLibraryData must not exhaust all cursor pages into React state");
