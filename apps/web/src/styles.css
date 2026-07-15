@@ -1020,10 +1020,6 @@ button:disabled {
   border-radius: 7px;
 }
 
-.tree-item[data-interactive-pointer-target="true"]::before {
-  filter: brightness(1.08);
-}
-
 .tree-list .tree-item[role="treeitem"][aria-expanded="true"] {
   position: sticky;
   top: calc(var(--tree-sticky-offset, 0px) - var(--tree-sticky-scrollport-inset, 0px));
@@ -1068,6 +1064,7 @@ button:disabled {
   min-width: 0;
   min-height: 30px;
   padding: 0 8px 0 2px;
+  color: var(--text-soft);
   text-align: left;
 }
 
@@ -1086,7 +1083,14 @@ button:disabled {
   line-height: 1;
   pointer-events: none;
   text-align: right;
+  transition: color 140ms ease;
   white-space: nowrap;
+}
+
+.tree-item:hover > .tree-disclosure,
+.tree-item:hover > .tree-label,
+.tree-item:hover > .tree-media-count {
+  color: color-mix(in srgb, var(--text-soft) 85%, var(--text-primary));
 }
 
 .tree-load-more {

@@ -1806,18 +1806,36 @@ for (const { block, selectorList } of sidebarHoverPaintBlocks) {
   }
 }
 
-const treePointerFillBlocks = cssBlocksForExactSelector(
-  stylesForChecks,
-  '.tree-item[data-interactive-pointer-target="true"]::before'
+const treePointerPseudoBlocks = cssRuleBlocksForMatchingSelectors(stylesForChecks, (selector) =>
+  cssSelectorContainsClass(selector, ".tree-item") &&
+  selector.includes('[data-interactive-pointer-target="true"]') &&
+  (selector.includes("::before") || selector.includes("::after"))
 );
-if (
-  !treePointerFillBlocks.some(
-    (block) =>
-      latestDeclarationValue(block, "filter") === "brightness(1.08)" &&
-      latestBackgroundValue(block) === null
-  )
-) {
-  fail("folder row hover must lightly tune the unified pointer fill on the tree-item visual owner without painting a second background");
+if (treePointerPseudoBlocks.some(({ block }) => latestDeclarationValue(block, "filter") !== null)) {
+  fail("folder rows must not alter the baseline unified pointer pseudo-elements with an extra filter");
+}
+
+const treeHoverContentSelectors = [
+  ".tree-item:hover > .tree-disclosure",
+  ".tree-item:hover > .tree-label",
+  ".tree-item:hover > .tree-media-count"
+];
+for (const selector of treeHoverContentSelectors) {
+  const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
+  if (
+    !blocks.some(
+      (block) =>
+        latestDeclarationValue(block, "color") ===
+          "color-mix(in srgb, var(--text-soft) 85%, var(--text-primary))" &&
+        latestBackgroundValue(block) === null &&
+        latestDeclarationValue(block, "filter") === null &&
+        latestDeclarationValue(block, "box-shadow") === null &&
+        latestDeclarationValue(block, "border") === null &&
+        latestDeclarationValue(block, "border-color") === null
+    )
+  ) {
+    fail(`${selector} must provide only a restrained foreground-color hover without adding another highlight surface`);
+  }
 }
 
 for (const selector of [
