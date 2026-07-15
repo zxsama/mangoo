@@ -1806,6 +1806,36 @@ for (const { block, selectorList } of sidebarHoverPaintBlocks) {
   }
 }
 
+const treePointerFillBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  '.tree-item[data-interactive-pointer-target="true"]::before'
+);
+if (
+  !treePointerFillBlocks.some(
+    (block) =>
+      latestDeclarationValue(block, "filter") === "brightness(1.08)" &&
+      latestBackgroundValue(block) === null
+  )
+) {
+  fail("folder row hover must lightly tune the unified pointer fill on the tree-item visual owner without painting a second background");
+}
+
+for (const selector of [
+  ".tree-item .tree-disclosure:active:not(:disabled)",
+  ".tree-item .tree-label:active:not(:disabled)"
+]) {
+  const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
+  if (
+    !blocks.some(
+      (block) =>
+        latestBackgroundValue(block) === "transparent" &&
+        latestDeclarationValue(block, "transform") === null
+    )
+  ) {
+    fail(`${selector} must suppress only the pressed background while inheriting global press scale motion`);
+  }
+}
+
 if (!settingsView.includes("settings-style-slider-control")) {
   fail("Interface style sliders must wrap native range inputs in a stylable pointer-highlight owner");
 }

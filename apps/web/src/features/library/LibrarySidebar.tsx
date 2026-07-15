@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import type { CSSProperties, RefObject } from "react";
 import { useEffect, useLayoutEffect, useRef } from "react";
+import { folderShowsOpenIcon, isFolderKnownChildless } from "../../core/folderTreeState";
 import type { FolderRecord, RootRecord } from "../../core/types";
 import type { LibraryState } from "../../core/useLibraryData";
 import { LibraryGlyph } from "./libraryGlyph";
@@ -197,9 +198,13 @@ function FolderNode({
   // empty child page loads. The "loaded and empty" clause is a fallback that
   // also collapses the affordance if a stale `hasChildren: true` turns out empty
   // after loading. A folder still loading keeps the chevron.
-  const knownChildless =
-    !folder.hasChildren ||
-    (library.folderChildrenByParent[folder.id] !== undefined && children.length === 0 && !loading);
+  const knownChildless = isFolderKnownChildless({
+    hasChildren: folder.hasChildren,
+    childrenLoaded: library.folderChildrenByParent[folder.id] !== undefined,
+    loadedChildCount: children.length,
+    loading
+  });
+  const showsOpenIcon = folderShowsOpenIcon({ expanded, knownChildless, selected });
 
   return (
     <div className="tree-branch">
@@ -209,7 +214,7 @@ function FolderNode({
         data-folder-id={folder.id}
         data-root-id={folder.rootId}
         role="treeitem"
-        aria-expanded={expanded}
+        aria-expanded={knownChildless ? undefined : expanded}
         aria-selected={selected}
         onContextMenu={(event) => {
           if (!onFolderContextMenu) return;
@@ -240,7 +245,7 @@ function FolderNode({
           onClick={() => library.setSelectedFolder(folder)}
           type="button"
         >
-          {expanded ? <FolderOpen size={16} /> : <Folder size={16} />}
+          {showsOpenIcon ? <FolderOpen size={16} /> : <Folder size={16} />}
           <span>{folder.name}</span>
         </button>
         <span
@@ -251,7 +256,7 @@ function FolderNode({
           {folder.mediaCount.toLocaleString()}
         </span>
       </div>
-      {expanded ? (
+      {expanded && !knownChildless ? (
         <div role="group">
           {children.map((child) => (
             <FolderNode

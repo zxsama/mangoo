@@ -1020,6 +1020,10 @@ button:disabled {
   border-radius: 7px;
 }
 
+.tree-item[data-interactive-pointer-target="true"]::before {
+  filter: brightness(1.08);
+}
+
 .tree-list .tree-item[role="treeitem"][aria-expanded="true"] {
   position: sticky;
   top: calc(var(--tree-sticky-offset, 0px) - var(--tree-sticky-scrollport-inset, 0px));
@@ -1041,6 +1045,11 @@ button:disabled {
   border: 0;
   background: transparent;
   cursor: pointer;
+}
+
+.tree-item .tree-disclosure:active:not(:disabled),
+.tree-item .tree-label:active:not(:disabled) {
+  background: transparent;
 }
 
 .tree-disclosure {

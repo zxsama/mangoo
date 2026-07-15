@@ -17,6 +17,7 @@ import type {
 import { CoreApiError } from "@megle/core-client";
 import { createCoreClient } from "./client";
 import { readDesktopDiagnostics, subscribeLibraryPhase, type DesktopDiagnostics } from "./desktop";
+import { reconcileFolderExpansionForSelection } from "./folderTreeState";
 import {
   isFreshThumbnailForMediaRecord,
   isLiveThumbnailResponseForMediaRecord,
@@ -196,6 +197,7 @@ type LibrarySelectionScope = {
 type FolderNavigationEntry = {
   rootId: number;
   folderId: number | null;
+  hasChildren?: boolean;
 };
 
 type FolderNavigationHistory = {
@@ -1062,6 +1064,11 @@ export function useLibraryData(
       const force = options.force ?? false;
       const cachedChildren = folderChildrenByParentRef.current[folderId];
       if (!force && cachedChildren !== undefined) {
+        if (cachedChildren.length === 0) {
+          setExpandedFolderIds((current) =>
+            reconcileFolderExpansionForSelection(current, folderId, false)
+          );
+        }
         return cachedChildren;
       }
       const existingRequest = folderChildInitialRequestsRef.current.get(folderId);
@@ -1097,6 +1104,11 @@ export function useLibraryData(
           ...current,
           [folderId]: page.nextCursor
         }));
+        if (page.items.length === 0 && page.nextCursor === null) {
+          setExpandedFolderIds((current) =>
+            reconcileFolderExpansionForSelection(current, folderId, false)
+          );
+        }
         return page.items;
       })();
 
@@ -1254,7 +1266,12 @@ export function useLibraryData(
       updateFolderNavigationHistory((current) => {
         const activeEntry = current.entries[current.index];
         if (sameFolderNavigationEntry(activeEntry, entry)) {
-          return current;
+          if (entry.hasChildren === undefined || activeEntry?.hasChildren === entry.hasChildren) {
+            return current;
+          }
+          const entries = [...current.entries];
+          entries[current.index] = entry;
+          return { entries, index: current.index };
         }
         const entries =
           current.index >= 0 ? current.entries.slice(0, current.index + 1) : [];
@@ -1682,14 +1699,6 @@ export function useLibraryData(
     }
     const root = refreshedRoots.find((item) => item.id === selectionToken.rootId) ?? null;
     const resolvedFolderId = selectionToken.folderId ?? root?.rootFolderId ?? null;
-    // Only ensure the currently-selected folder stays expanded; never re-drive
-    // selection here.
-    if (resolvedFolderId !== null && selectionToken.folderId !== null) {
-      setExpandedFolderIds((current) =>
-        current.has(resolvedFolderId) ? current : new Set(current).add(resolvedFolderId)
-      );
-    }
-
     if (selectionToken.folderId !== null || resolvedFolderId !== null) {
       const folderId = selectionToken.folderId ?? resolvedFolderId;
       if (folderId === null) {
@@ -2240,10 +2249,14 @@ export function useLibraryData(
         pushFolderNavigationEntry(entry);
       }
       if (entry.folderId !== null) {
-        setExpandedFolderIds((current) => new Set(current).add(entry.folderId as number));
-        void loadFolderChildren(entry.folderId).catch((cause) => {
-          setError(errorMessage(cause));
-        });
+        setExpandedFolderIds((current) =>
+          reconcileFolderExpansionForSelection(current, entry.folderId as number, entry.hasChildren)
+        );
+        if (entry.hasChildren !== false) {
+          void loadFolderChildren(entry.folderId).catch((cause) => {
+            setError(errorMessage(cause));
+          });
+        }
       }
       void reloadCurrentMedia({
         rootId: entry.rootId,
@@ -2990,7 +3003,11 @@ export function useLibraryData(
       selectLibraryFolder({ rootId, folderId: rootFolderId });
     },
     setSelectedFolder: (folder: FolderRecord) => {
-      selectLibraryFolder({ rootId: folder.rootId, folderId: folder.id });
+      selectLibraryFolder({
+        rootId: folder.rootId,
+        folderId: folder.id,
+        hasChildren: folder.hasChildren
+      });
     },
     setSelectedFolderInfo: (folder: FolderRecord | null) => {
       setSelectedFolderInfoState(folder);

@@ -89,6 +89,7 @@ const app = read("apps/web/src/app/App.tsx");
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const libraryView = read("apps/web/src/features/library/LibraryView.tsx");
 const librarySidebar = read("apps/web/src/features/library/LibrarySidebar.tsx");
+const folderTreeState = read("apps/web/src/core/folderTreeState.ts");
 const subfolderStrip = read("apps/web/src/features/library/SubfolderStrip.tsx");
 const settingsView = read("apps/web/src/features/settings/settingsPanels.tsx");
 const recentOpsPanel = read("apps/web/src/features/file-ops/RecentOpsPanel.tsx");
@@ -791,6 +792,36 @@ if (
 if (/data-pointer-glow="off"/.test(librarySidebar)) {
   fail("LibrarySidebar controls and tree rows must remain unified pointer-highlight targets");
 }
+for (const value of [
+  "folderShowsOpenIcon",
+  "isFolderKnownChildless",
+  "aria-expanded={knownChildless ? undefined : expanded}",
+  "expanded && !knownChildless"
+]) {
+  if (!librarySidebar.includes(value)) {
+    fail(`LibrarySidebar must separate leaf selection visuals from real parent expansion: missing ${value}`);
+  }
+}
+for (const value of [
+  "knownChildless ? selected : expanded",
+  "reconcileFolderExpansionForSelection"
+]) {
+  if (!folderTreeState.includes(value)) {
+    fail(`folder tree state model missing ${value}`);
+  }
+}
+if (
+  !/hasChildren:\s*folder\.hasChildren/.test(useLibraryData) ||
+  !/entry\.hasChildren\s*!==\s*false/.test(useLibraryData) ||
+  !/reconcileFolderExpansionForSelection\(current,\s*entry\.folderId\s+as\s+number,\s*entry\.hasChildren\)/.test(
+    useLibraryData
+  )
+) {
+  fail("folder selection and history must reconcile real hasChildren state without fake leaf expansion");
+}
+if (/new\s+Set\(current\)\.add\(entry\.folderId/.test(useLibraryData)) {
+  fail("folder selection must not unconditionally mark every selected folder expanded");
+}
 if (/loadAllPages/.test(useLibraryData)) {
   fail("useLibraryData must not exhaust all cursor pages into React state");
 }
@@ -920,7 +951,9 @@ if (
   !/flushThumbnailPriorityScopeSync\(\)/.test(useLibraryData) ||
   !/prepareNavigationMediaReload\(\)/.test(selectLibraryFolderBlock) ||
   !/selectLibraryFolder\(\{\s*rootId,\s*folderId:\s*rootFolderId\s*\}\)/.test(selectedRootHandlerBlock) ||
-  !/selectLibraryFolder\(\{\s*rootId:\s*folder\.rootId,\s*folderId:\s*folder\.id\s*\}\)/.test(selectedFolderHandlerBlock)
+  !/selectLibraryFolder\(\{\s*rootId:\s*folder\.rootId,\s*folderId:\s*folder\.id,\s*hasChildren:\s*folder\.hasChildren\s*\}\)/.test(
+    selectedFolderHandlerBlock
+  )
 ) {
   fail("useLibraryData navigation changes must clear load-more state, flush thumbnail scope sync, and reset scan refresh failures");
 }
