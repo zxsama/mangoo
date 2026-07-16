@@ -819,59 +819,18 @@ body {
   border-radius: 0;
 }
 
-.shell-titlebar-placeholder {
-  min-width: 0;
-  flex: 1 1 auto;
-  align-self: stretch;
-}
-
-.shell-titlebar-summary {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  color: var(--text-muted);
-  font-size: 12.5px;
-  font-weight: 650;
-  letter-spacing: 0.02em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .panel-title,
 .toolbar-title {
   font-size: 15px;
   font-weight: 650;
 }
 
-.shell-primary-nav {
-  display: inline-flex;
-  gap: 5px;
-  align-items: center;
-  min-width: 0;
-  padding: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 999px;
-  background: rgba(3, 7, 10, 0.32);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-}
-
-.shell-primary-nav-row {
+.shell-titlebar-primary-actions {
   display: flex;
   flex: 1 1 auto;
   align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.shell-primary-nav-row .shell-primary-nav {
-  flex: 1 1 auto;
-}
-
-.shell-titlebar-utilities {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
   gap: 4px;
+  min-width: 0;
 }
 
 .shell-titlebar-utility-button,
@@ -879,46 +838,36 @@ body {
   flex: 0 0 auto;
 }
 
-.shell-nav-button {
+.shell-library-switcher-button {
   display: inline-flex;
-  position: relative;
+  flex: 1 1 auto;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  min-width: 42px;
-  height: 38px;
-  padding: 0 10px;
-  border: 1px solid transparent;
-  border-radius: 999px;
+  gap: 7px;
+  min-width: 0;
+  max-width: 168px;
+  height: 34px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: var(--radius-control);
   background: transparent;
-  color: var(--text-muted);
+  box-shadow: none;
+  color: var(--text-soft);
   cursor: pointer;
 }
 
-.shell-nav-caption {
-  max-width: 0;
+.shell-library-switcher-name {
+  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
-  opacity: 0;
+  text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 650;
-  letter-spacing: 0.02em;
-  transition:
-    max-width 160ms ease,
-    opacity 160ms ease;
 }
 
-.shell-nav-button.active {
-  border-color: rgba(142, 199, 208, 0.32);
-  background: rgba(142, 199, 208, 0.12);
-  color: #f4f7f9;
-}
-
-.shell-nav-button.active .shell-nav-caption,
-.shell-nav-button:focus-visible .shell-nav-caption,
-.shell-nav-button:hover .shell-nav-caption {
-  max-width: 76px;
-  opacity: 1;
+.shell-library-switcher-button > svg:last-child {
+  flex: 0 0 auto;
+  opacity: 0.7;
 }
 
 .library-sidebar {
@@ -1001,7 +950,7 @@ button:disabled {
 .tree-list {
   display: grid;
   gap: 3px;
-  margin-top: 16px;
+  margin-top: 0;
   isolation: isolate;
   position: relative;
 }
@@ -1229,8 +1178,7 @@ button:disabled {
 }
 
 .titlebar-library-toolbar.has-shell-actions,
-.titlebar-preview-toolbar.has-shell-actions,
-.titlebar-placeholder-toolbar.has-shell-actions {
+.titlebar-preview-toolbar.has-shell-actions {
   gap: 10px;
 }
 
@@ -4430,9 +4378,8 @@ button:disabled {
   padding: 0;
 }
 
-/* Standalone settings OS window (a separate frameless BrowserWindow). Fills the
-   whole window with a custom draggable titlebar + the shared settings panels. */
-.settings-window {
+/* Shared shell for frameless Settings/Plugins BrowserWindows. */
+.secondary-window {
   display: flex;
   flex-direction: column;
   width: 100vw;
@@ -4448,7 +4395,7 @@ button:disabled {
   color: var(--text-soft, #d5dbe2);
 }
 
-.settings-window-titlebar {
+.secondary-window-titlebar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -4461,13 +4408,13 @@ button:disabled {
   -webkit-app-region: drag;
 }
 
-.settings-window-title {
+.secondary-window-title {
   font-size: 13px;
   font-weight: 650;
   color: var(--text-soft);
 }
 
-.settings-window-close {
+.secondary-window-close {
   display: grid;
   place-items: center;
   width: 30px;
@@ -4483,12 +4430,12 @@ button:disabled {
     background-color 120ms ease;
 }
 
-.settings-window-close:hover {
+.secondary-window-close:hover {
   color: #f4f7f9;
   background: rgba(228, 124, 115, 0.18);
 }
 
-.settings-window-body {
+.secondary-window-body {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
@@ -4498,6 +4445,12 @@ button:disabled {
 .settings-window-body .settings-dialog-layout {
   height: 100%;
   width: 100%;
+}
+
+.plugins-window-body > .workspace {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
 }
 
 /* The settings surface is a floating, draggable window: a lighter backdrop
@@ -6598,7 +6551,6 @@ button:disabled {
 }
 
 .icon-button,
-.shell-nav-button,
 .top-action,
 .root-form button[type="submit"],
 .load-more-button button,
@@ -6622,7 +6574,6 @@ button:disabled {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), var(--glass-shadow-tight);
 }
 
-.shell-nav-button.active,
 .top-action.active,
 .sort-menu-trigger-open,
 .task-filter-chip.active,
@@ -6844,8 +6795,6 @@ button:disabled {
   border-radius: var(--radius-control);
 }
 
-.shell-primary-nav,
-.shell-nav-button,
 .activity-dot,
 .task-filter-chip,
 .task-filter-chip-count,
@@ -6894,7 +6843,8 @@ button:disabled {
 .shell-titlebar-center .filter-menu-trigger,
 .shell-titlebar-center .sort-menu-trigger,
 .shell-titlebar-utility-button,
-.shell-sidebar-toggle {
+.shell-sidebar-toggle,
+.shell-library-switcher-button {
   --glass-fill: transparent;
   --glass-border-current: transparent;
   display: inline-flex;
@@ -6938,7 +6888,9 @@ button:disabled {
 .shell-titlebar-utility-button > .liquid-glass-backdrop,
 .shell-titlebar-utility-button > .liquid-glass-dim,
 .shell-sidebar-toggle > .liquid-glass-backdrop,
-.shell-sidebar-toggle > .liquid-glass-dim {
+.shell-sidebar-toggle > .liquid-glass-dim,
+.shell-library-switcher-button > .liquid-glass-backdrop,
+.shell-library-switcher-button > .liquid-glass-dim {
   opacity: 0;
   background: transparent;
   -webkit-backdrop-filter: none;
@@ -6950,9 +6902,11 @@ button:disabled {
 .shell-titlebar-center .titlebar-tool-button::after,
 .shell-titlebar-center .titlebar-icon-button::after,
 .shell-titlebar-center .filter-menu-trigger::after,
-.shell-titlebar-center .sort-menu-trigger::after {
-  opacity: 0;
-  border-color: transparent;
+.shell-titlebar-center .sort-menu-trigger::after,
+.shell-titlebar-utility-button::after,
+.shell-sidebar-toggle::after,
+.shell-library-switcher-button::after {
+  border: 0;
   box-shadow: none;
 }
 
@@ -6966,6 +6920,7 @@ button:disabled {
 .shell-titlebar-center .sort-menu-trigger:hover:not(:disabled),
 .shell-titlebar-utility-button:hover:not(:disabled),
 .shell-sidebar-toggle:hover:not(:disabled),
+.shell-library-switcher-button:hover:not(:disabled),
 .shell-titlebar-center .titlebar-tool-button[data-glass-active="true"],
 .shell-titlebar-center .titlebar-icon-button[data-glass-active="true"],
 .shell-titlebar-center .filter-menu-trigger[data-glass-active="true"],
@@ -6981,13 +6936,22 @@ button:disabled {
 .shell-titlebar-center .filter-menu-trigger:focus-visible,
 .shell-titlebar-center .sort-menu-trigger:focus-visible,
 .shell-titlebar-utility-button:focus-visible,
-.shell-sidebar-toggle:focus-visible {
+.shell-sidebar-toggle:focus-visible,
+.shell-library-switcher-button:focus-visible {
   color: #d9fbff;
   background: transparent;
   border: 0;
   box-shadow: none;
   outline: 2px solid rgba(151, 219, 226, 0.72);
   outline-offset: -4px;
+}
+
+.shell-library-switcher-button {
+  width: auto;
+  min-width: 0;
+  max-width: 168px;
+  padding: 0 9px;
+  justify-content: flex-start;
 }
 
 /* Open menu / active tool keeps a steady readable fill so it reads as selected
@@ -7088,19 +7052,15 @@ button:disabled {
     display: none;
   }
 
-  .shell-nav-caption,
   .top-action-label {
     display: none;
   }
 
-  .shell-primary-nav,
-  .shell-nav-button,
   .top-action,
   .window-chrome {
     flex: 0 0 auto;
   }
 
-  .shell-nav-button,
   .top-action {
     width: 36px;
     min-width: 36px;
@@ -7287,11 +7247,6 @@ button:disabled {
     display: none;
   }
 }
-
-.library-sidebar-heading { display: flex; align-items: center; gap: 8px; padding: 8px 4px; }
-.library-switch-button { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; background: transparent; border: 0; color: inherit; cursor: pointer; padding: 6px 8px; border-radius: var(--radius-control); transition: color 120ms ease; }
-.library-switch-name { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.library-switch-button > svg:last-child { flex: 0 0 auto; opacity: 0.7; }
 
 .library-loading-overlay {
   position: absolute;

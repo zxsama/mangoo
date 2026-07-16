@@ -124,6 +124,73 @@ for (const value of ["contextBridge", "coreUrl", "sessionToken", "notifyShellRea
   }
 }
 
+for (const value of [
+  "openPluginsWindow",
+  "closePluginsWindow",
+  'ipcRenderer.invoke("megle:open-plugins-window")',
+  'ipcRenderer.invoke("megle:close-plugins-window")'
+]) {
+  if (!preload.includes(value)) {
+    fail(`preload bridge missing Plugins secondary-window contract: ${value}`);
+  }
+}
+
+for (const value of [
+  'type SecondaryWindowRole = "settings" | "plugins"',
+  "SECONDARY_WINDOW_CONFIGS",
+  "secondaryWindows",
+  'route: "#/settings"',
+  'route: "#/plugins"',
+  'ipcMain.handle("megle:open-plugins-window"',
+  'ipcMain.handle("megle:close-plugins-window"',
+  "openSecondaryWindow",
+  "closeSecondaryWindow",
+  "closeAllSecondaryWindows"
+]) {
+  if (!main.includes(value)) {
+    fail(`desktop secondary-window lifecycle missing ${value}`);
+  }
+}
+
+const openSecondaryWindowBody = functionBody(
+  main,
+  "async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void>"
+);
+if (!openSecondaryWindowBody) {
+  fail("desktop must centralize Settings/Plugins creation in openSecondaryWindow");
+} else {
+  for (const value of [
+    "existing.isMinimized()",
+    "existing.restore()",
+    "existing.focus()",
+    "parent",
+    "modal: false",
+    'backgroundMaterial: "acrylic"',
+    "frame: false",
+    "secondaryWindows[role] = window",
+    "--megle-window=${role}",
+    "config.route"
+  ]) {
+    if (!openSecondaryWindowBody.includes(value)) {
+      fail(`shared secondary window must preserve the Settings lifecycle/material contract: ${value}`);
+    }
+  }
+}
+
+if (!main.includes("BrowserWindow.fromWebContents(event.sender)")) {
+  fail("window-control IPC must target the invoking BrowserWindow instead of hard-coding the main window");
+}
+for (const legacyMainWindowControl of [
+  "mainWindow?.minimize()",
+  "mainWindow?.close()",
+  "mainWindow?.isMaximized()",
+  "mainWindow?.getBounds()"
+]) {
+  if (main.includes(legacyMainWindowControl)) {
+    fail(`secondary windows must not route controls through mainWindow: ${legacyMainWindowControl}`);
+  }
+}
+
 if (!desktopPackage.includes('"typecheck"')) {
   fail("desktop package missing typecheck script");
 }

@@ -1,9 +1,9 @@
 import {
   ArrowLeft,
+  ChevronsUpDown,
   ChevronLeft,
   ChevronRight,
   History,
-  Images,
   ListChecks,
   Maximize2,
   Minimize2,
@@ -12,17 +12,15 @@ import {
   Package,
   Settings
 } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import { LiquidGlassButton } from "../design/liquid-glass";
 import { FilterMenu } from "../features/library/FilterMenu";
 import { LayoutMenu } from "../features/library/LayoutMenu";
 import { SearchBar } from "../features/library/SearchBar";
 import { SortMenu } from "../features/library/SortMenu";
+import { LibraryGlyph } from "../features/library/libraryGlyph";
 import { type LibraryLayoutMode } from "../features/media-grid/layoutMode";
 import { WindowChrome } from "../features/window-chrome/WindowChrome";
-
-export type ShellWorkspaceView = "library" | "plugins";
 
 type FilterMenuProps = ComponentProps<typeof FilterMenu>;
 type SearchBarProps = ComponentProps<typeof SearchBar>;
@@ -43,7 +41,7 @@ interface LibraryTitlebarToolbarProps {
   onLayoutModeChange: (mode: LibraryLayoutMode) => void;
   onNavigateFolderBack: () => void;
   onNavigateFolderForward: () => void;
-  onOpenSettings: () => void;
+  primaryActions?: ReactNode;
   onSetKind: FilterMenuProps["onSetKind"];
   onSetMinRating: FilterMenuProps["onSetMinRating"];
   onSetQ: SearchBarProps["onChange"];
@@ -61,7 +59,6 @@ interface LibraryTitlebarToolbarProps {
   tagIds: FilterMenuProps["tagIds"];
   tags: FilterMenuProps["tags"];
   title: string;
-  onToggleSidebars: () => void;
 }
 
 interface PreviewTitlebarToolbarProps {
@@ -75,8 +72,7 @@ interface PreviewTitlebarToolbarProps {
   onBack: () => void;
   onGoNext: () => void;
   onGoPrevious: () => void;
-  onOpenSettings: () => void;
-  onToggleSidebars: () => void;
+  primaryActions?: ReactNode;
   onToggleActualSize: () => void;
 }
 
@@ -89,17 +85,7 @@ interface ShellRightActionsProps {
   onToggleRecent: () => void;
 }
 
-const tabs = [
-  { id: "library", label: "Library", caption: "Library", icon: Images },
-  { id: "plugins", label: "Plugins", caption: "Plugins", icon: Package }
-] satisfies Array<{
-  id: ShellWorkspaceView;
-  label: string;
-  caption: string;
-  icon: LucideIcon;
-}>;
-
-export function ShellSidebarToggle({
+function ShellSidebarToggle({
   sidebarsHidden,
   onToggleSidebars
 }: {
@@ -125,20 +111,58 @@ export function ShellSidebarToggle({
   );
 }
 
-function ShellTitlebarUtilities({
+export function ShellTitlebarPrimaryActions({
+  activeLibraryColor,
+  activeLibraryIcon,
+  activeLibraryName,
   sidebarsHidden,
+  onOpenLibrarySwitcher,
+  onOpenPlugins,
   onOpenSettings,
   onToggleSidebars
 }: {
+  activeLibraryColor?: string;
+  activeLibraryIcon?: string;
+  activeLibraryName: string;
   sidebarsHidden: boolean;
+  onOpenLibrarySwitcher: () => void;
+  onOpenPlugins: () => void;
   onOpenSettings: () => void;
   onToggleSidebars: () => void;
 }) {
   return (
     <div
-      className="shell-titlebar-utilities no-drag"
+      className="shell-titlebar-primary-actions no-drag"
       data-no-drag="true"
     >
+      <LiquidGlassButton
+        aria-label={`Switch library, current library ${activeLibraryName}`}
+        className="shell-library-switcher-button no-drag"
+        data-titlebar-control="library-switcher"
+        onClick={onOpenLibrarySwitcher}
+        title="Switch library"
+        tone="control"
+        type="button"
+      >
+        <LibraryGlyph icon={activeLibraryIcon} color={activeLibraryColor} size={16} />
+        <span className="shell-library-switcher-name">{activeLibraryName}</span>
+        <ChevronsUpDown aria-hidden="true" size={14} />
+      </LiquidGlassButton>
+      <ShellSidebarToggle
+        sidebarsHidden={sidebarsHidden}
+        onToggleSidebars={onToggleSidebars}
+      />
+      <LiquidGlassButton
+        aria-label="Open plugins"
+        className="titlebar-icon-button shell-titlebar-utility-button shell-plugins-button no-drag"
+        data-titlebar-control="open-plugins"
+        onClick={onOpenPlugins}
+        title="Plugins"
+        tone="control"
+        type="button"
+      >
+        <Package aria-hidden="true" size={16} />
+      </LiquidGlassButton>
       <LiquidGlassButton
         aria-label="Open settings"
         className="titlebar-icon-button shell-titlebar-utility-button shell-settings-button no-drag"
@@ -150,97 +174,6 @@ function ShellTitlebarUtilities({
       >
         <Settings aria-hidden="true" size={16} />
       </LiquidGlassButton>
-      <ShellSidebarToggle
-        sidebarsHidden={sidebarsHidden}
-        onToggleSidebars={onToggleSidebars}
-      />
-    </div>
-  );
-}
-
-export function ShellPrimaryNav({
-  activeView,
-  onOpenSettings,
-  onToggleSidebars,
-  onSelectView
-}: {
-  activeView: ShellWorkspaceView;
-  onOpenSettings: () => void;
-  onToggleSidebars: () => void;
-  onSelectView: (view: ShellWorkspaceView) => void;
-}) {
-  return (
-    <div
-      className="shell-primary-nav-row no-drag"
-      data-no-drag="true"
-    >
-      <nav className="shell-primary-nav no-drag" aria-label="Workbench sections" role="tablist">
-        {tabs.map((tab) => {
-          const Icon = tab.icon;
-          return (
-            <LiquidGlassButton
-              active={activeView === tab.id}
-              aria-current={activeView === tab.id ? "page" : undefined}
-              aria-label={tab.label}
-              aria-selected={activeView === tab.id}
-              className={
-                activeView === tab.id
-                  ? "shell-nav-button active no-drag"
-                  : "shell-nav-button no-drag"
-              }
-              data-titlebar-control={`nav-${tab.id}`}
-              key={tab.id}
-              onClick={() => onSelectView(tab.id)}
-              role="tab"
-              title={tab.label}
-              tone="control"
-              type="button"
-            >
-              <Icon aria-hidden="true" size={17} />
-              <span className="shell-nav-caption">{tab.caption}</span>
-            </LiquidGlassButton>
-          );
-        })}
-      </nav>
-      <ShellTitlebarUtilities
-        sidebarsHidden={false}
-        onOpenSettings={onOpenSettings}
-        onToggleSidebars={onToggleSidebars}
-      />
-    </div>
-  );
-}
-
-export function ShellTitlebarPlaceholder({
-  label,
-  onOpenSettings,
-  onToggleSidebars,
-  shellActions,
-  sidebarsHidden = false
-}: {
-  label?: string;
-  onOpenSettings?: () => void;
-  onToggleSidebars?: () => void;
-  shellActions?: ReactNode;
-  sidebarsHidden?: boolean;
-}) {
-  if (!label) {
-    return <div className="shell-titlebar-placeholder" aria-hidden="true" />;
-  }
-
-  if (!sidebarsHidden || !onToggleSidebars || !onOpenSettings) {
-    return <div className="shell-titlebar-summary">{label}</div>;
-  }
-
-  return (
-    <div className="titlebar-workspace-toolbar titlebar-placeholder-toolbar has-shell-actions">
-      <ShellTitlebarUtilities
-        sidebarsHidden
-        onOpenSettings={onOpenSettings}
-        onToggleSidebars={onToggleSidebars}
-      />
-      <div className="shell-titlebar-summary">{label}</div>
-      {shellActions ? <div className="titlebar-shell-actions no-drag">{shellActions}</div> : null}
     </div>
   );
 }
@@ -259,7 +192,7 @@ export function LibraryTitlebarToolbar({
   onLayoutModeChange,
   onNavigateFolderBack,
   onNavigateFolderForward,
-  onOpenSettings,
+  primaryActions,
   onSetKind,
   onSetMinRating,
   onSetQ,
@@ -276,8 +209,7 @@ export function LibraryTitlebarToolbar({
   sortOpen,
   tagIds,
   tags,
-  title,
-  onToggleSidebars
+  title
 }: LibraryTitlebarToolbarProps) {
   return (
     <div
@@ -287,13 +219,7 @@ export function LibraryTitlebarToolbar({
           : "titlebar-workspace-toolbar titlebar-library-toolbar"
       }
     >
-      {sidebarsHidden ? (
-        <ShellTitlebarUtilities
-          sidebarsHidden
-          onOpenSettings={onOpenSettings}
-          onToggleSidebars={onToggleSidebars}
-        />
-      ) : null}
+      {sidebarsHidden ? primaryActions : null}
       <div className="titlebar-workspace-controls titlebar-library-controls no-drag" data-no-drag="true">
         <LiquidGlassButton
           aria-label="Back to previous folder"
@@ -374,8 +300,7 @@ export function PreviewTitlebarToolbar({
   onBack,
   onGoNext,
   onGoPrevious,
-  onOpenSettings,
-  onToggleSidebars,
+  primaryActions,
   onToggleActualSize
 }: PreviewTitlebarToolbarProps) {
   const previewScale = `${Math.round(scale * 100)}%`;
@@ -391,13 +316,7 @@ export function PreviewTitlebarToolbar({
       }
     >
       <div className="titlebar-workspace-controls titlebar-preview-controls no-drag" data-no-drag="true">
-        {sidebarsHidden ? (
-          <ShellTitlebarUtilities
-            sidebarsHidden
-            onOpenSettings={onOpenSettings}
-            onToggleSidebars={onToggleSidebars}
-          />
-        ) : null}
+        {sidebarsHidden ? primaryActions : null}
         <LiquidGlassButton
           aria-label="Back to library"
           className="titlebar-icon-button library-toolbar-back"

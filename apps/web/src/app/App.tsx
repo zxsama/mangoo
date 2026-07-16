@@ -19,10 +19,8 @@ import {
 import {
   LibraryTitlebarToolbar,
   PreviewTitlebarToolbar,
-  ShellPrimaryNav,
+  ShellTitlebarPrimaryActions,
   ShellRightActions,
-  ShellTitlebarPlaceholder,
-  type ShellWorkspaceView
 } from "../app-shell/ShellTopBar";
 import {
   copyText,
@@ -30,6 +28,7 @@ import {
   getDesktopShellActions,
   listLibraries,
   notifyDesktopShellReady,
+  openPluginsWindow,
   openPath,
   revealPath,
   subscribeLibraryPhase
@@ -65,7 +64,6 @@ import {
   type LibraryGridPreferences
 } from "../features/media-grid/gridPreferences";
 import { OnboardingHero } from "../features/onboarding/OnboardingHero";
-import { PluginsView } from "../features/plugins/PluginsView";
 import {
   readStoredPreviewPreferences,
   storePreviewPreferences,
@@ -75,7 +73,6 @@ import { subscribePreference } from "../core/preferenceSync";
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
 
-type AppView = ShellWorkspaceView;
 type CompactPopover = "tasks" | "recent" | "filter" | "sort" | null;
 type PreviewViewState = { mode: "fit-long-edge" | "actual"; scale: number };
 type PreviewViewCommands = { reset: () => void; toggleActualSize: () => void };
@@ -90,7 +87,6 @@ const LIBRARY_LAYOUT_STORAGE_KEY = "megle.library.layout-mode";
 
 export function App() {
   useOverlayScrollbars();
-  const [activeView, setActiveView] = useState<AppView>("library");
   const interfaceStyle = useInterfaceStyle();
   const [menu, setMenu] = useState<ShellContextMenuState | null>(null);
   const [activeCompactPopover, setActiveCompactPopover] =
@@ -373,7 +369,6 @@ export function App() {
       previewNavigationLockedRef.current = true;
       setPreviewDisplayedMediaId(null);
       library.setSelectedMediaId(mediaId);
-      setActiveView("library");
       setPreviewViewCommands(null);
       setPreviewViewState(DEFAULT_PREVIEW_VIEW_STATE);
       setPreviewOpen(true);
@@ -472,7 +467,6 @@ export function App() {
           fileOps,
           onOpenFolder: (target) => {
             library.setSelectedFolder(target);
-            setActiveView("library");
           },
           onRefreshFolder: (target) => {
             library.setSelectedFolder(target);
@@ -506,7 +500,6 @@ export function App() {
           root,
           onOpenRoot: (target) => {
             library.setSelectedRootId(target.id);
-            setActiveView("library");
           },
           onRefresh: () => void library.refresh(),
           onRescanRoot: (rootId) => {
@@ -520,7 +513,8 @@ export function App() {
   );
 
   function renderCenterTitlebar() {
-    if (activeView === "library" && previewOpen && library.selectedMedia) {
+    const primaryActions = sidebarsHidden ? renderPrimaryTitlebarActions() : undefined;
+    if (previewOpen && library.selectedMedia) {
       return (
         <PreviewTitlebarToolbar
           canGoNext={canPreviewNext}
@@ -533,63 +527,65 @@ export function App() {
           onBack={handleClosePreview}
           onGoNext={handlePreviewNext}
           onGoPrevious={handlePreviewPrevious}
-          onOpenSettings={handleOpenSettings}
-          onToggleSidebars={toggleSidebars}
+          primaryActions={primaryActions}
           onToggleActualSize={() => previewViewCommands?.toggleActualSize()}
         />
       );
     }
 
-    if (activeView === "library") {
-      const selectedRoot =
-        library.roots.find((root) => root.id === library.selectedRootId) ?? null;
-      const selectedFolder = library.folders.find(
-        (folder) => folder.id === library.selectedFolderId
-      );
-      return (
-        <LibraryTitlebarToolbar
-          canNavigateFolderBack={library.canNavigateFolderBack}
-          canNavigateFolderForward={library.canNavigateFolderForward}
-          favorite={library.searchState.favorite}
-          filterOpen={filterMenuOpen}
-          kind={library.searchState.kind}
-          layoutMode={layoutMode}
-          mediaCount={Math.max(library.mediaTotalCount, library.media.length)}
-          minRating={library.searchState.minRating}
-          onClearFilters={library.clearFilters}
-          onFilterOpenChange={setFilterOpen}
-          onLayoutModeChange={setLayoutMode}
-          onNavigateFolderBack={library.navigateFolderBack}
-          onNavigateFolderForward={library.navigateFolderForward}
-          onOpenSettings={handleOpenSettings}
-          onSetKind={library.setKind}
-          onSetMinRating={library.setMinRating}
-          onSetQ={library.setQ}
-          onSortOpenChange={setSortOpen}
-          onSetSort={library.setSort}
-          onToggleFavorite={library.toggleFavoriteFilter}
-          onToggleTag={library.toggleTagFilter}
-          q={library.searchState.q}
-          scanActive={library.scanActive}
-          searchActive={library.searchActive}
-          shellActions={sidebarsHidden ? shellRightActions : undefined}
-          sidebarsHidden={sidebarsHidden}
-          sort={library.searchState.sort}
-          sortOpen={sortMenuOpen}
-          tagIds={library.searchState.tagIds}
-          tags={library.tags}
-          title={selectedFolder?.name ?? selectedRoot?.displayName ?? "Library"}
-          onToggleSidebars={toggleSidebars}
-        />
-      );
-    }
+    const selectedRoot =
+      library.roots.find((root) => root.id === library.selectedRootId) ?? null;
+    const selectedFolder = library.folders.find(
+      (folder) => folder.id === library.selectedFolderId
+    );
     return (
-      <ShellTitlebarPlaceholder
-        label="Plugins"
-        onOpenSettings={handleOpenSettings}
+      <LibraryTitlebarToolbar
+        canNavigateFolderBack={library.canNavigateFolderBack}
+        canNavigateFolderForward={library.canNavigateFolderForward}
+        favorite={library.searchState.favorite}
+        filterOpen={filterMenuOpen}
+        kind={library.searchState.kind}
+        layoutMode={layoutMode}
+        mediaCount={Math.max(library.mediaTotalCount, library.media.length)}
+        minRating={library.searchState.minRating}
+        onClearFilters={library.clearFilters}
+        onFilterOpenChange={setFilterOpen}
+        onLayoutModeChange={setLayoutMode}
+        onNavigateFolderBack={library.navigateFolderBack}
+        onNavigateFolderForward={library.navigateFolderForward}
+        onSetKind={library.setKind}
+        onSetMinRating={library.setMinRating}
+        onSetQ={library.setQ}
+        onSortOpenChange={setSortOpen}
+        onSetSort={library.setSort}
+        onToggleFavorite={library.toggleFavoriteFilter}
+        onToggleTag={library.toggleTagFilter}
+        primaryActions={primaryActions}
+        q={library.searchState.q}
+        scanActive={library.scanActive}
+        searchActive={library.searchActive}
         shellActions={sidebarsHidden ? shellRightActions : undefined}
         sidebarsHidden={sidebarsHidden}
+        sort={library.searchState.sort}
+        sortOpen={sortMenuOpen}
+        tagIds={library.searchState.tagIds}
+        tags={library.tags}
+        title={selectedFolder?.name ?? selectedRoot?.displayName ?? "Library"}
+      />
+    );
+  }
+
+  function renderPrimaryTitlebarActions() {
+    return (
+      <ShellTitlebarPrimaryActions
+        activeLibraryColor={activeLibraryColor}
+        activeLibraryIcon={activeLibraryIcon}
+        activeLibraryName={activeLibraryName}
+        onOpenLibrarySwitcher={() => setSwitcherOpen(true)}
+        onOpenPlugins={handleOpenPlugins}
+        onOpenSettings={handleOpenSettings}
         onToggleSidebars={toggleSidebars}
+        sidebarsHidden={sidebarsHidden}
       />
     );
   }
@@ -598,10 +594,6 @@ export function App() {
     return (
       <LibrarySidebar
         library={library}
-        activeLibraryName={activeLibraryName}
-        activeLibraryIcon={activeLibraryIcon}
-        activeLibraryColor={activeLibraryColor}
-        onOpenSwitcher={() => setSwitcherOpen(true)}
         onFolderContextMenu={handleFolderContextMenu}
         onRootContextMenu={handleRootContextMenu}
       />
@@ -609,45 +601,33 @@ export function App() {
   }
 
   function renderCenterPane() {
-    if (activeView === "library") {
-      return library.roots.length === 0 && !library.loading ? (
-        <OnboardingHero
-          rootCount={library.roots.length}
-          loading={library.loading}
-          onAddRoot={(path) => library.addRoot(path)}
-        />
-      ) : (
-        <LibraryCenterPane
-          gridPreferences={gridPreferences}
-          library={library}
-          layoutMode={layoutMode}
-          onClosePreview={handleClosePreview}
-          onFolderContextMenu={handleFolderContextMenu}
-          onMediaContextMenu={handleMediaContextMenu}
-          onOpenPreview={handleOpenPreview}
-          onPreviewCommandChange={setPreviewViewCommands}
-          onPreviewMediaSettled={handlePreviewMediaSettled}
-          onPreviewNext={handlePreviewNext}
-          onPreviewPrevious={handlePreviewPrevious}
-          onPreviewViewStateChange={setPreviewViewState}
-          previewOpen={previewOpen}
-        />
-      );
-    }
-
-    return <PluginsView />;
+    return library.roots.length === 0 && !library.loading ? (
+      <OnboardingHero
+        rootCount={library.roots.length}
+        loading={library.loading}
+        onAddRoot={(path) => library.addRoot(path)}
+      />
+    ) : (
+      <LibraryCenterPane
+        gridPreferences={gridPreferences}
+        library={library}
+        layoutMode={layoutMode}
+        onClosePreview={handleClosePreview}
+        onFolderContextMenu={handleFolderContextMenu}
+        onMediaContextMenu={handleMediaContextMenu}
+        onOpenPreview={handleOpenPreview}
+        onPreviewCommandChange={setPreviewViewCommands}
+        onPreviewMediaSettled={handlePreviewMediaSettled}
+        onPreviewNext={handlePreviewNext}
+        onPreviewPrevious={handlePreviewPrevious}
+        onPreviewViewStateChange={setPreviewViewState}
+        previewOpen={previewOpen}
+      />
+    );
   }
 
   function renderRightPane() {
-    if (activeView === "library") {
-      return <LibraryInspectorPane library={library} previewOpen={previewOpen} />;
-    }
-
-    return (
-      <aside className="inspector-panel shell-empty-pane" aria-label="Inspector">
-        <div className="empty-panel">No selection</div>
-      </aside>
-    );
+    return <LibraryInspectorPane library={library} previewOpen={previewOpen} />;
   }
 
   function renderOverlays() {
@@ -680,23 +660,16 @@ export function App() {
     void getDesktopBridge()?.openSettingsWindow?.();
   }
 
-  function handleSelectView(view: AppView) {
-    setActiveView(view);
+  function handleOpenPlugins() {
+    void openPluginsWindow();
   }
 
   return (
     <LiquidGlassLayer>
       <AppShell
-        layout={activeView === "library" ? "library" : "simple"}
+        layout="library"
         sidebarsHidden={sidebarsHidden}
-        titlebarLeft={
-          <ShellPrimaryNav
-            activeView={activeView}
-            onOpenSettings={handleOpenSettings}
-            onSelectView={handleSelectView}
-            onToggleSidebars={toggleSidebars}
-          />
-        }
+        titlebarLeft={sidebarsHidden ? null : renderPrimaryTitlebarActions()}
         titlebarCenter={renderCenterTitlebar()}
         titlebarRight={sidebarsHidden ? null : shellRightActions}
         sidebar={renderSidebar()}

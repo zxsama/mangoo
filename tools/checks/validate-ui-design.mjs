@@ -35,6 +35,7 @@ const stylesForChecks = stripCssComments(styles);
 const webMain = read("apps/web/src/main.tsx");
 const app = read("apps/web/src/app/App.tsx");
 const appShell = read("apps/web/src/app-shell/AppShell.tsx");
+const secondaryWindowFrame = read("apps/web/src/app-shell/SecondaryWindowFrame.tsx");
 const overlayScrollbars = readOptional("apps/web/src/app-shell/useOverlayScrollbars.ts") ?? "";
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const shellOverlayHost = readOptional("apps/web/src/app-shell/ShellOverlayHost.tsx");
@@ -57,6 +58,7 @@ const useLibraryData = read("apps/web/src/core/useLibraryData.ts");
 const libraryCenterPane = readOptional("apps/web/src/features/library/LibraryCenterPane.tsx") ?? "";
 const libraryInspectorPane = readOptional("apps/web/src/features/library/LibraryInspectorPane.tsx") ?? "";
 const pluginsView = read("apps/web/src/features/plugins/PluginsView.tsx");
+const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
 const filterMenu = readOptional("apps/web/src/features/library/FilterMenu.tsx");
 const mediaGrid = read("apps/web/src/features/media-grid/MediaGrid.tsx");
 const mediaResources = read("apps/web/src/core/mediaResources.ts");
@@ -368,11 +370,7 @@ if (
   fail("interactive titlebar controls must define no-drag regions");
 }
 
-for (const selector of [
-  ".titlebar-workspace-toolbar",
-  ".shell-titlebar-placeholder",
-  ".shell-titlebar-summary"
-]) {
+for (const selector of [".titlebar-workspace-toolbar"]) {
   if (
     cssBlocksForExactSelector(stylesForChecks, selector).some(
       (block) => latestDeclarationValue(block, "-webkit-app-region") === "no-drag"
@@ -382,7 +380,7 @@ for (const selector of [
   }
 }
 
-for (const value of ["data-no-drag", "WindowChrome", "ShellRightActions", "ShellPrimaryNav"]) {
+for (const value of ["data-no-drag", "WindowChrome", "ShellRightActions", "ShellTitlebarPrimaryActions"]) {
   if (!shellTitlebar.includes(value) && !windowChrome.includes(value) && !liquidGlassSurface.includes(value)) {
     fail(`integrated titlebar no-drag/control contract missing ${value}`);
   }
@@ -902,15 +900,16 @@ if (!narrowShell) {
 }
 
 for (const value of [
-  "ShellPrimaryNav",
+  "ShellTitlebarPrimaryActions",
   "ShellRightActions",
   "LibraryTitlebarToolbar",
   "PreviewTitlebarToolbar",
-  "shell-nav-caption",
-  "aria-label={tab.label}",
-  "title={tab.label}",
-  'role="tablist"',
-  'role="tab"',
+  'data-titlebar-control="library-switcher"',
+  'data-titlebar-control="open-plugins"',
+  'data-titlebar-control="toggle-sidebars"',
+  'data-titlebar-control="open-settings"',
+  'aria-label="Open plugins"',
+  'aria-label="Open settings"',
   "task-drawer-toggle",
   "Open tasks palette",
   "Close tasks palette",
@@ -921,8 +920,13 @@ for (const value of [
   }
 }
 
-if (shellTitlebar.includes("<span>{tab.label}</span>")) {
-  fail("primary navigation must use the current caption/icon path instead of plain text-only tab labels");
+for (const legacy of ["ShellPrimaryNav", "ShellWorkspaceView", "shell-primary-nav", "shell-nav-button", "shell-nav-caption"]) {
+  if (shellTitlebar.includes(legacy) || stylesForChecks.includes(legacy)) {
+    fail(`titlebar must not retain the retired Library/Plugins workspace navigation: ${legacy}`);
+  }
+}
+if (app.includes("activeView") || app.includes("<PluginsView")) {
+  fail("Plugins must not remain a main-window activeView/content branch");
 }
 
 for (const value of ["chrome-title", "chrome-subtitle", "Local media workbench"]) {
@@ -1223,7 +1227,7 @@ for (const button of titlebarToolButtons) {
   if (!/\btitle=/.test(button)) {
     fail("middle titlebar tool buttons must expose tooltip text with title");
   }
-  if (/<span\b/.test(button) || /top-action-label|shell-nav-caption/.test(button)) {
+  if (/<span\b/.test(button) || /top-action-label/.test(button)) {
     fail("middle titlebar tool buttons must stay icon-only with no visible text label inside the button");
   }
 }
@@ -1519,6 +1523,28 @@ if (
 ) {
   fail("App must wire local Interface style settings into the renderer and the settings window must pass it to the panels");
 }
+for (const [label, source] of [
+  ["SettingsWindow", settingsWindow],
+  ["PluginsWindow", pluginsWindow]
+]) {
+  if (!source.includes("SecondaryWindowFrame")) {
+    fail(`${label} must share the frameless secondary-window titlebar/material frame`);
+  }
+}
+for (const value of [
+  "secondary-window-titlebar",
+  "secondary-window-close",
+  "LiquidGlassLayer",
+  "windowControls",
+  "onPointerDown"
+]) {
+  if (!secondaryWindowFrame.includes(value)) {
+    fail(`shared secondary-window frame missing ${value}`);
+  }
+}
+if (!webMain.includes('windowRole === "plugins"') || !webMain.includes('import("./features/plugins/PluginsWindow")')) {
+  fail("web entry must render PluginsWindow as a standalone renderer mode");
+}
 
 if (!shortcutBindings) {
   fail("editable shortcut binding model missing");
@@ -1585,7 +1611,9 @@ for (const [source, value, message] of [
   [appShell, "sidebarsHidden", "AppShell must receive hidden-sidebar shell state"],
   [appShell, "data-sidebars-hidden", "AppShell must expose hidden-sidebar state to CSS"],
   [shellTitlebar, "ShellSidebarToggle", "titlebar must expose the sidebar toggle control"],
-  [shellTitlebar, "shell-titlebar-utilities", "settings and sidebar toggle must share one titlebar utility group"],
+  [shellTitlebar, "shell-titlebar-primary-actions", "library/plugins/settings/sidebar controls must share one titlebar action group"],
+  [shellTitlebar, "shell-library-switcher-button", "active library selector must move into the titlebar"],
+  [shellTitlebar, "shell-plugins-button", "Plugins must have a standalone titlebar utility button"],
   [shellTitlebar, "shell-settings-button", "settings must have a standalone utility button beside the sidebar toggle"],
   [shellTitlebar, "titlebar-shell-actions", "center titlebar must host right shell actions when sidebars are hidden"],
   [stylesForChecks, ".app-shell[data-sidebars-hidden=\"true\"]", "styles must define the hidden-sidebar shell layout"],
@@ -1602,7 +1630,42 @@ if (/\{\s*id:\s*"settings"[\s\S]*?caption:\s*"Settings"/.test(shellTitlebar)) {
 }
 
 if (/data-pointer-glow="off"/.test(shellTitlebar)) {
-  fail("primary navigation, settings, and sidebar-toggle controls must use the unified pointer highlight");
+  fail("library selector, Plugins, settings, and sidebar-toggle controls must use the unified pointer highlight");
+}
+
+for (const selector of [
+  ".shell-library-switcher-button",
+  ".shell-titlebar-utility-button",
+  ".shell-sidebar-toggle"
+]) {
+  const controlBlocks = cssBlocksForExactSelector(stylesForChecks, selector);
+  if (
+    !controlBlocks.some(
+      (block) =>
+        latestDeclarationValue(block, "border") === "0" &&
+        latestDeclarationValue(block, "box-shadow") === "none"
+    )
+  ) {
+    fail(`${selector} must remove only its static border/shadow while retaining the LiquidGlass control structure`);
+  }
+
+  const edgeBlocks = cssBlocksForExactSelector(stylesForChecks, `${selector}::after`);
+  if (
+    !edgeBlocks.some(
+      (block) =>
+        latestDeclarationValue(block, "border") === "0" &&
+        latestDeclarationValue(block, "box-shadow") === "none" &&
+        latestDeclarationValue(block, "opacity") === null &&
+        latestDeclarationValue(block, "background") === null
+    )
+  ) {
+    fail(`${selector}::after must remove the static LiquidGlass stroke without suppressing the unified pointer edge`);
+  }
+
+  const focusBlocks = cssBlocksForExactSelector(stylesForChecks, `${selector}:focus-visible`);
+  if (!focusBlocks.some((block) => latestDeclarationValue(block, "outline")?.startsWith("2px solid"))) {
+    fail(`${selector} must retain a visible keyboard-focus outline after static border removal`);
+  }
 }
 
 for (const value of [
@@ -1775,7 +1838,6 @@ const sidebarPointerScopeClasses = [
   ".tree-label",
   ".tree-disclosure",
   ".tree-load-more",
-  ".library-switch-button",
   ".library-switcher",
   ".library-switcher-search",
   ".library-switcher-row",
@@ -1785,9 +1847,8 @@ const sidebarPointerScopeClasses = [
   ".library-icon-picker-cell",
   ".library-switcher-remove-menu-item",
   ".library-switcher-footer",
-  ".shell-primary-nav-row",
-  ".shell-nav-button",
-  ".shell-titlebar-utilities",
+  ".shell-titlebar-primary-actions",
+  ".shell-library-switcher-button",
   ".shell-titlebar-utility-button",
   ".shell-sidebar-toggle"
 ];

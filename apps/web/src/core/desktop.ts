@@ -39,12 +39,14 @@ export interface DesktopShellActions {
 export interface MegleDesktopBridge {
   coreUrl?: string;
   sessionToken?: string;
-  windowRole?: string;
+  windowRole?: "main" | "settings" | "plugins";
   notifyShellReady?: () => Promise<boolean>;
   pickFolder?: () => Promise<string | null>;
   diagnostics?: () => Promise<DesktopDiagnostics>;
   openSettingsWindow?: () => Promise<boolean>;
   closeSettingsWindow?: () => Promise<boolean>;
+  openPluginsWindow?: () => Promise<boolean>;
+  closePluginsWindow?: () => Promise<boolean>;
   windowControls?: DesktopWindowControls;
   shell?: DesktopShellActions;
   listLibraries?: () => Promise<LibrarySummary[]>;
@@ -69,6 +71,23 @@ declare global {
 
 export function getDesktopBridge(): MegleDesktopBridge | null {
   return window.megleDesktop ?? null;
+}
+
+export async function openPluginsWindow(): Promise<boolean> {
+  const desktopOpen = getDesktopBridge()?.openPluginsWindow;
+  if (desktopOpen) {
+    return desktopOpen();
+  }
+
+  const pluginsUrl = new URL(window.location.href);
+  pluginsUrl.hash = "/plugins";
+  const opened = window.open(
+    pluginsUrl,
+    "megle-plugins",
+    "popup=yes,width=1040,height=720"
+  );
+  opened?.focus();
+  return opened !== null;
 }
 
 let desktopShellReadyNotified = false;

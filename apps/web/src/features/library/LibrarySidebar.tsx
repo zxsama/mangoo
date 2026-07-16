@@ -1,7 +1,6 @@
 import {
   ChevronDown,
   ChevronRight,
-  ChevronsUpDown,
   Folder,
   FolderOpen
 } from "lucide-react";
@@ -10,14 +9,9 @@ import { useEffect, useLayoutEffect, useRef } from "react";
 import { folderShowsOpenIcon, isFolderKnownChildless } from "../../core/folderTreeState";
 import type { FolderRecord, RootRecord } from "../../core/types";
 import type { LibraryState } from "../../core/useLibraryData";
-import { LibraryGlyph } from "./libraryGlyph";
 
 interface LibrarySidebarProps {
   library: LibraryState;
-  onOpenSwitcher?: () => void;
-  activeLibraryName?: string;
-  activeLibraryIcon?: string;
-  activeLibraryColor?: string;
   onRootContextMenu?: (event: {
     root: RootRecord;
     x: number;
@@ -37,10 +31,6 @@ const TREE_STICKY_TOLERANCE = 1;
 
 export function LibrarySidebar({
   library,
-  onOpenSwitcher = () => {},
-  activeLibraryName = "Library",
-  activeLibraryIcon,
-  activeLibraryColor,
   onFolderContextMenu,
   onRootContextMenu
 }: LibrarySidebarProps) {
@@ -53,18 +43,6 @@ export function LibrarySidebar({
       ref={sidebarRef}
       aria-label="Library folders"
     >
-      <header className="library-sidebar-heading">
-        <button
-          type="button"
-          className="library-switch-button"
-          onClick={onOpenSwitcher}
-        >
-          <LibraryGlyph icon={activeLibraryIcon} color={activeLibraryColor} size={15} />
-          <span className="library-switch-name">{activeLibraryName ?? "Library"}</span>
-          <ChevronsUpDown size={14} aria-hidden="true" />
-        </button>
-      </header>
-
       <div className="tree-list" role="tree" aria-label="Folder tree">
         {library.roots.map((root) => (
           <RootNode

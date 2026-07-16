@@ -6,6 +6,7 @@ import {
   ipcMain,
   screen,
   shell,
+  type IpcMainInvokeEvent,
   type OpenDialogOptions
 } from "electron";
 import { spawn } from "node:child_process";
@@ -20,7 +21,37 @@ import * as libraryRegistry from "./library-registry.js";
 import { sessionForDbPath } from "./core-session.js";
 
 let mainWindow: BrowserWindow | null = null;
-let settingsWindow: BrowserWindow | null = null;
+type SecondaryWindowRole = "settings" | "plugins";
+type SecondaryWindowConfig = {
+  title: string;
+  route: string;
+  width: number;
+  height: number;
+  minWidth: number;
+  minHeight: number;
+};
+const secondaryWindows: Record<SecondaryWindowRole, BrowserWindow | null> = {
+  settings: null,
+  plugins: null
+};
+const SECONDARY_WINDOW_CONFIGS: Record<SecondaryWindowRole, SecondaryWindowConfig> = {
+  settings: {
+    title: "Megle 设置",
+    route: "#/settings",
+    width: 900,
+    height: 640,
+    minWidth: 560,
+    minHeight: 420
+  },
+  plugins: {
+    title: "Megle Plugins",
+    route: "#/plugins",
+    width: 1040,
+    height: 720,
+    minWidth: 720,
+    minHeight: 500
+  }
+};
 let coreProcess: CoreProcessHandle | null = null;
 let pendingCoreProcess: CoreProcessHandle | null = null;
 let coreSession: CoreSession | null = null;
@@ -33,7 +64,11 @@ let mainWindowReadyToShow: Promise<void> | null = null;
 let shellReadyRevealPromise: Promise<boolean> | null = null;
 let shellReadyVisibleWindowId: number | null = null;
 let shellReadyFailureFallbackTimer: NodeJS.Timeout | null = null;
-let activeWindowDrag: { pointerOffsetX: number; pointerOffsetY: number } | null = null;
+let activeWindowDrag: {
+  windowId: number;
+  pointerOffsetX: number;
+  pointerOffsetY: number;
+} | null = null;
 let launchWindowPlacement: WindowPlacement | null = null;
 let launchWindowMaximized = false;
 let windowStatePersistenceEnabled = false;
@@ -82,15 +117,18 @@ function persistRegistry(next: libraryRegistry.LibraryRegistry): void {
   libraryRegistry.saveRegistry(userDataDir(), next);
 }
 function pushLibraryPhase(phase: unknown): void {
-  // Broadcast to BOTH windows: the main window drives the loading overlay, but
-  // the separate settings window runs its own useLibraryData (Libraries tab +
-  // thumbnail stats). Without this, switching a library from Settings would
-  // leave the settings window's roots/media pointed at the pre-restart state.
-  for (const win of [mainWindow, settingsWindow]) {
+  // Secondary windows share the same Core URL/token. Broadcast restart phases
+  // to every renderer so settings/plugin requests do not remain on stale state.
+  for (const win of [mainWindow, ...Object.values(secondaryWindows)]) {
     if (win && !win.isDestroyed()) {
       win.webContents.send("megle:library-load-phase", phase);
     }
   }
+}
+
+function windowForIpcEvent(event: IpcMainInvokeEvent): BrowserWindow | null {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  return window && !window.isDestroyed() ? window : null;
 }
 function toSummaries(reg: libraryRegistry.LibraryRegistry): Array<{
   id: string; name: string; dbPath: string; available: boolean; active: boolean; icon?: string; color?: string;
@@ -124,65 +162,69 @@ ipcMain.handle("megle:diagnostics", async () => {
   };
 });
 
-ipcMain.handle("megle:window-minimize", () => {
-  mainWindow?.minimize();
+ipcMain.handle("megle:window-minimize", (event) => {
+  windowForIpcEvent(event)?.minimize();
 });
 
-ipcMain.handle("megle:window-maximize", () => {
-  if (!mainWindow) return false;
-  if (mainWindow.isMaximized()) {
-    mainWindow.unmaximize();
+ipcMain.handle("megle:window-maximize", (event) => {
+  const window = windowForIpcEvent(event);
+  if (!window) return false;
+  if (window.isMaximized()) {
+    window.unmaximize();
     return false;
   }
-  mainWindow.maximize();
+  window.maximize();
   return true;
 });
 
-ipcMain.handle("megle:window-close", () => {
-  mainWindow?.close();
+ipcMain.handle("megle:window-close", (event) => {
+  windowForIpcEvent(event)?.close();
 });
 
-ipcMain.handle("megle:window-is-maximized", () => {
-  return mainWindow?.isMaximized() ?? false;
+ipcMain.handle("megle:window-is-maximized", (event) => {
+  return windowForIpcEvent(event)?.isMaximized() ?? false;
 });
 
-ipcMain.handle("megle:window-get-bounds", () => {
-  const bounds = mainWindow?.getBounds();
+ipcMain.handle("megle:window-get-bounds", (event) => {
+  const bounds = windowForIpcEvent(event)?.getBounds();
   if (!bounds) {
     return null;
   }
   return bounds;
 });
 
-ipcMain.handle("megle:window-set-position", (_event, x: number, y: number) => {
-  if (!mainWindow) return false;
-  mainWindow.setPosition(Math.round(x), Math.round(y));
+ipcMain.handle("megle:window-set-position", (event, x: number, y: number) => {
+  const window = windowForIpcEvent(event);
+  if (!window) return false;
+  window.setPosition(Math.round(x), Math.round(y));
   return true;
 });
 
 ipcMain.handle(
   "megle:window-begin-drag",
   (
-    _event,
+    event,
     payload: { clientX: number; screenX: number; screenY: number; titlebarOffsetY: number; viewportWidth: number }
   ) => {
-    if (!mainWindow) return null;
+    const window = windowForIpcEvent(event);
+    if (!window) return null;
 
     const cursor = screen.getCursorScreenPoint();
-    if (mainWindow.isMaximized()) {
-      const restored = mainWindow.getNormalBounds();
+    if (window.isMaximized()) {
+      const restored = window.getNormalBounds();
       const pointerRatioX = clampNumber(payload.clientX / Math.max(payload.viewportWidth, 1), 0, 1);
       const targetX = Math.round(cursor.x - restored.width * pointerRatioX);
       const targetY = Math.round(cursor.y - Math.max(0, payload.titlebarOffsetY));
-      mainWindow.unmaximize();
-      mainWindow.setBounds({
+      window.unmaximize();
+      window.setBounds({
         x: targetX,
         y: targetY,
         width: restored.width,
         height: restored.height
       });
-      refreshWindowComposition(mainWindow);
+      refreshWindowComposition(window);
       activeWindowDrag = {
+        windowId: window.id,
         pointerOffsetX: cursor.x - targetX,
         pointerOffsetY: cursor.y - targetY
       };
@@ -195,8 +237,9 @@ ipcMain.handle(
       };
     }
 
-    const bounds = mainWindow.getBounds();
+    const bounds = window.getBounds();
     activeWindowDrag = {
+      windowId: window.id,
       pointerOffsetX: cursor.x - bounds.x,
       pointerOffsetY: cursor.y - bounds.y
     };
@@ -207,17 +250,20 @@ ipcMain.handle(
   }
 );
 
-ipcMain.handle("megle:window-drag-move", () => {
-  if (!mainWindow || !activeWindowDrag) return false;
+ipcMain.handle("megle:window-drag-move", (event) => {
+  const window = windowForIpcEvent(event);
+  if (!window || !activeWindowDrag || activeWindowDrag.windowId !== window.id) return false;
   const cursor = screen.getCursorScreenPoint();
-  mainWindow.setPosition(
+  window.setPosition(
     Math.round(cursor.x - activeWindowDrag.pointerOffsetX),
     Math.round(cursor.y - activeWindowDrag.pointerOffsetY)
   );
   return true;
 });
 
-ipcMain.handle("megle:window-end-drag", () => {
+ipcMain.handle("megle:window-end-drag", (event) => {
+  const window = windowForIpcEvent(event);
+  if (!window || activeWindowDrag?.windowId !== window.id) return false;
   activeWindowDrag = null;
   return true;
 });
@@ -271,30 +317,39 @@ ipcMain.handle("megle:shell-ready", async () => {
 });
 
 ipcMain.handle("megle:open-settings-window", async () => {
-  await openSettingsWindow();
+  await openSecondaryWindow("settings");
   return true;
 });
 
 ipcMain.handle("megle:close-settings-window", () => {
-  if (settingsWindow && !settingsWindow.isDestroyed()) {
-    settingsWindow.close();
-  }
+  closeSecondaryWindow("settings");
   return true;
 });
 
-ipcMain.handle("megle:visual-capture-page", async () => {
-  if (!isVisualHarnessEnabled() || !mainWindow || mainWindow.isDestroyed()) {
+ipcMain.handle("megle:open-plugins-window", async () => {
+  await openSecondaryWindow("plugins");
+  return true;
+});
+
+ipcMain.handle("megle:close-plugins-window", () => {
+  closeSecondaryWindow("plugins");
+  return true;
+});
+
+ipcMain.handle("megle:visual-capture-page", async (event) => {
+  const window = windowForIpcEvent(event);
+  if (!isVisualHarnessEnabled() || !window) {
     return null;
   }
-  if (mainWindow.isMinimized()) {
-    mainWindow.restore();
+  if (window.isMinimized()) {
+    window.restore();
   }
-  mainWindow.show();
-  mainWindow.focus();
+  window.show();
+  window.focus();
   await new Promise((resolve) => setTimeout(resolve, 120));
 
-  const bounds = mainWindow.getContentBounds();
-  const image = await mainWindow.webContents.capturePage({
+  const bounds = window.getContentBounds();
+  const image = await window.webContents.capturePage({
     x: 0,
     y: 0,
     width: Math.max(1, bounds.width),
@@ -491,11 +546,16 @@ async function createWindow(): Promise<void> {
   window.on("maximize", () => refreshWindowComposition(window));
   window.on("unmaximize", () => refreshWindowComposition(window));
   window.on("blur", () => {
-    activeWindowDrag = null;
+    if (activeWindowDrag?.windowId === window.id) {
+      activeWindowDrag = null;
+    }
   });
+  window.on("close", closeAllSecondaryWindows);
 
   window.on("closed", () => {
-    activeWindowDrag = null;
+    if (activeWindowDrag?.windowId === window.id) {
+      activeWindowDrag = null;
+    }
     launchWindowPlacement = null;
     launchWindowMaximized = false;
     windowStatePersistenceEnabled = false;
@@ -516,32 +576,29 @@ async function createWindow(): Promise<void> {
   }
 }
 
-// A genuinely separate OS window for settings: its own frameless BrowserWindow,
-// freely draggable across the desktop (and to other monitors), not clipped to or
-// dimming the main window. It loads the SAME renderer bundle at the #/settings
-// route and shares this app's origin, so preference changes sync to the main
-// window over a BroadcastChannel (no per-setting IPC needed). Single-instance:
-// re-invoking focuses the existing window.
-async function openSettingsWindow(): Promise<void> {
-  if (settingsWindow && !settingsWindow.isDestroyed()) {
-    if (settingsWindow.isMinimized()) settingsWindow.restore();
-    settingsWindow.focus();
+// Settings and Plugins use the same controlled secondary-window lifecycle:
+// non-modal child windows, shared preload/Core session, frameless acrylic, and
+// one live instance per role. Re-opening restores and focuses the existing one.
+async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
+  const existing = secondaryWindows[role];
+  if (existing && !existing.isDestroyed()) {
+    if (existing.isMinimized()) existing.restore();
+    existing.show();
+    existing.focus();
     return;
   }
+
+  const config = SECONDARY_WINDOW_CONFIGS[role];
   const session = await ensureCoreReady();
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
   const window = new BrowserWindow({
-    title: "Megle 设置",
-    width: 900,
-    height: 640,
-    minWidth: 560,
-    minHeight: 420,
-    // Not a modal child: independent, always movable, does not block the main
-    // window. `parent` only keeps it above its opener and closed with it.
+    title: config.title,
+    width: config.width,
+    height: config.height,
+    minWidth: config.minWidth,
+    minHeight: config.minHeight,
     parent,
     modal: false,
-    // Match the main window's frameless acrylic material so the settings window
-    // follows the same design language (and the native-window-options guard).
     backgroundMaterial: "acrylic",
     transparent: false,
     backgroundColor: "#00000000",
@@ -556,23 +613,47 @@ async function openSettingsWindow(): Promise<void> {
       additionalArguments: [
         `--megle-core-url=${session.baseUrl}`,
         `--megle-session-token=${session.sessionToken}`,
-        "--megle-window=settings"
+        `--megle-window=${role}`,
+        ...(isVisualHarnessEnabled() ? ["--megle-visual-harness=1"] : [])
       ]
     }
   });
-  settingsWindow = window;
+  secondaryWindows[role] = window;
   applyWindowMaterial(window);
   window.once("ready-to-show", () => window.show());
+  window.on("blur", () => {
+    if (activeWindowDrag?.windowId === window.id) {
+      activeWindowDrag = null;
+    }
+  });
   window.on("closed", () => {
-    settingsWindow = null;
+    if (activeWindowDrag?.windowId === window.id) {
+      activeWindowDrag = null;
+    }
+    if (secondaryWindows[role] === window) {
+      secondaryWindows[role] = null;
+    }
   });
 
   const devServer = process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173";
   try {
-    await window.loadURL(`${devServer}#/settings`);
+    await window.loadURL(`${devServer}${config.route}`);
   } catch (error) {
-    console.warn("[megle] settings window loadURL rejected:", error);
+    console.warn(`[megle] ${role} window loadURL rejected:`, error);
     if (!window.isDestroyed()) window.show();
+  }
+}
+
+function closeSecondaryWindow(role: SecondaryWindowRole): void {
+  const window = secondaryWindows[role];
+  if (window && !window.isDestroyed()) {
+    window.close();
+  }
+}
+
+function closeAllSecondaryWindows(): void {
+  for (const role of Object.keys(secondaryWindows) as SecondaryWindowRole[]) {
+    closeSecondaryWindow(role);
   }
 }
 

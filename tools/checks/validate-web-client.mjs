@@ -87,6 +87,9 @@ const mediaGridLayoutGeometry = read("apps/web/src/features/media-grid/layoutGeo
 const main = read("apps/web/src/main.tsx");
 const app = read("apps/web/src/app/App.tsx");
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
+const secondaryWindowFrame = read("apps/web/src/app-shell/SecondaryWindowFrame.tsx");
+const settingsWindow = read("apps/web/src/features/settings/SettingsWindow.tsx");
+const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
 const libraryView = read("apps/web/src/features/library/LibraryView.tsx");
 const librarySidebar = read("apps/web/src/features/library/LibrarySidebar.tsx");
 const folderTreeState = read("apps/web/src/core/folderTreeState.ts");
@@ -137,6 +140,85 @@ const duplicateCoreContractNames = [
   "CoreClientConfig",
   "CoreApiError"
 ];
+
+for (const value of [
+  'windowRole === "plugins"',
+  'window.location.hash.startsWith("#/plugins")',
+  'import("./features/plugins/PluginsWindow")'
+]) {
+  if (!main.includes(value)) {
+    fail(`web entry must route the standalone Plugins window: missing ${value}`);
+  }
+}
+
+for (const [label, source] of [
+  ["SettingsWindow", settingsWindow],
+  ["PluginsWindow", pluginsWindow]
+]) {
+  if (!source.includes("SecondaryWindowFrame")) {
+    fail(`${label} must reuse the shared frameless secondary-window frame`);
+  }
+}
+for (const value of ["onPointerDown", "windowControls", "LiquidGlassLayer", "secondary-window-titlebar"]) {
+  if (!secondaryWindowFrame.includes(value)) {
+    fail(`shared secondary-window frame missing ${value}`);
+  }
+}
+if (!pluginsWindow.includes("<PluginsView />")) {
+  fail("PluginsWindow must render the existing PluginsView data surface");
+}
+
+for (const value of [
+  "openPluginsWindow?:",
+  "closePluginsWindow?:",
+  'window.open(',
+  '"megle-plugins"'
+]) {
+  if (!desktopAdapter.includes(value)) {
+    fail(`desktop bridge must expose a safe Plugins window API/fallback: missing ${value}`);
+  }
+}
+
+for (const legacy of ["ShellPrimaryNav", "ShellWorkspaceView", "activeView", "shell-primary-nav"]) {
+  if (app.includes(legacy) || shellTitlebar.includes(legacy)) {
+    fail(`main Library shell must not keep the retired Plugins workspace navigation: ${legacy}`);
+  }
+}
+if (app.includes('features/plugins/PluginsView') || app.includes("<PluginsView")) {
+  fail("PluginsView must render only in the separate Plugins window, not replace main-window content");
+}
+for (const legacySidebarEntry of [
+  "onOpenSwitcher",
+  "activeLibraryName",
+  "activeLibraryIcon",
+  "activeLibraryColor",
+  "library-sidebar-heading",
+  "library-switch-button"
+]) {
+  if (librarySidebar.includes(legacySidebarEntry)) {
+    fail(`LibrarySidebar must not retain the moved library selector: ${legacySidebarEntry}`);
+  }
+}
+
+for (const value of [
+  "ShellTitlebarPrimaryActions",
+  'data-titlebar-control="library-switcher"',
+  'data-titlebar-control="toggle-sidebars"',
+  'data-titlebar-control="open-plugins"',
+  'data-titlebar-control="open-settings"',
+  "activeLibraryName",
+  "activeLibraryIcon",
+  "activeLibraryColor"
+]) {
+  if (!shellTitlebar.includes(value) && !app.includes(value)) {
+    fail(`main titlebar must expose the moved library/Plugins utility contract: missing ${value}`);
+  }
+}
+const pluginsControlIndex = shellTitlebar.indexOf('data-titlebar-control="open-plugins"');
+const settingsControlIndex = shellTitlebar.indexOf('data-titlebar-control="open-settings"');
+if (pluginsControlIndex === -1 || settingsControlIndex === -1 || pluginsControlIndex > settingsControlIndex) {
+  fail("Plugins titlebar control must be immediately before Settings in the shared utility group");
+}
 
 if (!existsSync(path.join(root, coreClientPackagePath))) {
   fail("packages/core-client must be a real workspace package");

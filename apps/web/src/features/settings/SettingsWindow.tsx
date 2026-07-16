@@ -1,9 +1,9 @@
-import { X } from "lucide-react";
-import { useCallback, useEffect, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
 import { getDesktopBridge } from "../../core/desktop";
 import { broadcastPreference } from "../../core/preferenceSync";
 import { useLibraryData } from "../../core/useLibraryData";
-import { LiquidGlassLayer, useInterfaceStyle } from "../../design/liquid-glass";
+import { useInterfaceStyle } from "../../design/liquid-glass";
 import {
   readStoredLibraryGridPreferences,
   storeLibraryGridPreferences,
@@ -38,6 +38,19 @@ export function SettingsWindow() {
     thumbnailGenerationMode: previewPreferences.thumbnailGenerationMode
   });
 
+  const handleClose = useCallback(async () => {
+    const bridge = getDesktopBridge();
+    if (bridge?.closeSettingsWindow) {
+      await bridge.closeSettingsWindow();
+      return;
+    }
+    if (bridge?.windowControls) {
+      await bridge.windowControls.close();
+      return;
+    }
+    window.close();
+  }, []);
+
   const handleGridChange = useCallback((patch: Partial<LibraryGridPreferences>) => {
     setGridPreferences((current) => {
       const next = { ...current, ...patch };
@@ -62,76 +75,21 @@ export function SettingsWindow() {
     broadcastPreference("interfaceStyle", interfaceStyle.value);
   }, [interfaceStyle.value]);
 
-  useEffect(() => {
-    function handleKey(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        void getDesktopBridge()?.closeSettingsWindow?.();
-      }
-    }
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, []);
-
   return (
-    <LiquidGlassLayer>
-      <div className="settings-window">
-        <SettingsTitlebar />
-        <div className="settings-window-body">
-          <SettingsPanels
-            gridPreferences={gridPreferences}
-            interfaceStyle={interfaceStyle}
-            library={library}
-            onGridPreferencesChange={handleGridChange}
-            onPreviewPreferencesChange={handlePreviewChange}
-            previewPreferences={previewPreferences}
-          />
-        </div>
-      </div>
-    </LiquidGlassLayer>
-  );
-}
-
-// The frameless window's own titlebar: a drag region (via the OS window-move
-// IPC the main shell already uses) plus a close button that closes this window.
-function SettingsTitlebar() {
-  const bridge = getDesktopBridge();
-  const controls = bridge?.windowControls;
-
-  function handlePointerDown(event: ReactPointerEvent<HTMLElement>) {
-    if ((event.target as HTMLElement).closest("button")) return;
-    if (!controls) return;
-    void controls.beginDrag({
-      clientX: event.clientX,
-      screenX: event.screenX,
-      screenY: event.screenY,
-      titlebarOffsetY: event.clientY,
-      viewportWidth: window.innerWidth
-    });
-  }
-  function handlePointerMove() {
-    void controls?.moveDrag();
-  }
-  function handlePointerUp() {
-    void controls?.endDrag();
-  }
-
-  return (
-    <header
-      className="settings-window-titlebar"
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
+    <SecondaryWindowFrame
+      bodyClassName="settings-window-body"
+      onRequestClose={handleClose}
+      title="偏好设置"
+      windowClassName="settings-window"
     >
-      <span className="settings-window-title">偏好设置</span>
-      <button
-        aria-label="关闭"
-        className="settings-window-close no-drag"
-        onClick={() => void (bridge?.closeSettingsWindow?.() ?? controls?.close?.())}
-        type="button"
-      >
-        <X aria-hidden="true" size={16} />
-      </button>
-    </header>
+      <SettingsPanels
+        gridPreferences={gridPreferences}
+        interfaceStyle={interfaceStyle}
+        library={library}
+        onGridPreferencesChange={handleGridChange}
+        onPreviewPreferencesChange={handlePreviewChange}
+        previewPreferences={previewPreferences}
+      />
+    </SecondaryWindowFrame>
   );
 }

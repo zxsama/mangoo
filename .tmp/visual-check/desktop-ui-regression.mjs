@@ -141,13 +141,16 @@ async function httpJson(url) {
   });
 }
 
-async function waitForTarget(timeoutMs = 90000) {
+async function waitForTarget(
+  predicate = (target) => target.url.startsWith(webUrl) && !target.url.includes("#/"),
+  timeoutMs = 90000
+) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
     try {
       const targets = await httpJson(`http://127.0.0.1:${debugPort}/json/list`);
-      const page = targets.find((target) => target.type === "page" && target.url.startsWith(webUrl));
+      const page = targets.find((target) => target.type === "page" && predicate(target));
       if (page?.webSocketDebuggerUrl) return page;
     } catch (error) {
       lastError = error;
@@ -155,6 +158,23 @@ async function waitForTarget(timeoutMs = 90000) {
     await delay(250);
   }
   throw new Error(`Timed out waiting for Electron CDP target: ${String(lastError)}`);
+}
+
+async function matchingTargets(predicate) {
+  const targets = await httpJson(`http://127.0.0.1:${debugPort}/json/list`);
+  return targets.filter((target) => target.type === "page" && predicate(target));
+}
+
+async function waitForTargetCount(predicate, expectedCount, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastCount = -1;
+  while (Date.now() < deadline) {
+    const targets = await matchingTargets(predicate);
+    lastCount = targets.length;
+    if (lastCount === expectedCount) return targets;
+    await delay(200);
+  }
+  throw new Error(`Timed out waiting for target count ${expectedCount}; last=${lastCount}`);
 }
 
 class CdpClient {
@@ -240,6 +260,14 @@ async function evaluate(client, expression) {
   });
   if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
   return result.result?.value;
+}
+
+function fireRendererCommand(client, expression) {
+  void client.send("Runtime.evaluate", {
+    expression,
+    awaitPromise: false,
+    returnByValue: false
+  }).catch(() => undefined);
 }
 
 async function waitFor(client, expression, timeoutMs = 30000, label = expression) {
@@ -1082,93 +1110,205 @@ async function glassMaterialEvidence(client) {
 
 async function settingsInterfaceStyleEvidence(client) {
   const materialBefore = await glassMaterialEvidence(client);
-  await clickSelector(client, `[aria-label="Settings"]`);
-  await waitFor(
-    client,
-    `Boolean([...document.querySelectorAll(".settings-section-title")].find((node) => node.textContent?.trim() === "Interface style"))`,
-    10000,
-    "Interface style settings"
-  );
-  const screenshotPath = await screenshot(client, "ui-settings-interface-style.png");
-  const evidenceBefore = await evaluate(client, settingsInterfaceStyleEvidenceExpression());
-  const pointSettingsSlider = await moveToSelector(
-    client,
-    '[data-settings-slider-control="side-blur"]',
-    0.27,
-    0.5
-  );
-  const pointerSettingsSlider = await evaluate(client, pointerEvidenceExpression());
-  const beforeSideBlur = evidenceBefore.sideBlur;
-  const sliderChange = await evaluate(
+  await clickSelector(client, `[data-titlebar-control="open-settings"]`);
+  const target = await waitForTarget((page) => page.url.includes("#/settings"), 10000);
+  const settingsClient = new CdpClient(target.webSocketDebuggerUrl);
+  await settingsClient.ready;
+  await Promise.all([
+    settingsClient.send("Page.enable"),
+    settingsClient.send("Runtime.enable")
+  ]);
+
+  try {
+    await waitFor(
+      settingsClient,
+      `Boolean(document.querySelector(".settings-window"))`,
+      10000,
+      "Settings secondary window"
+    );
+    await evaluate(
+      settingsClient,
+      `(() => {
+        const tab = [...document.querySelectorAll('.settings-dialog-nav-item')]
+          .find((node) => node.textContent?.trim() === '外观');
+        if (!(tab instanceof HTMLButtonElement)) return false;
+        tab.click();
+        return true;
+      })()`
+    );
+    await waitFor(
+      settingsClient,
+      `Boolean(document.querySelector('#side-blur'))`,
+      10000,
+      "Settings appearance controls"
+    );
+    const screenshotPath = await screenshot(settingsClient, "ui-settings-interface-style.png");
+    const evidenceBefore = await evaluate(settingsClient, settingsInterfaceStyleEvidenceExpression());
+    const pointSettingsSlider = await moveToSelector(
+      settingsClient,
+      '[data-settings-slider-control="side-blur"]',
+      0.27,
+      0.5
+    );
+    const pointerSettingsSlider = await evaluate(settingsClient, pointerEvidenceExpression());
+    const beforeSideBlur = evidenceBefore.sideBlur;
+    const sliderChange = await evaluate(
+      settingsClient,
+      `(() => {
+        const input = document.querySelector("#side-blur");
+        if (!(input instanceof HTMLInputElement)) return { changed: false, reason: "side-blur slider missing" };
+        const before = input.value;
+        const min = input.getAttribute("min") ?? "0";
+        const max = input.getAttribute("max") ?? "2";
+        const next = before === max ? min : max;
+        const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        valueSetter?.call(input, next);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+        return { changed: input.value !== before, before, after: input.value };
+      })()`
+    );
+    await waitFor(
+      client,
+      `getComputedStyle(document.documentElement).getPropertyValue("--glass-side-blur").trim() !== ${JSON.stringify(beforeSideBlur)}`,
+      5000,
+      "main-window side shell blur sync"
+    );
+    const evidenceAfter = await evaluate(settingsClient, settingsInterfaceStyleEvidenceExpression());
+    const materialAfter = await glassMaterialEvidence(client);
+    await evaluate(
+      settingsClient,
+      `(() => {
+        const reset = [...document.querySelectorAll(".settings-dialog-content button")]
+          .find((button) => button.textContent?.trim() === "恢复默认外观");
+        reset?.click();
+        return Boolean(reset);
+      })()`
+    );
+    await delay(350);
+    fireRendererCommand(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
+    await waitForTargetCount((page) => page.url.includes("#/settings"), 0, 10000);
+    return {
+      screenshotPath,
+      evidence: {
+        ...evidenceAfter,
+        before: evidenceBefore,
+        after: evidenceAfter,
+        pointerPoint: pointSettingsSlider,
+        pointerSlider: pointerSettingsSlider,
+        sliderChange,
+        materialBefore,
+        materialAfter,
+        standaloneWindow: true
+      }
+    };
+  } finally {
+    fireRendererCommand(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
+    settingsClient.close();
+  }
+}
+
+async function pluginsSecondaryWindowEvidence(client) {
+  const mainBefore = await evaluate(
     client,
     `(() => {
-      const input = document.querySelector("#side-blur");
-      if (!(input instanceof HTMLInputElement)) return { changed: false, reason: "side-blur slider missing" };
-      const before = input.value;
-      const min = input.getAttribute("min") ?? "0";
-      const max = input.getAttribute("max") ?? "2";
-      const next = before === max ? min : max;
-      const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-      valueSetter?.call(input, next);
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-      return { changed: input.value !== before, before, after: input.value };
+      const controlState = (id) => {
+        const element = document.querySelector('[data-titlebar-control="' + id + '"]');
+        if (!(element instanceof HTMLElement)) return null;
+        const style = getComputedStyle(element);
+        const before = getComputedStyle(element, "::before");
+        const after = getComputedStyle(element, "::after");
+        return {
+          borderWidth: style.borderWidth,
+          backgroundColor: style.backgroundColor,
+          pointerTarget: element.getAttribute("data-interactive-pointer-target"),
+          beforeBackgroundImage: before.backgroundImage,
+          afterBorderWidth: after.borderWidth,
+          afterBoxShadow: after.boxShadow,
+          afterBackgroundImage: after.backgroundImage
+        };
+      };
+      return {
+        libraryVisible: Boolean(document.querySelector(".grid-surface")),
+        pluginsInMain: Boolean(document.querySelector(".plugins-body")),
+        oldPrimaryNavPresent: Boolean(document.querySelector(".shell-primary-nav")),
+        controlOrder: [...document.querySelectorAll(".shell-titlebar-primary-actions [data-titlebar-control]")]
+          .map((node) => node.getAttribute("data-titlebar-control")),
+        controls: Object.fromEntries(
+          ["library-switcher", "toggle-sidebars", "open-plugins", "open-settings"]
+            .map((id) => [id, controlState(id)])
+        )
+      };
     })()`
   );
-  await waitFor(
-    client,
-    `getComputedStyle(document.documentElement).getPropertyValue("--glass-side-blur").trim() !== ${JSON.stringify(beforeSideBlur)}`,
-    5000,
-    "side shell blur CSS variable update"
-  );
-  const evidenceAfter = await evaluate(client, settingsInterfaceStyleEvidenceExpression());
-  await clickSelector(client, `[aria-label="Library"]`);
-  await waitFor(
-    client,
-    `[...document.querySelectorAll(".tile-label")].some((item) => item.textContent?.includes("landscape-sample")) &&
-      [...document.querySelectorAll(".tile-label")].some((item) => item.textContent?.includes("portrait-sample"))`,
-    30000,
-    "sample media tiles after returning from settings"
-  );
-  const materialAfter = await glassMaterialEvidence(client);
-  await clickSelector(client, `[aria-label="Settings"]`);
-  await waitFor(
-    client,
-    `Boolean([...document.querySelectorAll(".settings-section-title")].find((node) => node.textContent?.trim() === "Interface style"))`,
-    10000,
-    "Interface style settings for reset"
-  );
-  await evaluate(
-    client,
-    `(() => {
-      const reset = [...document.querySelectorAll(".settings-interface-style button")]
-        .find((button) => button.textContent?.trim() === "Reset interface style");
-      reset?.click();
-      return Boolean(reset);
-    })()`
-  );
-  await delay(350);
-  await clickSelector(client, `[aria-label="Library"]`);
-  await waitFor(
-    client,
-    `[...document.querySelectorAll(".tile-label")].some((item) => item.textContent?.includes("landscape-sample")) &&
-      [...document.querySelectorAll(".tile-label")].some((item) => item.textContent?.includes("portrait-sample"))`,
-    30000,
-    "sample media tiles after resetting interface style"
-  );
-  return {
-    screenshotPath,
-    evidence: {
-      ...evidenceAfter,
-      before: evidenceBefore,
-      after: evidenceAfter,
-      pointerPoint: pointSettingsSlider,
-      pointerSlider: pointerSettingsSlider,
-      sliderChange,
-      materialBefore,
-      materialAfter
-    }
-  };
+
+  await clickSelector(client, `[data-titlebar-control="open-plugins"]`);
+  const pluginTarget = await waitForTarget((page) => page.url.includes("#/plugins"), 10000);
+  const pluginsClient = new CdpClient(pluginTarget.webSocketDebuggerUrl);
+  await pluginsClient.ready;
+  await Promise.all([
+    pluginsClient.send("Page.enable"),
+    pluginsClient.send("Runtime.enable")
+  ]);
+
+  let settingsClient;
+  try {
+    await waitFor(pluginsClient, `Boolean(document.querySelector(".plugins-body"))`, 10000, "Plugins secondary window");
+    const screenshotPath = await screenshot(pluginsClient, "ui-plugins-secondary-window.png");
+    const firstTargets = await waitForTargetCount((page) => page.url.includes("#/plugins"), 1);
+
+    await clickSelector(client, `[data-titlebar-control="open-plugins"]`);
+    const repeatedTargets = await waitForTargetCount((page) => page.url.includes("#/plugins"), 1);
+    await waitFor(pluginsClient, `document.hasFocus()`, 5000, "existing Plugins window focus");
+
+    await clickSelector(client, `[data-titlebar-control="open-settings"]`);
+    const settingsTarget = await waitForTarget((page) => page.url.includes("#/settings"), 10000);
+    settingsClient = new CdpClient(settingsTarget.webSocketDebuggerUrl);
+    await settingsClient.ready;
+    await settingsClient.send("Runtime.enable");
+    await waitFor(settingsClient, `Boolean(document.querySelector(".settings-window"))`, 10000, "Settings alongside Plugins");
+
+    const coexistence = {
+      plugins: (await matchingTargets((page) => page.url.includes("#/plugins"))).length,
+      settings: (await matchingTargets((page) => page.url.includes("#/settings"))).length
+    };
+    const mainAfter = await evaluate(
+      client,
+      `({
+        libraryVisible: Boolean(document.querySelector(".grid-surface")),
+        pluginsInMain: Boolean(document.querySelector(".plugins-body"))
+      })`
+    );
+    const pluginWindow = await evaluate(
+      pluginsClient,
+      `({
+        role: window.megleDesktop?.windowRole,
+        title: document.querySelector(".secondary-window-title")?.textContent?.trim(),
+        closePresent: Boolean(document.querySelector(".secondary-window-close")),
+        pluginSurfacePresent: Boolean(document.querySelector(".plugins-layout"))
+      })`
+    );
+
+    fireRendererCommand(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
+    await waitForTargetCount((page) => page.url.includes("#/settings"), 0, 10000);
+    fireRendererCommand(pluginsClient, `void window.megleDesktop?.closePluginsWindow?.()`);
+    await waitForTargetCount((page) => page.url.includes("#/plugins"), 0, 10000);
+
+    return {
+      screenshotPath,
+      mainBefore,
+      mainAfter,
+      pluginWindow,
+      firstTargetId: firstTargets[0]?.id ?? null,
+      repeatedTargetId: repeatedTargets[0]?.id ?? null,
+      coexistence
+    };
+  } finally {
+    if (settingsClient) fireRendererCommand(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
+    fireRendererCommand(pluginsClient, `void window.megleDesktop?.closePluginsWindow?.()`);
+    settingsClient?.close();
+    pluginsClient.close();
+  }
 }
 
 async function imagePointRatioAt(client, point) {
@@ -1393,9 +1533,7 @@ function centralPreviewEvidenceExpression() {
 
 function settingsInterfaceStyleEvidenceExpression() {
   return `(() => {
-    const section = [...document.querySelectorAll(".settings-section")].find((node) =>
-      [...node.querySelectorAll(".settings-section-title")].some((title) => title.textContent?.trim() === "Interface style")
-    );
+    const section = document.querySelector(".settings-dialog-content");
     const rangeIds = [
       "window-corner-radius",
       "surface-corner-radius",
@@ -1414,11 +1552,10 @@ function settingsInterfaceStyleEvidenceExpression() {
       "dither-opacity",
       "backdrop-gradient-strength",
       "edge-highlight-brightness",
-      "edge-highlight-size",
       "halo-brightness",
-      "halo-falloff",
       "pointer-response-radius",
-      "refraction-strength",
+      "pointer-sensing-distance",
+      "pointer-falloff",
       "dialog-blur",
       "dialog-opacity",
       "dialog-overlay-strength",
@@ -1448,7 +1585,7 @@ function settingsInterfaceStyleEvidenceExpression() {
       }];
     }));
     const resetButton = [...(section?.querySelectorAll("button") ?? [])].find((button) =>
-      button.textContent?.trim() === "Reset interface style"
+      button.textContent?.trim() === "恢复默认外观"
     );
     return {
       present: Boolean(section),
@@ -1698,19 +1835,13 @@ function pointerEvidenceExpression() {
       };
     };
     const windowEdgeState = () => {
-      const element = document.querySelector(".window-edge-frame");
+      const element = document.querySelector(".app-shell");
       const style = element ? getComputedStyle(element) : null;
-      const after = element ? getComputedStyle(element, "::after") : null;
       return {
-        dataset: element?.getAttribute("data-window-edge-pointer") ?? null,
-        opacity: Number(style?.getPropertyValue("--glass-pointer-opacity") || 0),
-        x: style?.getPropertyValue("--glass-pointer-x").trim() ?? null,
-        y: style?.getPropertyValue("--glass-pointer-y").trim() ?? null,
-        boxShadow: style?.boxShadow ?? null,
-        afterOpacity: Number(after?.opacity || 0),
-        afterBackgroundImage: after?.backgroundImage ?? null,
-        afterMaskComposite: after?.maskComposite ?? null,
-        afterWebkitMaskComposite: after?.webkitMaskComposite ?? null
+        legacyFramePresent: Boolean(document.querySelector(".window-edge-frame")),
+        borderRadius: style?.borderRadius ?? null,
+        overflow: style?.overflow ?? null,
+        borderWidth: style?.borderWidth ?? null
       };
     };
     return {
@@ -1935,6 +2066,7 @@ try {
   const titlebarDrag = await titlebarDragEvidence(client);
   const searchNoDrag = await searchNoDragEvidence(client);
   const settingsInterfaceStyle = await settingsInterfaceStyleEvidence(client);
+  const pluginsSecondaryWindow = await pluginsSecondaryWindowEvidence(client);
   const compactPopovers = await compactPopoverDismissalEvidence(client);
 
   await selectMediaByName(client, "portrait-sample");
@@ -1995,7 +2127,7 @@ try {
   const pointFarIdle = await moveToSelector(client, ".grid-surface", 0.5, 0.5);
   const pointerFarIdle = await evaluate(client, pointerEvidenceExpression());
   const pointerFarIdleScreenshot = await screenshot(client, "ui-pointer-far-from-edge-idle.png");
-  const pointWindowOuterEdge = await moveToSelector(client, ".window-edge-frame", 0.5, 0.01);
+  const pointWindowOuterEdge = await moveToSelector(client, ".app-shell", 0.5, 0.01);
   const pointerWindowOuterEdge = await evaluate(client, pointerEvidenceExpression());
   const pointerWindowOuterEdgeScreenshot = await screenshot(client, "ui-window-outer-edge-highlight.png");
   const pointNearEdge = await moveToSelector(client, ".inspector-panel", 0.5, 0.985);
@@ -2015,6 +2147,7 @@ try {
     screenshots: {
       integratedTitlebarMain,
       settingsInterfaceStyle: settingsInterfaceStyle.screenshotPath,
+      pluginsSecondaryWindow: pluginsSecondaryWindow.screenshotPath,
       selectedPortraitRightPreview,
       centralLandscapeFit,
       centralLandscapeActual,
@@ -2038,6 +2171,7 @@ try {
       titlebarDrag,
       searchNoDrag,
       settingsInterfaceStyle: settingsInterfaceStyle.evidence,
+      pluginsSecondaryWindow,
       compactPopovers,
       inspectorPortrait,
       inspectorPreviewApiResponsesBeforeCentralOpen,
@@ -2276,9 +2410,47 @@ try {
   if (summary.evidence.searchNoDrag.appRegion !== "no-drag") {
     hardFailures.push("search input in center titlebar is not marked no-drag");
   }
+  const pluginsWindowEvidence = summary.evidence.pluginsSecondaryWindow;
+  if (
+    pluginsWindowEvidence.mainBefore?.oldPrimaryNavPresent ||
+    pluginsWindowEvidence.mainBefore?.pluginsInMain ||
+    !pluginsWindowEvidence.mainBefore?.libraryVisible ||
+    pluginsWindowEvidence.mainAfter?.pluginsInMain ||
+    !pluginsWindowEvidence.mainAfter?.libraryVisible
+  ) {
+    hardFailures.push("Plugins secondary window replaced main Library content or old primary nav is still present");
+  }
+  if (
+    JSON.stringify(pluginsWindowEvidence.mainBefore?.controlOrder) !==
+    JSON.stringify(["library-switcher", "toggle-sidebars", "open-plugins", "open-settings"])
+  ) {
+    hardFailures.push("left titlebar library/sidebar/Plugins/Settings control order is incorrect");
+  }
+  for (const [name, control] of Object.entries(pluginsWindowEvidence.mainBefore?.controls ?? {})) {
+    if (
+      control?.borderWidth !== "0px" ||
+      control?.afterBorderWidth !== "0px" ||
+      control?.afterBoxShadow !== "none" ||
+      control?.pointerTarget !== "true" ||
+      !/radial-gradient/i.test(control?.beforeBackgroundImage ?? "") ||
+      !/radial-gradient/i.test(control?.afterBackgroundImage ?? "")
+    ) {
+      hardFailures.push(`${name} titlebar control lost pointer material or retained a static outline`);
+    }
+  }
+  if (
+    pluginsWindowEvidence.firstTargetId !== pluginsWindowEvidence.repeatedTargetId ||
+    pluginsWindowEvidence.coexistence?.plugins !== 1 ||
+    pluginsWindowEvidence.coexistence?.settings !== 1 ||
+    pluginsWindowEvidence.pluginWindow?.role !== "plugins" ||
+    !pluginsWindowEvidence.pluginWindow?.closePresent ||
+    !pluginsWindowEvidence.pluginWindow?.pluginSurfacePresent
+  ) {
+    hardFailures.push("Plugins window single-instance/coexistence/renderer-role contract failed");
+  }
   if (
     !summary.evidence.settingsInterfaceStyle.present ||
-    summary.evidence.settingsInterfaceStyle.rangeSliderCount < 26 ||
+    summary.evidence.settingsInterfaceStyle.rangeSliderCount < 29 ||
     summary.evidence.settingsInterfaceStyle.colorInputCount < 2 ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["window-corner-radius"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["surface-corner-radius"]?.present ||
@@ -2299,11 +2471,10 @@ try {
     !summary.evidence.settingsInterfaceStyle.sliders?.["dither-opacity"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["backdrop-gradient-strength"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["edge-highlight-brightness"]?.present ||
-    !summary.evidence.settingsInterfaceStyle.sliders?.["edge-highlight-size"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["halo-brightness"]?.present ||
-    !summary.evidence.settingsInterfaceStyle.sliders?.["halo-falloff"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["pointer-response-radius"]?.present ||
-    !summary.evidence.settingsInterfaceStyle.sliders?.["refraction-strength"]?.present ||
+    !summary.evidence.settingsInterfaceStyle.sliders?.["pointer-sensing-distance"]?.present ||
+    !summary.evidence.settingsInterfaceStyle.sliders?.["pointer-falloff"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["dialog-blur"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["dialog-opacity"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["dialog-overlay-strength"]?.present ||
@@ -2327,11 +2498,10 @@ try {
     summary.evidence.settingsInterfaceStyle.sliders?.["dither-opacity"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["backdrop-gradient-strength"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["edge-highlight-brightness"]?.type !== "range" ||
-    summary.evidence.settingsInterfaceStyle.sliders?.["edge-highlight-size"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["halo-brightness"]?.type !== "range" ||
-    summary.evidence.settingsInterfaceStyle.sliders?.["halo-falloff"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["pointer-response-radius"]?.type !== "range" ||
-    summary.evidence.settingsInterfaceStyle.sliders?.["refraction-strength"]?.type !== "range" ||
+    summary.evidence.settingsInterfaceStyle.sliders?.["pointer-sensing-distance"]?.type !== "range" ||
+    summary.evidence.settingsInterfaceStyle.sliders?.["pointer-falloff"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["dialog-blur"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["dialog-opacity"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["dialog-overlay-strength"]?.type !== "range" ||
@@ -2499,16 +2669,13 @@ try {
   if (pointerFarIdle.inspector.opacity !== 0 || pointerFarIdle.inspector.dataset !== "idle") {
     hardFailures.push("glass edge highlight activates far from an edge");
   }
-  if (pointerFarIdle.windowEdge.opacity !== 0 || pointerFarIdle.windowEdge.dataset !== "idle") {
-    hardFailures.push("window outer edge highlight activates far from the shell edge");
-  }
   if (
-    !(pointerWindowOuterEdge.windowEdge.opacity > 0) ||
-    pointerWindowOuterEdge.windowEdge.dataset !== "active" ||
-    !(pointerWindowOuterEdge.windowEdge.afterOpacity > 0) ||
-    !/radial-gradient/i.test(pointerWindowOuterEdge.windowEdge.afterBackgroundImage ?? "")
+    pointerWindowOuterEdge.windowEdge.legacyFramePresent ||
+    pointerWindowOuterEdge.windowEdge.borderRadius === "0px" ||
+    !["hidden", "clip"].includes(pointerWindowOuterEdge.windowEdge.overflow) ||
+    pointerWindowOuterEdge.windowEdge.borderWidth !== "0px"
   ) {
-    hardFailures.push("window outer edge does not use a pointer-driven liquid-glass highlight ring");
+    hardFailures.push("window shell lost its clean rounded clip or restored the legacy edge frame");
   }
   if (!(pointerNearEdge.inspector.opacity > 0) || pointerNearEdge.inspector.dataset !== "active") {
     hardFailures.push("glass edge highlight does not activate near the local edge");
