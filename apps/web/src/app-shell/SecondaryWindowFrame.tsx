@@ -1,22 +1,35 @@
 import { X } from "lucide-react";
-import { useEffect, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
-import { getDesktopBridge } from "../core/desktop";
-import { LiquidGlassLayer } from "../design/liquid-glass";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode
+} from "react";
+import {
+  getDesktopBridge,
+  notifySecondaryWindowReady,
+  type DesktopSecondaryWindowRole
+} from "../core/desktop";
+import { LiquidGlassLayer, LiquidGlassSurface } from "../design/liquid-glass";
 
 export function SecondaryWindowFrame({
   bodyClassName,
   children,
   onRequestClose,
+  role,
   title,
   windowClassName
 }: {
   bodyClassName?: string;
   children: ReactNode;
   onRequestClose: () => void | Promise<unknown>;
+  role: DesktopSecondaryWindowRole;
   title: string;
   windowClassName?: string;
 }) {
   const controls = getDesktopBridge()?.windowControls;
+  const frameRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     function handleKey(event: KeyboardEvent) {
@@ -27,6 +40,22 @@ export function SecondaryWindowFrame({
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
   }, [onRequestClose]);
+
+  useLayoutEffect(() => {
+    const firstFrame = window.requestAnimationFrame(() => {
+      const frame = frameRef.current;
+      if (!frame) return;
+      frame.dataset.secondaryRendererReady = "true";
+      document.documentElement.dataset.secondaryRendererReady = role;
+      performance.mark(`megle-secondary-${role}-renderer-ready`);
+      void notifySecondaryWindowReady(role).then((didNotify) => {
+        if (!didNotify || !frameRef.current) return;
+        frameRef.current.dataset.secondaryWindowVisible = "true";
+        performance.mark(`megle-secondary-${role}-window-visible`);
+      });
+    });
+    return () => window.cancelAnimationFrame(firstFrame);
+  }, [role]);
 
   function handlePointerDown(event: ReactPointerEvent<HTMLElement>) {
     if ((event.target as HTMLElement).closest("button")) return;
@@ -42,7 +71,13 @@ export function SecondaryWindowFrame({
 
   return (
     <LiquidGlassLayer>
-      <div className={`secondary-window${windowClassName ? ` ${windowClassName}` : ""}`}>
+      <LiquidGlassSurface
+        as="div"
+        className={`secondary-window${windowClassName ? ` ${windowClassName}` : ""}`}
+        data-secondary-window-role={role}
+        ref={frameRef}
+        tone="chrome"
+      >
         <header
           className="secondary-window-titlebar"
           onPointerDown={handlePointerDown}
@@ -62,7 +97,7 @@ export function SecondaryWindowFrame({
         <div className={`secondary-window-body${bodyClassName ? ` ${bodyClassName}` : ""}`}>
           {children}
         </div>
-      </div>
+      </LiquidGlassSurface>
     </LiquidGlassLayer>
   );
 }

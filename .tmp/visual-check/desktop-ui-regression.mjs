@@ -1234,8 +1234,22 @@ async function pluginsSecondaryWindowEvidence(client) {
         oldPrimaryNavPresent: Boolean(document.querySelector(".shell-primary-nav")),
         controlOrder: [...document.querySelectorAll(".shell-titlebar-primary-actions [data-titlebar-control]")]
           .map((node) => node.getAttribute("data-titlebar-control")),
+        utilityOrder: [...document.querySelectorAll(".shell-titlebar-utility-group [data-titlebar-control]")]
+          .map((node) => node.getAttribute("data-titlebar-control")),
+        utilityRightGap: (() => {
+          const titlebar = document.querySelector(".shell-titlebar-left")?.getBoundingClientRect();
+          const utilities = document.querySelector(".shell-titlebar-utility-group")?.getBoundingClientRect();
+          return titlebar && utilities ? titlebar.right - utilities.right : null;
+        })(),
+        libraryWidth: document.querySelector('[data-titlebar-control="library-switcher"]')
+          ?.getBoundingClientRect().width ?? null,
+        treeTopGap: (() => {
+          const sidebar = document.querySelector(".library-sidebar")?.getBoundingClientRect();
+          const firstRow = document.querySelector(".tree-list > .tree-branch > .tree-item")?.getBoundingClientRect();
+          return sidebar && firstRow ? firstRow.top - sidebar.top : null;
+        })(),
         controls: Object.fromEntries(
-          ["library-switcher", "toggle-sidebars", "open-plugins", "open-settings"]
+          ["library-switcher", "open-plugins", "open-settings", "toggle-sidebars"]
             .map((id) => [id, controlState(id)])
         )
       };
@@ -1254,6 +1268,12 @@ async function pluginsSecondaryWindowEvidence(client) {
   let settingsClient;
   try {
     await waitFor(pluginsClient, `Boolean(document.querySelector(".plugins-body"))`, 10000, "Plugins secondary window");
+    await waitFor(
+      pluginsClient,
+      `document.querySelector(".secondary-window")?.getAttribute("data-secondary-window-visible") === "true"`,
+      10000,
+      "Plugins material-ready reveal"
+    );
     const screenshotPath = await screenshot(pluginsClient, "ui-plugins-secondary-window.png");
     const firstTargets = await waitForTargetCount((page) => page.url.includes("#/plugins"), 1);
 
@@ -1267,6 +1287,12 @@ async function pluginsSecondaryWindowEvidence(client) {
     await settingsClient.ready;
     await settingsClient.send("Runtime.enable");
     await waitFor(settingsClient, `Boolean(document.querySelector(".settings-window"))`, 10000, "Settings alongside Plugins");
+    await waitFor(
+      settingsClient,
+      `document.querySelector(".secondary-window")?.getAttribute("data-secondary-window-visible") === "true"`,
+      10000,
+      "Settings material-ready reveal"
+    );
 
     const coexistence = {
       plugins: (await matchingTargets((page) => page.url.includes("#/plugins"))).length,
@@ -1281,12 +1307,47 @@ async function pluginsSecondaryWindowEvidence(client) {
     );
     const pluginWindow = await evaluate(
       pluginsClient,
-      `({
-        role: window.megleDesktop?.windowRole,
-        title: document.querySelector(".secondary-window-title")?.textContent?.trim(),
-        closePresent: Boolean(document.querySelector(".secondary-window-close")),
-        pluginSurfacePresent: Boolean(document.querySelector(".plugins-layout"))
-      })`
+      `(() => {
+        const owner = document.querySelector(".secondary-window");
+        const backdrop = owner?.querySelector(":scope > .liquid-glass-backdrop");
+        const root = getComputedStyle(document.documentElement);
+        return {
+          role: window.megleDesktop?.windowRole,
+          title: document.querySelector(".secondary-window-title")?.textContent?.trim(),
+          closePresent: Boolean(document.querySelector(".secondary-window-close")),
+          pluginSurfacePresent: Boolean(document.querySelector(".plugins-layout")),
+          rendererReady: owner?.getAttribute("data-secondary-renderer-ready"),
+          windowVisible: owner?.getAttribute("data-secondary-window-visible"),
+          material: {
+            background: backdrop ? getComputedStyle(backdrop).backgroundColor : null,
+            backdropFilter: backdrop ? getComputedStyle(backdrop).backdropFilter : null,
+            sideBlur: root.getPropertyValue("--glass-side-blur").trim(),
+            sideFill: root.getPropertyValue("--glass-side-fill").trim(),
+            sideSaturation: root.getPropertyValue("--glass-side-saturation").trim(),
+            sideStroke: root.getPropertyValue("--glass-side-stroke").trim()
+          }
+        };
+      })()`
+    );
+    const settingsWindow = await evaluate(
+      settingsClient,
+      `(() => {
+        const owner = document.querySelector(".secondary-window");
+        const backdrop = owner?.querySelector(":scope > .liquid-glass-backdrop");
+        const root = getComputedStyle(document.documentElement);
+        return {
+          rendererReady: owner?.getAttribute("data-secondary-renderer-ready"),
+          windowVisible: owner?.getAttribute("data-secondary-window-visible"),
+          material: {
+            background: backdrop ? getComputedStyle(backdrop).backgroundColor : null,
+            backdropFilter: backdrop ? getComputedStyle(backdrop).backdropFilter : null,
+            sideBlur: root.getPropertyValue("--glass-side-blur").trim(),
+            sideFill: root.getPropertyValue("--glass-side-fill").trim(),
+            sideSaturation: root.getPropertyValue("--glass-side-saturation").trim(),
+            sideStroke: root.getPropertyValue("--glass-side-stroke").trim()
+          }
+        };
+      })()`
     );
 
     fireRendererCommand(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
@@ -1299,6 +1360,7 @@ async function pluginsSecondaryWindowEvidence(client) {
       mainBefore,
       mainAfter,
       pluginWindow,
+      settingsWindow,
       firstTargetId: firstTargets[0]?.id ?? null,
       repeatedTargetId: repeatedTargets[0]?.id ?? null,
       coexistence
@@ -2422,9 +2484,14 @@ try {
   }
   if (
     JSON.stringify(pluginsWindowEvidence.mainBefore?.controlOrder) !==
-    JSON.stringify(["library-switcher", "toggle-sidebars", "open-plugins", "open-settings"])
+    JSON.stringify(["library-switcher", "open-plugins", "open-settings", "toggle-sidebars"]) ||
+    JSON.stringify(pluginsWindowEvidence.mainBefore?.utilityOrder) !==
+      JSON.stringify(["open-plugins", "open-settings", "toggle-sidebars"]) ||
+    pluginsWindowEvidence.mainBefore?.utilityRightGap > 13 ||
+    pluginsWindowEvidence.mainBefore?.libraryWidth >= 168 ||
+    pluginsWindowEvidence.mainBefore?.treeTopGap > 6
   ) {
-    hardFailures.push("left titlebar library/sidebar/Plugins/Settings control order is incorrect");
+    hardFailures.push("titlebar utility grouping, intrinsic library width, or sidebar tree top spacing is incorrect");
   }
   for (const [name, control] of Object.entries(pluginsWindowEvidence.mainBefore?.controls ?? {})) {
     if (
@@ -2444,7 +2511,13 @@ try {
     pluginsWindowEvidence.coexistence?.settings !== 1 ||
     pluginsWindowEvidence.pluginWindow?.role !== "plugins" ||
     !pluginsWindowEvidence.pluginWindow?.closePresent ||
-    !pluginsWindowEvidence.pluginWindow?.pluginSurfacePresent
+    !pluginsWindowEvidence.pluginWindow?.pluginSurfacePresent ||
+    pluginsWindowEvidence.pluginWindow?.rendererReady !== "true" ||
+    pluginsWindowEvidence.pluginWindow?.windowVisible !== "true" ||
+    pluginsWindowEvidence.settingsWindow?.rendererReady !== "true" ||
+    pluginsWindowEvidence.settingsWindow?.windowVisible !== "true" ||
+    JSON.stringify(pluginsWindowEvidence.pluginWindow?.material) !==
+      JSON.stringify(pluginsWindowEvidence.settingsWindow?.material)
   ) {
     hardFailures.push("Plugins window single-instance/coexistence/renderer-role contract failed");
   }

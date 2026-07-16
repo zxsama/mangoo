@@ -1,9 +1,11 @@
 import { useCallback } from "react";
 import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
+import { useSecondaryWindowInterfaceStyle } from "../../app-shell/useSecondaryWindowInterfaceStyle";
 import { getDesktopBridge } from "../../core/desktop";
 import { PluginsView } from "./PluginsView";
 
 export function PluginsWindow() {
+  useSecondaryWindowInterfaceStyle();
   const handleClose = useCallback(async () => {
     const bridge = getDesktopBridge();
     if (bridge?.closePluginsWindow) {
@@ -21,6 +23,7 @@ export function PluginsWindow() {
     <SecondaryWindowFrame
       bodyClassName="plugins-window-body"
       onRequestClose={handleClose}
+      role="plugins"
       title="Plugins"
       windowClassName="plugins-window"
     >

@@ -1,5 +1,7 @@
 import type { LibrarySummary, LibraryLoadPhase } from "./libraryTypes";
 
+export type DesktopSecondaryWindowRole = "settings" | "plugins";
+
 export interface DesktopDiagnostics {
   ffmpegAvailable: boolean;
   dbPath: string | null;
@@ -39,8 +41,9 @@ export interface DesktopShellActions {
 export interface MegleDesktopBridge {
   coreUrl?: string;
   sessionToken?: string;
-  windowRole?: "main" | "settings" | "plugins";
+  windowRole?: "main" | DesktopSecondaryWindowRole;
   notifyShellReady?: () => Promise<boolean>;
+  notifySecondaryWindowReady?: (role: DesktopSecondaryWindowRole) => Promise<boolean>;
   pickFolder?: () => Promise<string | null>;
   diagnostics?: () => Promise<DesktopDiagnostics>;
   openSettingsWindow?: () => Promise<boolean>;
@@ -71,6 +74,26 @@ declare global {
 
 export function getDesktopBridge(): MegleDesktopBridge | null {
   return window.megleDesktop ?? null;
+}
+
+const notifiedSecondaryWindowRoles = new Set<DesktopSecondaryWindowRole>();
+
+export async function notifySecondaryWindowReady(
+  role: DesktopSecondaryWindowRole
+): Promise<boolean> {
+  const bridge = getDesktopBridge();
+  const notifyReady = bridge?.notifySecondaryWindowReady;
+  if (!notifyReady || bridge.windowRole !== role) return false;
+  if (notifiedSecondaryWindowRoles.has(role)) return true;
+  notifiedSecondaryWindowRoles.add(role);
+  try {
+    const didNotify = await notifyReady(role);
+    if (!didNotify) notifiedSecondaryWindowRoles.delete(role);
+    return didNotify;
+  } catch {
+    notifiedSecondaryWindowRoles.delete(role);
+    return false;
+  }
 }
 
 export async function openPluginsWindow(): Promise<boolean> {

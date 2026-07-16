@@ -1,7 +1,13 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { getDesktopBridge, notifyDesktopShellReady } from "./core/desktop";
+import { applyInterfaceStyleVariables, readInterfaceStyle } from "./design/liquid-glass";
 import "./styles.css";
+
+// Apply persisted material variables before any role-specific dynamic import or
+// first paint. Hooks keep them current after mount; this closes the blank default
+// CSS frame that used to appear before Settings/Plugins initialized.
+applyInterfaceStyleVariables(readInterfaceStyle());
 
 // Secondary OS windows load this same bundle with a role + matching hash route.
 // Hash detection also gives browser builds a safe named-window fallback.
@@ -35,5 +41,18 @@ if (isPluginsWindow) {
         <App />
       </React.StrictMode>
     );
+    preloadSecondaryWindowRenderers();
   });
+}
+
+function preloadSecondaryWindowRenderers() {
+  const preload = () => {
+    void import("./features/plugins/PluginsWindow");
+    void import("./features/settings/SettingsWindow");
+  };
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(preload, { timeout: 1200 });
+  } else {
+    window.setTimeout(preload, 0);
+  }
 }

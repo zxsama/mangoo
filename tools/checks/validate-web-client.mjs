@@ -88,6 +88,7 @@ const main = read("apps/web/src/main.tsx");
 const app = read("apps/web/src/app/App.tsx");
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const secondaryWindowFrame = read("apps/web/src/app-shell/SecondaryWindowFrame.tsx");
+const secondaryWindowInterfaceStyle = read("apps/web/src/app-shell/useSecondaryWindowInterfaceStyle.ts");
 const settingsWindow = read("apps/web/src/features/settings/SettingsWindow.tsx");
 const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
 const libraryView = read("apps/web/src/features/library/LibraryView.tsx");
@@ -159,9 +160,34 @@ for (const [label, source] of [
     fail(`${label} must reuse the shared frameless secondary-window frame`);
   }
 }
-for (const value of ["onPointerDown", "windowControls", "LiquidGlassLayer", "secondary-window-titlebar"]) {
+for (const value of [
+  "onPointerDown",
+  "windowControls",
+  "LiquidGlassLayer",
+  "LiquidGlassSurface",
+  "secondary-window-titlebar",
+  "notifySecondaryWindowReady",
+  "useLayoutEffect",
+  "secondaryRendererReady"
+]) {
   if (!secondaryWindowFrame.includes(value)) {
     fail(`shared secondary-window frame missing ${value}`);
+  }
+}
+for (const value of ["useInterfaceStyle", "subscribePreference", "broadcastChanges", "lastObservedValue"]) {
+  if (!secondaryWindowInterfaceStyle.includes(value)) {
+    fail(`shared secondary-window interface-style synchronization missing ${value}`);
+  }
+}
+if (
+  !settingsWindow.includes("useSecondaryWindowInterfaceStyle({ broadcastChanges: true })") ||
+  !pluginsWindow.includes("useSecondaryWindowInterfaceStyle()")
+) {
+  fail("Settings and Plugins must initialize and sync side material through the same shared hook");
+}
+for (const value of ["applyInterfaceStyleVariables(readInterfaceStyle())", "preloadSecondaryWindowRenderers"]) {
+  if (!main.includes(value)) {
+    fail(`web entry must initialize/preload secondary material before first window paint: ${value}`);
   }
 }
 if (!pluginsWindow.includes("<PluginsView />")) {
@@ -214,10 +240,16 @@ for (const value of [
     fail(`main titlebar must expose the moved library/Plugins utility contract: missing ${value}`);
   }
 }
-const pluginsControlIndex = shellTitlebar.indexOf('data-titlebar-control="open-plugins"');
-const settingsControlIndex = shellTitlebar.indexOf('data-titlebar-control="open-settings"');
-if (pluginsControlIndex === -1 || settingsControlIndex === -1 || pluginsControlIndex > settingsControlIndex) {
-  fail("Plugins titlebar control must be immediately before Settings in the shared utility group");
+const utilityGroup = /className="shell-titlebar-utility-group[^\"]*"[\s\S]*?>([\s\S]*?)<\/div>/.exec(shellTitlebar)?.[1] ?? "";
+const pluginsControlIndex = utilityGroup.indexOf('data-titlebar-control="open-plugins"');
+const settingsControlIndex = utilityGroup.indexOf('data-titlebar-control="open-settings"');
+const sidebarToggleIndex = utilityGroup.indexOf("<ShellSidebarToggle");
+if (
+  pluginsControlIndex === -1 ||
+  settingsControlIndex <= pluginsControlIndex ||
+  sidebarToggleIndex <= settingsControlIndex
+) {
+  fail("titlebar utility group order must be Plugins, Settings, then sidebar toggle");
 }
 
 if (!existsSync(path.join(root, coreClientPackagePath))) {

@@ -828,9 +828,18 @@ body {
 .shell-titlebar-primary-actions {
   display: flex;
   flex: 1 1 auto;
+  width: 100%;
   align-items: center;
   gap: 4px;
   min-width: 0;
+}
+
+.shell-titlebar-utility-group {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  margin-inline-start: auto;
 }
 
 .shell-titlebar-utility-button,
@@ -840,7 +849,7 @@ body {
 
 .shell-library-switcher-button {
   display: inline-flex;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   align-items: center;
   gap: 7px;
   min-width: 0;
@@ -857,7 +866,7 @@ body {
 
 .shell-library-switcher-name {
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -875,7 +884,7 @@ body {
   min-width: 0;
   min-height: 0;
   height: 100%;
-  padding: 16px;
+  padding: 4px 16px 16px;
   overflow: auto;
   background: transparent;
   border: 0;
@@ -4385,14 +4394,16 @@ button:disabled {
   width: 100vw;
   height: 100vh;
   overflow: hidden;
-  /* Frosted glass matching the sidebar: a translucent side-material fill over the
-     window's acrylic backdrop, blurred + saturated by the same "侧栏材质" settings
-     vars the sidebar uses (--glass-side-*). Previously a near-opaque
-     rgba(18,22,28,0.9) fill hid the acrylic once content mounted. */
-  background: var(--glass-side-fill, rgba(8, 12, 16, 0.38));
-  -webkit-backdrop-filter: blur(var(--glass-side-blur, 26px)) saturate(var(--glass-side-saturation, 1.55));
-  backdrop-filter: blur(var(--glass-side-blur, 26px)) saturate(var(--glass-side-saturation, 1.55));
+  border-radius: var(--radius-window);
+  background: transparent;
   color: var(--text-soft, #d5dbe2);
+}
+
+.liquid-glass.secondary-window {
+  --glass-fill: var(--glass-side-fill);
+  --glass-blur-current: var(--glass-side-blur);
+  --glass-border-current: var(--glass-side-stroke);
+  --glass-saturation: var(--glass-side-saturation);
 }
 
 .secondary-window-titlebar {

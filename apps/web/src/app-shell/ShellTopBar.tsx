@@ -148,32 +148,38 @@ export function ShellTitlebarPrimaryActions({
         <span className="shell-library-switcher-name">{activeLibraryName}</span>
         <ChevronsUpDown aria-hidden="true" size={14} />
       </LiquidGlassButton>
-      <ShellSidebarToggle
-        sidebarsHidden={sidebarsHidden}
-        onToggleSidebars={onToggleSidebars}
-      />
-      <LiquidGlassButton
-        aria-label="Open plugins"
-        className="titlebar-icon-button shell-titlebar-utility-button shell-plugins-button no-drag"
-        data-titlebar-control="open-plugins"
-        onClick={onOpenPlugins}
-        title="Plugins"
-        tone="control"
-        type="button"
+      <div
+        aria-label="Application utilities"
+        className="shell-titlebar-utility-group no-drag"
+        role="group"
       >
-        <Package aria-hidden="true" size={16} />
-      </LiquidGlassButton>
-      <LiquidGlassButton
-        aria-label="Open settings"
-        className="titlebar-icon-button shell-titlebar-utility-button shell-settings-button no-drag"
-        data-titlebar-control="open-settings"
-        onClick={onOpenSettings}
-        title="Settings"
-        tone="control"
-        type="button"
-      >
-        <Settings aria-hidden="true" size={16} />
-      </LiquidGlassButton>
+        <LiquidGlassButton
+          aria-label="Open plugins"
+          className="titlebar-icon-button shell-titlebar-utility-button shell-plugins-button no-drag"
+          data-titlebar-control="open-plugins"
+          onClick={onOpenPlugins}
+          title="Plugins"
+          tone="control"
+          type="button"
+        >
+          <Package aria-hidden="true" size={16} />
+        </LiquidGlassButton>
+        <LiquidGlassButton
+          aria-label="Open settings"
+          className="titlebar-icon-button shell-titlebar-utility-button shell-settings-button no-drag"
+          data-titlebar-control="open-settings"
+          onClick={onOpenSettings}
+          title="Settings"
+          tone="control"
+          type="button"
+        >
+          <Settings aria-hidden="true" size={16} />
+        </LiquidGlassButton>
+        <ShellSidebarToggle
+          sidebarsHidden={sidebarsHidden}
+          onToggleSidebars={onToggleSidebars}
+        />
+      </div>
     </div>
   );
 }

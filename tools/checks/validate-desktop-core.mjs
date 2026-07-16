@@ -125,6 +125,15 @@ for (const value of ["contextBridge", "coreUrl", "sessionToken", "notifyShellRea
 }
 
 for (const value of [
+  "notifySecondaryWindowReady",
+  'ipcRenderer.invoke("megle:secondary-window-ready", role)'
+]) {
+  if (!preload.includes(value)) {
+    fail(`preload bridge missing secondary renderer-ready contract: ${value}`);
+  }
+}
+
+for (const value of [
   "openPluginsWindow",
   "closePluginsWindow",
   'ipcRenderer.invoke("megle:open-plugins-window")',
@@ -139,10 +148,13 @@ for (const value of [
   'type SecondaryWindowRole = "settings" | "plugins"',
   "SECONDARY_WINDOW_CONFIGS",
   "secondaryWindows",
+  "secondaryWindowReadiness",
+  "SECONDARY_WINDOW_READY_TIMEOUT_MS",
   'route: "#/settings"',
   'route: "#/plugins"',
   'ipcMain.handle("megle:open-plugins-window"',
   'ipcMain.handle("megle:close-plugins-window"',
+  'ipcMain.handle("megle:secondary-window-ready"',
   "openSecondaryWindow",
   "closeSecondaryWindow",
   "closeAllSecondaryWindows"
@@ -168,6 +180,12 @@ if (!openSecondaryWindowBody) {
     'backgroundMaterial: "acrylic"',
     "frame: false",
     "secondaryWindows[role] = window",
+    "rendererReady: false",
+    "nativeReady: false",
+    "revealWaiters: []",
+    "SECONDARY_WINDOW_READY_TIMEOUT_MS",
+    'window.once("ready-to-show"',
+    "revealSecondaryWindowWhenReady(role, window)",
     "--megle-window=${role}",
     "config.route"
   ]) {
@@ -175,6 +193,36 @@ if (!openSecondaryWindowBody) {
       fail(`shared secondary window must preserve the Settings lifecycle/material contract: ${value}`);
     }
   }
+}
+
+if (main.includes('window.once("ready-to-show", () => window.show())')) {
+  fail("secondary windows must not reveal from ready-to-show before renderer material/content readiness");
+}
+for (const value of [
+  'ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown)',
+  "isSecondaryWindowRole(role)",
+  "windowForIpcEvent(event)",
+  "secondaryWindows[role] !== window",
+  "readiness.rendererReady = true",
+  "readiness.revealWaiters.push(resolve)"
+]) {
+  if (!main.includes(value)) {
+    fail(`secondary renderer-ready IPC must stay role/sender isolated: ${value}`);
+  }
+}
+const revealSecondaryWindowBody = functionBody(
+  main,
+  "function revealSecondaryWindowWhenReady("
+);
+if (
+  !revealSecondaryWindowBody ||
+  !revealSecondaryWindowBody.includes("readiness.nativeReady") ||
+  !revealSecondaryWindowBody.includes("readiness.rendererReady") ||
+  !revealSecondaryWindowBody.includes("window.show()") ||
+  !revealSecondaryWindowBody.includes("window.focus()") ||
+  !revealSecondaryWindowBody.includes("resolveSecondaryWindowRevealWaiters(readiness, true)")
+) {
+  fail("secondary reveal must require native+renderer readiness and then show/focus the invoking role window");
 }
 
 if (!main.includes("BrowserWindow.fromWebContents(event.sender)")) {

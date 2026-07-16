@@ -34,6 +34,17 @@ const secondaryWindows: Record<SecondaryWindowRole, BrowserWindow | null> = {
   settings: null,
   plugins: null
 };
+type SecondaryWindowReadiness = {
+  windowId: number;
+  nativeReady: boolean;
+  rendererReady: boolean;
+  fallbackTimer: NodeJS.Timeout | null;
+  revealWaiters: Array<(didReveal: boolean) => void>;
+};
+const secondaryWindowReadiness: Record<SecondaryWindowRole, SecondaryWindowReadiness | null> = {
+  settings: null,
+  plugins: null
+};
 const SECONDARY_WINDOW_CONFIGS: Record<SecondaryWindowRole, SecondaryWindowConfig> = {
   settings: {
     title: "Megle 设置",
@@ -75,6 +86,7 @@ let windowStatePersistenceEnabled = false;
 const WINDOW_COMPOSITION_BOOTSTRAP_MARGIN_PX = 96;
 const PERSIST_DEBOUNCE_MS = 500;
 const SHELL_READY_FAILURE_TIMEOUT_MS = 4000;
+const SECONDARY_WINDOW_READY_TIMEOUT_MS = 4000;
 const AUTO_CORE_STARTUP_MAX_ATTEMPTS = 3;
 const WINDOW_COMPOSITION_REFRESH_DELAYS_MS = [34, 140, 420] as const;
 const CHROMIUM_OVERLAY_SCROLLBAR_FEATURES = [
@@ -336,6 +348,17 @@ ipcMain.handle("megle:close-plugins-window", () => {
   return true;
 });
 
+ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown) => {
+  if (!isSecondaryWindowRole(role)) return false;
+  const window = windowForIpcEvent(event);
+  if (!window || secondaryWindows[role] !== window) return false;
+  const readiness = secondaryWindowReadiness[role];
+  if (!readiness || readiness.windowId !== window.id) return false;
+  readiness.rendererReady = true;
+  if (revealSecondaryWindowWhenReady(role, window)) return true;
+  return new Promise<boolean>((resolve) => readiness.revealWaiters.push(resolve));
+});
+
 ipcMain.handle("megle:visual-capture-page", async (event) => {
   const window = windowForIpcEvent(event);
   if (!isVisualHarnessEnabled() || !window) {
@@ -582,9 +605,13 @@ async function createWindow(): Promise<void> {
 async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
   const existing = secondaryWindows[role];
   if (existing && !existing.isDestroyed()) {
-    if (existing.isMinimized()) existing.restore();
-    existing.show();
-    existing.focus();
+    if (existing.isVisible()) {
+      if (existing.isMinimized()) existing.restore();
+      existing.show();
+      existing.focus();
+    } else {
+      revealSecondaryWindowWhenReady(role, existing);
+    }
     return;
   }
 
@@ -619,8 +646,28 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     }
   });
   secondaryWindows[role] = window;
+  secondaryWindowReadiness[role] = {
+    windowId: window.id,
+    nativeReady: false,
+    rendererReady: false,
+    revealWaiters: [],
+    fallbackTimer: setTimeout(() => {
+      revealSecondaryWindowWhenReady(role, window, true);
+    }, SECONDARY_WINDOW_READY_TIMEOUT_MS)
+  };
   applyWindowMaterial(window);
-  window.once("ready-to-show", () => window.show());
+  window.once("ready-to-show", () => {
+    const readiness = secondaryWindowReadiness[role];
+    if (!readiness || readiness.windowId !== window.id) return;
+    readiness.nativeReady = true;
+    revealSecondaryWindowWhenReady(role, window);
+  });
+  window.webContents.on(
+    "did-fail-load",
+    (_event, _errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
+      if (isMainFrame) revealSecondaryWindowWhenReady(role, window, true);
+    }
+  );
   window.on("blur", () => {
     if (activeWindowDrag?.windowId === window.id) {
       activeWindowDrag = null;
@@ -633,6 +680,14 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     if (secondaryWindows[role] === window) {
       secondaryWindows[role] = null;
     }
+    clearSecondaryWindowReadyFallback(role, window.id);
+    const readiness = secondaryWindowReadiness[role];
+    if (readiness?.windowId === window.id) {
+      resolveSecondaryWindowRevealWaiters(readiness, false);
+    }
+    if (secondaryWindowReadiness[role]?.windowId === window.id) {
+      secondaryWindowReadiness[role] = null;
+    }
   });
 
   const devServer = process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173";
@@ -640,8 +695,43 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     await window.loadURL(`${devServer}${config.route}`);
   } catch (error) {
     console.warn(`[megle] ${role} window loadURL rejected:`, error);
-    if (!window.isDestroyed()) window.show();
+    revealSecondaryWindowWhenReady(role, window, true);
   }
+}
+
+function isSecondaryWindowRole(value: unknown): value is SecondaryWindowRole {
+  return value === "settings" || value === "plugins";
+}
+
+function clearSecondaryWindowReadyFallback(role: SecondaryWindowRole, windowId: number): void {
+  const readiness = secondaryWindowReadiness[role];
+  if (!readiness || readiness.windowId !== windowId || !readiness.fallbackTimer) return;
+  clearTimeout(readiness.fallbackTimer);
+  readiness.fallbackTimer = null;
+}
+
+function resolveSecondaryWindowRevealWaiters(
+  readiness: SecondaryWindowReadiness,
+  didReveal: boolean
+): void {
+  for (const resolve of readiness.revealWaiters.splice(0)) resolve(didReveal);
+}
+
+function revealSecondaryWindowWhenReady(
+  role: SecondaryWindowRole,
+  window: BrowserWindow,
+  force = false
+): boolean {
+  if (window.isDestroyed() || secondaryWindows[role] !== window) return false;
+  const readiness = secondaryWindowReadiness[role];
+  if (!readiness || readiness.windowId !== window.id) return false;
+  if (!force && (!readiness.nativeReady || !readiness.rendererReady)) return false;
+  clearSecondaryWindowReadyFallback(role, window.id);
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+  resolveSecondaryWindowRevealWaiters(readiness, true);
+  return true;
 }
 
 function closeSecondaryWindow(role: SecondaryWindowRole): void {

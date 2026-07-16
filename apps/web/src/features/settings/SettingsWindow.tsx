@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
+import { useSecondaryWindowInterfaceStyle } from "../../app-shell/useSecondaryWindowInterfaceStyle";
 import { getDesktopBridge } from "../../core/desktop";
 import { broadcastPreference } from "../../core/preferenceSync";
 import { useLibraryData } from "../../core/useLibraryData";
-import { useInterfaceStyle } from "../../design/liquid-glass";
 import {
   readStoredLibraryGridPreferences,
   storeLibraryGridPreferences,
@@ -22,7 +22,7 @@ import { SettingsPanels } from "./settingsPanels";
 // the main window updates live — the two windows share this app's origin, so a
 // BroadcastChannel reaches across them without any per-setting IPC.
 export function SettingsWindow() {
-  const interfaceStyle = useInterfaceStyle();
+  const interfaceStyle = useSecondaryWindowInterfaceStyle({ broadcastChanges: true });
   const [gridPreferences, setGridPreferences] = useState<LibraryGridPreferences>(() =>
     readStoredLibraryGridPreferences()
   );
@@ -69,16 +69,11 @@ export function SettingsWindow() {
     });
   }, []);
 
-  // Interface-style changes are already persisted by useInterfaceStyle; broadcast
-  // the value on change so the main window's live style updates too.
-  useEffect(() => {
-    broadcastPreference("interfaceStyle", interfaceStyle.value);
-  }, [interfaceStyle.value]);
-
   return (
     <SecondaryWindowFrame
       bodyClassName="settings-window-body"
       onRequestClose={handleClose}
+      role="settings"
       title="偏好设置"
       windowClassName="settings-window"
     >

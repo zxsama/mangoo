@@ -25,6 +25,8 @@ contextBridge.exposeInMainWorld("megleDesktop", {
   closeSettingsWindow: () => ipcRenderer.invoke("megle:close-settings-window"),
   openPluginsWindow: () => ipcRenderer.invoke("megle:open-plugins-window"),
   closePluginsWindow: () => ipcRenderer.invoke("megle:close-plugins-window"),
+  notifySecondaryWindowReady: (role) =>
+    ipcRenderer.invoke("megle:secondary-window-ready", role),
   windowControls: {
     minimize: () => ipcRenderer.invoke("megle:window-minimize"),
     maximize: () => ipcRenderer.invoke("megle:window-maximize"),

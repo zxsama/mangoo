@@ -36,6 +36,7 @@ const webMain = read("apps/web/src/main.tsx");
 const app = read("apps/web/src/app/App.tsx");
 const appShell = read("apps/web/src/app-shell/AppShell.tsx");
 const secondaryWindowFrame = read("apps/web/src/app-shell/SecondaryWindowFrame.tsx");
+const secondaryWindowInterfaceStyle = read("apps/web/src/app-shell/useSecondaryWindowInterfaceStyle.ts");
 const overlayScrollbars = readOptional("apps/web/src/app-shell/useOverlayScrollbars.ts") ?? "";
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const shellOverlayHost = readOptional("apps/web/src/app-shell/ShellOverlayHost.tsx");
@@ -1535,11 +1536,30 @@ for (const value of [
   "secondary-window-titlebar",
   "secondary-window-close",
   "LiquidGlassLayer",
+  "LiquidGlassSurface",
   "windowControls",
-  "onPointerDown"
+  "onPointerDown",
+  "notifySecondaryWindowReady",
+  "secondaryRendererReady"
 ]) {
   if (!secondaryWindowFrame.includes(value)) {
     fail(`shared secondary-window frame missing ${value}`);
+  }
+}
+for (const value of ["useInterfaceStyle", "subscribePreference", "broadcastChanges", "lastObservedValue"]) {
+  if (!secondaryWindowInterfaceStyle.includes(value)) {
+    fail(`shared secondary-window material synchronization missing ${value}`);
+  }
+}
+if (
+  !settingsWindow.includes("useSecondaryWindowInterfaceStyle({ broadcastChanges: true })") ||
+  !pluginsWindow.includes("useSecondaryWindowInterfaceStyle()")
+) {
+  fail("Settings and Plugins must share side-material initialization and live synchronization");
+}
+for (const value of ["applyInterfaceStyleVariables(readInterfaceStyle())", "preloadSecondaryWindowRenderers"]) {
+  if (!webMain.includes(value)) {
+    fail(`web entry must prepare secondary material/chunks before first visible frame: ${value}`);
   }
 }
 if (!webMain.includes('windowRole === "plugins"') || !webMain.includes('import("./features/plugins/PluginsWindow")')) {
@@ -1612,6 +1632,7 @@ for (const [source, value, message] of [
   [appShell, "data-sidebars-hidden", "AppShell must expose hidden-sidebar state to CSS"],
   [shellTitlebar, "ShellSidebarToggle", "titlebar must expose the sidebar toggle control"],
   [shellTitlebar, "shell-titlebar-primary-actions", "library/plugins/settings/sidebar controls must share one titlebar action group"],
+  [shellTitlebar, "shell-titlebar-utility-group", "Plugins/Settings/sidebar controls must use a dedicated right-aligned group"],
   [shellTitlebar, "shell-library-switcher-button", "active library selector must move into the titlebar"],
   [shellTitlebar, "shell-plugins-button", "Plugins must have a standalone titlebar utility button"],
   [shellTitlebar, "shell-settings-button", "settings must have a standalone utility button beside the sidebar toggle"],
@@ -1631,6 +1652,71 @@ if (/\{\s*id:\s*"settings"[\s\S]*?caption:\s*"Settings"/.test(shellTitlebar)) {
 
 if (/data-pointer-glow="off"/.test(shellTitlebar)) {
   fail("library selector, Plugins, settings, and sidebar-toggle controls must use the unified pointer highlight");
+}
+
+const titlebarUtilityGroupBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  ".shell-titlebar-utility-group"
+);
+if (
+  !titlebarUtilityGroupBlocks.some(
+    (block) =>
+      latestDeclarationValue(block, "display") === "inline-flex" &&
+      latestDeclarationValue(block, "margin-inline-start") === "auto"
+  )
+) {
+  fail("titlebar utility group must use normal-flow flex auto alignment on the right");
+}
+const librarySwitcherSizingBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  ".shell-library-switcher-button"
+);
+if (
+  !librarySwitcherSizingBlocks.some(
+    (block) =>
+      latestDeclarationValue(block, "flex") === "0 1 auto" &&
+      latestDeclarationValue(block, "max-width") === "168px"
+  ) ||
+  !librarySwitcherSizingBlocks.some(
+    (block) => latestDeclarationValue(block, "width") === "auto"
+  )
+) {
+  fail("library selector must size to icon/name/chevron content with a bounded long-name width");
+}
+
+const secondaryMaterialBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  ".liquid-glass.secondary-window"
+);
+for (const [property, expected] of [
+  ["--glass-fill", "var(--glass-side-fill)"],
+  ["--glass-blur-current", "var(--glass-side-blur)"],
+  ["--glass-border-current", "var(--glass-side-stroke)"],
+  ["--glass-saturation", "var(--glass-side-saturation)"]
+]) {
+  if (!secondaryMaterialBlocks.some((block) => latestDeclarationValue(block, property) === expected)) {
+    fail(`secondary windows must reuse the sidebar LiquidGlass material mapping: ${property}`);
+  }
+}
+const secondaryWindowBlocks = cssBlocksForExactSelector(stylesForChecks, ".secondary-window");
+if (
+  !secondaryWindowBlocks.some(
+    (block) =>
+      latestDeclarationValue(block, "background") === "transparent" &&
+      latestDeclarationValue(block, "backdrop-filter") === null &&
+      latestDeclarationValue(block, "-webkit-backdrop-filter") === null
+  )
+) {
+  fail("secondary window root must not hard-code a second material over the shared LiquidGlass surface");
+}
+
+const sidebarSpacingBlocks = cssBlocksForExactSelector(stylesForChecks, ".library-sidebar");
+const treeListBlocks = cssBlocksForExactSelector(stylesForChecks, ".tree-list");
+if (
+  !sidebarSpacingBlocks.some((block) => latestDeclarationValue(block, "padding") === "4px 16px 16px") ||
+  !treeListBlocks.some((block) => latestDeclarationValue(block, "margin-top") === "0")
+) {
+  fail("folder tree must remove the retired sidebar-header top gap while retaining side/bottom padding");
 }
 
 for (const selector of [
