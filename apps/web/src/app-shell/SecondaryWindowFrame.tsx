@@ -42,7 +42,6 @@ export function SecondaryWindowFrame({
   }, [onRequestClose]);
 
   useLayoutEffect(() => {
-    let contentRevealFrame = 0;
     const unsubscribeMaterialVisible = getDesktopBridge()?.onSecondaryWindowMaterialVisible?.(
       (payload) => {
         const frame = frameRef.current;
@@ -77,21 +76,14 @@ export function SecondaryWindowFrame({
         );
         currentFrame.dataset.secondaryWindowVisible = "true";
         performance.mark(`megle-secondary-${role}-material-composited`);
-        contentRevealFrame = window.requestAnimationFrame(() => {
-          contentRevealFrame = window.requestAnimationFrame(() => {
-            const revealFrame = frameRef.current;
-            if (!revealFrame) return;
-            revealFrame.setAttribute("data-secondary-content-visible", "true");
-            revealFrame.setAttribute("data-secondary-content-visible-at", String(Date.now()));
-            performance.mark(`megle-secondary-${role}-content-visible`);
-          });
-        });
+        currentFrame.setAttribute("data-secondary-content-visible", "true");
+        currentFrame.setAttribute("data-secondary-content-visible-at", String(Date.now()));
+        performance.mark(`megle-secondary-${role}-content-visible`);
       });
     });
     return () => {
       unsubscribeMaterialVisible?.();
       window.cancelAnimationFrame(firstFrame);
-      if (contentRevealFrame) window.cancelAnimationFrame(contentRevealFrame);
     };
   }, [role]);
 

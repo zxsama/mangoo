@@ -50,7 +50,7 @@ export interface MegleDesktopBridge {
   notifyShellReady?: () => Promise<boolean>;
   notifySecondaryWindowReady?: (
     role: DesktopSecondaryWindowRole
-  ) => Promise<DesktopSecondaryWindowRevealResult | null>;
+  ) => Promise<DesktopSecondaryWindowRevealResult | false>;
   onSecondaryWindowMaterialVisible?: (
     cb: (payload: {
       role: DesktopSecondaryWindowRole;
@@ -96,10 +96,10 @@ const secondaryWindowRevealResults = new Map<
 
 export async function notifySecondaryWindowReady(
   role: DesktopSecondaryWindowRole
-): Promise<DesktopSecondaryWindowRevealResult | null> {
+): Promise<DesktopSecondaryWindowRevealResult | false> {
   const bridge = getDesktopBridge();
   const notifyReady = bridge?.notifySecondaryWindowReady;
-  if (!notifyReady || bridge.windowRole !== role) return null;
+  if (!notifyReady || bridge.windowRole !== role) return false;
   const previousResult = secondaryWindowRevealResults.get(role);
   if (previousResult) return previousResult;
   try {
@@ -107,7 +107,7 @@ export async function notifySecondaryWindowReady(
     if (result) secondaryWindowRevealResults.set(role, result);
     return result;
   } catch {
-    return null;
+    return false;
   }
 }
 

@@ -19,6 +19,12 @@ import { startCoreProcess, waitForCoreHealth, type CoreProcessHandle } from "./c
 import { createCoreSession, type CoreSession } from "./core-session.js";
 import * as libraryRegistry from "./library-registry.js";
 import { sessionForDbPath } from "./core-session.js";
+import {
+  MATERIAL_WARMUP_HOLD_MS,
+  createSecondaryWindowRevealState,
+  waitForSecondaryMaterialWarmup,
+  type SecondaryWindowRevealState
+} from "./secondary-window-reveal.js";
 
 let mainWindow: BrowserWindow | null = null;
 type SecondaryWindowRole = "settings" | "plugins";
@@ -36,14 +42,10 @@ const secondaryWindows: Record<SecondaryWindowRole, BrowserWindow | null> = {
 };
 type SecondaryWindowReadiness = {
   windowId: number;
-  nativeReady: boolean;
-  rendererReady: boolean;
+  revealState: SecondaryWindowRevealState<SecondaryWindowRevealResult | false>;
   materialVisibleAt: number | null;
   materialCompositedAt: number | null;
-  revealResult: SecondaryWindowRevealResult | null;
-  compositionPromise: Promise<SecondaryWindowRevealResult | null> | null;
   fallbackTimer: NodeJS.Timeout | null;
-  revealWaiters: Array<(result: SecondaryWindowRevealResult | null) => void>;
 };
 type SecondaryWindowRevealResult = {
   materialVisibleAt: number;
@@ -358,17 +360,14 @@ ipcMain.handle("megle:close-plugins-window", () => {
 });
 
 ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown) => {
-  if (!isSecondaryWindowRole(role)) return null;
+  if (!isSecondaryWindowRole(role)) return false;
   const window = windowForIpcEvent(event);
-  if (!window || secondaryWindows[role] !== window) return null;
+  if (!window || secondaryWindows[role] !== window) return false;
   const readiness = secondaryWindowReadiness[role];
-  if (!readiness || readiness.windowId !== window.id) return null;
-  readiness.rendererReady = true;
-  const revealPromise = revealSecondaryWindowWhenReady(role, window);
-  if (revealPromise) return revealPromise;
-  return new Promise<SecondaryWindowRevealResult | null>((resolve) => {
-    readiness.revealWaiters.push(resolve);
-  });
+  if (!readiness || readiness.windowId !== window.id) return false;
+  readiness.revealState.rendererReady = true;
+  revealSecondaryWindowWhenReady(role, window);
+  return readiness.revealState.result;
 });
 
 ipcMain.handle("megle:visual-capture-page", async (event) => {
@@ -660,13 +659,9 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
   secondaryWindows[role] = window;
   secondaryWindowReadiness[role] = {
     windowId: window.id,
-    nativeReady: false,
-    rendererReady: false,
+    revealState: createSecondaryWindowRevealState<SecondaryWindowRevealResult | false>(),
     materialVisibleAt: null,
     materialCompositedAt: null,
-    revealResult: null,
-    compositionPromise: null,
-    revealWaiters: [],
     fallbackTimer: setTimeout(() => {
       forceSecondaryWindowReveal(role, window);
     }, SECONDARY_WINDOW_READY_TIMEOUT_MS)
@@ -675,8 +670,8 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
   window.once("ready-to-show", () => {
     const readiness = secondaryWindowReadiness[role];
     if (!readiness || readiness.windowId !== window.id) return;
-    readiness.nativeReady = true;
-    void revealSecondaryWindowWhenReady(role, window);
+    readiness.revealState.nativeReady = true;
+    revealSecondaryWindowWhenReady(role, window);
   });
   window.webContents.on(
     "did-fail-load",
@@ -699,7 +694,7 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     clearSecondaryWindowReadyFallback(role, window.id);
     const readiness = secondaryWindowReadiness[role];
     if (readiness?.windowId === window.id) {
-      resolveSecondaryWindowRevealWaiters(readiness, null);
+      readiness.revealState.settle(false);
     }
     if (secondaryWindowReadiness[role]?.windowId === window.id) {
       secondaryWindowReadiness[role] = null;
@@ -726,32 +721,31 @@ function clearSecondaryWindowReadyFallback(role: SecondaryWindowRole, windowId: 
   readiness.fallbackTimer = null;
 }
 
-function resolveSecondaryWindowRevealWaiters(
-  readiness: SecondaryWindowReadiness,
-  result: SecondaryWindowRevealResult | null
-): void {
-  for (const resolve of readiness.revealWaiters.splice(0)) resolve(result);
-}
-
 function revealSecondaryWindowWhenReady(
   role: SecondaryWindowRole,
   window: BrowserWindow
-): Promise<SecondaryWindowRevealResult | null> | null {
-  if (window.isDestroyed() || secondaryWindows[role] !== window) return null;
+): void {
+  if (window.isDestroyed() || secondaryWindows[role] !== window) return;
   const readiness = secondaryWindowReadiness[role];
-  if (!readiness || readiness.windowId !== window.id) return null;
-  if (readiness.revealResult) return Promise.resolve(readiness.revealResult);
-  if (readiness.compositionPromise) return readiness.compositionPromise;
-  if (!readiness.nativeReady || !readiness.rendererReady) return null;
-  readiness.compositionPromise = composeSecondaryWindowMaterial(role, window, readiness);
-  return readiness.compositionPromise;
+  if (!readiness || readiness.windowId !== window.id) return;
+  const warmupToken = readiness.revealState.beginWarmup();
+  if (warmupToken === null) return;
+  void warmSecondaryWindowMaterial(role, window, readiness, warmupToken)
+    .catch((error) => {
+      console.warn(`[megle] ${role} material composition failed:`, error);
+      forceSecondaryWindowReveal(role, window);
+    })
+    .finally(() => {
+      readiness.revealState.finishWarmup(warmupToken);
+    });
 }
 
-async function composeSecondaryWindowMaterial(
+async function warmSecondaryWindowMaterial(
   role: SecondaryWindowRole,
   window: BrowserWindow,
-  readiness: SecondaryWindowReadiness
-): Promise<SecondaryWindowRevealResult | null> {
+  readiness: SecondaryWindowReadiness,
+  warmupToken: number
+): Promise<void> {
   if (window.isMinimized()) window.restore();
   applyWindowMaterial(window);
   window.showInactive();
@@ -762,11 +756,16 @@ async function composeSecondaryWindowMaterial(
       materialVisibleAt: readiness.materialVisibleAt
     });
   }
-  await waitForRendererFrame(window);
-  if (readiness.revealResult) return readiness.revealResult;
+  const didWarm = await waitForSecondaryMaterialWarmup(
+    readiness.revealState,
+    warmupToken,
+    waitForRendererFrame(window),
+    MATERIAL_WARMUP_HOLD_MS
+  );
+  if (!didWarm) return;
   if (window.isDestroyed() || secondaryWindows[role] !== window) {
-    resolveSecondaryWindowRevealWaiters(readiness, null);
-    return null;
+    readiness.revealState.settle(false);
+    return;
   }
   clearSecondaryWindowReadyFallback(role, window.id);
   readiness.materialCompositedAt = Date.now();
@@ -775,10 +774,8 @@ async function composeSecondaryWindowMaterial(
     materialCompositedAt: readiness.materialCompositedAt,
     fallback: false
   };
-  readiness.revealResult = result;
+  if (!readiness.revealState.settle(result)) return;
   window.focus();
-  resolveSecondaryWindowRevealWaiters(readiness, result);
-  return result;
 }
 
 function forceSecondaryWindowReveal(
@@ -788,7 +785,10 @@ function forceSecondaryWindowReveal(
   if (window.isDestroyed() || secondaryWindows[role] !== window) return null;
   const readiness = secondaryWindowReadiness[role];
   if (!readiness || readiness.windowId !== window.id) return null;
-  if (readiness.revealResult) return readiness.revealResult;
+  if (readiness.revealState.settled) {
+    const value = readiness.revealState.value;
+    return value === false ? null : (value ?? null);
+  }
   clearSecondaryWindowReadyFallback(role, window.id);
   if (window.isMinimized()) window.restore();
   applyWindowMaterial(window);
@@ -806,9 +806,11 @@ function forceSecondaryWindowReveal(
     materialCompositedAt: readiness.materialCompositedAt,
     fallback: true
   };
-  readiness.revealResult = result;
+  if (!readiness.revealState.settle(result)) {
+    const value = readiness.revealState.value;
+    return value === false ? null : (value ?? null);
+  }
   window.focus();
-  resolveSecondaryWindowRevealWaiters(readiness, result);
   return result;
 }
 

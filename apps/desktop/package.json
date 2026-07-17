@@ -6,6 +6,7 @@
   "main": "dist/main.js",
   "scripts": {
     "dev": "npm --prefix ../.. run dev",
+    "test": "node --experimental-strip-types --test tests/*.test.mts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('src/preload.cjs', 'dist/preload.cjs')\""
   },

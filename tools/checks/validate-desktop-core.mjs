@@ -44,6 +44,7 @@ const main = read("apps/desktop/src/main.ts");
 const session = read("apps/desktop/src/core-session.ts");
 const processFile = read("apps/desktop/src/core-process.ts");
 const preload = read("apps/desktop/src/preload.cjs");
+const secondaryReveal = read("apps/desktop/src/secondary-window-reveal.ts");
 const desktopPackage = read("apps/desktop/package.json");
 const rootPackage = read("package.json");
 const devRunner = read("tools/dev/run-dev.mjs");
@@ -182,9 +183,9 @@ if (!openSecondaryWindowBody) {
     'backgroundMaterial: "acrylic"',
     "frame: false",
     "secondaryWindows[role] = window",
-    "rendererReady: false",
-    "nativeReady: false",
-    "revealWaiters: []",
+    "revealState: createSecondaryWindowRevealState",
+    "readiness.revealState.nativeReady = true",
+    "readiness.revealState.settle(false)",
     "SECONDARY_WINDOW_READY_TIMEOUT_MS",
     'window.once("ready-to-show"',
     "revealSecondaryWindowWhenReady(role, window)",
@@ -205,8 +206,8 @@ for (const value of [
   "isSecondaryWindowRole(role)",
   "windowForIpcEvent(event)",
   "secondaryWindows[role] !== window",
-  "readiness.rendererReady = true",
-  "readiness.revealWaiters.push(resolve)"
+  "readiness.revealState.rendererReady = true",
+  "return readiness.revealState.result"
 ]) {
   if (!main.includes(value)) {
     fail(`secondary renderer-ready IPC must stay role/sender isolated: ${value}`);
@@ -218,35 +219,45 @@ const revealSecondaryWindowBody = functionBody(
 );
 if (
   !revealSecondaryWindowBody ||
-  !revealSecondaryWindowBody.includes("readiness.nativeReady") ||
-  !revealSecondaryWindowBody.includes("readiness.rendererReady") ||
-  !revealSecondaryWindowBody.includes("composeSecondaryWindowMaterial(role, window, readiness)")
+  !revealSecondaryWindowBody.includes("readiness.revealState.beginWarmup()") ||
+  !revealSecondaryWindowBody.includes("warmSecondaryWindowMaterial(role, window, readiness, warmupToken)")
 ) {
-  fail("secondary reveal gate must require native+renderer readiness before starting material composition");
+  fail("secondary reveal gate must start one cancellable material warm-up after native+renderer readiness");
 }
 
-const composeSecondaryWindowBody = functionBody(
+const warmSecondaryWindowBody = functionBody(
   main,
-  "async function composeSecondaryWindowMaterial("
+  "async function warmSecondaryWindowMaterial("
 );
-const materialShowIndex = composeSecondaryWindowBody?.indexOf("window.showInactive()") ?? -1;
-const compositorFrameIndex =
-  composeSecondaryWindowBody?.indexOf("await waitForRendererFrame(window)") ?? -1;
+const materialShowIndex = warmSecondaryWindowBody?.indexOf("window.showInactive()") ?? -1;
+const warmupWaitIndex =
+  warmSecondaryWindowBody?.indexOf("await waitForSecondaryMaterialWarmup(") ?? -1;
 const compositedTimestampIndex =
-  composeSecondaryWindowBody?.indexOf("readiness.materialCompositedAt = Date.now()") ?? -1;
+  warmSecondaryWindowBody?.indexOf("readiness.materialCompositedAt = Date.now()") ?? -1;
 if (
-  !composeSecondaryWindowBody ||
+  !warmSecondaryWindowBody ||
   materialShowIndex < 0 ||
-  compositorFrameIndex <= materialShowIndex ||
-  compositedTimestampIndex <= compositorFrameIndex ||
-  !composeSecondaryWindowBody.includes(
+  warmupWaitIndex <= materialShowIndex ||
+  compositedTimestampIndex <= warmupWaitIndex ||
+  !warmSecondaryWindowBody.includes(
     'window.webContents.send("megle:secondary-window-material-visible"'
   ) ||
-  !composeSecondaryWindowBody.includes("fallback: false") ||
-  !composeSecondaryWindowBody.includes("window.focus()") ||
-  !composeSecondaryWindowBody.includes("resolveSecondaryWindowRevealWaiters(readiness, result)")
+  !warmSecondaryWindowBody.includes("waitForRendererFrame(window)") ||
+  !warmSecondaryWindowBody.includes("MATERIAL_WARMUP_HOLD_MS") ||
+  !warmSecondaryWindowBody.includes("fallback: false") ||
+  !warmSecondaryWindowBody.includes("readiness.revealState.settle(result)") ||
+  !warmSecondaryWindowBody.includes("window.focus()")
 ) {
-  fail("secondary composition must show material-only, await a post-show frame, then resolve normal content reveal");
+  fail("secondary reveal must show material-only, complete the named warm-up hold, then resolve content visibility");
+}
+
+if (
+  !/export const MATERIAL_WARMUP_HOLD_MS = 100;/.test(secondaryReveal) ||
+  !secondaryReveal.includes("state.cancellation") ||
+  !secondaryReveal.includes("clearTimeout(timer)") ||
+  !secondaryReveal.includes("state.isWarmupCurrent(token)")
+) {
+  fail("secondary material warm-up must be a short 100ms cancellable hold with stale-token protection");
 }
 
 const forceSecondaryWindowBody = functionBody(
@@ -257,9 +268,43 @@ if (
   !forceSecondaryWindowBody ||
   !forceSecondaryWindowBody.includes("clearSecondaryWindowReadyFallback(role, window.id)") ||
   !forceSecondaryWindowBody.includes("fallback: true") ||
-  !forceSecondaryWindowBody.includes("resolveSecondaryWindowRevealWaiters(readiness, result)")
+  !forceSecondaryWindowBody.includes("readiness.revealState.settle(result)")
 ) {
-  fail("secondary windows must retain an explicit 4s force-reveal failure fallback");
+  fail("secondary windows must retain an explicit 4s fallback that settles and cancels warm-up");
+}
+
+if (
+  revealSecondaryWindowBody?.includes("readiness.compositionPromise") &&
+  forceSecondaryWindowBody?.includes("resolveSecondaryWindowRevealWaiters(readiness, result)")
+) {
+  const nativeReady = true;
+  const rendererReady = true;
+  const hangingComposition = new Promise(() => {});
+  let resolveFallbackWaiter;
+  const fallbackWaiter = new Promise((resolve) => {
+    resolveFallbackWaiter = resolve;
+  });
+  const readyIpcResult = nativeReady && rendererReady ? hangingComposition : fallbackWaiter;
+  resolveFallbackWaiter({ fallback: true });
+  const outcome = await Promise.race([
+    readyIpcResult.then(() => "resolved"),
+    new Promise((resolve) => setTimeout(() => resolve("timed-out"), 10))
+  ]);
+  if (outcome !== "resolved") {
+    fail("secondary ready IPC remains blocked when compositor RAF hangs and the 4s fallback fires");
+  }
+}
+
+if (
+  main.includes("compositionPromise") ||
+  main.includes("revealWaiters") ||
+  main.includes("resolveSecondaryWindowRevealWaiters")
+) {
+  fail("secondary ready IPC must not split completion between composition promises and reveal waiters");
+}
+
+if (!main.includes("readiness.revealState.settle(false)")) {
+  fail("closing a secondary window must resolve ready IPC false and cancel warm-up");
 }
 
 if (!main.includes("BrowserWindow.fromWebContents(event.sender)")) {
@@ -276,8 +321,8 @@ for (const legacyMainWindowControl of [
   }
 }
 
-if (!desktopPackage.includes('"typecheck"')) {
-  fail("desktop package missing typecheck script");
+for (const script of ['"typecheck"', '"test"']) {
+  if (!desktopPackage.includes(script)) fail(`desktop package missing ${script} script`);
 }
 if (desktopPackage.includes("vite --host")) {
   fail("desktop package dev script must not start Vite directly; use root dev runner");

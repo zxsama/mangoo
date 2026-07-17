@@ -29,6 +29,7 @@ function readOptional(relativePath) {
 }
 
 const desktopMain = read("apps/desktop/src/main.ts");
+const secondaryReveal = read("apps/desktop/src/secondary-window-reveal.ts");
 const preload = read("apps/desktop/src/preload.cjs");
 const styles = read("apps/web/src/styles.css");
 const stylesForChecks = stripCssComments(styles);
@@ -1712,19 +1713,21 @@ if (
   fail("collapsed Library and Preview titlebars must inject only the shared SidebarToggle, never the full primary action group");
 }
 
-const secondaryCompositionMatch = desktopMain.match(
-  /async function composeSecondaryWindowMaterial\([\s\S]*?\n\}/
+const secondaryWarmupMatch = desktopMain.match(
+  /async function warmSecondaryWindowMaterial\([\s\S]*?\n\}/
 );
-const secondaryCompositionBody = secondaryCompositionMatch?.[0] ?? "";
-const materialShowIndex = secondaryCompositionBody.indexOf("window.showInactive()");
-const compositorFrameIndex = secondaryCompositionBody.indexOf("await waitForRendererFrame(window)");
-const materialCompositedIndex = secondaryCompositionBody.indexOf("materialCompositedAt = Date.now()");
+const secondaryWarmupBody = secondaryWarmupMatch?.[0] ?? "";
+const materialShowIndex = secondaryWarmupBody.indexOf("window.showInactive()");
+const warmupIndex = secondaryWarmupBody.indexOf("await waitForSecondaryMaterialWarmup(");
+const materialCompositedIndex = secondaryWarmupBody.indexOf("materialCompositedAt = Date.now()");
 if (
   materialShowIndex < 0 ||
-  compositorFrameIndex <= materialShowIndex ||
-  materialCompositedIndex <= compositorFrameIndex
+  warmupIndex <= materialShowIndex ||
+  materialCompositedIndex <= warmupIndex ||
+  !secondaryWarmupBody.includes("MATERIAL_WARMUP_HOLD_MS") ||
+  !secondaryReveal.includes("export const MATERIAL_WARMUP_HOLD_MS = 100")
 ) {
-  fail("secondary windows must show the material-only native window, await a post-show renderer/compositor frame, then mark material composited");
+  fail("secondary windows must show material-only, hold for the named 100ms warm-up, then allow content visibility");
 }
 for (const [source, value, message] of [
   [desktopMain, "materialVisibleAt", "desktop secondary-window readiness must record the native material-visible stage"],
@@ -1742,12 +1745,16 @@ for (const [source, value, message] of [
 ]) {
   if (!source.includes(value)) fail(message);
 }
+const readyResultIndex = secondaryWindowFrame.indexOf("notifySecondaryWindowReady(role).then((result)");
+const contentVisibleIndex = secondaryWindowFrame.indexOf(
+  'currentFrame.setAttribute("data-secondary-content-visible", "true")'
+);
 if (
-  !/contentRevealFrame\s*=\s*window\.requestAnimationFrame\(\(\)\s*=>\s*\{\s*contentRevealFrame\s*=\s*window\.requestAnimationFrame\(/.test(
-    secondaryWindowFrame
-  )
+  readyResultIndex < 0 ||
+  contentVisibleIndex <= readyResultIndex ||
+  secondaryWindowFrame.includes("contentRevealFrame")
 ) {
-  fail("secondary UI reveal must cross a full additional renderer frame after native material composition");
+  fail("secondary UI must switch visibility once after the native material warm-up result, without extra reveal animation");
 }
 
 for (const selector of [".secondary-window-titlebar", ".secondary-window-body"]) {

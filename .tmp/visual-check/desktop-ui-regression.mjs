@@ -2301,6 +2301,7 @@ try {
       Number.isFinite(contentVisibleAt) &&
       materialVisibleAt <= materialCompositedAt &&
       materialCompositedAt <= contentVisibleAt &&
+      contentVisibleAt - materialVisibleAt >= 100 &&
       evidence?.contentVisible === "true" &&
       evidence?.revealFallback === "false"
     );
