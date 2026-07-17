@@ -121,7 +121,7 @@ if (nativeMaterial.disablesNativeMaterial) {
 }
 
 if (/\.setOpacity\s*\(/.test(desktopMain)) {
-  fail("desktop window reveal must not use opacity gating because it can leave Windows acrylic in an opaque gray launch state");
+  fail("secondary opacity reveal must stay centralized in the cancellable native-window reveal primitive");
 }
 
 if (/titleBarStyle\s*:\s*"hidden"/.test(desktopMain)) {
@@ -1714,47 +1714,55 @@ if (
 }
 
 const secondaryWarmupMatch = desktopMain.match(
-  /async function warmSecondaryWindowMaterial\([\s\S]*?\n\}/
+  /async function warmSecondaryWindowNativeHost\([\s\S]*?\n\}/
 );
 const secondaryWarmupBody = secondaryWarmupMatch?.[0] ?? "";
-const materialShowIndex = secondaryWarmupBody.indexOf("window.showInactive()");
-const warmupIndex = secondaryWarmupBody.indexOf("await waitForSecondaryMaterialWarmup(");
-const materialCompositedIndex = secondaryWarmupBody.indexOf("materialCompositedAt = Date.now()");
+const invisibleShowIndex = secondaryWarmupBody.indexOf("window.showInactive()");
+const warmupIndex = secondaryWarmupBody.indexOf("await waitForSecondaryNativeWindowWarmup(");
+const nativeRevealTimestampIndex = secondaryWarmupBody.indexOf("nativeWindowRevealedAt = Date.now()");
+const nativeRevealIndex = secondaryWarmupBody.indexOf("revealSecondaryNativeWindow(");
 if (
-  materialShowIndex < 0 ||
-  warmupIndex <= materialShowIndex ||
-  materialCompositedIndex <= warmupIndex ||
-  !secondaryWarmupBody.includes("MATERIAL_WARMUP_HOLD_MS") ||
-  !secondaryReveal.includes("export const MATERIAL_WARMUP_HOLD_MS = 100")
+  invisibleShowIndex < 0 ||
+  warmupIndex <= invisibleShowIndex ||
+  nativeRevealTimestampIndex <= warmupIndex ||
+  nativeRevealIndex <= nativeRevealTimestampIndex ||
+  !secondaryWarmupBody.includes("NATIVE_WINDOW_WARMUP_MS") ||
+  !secondaryReveal.includes("export const NATIVE_WINDOW_WARMUP_MS = 200") ||
+  !/opacity:\s*0/.test(desktopMain)
 ) {
-  fail("secondary windows must show material-only, hold for the named 100ms warm-up, then allow content visibility");
+  fail("secondary windows must start transparent, warm the shown native host for 200ms, then reveal it once");
 }
 for (const [source, value, message] of [
-  [desktopMain, "materialVisibleAt", "desktop secondary-window readiness must record the native material-visible stage"],
-  [desktopMain, "materialCompositedAt", "desktop secondary-window readiness must record the post-show material-composited stage"],
-  [desktopBridge, "materialCompositedAt", "web desktop bridge must carry the native material-composited result"],
-  [secondaryWindowFrame, "data-secondary-content-visible", "secondary UI must have an explicit content-visible stage after native material composition"]
+  [desktopMain, "nativeWarmupStartedAt", "desktop secondary-window readiness must record native warm-up start"],
+  [desktopMain, "nativeWindowRevealedAt", "desktop secondary-window readiness must record opacity reveal"],
+  [desktopBridge, "nativeWindowRevealedAt", "web desktop bridge must carry the native opacity reveal result"],
+  [secondaryWindowFrame, "data-secondary-content-visible", "secondary UI must have an explicit content-visible stage after native reveal"]
 ]) {
   if (!source.includes(value)) fail(message);
 }
 for (const [source, value, message] of [
   [desktopMain, "forceSecondaryWindowReveal", "secondary windows must retain a force-reveal path for the 4s failure fallback"],
-  [desktopMain, "fallback: false", "normal secondary composition must report that it did not use the failure fallback"],
+  [desktopMain, "fallback: false", "normal secondary warm-up must report that it did not use the failure fallback"],
   [desktopBridge, "fallback: boolean", "secondary reveal results must distinguish normal composition from the failure fallback"],
   [secondaryWindowFrame, "data-secondary-reveal-fallback", "secondary window evidence must expose whether the 4s failure fallback was used"]
 ]) {
   if (!source.includes(value)) fail(message);
 }
 const readyResultIndex = secondaryWindowFrame.indexOf("notifySecondaryWindowReady(role).then((result)");
+const contentRevealFrameIndex = secondaryWindowFrame.indexOf(
+  "contentRevealFrame = window.requestAnimationFrame"
+);
 const contentVisibleIndex = secondaryWindowFrame.indexOf(
-  'currentFrame.setAttribute("data-secondary-content-visible", "true")'
+  'revealFrame.setAttribute("data-secondary-content-visible", "true")'
 );
 if (
   readyResultIndex < 0 ||
-  contentVisibleIndex <= readyResultIndex ||
-  secondaryWindowFrame.includes("contentRevealFrame")
+  contentRevealFrameIndex <= readyResultIndex ||
+  contentVisibleIndex <= contentRevealFrameIndex ||
+  !secondaryWindowFrame.includes("contentRevealFrame") ||
+  !secondaryWindowFrame.includes("window.requestAnimationFrame")
 ) {
-  fail("secondary UI must switch visibility once after the native material warm-up result, without extra reveal animation");
+  fail("secondary UI must switch visibility once on the renderer frame after native opacity reveal");
 }
 
 for (const selector of [".secondary-window-titlebar", ".secondary-window-body"]) {
@@ -1766,7 +1774,7 @@ for (const selector of [".secondary-window-titlebar", ".secondary-window-body"])
         latestDeclarationValue(block, "content-visibility") === "hidden"
     )
   ) {
-    fail(`${selector} must stay non-visible while the native secondary-window material composes`);
+    fail(`${selector} must stay non-visible while the opacity-zero native window warms up`);
   }
   const revealSelector = `.secondary-window[data-secondary-content-visible="true"] ${selector}`;
   const revealBlocks = cssBlocksForExactSelector(stylesForChecks, revealSelector);

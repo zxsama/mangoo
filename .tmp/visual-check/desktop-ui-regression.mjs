@@ -1272,7 +1272,7 @@ async function pluginsSecondaryWindowEvidence(client) {
       pluginsClient,
       `document.querySelector(".secondary-window")?.getAttribute("data-secondary-content-visible") === "true"`,
       10000,
-      "Plugins material-ready reveal"
+      "Plugins native-window reveal"
     );
     const screenshotPath = await screenshot(pluginsClient, "ui-plugins-secondary-window.png");
     const firstTargets = await waitForTargetCount((page) => page.url.includes("#/plugins"), 1);
@@ -1291,7 +1291,7 @@ async function pluginsSecondaryWindowEvidence(client) {
       settingsClient,
       `document.querySelector(".secondary-window")?.getAttribute("data-secondary-content-visible") === "true"`,
       10000,
-      "Settings material-ready reveal"
+      "Settings native-window reveal"
     );
 
     const coexistence = {
@@ -1319,8 +1319,8 @@ async function pluginsSecondaryWindowEvidence(client) {
           rendererReady: owner?.getAttribute("data-secondary-renderer-ready"),
           windowVisible: owner?.getAttribute("data-secondary-window-visible"),
           contentVisible: owner?.getAttribute("data-secondary-content-visible"),
-          materialVisibleAt: owner?.getAttribute("data-secondary-material-visible-at"),
-          materialCompositedAt: owner?.getAttribute("data-secondary-material-composited-at"),
+          nativeWarmupStartedAt: owner?.getAttribute("data-secondary-native-warmup-started-at"),
+          nativeWindowRevealedAt: owner?.getAttribute("data-secondary-native-window-revealed-at"),
           contentVisibleAt: owner?.getAttribute("data-secondary-content-visible-at"),
           revealFallback: owner?.getAttribute("data-secondary-reveal-fallback"),
           material: {
@@ -1344,8 +1344,8 @@ async function pluginsSecondaryWindowEvidence(client) {
           rendererReady: owner?.getAttribute("data-secondary-renderer-ready"),
           windowVisible: owner?.getAttribute("data-secondary-window-visible"),
           contentVisible: owner?.getAttribute("data-secondary-content-visible"),
-          materialVisibleAt: owner?.getAttribute("data-secondary-material-visible-at"),
-          materialCompositedAt: owner?.getAttribute("data-secondary-material-composited-at"),
+          nativeWarmupStartedAt: owner?.getAttribute("data-secondary-native-warmup-started-at"),
+          nativeWindowRevealedAt: owner?.getAttribute("data-secondary-native-window-revealed-at"),
           contentVisibleAt: owner?.getAttribute("data-secondary-content-visible-at"),
           revealFallback: owner?.getAttribute("data-secondary-reveal-fallback"),
           material: {
@@ -2292,16 +2292,16 @@ try {
     hardFailures.push("html/body/root backgrounds are not transparent");
   }
   const stagedSecondaryReveal = (evidence) => {
-    const materialVisibleAt = Number(evidence?.materialVisibleAt);
-    const materialCompositedAt = Number(evidence?.materialCompositedAt);
+    const nativeWarmupStartedAt = Number(evidence?.nativeWarmupStartedAt);
+    const nativeWindowRevealedAt = Number(evidence?.nativeWindowRevealedAt);
     const contentVisibleAt = Number(evidence?.contentVisibleAt);
     return (
-      Number.isFinite(materialVisibleAt) &&
-      Number.isFinite(materialCompositedAt) &&
+      Number.isFinite(nativeWarmupStartedAt) &&
+      Number.isFinite(nativeWindowRevealedAt) &&
       Number.isFinite(contentVisibleAt) &&
-      materialVisibleAt <= materialCompositedAt &&
-      materialCompositedAt <= contentVisibleAt &&
-      contentVisibleAt - materialVisibleAt >= 100 &&
+      nativeWarmupStartedAt <= nativeWindowRevealedAt &&
+      nativeWindowRevealedAt <= contentVisibleAt &&
+      nativeWindowRevealedAt - nativeWarmupStartedAt >= 200 &&
       evidence?.contentVisible === "true" &&
       evidence?.revealFallback === "false"
     );

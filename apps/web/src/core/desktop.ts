@@ -2,8 +2,8 @@ import type { LibrarySummary, LibraryLoadPhase } from "./libraryTypes";
 
 export type DesktopSecondaryWindowRole = "settings" | "plugins";
 export interface DesktopSecondaryWindowRevealResult {
-  materialVisibleAt: number;
-  materialCompositedAt: number;
+  nativeWarmupStartedAt: number;
+  nativeWindowRevealedAt: number;
   fallback: boolean;
 }
 
@@ -51,12 +51,6 @@ export interface MegleDesktopBridge {
   notifySecondaryWindowReady?: (
     role: DesktopSecondaryWindowRole
   ) => Promise<DesktopSecondaryWindowRevealResult | false>;
-  onSecondaryWindowMaterialVisible?: (
-    cb: (payload: {
-      role: DesktopSecondaryWindowRole;
-      materialVisibleAt: number;
-    }) => void
-  ) => () => void;
   pickFolder?: () => Promise<string | null>;
   diagnostics?: () => Promise<DesktopDiagnostics>;
   openSettingsWindow?: () => Promise<boolean>;

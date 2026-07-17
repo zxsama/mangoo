@@ -12,7 +12,12 @@ export interface SecondaryWindowRevealState<T> {
   settle(value: T): boolean;
 }
 
-export const MATERIAL_WARMUP_HOLD_MS = 100;
+export interface SecondaryNativeWindowHost {
+  setOpacity(opacity: number): void;
+  focus(): void;
+}
+
+export const NATIVE_WINDOW_WARMUP_MS = 200;
 
 export function createSecondaryWindowRevealState<T>(): SecondaryWindowRevealState<T> {
   let resolveResult!: (value: T) => void;
@@ -71,11 +76,23 @@ export function createSecondaryWindowRevealState<T>(): SecondaryWindowRevealStat
   };
 }
 
-export async function waitForSecondaryMaterialWarmup<T>(
+export function revealSecondaryNativeWindow<T>(
+  state: SecondaryWindowRevealState<T>,
+  result: T,
+  window: SecondaryNativeWindowHost
+): boolean {
+  if (state.settled) return false;
+  window.setOpacity(1);
+  if (!state.settle(result)) return false;
+  window.focus();
+  return true;
+}
+
+export async function waitForSecondaryNativeWindowWarmup<T>(
   state: SecondaryWindowRevealState<T>,
   token: number,
   compositionFrame: Promise<void>,
-  holdMs = MATERIAL_WARMUP_HOLD_MS
+  holdMs = NATIVE_WINDOW_WARMUP_MS
 ): Promise<boolean> {
   const frameOutcome = await Promise.race([
     compositionFrame.then(() => "ready" as const),

@@ -2,77 +2,124 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
-  MATERIAL_WARMUP_HOLD_MS,
+  NATIVE_WINDOW_WARMUP_MS,
   createSecondaryWindowRevealState,
-  waitForSecondaryMaterialWarmup
+  revealSecondaryNativeWindow,
+  waitForSecondaryNativeWindowWarmup,
+  type SecondaryNativeWindowHost
 } from "../src/secondary-window-reveal.ts";
 
 type RevealResult = false | {
   fallback: boolean;
 };
 
-describe("secondary window reveal state", () => {
-  it("unblocks ready IPC when fallback wins against a hanging compositor frame", async () => {
+function fakeNativeWindow(calls: string[]): SecondaryNativeWindowHost {
+  return {
+    setOpacity(opacity) {
+      calls.push(`opacity:${opacity}`);
+    },
+    focus() {
+      calls.push("focus");
+    }
+  };
+}
+
+describe("secondary native window reveal state", () => {
+  it("fallback reveals an opacity-zero window and ignores late warm-up completion", async () => {
     const state = createSecondaryWindowRevealState<RevealResult>();
     state.nativeReady = true;
     state.rendererReady = true;
     const token = state.beginWarmup();
     assert.equal(typeof token, "number");
 
-    const warmup = waitForSecondaryMaterialWarmup(
+    let finishFrame!: () => void;
+    const compositionFrame = new Promise<void>((resolve) => {
+      finishFrame = resolve;
+    });
+    const warmup = waitForSecondaryNativeWindowWarmup(
       state,
       token as number,
-      new Promise<void>(() => {})
+      compositionFrame
     );
     const readyIpc = state.result;
+    const calls: string[] = [];
     const fallback = { fallback: true };
 
-    assert.equal(state.settle(fallback), true);
+    assert.deepEqual(calls, [], "normal warm-up must not reveal the native window early");
+    assert.equal(revealSecondaryNativeWindow(state, fallback, fakeNativeWindow(calls)), true);
+    assert.deepEqual(calls, ["opacity:1", "focus"]);
     assert.deepEqual(await readyIpc, fallback);
+
+    finishFrame();
     assert.equal(await warmup, false);
     assert.equal(state.warmupInFlight, false);
-    assert.equal(state.settle({ fallback: false }), false);
+    assert.equal(
+      revealSecondaryNativeWindow(state, { fallback: false }, fakeNativeWindow(calls)),
+      false
+    );
+    assert.deepEqual(calls, ["opacity:1", "focus"]);
     assert.deepEqual(state.value, fallback);
   });
 
-  it("resolves ready IPC false and cancels warmup when the window closes", async () => {
+  it("close resolves ready IPC false without revealing the native window", async () => {
     const state = createSecondaryWindowRevealState<RevealResult>();
     state.nativeReady = true;
     state.rendererReady = true;
     const token = state.beginWarmup();
     assert.equal(typeof token, "number");
 
-    const warmup = waitForSecondaryMaterialWarmup(
+    const warmup = waitForSecondaryNativeWindowWarmup(
       state,
       token as number,
       new Promise<void>(() => {})
     );
+    const calls: string[] = [];
 
     assert.equal(state.settle(false), true);
     assert.equal(await state.result, false);
     assert.equal(await warmup, false);
     assert.equal(state.warmupInFlight, false);
-    assert.equal(state.settle({ fallback: true }), false);
+    assert.deepEqual(calls, []);
+    assert.equal(
+      revealSecondaryNativeWindow(state, { fallback: true }, fakeNativeWindow(calls)),
+      false
+    );
+    assert.deepEqual(calls, []);
   });
 
-  it("holds material-only visibility before the normal content reveal", async () => {
+  it("reveals once only after the native opacity-zero warm-up", async () => {
     const state = createSecondaryWindowRevealState<RevealResult>();
     state.nativeReady = true;
     state.rendererReady = true;
     const token = state.beginWarmup();
     assert.equal(typeof token, "number");
 
-    const materialOnlyAt = Date.now();
-    assert.equal(
-      await waitForSecondaryMaterialWarmup(state, token as number, Promise.resolve()),
-      true
+    const calls: string[] = [];
+    let readySettled = false;
+    void state.result.then(() => {
+      readySettled = true;
+    });
+    const warmupStartedAt = Date.now();
+    const didWarm = await waitForSecondaryNativeWindowWarmup(
+      state,
+      token as number,
+      Promise.resolve()
     );
-    const contentVisibleAt = Date.now();
-    assert.ok(contentVisibleAt - materialOnlyAt >= MATERIAL_WARMUP_HOLD_MS);
+    const warmupCompletedAt = Date.now();
+
+    assert.equal(didWarm, true);
+    assert.equal(readySettled, false);
+    assert.deepEqual(calls, []);
+    assert.ok(warmupCompletedAt - warmupStartedAt >= NATIVE_WINDOW_WARMUP_MS);
 
     const normal = { fallback: false };
-    assert.equal(state.settle(normal), true);
+    assert.equal(revealSecondaryNativeWindow(state, normal, fakeNativeWindow(calls)), true);
+    assert.deepEqual(calls, ["opacity:1", "focus"]);
     assert.deepEqual(await state.result, normal);
-    assert.equal(state.settle({ fallback: true }), false);
+    assert.equal(
+      revealSecondaryNativeWindow(state, { fallback: true }, fakeNativeWindow(calls)),
+      false
+    );
+    assert.deepEqual(calls, ["opacity:1", "focus"]);
   });
 });

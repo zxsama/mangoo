@@ -127,9 +127,7 @@ for (const value of ["contextBridge", "coreUrl", "sessionToken", "notifyShellRea
 
 for (const value of [
   "notifySecondaryWindowReady",
-  'ipcRenderer.invoke("megle:secondary-window-ready", role)',
-  "onSecondaryWindowMaterialVisible",
-  'ipcRenderer.on("megle:secondary-window-material-visible", listener)'
+  'ipcRenderer.invoke("megle:secondary-window-ready", role)'
 ]) {
   if (!preload.includes(value)) {
     fail(`preload bridge missing secondary renderer-ready contract: ${value}`);
@@ -177,10 +175,13 @@ if (!openSecondaryWindowBody) {
   for (const value of [
     "existing.isMinimized()",
     "existing.restore()",
+    "readiness?.windowId === existing.id",
+    "!readiness.revealState.settled",
     "existing.focus()",
     "parent",
     "modal: false",
     'backgroundMaterial: "acrylic"',
+    "opacity: 0",
     "frame: false",
     "secondaryWindows[role] = window",
     "revealState: createSecondaryWindowRevealState",
@@ -199,7 +200,7 @@ if (!openSecondaryWindowBody) {
 }
 
 if (main.includes('window.once("ready-to-show", () => window.show())')) {
-  fail("secondary windows must not reveal from ready-to-show before renderer material/content readiness");
+  fail("secondary windows must not reveal from ready-to-show before renderer/native warm-up readiness");
 }
 for (const value of [
   'ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown)',
@@ -220,44 +221,60 @@ const revealSecondaryWindowBody = functionBody(
 if (
   !revealSecondaryWindowBody ||
   !revealSecondaryWindowBody.includes("readiness.revealState.beginWarmup()") ||
-  !revealSecondaryWindowBody.includes("warmSecondaryWindowMaterial(role, window, readiness, warmupToken)")
+  !revealSecondaryWindowBody.includes("warmSecondaryWindowNativeHost(role, window, readiness, warmupToken)")
 ) {
-  fail("secondary reveal gate must start one cancellable material warm-up after native+renderer readiness");
+  fail("secondary reveal gate must start one cancellable native opacity warm-up after native+renderer readiness");
 }
 
 const warmSecondaryWindowBody = functionBody(
   main,
-  "async function warmSecondaryWindowMaterial("
+  "async function warmSecondaryWindowNativeHost("
 );
-const materialShowIndex = warmSecondaryWindowBody?.indexOf("window.showInactive()") ?? -1;
+const invisibleShowIndex = warmSecondaryWindowBody?.indexOf("window.showInactive()") ?? -1;
 const warmupWaitIndex =
-  warmSecondaryWindowBody?.indexOf("await waitForSecondaryMaterialWarmup(") ?? -1;
-const compositedTimestampIndex =
-  warmSecondaryWindowBody?.indexOf("readiness.materialCompositedAt = Date.now()") ?? -1;
+  warmSecondaryWindowBody?.indexOf("await waitForSecondaryNativeWindowWarmup(") ?? -1;
+const nativeRevealTimestampIndex =
+  warmSecondaryWindowBody?.indexOf("readiness.nativeWindowRevealedAt = Date.now()") ?? -1;
+const nativeRevealIndex =
+  warmSecondaryWindowBody?.indexOf("revealSecondaryNativeWindow(") ?? -1;
 if (
   !warmSecondaryWindowBody ||
-  materialShowIndex < 0 ||
-  warmupWaitIndex <= materialShowIndex ||
-  compositedTimestampIndex <= warmupWaitIndex ||
-  !warmSecondaryWindowBody.includes(
-    'window.webContents.send("megle:secondary-window-material-visible"'
-  ) ||
+  invisibleShowIndex < 0 ||
+  warmupWaitIndex <= invisibleShowIndex ||
+  nativeRevealTimestampIndex <= warmupWaitIndex ||
+  nativeRevealIndex <= nativeRevealTimestampIndex ||
   !warmSecondaryWindowBody.includes("waitForRendererFrame(window)") ||
-  !warmSecondaryWindowBody.includes("MATERIAL_WARMUP_HOLD_MS") ||
+  !warmSecondaryWindowBody.includes("NATIVE_WINDOW_WARMUP_MS") ||
   !warmSecondaryWindowBody.includes("fallback: false") ||
-  !warmSecondaryWindowBody.includes("readiness.revealState.settle(result)") ||
-  !warmSecondaryWindowBody.includes("window.focus()")
+  warmSecondaryWindowBody.includes("window.setOpacity(1)")
 ) {
-  fail("secondary reveal must show material-only, complete the named warm-up hold, then resolve content visibility");
+  fail("secondary reveal must show at opacity zero, finish native warm-up, then reveal through the shared helper");
 }
 
 if (
-  !/export const MATERIAL_WARMUP_HOLD_MS = 100;/.test(secondaryReveal) ||
+  !/export const NATIVE_WINDOW_WARMUP_MS = 200;/.test(secondaryReveal) ||
   !secondaryReveal.includes("state.cancellation") ||
   !secondaryReveal.includes("clearTimeout(timer)") ||
   !secondaryReveal.includes("state.isWarmupCurrent(token)")
 ) {
-  fail("secondary material warm-up must be a short 100ms cancellable hold with stale-token protection");
+  fail("secondary native window warm-up must be a cancellable 200ms hold with stale-token protection");
+}
+
+const revealNativeWindowBody = functionBody(
+  secondaryReveal,
+  "export function revealSecondaryNativeWindow<"
+);
+const opacityRevealIndex = revealNativeWindowBody?.indexOf("window.setOpacity(1)") ?? -1;
+const settleRevealIndex = revealNativeWindowBody?.indexOf("state.settle(result)") ?? -1;
+const focusRevealIndex = revealNativeWindowBody?.indexOf("window.focus()") ?? -1;
+if (
+  !revealNativeWindowBody ||
+  opacityRevealIndex < 0 ||
+  settleRevealIndex <= opacityRevealIndex ||
+  focusRevealIndex <= settleRevealIndex ||
+  (secondaryReveal.match(/window\.setOpacity\(1\)/g) ?? []).length !== 1
+) {
+  fail("secondary native reveal must set opacity once before settling ready IPC and focusing");
 }
 
 const forceSecondaryWindowBody = functionBody(
@@ -267,10 +284,11 @@ const forceSecondaryWindowBody = functionBody(
 if (
   !forceSecondaryWindowBody ||
   !forceSecondaryWindowBody.includes("clearSecondaryWindowReadyFallback(role, window.id)") ||
+  !forceSecondaryWindowBody.includes("if (!window.isVisible()) window.showInactive()") ||
   !forceSecondaryWindowBody.includes("fallback: true") ||
-  !forceSecondaryWindowBody.includes("readiness.revealState.settle(result)")
+  !forceSecondaryWindowBody.includes("revealSecondaryNativeWindow(")
 ) {
-  fail("secondary windows must retain an explicit 4s fallback that settles and cancels warm-up");
+  fail("secondary fallback must show, restore opacity, settle ready IPC, and focus through the shared reveal helper");
 }
 
 if (

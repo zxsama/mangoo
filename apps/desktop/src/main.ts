@@ -20,9 +20,10 @@ import { createCoreSession, type CoreSession } from "./core-session.js";
 import * as libraryRegistry from "./library-registry.js";
 import { sessionForDbPath } from "./core-session.js";
 import {
-  MATERIAL_WARMUP_HOLD_MS,
+  NATIVE_WINDOW_WARMUP_MS,
   createSecondaryWindowRevealState,
-  waitForSecondaryMaterialWarmup,
+  revealSecondaryNativeWindow,
+  waitForSecondaryNativeWindowWarmup,
   type SecondaryWindowRevealState
 } from "./secondary-window-reveal.js";
 
@@ -43,13 +44,13 @@ const secondaryWindows: Record<SecondaryWindowRole, BrowserWindow | null> = {
 type SecondaryWindowReadiness = {
   windowId: number;
   revealState: SecondaryWindowRevealState<SecondaryWindowRevealResult | false>;
-  materialVisibleAt: number | null;
-  materialCompositedAt: number | null;
+  nativeWarmupStartedAt: number | null;
+  nativeWindowRevealedAt: number | null;
   fallbackTimer: NodeJS.Timeout | null;
 };
 type SecondaryWindowRevealResult = {
-  materialVisibleAt: number;
-  materialCompositedAt: number;
+  nativeWarmupStartedAt: number;
+  nativeWindowRevealedAt: number;
   fallback: boolean;
 };
 const secondaryWindowReadiness: Record<SecondaryWindowRole, SecondaryWindowReadiness | null> = {
@@ -616,13 +617,17 @@ async function createWindow(): Promise<void> {
 async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
   const existing = secondaryWindows[role];
   if (existing && !existing.isDestroyed()) {
-    if (existing.isVisible()) {
-      if (existing.isMinimized()) existing.restore();
-      existing.show();
-      existing.focus();
-    } else {
+    if (existing.isMinimized()) existing.restore();
+    const readiness = secondaryWindowReadiness[role];
+    if (
+      readiness?.windowId === existing.id &&
+      !readiness.revealState.settled
+    ) {
       void revealSecondaryWindowWhenReady(role, existing);
+      return;
     }
+    existing.show();
+    existing.focus();
     return;
   }
 
@@ -638,6 +643,7 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     parent,
     modal: false,
     backgroundMaterial: "acrylic",
+    opacity: 0,
     transparent: false,
     backgroundColor: "#00000000",
     roundedCorners: true,
@@ -660,8 +666,8 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
   secondaryWindowReadiness[role] = {
     windowId: window.id,
     revealState: createSecondaryWindowRevealState<SecondaryWindowRevealResult | false>(),
-    materialVisibleAt: null,
-    materialCompositedAt: null,
+    nativeWarmupStartedAt: null,
+    nativeWindowRevealedAt: null,
     fallbackTimer: setTimeout(() => {
       forceSecondaryWindowReveal(role, window);
     }, SECONDARY_WINDOW_READY_TIMEOUT_MS)
@@ -730,9 +736,9 @@ function revealSecondaryWindowWhenReady(
   if (!readiness || readiness.windowId !== window.id) return;
   const warmupToken = readiness.revealState.beginWarmup();
   if (warmupToken === null) return;
-  void warmSecondaryWindowMaterial(role, window, readiness, warmupToken)
+  void warmSecondaryWindowNativeHost(role, window, readiness, warmupToken)
     .catch((error) => {
-      console.warn(`[megle] ${role} material composition failed:`, error);
+      console.warn(`[megle] ${role} native window warm-up failed:`, error);
       forceSecondaryWindowReveal(role, window);
     })
     .finally(() => {
@@ -740,7 +746,7 @@ function revealSecondaryWindowWhenReady(
     });
 }
 
-async function warmSecondaryWindowMaterial(
+async function warmSecondaryWindowNativeHost(
   role: SecondaryWindowRole,
   window: BrowserWindow,
   readiness: SecondaryWindowReadiness,
@@ -749,18 +755,14 @@ async function warmSecondaryWindowMaterial(
   if (window.isMinimized()) window.restore();
   applyWindowMaterial(window);
   window.showInactive();
-  if (readiness.materialVisibleAt === null) {
-    readiness.materialVisibleAt = Date.now();
-    window.webContents.send("megle:secondary-window-material-visible", {
-      role,
-      materialVisibleAt: readiness.materialVisibleAt
-    });
+  if (readiness.nativeWarmupStartedAt === null) {
+    readiness.nativeWarmupStartedAt = Date.now();
   }
-  const didWarm = await waitForSecondaryMaterialWarmup(
+  const didWarm = await waitForSecondaryNativeWindowWarmup(
     readiness.revealState,
     warmupToken,
     waitForRendererFrame(window),
-    MATERIAL_WARMUP_HOLD_MS
+    NATIVE_WINDOW_WARMUP_MS
   );
   if (!didWarm) return;
   if (window.isDestroyed() || secondaryWindows[role] !== window) {
@@ -768,14 +770,13 @@ async function warmSecondaryWindowMaterial(
     return;
   }
   clearSecondaryWindowReadyFallback(role, window.id);
-  readiness.materialCompositedAt = Date.now();
+  readiness.nativeWindowRevealedAt = Date.now();
   const result: SecondaryWindowRevealResult = {
-    materialVisibleAt: readiness.materialVisibleAt,
-    materialCompositedAt: readiness.materialCompositedAt,
+    nativeWarmupStartedAt: readiness.nativeWarmupStartedAt,
+    nativeWindowRevealedAt: readiness.nativeWindowRevealedAt,
     fallback: false
   };
-  if (!readiness.revealState.settle(result)) return;
-  window.focus();
+  revealSecondaryNativeWindow(readiness.revealState, result, window);
 }
 
 function forceSecondaryWindowReveal(
@@ -793,24 +794,19 @@ function forceSecondaryWindowReveal(
   if (window.isMinimized()) window.restore();
   applyWindowMaterial(window);
   if (!window.isVisible()) window.showInactive();
-  if (readiness.materialVisibleAt === null) {
-    readiness.materialVisibleAt = Date.now();
-    window.webContents.send("megle:secondary-window-material-visible", {
-      role,
-      materialVisibleAt: readiness.materialVisibleAt
-    });
+  if (readiness.nativeWarmupStartedAt === null) {
+    readiness.nativeWarmupStartedAt = Date.now();
   }
-  readiness.materialCompositedAt = Date.now();
+  readiness.nativeWindowRevealedAt = Date.now();
   const result: SecondaryWindowRevealResult = {
-    materialVisibleAt: readiness.materialVisibleAt,
-    materialCompositedAt: readiness.materialCompositedAt,
+    nativeWarmupStartedAt: readiness.nativeWarmupStartedAt,
+    nativeWindowRevealedAt: readiness.nativeWindowRevealedAt,
     fallback: true
   };
-  if (!readiness.revealState.settle(result)) {
+  if (!revealSecondaryNativeWindow(readiness.revealState, result, window)) {
     const value = readiness.revealState.value;
     return value === false ? null : (value ?? null);
   }
-  window.focus();
   return result;
 }
 

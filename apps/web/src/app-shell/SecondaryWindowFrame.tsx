@@ -42,17 +42,7 @@ export function SecondaryWindowFrame({
   }, [onRequestClose]);
 
   useLayoutEffect(() => {
-    const unsubscribeMaterialVisible = getDesktopBridge()?.onSecondaryWindowMaterialVisible?.(
-      (payload) => {
-        const frame = frameRef.current;
-        if (!frame || payload.role !== role) return;
-        frame.setAttribute(
-          "data-secondary-material-visible-at",
-          String(payload.materialVisibleAt)
-        );
-        performance.mark(`megle-secondary-${role}-material-visible`);
-      }
-    );
+    let contentRevealFrame = 0;
     const firstFrame = window.requestAnimationFrame(() => {
       const frame = frameRef.current;
       if (!frame) return;
@@ -63,27 +53,31 @@ export function SecondaryWindowFrame({
         const currentFrame = frameRef.current;
         if (!result || !currentFrame) return;
         currentFrame.setAttribute(
-          "data-secondary-material-visible-at",
-          String(result.materialVisibleAt)
+          "data-secondary-native-warmup-started-at",
+          String(result.nativeWarmupStartedAt)
         );
         currentFrame.setAttribute(
-          "data-secondary-material-composited-at",
-          String(result.materialCompositedAt)
+          "data-secondary-native-window-revealed-at",
+          String(result.nativeWindowRevealedAt)
         );
         currentFrame.setAttribute(
           "data-secondary-reveal-fallback",
           String(result.fallback)
         );
         currentFrame.dataset.secondaryWindowVisible = "true";
-        performance.mark(`megle-secondary-${role}-material-composited`);
-        currentFrame.setAttribute("data-secondary-content-visible", "true");
-        currentFrame.setAttribute("data-secondary-content-visible-at", String(Date.now()));
-        performance.mark(`megle-secondary-${role}-content-visible`);
+        performance.mark(`megle-secondary-${role}-native-window-revealed`);
+        contentRevealFrame = window.requestAnimationFrame(() => {
+          const revealFrame = frameRef.current;
+          if (!revealFrame) return;
+          revealFrame.setAttribute("data-secondary-content-visible", "true");
+          revealFrame.setAttribute("data-secondary-content-visible-at", String(Date.now()));
+          performance.mark(`megle-secondary-${role}-content-visible`);
+        });
       });
     });
     return () => {
-      unsubscribeMaterialVisible?.();
       window.cancelAnimationFrame(firstFrame);
+      if (contentRevealFrame) window.cancelAnimationFrame(contentRevealFrame);
     };
   }, [role]);
 
