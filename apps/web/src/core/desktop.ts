@@ -1,6 +1,11 @@
 import type { LibrarySummary, LibraryLoadPhase } from "./libraryTypes";
 
 export type DesktopSecondaryWindowRole = "settings" | "plugins";
+export interface DesktopSecondaryWindowRevealResult {
+  materialVisibleAt: number;
+  materialCompositedAt: number;
+  fallback: boolean;
+}
 
 export interface DesktopDiagnostics {
   ffmpegAvailable: boolean;
@@ -43,7 +48,15 @@ export interface MegleDesktopBridge {
   sessionToken?: string;
   windowRole?: "main" | DesktopSecondaryWindowRole;
   notifyShellReady?: () => Promise<boolean>;
-  notifySecondaryWindowReady?: (role: DesktopSecondaryWindowRole) => Promise<boolean>;
+  notifySecondaryWindowReady?: (
+    role: DesktopSecondaryWindowRole
+  ) => Promise<DesktopSecondaryWindowRevealResult | null>;
+  onSecondaryWindowMaterialVisible?: (
+    cb: (payload: {
+      role: DesktopSecondaryWindowRole;
+      materialVisibleAt: number;
+    }) => void
+  ) => () => void;
   pickFolder?: () => Promise<string | null>;
   diagnostics?: () => Promise<DesktopDiagnostics>;
   openSettingsWindow?: () => Promise<boolean>;
@@ -76,23 +89,25 @@ export function getDesktopBridge(): MegleDesktopBridge | null {
   return window.megleDesktop ?? null;
 }
 
-const notifiedSecondaryWindowRoles = new Set<DesktopSecondaryWindowRole>();
+const secondaryWindowRevealResults = new Map<
+  DesktopSecondaryWindowRole,
+  DesktopSecondaryWindowRevealResult
+>();
 
 export async function notifySecondaryWindowReady(
   role: DesktopSecondaryWindowRole
-): Promise<boolean> {
+): Promise<DesktopSecondaryWindowRevealResult | null> {
   const bridge = getDesktopBridge();
   const notifyReady = bridge?.notifySecondaryWindowReady;
-  if (!notifyReady || bridge.windowRole !== role) return false;
-  if (notifiedSecondaryWindowRoles.has(role)) return true;
-  notifiedSecondaryWindowRoles.add(role);
+  if (!notifyReady || bridge.windowRole !== role) return null;
+  const previousResult = secondaryWindowRevealResults.get(role);
+  if (previousResult) return previousResult;
   try {
-    const didNotify = await notifyReady(role);
-    if (!didNotify) notifiedSecondaryWindowRoles.delete(role);
-    return didNotify;
+    const result = await notifyReady(role);
+    if (result) secondaryWindowRevealResults.set(role, result);
+    return result;
   } catch {
-    notifiedSecondaryWindowRoles.delete(role);
-    return false;
+    return null;
   }
 }
 

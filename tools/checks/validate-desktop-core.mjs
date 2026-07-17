@@ -126,7 +126,9 @@ for (const value of ["contextBridge", "coreUrl", "sessionToken", "notifyShellRea
 
 for (const value of [
   "notifySecondaryWindowReady",
-  'ipcRenderer.invoke("megle:secondary-window-ready", role)'
+  'ipcRenderer.invoke("megle:secondary-window-ready", role)',
+  "onSecondaryWindowMaterialVisible",
+  'ipcRenderer.on("megle:secondary-window-material-visible", listener)'
 ]) {
   if (!preload.includes(value)) {
     fail(`preload bridge missing secondary renderer-ready contract: ${value}`);
@@ -218,11 +220,46 @@ if (
   !revealSecondaryWindowBody ||
   !revealSecondaryWindowBody.includes("readiness.nativeReady") ||
   !revealSecondaryWindowBody.includes("readiness.rendererReady") ||
-  !revealSecondaryWindowBody.includes("window.show()") ||
-  !revealSecondaryWindowBody.includes("window.focus()") ||
-  !revealSecondaryWindowBody.includes("resolveSecondaryWindowRevealWaiters(readiness, true)")
+  !revealSecondaryWindowBody.includes("composeSecondaryWindowMaterial(role, window, readiness)")
 ) {
-  fail("secondary reveal must require native+renderer readiness and then show/focus the invoking role window");
+  fail("secondary reveal gate must require native+renderer readiness before starting material composition");
+}
+
+const composeSecondaryWindowBody = functionBody(
+  main,
+  "async function composeSecondaryWindowMaterial("
+);
+const materialShowIndex = composeSecondaryWindowBody?.indexOf("window.showInactive()") ?? -1;
+const compositorFrameIndex =
+  composeSecondaryWindowBody?.indexOf("await waitForRendererFrame(window)") ?? -1;
+const compositedTimestampIndex =
+  composeSecondaryWindowBody?.indexOf("readiness.materialCompositedAt = Date.now()") ?? -1;
+if (
+  !composeSecondaryWindowBody ||
+  materialShowIndex < 0 ||
+  compositorFrameIndex <= materialShowIndex ||
+  compositedTimestampIndex <= compositorFrameIndex ||
+  !composeSecondaryWindowBody.includes(
+    'window.webContents.send("megle:secondary-window-material-visible"'
+  ) ||
+  !composeSecondaryWindowBody.includes("fallback: false") ||
+  !composeSecondaryWindowBody.includes("window.focus()") ||
+  !composeSecondaryWindowBody.includes("resolveSecondaryWindowRevealWaiters(readiness, result)")
+) {
+  fail("secondary composition must show material-only, await a post-show frame, then resolve normal content reveal");
+}
+
+const forceSecondaryWindowBody = functionBody(
+  main,
+  "function forceSecondaryWindowReveal("
+);
+if (
+  !forceSecondaryWindowBody ||
+  !forceSecondaryWindowBody.includes("clearSecondaryWindowReadyFallback(role, window.id)") ||
+  !forceSecondaryWindowBody.includes("fallback: true") ||
+  !forceSecondaryWindowBody.includes("resolveSecondaryWindowRevealWaiters(readiness, result)")
+) {
+  fail("secondary windows must retain an explicit 4s force-reveal failure fallback");
 }
 
 if (!main.includes("BrowserWindow.fromWebContents(event.sender)")) {

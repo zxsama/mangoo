@@ -15,7 +15,7 @@ const logDir = path.join(visualRoot, "logs");
 const dataDir = path.join(visualRoot, "data-desktop-ui");
 const electronUserDataDir = path.join(dataDir, "electron-user-data");
 const webUrl = "http://127.0.0.1:5179";
-const debugPort = Number(process.env.MEGLE_VISUAL_DEBUG_PORT ?? process.env.MEGLE_REMOTE_DEBUG_PORT ?? 9239);
+const debugPort = Number(process.env.MEGLE_VISUAL_DEBUG_PORT ?? process.env.MEGLE_REMOTE_DEBUG_PORT ?? 13242);
 const visualRunId = `megle-visual-${Date.now().toString(36)}-${process.pid}`;
 const runStartedAt = new Date();
 const osBackdropEvidenceEnabled = process.env.MEGLE_VISUAL_OS_BACKDROP === "1";
@@ -1270,7 +1270,7 @@ async function pluginsSecondaryWindowEvidence(client) {
     await waitFor(pluginsClient, `Boolean(document.querySelector(".plugins-body"))`, 10000, "Plugins secondary window");
     await waitFor(
       pluginsClient,
-      `document.querySelector(".secondary-window")?.getAttribute("data-secondary-window-visible") === "true"`,
+      `document.querySelector(".secondary-window")?.getAttribute("data-secondary-content-visible") === "true"`,
       10000,
       "Plugins material-ready reveal"
     );
@@ -1289,7 +1289,7 @@ async function pluginsSecondaryWindowEvidence(client) {
     await waitFor(settingsClient, `Boolean(document.querySelector(".settings-window"))`, 10000, "Settings alongside Plugins");
     await waitFor(
       settingsClient,
-      `document.querySelector(".secondary-window")?.getAttribute("data-secondary-window-visible") === "true"`,
+      `document.querySelector(".secondary-window")?.getAttribute("data-secondary-content-visible") === "true"`,
       10000,
       "Settings material-ready reveal"
     );
@@ -1318,6 +1318,11 @@ async function pluginsSecondaryWindowEvidence(client) {
           pluginSurfacePresent: Boolean(document.querySelector(".plugins-layout")),
           rendererReady: owner?.getAttribute("data-secondary-renderer-ready"),
           windowVisible: owner?.getAttribute("data-secondary-window-visible"),
+          contentVisible: owner?.getAttribute("data-secondary-content-visible"),
+          materialVisibleAt: owner?.getAttribute("data-secondary-material-visible-at"),
+          materialCompositedAt: owner?.getAttribute("data-secondary-material-composited-at"),
+          contentVisibleAt: owner?.getAttribute("data-secondary-content-visible-at"),
+          revealFallback: owner?.getAttribute("data-secondary-reveal-fallback"),
           material: {
             background: backdrop ? getComputedStyle(backdrop).backgroundColor : null,
             backdropFilter: backdrop ? getComputedStyle(backdrop).backdropFilter : null,
@@ -1338,6 +1343,11 @@ async function pluginsSecondaryWindowEvidence(client) {
         return {
           rendererReady: owner?.getAttribute("data-secondary-renderer-ready"),
           windowVisible: owner?.getAttribute("data-secondary-window-visible"),
+          contentVisible: owner?.getAttribute("data-secondary-content-visible"),
+          materialVisibleAt: owner?.getAttribute("data-secondary-material-visible-at"),
+          materialCompositedAt: owner?.getAttribute("data-secondary-material-composited-at"),
+          contentVisibleAt: owner?.getAttribute("data-secondary-content-visible-at"),
+          revealFallback: owner?.getAttribute("data-secondary-reveal-fallback"),
           material: {
             background: backdrop ? getComputedStyle(backdrop).backgroundColor : null,
             backdropFilter: backdrop ? getComputedStyle(backdrop).backdropFilter : null,
@@ -2281,6 +2291,20 @@ try {
   if (!transparent(layout.htmlBackground) || !transparent(layout.bodyBackground) || !transparent(layout.rootBackground)) {
     hardFailures.push("html/body/root backgrounds are not transparent");
   }
+  const stagedSecondaryReveal = (evidence) => {
+    const materialVisibleAt = Number(evidence?.materialVisibleAt);
+    const materialCompositedAt = Number(evidence?.materialCompositedAt);
+    const contentVisibleAt = Number(evidence?.contentVisibleAt);
+    return (
+      Number.isFinite(materialVisibleAt) &&
+      Number.isFinite(materialCompositedAt) &&
+      Number.isFinite(contentVisibleAt) &&
+      materialVisibleAt <= materialCompositedAt &&
+      materialCompositedAt <= contentVisibleAt &&
+      evidence?.contentVisible === "true" &&
+      evidence?.revealFallback === "false"
+    );
+  };
   if (
     !noBackdropFilter(layout.htmlBackdropFilter) ||
     !noBackdropFilter(layout.bodyBackdropFilter) ||
@@ -2514,8 +2538,10 @@ try {
     !pluginsWindowEvidence.pluginWindow?.pluginSurfacePresent ||
     pluginsWindowEvidence.pluginWindow?.rendererReady !== "true" ||
     pluginsWindowEvidence.pluginWindow?.windowVisible !== "true" ||
+    !stagedSecondaryReveal(pluginsWindowEvidence.pluginWindow) ||
     pluginsWindowEvidence.settingsWindow?.rendererReady !== "true" ||
     pluginsWindowEvidence.settingsWindow?.windowVisible !== "true" ||
+    !stagedSecondaryReveal(pluginsWindowEvidence.settingsWindow) ||
     JSON.stringify(pluginsWindowEvidence.pluginWindow?.material) !==
       JSON.stringify(pluginsWindowEvidence.settingsWindow?.material)
   ) {

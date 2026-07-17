@@ -313,10 +313,7 @@ function updateTreeStickyOcclusion(sidebar: HTMLElement): void {
   if (rows.length === 0) return;
 
   const sidebarRect = sidebar.getBoundingClientRect();
-  const sidebarStyle = window.getComputedStyle(sidebar);
-  const scrollportInsetTop = parseCssPixels(sidebarStyle.paddingTop);
   const stickyBaseTop = sidebarRect.top;
-  sidebar.style.setProperty("--tree-sticky-scrollport-inset", `${scrollportInsetTop}px`);
   const layouts = rows.map(resolveTreeRowLayout);
   const pinnedLayouts = resolvePinnedTreeRows(layouts, stickyBaseTop);
 
@@ -464,11 +461,6 @@ function applyTreeRowClip(row: HTMLElement, clippedTop: number): void {
 function clearTreeRowState(row: HTMLElement): void {
   clearTreeRowOcclusion(row);
   clearTreeRowPinned(row);
-}
-
-function parseCssPixels(value: string): number {
-  const parsed = Number.parseFloat(value);
-  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function LoadMoreChildren({

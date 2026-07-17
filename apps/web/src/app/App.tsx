@@ -19,6 +19,7 @@ import {
 import {
   LibraryTitlebarToolbar,
   PreviewTitlebarToolbar,
+  ShellSidebarToggle,
   ShellTitlebarPrimaryActions,
   ShellRightActions,
 } from "../app-shell/ShellTopBar";
@@ -513,7 +514,12 @@ export function App() {
   );
 
   function renderCenterTitlebar() {
-    const primaryActions = sidebarsHidden ? renderPrimaryTitlebarActions() : undefined;
+    const primaryActions = sidebarsHidden ? (
+      <ShellSidebarToggle
+        sidebarsHidden
+        onToggleSidebars={toggleSidebars}
+      />
+    ) : undefined;
     if (previewOpen && library.selectedMedia) {
       return (
         <PreviewTitlebarToolbar

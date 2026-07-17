@@ -27,6 +27,11 @@ contextBridge.exposeInMainWorld("megleDesktop", {
   closePluginsWindow: () => ipcRenderer.invoke("megle:close-plugins-window"),
   notifySecondaryWindowReady: (role) =>
     ipcRenderer.invoke("megle:secondary-window-ready", role),
+  onSecondaryWindowMaterialVisible: (cb) => {
+    const listener = (_event, payload) => cb(payload);
+    ipcRenderer.on("megle:secondary-window-material-visible", listener);
+    return () => ipcRenderer.removeListener("megle:secondary-window-material-visible", listener);
+  },
   windowControls: {
     minimize: () => ipcRenderer.invoke("megle:window-minimize"),
     maximize: () => ipcRenderer.invoke("megle:window-maximize"),

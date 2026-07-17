@@ -85,7 +85,7 @@ interface ShellRightActionsProps {
   onToggleRecent: () => void;
 }
 
-function ShellSidebarToggle({
+export function ShellSidebarToggle({
   sidebarsHidden,
   onToggleSidebars
 }: {

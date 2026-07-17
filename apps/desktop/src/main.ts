@@ -38,8 +38,17 @@ type SecondaryWindowReadiness = {
   windowId: number;
   nativeReady: boolean;
   rendererReady: boolean;
+  materialVisibleAt: number | null;
+  materialCompositedAt: number | null;
+  revealResult: SecondaryWindowRevealResult | null;
+  compositionPromise: Promise<SecondaryWindowRevealResult | null> | null;
   fallbackTimer: NodeJS.Timeout | null;
-  revealWaiters: Array<(didReveal: boolean) => void>;
+  revealWaiters: Array<(result: SecondaryWindowRevealResult | null) => void>;
+};
+type SecondaryWindowRevealResult = {
+  materialVisibleAt: number;
+  materialCompositedAt: number;
+  fallback: boolean;
 };
 const secondaryWindowReadiness: Record<SecondaryWindowRole, SecondaryWindowReadiness | null> = {
   settings: null,
@@ -349,14 +358,17 @@ ipcMain.handle("megle:close-plugins-window", () => {
 });
 
 ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown) => {
-  if (!isSecondaryWindowRole(role)) return false;
+  if (!isSecondaryWindowRole(role)) return null;
   const window = windowForIpcEvent(event);
-  if (!window || secondaryWindows[role] !== window) return false;
+  if (!window || secondaryWindows[role] !== window) return null;
   const readiness = secondaryWindowReadiness[role];
-  if (!readiness || readiness.windowId !== window.id) return false;
+  if (!readiness || readiness.windowId !== window.id) return null;
   readiness.rendererReady = true;
-  if (revealSecondaryWindowWhenReady(role, window)) return true;
-  return new Promise<boolean>((resolve) => readiness.revealWaiters.push(resolve));
+  const revealPromise = revealSecondaryWindowWhenReady(role, window);
+  if (revealPromise) return revealPromise;
+  return new Promise<SecondaryWindowRevealResult | null>((resolve) => {
+    readiness.revealWaiters.push(resolve);
+  });
 });
 
 ipcMain.handle("megle:visual-capture-page", async (event) => {
@@ -610,7 +622,7 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
       existing.show();
       existing.focus();
     } else {
-      revealSecondaryWindowWhenReady(role, existing);
+      void revealSecondaryWindowWhenReady(role, existing);
     }
     return;
   }
@@ -650,9 +662,13 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     windowId: window.id,
     nativeReady: false,
     rendererReady: false,
+    materialVisibleAt: null,
+    materialCompositedAt: null,
+    revealResult: null,
+    compositionPromise: null,
     revealWaiters: [],
     fallbackTimer: setTimeout(() => {
-      revealSecondaryWindowWhenReady(role, window, true);
+      forceSecondaryWindowReveal(role, window);
     }, SECONDARY_WINDOW_READY_TIMEOUT_MS)
   };
   applyWindowMaterial(window);
@@ -660,12 +676,12 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     const readiness = secondaryWindowReadiness[role];
     if (!readiness || readiness.windowId !== window.id) return;
     readiness.nativeReady = true;
-    revealSecondaryWindowWhenReady(role, window);
+    void revealSecondaryWindowWhenReady(role, window);
   });
   window.webContents.on(
     "did-fail-load",
     (_event, _errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
-      if (isMainFrame) revealSecondaryWindowWhenReady(role, window, true);
+      if (isMainFrame) forceSecondaryWindowReveal(role, window);
     }
   );
   window.on("blur", () => {
@@ -683,7 +699,7 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     clearSecondaryWindowReadyFallback(role, window.id);
     const readiness = secondaryWindowReadiness[role];
     if (readiness?.windowId === window.id) {
-      resolveSecondaryWindowRevealWaiters(readiness, false);
+      resolveSecondaryWindowRevealWaiters(readiness, null);
     }
     if (secondaryWindowReadiness[role]?.windowId === window.id) {
       secondaryWindowReadiness[role] = null;
@@ -695,7 +711,7 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     await window.loadURL(`${devServer}${config.route}`);
   } catch (error) {
     console.warn(`[megle] ${role} window loadURL rejected:`, error);
-    revealSecondaryWindowWhenReady(role, window, true);
+    forceSecondaryWindowReveal(role, window);
   }
 }
 
@@ -712,26 +728,88 @@ function clearSecondaryWindowReadyFallback(role: SecondaryWindowRole, windowId: 
 
 function resolveSecondaryWindowRevealWaiters(
   readiness: SecondaryWindowReadiness,
-  didReveal: boolean
+  result: SecondaryWindowRevealResult | null
 ): void {
-  for (const resolve of readiness.revealWaiters.splice(0)) resolve(didReveal);
+  for (const resolve of readiness.revealWaiters.splice(0)) resolve(result);
 }
 
 function revealSecondaryWindowWhenReady(
   role: SecondaryWindowRole,
-  window: BrowserWindow,
-  force = false
-): boolean {
-  if (window.isDestroyed() || secondaryWindows[role] !== window) return false;
+  window: BrowserWindow
+): Promise<SecondaryWindowRevealResult | null> | null {
+  if (window.isDestroyed() || secondaryWindows[role] !== window) return null;
   const readiness = secondaryWindowReadiness[role];
-  if (!readiness || readiness.windowId !== window.id) return false;
-  if (!force && (!readiness.nativeReady || !readiness.rendererReady)) return false;
+  if (!readiness || readiness.windowId !== window.id) return null;
+  if (readiness.revealResult) return Promise.resolve(readiness.revealResult);
+  if (readiness.compositionPromise) return readiness.compositionPromise;
+  if (!readiness.nativeReady || !readiness.rendererReady) return null;
+  readiness.compositionPromise = composeSecondaryWindowMaterial(role, window, readiness);
+  return readiness.compositionPromise;
+}
+
+async function composeSecondaryWindowMaterial(
+  role: SecondaryWindowRole,
+  window: BrowserWindow,
+  readiness: SecondaryWindowReadiness
+): Promise<SecondaryWindowRevealResult | null> {
+  if (window.isMinimized()) window.restore();
+  applyWindowMaterial(window);
+  window.showInactive();
+  if (readiness.materialVisibleAt === null) {
+    readiness.materialVisibleAt = Date.now();
+    window.webContents.send("megle:secondary-window-material-visible", {
+      role,
+      materialVisibleAt: readiness.materialVisibleAt
+    });
+  }
+  await waitForRendererFrame(window);
+  if (readiness.revealResult) return readiness.revealResult;
+  if (window.isDestroyed() || secondaryWindows[role] !== window) {
+    resolveSecondaryWindowRevealWaiters(readiness, null);
+    return null;
+  }
+  clearSecondaryWindowReadyFallback(role, window.id);
+  readiness.materialCompositedAt = Date.now();
+  const result: SecondaryWindowRevealResult = {
+    materialVisibleAt: readiness.materialVisibleAt,
+    materialCompositedAt: readiness.materialCompositedAt,
+    fallback: false
+  };
+  readiness.revealResult = result;
+  window.focus();
+  resolveSecondaryWindowRevealWaiters(readiness, result);
+  return result;
+}
+
+function forceSecondaryWindowReveal(
+  role: SecondaryWindowRole,
+  window: BrowserWindow
+): SecondaryWindowRevealResult | null {
+  if (window.isDestroyed() || secondaryWindows[role] !== window) return null;
+  const readiness = secondaryWindowReadiness[role];
+  if (!readiness || readiness.windowId !== window.id) return null;
+  if (readiness.revealResult) return readiness.revealResult;
   clearSecondaryWindowReadyFallback(role, window.id);
   if (window.isMinimized()) window.restore();
-  window.show();
+  applyWindowMaterial(window);
+  if (!window.isVisible()) window.showInactive();
+  if (readiness.materialVisibleAt === null) {
+    readiness.materialVisibleAt = Date.now();
+    window.webContents.send("megle:secondary-window-material-visible", {
+      role,
+      materialVisibleAt: readiness.materialVisibleAt
+    });
+  }
+  readiness.materialCompositedAt = Date.now();
+  const result: SecondaryWindowRevealResult = {
+    materialVisibleAt: readiness.materialVisibleAt,
+    materialCompositedAt: readiness.materialCompositedAt,
+    fallback: true
+  };
+  readiness.revealResult = result;
   window.focus();
-  resolveSecondaryWindowRevealWaiters(readiness, true);
-  return true;
+  resolveSecondaryWindowRevealWaiters(readiness, result);
+  return result;
 }
 
 function closeSecondaryWindow(role: SecondaryWindowRole): void {

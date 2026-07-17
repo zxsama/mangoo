@@ -54,6 +54,7 @@ const moveDialog = read("apps/web/src/features/file-ops/MoveDialog.tsx");
 const deleteConfirm = read("apps/web/src/features/file-ops/DeleteConfirm.tsx");
 const onboardingHero = read("apps/web/src/features/onboarding/OnboardingHero.tsx");
 const libraryView = read("apps/web/src/features/library/LibraryView.tsx");
+const librarySidebar = read("apps/web/src/features/library/LibrarySidebar.tsx");
 const subfolderStrip = read("apps/web/src/features/library/SubfolderStrip.tsx");
 const useLibraryData = read("apps/web/src/core/useLibraryData.ts");
 const libraryCenterPane = readOptional("apps/web/src/features/library/LibraryCenterPane.tsx") ?? "";
@@ -1698,6 +1699,80 @@ for (const [property, expected] of [
     fail(`secondary windows must reuse the sidebar LiquidGlass material mapping: ${property}`);
   }
 }
+
+const centerTitlebarMatch = app.match(
+  /function renderCenterTitlebar\(\) \{([\s\S]*?)\n  \}\n\n  function renderPrimaryTitlebarActions/
+);
+if (
+  !centerTitlebarMatch ||
+  !centerTitlebarMatch[1].includes("ShellSidebarToggle") ||
+  centerTitlebarMatch[1].includes("renderPrimaryTitlebarActions") ||
+  !/export function ShellSidebarToggle\(/.test(shellTitlebar)
+) {
+  fail("collapsed Library and Preview titlebars must inject only the shared SidebarToggle, never the full primary action group");
+}
+
+const secondaryCompositionMatch = desktopMain.match(
+  /async function composeSecondaryWindowMaterial\([\s\S]*?\n\}/
+);
+const secondaryCompositionBody = secondaryCompositionMatch?.[0] ?? "";
+const materialShowIndex = secondaryCompositionBody.indexOf("window.showInactive()");
+const compositorFrameIndex = secondaryCompositionBody.indexOf("await waitForRendererFrame(window)");
+const materialCompositedIndex = secondaryCompositionBody.indexOf("materialCompositedAt = Date.now()");
+if (
+  materialShowIndex < 0 ||
+  compositorFrameIndex <= materialShowIndex ||
+  materialCompositedIndex <= compositorFrameIndex
+) {
+  fail("secondary windows must show the material-only native window, await a post-show renderer/compositor frame, then mark material composited");
+}
+for (const [source, value, message] of [
+  [desktopMain, "materialVisibleAt", "desktop secondary-window readiness must record the native material-visible stage"],
+  [desktopMain, "materialCompositedAt", "desktop secondary-window readiness must record the post-show material-composited stage"],
+  [desktopBridge, "materialCompositedAt", "web desktop bridge must carry the native material-composited result"],
+  [secondaryWindowFrame, "data-secondary-content-visible", "secondary UI must have an explicit content-visible stage after native material composition"]
+]) {
+  if (!source.includes(value)) fail(message);
+}
+for (const [source, value, message] of [
+  [desktopMain, "forceSecondaryWindowReveal", "secondary windows must retain a force-reveal path for the 4s failure fallback"],
+  [desktopMain, "fallback: false", "normal secondary composition must report that it did not use the failure fallback"],
+  [desktopBridge, "fallback: boolean", "secondary reveal results must distinguish normal composition from the failure fallback"],
+  [secondaryWindowFrame, "data-secondary-reveal-fallback", "secondary window evidence must expose whether the 4s failure fallback was used"]
+]) {
+  if (!source.includes(value)) fail(message);
+}
+if (
+  !/contentRevealFrame\s*=\s*window\.requestAnimationFrame\(\(\)\s*=>\s*\{\s*contentRevealFrame\s*=\s*window\.requestAnimationFrame\(/.test(
+    secondaryWindowFrame
+  )
+) {
+  fail("secondary UI reveal must cross a full additional renderer frame after native material composition");
+}
+
+for (const selector of [".secondary-window-titlebar", ".secondary-window-body"]) {
+  const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
+  if (
+    !blocks.some(
+      (block) =>
+        latestDeclarationValue(block, "visibility") === "hidden" &&
+        latestDeclarationValue(block, "content-visibility") === "hidden"
+    )
+  ) {
+    fail(`${selector} must stay non-visible while the native secondary-window material composes`);
+  }
+  const revealSelector = `.secondary-window[data-secondary-content-visible="true"] ${selector}`;
+  const revealBlocks = cssBlocksForExactSelector(stylesForChecks, revealSelector);
+  if (
+    !revealBlocks.some(
+      (block) =>
+        latestDeclarationValue(block, "visibility") === "visible" &&
+        latestDeclarationValue(block, "content-visibility") === "visible"
+    )
+  ) {
+    fail(`${selector} must reveal only from the explicit secondary content-visible stage`);
+  }
+}
 const secondaryWindowBlocks = cssBlocksForExactSelector(stylesForChecks, ".secondary-window");
 if (
   !secondaryWindowBlocks.some(
@@ -1713,10 +1788,16 @@ if (
 const sidebarSpacingBlocks = cssBlocksForExactSelector(stylesForChecks, ".library-sidebar");
 const treeListBlocks = cssBlocksForExactSelector(stylesForChecks, ".tree-list");
 if (
-  !sidebarSpacingBlocks.some((block) => latestDeclarationValue(block, "padding") === "4px 16px 16px") ||
+  !sidebarSpacingBlocks.some((block) => latestDeclarationValue(block, "padding") === "0 16px 16px") ||
   !treeListBlocks.some((block) => latestDeclarationValue(block, "margin-top") === "0")
 ) {
-  fail("folder tree must remove the retired sidebar-header top gap while retaining side/bottom padding");
+  fail("folder tree scrollport must start at the first pixel while retaining side/bottom padding");
+}
+if (
+  stylesForChecks.includes("--tree-sticky-scrollport-inset") ||
+  librarySidebar.includes("--tree-sticky-scrollport-inset")
+) {
+  fail("folder tree sticky coordinates must not retain the retired top-padding scrollport inset compensation");
 }
 
 for (const selector of [

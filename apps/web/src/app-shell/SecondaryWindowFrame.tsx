@@ -42,19 +42,57 @@ export function SecondaryWindowFrame({
   }, [onRequestClose]);
 
   useLayoutEffect(() => {
+    let contentRevealFrame = 0;
+    const unsubscribeMaterialVisible = getDesktopBridge()?.onSecondaryWindowMaterialVisible?.(
+      (payload) => {
+        const frame = frameRef.current;
+        if (!frame || payload.role !== role) return;
+        frame.setAttribute(
+          "data-secondary-material-visible-at",
+          String(payload.materialVisibleAt)
+        );
+        performance.mark(`megle-secondary-${role}-material-visible`);
+      }
+    );
     const firstFrame = window.requestAnimationFrame(() => {
       const frame = frameRef.current;
       if (!frame) return;
       frame.dataset.secondaryRendererReady = "true";
       document.documentElement.dataset.secondaryRendererReady = role;
       performance.mark(`megle-secondary-${role}-renderer-ready`);
-      void notifySecondaryWindowReady(role).then((didNotify) => {
-        if (!didNotify || !frameRef.current) return;
-        frameRef.current.dataset.secondaryWindowVisible = "true";
-        performance.mark(`megle-secondary-${role}-window-visible`);
+      void notifySecondaryWindowReady(role).then((result) => {
+        const currentFrame = frameRef.current;
+        if (!result || !currentFrame) return;
+        currentFrame.setAttribute(
+          "data-secondary-material-visible-at",
+          String(result.materialVisibleAt)
+        );
+        currentFrame.setAttribute(
+          "data-secondary-material-composited-at",
+          String(result.materialCompositedAt)
+        );
+        currentFrame.setAttribute(
+          "data-secondary-reveal-fallback",
+          String(result.fallback)
+        );
+        currentFrame.dataset.secondaryWindowVisible = "true";
+        performance.mark(`megle-secondary-${role}-material-composited`);
+        contentRevealFrame = window.requestAnimationFrame(() => {
+          contentRevealFrame = window.requestAnimationFrame(() => {
+            const revealFrame = frameRef.current;
+            if (!revealFrame) return;
+            revealFrame.setAttribute("data-secondary-content-visible", "true");
+            revealFrame.setAttribute("data-secondary-content-visible-at", String(Date.now()));
+            performance.mark(`megle-secondary-${role}-content-visible`);
+          });
+        });
       });
     });
-    return () => window.cancelAnimationFrame(firstFrame);
+    return () => {
+      unsubscribeMaterialVisible?.();
+      window.cancelAnimationFrame(firstFrame);
+      if (contentRevealFrame) window.cancelAnimationFrame(contentRevealFrame);
+    };
   }, [role]);
 
   function handlePointerDown(event: ReactPointerEvent<HTMLElement>) {
@@ -74,6 +112,7 @@ export function SecondaryWindowFrame({
       <LiquidGlassSurface
         as="div"
         className={`secondary-window${windowClassName ? ` ${windowClassName}` : ""}`}
+        data-secondary-content-visible="false"
         data-secondary-window-role={role}
         ref={frameRef}
         tone="chrome"
