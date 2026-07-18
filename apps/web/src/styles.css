@@ -998,7 +998,7 @@ button:disabled {
   }
   25% {
     background: rgba(151, 219, 226, 0.32);
-    box-shadow: 0 0 0 2px rgba(151, 219, 226, 0.42), 0 0 18px rgba(151, 219, 226, 0.24);
+    box-shadow: inset 0 0 0 1px rgba(151, 219, 226, 0.42), inset 0 0 12px rgba(151, 219, 226, 0.24);
   }
   50% {
     background: transparent;
@@ -1007,7 +1007,7 @@ button:disabled {
   75%,
   100% {
     background: rgba(151, 219, 226, 0.32);
-    box-shadow: 0 0 0 2px rgba(151, 219, 226, 0.42), 0 0 18px rgba(151, 219, 226, 0.24);
+    box-shadow: inset 0 0 0 1px rgba(151, 219, 226, 0.42), inset 0 0 12px rgba(151, 219, 226, 0.24);
   }
 }
 
@@ -1015,7 +1015,7 @@ button:disabled {
   .tree-item[data-tree-locate-highlight="true"] {
     animation: none;
     background: rgba(151, 219, 226, 0.24);
-    box-shadow: 0 0 0 2px rgba(151, 219, 226, 0.32);
+    box-shadow: inset 0 0 0 1px rgba(151, 219, 226, 0.32);
   }
 }
 
@@ -2354,7 +2354,7 @@ button:disabled {
 }
 
 .media-tile-thumb-shell:hover .media-tile-locate-button {
-  opacity: 0.1;
+  opacity: 0.32;
   pointer-events: auto;
   transition: opacity 140ms ease 200ms, color 140ms ease 0ms, transform 140ms ease 0ms;
 }
