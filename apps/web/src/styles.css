@@ -987,6 +987,29 @@ button:disabled {
   border-radius: 7px;
 }
 
+.tree-item[data-tree-locate-highlight="true"] {
+  animation: tree-locate-highlight 900ms ease-out;
+}
+
+@keyframes tree-locate-highlight {
+  0% {
+    background: rgba(151, 219, 226, 0.32);
+    box-shadow: 0 0 0 2px rgba(151, 219, 226, 0.42), 0 0 18px rgba(151, 219, 226, 0.24);
+  }
+  100% {
+    background: transparent;
+    box-shadow: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tree-item[data-tree-locate-highlight="true"] {
+    animation: none;
+    background: rgba(151, 219, 226, 0.24);
+    box-shadow: 0 0 0 2px rgba(151, 219, 226, 0.32);
+  }
+}
+
 .tree-list .tree-item[role="treeitem"][aria-expanded="true"] {
   position: sticky;
   top: var(--tree-sticky-offset, 0px);
@@ -2326,11 +2349,6 @@ button:disabled {
   opacity: 1;
   pointer-events: auto;
   transition-delay: 500ms;
-}
-
-.media-tile-locate-button:hover {
-  background: rgba(28, 32, 37, 0.68);
-  color: var(--text-strong);
 }
 
 .media-tile-thumb-shell .media-tile-locate-button:focus-visible {

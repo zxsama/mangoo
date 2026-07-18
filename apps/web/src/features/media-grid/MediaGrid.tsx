@@ -3,7 +3,7 @@ import type { KeyboardEvent, ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import type { MediaRecord, ThumbnailResponse } from "@megle/core-client";
-import { FolderLocationIcon } from "../../app-shell/ShellTopBar";
+import { FolderLocationIcon } from "../library/FolderLocationIcon";
 import {
   mediaContentSignature,
   mediaFileContentSignature,
@@ -1684,6 +1684,9 @@ function MediaTile({
         onOpenPreview(item.id);
       }}
       onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) {
+          return;
+        }
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
           event.stopPropagation();

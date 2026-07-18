@@ -5,7 +5,6 @@ import {
   ChevronRight,
   History,
   ListChecks,
-  LocateFixed,
   Maximize2,
   Minimize2,
   PanelLeftClose,
@@ -16,6 +15,7 @@ import {
 import type { ComponentProps, ReactNode } from "react";
 import { LiquidGlassButton } from "../design/liquid-glass";
 import { FilterMenu } from "../features/library/FilterMenu";
+import { FolderLocationIcon } from "../features/library/FolderLocationIcon";
 import { LayoutMenu } from "../features/library/LayoutMenu";
 import { SearchBar } from "../features/library/SearchBar";
 import { SortMenu } from "../features/library/SortMenu";
@@ -27,10 +27,6 @@ type FilterMenuProps = ComponentProps<typeof FilterMenu>;
 type SearchBarProps = ComponentProps<typeof SearchBar>;
 type SortMenuProps = ComponentProps<typeof SortMenu>;
 type PreviewViewMode = "fit-long-edge" | "actual";
-
-export function FolderLocationIcon(props: ComponentProps<typeof LocateFixed>) {
-  return <LocateFixed {...props} />;
-}
 
 interface LibraryTitlebarToolbarProps {
   canNavigateFolderBack: boolean;
