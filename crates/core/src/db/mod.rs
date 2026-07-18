@@ -715,24 +715,6 @@ impl Database {
         Ok(())
     }
 
-    /// One-time backfill: classify every existing failed thumbnail's failure_kind
-    /// from its stored error text. Idempotent — only touches rows where
-    /// failure_kind IS NULL.
-    ///
-    /// This runs in its own explicit transaction so a standalone call (e.g.
-    /// from tests, or a future manual maintenance path) is atomic by itself.
-    /// The 0018 migration gate in `apply_migrations` does NOT call this
-    /// method — it drives the same logic
-    /// (`backfill_thumbnail_failure_kind_in_transaction`) inside the single
-    /// transaction that also adds the column and registers migration 18, so
-    /// the backfill and the "migration applied" marker can never diverge.
-    pub fn backfill_thumbnail_failure_kind(&self) -> anyhow::Result<()> {
-        let transaction = self.connection.unchecked_transaction()?;
-        backfill_thumbnail_failure_kind_in_transaction(&transaction)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
     /// Size in bytes of the `-wal` sidecar for this database's file, or 0 for
     /// in-memory databases or when the WAL file is absent. Used for checkpoint
     /// diagnostics and to assert the WAL stays bounded in tests.
@@ -6226,11 +6208,11 @@ fn table_has_column_in_transaction(
 
 /// Classify every existing failed thumbnail's `failure_kind` from its stored
 /// `error` text and UPDATE it in place. Idempotent — only touches rows where
-/// `failure_kind IS NULL`. Shared body for `Database::backfill_thumbnail_failure_kind`
-/// (its own standalone transaction) and the 0018 migration gate in
-/// `apply_migrations` (same transaction as the ALTER TABLE + schema_migrations
-/// registration), so both callers run identical classify+UPDATE logic and the
-/// caller controls the atomic boundary.
+/// `failure_kind IS NULL`. Driven by the 0018 migration gate in
+/// `apply_migrations` inside the same transaction as the ALTER TABLE +
+/// schema_migrations registration (so the backfill and the "migration
+/// applied" marker can never diverge), and directly by tests that need to
+/// exercise the backfill logic against a hand-seeded transaction.
 fn backfill_thumbnail_failure_kind_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
 ) -> anyhow::Result<()> {
@@ -15031,7 +15013,11 @@ mod tests {
             "thumbnail decode failed: The image format Avif is not supported",
             true,
         );
-        db.backfill_thumbnail_failure_kind().unwrap();
+        {
+            let transaction = db.connection.unchecked_transaction().unwrap();
+            backfill_thumbnail_failure_kind_in_transaction(&transaction).unwrap();
+            transaction.commit().unwrap();
+        }
         assert_eq!(
             read_failure_kind(&db, net_fid),
             Some("transient".to_string())
