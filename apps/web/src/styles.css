@@ -2359,6 +2359,11 @@ button:disabled {
   transition: opacity 140ms ease 200ms, color 140ms ease 0ms, transform 140ms ease 0ms;
 }
 
+.media-tile-thumb-shell:hover .media-tile-locate-button:hover:not(:disabled) {
+  opacity: 1;
+  transition: opacity 140ms ease 0ms, color 140ms ease 0ms, transform 140ms ease 0ms;
+}
+
 .media-tile-locate-button:hover:not(:disabled),
 .media-tile-locate-button:active:not(:disabled) {
   transform: none;
