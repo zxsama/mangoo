@@ -294,14 +294,10 @@ const TRANSIENT_RETRY_SWEEP_PER_ROOT_LIMIT: usize = 500;
 /// tick is logged and skipped; it never crashes Core, and the next tick tries
 /// again.
 fn spawn_transient_retry_sweep(state: &AppState) {
-    let reach = state.root_reachability.clone();
-    let writer = state.writer.clone();
+    let sweep_state = state.clone();
     tokio::spawn(async move {
         loop {
-            let reach_for_tick = reach.clone();
-            let result = writer
-                .write(move |database| run_transient_retry_sweep(database, &reach_for_tick))
-                .await;
+            let result = sweep_transient_retries(&sweep_state).await;
             match result {
                 Ok(enqueued_count) if enqueued_count > 0 => {
                     tracing::info!(
@@ -319,6 +315,83 @@ fn spawn_transient_retry_sweep(state: &AppState) {
     });
 }
 
+/// Production driver for the transient-retry sweep, invoked once per tick by
+/// `spawn_transient_retry_sweep`. Enumerating roots is a read, so it uses a
+/// dedicated read-only connection when the database is file-backed (same
+/// pattern as `enabled_root_paths`) instead of `run_transient_retry_sweep`'s
+/// write-connection `list_roots` call, which used to hold the single writer
+/// for the entire multi-root enumeration. Reachability filtering happens here,
+/// outside any writer closure, and each reachable root then gets its *own*
+/// `writer.write(...)` job bounded to that one root's enqueue — a many-root
+/// NAS library can no longer occupy the writer actor for a whole sweep tick;
+/// interactive writes can interleave between per-root jobs. In-memory/test
+/// databases (no separate read connection) fall back to running the whole
+/// sweep as a single writer job via `run_transient_retry_sweep`, the same
+/// kernel the unit tests exercise directly.
+async fn sweep_transient_retries(state: &AppState) -> anyhow::Result<usize> {
+    if !state.has_read_database() {
+        let reach = state.root_reachability.clone();
+        return state
+            .writer
+            .write(move |database| run_transient_retry_sweep(database, &reach))
+            .await;
+    }
+
+    let read_state = state.clone();
+    let root_ids = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<i64>> {
+        let database = read_state
+            .open_read_database()?
+            .ok_or_else(|| anyhow::anyhow!("read database unexpectedly unavailable"))?;
+        Ok(database
+            .list_roots()?
+            .into_iter()
+            .map(|root| root.id)
+            .collect())
+    })
+    .await??;
+
+    // Snapshot the cache once up front, outside any writer job, rather than
+    // holding the lock across the per-root dispatch loop below.
+    let reachable_by_root_id: HashMap<i64, bool> = state
+        .root_reachability
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+
+    let mut enqueued_count = 0usize;
+    for root_id in root_ids {
+        let is_reachable = *reachable_by_root_id.get(&root_id).unwrap_or(&true);
+        if !is_reachable {
+            continue;
+        }
+        enqueued_count += state
+            .writer
+            .write(move |database| enqueue_transient_retry_for_root(database, root_id))
+            .await?;
+    }
+    Ok(enqueued_count)
+}
+
+/// Re-enqueues one root's `failed AND failure_kind = 'transient'` thumbnails
+/// via the existing `RetryFailedAndStale` bulk enqueue path, capped at
+/// `TRANSIENT_RETRY_SWEEP_PER_ROOT_LIMIT`. Shared by `sweep_transient_retries`
+/// (one writer job per root in production) and `run_transient_retry_sweep`
+/// (the in-memory/test fallback that loops over all roots in one job).
+fn enqueue_transient_retry_for_root(database: &Database, root_id: i64) -> anyhow::Result<usize> {
+    let scope = ThumbnailCacheScope {
+        root_id: Some(root_id),
+        folder_id: None,
+        include_descendants: false,
+    };
+    let result = database.enqueue_thumbnail_cache_tasks(
+        scope,
+        ThumbnailCacheRefreshMode::RetryFailedAndStale,
+        TRANSIENT_RETRY_SWEEP_PER_ROOT_LIMIT,
+        None,
+    )?;
+    Ok(result.accepted_count)
+}
+
 /// Pure sweep logic, run once: lists every enabled root, skips any the
 /// reachability cache marks unreachable (a cache miss defaults to reachable,
 /// matching `routes::list_roots`'s overlay so a not-yet-probed root is never
@@ -326,6 +399,12 @@ fn spawn_transient_retry_sweep(state: &AppState) {
 /// AND failure_kind = 'transient'` thumbnails via the existing
 /// `RetryFailedAndStale` bulk enqueue path. Returns the total number of
 /// thumbnails accepted for retry across all roots this call.
+///
+/// This is the synchronous kernel the unit tests below exercise directly
+/// against a single in-memory connection. In production it is only reached
+/// via `sweep_transient_retries`'s in-memory/test fallback branch — the
+/// file-backed path enumerates roots on a read-only connection and dispatches
+/// one writer job per root instead (see `sweep_transient_retries` for why).
 pub(crate) fn run_transient_retry_sweep(
     database: &Database,
     reachability: &RootReachability,
@@ -344,18 +423,7 @@ pub(crate) fn run_transient_retry_sweep(
         if !is_reachable {
             continue;
         }
-        let scope = ThumbnailCacheScope {
-            root_id: Some(root.id),
-            folder_id: None,
-            include_descendants: false,
-        };
-        let result = database.enqueue_thumbnail_cache_tasks(
-            scope,
-            ThumbnailCacheRefreshMode::RetryFailedAndStale,
-            TRANSIENT_RETRY_SWEEP_PER_ROOT_LIMIT,
-            None,
-        )?;
-        enqueued_count += result.accepted_count;
+        enqueued_count += enqueue_transient_retry_for_root(database, root.id)?;
     }
     Ok(enqueued_count)
 }
