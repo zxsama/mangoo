@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Per-root reachability cache: root_id -> last-probed reachable state.
+#[allow(dead_code)] // consumed by Task 4 (RootRecord.reachable)
 pub type RootReachability = Arc<Mutex<HashMap<i64, bool>>>;
 
 /// True iff the root's own directory can be stat'd as a directory right now.
 /// One syscall stands in for the whole share's online status: unreachable root
 /// path == NAS offline. Any error (network down, permission, timeout) => false.
+#[allow(dead_code)] // consumed by Task 4 (RootRecord.reachable)
 pub fn probe_root_reachable(path: &str) -> bool {
     if path.is_empty() {
         return false;
@@ -15,6 +17,7 @@ pub fn probe_root_reachable(path: &str) -> bool {
 }
 
 /// Probes every root's path and replaces the cache wholesale with the fresh results.
+#[allow(dead_code)] // consumed by Task 6 (retry sweep)
 pub fn refresh_root_reachability(reach: &RootReachability, roots: &[(i64, String)]) {
     let mut next = HashMap::with_capacity(roots.len());
     for (id, path) in roots {
@@ -35,9 +38,8 @@ mod tests {
     fn probe_root_reachable_true_for_existing_dir_false_for_missing() {
         let dir = std::env::temp_dir();
         assert!(probe_root_reachable(dir.to_str().unwrap()));
-        assert!(!probe_root_reachable(
-            r"\\?\UNC\10.255.255.1\nonexistent\share"
-        ));
+        let missing = std::env::temp_dir().join("megle-reachability-nonexistent-zzz");
+        assert!(!probe_root_reachable(missing.to_str().unwrap()));
         assert!(!probe_root_reachable(""));
     }
 
@@ -45,7 +47,11 @@ mod tests {
     fn refresh_root_reachability_replaces_map_with_fresh_probe_results() {
         let dir = std::env::temp_dir();
         let existing_path = dir.to_str().unwrap().to_string();
-        let missing_path = r"\\?\UNC\10.255.255.1\nonexistent\share".to_string();
+        let missing_path = std::env::temp_dir()
+            .join("megle-reachability-nonexistent-zzz")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let reach: RootReachability = Arc::new(Mutex::new(HashMap::new()));
         // Seed with a stale value for a root id that will be probed again, to
