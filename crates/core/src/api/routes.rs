@@ -963,6 +963,42 @@ async fn enqueue_thumbnail_cache(
         folder_id: body.folder_id,
         include_descendants: body.include_descendants.unwrap_or(false),
     };
+    // Manual "retry failed/stale" (Settings -> retry button) is the one enqueue
+    // path a user can trigger directly against a root the background
+    // reachability probe already knows is offline (NAS unplugged, share
+    // unmounted). Without this gate the button would reset every
+    // transient-failed row in scope back to `queued`, the worker would
+    // immediately fail them again against the unreachable path, and the
+    // frontend's poll loop (`enqueueThumbnailCacheLoop`) would keep re-issuing
+    // the same request since something was "accepted" each round — hammering a
+    // known-offline root exactly like `sweep_transient_retries`
+    // (`api/mod.rs`) is designed to avoid for the background sweep. Short-
+    // circuiting to a zero-accepted response lets the frontend loop's existing
+    // `acceptedCount === 0` termination stop it without resetting any rows or
+    // waking a worker. Only gates `RetryFailedAndStale` scoped to one root:
+    // `MissingOnly`/`StaleOrMissing` enqueues (including the whole-library
+    // "generate all" paginated pass) never reset already-failed rows, so they
+    // stay ungated; a root-less scope (no root selected) also stays ungated,
+    // matching `sweep_transient_retries`' "absent id defaults reachable"
+    // convention.
+    if refresh_mode == ThumbnailCacheRefreshMode::RetryFailedAndStale {
+        if let Some(root_id) = scope.root_id {
+            let is_reachable = state
+                .root_reachability
+                .lock()
+                .map(|guard| *guard.get(&root_id).unwrap_or(&true))
+                .unwrap_or(true);
+            if !is_reachable {
+                let response = thumbnail_cache_enqueue_response(ThumbnailCacheEnqueueResult {
+                    accepted_count: 0,
+                    task_id_to_wake: None,
+                    stats: ThumbnailCacheStats::default(),
+                    next_cursor: None,
+                });
+                return Ok((StatusCode::ACCEPTED, Json(response)));
+            }
+        }
+    }
     let file_ids = body.file_ids.unwrap_or_default();
     let limit = body.limit.unwrap_or(256).clamp(1, 4096);
     // Keyset cursor for the whole-library "generate all" pass. When present,
@@ -3038,6 +3074,173 @@ mod tests {
                     && task.priority == crate::db::THUMBNAIL_BULK_PRIORITY
             });
         assert!(retry_task.is_some());
+        let _ = fs::remove_dir_all(db_dir);
+    }
+
+    // Gap A: manual "retry failed/stale" must not hammer a root the
+    // reachability probe already knows is offline. Covers both sides of the
+    // gate added to `enqueue_thumbnail_cache` (routes.rs) — unreachable short-
+    // circuits to a zero-accepted response without touching the row, reachable
+    // (or an unprobed/miss root) falls through to the existing enqueue.
+    #[tokio::test]
+    async fn thumbnail_cache_enqueue_route_skips_retry_on_unreachable_root() {
+        let db_dir = unique_temp_dir();
+        fs::create_dir_all(&db_dir).expect("create db dir");
+        let db_path = db_dir.join("megle.sqlite");
+        let (database, inspector) = test_database_pair(db_path);
+        let (root_id, folder_id) =
+            seed_thumbnail_cache_scope_fixture(&database, "cache-enqueue-unreachable");
+        let failed_file_id = seed_thumbnail_cache_candidate(
+            &database,
+            root_id,
+            folder_id,
+            "failed.jpg",
+            "failed",
+            false,
+            false,
+        );
+        database
+            .set_thumbnail_failure_kind_for_test(
+                failed_file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                "transient",
+            )
+            .expect("classify seeded failure as transient");
+        let state = AppState::new(database);
+        state
+            .root_reachability
+            .lock()
+            .expect("lock reachability cache")
+            .insert(root_id, false);
+        let app = router(state.clone());
+
+        // Case 1: root marked unreachable. The handler must short-circuit to
+        // an accepted-count-0 response and leave the failed row untouched.
+        let unreachable_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/tasks/thumbnail-cache")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        "{{\"rootId\":{root_id},\"folderId\":{folder_id},\"includeDescendants\":false,\"refreshMode\":\"retryFailedAndStale\",\"limit\":4}}"
+                    )))
+                    .expect("build retry request against unreachable root"),
+            )
+            .await
+            .expect("enqueue retry thumbnail cache against unreachable root");
+        assert_eq!(unreachable_response.status(), StatusCode::ACCEPTED);
+        let unreachable_body = response_json(unreachable_response).await;
+        assert_eq!(unreachable_body["acceptedCount"], 0);
+        assert_eq!(unreachable_body.get("nextCursor"), None);
+
+        let untouched_thumb = inspector
+            .get_thumbnail(failed_file_id, crate::thumbnails::GRID_320_PROFILE)
+            .expect("read thumb after unreachable retry attempt")
+            .expect("thumb row still exists");
+        assert_eq!(untouched_thumb.state, "failed");
+
+        let no_retry_task = inspector
+            .list_tasks()
+            .expect("list tasks after unreachable retry attempt")
+            .into_iter()
+            .find(|task| task.file_id == Some(failed_file_id));
+        assert!(
+            no_retry_task.is_none(),
+            "unreachable root must not enqueue a retry task"
+        );
+
+        // Case 2: root becomes reachable again (mirrors the reachability
+        // probe's next 30s tick clearing a transient NAS blip). The same
+        // request now falls through to the existing enqueue behavior.
+        state
+            .root_reachability
+            .lock()
+            .expect("lock reachability cache")
+            .insert(root_id, true);
+        let reachable_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/tasks/thumbnail-cache")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        "{{\"rootId\":{root_id},\"folderId\":{folder_id},\"includeDescendants\":false,\"refreshMode\":\"retryFailedAndStale\",\"limit\":4}}"
+                    )))
+                    .expect("build retry request against reachable root"),
+            )
+            .await
+            .expect("enqueue retry thumbnail cache against reachable root");
+        assert_eq!(reachable_response.status(), StatusCode::ACCEPTED);
+        let reachable_body = response_json(reachable_response).await;
+        assert_eq!(reachable_body["acceptedCount"], 1);
+
+        let retry_task = inspector
+            .list_tasks()
+            .expect("list tasks after reachable retry attempt")
+            .into_iter()
+            .find(|task| {
+                task.file_id == Some(failed_file_id)
+                    && task.priority == crate::db::THUMBNAIL_BULK_PRIORITY
+            });
+        assert!(retry_task.is_some());
+        let _ = fs::remove_dir_all(db_dir);
+    }
+
+    // Only `RetryFailedAndStale` is gated by root reachability; a plain
+    // `staleOrMissing` request (e.g. the whole-library "generate all" pass,
+    // which also carries a concrete `rootId`) must keep enqueuing even while
+    // the root is marked unreachable — it never resets an already-failed row,
+    // so there is nothing for the gate to protect against there.
+    #[tokio::test]
+    async fn thumbnail_cache_enqueue_route_stale_mode_ignores_root_reachability_gate() {
+        let db_dir = unique_temp_dir();
+        fs::create_dir_all(&db_dir).expect("create db dir");
+        let db_path = db_dir.join("megle.sqlite");
+        let (database, inspector) = test_database_pair(db_path);
+        let (root_id, folder_id) =
+            seed_thumbnail_cache_scope_fixture(&database, "cache-enqueue-stale-unreachable");
+        let missing_file_id = seed_thumbnail_cache_candidate(
+            &database,
+            root_id,
+            folder_id,
+            "missing.jpg",
+            "absent",
+            false,
+            false,
+        );
+        let state = AppState::new(database);
+        state
+            .root_reachability
+            .lock()
+            .expect("lock reachability cache")
+            .insert(root_id, false);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/tasks/thumbnail-cache")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        "{{\"rootId\":{root_id},\"folderId\":{folder_id},\"includeDescendants\":false,\"refreshMode\":\"staleOrMissing\",\"limit\":4}}"
+                    )))
+                    .expect("build stale request against unreachable root"),
+            )
+            .await
+            .expect("enqueue stale thumbnail cache against unreachable root");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(body["acceptedCount"], 1);
+
+        let queued_task = inspector
+            .list_tasks()
+            .expect("list tasks after stale enqueue on unreachable root")
+            .into_iter()
+            .find(|task| task.file_id == Some(missing_file_id));
+        assert!(queued_task.is_some());
         let _ = fs::remove_dir_all(db_dir);
     }
 
