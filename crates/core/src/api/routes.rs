@@ -2983,6 +2983,15 @@ mod tests {
             false,
             false,
         );
+        // Task 5: automatic `retryFailedAndStale` only treats `failed` as a
+        // candidate when the row is classified `transient`.
+        database
+            .set_thumbnail_failure_kind_for_test(
+                failed_file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                "transient",
+            )
+            .expect("classify seeded failure as transient");
         let app = router(AppState::new(database));
 
         let missing_only_response = app

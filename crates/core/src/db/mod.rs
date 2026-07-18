@@ -2156,6 +2156,28 @@ impl Database {
         self.update_task_scan_progress_for_attempt(task_id, attempt_generation, progress)
     }
 
+    /// Test-only: classify a seeded `failed` thumbnail row's `failure_kind`
+    /// directly, without going through a task-attempt-guarded publish call.
+    /// Fixtures across the crate seed failed rows via `upsert_thumbnail_state`
+    /// (which never touches `failure_kind`), so the Task 5 automatic
+    /// `RetryFailedAndStale` transient-only gate needs an explicit way to mark
+    /// a seeded row `transient` or `permanent` in tests outside `db::tests`
+    /// (private field access to `self.connection` doesn't cross module
+    /// boundaries).
+    #[cfg(test)]
+    pub(crate) fn set_thumbnail_failure_kind_for_test(
+        &self,
+        file_id: i64,
+        profile: &str,
+        failure_kind: &str,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "UPDATE thumbs SET failure_kind = ?1 WHERE file_id = ?2 AND profile = ?3",
+            (failure_kind, file_id, profile),
+        )?;
+        Ok(())
+    }
+
     pub fn update_task_scan_progress_for_attempt(
         &self,
         task_id: i64,
@@ -3049,6 +3071,11 @@ impl Database {
 
     /// Transaction-bound twin of [`Database::reset_failed_thumbnail_for_manual_retry`]
     /// so batch enqueue can reset failed rows inside its single transaction.
+    /// Only resets rows classified `transient` — this is the automatic bulk
+    /// `RetryFailedAndStale` path (called from `enqueue_thumbnail_cache_entries`
+    /// / `enqueue_thumbnail_cache_tasks_for_file_ids`, never from the explicit
+    /// per-task `retry_task` -> `retry_thumbnail_task` chain, which resets its
+    /// task/thumbnail rows directly and is unaffected by this gate).
     fn reset_failed_thumbnail_for_manual_retry_in_transaction(
         transaction: &Transaction<'_>,
         file_id: i64,
@@ -3069,6 +3096,7 @@ impl Database {
             WHERE file_id = ?2
               AND profile = ?3
               AND state = 'failed'
+              AND failure_kind = 'transient'
             "#,
             (unix_timestamp(), file_id, profile),
         )?;
@@ -3307,6 +3335,9 @@ impl Database {
         })
     }
 
+    /// Only resets rows classified `transient` — see the `_in_transaction`
+    /// twin's doc comment above for why this gate is safe for its (automatic
+    /// bulk enqueue only) callers.
     fn reset_failed_thumbnail_for_manual_retry(
         &self,
         file_id: i64,
@@ -3327,6 +3358,7 @@ impl Database {
             WHERE file_id = ?2
               AND profile = ?3
               AND state = 'failed'
+              AND failure_kind = 'transient'
             "#,
             (unix_timestamp(), file_id, profile),
         )?;
@@ -6959,7 +6991,13 @@ fn thumbnail_cache_refresh_mode_sql_condition(refresh_mode: ThumbnailCacheRefres
             "cache_status IN ('missing', 'stale')".to_string()
         }
         ThumbnailCacheRefreshMode::RetryFailedAndStale => {
-            "cache_status IN ('missing', 'stale', 'failed')".to_string()
+            // Automatic bulk retry candidates: `failed` only qualifies when the
+            // stored failure was classified `transient` (NAS blip, timeout,
+            // etc). `permanent` failures (bad format, corrupt file, ...) never
+            // enter the automatic candidate set — they still surface to the
+            // user and remain retryable via the explicit single-task
+            // `retry_task` path, which does not go through this query.
+            "(cache_status IN ('missing', 'stale') OR (cache_status = 'failed' AND failure_kind = 'transient'))".to_string()
         }
     }
 }
@@ -7063,6 +7101,7 @@ fn thumbnail_cache_candidate_query(
                 thumbs.source_fingerprint AS source_fingerprint,
                 thumbs.served_by AS served_by,
                 thumbs.updated_at AS updated_at,
+                thumbs.failure_kind AS failure_kind,
                 CASE WHEN thumb_blobs.file_id IS NULL THEN 0 ELSE 1 END AS has_blob,
                 COALESCE(thumb_blobs.byte_size, 0) AS blob_byte_size,
                 {status_expression} AS cache_status,
@@ -7104,7 +7143,8 @@ fn thumbnail_cache_pending_bulk_task_query(
         FROM (
             SELECT
                 files.id AS file_id,
-                {status_expression} AS cache_status
+                {status_expression} AS cache_status,
+                thumbs.failure_kind AS failure_kind
             FROM files
             JOIN roots ON roots.id = files.root_id
             LEFT JOIN media ON media.file_id = files.id
@@ -11107,6 +11147,16 @@ mod tests {
             None,
             None,
         );
+        // `RetryFailedAndStale` only treats `transient` failures as automatic
+        // retry candidates (Task 5); this fixture's failed row must be
+        // classified as such to keep exercising that path below.
+        database
+            .connection
+            .execute(
+                "UPDATE thumbs SET failure_kind = 'transient' WHERE file_id = ?1",
+                [failed_file_id],
+            )
+            .expect("classify seeded failure as transient");
 
         let stats = database
             .get_thumbnail_cache_stats(ThumbnailCacheScope {
@@ -11169,6 +11219,208 @@ mod tests {
                     && task.file_id == Some(failed_file_id)
             });
         assert!(failed_bulk_task.is_some());
+    }
+
+    #[test]
+    fn retry_failed_and_stale_candidate_gate_only_retries_transient_failures() {
+        // Task 5: the automatic `RetryFailedAndStale` bulk enqueue must treat
+        // `state = 'failed'` as a candidate only when `failure_kind =
+        // 'transient'`. A `permanent` failure (bad format, corrupt file, ...)
+        // must never be picked up by this batch path.
+        let database = migrated_database();
+        let (root_id, folder_id) =
+            seed_thumbnail_cache_scope_fixture(&database, "cache-retry-gate");
+
+        let transient_file_id = seed_thumbnail_cache_candidate(
+            &database,
+            root_id,
+            folder_id,
+            "transient-failed.jpg",
+            Some("candidate-transient-failed"),
+            "failed",
+            false,
+            None,
+            None,
+        );
+        database
+            .connection
+            .execute(
+                "UPDATE thumbs SET failure_kind = 'transient' WHERE file_id = ?1",
+                [transient_file_id],
+            )
+            .expect("classify transient failure");
+
+        let permanent_file_id = seed_thumbnail_cache_candidate(
+            &database,
+            root_id,
+            folder_id,
+            "permanent-failed.jpg",
+            Some("candidate-permanent-failed"),
+            "failed",
+            false,
+            None,
+            None,
+        );
+        database
+            .connection
+            .execute(
+                "UPDATE thumbs SET failure_kind = 'permanent' WHERE file_id = ?1",
+                [permanent_file_id],
+            )
+            .expect("classify permanent failure");
+
+        let scope = ThumbnailCacheScope {
+            root_id: Some(root_id),
+            folder_id: Some(folder_id),
+            include_descendants: false,
+        };
+        let result = database
+            .enqueue_thumbnail_cache_tasks(
+                scope,
+                ThumbnailCacheRefreshMode::RetryFailedAndStale,
+                4,
+                None,
+            )
+            .expect("enqueue retry-failed-and-stale candidates");
+        assert_eq!(
+            result.accepted_count, 1,
+            "only the transient failure should be accepted as an automatic retry candidate"
+        );
+
+        let transient_thumbnail = database
+            .get_thumbnail(transient_file_id, crate::thumbnails::GRID_320_PROFILE)
+            .expect("get transient thumbnail")
+            .expect("transient thumbnail exists");
+        assert_eq!(
+            transient_thumbnail.state, "queued",
+            "transient failure must be requeued by the automatic retry gate"
+        );
+
+        let permanent_thumbnail = database
+            .get_thumbnail(permanent_file_id, crate::thumbnails::GRID_320_PROFILE)
+            .expect("get permanent thumbnail")
+            .expect("permanent thumbnail exists");
+        assert_eq!(
+            permanent_thumbnail.state, "failed",
+            "permanent failure must never be touched by the automatic retry gate"
+        );
+
+        let tasks = database.list_tasks().expect("list tasks after retry gate");
+        let transient_task = tasks.iter().find(|task| {
+            task.kind == "thumbnail"
+                && task.priority == THUMBNAIL_BULK_PRIORITY
+                && task.file_id == Some(transient_file_id)
+        });
+        assert!(
+            transient_task.is_some(),
+            "transient failure must get a bulk retry task"
+        );
+        let permanent_task = tasks.iter().find(|task| {
+            task.kind == "thumbnail"
+                && task.priority == THUMBNAIL_BULK_PRIORITY
+                && task.file_id == Some(permanent_file_id)
+        });
+        assert!(
+            permanent_task.is_none(),
+            "permanent failure must not get an automatic bulk retry task"
+        );
+    }
+
+    #[test]
+    fn manual_retry_task_still_retries_permanent_failure() {
+        // Task 5: the explicit single-task `retry_task` -> `retry_thumbnail_task`
+        // path is the user clicking "retry" on one item. It must remain able to
+        // retry ANY failed thumbnail task, including one whose thumbnail row was
+        // classified `permanent` — the transient-only gate applies solely to the
+        // automatic `RetryFailedAndStale` bulk candidate query, which this path
+        // never calls.
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_media_page_fixture(&database);
+        let file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "manual-retry-permanent.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 100,
+                mtime: 10,
+                ctime: None,
+                file_key: Some("manual-retry-permanent-source".to_string()),
+            })
+            .expect("insert file");
+        database
+            .upsert_media_kind(file_id, "image")
+            .expect("insert media kind");
+        let source_fingerprint = database
+            .get_thumbnail_source(file_id)
+            .expect("get source")
+            .expect("source exists")
+            .source_fingerprint(crate::thumbnails::GRID_320_PROFILE);
+
+        let request = database
+            .request_thumbnail_task(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                ThumbnailTaskPriority::Visible,
+            )
+            .expect("request thumbnail");
+        let task_id = request.task_id.expect("thumbnail task id");
+        let attempt_generation = database
+            .get_task(task_id)
+            .expect("get task")
+            .expect("task exists")
+            .attempt_generation;
+        database
+            .mark_thumbnail_task_running_for_attempt(
+                task_id,
+                attempt_generation,
+                &source_fingerprint,
+            )
+            .expect("mark thumbnail running");
+        let published = database
+            .publish_thumbnail_failure_for_attempted_source_for_task_attempt(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                Some(source_fingerprint.as_str()),
+                "thumbnail decode failed: unsupported format",
+                "permanent",
+                task_id,
+                attempt_generation,
+            )
+            .expect("publish permanent failure");
+        assert!(published);
+        database
+            .mark_task_failed_current_attempt_for_test(
+                task_id,
+                "thumbnail decode failed: unsupported format",
+            )
+            .expect("mark task failed");
+
+        let (state, failure_kind): (String, Option<String>) = database
+            .connection
+            .query_row(
+                "SELECT state, failure_kind FROM thumbs WHERE file_id = ?1 AND profile = ?2",
+                (file_id, crate::thumbnails::GRID_320_PROFILE),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query thumbs row before retry");
+        assert_eq!(state, "failed");
+        assert_eq!(failure_kind.as_deref(), Some("permanent"));
+
+        // The user explicitly retries this one failed task.
+        let retried = database
+            .retry_task(task_id)
+            .expect("manual retry of a permanent failure must succeed");
+        assert_eq!(retried.status, "pending");
+
+        let thumbnail = database
+            .get_thumbnail(file_id, crate::thumbnails::GRID_320_PROFILE)
+            .expect("get thumbnail")
+            .expect("thumbnail exists");
+        assert_eq!(
+            thumbnail.state, "queued",
+            "manual retry must requeue the thumbnail regardless of failure_kind"
+        );
     }
 
     #[test]
