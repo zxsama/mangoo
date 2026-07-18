@@ -267,6 +267,7 @@ for (const [name, line] of [
 }
 
 assertOperationParameters("listFolderChildren", ["folderId", "limit", "cursor", "includeDescendants"]);
+assertOperationParameters("listFolderAncestors", ["folderId"]);
 assertOperationParameters("listMedia", ["rootId", "folderId", "limit", "offset", "cursor", "sort", "kind"]);
 assertOperationParameters("getMedia", ["fileId"]);
 assertOperationParameters("getThumbnail", ["fileId", "target", "priority"]);
@@ -282,6 +283,7 @@ for (const method of [
   "enqueueInteractiveFolderScan",
   "syncThumbnailPriorityScope",
   "listFolderChildren",
+  "listFolderAncestors",
   "listMedia",
   "getMedia",
   "getThumbnail",
@@ -407,6 +409,14 @@ if (
   )
 ) {
   fail("client.ts listFolderChildren must accept typed limit/cursor params, serialize them, and forward abort signals");
+}
+
+if (
+  !/listFolderAncestors:\s*\(\s*folderId:\s*number,\s*options:\s*CoreRequestOptions\s*=\s*\{\}\s*\)\s*=>[\s\S]*?request<Page<FolderRecord>>\(`\/folders\/\$\{folderId\}\/ancestors`,\s*\{[\s\S]*?requestPriority:\s*options\.requestPriority\s*\?\?\s*"navigation",[\s\S]*?signal:\s*options\.signal\s*\}\)/.test(
+    client
+  )
+) {
+  fail("client.ts listFolderAncestors must request the ordered folder path and forward abort signals");
 }
 
 if (

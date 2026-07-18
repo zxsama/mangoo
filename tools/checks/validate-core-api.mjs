@@ -68,6 +68,7 @@ const expectedAxumRoutes = [
   "/api/roots",
   "/api/roots/:root_id",
   "/api/folders/:folder_id/children",
+  "/api/folders/:folder_id/ancestors",
   "/api/media",
   "/api/media/:file_id",
   "/api/media/:file_id/thumbnail",
@@ -486,6 +487,12 @@ const folderChildrenOperation = operationBlock("/folders/{folderId}/children", "
 if (!folderChildrenOperation.includes('"400"') || !folderChildrenOperation.includes("ErrorResponse")) {
   fail("OpenAPI GET /folders/{folderId}/children must document invalid cursor 400 ErrorResponse");
 }
+const folderAncestorsOperation = operationBlock("/folders/{folderId}/ancestors", "get");
+for (const value of ["operationId: listFolderAncestors", '"200"', '"404"', "FolderListResponse", "ErrorResponse"]) {
+  if (!folderAncestorsOperation.includes(value)) {
+    fail(`OpenAPI GET /folders/{folderId}/ancestors missing ${value}`);
+  }
+}
 if (!functionBody("list_tasks").includes("database.list_tasks")) {
   fail("GET /api/tasks must return persisted task rows");
 }
@@ -499,6 +506,7 @@ if (
 for (const name of [
   "list_roots",
   "list_folder_children",
+  "list_folder_ancestors",
   "list_media",
   "get_media",
   "get_thumbnail_blob",

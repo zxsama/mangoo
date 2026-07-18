@@ -338,6 +338,8 @@ pub struct FolderRecord {
     pub media_count: i64,
 }
 
+const FOLDER_ANCESTOR_DEPTH_CAP: i64 = 4096;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaRecord {
@@ -3776,6 +3778,83 @@ impl Database {
             next_cursor,
             total_count: None,
         })
+    }
+
+    /// Returns the active folder path in root-to-target order. The recursive
+    /// walk is bounded and carries visited ids so a corrupt parent chain
+    /// cannot run indefinitely; malformed chains are returned as errors for
+    /// the API layer to expose as a server error rather than a false 404.
+    pub fn list_folder_ancestors(
+        &self,
+        folder_id: i64,
+    ) -> anyhow::Result<Option<Vec<FolderRecord>>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            WITH RECURSIVE ancestors(
+                id, root_id, parent_id, name, status, depth, visited
+            ) AS (
+                SELECT folders.id, folders.root_id, folders.parent_id, folders.name,
+                       folders.status, 0, ',' || folders.id || ','
+                FROM folders
+                JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
+                WHERE folders.id = ?1 AND folders.status = 'active'
+                UNION ALL
+                SELECT parent.id, parent.root_id, parent.parent_id, parent.name,
+                       parent.status, ancestors.depth + 1,
+                       ancestors.visited || parent.id || ','
+                FROM ancestors
+                JOIN folders parent
+                  ON parent.id = ancestors.parent_id
+                 AND parent.root_id = ancestors.root_id
+                 AND parent.status = 'active'
+                WHERE ancestors.depth + 1 < ?2
+                  AND instr(ancestors.visited, ',' || parent.id || ',') = 0
+            )
+            SELECT ancestors.id, ancestors.root_id, ancestors.parent_id,
+                   ancestors.name, ancestors.status,
+                   EXISTS(
+                       SELECT 1 FROM folders child
+                       WHERE child.parent_id = ancestors.id
+                         AND child.status = 'active'
+                   ) AS has_children
+            FROM ancestors
+            ORDER BY ancestors.depth DESC
+            "#,
+        )?;
+        let rows = statement.query_map((folder_id, FOLDER_ANCESTOR_DEPTH_CAP), |row| {
+            Ok(FolderRecord {
+                id: row.get(0)?,
+                root_id: row.get(1)?,
+                parent_id: row.get(2)?,
+                name: row.get(3)?,
+                status: row.get(4)?,
+                has_children: row.get(5)?,
+                media_count: 0,
+            })
+        })?;
+
+        let mut ancestors = Vec::new();
+        for row in rows {
+            ancestors.push(row?);
+        }
+        drop(statement);
+        let Some(first) = ancestors.first() else {
+            return Ok(None);
+        };
+        if first.parent_id.is_some() {
+            anyhow::bail!(
+                "invalid folder ancestor chain for {folder_id}: cycle, missing parent, or depth cap exceeded"
+            );
+        }
+
+        for folder in &mut ancestors {
+            folder.media_count = self
+                .folder_subtree_media_counts(folder.id)?
+                .get(&folder.id)
+                .copied()
+                .unwrap_or(0);
+        }
+        Ok(Some(ancestors))
     }
 
     #[cfg(test)]
@@ -9787,6 +9866,120 @@ mod tests {
             .expect("list second child page");
         assert_eq!(folder_names(&second_page.items), vec!["charlie"]);
         assert!(second_page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn list_folder_ancestors_returns_root_to_leaf_and_handles_missing_and_cycles() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures".to_string(),
+                display_name: "Pictures".to_string(),
+            })
+            .expect("add root");
+        let root_folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "root-hash".to_string(),
+                mtime: Some(1),
+            })
+            .expect("insert root folder");
+        let child_folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: Some(root_folder_id),
+                name: "child".to_string(),
+                path_hash: "child-hash".to_string(),
+                mtime: Some(2),
+            })
+            .expect("insert child folder");
+        let leaf_folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: Some(child_folder_id),
+                name: "leaf".to_string(),
+                path_hash: "leaf-hash".to_string(),
+                mtime: Some(3),
+            })
+            .expect("insert leaf folder");
+
+        let ancestors = database
+            .list_folder_ancestors(leaf_folder_id)
+            .expect("list folder ancestors")
+            .expect("leaf folder exists");
+        assert_eq!(folder_names(&ancestors), vec!["", "child", "leaf"]);
+        assert_eq!(
+            ancestors.iter().map(|folder| folder.id).collect::<Vec<_>>(),
+            vec![root_folder_id, child_folder_id, leaf_folder_id]
+        );
+        assert_eq!(ancestors[0].parent_id, None);
+        assert!(database
+            .list_folder_ancestors(999_999)
+            .expect("missing folder lookup")
+            .is_none());
+
+        database
+            .connection
+            .execute(
+                "UPDATE folders SET parent_id = ?1 WHERE id = ?1",
+                [child_folder_id],
+            )
+            .expect("inject folder cycle");
+        assert!(
+            database.list_folder_ancestors(child_folder_id).is_err(),
+            "cyclic folder paths must fail instead of looping"
+        );
+    }
+
+    #[test]
+    fn list_folder_ancestors_enforces_depth_cap() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures".to_string(),
+                display_name: "Pictures".to_string(),
+            })
+            .expect("add root");
+        let root_folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "root-hash".to_string(),
+                mtime: Some(1),
+            })
+            .expect("insert root folder");
+
+        let transaction = database
+            .connection
+            .unchecked_transaction()
+            .expect("start deep folder transaction");
+        let mut parent_id = root_folder_id;
+        for depth in 0..FOLDER_ANCESTOR_DEPTH_CAP {
+            let folder_id = root_folder_id + depth + 1;
+            transaction
+                .execute(
+                    "INSERT INTO folders(id, root_id, parent_id, name, path_hash, mtime) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (
+                        folder_id,
+                        root_id,
+                        parent_id,
+                        format!("folder-{depth}"),
+                        format!("hash-{depth}"),
+                        1,
+                    ),
+                )
+                .expect("insert deep folder");
+            parent_id = folder_id;
+        }
+        transaction.commit().expect("commit deep folder chain");
+
+        assert!(
+            database.list_folder_ancestors(parent_id).is_err(),
+            "folder paths beyond the cap must fail promptly"
+        );
     }
 
     #[test]

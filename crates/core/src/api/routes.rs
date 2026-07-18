@@ -79,6 +79,7 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/roots",
     "/api/roots/{rootId}",
     "/api/folders/{folderId}/children",
+    "/api/folders/{folderId}/ancestors",
     "/api/media",
     "/api/media/{fileId}",
     "/api/media/{fileId}/thumbnail",
@@ -484,6 +485,10 @@ pub fn router(state: AppState) -> Router {
             "/api/folders/:folder_id/children",
             get(list_folder_children),
         )
+        .route(
+            "/api/folders/:folder_id/ancestors",
+            get(list_folder_ancestors),
+        )
         .route("/api/media", get(list_media))
         .route("/api/media/:file_id", get(get_media))
         .route("/api/media/:file_id/thumbnail", get(get_thumbnail))
@@ -731,6 +736,22 @@ async fn list_folder_children(
         items: page.items,
         next_cursor: page.next_cursor,
         total_count: page.total_count,
+    }))
+}
+
+async fn list_folder_ancestors(
+    State(state): State<AppState>,
+    Path(folder_id): Path<i64>,
+) -> ApiResult<Json<ListResponse<FolderRecord>>> {
+    let ancestors = run_read_database(state, move |database| {
+        Ok(database.list_folder_ancestors(folder_id)?)
+    })
+    .await?
+    .ok_or_else(|| CoreError::not_found(format!("folder not found: {folder_id}")))?;
+    Ok(Json(ListResponse {
+        items: ancestors,
+        next_cursor: None,
+        total_count: None,
     }))
 }
 
@@ -2216,6 +2237,30 @@ mod tests {
         assert_eq!(body["items"].as_array().expect("items").len(), 1);
         assert_eq!(body["items"][0]["name"], "photos");
         assert_eq!(body["items"][0]["mediaCount"], 1);
+        let photos_folder_id = body["items"][0]["id"].as_i64().expect("photos folder id");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/folders/{photos_folder_id}/ancestors"))
+                    .body(Body::empty())
+                    .expect("build folder ancestors request"),
+            )
+            .await
+            .expect("list folder ancestors");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["items"]
+                .as_array()
+                .expect("ancestor items")
+                .iter()
+                .map(|item| item["name"].as_str().expect("folder name"))
+                .collect::<Vec<_>>(),
+            vec!["", "photos"]
+        );
 
         let response = app
             .clone()
@@ -2228,6 +2273,19 @@ mod tests {
             )
             .await
             .expect("list missing folder children");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/folders/999999/ancestors")
+                    .body(Body::empty())
+                    .expect("build missing folder ancestors request"),
+            )
+            .await
+            .expect("missing folder ancestors");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app

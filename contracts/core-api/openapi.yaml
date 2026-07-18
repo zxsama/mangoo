@@ -96,6 +96,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /folders/{folderId}/ancestors:
+    get:
+      operationId: listFolderAncestors
+      description: Return the target folder's path from its library root to the target folder.
+      parameters:
+        - $ref: "#/components/parameters/folderId"
+      responses:
+        "200":
+          description: Ordered folder path from the library root to the target folder.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FolderListResponse"
+        "404":
+          description: Folder not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /media:
     get:
       operationId: listMedia

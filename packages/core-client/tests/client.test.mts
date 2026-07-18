@@ -429,6 +429,21 @@ describe("createCoreClient", () => {
     assert.equal(recorded[0].signal, controller.signal);
   });
 
+  test("listFolderAncestors requests the ordered folder path", async () => {
+    mockFetch({ items: [], nextCursor: null });
+    await client().listFolderAncestors(42);
+    const url = new URL(recorded[0].url);
+    assert.equal(url.pathname, "/api/folders/42/ancestors");
+    assert.equal(recorded[0].method, "GET");
+  });
+
+  test("listFolderAncestors forwards abort signal", async () => {
+    mockFetch({ items: [], nextCursor: null });
+    const controller = new AbortController();
+    await client().listFolderAncestors(42, { signal: controller.signal });
+    assert.equal(recorded[0].signal, controller.signal);
+  });
+
   test("searchMedia repeats tagId for AND filtering and offset windows", async () => {
     mockFetch({ items: [], nextCursor: null });
     await client().searchMedia({

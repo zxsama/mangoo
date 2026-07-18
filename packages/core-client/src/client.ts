@@ -297,6 +297,11 @@ export function createCoreClient(config: CoreClientConfig) {
         requestPriority: options.requestPriority ?? "navigation",
         signal: options.signal
       }),
+    listFolderAncestors: (folderId: number, options: CoreRequestOptions = {}) =>
+      request<Page<FolderRecord>>(`/folders/${folderId}/ancestors`, {
+        requestPriority: options.requestPriority ?? "navigation",
+        signal: options.signal
+      }),
     listMedia: (params: ListMediaParams = {}, options: CoreRequestOptions = {}) =>
       request<Page<MediaRecord>>(`/media${query(params)}`, {
         requestPriority: options.requestPriority ?? "navigation",
