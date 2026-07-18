@@ -1,4 +1,4 @@
-import { Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Folder, LoaderCircle } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Folder } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import type { FolderRecord, MediaRecord } from "@megle/core-client";
@@ -12,6 +12,7 @@ import {
   thumbnailObjectUrlCacheKey
 } from "../../core/mediaResources";
 import type { SubfolderSiblingPosition } from "./subfolderHierarchy";
+import { MediaLoadingRing } from "../loading/MediaLoadingRing";
 
 interface SubfolderStripProps {
   collapsed: boolean;
@@ -181,7 +182,7 @@ export function SubfolderCard({
           type="button"
         >
           {loadingChildren ? (
-            <LoaderCircle className="subfolder-card-expand-spinner" size={13} />
+            <MediaLoadingRing className="media-loading-ring subfolder-card-expand-spinner" size={13} />
           ) : expanded ? (
             <ChevronLeft size={14} />
           ) : (

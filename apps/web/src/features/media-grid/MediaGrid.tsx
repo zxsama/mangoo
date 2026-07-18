@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { CSSProperties } from "react";
 import type { MediaRecord, ThumbnailResponse } from "@megle/core-client";
 import { FolderLocationIcon } from "../library/FolderLocationIcon";
+import { MediaLoadingIndicator, MediaLoadingRing } from "../loading/MediaLoadingRing";
 import {
   mediaContentSignature,
   mediaFileContentSignature,
@@ -1568,7 +1569,6 @@ export function MediaGrid({
         })}
 
       </div>
-      {loading || loadingMore ? <MediaGridRefreshIndicator label="Refreshing media" /> : null}
     </div>
   );
 }
@@ -2054,11 +2054,21 @@ function shouldRefreshThumbnailState(
   return state === "pending" || state === "queued";
 }
 
-function MediaGridRefreshIndicator({ label }: { label: string }) {
+export function MediaGridRefreshIndicator({
+  active,
+  label
+}: {
+  active: boolean;
+  label: string;
+}) {
   return (
-    <div aria-label={label} className="media-grid-refresh-indicator" role="status">
-      <span className="central-preview-loading-spinner" aria-hidden="true" />
-    </div>
+    <MediaLoadingIndicator
+      active={active}
+      className="media-grid-refresh-indicator"
+      label={label}
+    >
+      <MediaLoadingRing />
+    </MediaLoadingIndicator>
   );
 }
 

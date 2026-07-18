@@ -26,11 +26,16 @@
   --glass-dialog-fill: rgba(8, 12, 16, 0.5);
   --dialog-blur: 18px;
   --dialog-backdrop-dim: rgba(2, 5, 8, 0.52);
-  --scrollbar-thumb: rgba(151, 219, 226, 0.34);
-  --scrollbar-thumb-hover: rgba(151, 219, 226, 0.56);
+  --scrollbar-thumb: rgba(244, 247, 249, 0.34);
+  --scrollbar-thumb-hover: rgba(244, 247, 249, 0.52);
+  /* The rail stays wider for pointer hit testing; only the thumb thickness is
+     visible and is expressed in CSS logical pixels. */
   --scrollbar-size: 10px;
-  --scrollbar-thumb-size: 4px;
-  --media-scrollbar-outset: var(--scrollbar-size);
+  --scrollbar-thumb-size: 5px;
+  /* The vertical thumb's right edge, or horizontal thumb's bottom edge, stays
+     this far inside its owning scroll container. */
+  --scrollbar-edge-inset: 5px;
+  --media-scrollbar-outset: 16px;
   --glass-blur: 26px;
   --glass-elevated-blur: 34px;
   --glass-control-blur: 18px;
@@ -151,9 +156,9 @@ body {
   position: fixed;
   z-index: 240;
   opacity: 0;
-  pointer-events: none;
+  pointer-events: auto;
   background: transparent;
-  transition: opacity 80ms ease;
+  transition: opacity 140ms ease;
 }
 
 .megle-overlay-scrollbar-thumb {
@@ -166,9 +171,10 @@ body {
   background: var(--scrollbar-thumb);
   cursor: pointer;
   opacity: 0;
-  pointer-events: auto;
+  pointer-events: none;
   touch-action: none;
-  transition: opacity 80ms ease;
+  filter: saturate(0);
+  transition: opacity 140ms ease, background-color 140ms ease;
   user-select: none;
   will-change: transform;
 }
@@ -193,9 +199,11 @@ body {
 
 .megle-overlay-scrollbar[data-scrollbar-visible="true"] .megle-overlay-scrollbar-thumb {
   opacity: 0.5;
+  pointer-events: auto;
 }
 
 .megle-overlay-scrollbar[data-scrollbar-hover="true"] .megle-overlay-scrollbar-thumb {
+  background: var(--scrollbar-thumb-hover);
   opacity: 0.75;
 }
 
@@ -550,7 +558,10 @@ body {
   --shell-left-width: 292px;
   --shell-right-width: 270px;
   --shell-column-resizer-width: 10px;
-  --shell-titlebar-height: 58px;
+  --shell-titlebar-height: 50px;
+  --titlebar-control-size: 28px;
+  --titlebar-window-control-width: 32px;
+  --titlebar-window-control-height: 28px;
   display: grid;
   position: relative;
   grid-template-areas: "workbench-left workbench-center workbench-right";
@@ -606,56 +617,31 @@ body {
 
 .shell-column-resizer::after {
   position: absolute;
-  top: 58px;
-  bottom: 10px;
+  top: 0;
+  bottom: 0;
   left: 50%;
   width: 1px;
   border-radius: 999px;
   background: rgba(222, 251, 255, 0.36);
-  box-shadow: 0 0 14px rgba(151, 219, 226, 0.22);
   content: "";
   opacity: 0;
   transform: translateX(-50%);
-  transition: opacity 120ms ease, width 120ms ease;
+  transition: opacity 120ms ease;
 }
 
 .shell-column-resizer:hover::after,
 .shell-column-resizer:focus-visible::after,
 .shell-column-resizer.active::after {
-  width: 2px;
   opacity: 1;
 }
 
-/* Drive the resizer highlight from the shared pointer-DISTANCE calc: the global
-   interactive-affordance system registers .shell-column-resizer and sets
-   --interactive-pointer-opacity by cursor proximity (same as tiles/buttons/tree
-   items), replacing the binary :hover above. Suppress the generic affordance
-   ::before fill glow; the resizer's own 1px-line ::after is the highlight, now
-   faded by distance. active/focus force it fully on. */
-.shell-column-resizer[data-interactive-pointer-target="true"]::before {
-  display: none;
+.shell-column-resizer:hover::after {
+  transition-delay: 500ms;
 }
-.shell-column-resizer[data-interactive-pointer-target="true"]::after {
-  position: absolute;
-  inset: auto;
-  top: 58px;
-  bottom: 10px;
-  left: 50%;
-  width: 1px;
-  padding: 0;
-  border-radius: 999px;
-  background: rgba(222, 251, 255, 0.36);
-  box-shadow: 0 0 14px rgba(151, 219, 226, 0.22);
-  -webkit-mask: none;
-  mask: none;
-  opacity: var(--interactive-pointer-opacity, 0);
-  transform: translateX(-50%);
-  transition: width 120ms ease;
-}
-.shell-column-resizer.active[data-interactive-pointer-target="true"]::after,
-.shell-column-resizer:focus-visible[data-interactive-pointer-target="true"]::after {
-  width: 2px;
-  opacity: 1;
+
+.shell-column-resizer:focus-visible::after,
+.shell-column-resizer.active::after {
+  transition-delay: 0ms;
 }
 
 .shell-column-resizer:focus-visible {
@@ -849,7 +835,7 @@ body {
 
 .shell-titlebar-utility-separator {
   width: 1px;
-  height: 18px;
+  height: 16px;
   flex: 0 0 auto;
   margin-inline: 2px;
   background: var(--text-muted);
@@ -860,11 +846,11 @@ body {
   display: inline-flex;
   flex: 0 1 auto;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   min-width: 0;
   max-width: 168px;
-  height: 34px;
-  padding: 0 9px;
+  height: var(--titlebar-control-size);
+  padding: 0 7px;
   border: 0;
   border-radius: var(--radius-control);
   background: transparent;
@@ -889,7 +875,6 @@ body {
 }
 
 .library-sidebar {
-  --overlay-scrollbar-inline-inset: 4px;
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -1128,7 +1113,7 @@ button:disabled {
 
 .task-drawer-panel {
   position: fixed;
-  top: 74px;
+  top: calc(var(--shell-titlebar-height) + 16px);
   right: 24px;
   bottom: 24px;
   z-index: 140;
@@ -1181,6 +1166,7 @@ button:disabled {
   position: relative;
   flex-direction: column;
   gap: 12px;
+  --media-scrollbar-outset: 16px;
   min-width: 0;
   min-height: 0;
   padding: 0 16px;
@@ -1217,9 +1203,9 @@ button:disabled {
   align-items: center;
   gap: 12px;
   min-width: 0;
-  padding-right: 28px;
-  margin-right: -28px;
-  min-height: 40px;
+  padding-right: var(--titlebar-control-size);
+  margin-right: calc(var(--titlebar-control-size) * -1);
+  min-height: var(--titlebar-control-size);
 }
 
 .titlebar-workspace-summary {
@@ -1318,8 +1304,8 @@ button:disabled {
 
 .titlebar-icon-button {
   display: inline-flex;
-  width: 34px;
-  height: 34px;
+  width: var(--titlebar-control-size);
+  height: var(--titlebar-control-size);
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
@@ -1327,7 +1313,7 @@ button:disabled {
 }
 
 .titlebar-preview-toolbar {
-  --titlebar-preview-side-width: calc((34px * 6) + 1px + (8px * 6));
+  --titlebar-preview-side-width: calc((var(--titlebar-control-size) * 6) + 1px + (8px * 6));
   display: grid;
   grid-template-columns:
     var(--titlebar-preview-side-width)
@@ -1352,13 +1338,13 @@ button:disabled {
 
 .titlebar-preview-divider {
   width: 1px;
-  height: 24px;
+  height: 20px;
   flex: 0 0 auto;
   background: var(--line);
 }
 
 .titlebar-preview-mode {
-  flex: 0 0 34px;
+  flex: 0 0 var(--titlebar-control-size);
 }
 
 .library-grid-content {
@@ -2008,7 +1994,7 @@ button:disabled {
 }
 
 .subfolder-card-expand-spinner {
-  animation: media-grid-spinner 820ms linear infinite;
+  flex: 0 0 auto;
 }
 
 .library-browser-content-header {
@@ -2688,41 +2674,87 @@ button:disabled {
   opacity: 0;
 }
 
-.central-preview-loading-indicator,
-.media-grid-refresh-indicator {
+.media-loading-indicator {
   position: absolute;
-  right: 18px;
-  bottom: 18px;
+  right: 28px;
+  bottom: 28px;
   z-index: 3;
   display: grid;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 999px;
-  background: rgba(6, 10, 14, 0.58);
-  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.26);
-  -webkit-backdrop-filter: blur(14px) saturate(1.4);
-  backdrop-filter: blur(14px) saturate(1.4);
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
   pointer-events: none;
+  isolation: isolate;
+  opacity: 1;
+  transition: opacity 180ms ease;
 }
 
 .media-grid-empty-shell {
   position: relative;
 }
 
-.media-grid-refresh-indicator {
-  right: 14px;
-  bottom: 14px;
+.media-loading-indicator::before {
+  position: absolute;
+  z-index: 0;
+  inset: -2px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    rgba(216, 229, 227, 0.16) 0deg,
+    rgba(169, 199, 192, 0.2) 100deg,
+    rgba(109, 159, 159, 0.18) 220deg,
+    rgba(125, 153, 170, 0.16) 310deg,
+    rgba(216, 229, 227, 0.16) 360deg
+  );
+  content: "";
+  filter: blur(6px);
+  opacity: 0.48;
+  animation:
+    media-loading-ring-flow 2.6s linear infinite,
+    media-loading-pulse 1.8s ease-in-out infinite;
 }
 
-.central-preview-loading-spinner {
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgba(244, 247, 249, 0.3);
-  border-top-color: rgba(244, 247, 249, 0.9);
-  border-radius: 999px;
-  animation: spin 0.8s linear infinite;
+.media-loading-indicator[data-media-loading-state="hidden"] {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.media-loading-ring {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 22px;
+  height: 22px;
+  overflow: visible;
+  filter: saturate(0.76) brightness(0.88);
+  animation: media-loading-pulse 1.8s ease-in-out infinite;
+}
+
+.media-loading-ring-flow {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: media-loading-ring-flow 2.6s linear infinite;
+}
+
+@keyframes media-loading-ring-flow {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes media-loading-pulse {
+  0%,
+  100% {
+    opacity: 0.28;
+  }
+  50% {
+    opacity: 0.72;
+  }
 }
 
 .central-preview-stage .preview-video {
@@ -2748,6 +2780,10 @@ button:disabled {
   box-shadow: none;
   transform-origin: top left;
   will-change: transform;
+}
+
+.central-preview-transform[data-preview-frame-ready="false"] {
+  visibility: hidden;
 }
 
 .video-playback-controls {
@@ -3592,9 +3628,9 @@ button:disabled {
 }
 
 .library-toolbar-back {
-  height: 34px;
-  padding: 0 12px;
-  gap: 7px;
+  height: var(--titlebar-control-size);
+  padding: 0;
+  gap: 6px;
   flex: 0 0 auto;
   font-size: 12.5px;
   font-weight: 650;
@@ -3608,13 +3644,14 @@ button:disabled {
   border: 0;
   border-radius: 8px;
   box-shadow: none;
-  padding: 6px 10px 6px 30px;
+  height: var(--titlebar-control-size);
+  padding: 0 8px 0 28px;
   min-width: 220px;
 }
 
 .search-bar-icon {
   position: absolute;
-  left: 10px;
+  left: 8px;
   top: 50%;
   transform: translateY(-50%);
   color: rgba(255, 255, 255, 0.5);
@@ -3683,15 +3720,15 @@ button:disabled {
 
 .filter-menu-trigger {
   position: relative;
-  width: 34px;
-  height: 34px;
+  width: var(--titlebar-control-size);
+  height: var(--titlebar-control-size);
   padding: 0;
 }
 
 .filter-menu-dot {
   position: absolute;
-  right: 7px;
-  top: 7px;
+  right: 5px;
+  top: 5px;
   width: 6px;
   height: 6px;
   border-radius: 999px;
@@ -3811,9 +3848,9 @@ button:disabled {
 }
 
 .sort-menu-trigger-icon-only {
-  width: 34px;
-  min-width: 34px;
-  height: 34px;
+  width: var(--titlebar-control-size);
+  min-width: var(--titlebar-control-size);
+  height: var(--titlebar-control-size);
   justify-content: center;
   padding: 0;
 }
@@ -4231,9 +4268,9 @@ button:disabled {
 .top-action {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  height: 36px;
-  padding: 0 11px;
+  gap: 6px;
+  height: var(--titlebar-control-size);
+  padding: 0 8px;
   border-radius: 999px;
 }
 
@@ -4253,7 +4290,7 @@ button:disabled {
   padding-right: 18px;
   margin-left: -18px;
   margin-right: -18px;
-  min-height: 40px;
+  min-height: var(--titlebar-control-size);
 }
 
 .task-drawer-toggle {
@@ -4262,8 +4299,8 @@ button:disabled {
 
 .task-drawer-status {
   position: absolute;
-  top: 7px;
-  right: 7px;
+  top: 5px;
+  right: 5px;
   width: 7px;
   height: 7px;
   border: 1px solid rgba(2, 5, 8, 0.92);
@@ -5298,11 +5335,11 @@ button:disabled {
 
 .recent-ops-drawer {
   position: fixed;
-  top: 60px;
+  top: calc(var(--shell-titlebar-height) + 2px);
   right: 12px;
   z-index: 241;
   width: min(380px, 92vw);
-  max-height: calc(100vh - 80px);
+  max-height: calc(100vh - var(--shell-titlebar-height) - 22px);
   display: flex;
   flex-direction: column;
   background: transparent;
@@ -6034,8 +6071,8 @@ button:disabled {
 
 .window-chrome-button {
   display: inline-flex;
-  width: 34px;
-  height: 28px;
+  width: var(--titlebar-window-control-width);
+  height: var(--titlebar-window-control-height);
   align-items: center;
   justify-content: center;
   background: transparent;
@@ -6980,9 +7017,9 @@ button:disabled {
   --glass-fill: transparent;
   --glass-border-current: transparent;
   display: inline-flex;
-  width: 34px;
-  min-width: 34px;
-  height: 34px;
+  width: var(--titlebar-control-size);
+  min-width: var(--titlebar-control-size);
+  height: var(--titlebar-control-size);
   align-items: center;
   justify-content: center;
   padding: 0;
@@ -7082,7 +7119,7 @@ button:disabled {
   width: auto;
   min-width: 0;
   max-width: 168px;
-  padding: 0 9px;
+  padding: 0 7px;
   justify-content: flex-start;
 }
 
@@ -7194,8 +7231,8 @@ button:disabled {
   }
 
   .top-action {
-    width: 36px;
-    min-width: 36px;
+    width: var(--titlebar-control-size);
+    min-width: var(--titlebar-control-size);
     padding: 0;
   }
 
@@ -7241,6 +7278,7 @@ button:disabled {
 
   .grid-surface {
     padding: 10px;
+    --media-scrollbar-outset: 10px;
   }
 
   .inspector-panel {
@@ -7395,6 +7433,27 @@ button:disabled {
   gap: 12px;
   padding: 28px 40px;
   pointer-events: auto;
+}
+.library-loading-card--progress {
+  --glass-fill: transparent;
+  --glass-blur-current: none;
+  --glass-border-current: transparent;
+  overflow: visible;
+  padding: 12px 16px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.library-loading-card--progress > .liquid-glass-backdrop,
+.library-loading-card--progress > .liquid-glass-lens,
+.library-loading-card--progress > .liquid-glass-dither,
+.library-loading-card--progress > .liquid-glass-edge {
+  display: none;
+}
+.library-loading-card--progress::after {
+  border: 0;
+  box-shadow: none;
 }
 .library-loading-spinner { animation: library-loading-spin 900ms linear infinite; }
 @keyframes library-loading-spin { to { transform: rotate(360deg); } }

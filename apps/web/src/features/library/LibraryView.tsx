@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FolderRecord, MediaRecord } from "@megle/core-client";
 import type { LibraryState } from "../../core/useLibraryData";
-import { MediaGrid } from "../media-grid/MediaGrid";
+import { MediaGrid, MediaGridRefreshIndicator } from "../media-grid/MediaGrid";
 import type { LibraryGridPreferences } from "../media-grid/gridPreferences";
 import type { LibraryLayoutMode } from "../media-grid/layoutMode";
 import { CentralPreviewStage } from "../preview/CentralPreviewStage";
@@ -28,6 +28,7 @@ interface LibraryViewProps {
   onPreviewNext: () => void;
   onPreviewMediaSettled: (mediaId: number) => void;
   onPreviewViewStateChange: (state: { mode: "fit-long-edge" | "actual"; scale: number }) => void;
+  previewViewState: { mode: "fit-long-edge" | "actual"; scale: number };
   onPreviewCommandChange: (commands: {
     reset: () => void;
     toggleActualSize: () => void;
@@ -60,6 +61,7 @@ export function LibraryView({
   onPreviewNext,
   onPreviewPrevious,
   onPreviewViewStateChange,
+  previewViewState,
   previewOpen,
   sidebarLayoutTransitionKey
 }: LibraryViewProps) {
@@ -79,6 +81,7 @@ export function LibraryView({
         onPreviewNext={onPreviewNext}
         onPreviewPrevious={onPreviewPrevious}
         onPreviewViewStateChange={onPreviewViewStateChange}
+        previewViewState={previewViewState}
         previewOpen={previewOpen}
         sidebarLayoutTransitionKey={sidebarLayoutTransitionKey}
       />
@@ -101,6 +104,7 @@ export function LibraryCenterPane({
   onPreviewNext,
   onPreviewPrevious,
   onPreviewViewStateChange,
+  previewViewState,
   previewOpen,
   sidebarLayoutTransitionKey
 }: LibraryViewProps) {
@@ -437,6 +441,10 @@ export function LibraryCenterPane({
             />
           </div>
         </div>
+        <MediaGridRefreshIndicator
+          active={library.loading || library.loadingMoreMedia}
+          label="Refreshing media"
+        />
         {previewMedia ? (
           <div className="central-preview-overlay">
             <CentralPreviewStage
@@ -447,6 +455,7 @@ export function LibraryCenterPane({
               onPreviewMediaSettled={onPreviewMediaSettled}
               onPreviewNext={onPreviewNext}
               onPreviewPrevious={onPreviewPrevious}
+              initialViewState={previewViewState}
               onViewStateChange={onPreviewViewStateChange}
             />
           </div>

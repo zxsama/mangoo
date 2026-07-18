@@ -1,6 +1,7 @@
 import { Folder as FolderIcon } from "lucide-react";
 import { type ReactNode } from "react";
 import type { FolderRecord, MediaRecord, ThumbnailResponse } from "@megle/core-client";
+import { MediaLoadingRing } from "../loading/MediaLoadingRing";
 import { MediaPreview } from "./MediaPreview";
 
 interface PreviewPanelProps {
@@ -105,7 +106,7 @@ function thumbnailStatus(state: ThumbnailResponse["state"] | string | null | und
   }
   return (
     <span aria-label="Thumbnail refreshing" className="metadata-inline-spinner" role="status">
-      <span className="central-preview-loading-spinner" aria-hidden="true" />
+      <MediaLoadingRing size={16} />
     </span>
   );
 }

@@ -19,9 +19,14 @@ export function LibraryLoadingOverlay({
 }) {
   if (phase === "ready") return null;
   const error = isErrorPhase(phase);
+  const mediaLoading = phase === "loading-media";
   return (
     <div className="library-loading-overlay" aria-live="polite" aria-busy={!error}>
-      <LiquidGlassSurface as="div" className="library-loading-card" tone="elevated">
+      <LiquidGlassSurface
+        as="div"
+        className={`library-loading-card${mediaLoading ? " library-loading-card--progress" : ""}`}
+        tone="elevated"
+      >
         {error ? (
           <>
             <div className="library-loading-error-text">{phase.message}</div>

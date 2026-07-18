@@ -17,7 +17,7 @@ export interface SecondaryNativeWindowHost {
   focus(): void;
 }
 
-export const NATIVE_WINDOW_WARMUP_MS = 200;
+export const NATIVE_WINDOW_WARMUP_MS = 100;
 
 export function createSecondaryWindowRevealState<T>(): SecondaryWindowRevealState<T> {
   let resolveResult!: (value: T) => void;

@@ -47,7 +47,6 @@ export function SecondaryWindowFrame({
       const frame = frameRef.current;
       if (!frame) return;
       frame.dataset.secondaryRendererReady = "true";
-      document.documentElement.dataset.secondaryRendererReady = role;
       performance.mark(`megle-secondary-${role}-renderer-ready`);
       void notifySecondaryWindowReady(role).then((result) => {
         const currentFrame = frameRef.current;
@@ -99,7 +98,6 @@ export function SecondaryWindowFrame({
         as="div"
         className={`secondary-window${windowClassName ? ` ${windowClassName}` : ""}`}
         data-secondary-content-visible="false"
-        data-secondary-window-role={role}
         ref={frameRef}
         tone="chrome"
       >

@@ -527,16 +527,21 @@ if (
 }
 
 for (const value of [
-  "document.elementsFromPoint",
-  "pointerover",
-  "pointermove",
-  "pointerleave",
   "pointerdown",
   "pointerup",
+  "document.addEventListener(\"scroll\", handleScroll, true)",
   "data-scrollbar-visible",
+  "data-scrollbar-area-hover",
   "data-scrollbar-dragging",
-  "--overlay-scrollbar-inline-inset",
+  "--scrollbar-edge-inset",
   "readOverlayScrollbarInset",
+  "SCROLLBAR_SCROLL_IDLE_MS",
+  "scrollActiveUntil",
+  "tickScrollActivity",
+  "MutationObserver",
+  "getComputedStyle(element)",
+  "elementStyle.visibility",
+  "attributeFilter",
   "requestAnimationFrame"
 ]) {
   if (!overlayScrollbars.includes(value)) {
@@ -548,11 +553,33 @@ if (/setTimeout|clearTimeout/.test(overlayScrollbars)) {
   fail("custom overlay scrollbar controller must not use timers to hide or show scrollbars");
 }
 
+for (const forbidden of [
+  "document.elementsFromPoint",
+  'document.addEventListener("pointerover"',
+  'document.addEventListener("pointerleave"',
+  "findScrollableElementAtPoint",
+  "isPointInsideElement"
+]) {
+  if (overlayScrollbars.includes(forbidden)) {
+    fail(`custom overlay scrollbar controller must not activate from panel pointer presence: ${forbidden}`);
+  }
+}
+
 for (const [selector, checks, message] of [
   [
     ".megle-overlay-scrollbar",
-    [/position:\s*fixed/, /pointer-events:\s*none/, /z-index:\s*240/, /opacity:\s*0/],
-    "custom overlay scrollbar rail must be fixed, non-layout, and hidden by default"
+    [/position:\s*fixed/, /pointer-events:\s*auto/, /z-index:\s*240/, /opacity:\s*0/],
+    "custom overlay scrollbar rail must be fixed, non-layout, pointer-interactive, and hidden by default"
+  ],
+  [
+    ".megle-overlay-scrollbar-thumb",
+    [/pointer-events:\s*none/],
+    "custom overlay scrollbar thumb must not receive pointer input while hidden"
+  ],
+  [
+    '.megle-overlay-scrollbar[data-scrollbar-visible="true"] .megle-overlay-scrollbar-thumb',
+    [/pointer-events:\s*auto/],
+    "custom overlay scrollbar thumb must receive pointer input while visible"
   ],
   [
     '.megle-overlay-scrollbar[data-scrollbar-visible="true"] .megle-overlay-scrollbar-thumb',
@@ -576,13 +603,46 @@ for (const [selector, checks, message] of [
   }
 }
 
-const librarySidebarBlocks = cssBlocksForExactSelector(stylesForChecks, ".library-sidebar");
+for (const [selector, checks, message] of [
+  [
+    ".task-drawer-panel",
+    [/top:\s*calc\(var\(--shell-titlebar-height\)\s*\+\s*16px\)/],
+    "task drawer must preserve its 16px gap below the variable main titlebar"
+  ],
+  [
+    ".recent-ops-drawer",
+    [
+      /top:\s*calc\(var\(--shell-titlebar-height\)\s*\+\s*2px\)/,
+      /max-height:\s*calc\(100vh\s*-\s*var\(--shell-titlebar-height\)\s*-\s*22px\)/
+    ],
+    "recent operations drawer must track the variable main titlebar height"
+  ]
+]) {
+  const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
+  if (!blocks.some((block) => checks.every((check) => check.test(block)))) {
+    fail(message);
+  }
+}
+
+const rootScrollbarBlocks = cssBlocksForExactSelector(stylesForChecks, ":root");
 if (
-  !librarySidebarBlocks.some((block) =>
-    /--overlay-scrollbar-inline-inset:\s*4px/.test(block)
+  !rootScrollbarBlocks.some(
+    (block) =>
+      /--scrollbar-thumb-size:\s*5px/.test(block) &&
+      /--scrollbar-edge-inset:\s*5px/.test(block) &&
+      /--media-scrollbar-outset:\s*16px/.test(block)
   )
 ) {
-  fail("left library sidebar scrollbar must be inset from the pane divider instead of hugging the edge");
+  fail("global scrollbar thumb must be 5 CSS px thick, inset 5 CSS px, and media overhang must match the 16px desktop content inset");
+}
+
+const gridSurfaceScrollbarBlocks = cssBlocksForExactSelector(stylesForChecks, ".grid-surface");
+if (
+  !gridSurfaceScrollbarBlocks.some((block) =>
+    /--media-scrollbar-outset:\s*10px/.test(block)
+  )
+) {
+  fail("responsive grid surface must reduce media scrollbar overhang to its 10px content inset");
 }
 
 const virtualGridBlocks = cssBlocksForExactSelector(stylesForChecks, ".virtual-grid");
@@ -650,6 +710,10 @@ for (const value of [
 const appShellBlocks = cssBlocksForSelector(stylesForChecks, ".app-shell");
 const baseAppShellBlock = appShellBlocks[0] ?? "";
 if (
+  !/--shell-titlebar-height:\s*50px/.test(baseAppShellBlock) ||
+  !/--titlebar-control-size:\s*28px/.test(baseAppShellBlock) ||
+  !/--titlebar-window-control-width:\s*32px/.test(baseAppShellBlock) ||
+  !/--titlebar-window-control-height:\s*28px/.test(baseAppShellBlock) ||
   !/width:\s*100vw/.test(baseAppShellBlock) ||
   !/height:\s*100vh/.test(baseAppShellBlock) ||
   !/margin:\s*0/.test(baseAppShellBlock) ||
@@ -660,7 +724,63 @@ if (
   !/overflow:\s*hidden/.test(baseAppShellBlock) ||
   !/clip-path:\s*inset\(0\s+round\s+var\(--radius-window\)\)/.test(baseAppShellBlock)
 ) {
-  fail("app shell must fill the native acrylic host and clip child surfaces at the DWM-matched host radius");
+  fail("app shell must use the approved 50px/28px main-titlebar density and fill the native acrylic host");
+}
+
+for (const [selector, checks, message] of [
+  [
+    ".titlebar-icon-button",
+    [/width:\s*var\(--titlebar-control-size\)/, /height:\s*var\(--titlebar-control-size\)/],
+    "main titlebar icon buttons must use the shared 28px control token"
+  ],
+  [
+    ".filter-menu-trigger",
+    [/width:\s*var\(--titlebar-control-size\)/, /height:\s*var\(--titlebar-control-size\)/],
+    "main titlebar filter button must use the shared 28px control token"
+  ],
+  [
+    ".sort-menu-trigger-icon-only",
+    [/width:\s*var\(--titlebar-control-size\)/, /height:\s*var\(--titlebar-control-size\)/],
+    "main titlebar sort/layout buttons must use the shared 28px control token"
+  ],
+  [
+    ".top-action",
+    [/height:\s*var\(--titlebar-control-size\)/],
+    "main titlebar task and recent buttons must use the shared 28px control token"
+  ],
+  [
+    ".search-bar",
+    [/height:\s*var\(--titlebar-control-size\)/],
+    "main titlebar search must align to the shared 28px control height"
+  ],
+  [
+    ".shell-library-switcher-button",
+    [/height:\s*var\(--titlebar-control-size\)/],
+    "main library switcher must align to the shared 28px control height"
+  ],
+  [
+    ".titlebar-workspace-controls",
+    [/min-height:\s*var\(--titlebar-control-size\)/],
+    "middle titlebar control group must not retain the old 40px minimum height"
+  ],
+  [
+    ".shell-right-actions",
+    [/min-height:\s*var\(--titlebar-control-size\)/],
+    "right titlebar action group must not retain the old 40px minimum height"
+  ],
+  [
+    ".window-chrome-button",
+    [
+      /width:\s*var\(--titlebar-window-control-width\)/,
+      /height:\s*var\(--titlebar-window-control-height\)/
+    ],
+    "main window controls must use the approved 32x28px titlebar tokens"
+  ]
+]) {
+  const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
+  if (!blocks.some((block) => checks.every((check) => check.test(block)))) {
+    fail(message);
+  }
 }
 
 if (stylesForChecks.includes("--radius-window-host")) {
@@ -1727,10 +1847,10 @@ if (
   nativeRevealTimestampIndex <= warmupIndex ||
   nativeRevealIndex <= nativeRevealTimestampIndex ||
   !secondaryWarmupBody.includes("NATIVE_WINDOW_WARMUP_MS") ||
-  !secondaryReveal.includes("export const NATIVE_WINDOW_WARMUP_MS = 200") ||
+  !secondaryReveal.includes("export const NATIVE_WINDOW_WARMUP_MS = 100") ||
   !/opacity:\s*0/.test(desktopMain)
 ) {
-  fail("secondary windows must start transparent, warm the shown native host for 200ms, then reveal it once");
+  fail("secondary windows must start transparent, warm the shown native host for 100ms, then reveal it once");
 }
 for (const [source, value, message] of [
   [desktopMain, "nativeWarmupStartedAt", "desktop secondary-window readiness must record native warm-up start"],
@@ -1787,6 +1907,22 @@ for (const selector of [".secondary-window-titlebar", ".secondary-window-body"])
   ) {
     fail(`${selector} must reveal only from the explicit secondary content-visible stage`);
   }
+}
+const secondaryWindowTitlebarBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  ".secondary-window-titlebar"
+);
+const secondaryWindowCloseBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  ".secondary-window-close"
+);
+if (
+  !secondaryWindowTitlebarBlocks.some((block) => /height:\s*40px/.test(block)) ||
+  !secondaryWindowCloseBlocks.some(
+    (block) => /width:\s*30px/.test(block) && /height:\s*30px/.test(block)
+  )
+) {
+  fail("Settings and Plugins windows must retain their independent 40px titlebar and 30px close button sizing");
 }
 const secondaryWindowBlocks = cssBlocksForExactSelector(stylesForChecks, ".secondary-window");
 if (

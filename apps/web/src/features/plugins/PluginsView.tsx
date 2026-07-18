@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import { AlertTriangle, Loader2, RefreshCw } from "lucide-react";
+import { MediaLoadingRing } from "../loading/MediaLoadingRing";
 import { LiquidGlassSurface } from "../../design/liquid-glass";
 import { PluginCard } from "./PluginCard";
 import { PluginDetail } from "./PluginDetail";
@@ -79,7 +80,7 @@ export function PluginsView() {
           <div className="plugins-list" role="list">
             {plugins.loading && totalCount === 0 ? (
               <div aria-label="Refreshing plugins" className="empty-panel empty-panel-busy" role="status">
-                <span className="central-preview-loading-spinner" aria-hidden="true" />
+                <MediaLoadingRing size={18} />
               </div>
             ) : totalCount === 0 ? (
               <div className="plugins-empty">

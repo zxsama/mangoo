@@ -37,6 +37,7 @@ type SecondaryWindowConfig = {
   minWidth: number;
   minHeight: number;
 };
+type SecondaryWindowPosition = { x: number; y: number };
 const secondaryWindows: Record<SecondaryWindowRole, BrowserWindow | null> = {
   settings: null,
   plugins: null
@@ -54,6 +55,10 @@ type SecondaryWindowRevealResult = {
   fallback: boolean;
 };
 const secondaryWindowReadiness: Record<SecondaryWindowRole, SecondaryWindowReadiness | null> = {
+  settings: null,
+  plugins: null
+};
+const secondaryWindowPositions: Record<SecondaryWindowRole, SecondaryWindowPosition | null> = {
   settings: null,
   plugins: null
 };
@@ -114,6 +119,7 @@ interface WindowState {
   x?: number;
   y?: number;
   maximized: boolean;
+  secondaryWindows?: Partial<Record<SecondaryWindowRole, SecondaryWindowPosition>>;
 }
 
 interface WindowPlacement {
@@ -511,6 +517,7 @@ ipcMain.handle("megle:pick-new-library-path", async (_e, defaultName?: string) =
 async function createWindow(): Promise<void> {
   const session = await ensureCoreReady();
   const state = await loadWindowState();
+  restoreSecondaryWindowPositions(state.secondaryWindows);
   const placement = resolveVisibleWindowPlacement(clampWindowPlacement(state));
   const bootstrapPlacement = compositionBootstrapPlacement(placement);
   const runId = visualHarnessRunId();
@@ -634,10 +641,13 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
   const config = SECONDARY_WINDOW_CONFIGS[role];
   const session = await ensureCoreReady();
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+  const position = resolveSecondaryWindowPosition(role, parent, config);
   const window = new BrowserWindow({
     title: config.title,
     width: config.width,
     height: config.height,
+    x: position.x,
+    y: position.y,
     minWidth: config.minWidth,
     minHeight: config.minHeight,
     parent,
@@ -690,6 +700,10 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
       activeWindowDrag = null;
     }
   });
+  window.on("move", () => {
+    rememberSecondaryWindowPosition(role, window);
+    schedulePersistWindowState();
+  });
   window.on("closed", () => {
     if (activeWindowDrag?.windowId === window.id) {
       activeWindowDrag = null;
@@ -718,6 +732,60 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
 
 function isSecondaryWindowRole(value: unknown): value is SecondaryWindowRole {
   return value === "settings" || value === "plugins";
+}
+
+function restoreSecondaryWindowPositions(
+  positions: Partial<Record<SecondaryWindowRole, SecondaryWindowPosition>> | undefined
+): void {
+  for (const role of Object.keys(secondaryWindowPositions) as SecondaryWindowRole[]) {
+    const position = positions?.[role];
+    secondaryWindowPositions[role] =
+      position && Number.isFinite(position.x) && Number.isFinite(position.y)
+        ? { x: Math.round(position.x), y: Math.round(position.y) }
+        : null;
+  }
+}
+
+function resolveSecondaryWindowPosition(
+  role: SecondaryWindowRole,
+  parent: BrowserWindow | undefined,
+  config: SecondaryWindowConfig
+): SecondaryWindowPosition {
+  const saved = secondaryWindowPositions[role];
+  if (saved) {
+    return clampSecondaryWindowPosition(saved, config.width, config.height);
+  }
+
+  const anchor = parent && !parent.isDestroyed() ? parent.getBounds() : screen.getPrimaryDisplay().workArea;
+  return clampSecondaryWindowPosition(
+    {
+      x: Math.round(anchor.x + (anchor.width - config.width) / 2),
+      y: Math.round(anchor.y + (anchor.height - config.height) / 2)
+    },
+    config.width,
+    config.height
+  );
+}
+
+function clampSecondaryWindowPosition(
+  position: SecondaryWindowPosition,
+  width: number,
+  height: number
+): SecondaryWindowPosition {
+  const display = screen.getDisplayMatching({ x: position.x, y: position.y, width, height });
+  const workArea = display.workArea;
+  const maxX = Math.max(workArea.x, workArea.x + workArea.width - width);
+  const maxY = Math.max(workArea.y, workArea.y + workArea.height - height);
+  return {
+    x: Math.round(Math.min(maxX, Math.max(workArea.x, position.x))),
+    y: Math.round(Math.min(maxY, Math.max(workArea.y, position.y)))
+  };
+}
+
+function rememberSecondaryWindowPosition(role: SecondaryWindowRole, window: BrowserWindow): void {
+  if (window.isDestroyed()) return;
+  const bounds = window.isMaximized() ? window.getNormalBounds() : window.getBounds();
+  secondaryWindowPositions[role] = { x: bounds.x, y: bounds.y };
 }
 
 function clearSecondaryWindowReadyFallback(role: SecondaryWindowRole, windowId: number): void {
@@ -1058,11 +1126,29 @@ async function loadWindowState(): Promise<WindowState> {
       height: typeof parsed.height === "number" ? parsed.height : DEFAULT_WINDOW_STATE.height,
       x: typeof parsed.x === "number" ? parsed.x : undefined,
       y: typeof parsed.y === "number" ? parsed.y : undefined,
-      maximized: parsed.maximized === true
+      maximized: parsed.maximized === true,
+      secondaryWindows: readSecondaryWindowPositions(parsed.secondaryWindows)
     };
   } catch {
     return { ...DEFAULT_WINDOW_STATE };
   }
+}
+
+function readSecondaryWindowPositions(value: unknown):
+  | Partial<Record<SecondaryWindowRole, SecondaryWindowPosition>>
+  | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const source = value as Record<string, unknown>;
+  const positions: Partial<Record<SecondaryWindowRole, SecondaryWindowPosition>> = {};
+  for (const role of ["settings", "plugins"] as const) {
+    const candidate = source[role];
+    if (!candidate || typeof candidate !== "object") continue;
+    const position = candidate as { x?: unknown; y?: unknown };
+    if (typeof position.x === "number" && typeof position.y === "number") {
+      positions[role] = { x: position.x, y: position.y };
+    }
+  }
+  return positions;
 }
 
 /// Bounds-check a saved window placement against the currently connected
@@ -1278,7 +1364,10 @@ async function persistWindowState(): Promise<void> {
     height: bounds.height,
     x: bounds.x,
     y: bounds.y,
-    maximized
+    maximized,
+    secondaryWindows: Object.fromEntries(
+      Object.entries(secondaryWindowPositions).filter((entry): entry is [string, SecondaryWindowPosition] => entry[1] !== null)
+    ) as Partial<Record<SecondaryWindowRole, SecondaryWindowPosition>>
   };
   const targetPath = windowStatePath();
   // Atomic write: render to a sibling temp file, then rename. A crash

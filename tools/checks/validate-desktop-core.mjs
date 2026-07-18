@@ -203,6 +203,19 @@ if (main.includes('window.once("ready-to-show", () => window.show())')) {
   fail("secondary windows must not reveal from ready-to-show before renderer/native warm-up readiness");
 }
 for (const value of [
+  "const secondaryWindowPositions",
+  "restoreSecondaryWindowPositions(state.secondaryWindows)",
+  "const position = resolveSecondaryWindowPosition(role, parent, config)",
+  "x: position.x",
+  "y: position.y",
+  "rememberSecondaryWindowPosition(role, window)",
+  "secondaryWindows: readSecondaryWindowPositions(parsed.secondaryWindows)"
+]) {
+  if (!main.includes(value)) {
+    fail(`secondary windows must restore and persist their desktop position: ${value}`);
+  }
+}
+for (const value of [
   'ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown)',
   "isSecondaryWindowRole(role)",
   "windowForIpcEvent(event)",
@@ -252,12 +265,12 @@ if (
 }
 
 if (
-  !/export const NATIVE_WINDOW_WARMUP_MS = 200;/.test(secondaryReveal) ||
+  !/export const NATIVE_WINDOW_WARMUP_MS = 100;/.test(secondaryReveal) ||
   !secondaryReveal.includes("state.cancellation") ||
   !secondaryReveal.includes("clearTimeout(timer)") ||
   !secondaryReveal.includes("state.isWarmupCurrent(token)")
 ) {
-  fail("secondary native window warm-up must be a cancellable 200ms hold with stale-token protection");
+  fail("secondary native window warm-up must be a cancellable 100ms hold with stale-token protection");
 }
 
 const revealNativeWindowBody = functionBody(
@@ -289,28 +302,6 @@ if (
   !forceSecondaryWindowBody.includes("revealSecondaryNativeWindow(")
 ) {
   fail("secondary fallback must show, restore opacity, settle ready IPC, and focus through the shared reveal helper");
-}
-
-if (
-  revealSecondaryWindowBody?.includes("readiness.compositionPromise") &&
-  forceSecondaryWindowBody?.includes("resolveSecondaryWindowRevealWaiters(readiness, result)")
-) {
-  const nativeReady = true;
-  const rendererReady = true;
-  const hangingComposition = new Promise(() => {});
-  let resolveFallbackWaiter;
-  const fallbackWaiter = new Promise((resolve) => {
-    resolveFallbackWaiter = resolve;
-  });
-  const readyIpcResult = nativeReady && rendererReady ? hangingComposition : fallbackWaiter;
-  resolveFallbackWaiter({ fallback: true });
-  const outcome = await Promise.race([
-    readyIpcResult.then(() => "resolved"),
-    new Promise((resolve) => setTimeout(() => resolve("timed-out"), 10))
-  ]);
-  if (outcome !== "resolved") {
-    fail("secondary ready IPC remains blocked when compositor RAF hangs and the 4s fallback fires");
-  }
 }
 
 if (

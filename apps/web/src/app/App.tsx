@@ -194,7 +194,6 @@ export function App() {
     setPreviewDisplayedMediaId(null);
     previewNavigationLockedRef.current = false;
     setPreviewViewCommands(null);
-    setPreviewViewState(DEFAULT_PREVIEW_VIEW_STATE);
   }, []);
 
   const toggleSidebars = useCallback(() => {
@@ -406,7 +405,6 @@ export function App() {
       setPreviewDisplayedMediaId(null);
       library.setSelectedMediaId(mediaId);
       setPreviewViewCommands(null);
-      setPreviewViewState(DEFAULT_PREVIEW_VIEW_STATE);
       setPreviewOpen(true);
     },
     [library]
@@ -665,6 +663,7 @@ export function App() {
         onPreviewNext={handlePreviewNext}
         onPreviewPrevious={handlePreviewPrevious}
         onPreviewViewStateChange={setPreviewViewState}
+        previewViewState={previewViewState}
         previewOpen={previewOpen}
         sidebarLayoutTransitionKey={sidebarsHidden ? "hidden" : "visible"}
       />
@@ -722,7 +721,7 @@ export function App() {
           <>
             {renderCenterPane()}
             <LibraryLoadingOverlay
-              phase={library.loading && libraryPhase === "ready" ? "loading-media" : libraryPhase}
+              phase={libraryPhase}
               onRetry={() => window.location.reload()}
               onSwitchLibrary={() => setSwitcherOpen(true)}
             />

@@ -329,7 +329,7 @@ export function PreviewTitlebarToolbar({
 }: PreviewTitlebarToolbarProps) {
   const previewScale = `${Math.round(scale * 100)}%`;
   const modeAction = mode === "actual" ? "Fit long edge" : "Actual size";
-  const ModeIcon = mode === "actual" ? Minimize2 : Maximize2;
+  const ModeIcon = mode === "actual" ? Maximize2 : Minimize2;
 
   return (
     <div

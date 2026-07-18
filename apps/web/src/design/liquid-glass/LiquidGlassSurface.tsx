@@ -73,10 +73,6 @@ const INTERACTIVE_AFFORDANCE_OWNER_SELECTOR = [
   ".tree-item",
   ".tile-thumb",
   ".settings-style-slider-control",
-  // The column-resize divider: drive its edge highlight from the same
-  // pointer-distance calc as everything else (was a binary :hover) so its glow
-  // fades in with cursor proximity like the rest of the UI.
-  ".shell-column-resizer",
   // Clickable list rows / cards. These were previously highlighted by their own
   // rectangular :hover border+background; they now route through the single
   // circular pointer-distance glow like every other interactive element. Disabled

@@ -14,6 +14,7 @@ import {
   useShortcutBindings
 } from "../shortcuts/shortcutBindings";
 import { MediaPreview } from "./MediaPreview";
+import { MediaLoadingIndicator, MediaLoadingRing } from "../loading/MediaLoadingRing";
 import { DampedMotionAxis, normalizeWheelDelta } from "../../core/dampedMotion";
 import { VideoPlaybackControls } from "./VideoPlaybackControls";
 import {
@@ -37,6 +38,7 @@ interface CentralPreviewStageProps {
   onPreviewPrevious: () => void;
   onPreviewNext: () => void;
   onPreviewMediaSettled: (mediaId: number) => void;
+  initialViewState: { mode: PreviewViewMode; scale: number };
   onViewStateChange: (state: { mode: PreviewViewMode; scale: number }) => void;
   onCommandChange: (
     commands: { reset: () => void; toggleActualSize: () => void } | null
@@ -62,6 +64,7 @@ export function CentralPreviewStage({
   onPreviewMediaSettled,
   onPreviewPrevious,
   onPreviewNext,
+  initialViewState,
   onViewStateChange,
   onCommandChange
 }: CentralPreviewStageProps) {
@@ -81,11 +84,12 @@ export function CentralPreviewStage({
   const wheelZoomLastFrameTimeRef = useRef(0);
   const wheelZoomAnchorRef = useRef<{ x: number; y: number } | null>(null);
   const { bindings } = useShortcutBindings();
-  const [scale, setScale] = useState(1);
+  const [scale, setScale] = useState(initialViewState.scale);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [fitSyncTick, setFitSyncTick] = useState(0);
   const [previewReadyTick, setPreviewReadyTick] = useState(0);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [hasCommittedPreviewFrame, setHasCommittedPreviewFrame] = useState(false);
   const [previewDragging, setPreviewDragging] = useState(false);
   const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
   const [videoPlayback, setVideoPlayback] = useState<VideoPlaybackSnapshot>({
@@ -97,8 +101,14 @@ export function CentralPreviewStage({
     naturalWidth: number;
   } | null>(null);
   const fittedMediaIdRef = useRef<number | null>(null);
+  const lastCommittedNaturalSizeRef = useRef<{
+    mediaId: number;
+    naturalHeight: number;
+    naturalWidth: number;
+  } | null>(null);
+  const panRef = useRef(pan);
   const measuredNaturalSizeRef = useRef(measuredNaturalSize);
-  const [viewMode, setViewMode] = useState<PreviewViewMode>("fit-long-edge");
+  const [viewMode, setViewMode] = useState<PreviewViewMode>(initialViewState.mode);
   const viewModeRef = useRef(viewMode);
   const fitLongEdgeScaleForMedia = useCallback((sizeOverride?: {
     naturalHeight: number;
@@ -144,6 +154,10 @@ export function CentralPreviewStage({
   useEffect(() => {
     scaleRef.current = scale;
   }, [scale]);
+
+  useEffect(() => {
+    panRef.current = pan;
+  }, [pan]);
 
   useEffect(() => {
     fittedMediaIdRef.current = null;
@@ -266,6 +280,10 @@ export function CentralPreviewStage({
 
     function syncFitLongEdge() {
       if (cancelled || viewModeRef.current !== "fit-long-edge") return;
+      // Keep the previous frame's scale while the next image is buffered. If
+      // metadata from the next media item is used here, the visible old image
+      // is resized before the atomic preview swap and briefly appears warped.
+      if (fittedMediaIdRef.current !== selectedMedia.id) return;
       frame = 0;
       const nextScale = fitLongEdgeScaleForMedia();
       if (nextScale !== null) {
@@ -304,6 +322,7 @@ export function CentralPreviewStage({
   }, [fitLongEdgeScaleForMedia, fitSyncTick, previewReadyTick, viewMode]);
 
   const handleMediaReady = useCallback(() => {
+    setHasCommittedPreviewFrame(true);
     setPreviewReadyTick((value) => value + 1);
     onPreviewMediaSettled(selectedMedia.id);
   }, [onPreviewMediaSettled, selectedMedia.id]);
@@ -313,19 +332,42 @@ export function CentralPreviewStage({
   const handleNaturalSize = useCallback(
     (size: { naturalHeight: number; naturalWidth: number }) => {
       const measuredSize = { mediaId: selectedMedia.id, ...size };
+      const previousNaturalSize =
+        lastCommittedNaturalSizeRef.current?.mediaId === selectedMedia.id
+          ? null
+          : lastCommittedNaturalSizeRef.current;
+      lastCommittedNaturalSizeRef.current = measuredSize;
       measuredNaturalSizeRef.current = measuredSize;
       setMeasuredNaturalSize(measuredSize);
       const shouldResetTransform = fittedMediaIdRef.current !== selectedMedia.id;
       if (shouldResetTransform) {
         fittedMediaIdRef.current = selectedMedia.id;
-      }
-      if (shouldResetTransform || viewModeRef.current === "fit-long-edge") {
+        if (viewModeRef.current === "fit-long-edge") {
+          const nextScale =
+            fitScaleForDimensions(stageRef.current, size.naturalWidth, size.naturalHeight) ?? 1;
+          scaleRef.current = nextScale;
+          setScale(nextScale);
+          panRef.current = { x: 0, y: 0 };
+          setPan({ x: 0, y: 0 });
+        } else if (previousNaturalSize) {
+          const nextTransform = preserveTransformForResolution(
+            previousNaturalSize,
+            size,
+            scaleRef.current,
+            panRef.current
+          );
+          scaleRef.current = nextTransform.scale;
+          setScale(nextTransform.scale);
+          panRef.current = nextTransform.pan;
+          setPan(nextTransform.pan);
+        }
+        setFitSyncTick((value) => value + 1);
+      } else if (viewModeRef.current === "fit-long-edge") {
         const nextScale =
           fitScaleForDimensions(stageRef.current, size.naturalWidth, size.naturalHeight) ?? 1;
-        viewModeRef.current = "fit-long-edge";
-        setViewMode("fit-long-edge");
         scaleRef.current = nextScale;
         setScale(nextScale);
+        panRef.current = { x: 0, y: 0 };
         setPan({ x: 0, y: 0 });
         setFitSyncTick((value) => value + 1);
       }
@@ -651,6 +693,7 @@ export function CentralPreviewStage({
         >
           <div
             className="central-preview-transform"
+            data-preview-frame-ready={hasCommittedPreviewFrame ? "true" : "false"}
             style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale}) translate(-50%, -50%)` }}
           >
             <MediaPreview
@@ -664,15 +707,13 @@ export function CentralPreviewStage({
               stableFrame
             />
           </div>
-          {previewLoading ? (
-            <div
-              aria-label="Loading preview"
-              className="central-preview-loading-indicator"
-              role="status"
-            >
-              <span className="central-preview-loading-spinner" aria-hidden="true" />
-            </div>
-          ) : null}
+          <MediaLoadingIndicator
+            active={previewLoading}
+            className="central-preview-loading-indicator"
+            label="Loading preview"
+          >
+            <MediaLoadingRing />
+          </MediaLoadingIndicator>
         </div>
         {isVideo ? (
           <VideoPlaybackControls
@@ -691,6 +732,21 @@ export function CentralPreviewStage({
 
 const MAX_PREVIEW_SCALE = 8;
 const MIN_INTERACTIVE_SCALE = 0.1;
+
+function preserveTransformForResolution(
+  previous: { naturalHeight: number; naturalWidth: number },
+  next: { naturalHeight: number; naturalWidth: number },
+  scale: number,
+  pan: { x: number; y: number }
+) {
+  const previousLongEdge = Math.max(previous.naturalWidth, previous.naturalHeight);
+  const nextLongEdge = Math.max(next.naturalWidth, next.naturalHeight);
+  const ratio = previousLongEdge / nextLongEdge;
+  return {
+    pan: { x: pan.x * ratio, y: pan.y * ratio },
+    scale: clampScale(scale * ratio)
+  };
+}
 
 function fitScaleForDimensions(
   stage: HTMLDivElement | null,

@@ -2301,7 +2301,7 @@ try {
       Number.isFinite(contentVisibleAt) &&
       nativeWarmupStartedAt <= nativeWindowRevealedAt &&
       nativeWindowRevealedAt <= contentVisibleAt &&
-      nativeWindowRevealedAt - nativeWarmupStartedAt >= 200 &&
+      nativeWindowRevealedAt - nativeWarmupStartedAt >= 100 &&
       evidence?.contentVisible === "true" &&
       evidence?.revealFallback === "false"
     );

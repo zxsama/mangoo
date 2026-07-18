@@ -438,6 +438,7 @@ function ReadyPreviewMedia({
       aria-hidden="true"
       className="preview-image preview-image-pending"
       decoding="async"
+      key={pendingPreview.src}
       onError={() => {
         if (pendingObjectUrlRef.current !== pendingPreview.src) {
           return;
@@ -541,11 +542,17 @@ function ReadyPreviewMedia({
 
   return (
     <>
-      <div className="preview-placeholder ready" data-preview-source={source} style={renderedFrameStyle}>
+      <div
+        className="preview-placeholder ready"
+        data-preview-source={source}
+        key={src}
+        style={renderedFrameStyle}
+      >
         <img
           alt={alt}
           className="preview-image"
           decoding="async"
+          key={src}
           onLoad={(event) => {
             const image = event.currentTarget;
             const naturalSize = {

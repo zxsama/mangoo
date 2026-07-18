@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -58,6 +59,14 @@ export function AppShell({
   );
   const [activeResizeSide, setActiveResizeSide] = useState<ShellResizeSide | null>(null);
 
+  useEffect(() => {
+    document.body.dataset.shellResizing = "false";
+    return () => {
+      document.body.dataset.shellResizing = "false";
+      window.dispatchEvent(new Event("megle:shell-resize-state"));
+    };
+  }, []);
+
   const shellStyle = useMemo(
     () =>
       ({
@@ -102,6 +111,8 @@ export function AppShell({
       event.preventDefault();
       event.stopPropagation();
       event.currentTarget.setPointerCapture(event.pointerId);
+      document.body.dataset.shellResizing = "true";
+      window.dispatchEvent(new Event("megle:shell-resize-state"));
       setActiveResizeSide(side);
       resizeColumnAtPointer(side, event);
     },
@@ -120,6 +131,8 @@ export function AppShell({
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+    document.body.dataset.shellResizing = "false";
+    window.dispatchEvent(new Event("megle:shell-resize-state"));
     setActiveResizeSide(null);
   }, []);
 

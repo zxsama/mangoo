@@ -15,8 +15,9 @@ interface DragState {
   thumbTravel: number;
 }
 
-const SCROLLBAR_THICKNESS_PX = 10;
+const SCROLLBAR_RAIL_SIZE_PX = 10;
 const SCROLLBAR_MIN_THUMB_PX = 32;
+const SCROLLBAR_SCROLL_IDLE_MS = 180;
 
 export function useOverlayScrollbars() {
   useEffect(() => {
@@ -24,9 +25,10 @@ export function useOverlayScrollbars() {
     const horizontal = createScrollbar("horizontal");
     let activeElement: HTMLElement | null = null;
     let dragging: DragState | null = null;
-    let pointerX = Number.NaN;
-    let pointerY = Number.NaN;
     let animationFrame = 0;
+    let scrollIdleFrame = 0;
+    let scrollActiveUntil = 0;
+    let visibilityObserver: MutationObserver | null = null;
 
     document.body.append(vertical.rail, horizontal.rail);
 
@@ -35,6 +37,11 @@ export function useOverlayScrollbars() {
         window.cancelAnimationFrame(animationFrame);
         animationFrame = 0;
       }
+      if (scrollIdleFrame) {
+        window.cancelAnimationFrame(scrollIdleFrame);
+        scrollIdleFrame = 0;
+      }
+      visibilityObserver?.disconnect();
       vertical.rail.remove();
       horizontal.rail.remove();
     };
@@ -58,29 +65,59 @@ export function useOverlayScrollbars() {
       scheduleOverlaySync();
     }
 
-    function clearActiveElement() {
-      if (dragging) return;
-      setActiveElement(null);
+    function scheduleScrollIdleCheck() {
+      if (scrollIdleFrame) return;
+      const tickScrollActivity = (now: number) => {
+        scrollIdleFrame = 0;
+        scheduleOverlaySync();
+        if (now < scrollActiveUntil) {
+          scrollIdleFrame = window.requestAnimationFrame(tickScrollActivity);
+        }
+      };
+      scrollIdleFrame = window.requestAnimationFrame(tickScrollActivity);
+    }
+
+    function markScrollActivity() {
+      scrollActiveUntil = performance.now() + SCROLLBAR_SCROLL_IDLE_MS;
+      scheduleScrollIdleCheck();
     }
 
     function syncOverlay() {
+      if (document.body.dataset.shellResizing === "true") {
+        setOverlayVisible(vertical, false);
+        setOverlayVisible(horizontal, false);
+        return;
+      }
       const element = activeElement;
       if (!element || !element.isConnected) {
         setOverlayVisible(vertical, false);
         setOverlayVisible(horizontal, false);
         return;
       }
-
-      if (!dragging && !isPointInsideElement(element, pointerX, pointerY)) {
-        clearActiveElement();
+      const elementStyle = getComputedStyle(element);
+      if (
+        elementStyle.visibility === "hidden" ||
+        elementStyle.display === "none" ||
+        element.getClientRects().length === 0
+      ) {
+        setOverlayVisible(vertical, false);
+        setOverlayVisible(horizontal, false);
         return;
       }
+
+      const scrollActive = performance.now() < scrollActiveUntil;
+      const scrollbarHovered =
+        vertical.rail.dataset.scrollbarHover === "true" ||
+        horizontal.rail.dataset.scrollbarHover === "true" ||
+        vertical.rail.dataset.scrollbarAreaHover === "true" ||
+        horizontal.rail.dataset.scrollbarAreaHover === "true";
+      const overlayVisible = Boolean(dragging) || scrollActive || scrollbarHovered;
 
       const rect = element.getBoundingClientRect();
       const canScrollVertical = element.scrollHeight > element.clientHeight + 1;
       const canScrollHorizontal = element.scrollWidth > element.clientWidth + 1;
-      updateScrollbar(vertical, "vertical", element, rect, canScrollVertical);
-      updateScrollbar(horizontal, "horizontal", element, rect, canScrollHorizontal);
+      updateScrollbar(vertical, "vertical", element, rect, canScrollVertical, overlayVisible);
+      updateScrollbar(horizontal, "horizontal", element, rect, canScrollHorizontal, overlayVisible);
     }
 
     function updateScrollbar(
@@ -88,20 +125,18 @@ export function useOverlayScrollbars() {
       axis: ScrollAxis,
       element: HTMLElement,
       rect: DOMRect,
-      visible: boolean
+      canScroll: boolean,
+      overlayVisible: boolean
     ) {
-      setOverlayVisible(scrollbar, visible);
+      setOverlayVisible(scrollbar, canScroll && overlayVisible);
       scrollbar.rail.setAttribute(
         "data-scrollbar-dragging",
         dragging?.axis === axis ? "true" : "false"
       );
-      if (!visible) return;
+      if (!canScroll) return;
 
       if (axis === "vertical") {
-        const inlineInset = readOverlayScrollbarInset(
-          element,
-          "--overlay-scrollbar-inline-inset"
-        );
+        const inlineInset = readOverlayScrollbarInset(element, "--scrollbar-edge-inset");
         const viewportSize = element.clientHeight;
         const scrollSize = element.scrollHeight;
         const railSize = Math.max(0, rect.height);
@@ -110,11 +145,9 @@ export function useOverlayScrollbars() {
         const scrollRange = Math.max(1, scrollSize - viewportSize);
         const thumbOffset = (element.scrollTop / scrollRange) * thumbTravel;
 
-        scrollbar.rail.style.left = `${Math.round(
-          rect.right - SCROLLBAR_THICKNESS_PX - inlineInset
-        )}px`;
+        scrollbar.rail.style.left = `${Math.round(rect.right - SCROLLBAR_RAIL_SIZE_PX - inlineInset)}px`;
         scrollbar.rail.style.top = `${Math.round(rect.top)}px`;
-        scrollbar.rail.style.width = `${SCROLLBAR_THICKNESS_PX}px`;
+        scrollbar.rail.style.width = `${SCROLLBAR_RAIL_SIZE_PX}px`;
         scrollbar.rail.style.height = `${Math.round(rect.height)}px`;
         scrollbar.thumb.style.width = "";
         scrollbar.thumb.style.height = `${Math.round(thumbSize)}px`;
@@ -131,56 +164,26 @@ export function useOverlayScrollbars() {
       const thumbOffset = (element.scrollLeft / scrollRange) * thumbTravel;
 
       scrollbar.rail.style.left = `${Math.round(rect.left)}px`;
-      scrollbar.rail.style.top = `${Math.round(rect.bottom - SCROLLBAR_THICKNESS_PX)}px`;
+      const inlineInset = readOverlayScrollbarInset(element, "--scrollbar-edge-inset");
+      scrollbar.rail.style.top = `${Math.round(rect.bottom - SCROLLBAR_RAIL_SIZE_PX - inlineInset)}px`;
       scrollbar.rail.style.width = `${Math.round(rect.width)}px`;
-      scrollbar.rail.style.height = `${SCROLLBAR_THICKNESS_PX}px`;
+      scrollbar.rail.style.height = `${SCROLLBAR_RAIL_SIZE_PX}px`;
       scrollbar.thumb.style.width = `${Math.round(thumbSize)}px`;
       scrollbar.thumb.style.height = "";
       scrollbar.thumb.style.transform = `translate3d(${Math.round(thumbOffset)}px, 0, 0)`;
     }
 
-    function handlePointerOver(event: PointerEvent) {
-      pointerX = event.clientX;
-      pointerY = event.clientY;
-      setActiveElement(findScrollableElementAtPoint(pointerX, pointerY));
-    }
-
     function handlePointerMove(event: PointerEvent) {
-      pointerX = event.clientX;
-      pointerY = event.clientY;
-      if (dragging && activeElement) {
-        const currentPointer = dragging.axis === "vertical" ? event.clientY : event.clientX;
-        const pointerDelta = currentPointer - dragging.pointerStart;
-        const scrollDelta = (pointerDelta / dragging.thumbTravel) * dragging.scrollRange;
-        if (dragging.axis === "vertical") {
-          activeElement.scrollTop = dragging.scrollStart + scrollDelta;
-        } else {
-          activeElement.scrollLeft = dragging.scrollStart + scrollDelta;
-        }
-        scheduleOverlaySync();
-        return;
+      if (!dragging || !activeElement) return;
+      const currentPointer = dragging.axis === "vertical" ? event.clientY : event.clientX;
+      const pointerDelta = currentPointer - dragging.pointerStart;
+      const scrollDelta = (pointerDelta / dragging.thumbTravel) * dragging.scrollRange;
+      if (dragging.axis === "vertical") {
+        activeElement.scrollTop = dragging.scrollStart + scrollDelta;
+      } else {
+        activeElement.scrollLeft = dragging.scrollStart + scrollDelta;
       }
-
-      // Fast path: while the pointer stays inside the currently-active
-      // scrollable, the answer can't change — skip the expensive hit-test
-      // (document.elementsFromPoint + a getComputedStyle walk), which otherwise
-      // ran on EVERY pointer-move and scaled with DOM size, contributing to the
-      // main-thread jank while the media grid mutates during thumbnail
-      // generation. `isPointInsideElement` is a cheap rect check.
-      if (activeElement && isPointInsideElement(activeElement, pointerX, pointerY)) {
-        return;
-      }
-
-      const scrollable = findScrollableElementAtPoint(pointerX, pointerY);
-      if (scrollable) {
-        setActiveElement(scrollable);
-      } else if (activeElement && !isPointInsideElement(activeElement, pointerX, pointerY)) {
-        clearActiveElement();
-      }
-    }
-
-    function handlePointerLeave() {
-      if (!dragging) clearActiveElement();
+      scheduleOverlaySync();
     }
 
     function handlePointerDown(event: PointerEvent) {
@@ -216,54 +219,117 @@ export function useOverlayScrollbars() {
       const rail = axis === "vertical" ? vertical.rail : horizontal.rail;
       rail.setAttribute("data-scrollbar-dragging", "false");
       event.currentTarget instanceof Element && event.currentTarget.releasePointerCapture?.(event.pointerId);
-      if (!activeElement || !isPointInsideElement(activeElement, pointerX, pointerY)) {
-        clearActiveElement();
-      } else {
-        scheduleOverlaySync();
-      }
+      markScrollActivity();
+      scheduleOverlaySync();
     }
 
     function handleScroll(event: Event) {
       const target = event.target;
       if (target instanceof HTMLElement && isScrollableElement(target)) {
         setActiveElement(target);
+        markScrollActivity();
       }
+    }
+
+    function handleShellResizeState() {
+      if (document.body.dataset.shellResizing === "true") {
+        scrollActiveUntil = 0;
+        setActiveElement(null);
+        setOverlayVisible(vertical, false);
+        setOverlayVisible(horizontal, false);
+        return;
+      }
+      scheduleOverlaySync();
     }
 
     function handleResize() {
       scheduleOverlaySync();
     }
 
+    function handleVerticalThumbEnter() {
+      vertical.rail.dataset.scrollbarHover = "true";
+      scheduleOverlaySync();
+    }
+
+    function handleHorizontalThumbEnter() {
+      horizontal.rail.dataset.scrollbarHover = "true";
+      scheduleOverlaySync();
+    }
+
+    function handleVerticalThumbLeave() {
+      vertical.rail.dataset.scrollbarHover = "false";
+      scheduleOverlaySync();
+    }
+
+    function handleHorizontalThumbLeave() {
+      horizontal.rail.dataset.scrollbarHover = "false";
+      scheduleOverlaySync();
+    }
+
+    function handleVerticalRailEnter() {
+      vertical.rail.dataset.scrollbarAreaHover = "true";
+      scheduleOverlaySync();
+    }
+
+    function handleHorizontalRailEnter() {
+      horizontal.rail.dataset.scrollbarAreaHover = "true";
+      scheduleOverlaySync();
+    }
+
+    function handleVerticalRailLeave() {
+      vertical.rail.dataset.scrollbarAreaHover = "false";
+      scheduleOverlaySync();
+    }
+
+    function handleHorizontalRailLeave() {
+      horizontal.rail.dataset.scrollbarAreaHover = "false";
+      scheduleOverlaySync();
+    }
+
     vertical.thumb.addEventListener("pointerdown", handlePointerDown);
     horizontal.thumb.addEventListener("pointerdown", handlePointerDown);
-    vertical.thumb.addEventListener("pointerenter", () => {
-      vertical.rail.dataset.scrollbarHover = "true";
-    });
-    horizontal.thumb.addEventListener("pointerenter", () => {
-      horizontal.rail.dataset.scrollbarHover = "true";
-    });
-    vertical.thumb.addEventListener("pointerleave", () => {
-      vertical.rail.dataset.scrollbarHover = "false";
-    });
-    horizontal.thumb.addEventListener("pointerleave", () => {
-      horizontal.rail.dataset.scrollbarHover = "false";
-    });
-    document.addEventListener("pointerover", handlePointerOver, { passive: true });
-    document.addEventListener("pointermove", handlePointerMove, { passive: !dragging });
-    document.addEventListener("pointerleave", handlePointerLeave);
+    vertical.thumb.addEventListener("pointerenter", handleVerticalThumbEnter);
+    horizontal.thumb.addEventListener("pointerenter", handleHorizontalThumbEnter);
+    vertical.thumb.addEventListener("pointerleave", handleVerticalThumbLeave);
+    horizontal.thumb.addEventListener("pointerleave", handleHorizontalThumbLeave);
+    vertical.rail.addEventListener("pointerenter", handleVerticalRailEnter);
+    horizontal.rail.addEventListener("pointerenter", handleHorizontalRailEnter);
+    vertical.rail.addEventListener("pointerleave", handleVerticalRailLeave);
+    horizontal.rail.addEventListener("pointerleave", handleHorizontalRailLeave);
+
+    if (typeof MutationObserver !== "undefined") {
+      visibilityObserver = new MutationObserver(() => {
+        scheduleOverlaySync();
+      });
+      visibilityObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ["class", "style", "hidden"],
+        subtree: true
+      });
+    }
+
+    document.addEventListener("pointermove", handlePointerMove, { passive: true });
     document.addEventListener("pointerup", handlePointerUp);
     document.addEventListener("scroll", handleScroll, true);
+    window.addEventListener("megle:shell-resize-state", handleShellResizeState);
     window.addEventListener("resize", handleResize, { passive: true });
 
     return () => {
       activeElement?.removeEventListener("scroll", scheduleOverlaySync);
       vertical.thumb.removeEventListener("pointerdown", handlePointerDown);
       horizontal.thumb.removeEventListener("pointerdown", handlePointerDown);
-      document.removeEventListener("pointerover", handlePointerOver);
+      vertical.thumb.removeEventListener("pointerenter", handleVerticalThumbEnter);
+      horizontal.thumb.removeEventListener("pointerenter", handleHorizontalThumbEnter);
+      vertical.thumb.removeEventListener("pointerleave", handleVerticalThumbLeave);
+      horizontal.thumb.removeEventListener("pointerleave", handleHorizontalThumbLeave);
+      vertical.rail.removeEventListener("pointerenter", handleVerticalRailEnter);
+      horizontal.rail.removeEventListener("pointerenter", handleHorizontalRailEnter);
+      vertical.rail.removeEventListener("pointerleave", handleVerticalRailLeave);
+      horizontal.rail.removeEventListener("pointerleave", handleHorizontalRailLeave);
       document.removeEventListener("pointermove", handlePointerMove);
-      document.removeEventListener("pointerleave", handlePointerLeave);
       document.removeEventListener("pointerup", handlePointerUp);
       document.removeEventListener("scroll", handleScroll, true);
+      window.removeEventListener("megle:shell-resize-state", handleShellResizeState);
       window.removeEventListener("resize", handleResize);
       cleanup();
     };
@@ -282,6 +348,7 @@ function createScrollbar(axis: ScrollAxis): ScrollbarElements {
   rail.className = `megle-overlay-scrollbar megle-overlay-scrollbar-${axis}`;
   rail.setAttribute("data-scrollbar-visible", "false");
   rail.setAttribute("data-scrollbar-hover", "false");
+  rail.setAttribute("data-scrollbar-area-hover", "false");
   rail.setAttribute("data-scrollbar-dragging", "false");
   thumb.className = "megle-overlay-scrollbar-thumb";
   thumb.dataset.scrollbarAxis = axis;
@@ -293,6 +360,7 @@ function setOverlayVisible(scrollbar: ScrollbarElements, visible: boolean) {
   scrollbar.rail.setAttribute("data-scrollbar-visible", visible ? "true" : "false");
   if (!visible) {
     scrollbar.rail.setAttribute("data-scrollbar-hover", "false");
+    scrollbar.rail.setAttribute("data-scrollbar-area-hover", "false");
   }
 }
 
@@ -305,20 +373,6 @@ function resolveScrollbarAxis(target: EventTarget | null): ScrollAxis | null {
   if (!(target instanceof HTMLElement)) return null;
   const axis = target.dataset.scrollbarAxis;
   return axis === "vertical" || axis === "horizontal" ? axis : null;
-}
-
-function findScrollableElementAtPoint(x: number, y: number): HTMLElement | null {
-  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
-  for (const element of document.elementsFromPoint(x, y)) {
-    let current: Element | null = element;
-    while (current && current !== document.body && current !== document.documentElement) {
-      if (current instanceof HTMLElement && isScrollableElement(current)) {
-        return current;
-      }
-      current = current.parentElement;
-    }
-  }
-  return null;
 }
 
 function isScrollableElement(element: HTMLElement) {
@@ -334,10 +388,4 @@ function isScrollableElement(element: HTMLElement) {
 
 function allowsScroll(value: string) {
   return value === "auto" || value === "scroll" || value === "overlay";
-}
-
-function isPointInsideElement(element: HTMLElement, x: number, y: number) {
-  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
-  const rect = element.getBoundingClientRect();
-  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
 }

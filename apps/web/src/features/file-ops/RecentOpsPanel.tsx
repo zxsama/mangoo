@@ -1,6 +1,7 @@
 import { ArrowRightLeft, CheckCircle2, Pencil, RefreshCw, Trash2, XCircle } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { FileOperationKind, FileOperationRecord } from "@megle/core-client";
+import { MediaLoadingRing } from "../loading/MediaLoadingRing";
 
 export interface RecentOpsPanelProps {
   ops: FileOperationRecord[];
@@ -62,7 +63,7 @@ export function RecentOpsPanel({ ops, loading, onRefresh, onDismiss }: RecentOps
             className={loading ? "empty-panel empty-panel-busy" : "empty-panel"}
             role={loading ? "status" : undefined}
           >
-            {loading ? <span className="central-preview-loading-spinner" aria-hidden="true" /> : "No file operations yet"}
+            {loading ? <MediaLoadingRing size={18} /> : "No file operations yet"}
           </div>
         ) : (
           ops.map((op) => <RecentOpRow key={op.id} op={op} />)
