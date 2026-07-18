@@ -564,7 +564,7 @@ git commit -m "feat(web): show disconnected icon for unreachable roots; document
 
 ## 自审记录(已处理)
 
-- **Spec 覆盖**:分类字段+函数(T1)、回填 19k(T2)、根探针+缓存(T3)、reachable DTO+契约+API(T4)、transient 重试门(T5)、后台扫描(T6)、断连图标+全量门(T7)。viewport 即时重试:由现有 `/api/thumbnails/priority-scope` + T5 的候选门自动覆盖(可达根的 transient 失败进入 RetryFailedAndStale 候选,滚动即触发);无需单独任务,但 T5 测试须含"可达根 transient 失败进入候选"。已在 T5 Step 1 覆盖。
+- **Spec 覆盖**:分类字段+函数(T1)、回填 19k(T2)、根探针+缓存(T3)、reachable DTO+契约+API(T4)、transient 重试门(T5)、后台扫描(T6)、断连图标+全量门(T7)。viewport 即时重试:由浏览时对当前文件夹 scope 触发 retryFailedAndStale(复活 transient-failed→pending)+ 现有 priority-scope promotion 把可见/选中项提升到 viewport 优先级实现(见后补的 Gap B 修复,commit e276cf9);服务端手动 retryFailedAndStale route 也已按根可达性 gate(Gap A,commit 2266a7c)。注:最初本自审曾错误声称 viewport 即时重试"已被现有 priority-scope + 候选门自动覆盖"——priority-scope 只重排已存在的 pending/running,不复活 failed,故那条声明不成立,已由 Gap B 单独实现。
 - **占位符扫描**:无 TBD;所有代码步含完整代码;grep-确认项(error 变量名、roots 模块结构、手动 vs 自动 retry 调用链、schema-check 断言风格)明确标注为实现者用真实源确认,而非猜测。
 - **类型一致**:`ThumbnailFailureKind`/`classify_thumbnail_failure`(T1)→ T2/T5/T6 消费;`RootReachability`/`probe_root_reachable`/`refresh_root_reachability`(T3)→ T4/T6 消费;`RootRecord.reachable`(T4)→ T7 消费。签名一致。
 - **手动 retry 保护**:T5 明确只给自动 `RetryFailedAndStale` 加 transient 门,`retry_task` 手动路径不变(用户可手动重试 permanent),并加断言测试。
