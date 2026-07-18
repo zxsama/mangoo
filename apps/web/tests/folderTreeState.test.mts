@@ -1,10 +1,33 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  expandFolderPath,
   folderShowsOpenIcon,
   isFolderKnownChildless,
+  mergeFolderAncestorPath,
+  mergeFolderChildrenByParent,
   reconcileFolderExpansionForSelection
 } from "../src/core/folderTreeState.ts";
+
+function folder(id: number, name: string, parentId: number | null): {
+  id: number;
+  rootId: number;
+  parentId: number | null;
+  name: string;
+  status: string;
+  hasChildren: boolean;
+  mediaCount: number;
+} {
+  return {
+    id,
+    rootId: 1,
+    parentId,
+    name,
+    status: "active",
+    hasChildren: true,
+    mediaCount: 0
+  };
+}
 
 describe("folder tree interaction state", () => {
   it("opens only the currently selected leaf icon", () => {
@@ -59,5 +82,33 @@ describe("folder tree interaction state", () => {
       }),
       false
     );
+  });
+
+  it("merges an ancestor path without replacing or duplicating paged children", () => {
+    const existing = {
+      10: [folder(12, "bravo", 10), folder(11, "alpha", 10)]
+    };
+    const merged = mergeFolderAncestorPath(existing, [
+      folder(10, "root", null),
+      folder(11, "alpha", 10),
+      folder(20, "target", 11)
+    ]);
+
+    assert.deepEqual(
+      merged[10].map((item) => item.id),
+      [11, 12]
+    );
+    assert.deepEqual(merged[11].map((item) => item.id), [20]);
+    assert.deepEqual(existing[10].map((item) => item.id), [12, 11]);
+    assert.equal(mergeFolderChildrenByParent(merged, 11, [merged[11][0]]), merged);
+  });
+
+  it("expands every ancestor but not the target and preserves existing state", () => {
+    const current = new Set([99]);
+    const path = [folder(10, "root", null), folder(11, "parent", 10), folder(20, "target", 11)];
+    const expanded = expandFolderPath(current, path);
+
+    assert.deepEqual([...expanded], [99, 10, 11]);
+    assert.equal(expandFolderPath(expanded, path), expanded);
   });
 });

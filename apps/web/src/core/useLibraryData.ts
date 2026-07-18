@@ -17,7 +17,12 @@ import type {
 import { CoreApiError } from "@megle/core-client";
 import { createCoreClient } from "./client";
 import { readDesktopDiagnostics, subscribeLibraryPhase, type DesktopDiagnostics } from "./desktop";
-import { reconcileFolderExpansionForSelection } from "./folderTreeState";
+import {
+  expandFolderPath,
+  mergeFolderAncestorPath,
+  mergeFolderChildrenByParent,
+  reconcileFolderExpansionForSelection
+} from "./folderTreeState";
 import {
   isFreshThumbnailForMediaRecord,
   isLiveThumbnailResponseForMediaRecord,
@@ -157,6 +162,7 @@ export interface LibraryState {
   setSelectedMediaId: (mediaId: number | null) => void;
   toggleFolderExpanded: (folderId: number) => void;
   requestFolderChildren: (folderId: number) => Promise<FolderRecord[]>;
+  revealFolderPath: (folderId: number) => Promise<FolderRecord[]>;
   requestThumbnailStates: (mediaIds: number[], priority: ThumbnailRequestPriority) => void;
   requestMediaWindow: (startIndex: number, endIndex: number) => void;
   loadMoreFolderChildren: (folderId: number) => Promise<void>;
@@ -242,6 +248,9 @@ export function useLibraryData(
   const folderChildInitialRequestsRef = useRef<Map<number, Promise<FolderRecord[]>>>(
     new Map()
   );
+  const folderAncestorRequestsRef = useRef<Map<number, Promise<FolderRecord[]>>>(new Map());
+  const folderAncestorControllersRef = useRef<Map<number, AbortController>>(new Map());
+  const folderAncestorPathCacheRef = useRef<Map<number, FolderRecord[]>>(new Map());
   const thumbnailStateControllersRef = useRef<Map<ThumbnailRequestPriority, AbortController>>(
     new Map()
   );
@@ -572,7 +581,10 @@ export function useLibraryData(
   const abortStaleFolderRequests = useCallback(() => {
     abortAllControllers(folderChildControllersRef.current);
     abortAllControllers(folderDescendantControllersRef.current);
+    abortAllControllers(folderAncestorControllersRef.current);
     folderChildInitialRequestsRef.current.clear();
+    folderAncestorRequestsRef.current.clear();
+    folderAncestorPathCacheRef.current.clear();
     inFlightFolderChildPageKeys.current.clear();
     inFlightFolderDescendantIds.current.clear();
     setLoadingFolderIds(new Set());
@@ -1082,10 +1094,13 @@ export function useLibraryData(
         }, {
           signal: controller.signal
         });
-        const nextChildrenByParent = {
+        let nextChildrenByParent = {
           ...folderChildrenByParentRef.current,
           [folderId]: page.items
         };
+        for (const path of folderAncestorPathCacheRef.current.values()) {
+          nextChildrenByParent = mergeFolderAncestorPath(nextChildrenByParent, path);
+        }
         folderChildrenByParentRef.current = nextChildrenByParent;
         setFolderChildrenByParent(nextChildrenByParent);
         loadedFolderChildPageKeys.current.add(requestKey);
@@ -1126,6 +1141,69 @@ export function useLibraryData(
     [client]
   );
 
+  const revealFolderPath = useCallback(
+    async (folderId: number): Promise<FolderRecord[]> => {
+      const cachedPath = folderAncestorPathCacheRef.current.get(folderId);
+      if (cachedPath) {
+        const mergedChildren = mergeFolderAncestorPath(
+          folderChildrenByParentRef.current,
+          cachedPath
+        );
+        folderChildrenByParentRef.current = mergedChildren;
+        setFolderChildrenByParent(mergedChildren);
+        setExpandedFolderIds((current) => expandFolderPath(current, cachedPath));
+        return cachedPath;
+      }
+
+      const existingRequest = folderAncestorRequestsRef.current.get(folderId);
+      if (existingRequest) {
+        return existingRequest;
+      }
+
+      const controller = new AbortController();
+      folderAncestorControllersRef.current.set(folderId, controller);
+      const request = (async () => {
+        const response = await client.listFolderAncestors(folderId, {
+          requestPriority: "navigation",
+          signal: controller.signal
+        });
+        const path = response.items;
+        if (path.length === 0 || path[path.length - 1]?.id !== folderId) {
+          throw new Error(`Invalid folder ancestor path for ${folderId}`);
+        }
+
+        folderAncestorPathCacheRef.current.set(folderId, path);
+        const mergedChildren = mergeFolderAncestorPath(
+          folderChildrenByParentRef.current,
+          path
+        );
+        folderChildrenByParentRef.current = mergedChildren;
+        setFolderChildrenByParent(mergedChildren);
+        setExpandedFolderIds((current) => expandFolderPath(current, path));
+        return path;
+      })();
+
+      folderAncestorRequestsRef.current.set(folderId, request);
+      try {
+        return await request;
+      } catch (cause) {
+        if (isAbortError(cause)) {
+          return [];
+        }
+        setError(errorMessage(cause));
+        throw cause;
+      } finally {
+        if (folderAncestorControllersRef.current.get(folderId) === controller) {
+          folderAncestorControllersRef.current.delete(folderId);
+        }
+        if (folderAncestorRequestsRef.current.get(folderId) === request) {
+          folderAncestorRequestsRef.current.delete(folderId);
+        }
+      }
+    },
+    [client]
+  );
+
   const loadMoreFolderChildren = useCallback(
     async (folderId: number) => {
       const cursor = folderChildNextCursorByParent[folderId];
@@ -1152,10 +1230,11 @@ export function useLibraryData(
         }, {
           signal: controller.signal
         });
-        setFolderChildrenByParent((current) => ({
-          ...current,
-          [folderId]: [...(current[folderId] ?? []), ...page.items]
-        }));
+        setFolderChildrenByParent((current) => {
+          const next = mergeFolderChildrenByParent(current, folderId, page.items);
+          folderChildrenByParentRef.current = next;
+          return next;
+        });
         loadedFolderChildPageKeys.current.add(requestKey);
         setFolderChildNextCursorByParent((current) => ({
           ...current,
@@ -1841,6 +1920,7 @@ export function useLibraryData(
       abortAllControllers(mediaPageControllersRef.current);
       abortAllControllers(folderChildControllersRef.current);
       abortAllControllers(folderDescendantControllersRef.current);
+      abortAllControllers(folderAncestorControllersRef.current);
       abortAllControllers(thumbnailStateControllersRef.current);
       interactiveFolderScanControllerRef.current?.abort();
       thumbnailPriorityScopeSyncControllerRef.current?.abort();
@@ -3098,6 +3178,7 @@ export function useLibraryData(
     requestThumbnailStates,
     requestMediaWindow,
     requestFolderChildren: loadFolderChildren,
+    revealFolderPath,
     toggleFolderExpanded: (folderId: number) => {
       setExpandedFolderIds((current) => {
         const next = new Set(current);

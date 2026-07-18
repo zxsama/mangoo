@@ -6,13 +6,19 @@ import {
   FolderX
 } from "lucide-react";
 import type { CSSProperties, RefObject } from "react";
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { folderShowsOpenIcon, isFolderKnownChildless } from "../../core/folderTreeState";
 import type { FolderRecord, RootRecord } from "../../core/types";
 import type { LibraryState } from "../../core/useLibraryData";
 
+export interface LibrarySidebarLocateRequest {
+  folderId: number;
+  requestId: number | string;
+}
+
 interface LibrarySidebarProps {
   library: LibraryState;
+  locateRequest?: LibrarySidebarLocateRequest;
   onRootContextMenu?: (event: {
     root: RootRecord;
     x: number;
@@ -32,11 +38,75 @@ const TREE_STICKY_TOLERANCE = 1;
 
 export function LibrarySidebar({
   library,
+  locateRequest,
   onFolderContextMenu,
   onRootContextMenu
 }: LibrarySidebarProps) {
   const sidebarRef = useRef<HTMLElement | null>(null);
+  const [locateTarget, setLocateTarget] = useState<LibrarySidebarLocateRequest | null>(null);
+  const revealFolderPath = library.revealFolderPath;
   useTreeStickyOcclusion(sidebarRef);
+
+  useEffect(() => {
+    if (!locateRequest) return;
+    let cancelled = false;
+    void revealFolderPath(locateRequest.folderId)
+      .then((path) => {
+        if (!cancelled && path.length > 0) {
+          setLocateTarget({ ...locateRequest });
+        }
+      })
+      .catch(() => {
+        // The library state owns the error; failed location must not select a row.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [locateRequest?.folderId, locateRequest?.requestId, revealFolderPath]);
+
+  useLayoutEffect(() => {
+    if (!locateTarget) return;
+    const sidebar = sidebarRef.current;
+    if (!sidebar) return;
+
+    let frame = 0;
+    let attempts = 0;
+    let clearHighlight: () => void = () => undefined;
+    const locate = () => {
+      frame = 0;
+      const row = sidebar.querySelector<HTMLElement>(
+        `.tree-item[data-folder-id="${locateTarget.folderId}"]`
+      );
+      if (!row) {
+        if (attempts < 8) {
+          attempts += 1;
+          frame = window.requestAnimationFrame(locate);
+        }
+        return;
+      }
+
+      const sidebarRect = sidebar.getBoundingClientRect();
+      const rowRect = row.getBoundingClientRect();
+      const centeredTop =
+        sidebar.scrollTop +
+        rowRect.top -
+        sidebarRect.top -
+        Math.max(0, (sidebar.clientHeight - rowRect.height) / 2);
+      const maxScrollTop = Math.max(0, sidebar.scrollHeight - sidebar.clientHeight);
+      sidebar.scrollTo({
+        top: Math.max(0, Math.min(maxScrollTop, centeredTop)),
+        behavior: "smooth"
+      });
+      const timeout = window.setTimeout(() => setLocateTarget(null), 900);
+      clearHighlight = () => window.clearTimeout(timeout);
+    };
+
+    frame = window.requestAnimationFrame(locate);
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      clearHighlight();
+    };
+  }, [locateTarget]);
 
   return (
     <aside
@@ -52,6 +122,7 @@ export function LibrarySidebar({
             onFolderContextMenu={onFolderContextMenu}
             onRootContextMenu={onRootContextMenu}
             root={root}
+            highlightedFolderId={locateTarget?.folderId ?? null}
           />
         ))}
         {library.roots.length === 0 ? <div className="empty-panel">No roots</div> : null}
@@ -63,11 +134,13 @@ export function LibrarySidebar({
 function RootNode({
   library,
   root,
+  highlightedFolderId,
   onFolderContextMenu,
   onRootContextMenu
 }: {
   library: LibraryState;
   root: RootRecord;
+  highlightedFolderId: number | null;
   onRootContextMenu?: (event: {
     root: RootRecord;
     x: number;
@@ -93,6 +166,9 @@ function RootNode({
         data-depth="0"
         data-folder-id={rootFolderId ?? undefined}
         data-root-id={root.id}
+        data-tree-locate-highlight={
+          rootFolderId !== null && rootFolderId === highlightedFolderId ? "true" : undefined
+        }
         role="treeitem"
         aria-expanded={rootFolderId ? expanded : undefined}
         aria-selected={selected}
@@ -147,6 +223,7 @@ function RootNode({
               folder={folder}
               key={folder.id}
               library={library}
+              highlightedFolderId={highlightedFolderId}
               onFolderContextMenu={onFolderContextMenu}
             />
           ))}
@@ -160,11 +237,13 @@ function RootNode({
 function FolderNode({
   depth,
   folder,
+  highlightedFolderId,
   library,
   onFolderContextMenu
 }: {
   depth: number;
   folder: FolderRecord;
+  highlightedFolderId: number | null;
   library: LibraryState;
   onFolderContextMenu?: (event: {
     folder: FolderRecord;
@@ -198,6 +277,7 @@ function FolderNode({
         data-depth={depth}
         data-folder-id={folder.id}
         data-root-id={folder.rootId}
+        data-tree-locate-highlight={folder.id === highlightedFolderId ? "true" : undefined}
         role="treeitem"
         aria-expanded={knownChildless ? undefined : expanded}
         aria-selected={selected}
@@ -249,6 +329,7 @@ function FolderNode({
               folder={child}
               key={child.id}
               library={library}
+              highlightedFolderId={highlightedFolderId}
               onFolderContextMenu={onFolderContextMenu}
             />
           ))}
