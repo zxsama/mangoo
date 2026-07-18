@@ -2326,8 +2326,8 @@ button:disabled {
 .media-tile-locate-button {
   position: absolute;
   z-index: 2;
-  top: 4px;
-  right: 4px;
+  top: 0;
+  right: 0;
   display: grid;
   width: 28px;
   height: 28px;
@@ -2341,14 +2341,24 @@ button:disabled {
   cursor: pointer;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 140ms ease, color 140ms ease;
+  transition: opacity 140ms ease 0ms, color 140ms ease 0ms, transform 140ms ease 0ms;
 }
 
-.media-tile-thumb-shell:hover .media-tile-locate-button,
+.media-tile-thumb-shell:hover .media-tile-locate-button {
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity 140ms ease 500ms, color 140ms ease 0ms, transform 140ms ease 0ms;
+}
+
 .media-tile-thumb-shell:focus-within .media-tile-locate-button {
   opacity: 1;
   pointer-events: auto;
-  transition-delay: 500ms;
+  transition: opacity 140ms ease 0ms, color 140ms ease 0ms, transform 140ms ease 0ms;
+}
+
+.media-tile-locate-button:hover:not(:disabled),
+.media-tile-locate-button:active:not(:disabled) {
+  transform: none;
 }
 
 .media-tile-thumb-shell .media-tile-locate-button:focus-visible {
@@ -2356,7 +2366,7 @@ button:disabled {
   pointer-events: auto;
   outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
   outline-offset: -2px;
-  transition-delay: 0s;
+  transition: opacity 140ms ease 0ms, color 140ms ease 0ms, transform 140ms ease 0ms;
 }
 .virtual-grid--list .load-more-row {
   justify-content: flex-start;

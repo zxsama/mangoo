@@ -8,6 +8,7 @@ import {
 import type { CSSProperties, RefObject } from "react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { folderShowsOpenIcon, isFolderKnownChildless } from "../../core/folderTreeState";
+import { resolveFolderLocationScrollFrame } from "./folderLocationScroll";
 import type { FolderRecord, RootRecord } from "../../core/types";
 import type { LibraryState } from "../../core/useLibraryData";
 
@@ -44,11 +45,14 @@ export function LibrarySidebar({
 }: LibrarySidebarProps) {
   const sidebarRef = useRef<HTMLElement | null>(null);
   const [locateTarget, setLocateTarget] = useState<LibrarySidebarLocateRequest | null>(null);
+  const [highlightedFolderId, setHighlightedFolderId] = useState<number | null>(null);
   const revealFolderPath = library.revealFolderPath;
   useTreeStickyOcclusion(sidebarRef);
 
   useEffect(() => {
     if (!locateRequest) return;
+    setLocateTarget(null);
+    setHighlightedFolderId(null);
     let cancelled = false;
     void revealFolderPath(locateRequest.folderId)
       .then((path) => {
@@ -71,7 +75,8 @@ export function LibrarySidebar({
 
     let frame = 0;
     let attempts = 0;
-    let clearHighlight: () => void = () => undefined;
+    let highlightTimeout = 0;
+    let scrollFrame = 0;
     const locate = () => {
       frame = 0;
       const row = sidebar.querySelector<HTMLElement>(
@@ -93,18 +98,44 @@ export function LibrarySidebar({
         sidebarRect.top -
         Math.max(0, (sidebar.clientHeight - rowRect.height) / 2);
       const maxScrollTop = Math.max(0, sidebar.scrollHeight - sidebar.clientHeight);
-      sidebar.scrollTo({
-        top: Math.max(0, Math.min(maxScrollTop, centeredTop)),
-        behavior: "smooth"
-      });
-      const timeout = window.setTimeout(() => setLocateTarget(null), 900);
-      clearHighlight = () => window.clearTimeout(timeout);
+      const targetTop = Math.max(0, Math.min(maxScrollTop, centeredTop));
+      const startTop = sidebar.scrollTop;
+      const distance = Math.abs(targetTop - startTop);
+      const durationMs = distance === 0 ? 0 : Math.min(420, Math.max(180, distance * 0.45));
+      const startedAt = performance.now();
+      const finish = () => {
+        sidebar.scrollTop = targetTop;
+        setHighlightedFolderId(locateTarget.folderId);
+        highlightTimeout = window.setTimeout(() => {
+          setHighlightedFolderId(null);
+        }, 900);
+      };
+      const animate = (now: number) => {
+        const next = resolveFolderLocationScrollFrame({
+          from: startTop,
+          to: targetTop,
+          elapsedMs: now - startedAt,
+          durationMs
+        });
+        sidebar.scrollTop = next.top;
+        if (next.done) {
+          finish();
+          return;
+        }
+        scrollFrame = window.requestAnimationFrame(animate);
+      };
+      if (durationMs === 0) {
+        finish();
+      } else {
+        scrollFrame = window.requestAnimationFrame(animate);
+      }
     };
 
     frame = window.requestAnimationFrame(locate);
     return () => {
       if (frame) window.cancelAnimationFrame(frame);
-      clearHighlight();
+      if (scrollFrame) window.cancelAnimationFrame(scrollFrame);
+      if (highlightTimeout) window.clearTimeout(highlightTimeout);
     };
   }, [locateTarget]);
 
@@ -122,7 +153,7 @@ export function LibrarySidebar({
             onFolderContextMenu={onFolderContextMenu}
             onRootContextMenu={onRootContextMenu}
             root={root}
-            highlightedFolderId={locateTarget?.folderId ?? null}
+            highlightedFolderId={highlightedFolderId}
           />
         ))}
         {library.roots.length === 0 ? <div className="empty-panel">No roots</div> : null}
