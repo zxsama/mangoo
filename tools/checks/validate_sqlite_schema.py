@@ -22,6 +22,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0015_root_status_browsing_indexes.sql",
     ROOT / "crates" / "core" / "migrations" / "0016_folder_status_browsing_indexes.sql",
     ROOT / "crates" / "core" / "migrations" / "0017_thumbnail_task_indexes.sql",
+    ROOT / "crates" / "core" / "migrations" / "0018_thumb_failure_kind.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -355,6 +356,7 @@ def main() -> None:
                 "source_fingerprint",
                 "served_by",
                 "error",
+                "failure_kind",
                 "updated_at",
             }
             missing_thumb_columns = required_thumb_columns - thumb_columns

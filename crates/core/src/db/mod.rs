@@ -695,6 +695,10 @@ impl Database {
             self.connection
                 .execute_batch(migrations::THUMBNAIL_TASK_INDEXES_MIGRATION)?;
         }
+        if !self.migration_applied(18)? {
+            self.connection
+                .execute_batch(migrations::THUMB_FAILURE_KIND_MIGRATION)?;
+        }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
         Ok(())
@@ -2594,6 +2598,7 @@ impl Database {
         profile: &str,
         attempted_source_fingerprint: Option<&str>,
         error: &str,
+        failure_kind: &str,
         task_id: i64,
         attempt_generation: i64,
     ) -> anyhow::Result<bool> {
@@ -2623,6 +2628,10 @@ impl Database {
                     error: Some(error.to_string()),
                     source_fingerprint: Some(current_source_fingerprint),
                 },
+            )?;
+            transaction.execute(
+                "UPDATE thumbs SET failure_kind = ?1 WHERE file_id = ?2 AND profile = ?3",
+                (failure_kind, file_id, profile),
             )?;
             transaction.commit()?;
             return Ok(true);
@@ -13881,6 +13890,7 @@ mod tests {
                 crate::thumbnails::GRID_320_PROFILE,
                 Some(source_fingerprint.as_str()),
                 "late decode failure",
+                "permanent",
                 task_id,
                 old_attempt,
             )
@@ -13894,6 +13904,76 @@ mod tests {
         assert_eq!(thumbnail.state, "queued");
         assert_eq!(thumbnail.error, None);
         assert_eq!(thumbnail.cache_key, None);
+    }
+
+    #[test]
+    fn publish_thumbnail_failure_writes_failure_kind() {
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_media_page_fixture(&database);
+        let file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "transient-failure.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 100,
+                mtime: 10,
+                ctime: None,
+                file_key: Some("transient-failure-source".to_string()),
+            })
+            .expect("insert file");
+        database
+            .upsert_media_kind(file_id, "image")
+            .expect("insert media");
+        let source_fingerprint = database
+            .get_thumbnail_source(file_id)
+            .expect("get source")
+            .expect("source exists")
+            .source_fingerprint(crate::thumbnails::GRID_320_PROFILE);
+        let request = database
+            .request_thumbnail_task(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                ThumbnailTaskPriority::Visible,
+            )
+            .expect("request thumbnail");
+        let task_id = request.task_id.expect("task id");
+        let attempt_generation = database
+            .get_task(task_id)
+            .expect("get task")
+            .expect("task exists")
+            .attempt_generation;
+        database
+            .mark_thumbnail_task_running_for_attempt(
+                task_id,
+                attempt_generation,
+                &source_fingerprint,
+            )
+            .expect("mark thumbnail running");
+
+        let published = database
+            .publish_thumbnail_failure_for_attempted_source_for_task_attempt(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                Some(source_fingerprint.as_str()),
+                "thumbnail decode failed: 找不到网络路径。 (os error 53)",
+                "transient",
+                task_id,
+                attempt_generation,
+            )
+            .expect("publish failure");
+        assert!(published);
+
+        let (state, failure_kind): (String, Option<String>) = database
+            .connection
+            .query_row(
+                "SELECT state, failure_kind FROM thumbs WHERE file_id = ?1 AND profile = ?2",
+                (file_id, crate::thumbnails::GRID_320_PROFILE),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query thumbs row");
+        assert_eq!(state, "failed");
+        assert_eq!(failure_kind.as_deref(), Some("transient"));
     }
 
     #[test]

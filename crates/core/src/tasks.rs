@@ -710,12 +710,15 @@ fn handle_task_error_for_attempt(
                         attempt_generation,
                     );
                 } else {
+                    let failure_kind =
+                        crate::thumbnails::classify_thumbnail_failure(&error_message).as_str();
                     let _ = database
                         .publish_thumbnail_failure_for_attempted_source_for_task_attempt(
                             file_id,
                             GRID_320_PROFILE,
                             task.thumbnail_source_fingerprint.as_deref(),
                             &error_message,
+                            failure_kind,
                             task_id,
                             attempt_generation,
                         );

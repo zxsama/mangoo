@@ -476,11 +476,71 @@ pub fn ffmpeg_available() -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailFailureKind {
+    Transient,
+    Permanent,
+}
+
+impl ThumbnailFailureKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThumbnailFailureKind::Transient => "transient",
+            ThumbnailFailureKind::Permanent => "permanent",
+        }
+    }
+}
+
+/// Classify a thumbnail generation error as transient (source momentarily
+/// unreachable / contention / memory — will succeed on retry once conditions
+/// recover) or permanent (unsupported format / corrupt file — retrying is
+/// futile). Pure function on the stored error string.
+pub fn classify_thumbnail_failure(error: &str) -> ThumbnailFailureKind {
+    const TRANSIENT_SIGNATURES: &[&str] = &[
+        "os error 53",    // Windows: network path not found
+        "找不到网络路径", // localized "network path not found"
+        "network path",
+        "database is locked",
+        "Memory limit exceeded",
+    ];
+    if TRANSIENT_SIGNATURES.iter().any(|sig| error.contains(sig)) {
+        ThumbnailFailureKind::Transient
+    } else {
+        ThumbnailFailureKind::Permanent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn classify_thumbnail_failure_splits_transient_and_permanent() {
+        use super::{classify_thumbnail_failure, ThumbnailFailureKind::*};
+        // transient
+        for e in [
+            "thumbnail decode failed: 找不到网络路径。 (os error 53)",
+            "database is locked",
+            "thumbnail decode failed: Memory limit exceeded",
+            "read failed: network path not found",
+        ] {
+            assert!(
+                matches!(classify_thumbnail_failure(e), Transient),
+                "should be transient: {e}"
+            );
+        }
+        // permanent
+        for e in [
+            "thumbnail decode failed: The image format Avif is not supported",
+            "thumbnail decode failed: The file extension `.\"psd\"` was not recognized as an image format",
+            "thumbnail decode failed: Format error decoding Jpeg: Error parsing image",
+            "thumbnail decode failed: unsupported media kind \"text\"",
+        ] {
+            assert!(matches!(classify_thumbnail_failure(e), Permanent), "should be permanent: {e}");
+        }
+    }
 
     #[test]
     fn grid_320_policy_is_webp_with_exact_short_side() {
