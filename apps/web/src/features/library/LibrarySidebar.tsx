@@ -2,7 +2,8 @@ import {
   ChevronDown,
   ChevronRight,
   Folder,
-  FolderOpen
+  FolderOpen,
+  FolderX
 } from "lucide-react";
 import type { CSSProperties, RefObject } from "react";
 import { useEffect, useLayoutEffect, useRef } from "react";
@@ -121,7 +122,13 @@ function RootNode({
           onClick={() => library.setSelectedRootId(root.id)}
           type="button"
         >
-          {expanded ? <FolderOpen size={16} /> : <Folder size={16} />}
+          {root.reachable === false ? (
+            <FolderX size={16} className="tree-root-offline" aria-label="资源库离线" />
+          ) : expanded ? (
+            <FolderOpen size={16} />
+          ) : (
+            <Folder size={16} />
+          )}
           <span>{root.displayName}</span>
         </button>
         <span
