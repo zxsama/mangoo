@@ -13,7 +13,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::db::{Database, DbWriter};
+use crate::db::{Database, DbWriter, ThumbnailCacheRefreshMode, ThumbnailCacheScope};
 use crate::roots::reachability::{refresh_root_reachability, RootReachability};
 use crate::tasks::{start_worker, TaskSender};
 use crate::watch::{start_watcher, WatcherHandle};
@@ -189,6 +189,7 @@ pub fn router_with_config(database: Database, config: ApiConfig) -> Router {
         });
     }
     spawn_root_reachability_probe(&state);
+    spawn_transient_retry_sweep(&state);
     let api_router = routes::router(state).layer(middleware::from_fn_with_state(
         config.clone(),
         require_session_token,
@@ -270,6 +271,93 @@ fn spawn_root_reachability_probe(state: &AppState) {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     });
+}
+
+/// Upper bound on how many transient-failure retries this sweep enqueues per
+/// root per tick. The candidate query + enqueue loop runs inside one
+/// transaction on the single writer, so an unbounded batch on a root with a
+/// huge backlog (e.g. the ~19k thumbnails a NAS blip left `failed`) would hold
+/// the writer for a long single job; capping keeps each tick's writer hold
+/// short and lets the backlog drain over several ticks instead.
+const TRANSIENT_RETRY_SWEEP_PER_ROOT_LIMIT: usize = 500;
+
+/// Starts the background transient-retry sweep: every 60s, re-enqueues
+/// `failed` thumbnails classified `transient` (the `RetryFailedAndStale`
+/// candidate gate, which already restricts to `failure_kind = 'transient'`)
+/// for every root the reachability cache currently reports reachable, at
+/// `bulk` priority so it never competes with interactive generation.
+/// `spawn_root_reachability_probe` only keeps that cache fresh — nothing else
+/// re-queues the backlog a transient NAS outage leaves stuck `failed`, which
+/// is exactly what let ~19k thumbnails go permanently failed instead of
+/// clearing once the share came back. Unreachable roots are skipped entirely
+/// so an offline NAS is never hammered with retry enqueues. A failed sweep
+/// tick is logged and skipped; it never crashes Core, and the next tick tries
+/// again.
+fn spawn_transient_retry_sweep(state: &AppState) {
+    let reach = state.root_reachability.clone();
+    let writer = state.writer.clone();
+    tokio::spawn(async move {
+        loop {
+            let reach_for_tick = reach.clone();
+            let result = writer
+                .write(move |database| run_transient_retry_sweep(database, &reach_for_tick))
+                .await;
+            match result {
+                Ok(enqueued_count) if enqueued_count > 0 => {
+                    tracing::info!(
+                        enqueued_count,
+                        "transient retry sweep re-enqueued failed thumbnails"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "transient retry sweep failed; will retry next tick");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+/// Pure sweep logic, run once: lists every enabled root, skips any the
+/// reachability cache marks unreachable (a cache miss defaults to reachable,
+/// matching `routes::list_roots`'s overlay so a not-yet-probed root is never
+/// treated as offline), and for each reachable root re-enqueues its `failed
+/// AND failure_kind = 'transient'` thumbnails via the existing
+/// `RetryFailedAndStale` bulk enqueue path. Returns the total number of
+/// thumbnails accepted for retry across all roots this call.
+pub(crate) fn run_transient_retry_sweep(
+    database: &Database,
+    reachability: &RootReachability,
+) -> anyhow::Result<usize> {
+    let roots = database.list_roots()?;
+    // Snapshot the cache once up front rather than holding the lock across the
+    // enqueue loop below (which can run one write transaction per root).
+    let reachable_by_root_id: HashMap<i64, bool> = reachability
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+
+    let mut enqueued_count = 0usize;
+    for root in roots {
+        let is_reachable = *reachable_by_root_id.get(&root.id).unwrap_or(&true);
+        if !is_reachable {
+            continue;
+        }
+        let scope = ThumbnailCacheScope {
+            root_id: Some(root.id),
+            folder_id: None,
+            include_descendants: false,
+        };
+        let result = database.enqueue_thumbnail_cache_tasks(
+            scope,
+            ThumbnailCacheRefreshMode::RetryFailedAndStale,
+            TRANSIENT_RETRY_SWEEP_PER_ROOT_LIMIT,
+            None,
+        )?;
+        enqueued_count += result.accepted_count;
+    }
+    Ok(enqueued_count)
 }
 
 /// Reads `(id, path)` for every enabled root using a dedicated read connection
@@ -394,4 +482,208 @@ async fn require_basic_auth(
         )
         .body(axum::body::Body::empty())
         .expect("build 401 response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_transient_retry_sweep;
+    use crate::db::{Database, FileUpsert, FolderUpsert, NewRoot, ThumbnailStateUpsert};
+    use crate::roots::reachability::RootReachability;
+    use crate::thumbnails::GRID_320_PROFILE;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn migrated_database() -> Database {
+        let database = Database::open_in_memory().expect("open in-memory database");
+        database.apply_migrations().expect("apply migrations");
+        database
+    }
+
+    /// Seeds one root with one folder and one `failed` thumbnail classified
+    /// with `failure_kind`, mirroring the real backlog: a thumbnail that
+    /// generation already attempted and marked `failed`, then Task 5's
+    /// migration/classification stamped `transient` or `permanent`.
+    fn seed_failed_thumbnail(
+        database: &Database,
+        root_id: i64,
+        folder_id: i64,
+        name: &str,
+        file_key: &str,
+        failure_kind: &str,
+    ) -> i64 {
+        let file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: name.to_string(),
+                ext: ".jpg".to_string(),
+                size: 4096,
+                mtime: 123,
+                ctime: None,
+                file_key: Some(file_key.to_string()),
+            })
+            .expect("insert file");
+        database
+            .upsert_media_kind(file_id, "image")
+            .expect("insert media kind");
+        let source_fingerprint = database
+            .get_thumbnail_source(file_id)
+            .expect("get thumbnail source")
+            .expect("thumbnail source exists")
+            .source_fingerprint(GRID_320_PROFILE);
+        database
+            .upsert_thumbnail_state(ThumbnailStateUpsert {
+                file_id,
+                profile: GRID_320_PROFILE.to_string(),
+                state: "failed".to_string(),
+                cache_key: None,
+                width: None,
+                height: None,
+                byte_size: None,
+                error: Some("decode failed".to_string()),
+                source_fingerprint: Some(source_fingerprint),
+            })
+            .expect("insert failed thumbnail state");
+        database
+            .set_thumbnail_failure_kind_for_test(file_id, GRID_320_PROFILE, failure_kind)
+            .expect("classify failure kind");
+        file_id
+    }
+
+    fn thumbnail_state(database: &Database, file_id: i64) -> String {
+        database
+            .get_thumbnail(file_id, GRID_320_PROFILE)
+            .expect("get thumbnail")
+            .expect("thumbnail row exists")
+            .state
+    }
+
+    #[test]
+    fn transient_retry_sweep_retries_reachable_root_and_skips_unreachable_root() {
+        let database = migrated_database();
+
+        let reachable_root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures/reachable-root".to_string(),
+                display_name: "Reachable Root".to_string(),
+            })
+            .expect("add reachable root");
+        let reachable_folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id: reachable_root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "reachable-root-hash".to_string(),
+                mtime: Some(1),
+            })
+            .expect("insert reachable root folder");
+
+        let unreachable_root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures/unreachable-root".to_string(),
+                display_name: "Unreachable Root".to_string(),
+            })
+            .expect("add unreachable root");
+        let unreachable_folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id: unreachable_root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "unreachable-root-hash".to_string(),
+                mtime: Some(1),
+            })
+            .expect("insert unreachable root folder");
+
+        let reachable_transient_file_id = seed_failed_thumbnail(
+            &database,
+            reachable_root_id,
+            reachable_folder_id,
+            "reachable-transient.jpg",
+            "sweep-reachable-transient",
+            "transient",
+        );
+        let reachable_permanent_file_id = seed_failed_thumbnail(
+            &database,
+            reachable_root_id,
+            reachable_folder_id,
+            "reachable-permanent.jpg",
+            "sweep-reachable-permanent",
+            "permanent",
+        );
+        let unreachable_transient_file_id = seed_failed_thumbnail(
+            &database,
+            unreachable_root_id,
+            unreachable_folder_id,
+            "unreachable-transient.jpg",
+            "sweep-unreachable-transient",
+            "transient",
+        );
+        let unreachable_permanent_file_id = seed_failed_thumbnail(
+            &database,
+            unreachable_root_id,
+            unreachable_folder_id,
+            "unreachable-permanent.jpg",
+            "sweep-unreachable-permanent",
+            "permanent",
+        );
+
+        let reachability: RootReachability = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut guard = reachability.lock().expect("lock reachability cache");
+            guard.insert(reachable_root_id, true);
+            guard.insert(unreachable_root_id, false);
+        }
+
+        let enqueued_count =
+            run_transient_retry_sweep(&database, &reachability).expect("run transient retry sweep");
+
+        assert_eq!(
+            enqueued_count, 1,
+            "only the reachable root's transient failure should be enqueued"
+        );
+
+        assert_eq!(
+            thumbnail_state(&database, reachable_transient_file_id),
+            "queued",
+            "reachable root's transient failure must be requeued"
+        );
+        assert_eq!(
+            thumbnail_state(&database, reachable_permanent_file_id),
+            "failed",
+            "reachable root's permanent failure must never be touched"
+        );
+        assert_eq!(
+            thumbnail_state(&database, unreachable_transient_file_id),
+            "failed",
+            "unreachable root's transient failure must be skipped"
+        );
+        assert_eq!(
+            thumbnail_state(&database, unreachable_permanent_file_id),
+            "failed",
+            "unreachable root's permanent failure must be skipped"
+        );
+
+        // A second sweep on the same DB with no reachability data (fresh cache,
+        // matching cold start) still respects the transient-only gate: it must
+        // not touch the permanent failures, and re-running it is idempotent for
+        // the already-requeued transient one (no longer `failed`, so it is no
+        // longer a candidate).
+        let empty_reachability: RootReachability = Arc::new(Mutex::new(HashMap::new()));
+        let second_pass_enqueued = run_transient_retry_sweep(&database, &empty_reachability)
+            .expect("run second transient retry sweep");
+        assert_eq!(
+            second_pass_enqueued, 1,
+            "a cache miss defaults to reachable, so the still-unreachable root's transient \
+             failure is picked up once the cache has no entry for it"
+        );
+    }
+
+    #[test]
+    fn transient_retry_sweep_returns_zero_when_no_roots_exist() {
+        let database = migrated_database();
+        let reachability: RootReachability = Arc::new(Mutex::new(HashMap::new()));
+        let enqueued_count = run_transient_retry_sweep(&database, &reachability)
+            .expect("run transient retry sweep with no roots");
+        assert_eq!(enqueued_count, 0);
+    }
 }
