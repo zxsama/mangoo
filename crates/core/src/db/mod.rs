@@ -696,9 +696,19 @@ impl Database {
                 .execute_batch(migrations::THUMBNAIL_TASK_INDEXES_MIGRATION)?;
         }
         if !self.migration_applied(18)? {
-            self.connection
-                .execute_batch(migrations::THUMB_FAILURE_KIND_MIGRATION)?;
-            self.backfill_thumbnail_failure_kind()?;
+            // Atomicity: the ALTER TABLE + schema_migrations registration (both
+            // inside THUMB_FAILURE_KIND_MIGRATION's SQL, same shape as migration
+            // 12/13's registration-in-SQL-file pattern) and the failure_kind
+            // backfill must commit together. If the process crashes mid-backfill,
+            // this transaction rolls back: the column add and the version-18
+            // registration are undone together, so `migration_applied(18)` stays
+            // false and the next startup reruns this whole gate from scratch
+            // (ALTER TABLE ADD COLUMN is safe to retry here because the rollback
+            // guarantees the column does not already exist).
+            let transaction = self.connection.unchecked_transaction()?;
+            transaction.execute_batch(migrations::THUMB_FAILURE_KIND_MIGRATION)?;
+            backfill_thumbnail_failure_kind_in_transaction(&transaction)?;
+            transaction.commit()?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
@@ -707,21 +717,19 @@ impl Database {
 
     /// One-time backfill: classify every existing failed thumbnail's failure_kind
     /// from its stored error text. Idempotent — only touches rows where
-    /// failure_kind IS NULL. Run inside the 0018 migration gate.
+    /// failure_kind IS NULL.
+    ///
+    /// This runs in its own explicit transaction so a standalone call (e.g.
+    /// from tests, or a future manual maintenance path) is atomic by itself.
+    /// The 0018 migration gate in `apply_migrations` does NOT call this
+    /// method — it drives the same logic
+    /// (`backfill_thumbnail_failure_kind_in_transaction`) inside the single
+    /// transaction that also adds the column and registers migration 18, so
+    /// the backfill and the "migration applied" marker can never diverge.
     pub fn backfill_thumbnail_failure_kind(&self) -> anyhow::Result<()> {
-        let mut stmt = self
-            .connection
-            .prepare("SELECT file_id, profile, coalesce(error, '') FROM thumbs WHERE state = 'failed' AND failure_kind IS NULL")?;
-        let rows: Vec<(i64, String, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<Result<_, _>>()?;
-        for (file_id, profile, error) in rows {
-            let kind = crate::thumbnails::classify_thumbnail_failure(&error).as_str();
-            self.connection.execute(
-                "UPDATE thumbs SET failure_kind = ?1 WHERE file_id = ?2 AND profile = ?3",
-                (kind, file_id, profile),
-            )?;
-        }
+        let transaction = self.connection.unchecked_transaction()?;
+        backfill_thumbnail_failure_kind_in_transaction(&transaction)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -6214,6 +6222,33 @@ fn table_has_column_in_transaction(
         }
     }
     Ok(false)
+}
+
+/// Classify every existing failed thumbnail's `failure_kind` from its stored
+/// `error` text and UPDATE it in place. Idempotent — only touches rows where
+/// `failure_kind IS NULL`. Shared body for `Database::backfill_thumbnail_failure_kind`
+/// (its own standalone transaction) and the 0018 migration gate in
+/// `apply_migrations` (same transaction as the ALTER TABLE + schema_migrations
+/// registration), so both callers run identical classify+UPDATE logic and the
+/// caller controls the atomic boundary.
+fn backfill_thumbnail_failure_kind_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> anyhow::Result<()> {
+    let mut stmt = transaction.prepare(
+        "SELECT file_id, profile, coalesce(error, '') FROM thumbs \
+         WHERE state = 'failed' AND failure_kind IS NULL",
+    )?;
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    for (file_id, profile, error) in rows {
+        let kind = crate::thumbnails::classify_thumbnail_failure(&error).as_str();
+        transaction.execute(
+            "UPDATE thumbs SET failure_kind = ?1 WHERE file_id = ?2 AND profile = ?3",
+            (kind, file_id, profile),
+        )?;
+    }
+    Ok(())
 }
 
 fn reset_thumbnail_after_stale_source_in_transaction(
@@ -14876,13 +14911,17 @@ mod tests {
     }
 
     /// Seeds a root+folder+2 files, each with a `failed` thumbnail row whose
-    /// `error` text is set as given and whose `failure_kind` is explicitly
-    /// nulled out afterward — simulating rows written before migration 0018
-    /// existed. Returns (net_file_id, fmt_file_id).
-    fn seed_two_failed_thumbs_null_kind(
+    /// `error` text is set as given. When `null_out_failure_kind` is true, the
+    /// row's `failure_kind` is explicitly nulled out afterward — simulating
+    /// rows written after migration 0018 added the column but before this
+    /// backfill classified them. When false, the seed skips that step
+    /// entirely, for use against a pre-0018 schema where the `failure_kind`
+    /// column does not exist yet. Returns (net_file_id, fmt_file_id).
+    fn seed_two_failed_thumbs(
         database: &Database,
         net_error: &str,
         fmt_error: &str,
+        null_out_failure_kind: bool,
     ) -> (i64, i64) {
         let root_id = database
             .add_root(NewRoot {
@@ -14946,16 +14985,18 @@ mod tests {
                     source_fingerprint: None,
                 })
                 .expect("seed failed thumbnail");
-            // Simulate pre-0018 data: state='failed' with error text but no
-            // failure_kind classification yet.
-            database
-                .connection
-                .execute(
-                    "UPDATE thumbs SET state = 'failed', error = ?1, failure_kind = NULL \
-                     WHERE file_id = ?2 AND profile = ?3",
-                    (error, file_id, crate::thumbnails::GRID_320_PROFILE),
-                )
-                .expect("null out failure_kind");
+            if null_out_failure_kind {
+                // Simulate rows written after 0018 added the column but
+                // before this row was classified.
+                database
+                    .connection
+                    .execute(
+                        "UPDATE thumbs SET state = 'failed', error = ?1, failure_kind = NULL \
+                         WHERE file_id = ?2 AND profile = ?3",
+                        (error, file_id, crate::thumbnails::GRID_320_PROFILE),
+                    )
+                    .expect("null out failure_kind");
+            }
         }
 
         (net_file_id, fmt_file_id)
@@ -14984,10 +15025,11 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
         db.apply_migrations().unwrap();
         // seed a root+folder+2 files+2 failed thumbs with known errors, failure_kind NULL
-        let (net_fid, fmt_fid) = seed_two_failed_thumbs_null_kind(
+        let (net_fid, fmt_fid) = seed_two_failed_thumbs(
             &db,
             "thumbnail decode failed: 找不到网络路径。 (os error 53)",
             "thumbnail decode failed: The image format Avif is not supported",
+            true,
         );
         db.backfill_thumbnail_failure_kind().unwrap();
         assert_eq!(
@@ -14999,5 +15041,167 @@ mod tests {
             Some("permanent".to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Builds an in-memory database migrated through version 17 only — i.e.
+    /// the schema state immediately BEFORE the 0018 gate has ever run: no
+    /// `thumbs.failure_kind` column, no `schema_migrations` row for version
+    /// 18. Mirrors the same "apply earlier migration constants directly"
+    /// idiom as `task_attempt_generation_migration_recovers_partial_apply_and_defaults_existing_tasks`,
+    /// rather than calling the public `apply_migrations()` (which would also
+    /// run gate 18).
+    fn database_migrated_through_17() -> Database {
+        let database = Database::open_in_memory().expect("open in-memory database");
+        database
+            .connection
+            .execute_batch(migrations::INITIAL_MIGRATION)
+            .expect("apply initial migration");
+        database
+            .connection
+            .execute_batch(migrations::TASK_PROGRESS_MIGRATION)
+            .expect("apply task progress migration");
+        database
+            .connection
+            .execute_batch(migrations::BROWSING_INDEXES_MIGRATION)
+            .expect("apply browsing indexes migration");
+        database
+            .connection
+            .execute_batch(migrations::THUMBNAIL_STATE_MIGRATION)
+            .expect("apply thumbnail state migration");
+        database
+            .connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("re-enable foreign keys after thumbnail state migration");
+        database
+            .connection
+            .execute_batch(migrations::THUMBNAIL_SOURCE_FINGERPRINT_MIGRATION)
+            .expect("apply thumbnail source fingerprint migration");
+        database
+            .connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("re-enable foreign keys after fingerprint migration");
+        database
+            .connection
+            .execute_batch(migrations::THUMBNAIL_TASK_ATTEMPT_FINGERPRINT_MIGRATION)
+            .expect("apply thumbnail task attempt fingerprint migration");
+        database
+            .ensure_task_contract_prerequisite_columns()
+            .expect("ensure task contract prerequisite columns");
+        database
+            .connection
+            .execute_batch(migrations::TASK_STATUS_CONTRACT_MIGRATION)
+            .expect("apply task status contract migration");
+        database
+            .connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("re-enable foreign keys after task status contract migration");
+        database
+            .apply_task_attempt_generation_migration()
+            .expect("apply task attempt generation migration");
+        database
+            .apply_scan_reconciliation_migration()
+            .expect("apply scan reconciliation migration");
+        database
+            .connection
+            .execute_batch(migrations::MEDIA_FTS_CONTENTLESS_DELETE_MIGRATION)
+            .expect("apply media fts contentless delete migration");
+        database
+            .apply_plugins_extended_migration()
+            .expect("apply plugins extended migration");
+        database
+            .apply_preview_pipeline_refactor_migration()
+            .expect("apply preview pipeline refactor migration");
+        database
+            .apply_preview_served_by_migration()
+            .expect("apply preview served by migration");
+        database
+            .apply_interactive_folder_scan_task_migration()
+            .expect("apply interactive folder scan task migration");
+        database
+            .connection
+            .execute_batch(migrations::ROOT_STATUS_BROWSING_INDEXES_MIGRATION)
+            .expect("apply root status browsing indexes migration");
+        database
+            .connection
+            .execute_batch(migrations::FOLDER_STATUS_BROWSING_INDEXES_MIGRATION)
+            .expect("apply folder status browsing indexes migration");
+        database
+            .connection
+            .execute_batch(migrations::THUMBNAIL_TASK_INDEXES_MIGRATION)
+            .expect("apply thumbnail task indexes migration");
+        database
+    }
+
+    /// Proves the 0018 gate's atomicity: the ALTER TABLE (add
+    /// `failure_kind`), the `schema_migrations` version-18 registration, and
+    /// the failure_kind backfill all live inside ONE explicit transaction, so
+    /// a crash/panic before that transaction's `commit()` rolls back all
+    /// three together — never just the registration, and never a partial
+    /// backfill with the registration already durable. This directly guards
+    /// against the pre-fix bug where `execute_batch` (which auto-commits the
+    /// registration row immediately) ran before a separate, unguarded
+    /// backfill pass, so a mid-backfill crash left migration 18 marked
+    /// applied with some `failed` rows permanently stuck at
+    /// `failure_kind IS NULL`.
+    #[test]
+    fn migration_18_gate_rolls_back_registration_and_column_when_not_committed() {
+        let database = database_migrated_through_17();
+        assert!(!database.migration_applied(18).unwrap());
+        assert!(!database.table_has_column("thumbs", "failure_kind").unwrap());
+
+        // Seed 2 failed thumbnail rows against the pre-0018 schema (no
+        // failure_kind column yet — upsert_thumbnail_state never references
+        // it, matching real pre-migration data).
+        let (net_fid, fmt_fid) = seed_two_failed_thumbs(
+            &database,
+            "thumbnail decode failed: 找不到网络路径。 (os error 53)",
+            "thumbnail decode failed: The image format Avif is not supported",
+            false,
+        );
+
+        // Simulate a crash: run exactly what the real 0018 gate runs (ALTER +
+        // schema_migrations registration, both inside THUMB_FAILURE_KIND_MIGRATION,
+        // plus the failure_kind backfill) inside one explicit transaction, then
+        // drop it WITHOUT calling commit(). rusqlite's Transaction rolls back
+        // on drop unless committed, exactly like the abrupt rollback SQLite
+        // performs on an OS crash / process kill mid-transaction.
+        {
+            let transaction = database.connection.unchecked_transaction().unwrap();
+            transaction
+                .execute_batch(migrations::THUMB_FAILURE_KIND_MIGRATION)
+                .expect("run ALTER + registration inside the uncommitted transaction");
+            backfill_thumbnail_failure_kind_in_transaction(&transaction)
+                .expect("run backfill inside the uncommitted transaction");
+            // No `transaction.commit()` — dropped here, forcing a rollback.
+        }
+
+        // Nothing from the "crashed" attempt is visible: no column, no
+        // registration row, and (implicitly) no partial backfill, because the
+        // column it would have written to doesn't even exist anymore.
+        assert!(
+            !database.table_has_column("thumbs", "failure_kind").unwrap(),
+            "ALTER TABLE must roll back along with the rest of the gate"
+        );
+        assert!(
+            !database.migration_applied(18).unwrap(),
+            "schema_migrations row must roll back too, so the gate reruns on next startup"
+        );
+
+        // Recovery: rerunning the real gate must succeed with no "duplicate
+        // column" error (proving the ALTER really was rolled back, not just
+        // the registration) and must classify the rows the crashed attempt
+        // never durably touched.
+        database
+            .apply_migrations()
+            .expect("rerun migration 18 gate cleanly after a simulated crash");
+        assert!(database.migration_applied(18).unwrap());
+        assert_eq!(
+            read_failure_kind(&database, net_fid),
+            Some("transient".to_string())
+        );
+        assert_eq!(
+            read_failure_kind(&database, fmt_fid),
+            Some("permanent".to_string())
+        );
     }
 }
