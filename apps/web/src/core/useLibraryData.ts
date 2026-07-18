@@ -257,6 +257,14 @@ export function useLibraryData(
   const thumbnailCacheActionControllerRef = useRef<AbortController | null>(null);
   const thumbnailCacheAutoRefreshTimerRef = useRef<number | null>(null);
   const lastThumbnailCacheAutoRefreshScopeKeyRef = useRef<string | null>(null);
+  // Independent from `thumbnailCacheActionControllerRef`: that ref is the
+  // single shared "bulk action" slot behind the Settings buttons (generate
+  // folder/tree/all, manual retry-failures), all funneled through
+  // `enqueueThumbnailCacheLoop` + `thumbnailCacheActionBusy`. The browse-time
+  // auto-retry below runs on every folder visit and must not steal that slot —
+  // doing so would silently abort a user's in-flight "generate all" every time
+  // they browsed to a new folder.
+  const autoRetryFailedThumbnailsControllerRef = useRef<AbortController | null>(null);
   const scanRefreshInFlightRef = useRef(false);
   const scanRefreshActiveRootIdRef = useRef<number | null>(null);
   const scanRefreshSelectionVersionRef = useRef(0);
@@ -523,30 +531,11 @@ export function useLibraryData(
       thumbnailCacheActionControllerRef.current = controller;
       setThumbnailCacheActionBusy(true);
       try {
-        while (!controller.signal.aborted) {
-          const response = await client.enqueueThumbnailCache(
-            {
-              ...scope,
-              refreshMode,
-              limit: MEDIA_WINDOW_MAX_LIMIT
-            },
-            {
-              requestPriority: "background",
-              signal: controller.signal
-            }
-          );
-          // Don't feed the enqueue response into the shared stats state: it no
-          // longer computes whole-scope stats (that O(scope) query blocked the
-          // writer). The settings tab polls real whole-library stats separately.
-          // The loop terminates on acceptedCount / the derived pendingCandidateCount.
-          const nothingLeft =
-            response.pendingCandidateCount === 0 &&
-            (refreshMode !== "retryFailedAndStale" || response.failedCount === 0);
-          if (response.acceptedCount === 0 || nothingLeft) {
-            break;
-          }
-          await yieldToBrowser();
-        }
+        // Don't feed the enqueue response into the shared stats state: it no
+        // longer computes whole-scope stats (that O(scope) query blocked the
+        // writer). The settings tab polls real whole-library stats separately.
+        // The loop terminates on acceptedCount / the derived pendingCandidateCount.
+        await runThumbnailCacheEnqueueBatches(client, scope, refreshMode, controller.signal);
       } catch (cause) {
         if (!isAbortError(cause)) {
           setError(errorMessage(cause));
@@ -1988,6 +1977,8 @@ export function useLibraryData(
         thumbnailCacheAutoRefreshTimerRef.current = null;
       }
       lastThumbnailCacheAutoRefreshScopeKeyRef.current = null;
+      autoRetryFailedThumbnailsControllerRef.current?.abort();
+      autoRetryFailedThumbnailsControllerRef.current = null;
       return;
     }
 
@@ -2030,6 +2021,64 @@ export function useLibraryData(
             setError(errorMessage(cause));
           }
         });
+
+      // Gap B: browsing this folder scope also revives transient-failed
+      // thumbnails in it, not just missing/stale ones — a separate request
+      // loop from the staleOrMissing enqueue above (independent success/
+      // failure). This intentionally does NOT go through
+      // `enqueueThumbnailCacheLoop`: that helper shares
+      // `thumbnailCacheActionControllerRef` / `thumbnailCacheActionBusy` with
+      // the explicit Settings buttons (generate folder/tree/all, manual
+      // retry-failures) — reusing it here would abort a user's in-flight
+      // "generate all" every time they browse to a new folder. Root
+      // reachability is enforced server-side (the enqueue route short-
+      // circuits to acceptedCount 0 for an unreachable root when refreshMode
+      // is retryFailedAndStale — see Gap A), so this loop naturally stops
+      // without hammering an offline NAS; it never needs its own
+      // reachability check.
+      autoRetryFailedThumbnailsControllerRef.current?.abort();
+      const retryController = new AbortController();
+      autoRetryFailedThumbnailsControllerRef.current = retryController;
+      void runThumbnailCacheEnqueueBatches(
+        client,
+        scope,
+        "retryFailedAndStale",
+        retryController.signal
+      )
+        .then(() => {
+          if (retryController.signal.aborted) {
+            return;
+          }
+          // Revived rows go from `failed` to a `pending` bulk-priority task
+          // with the SAME file id, so the visible/selected/ahead file-id SET
+          // the client already synced for this scope is usually unchanged.
+          // `flushThumbnailPriorityScopeSync`'s own dedupe would then treat
+          // a same-scope resync as a no-op and skip re-POSTing it — which
+          // would leave every revived task sitting at bulk priority until the
+          // viewport happens to change (e.g. a scroll). Clearing the dedupe
+          // key here forces one more sync of the CURRENT scope so the
+          // existing server-side promotion (`sync_thumbnail_priority_scope_
+          // with_promotions`, which re-prioritizes any pending/running task
+          // whose file id is in the posted selected/visible/ahead scope) picks
+          // up the just-revived tasks at viewport priority — the same
+          // priority tier as first-time generation.
+          thumbnailPriorityScopeSyncKeyRef.current = null;
+          void flushThumbnailPriorityScopeSync().catch((cause) => {
+            if (!isAbortError(cause)) {
+              setError(errorMessage(cause));
+            }
+          });
+        })
+        .catch((cause) => {
+          if (!isAbortError(cause)) {
+            setError(errorMessage(cause));
+          }
+        })
+        .finally(() => {
+          if (autoRetryFailedThumbnailsControllerRef.current === retryController) {
+            autoRetryFailedThumbnailsControllerRef.current = null;
+          }
+        });
     }, INTERACTIVE_FOLDER_SCAN_DEBOUNCE_MS);
 
     return () => {
@@ -2038,8 +2087,19 @@ export function useLibraryData(
         window.clearTimeout(thumbnailCacheAutoRefreshTimerRef.current);
         thumbnailCacheAutoRefreshTimerRef.current = null;
       }
+      autoRetryFailedThumbnailsControllerRef.current?.abort();
+      autoRetryFailedThumbnailsControllerRef.current = null;
     };
-  }, [client, currentThumbnailCacheScope, options.persistentThumbnailCacheAutoRefresh, refreshThumbnailCacheStats, selectedFolderId, selectedRootId, showChildFolderContents]);
+  }, [
+    client,
+    currentThumbnailCacheScope,
+    flushThumbnailPriorityScopeSync,
+    options.persistentThumbnailCacheAutoRefresh,
+    refreshThumbnailCacheStats,
+    selectedFolderId,
+    selectedRootId,
+    showChildFolderContents
+  ]);
 
   useEffect(() => {
     interactiveFolderScanControllerRef.current?.abort();
@@ -3179,6 +3239,40 @@ function abortAllControllers<K>(controllers: Map<K, AbortController>): void {
 
 function isAbortError(cause: unknown): boolean {
   return cause instanceof Error && cause.name === "AbortError";
+}
+
+// Shared batching/termination logic behind `enqueueThumbnailCache`: keeps
+// requesting the same scope+refreshMode until the server reports nothing left
+// to accept. Extracted so callers can drive it under their OWN AbortController
+// without going through `enqueueThumbnailCacheLoop`'s shared "bulk action" busy
+// state (see the browse-time auto-retry effect, which must not abort an
+// in-flight user-initiated "generate all"/"retry failures" Settings action).
+async function runThumbnailCacheEnqueueBatches(
+  client: ReturnType<typeof createCoreClient>,
+  scope: { rootId?: number; folderId?: number; includeDescendants?: boolean },
+  refreshMode: ThumbnailCacheRefreshMode,
+  signal: AbortSignal
+): Promise<void> {
+  while (!signal.aborted) {
+    const response = await client.enqueueThumbnailCache(
+      {
+        ...scope,
+        refreshMode,
+        limit: MEDIA_WINDOW_MAX_LIMIT
+      },
+      {
+        requestPriority: "background",
+        signal
+      }
+    );
+    const nothingLeft =
+      response.pendingCandidateCount === 0 &&
+      (refreshMode !== "retryFailedAndStale" || response.failedCount === 0);
+    if (response.acceptedCount === 0 || nothingLeft) {
+      break;
+    }
+    await yieldToBrowser();
+  }
 }
 
 function mediaPageRequestKey(
