@@ -1756,7 +1756,7 @@ function MediaTile({
           }}
           type="button"
         >
-          <FolderLocationIcon aria-hidden="true" size={15} />
+          <FolderLocationIcon aria-hidden="true" size={13} />
         </button>
       </div>
       {listMode ? (

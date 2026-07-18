@@ -2329,8 +2329,8 @@ button:disabled {
   top: 0;
   right: 0;
   display: grid;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   padding: 0;
   place-items: center;
   border: 0;
@@ -2339,21 +2339,15 @@ button:disabled {
   box-shadow: none;
   color: var(--text-soft);
   cursor: pointer;
-  opacity: 0;
-  pointer-events: none;
+  opacity: 0.1;
+  pointer-events: auto;
   transition: opacity 140ms ease 0ms, color 140ms ease 0ms, transform 140ms ease 0ms;
 }
 
 .media-tile-thumb-shell:hover .media-tile-locate-button {
   opacity: 1;
   pointer-events: auto;
-  transition: opacity 140ms ease 500ms, color 140ms ease 0ms, transform 140ms ease 0ms;
-}
-
-.media-tile-thumb-shell:focus-within .media-tile-locate-button {
-  opacity: 1;
-  pointer-events: auto;
-  transition: opacity 140ms ease 0ms, color 140ms ease 0ms, transform 140ms ease 0ms;
+  transition: opacity 140ms ease 200ms, color 140ms ease 0ms, transform 140ms ease 0ms;
 }
 
 .media-tile-locate-button:hover:not(:disabled),
