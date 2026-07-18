@@ -3,6 +3,7 @@ import type { KeyboardEvent, ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import type { MediaRecord, ThumbnailResponse } from "@megle/core-client";
+import { FolderLocationIcon } from "../../app-shell/ShellTopBar";
 import {
   mediaContentSignature,
   mediaFileContentSignature,
@@ -157,10 +158,12 @@ interface MediaGridProps {
   mediaSlots?: Map<number, MediaRecord>;
   totalCount?: number;
   selectedMediaId: number | null;
+  sidebarLayoutTransitionKey?: string;
   loading: boolean;
   loadingMore: boolean;
   onSelect: (mediaId: number) => void;
   onOpenPreview: (mediaId: number) => void;
+  onLocateFolder: (folderId: number) => void;
   onRequestMediaWindow?: (startIndex: number, endIndex: number) => void;
   onRequestThumbnailStates: (mediaIds: number[], priority: ThumbnailRequestPriority) => void;
   scrollPositionKey?: string;
@@ -254,11 +257,13 @@ export function MediaGrid({
   mediaSlots,
   totalCount,
   selectedMediaId,
+  sidebarLayoutTransitionKey,
   loading,
   loadingMore,
   onRequestMediaWindow,
   onRequestThumbnailStates,
   onOpenPreview,
+  onLocateFolder,
   onSelect,
   scrollPositionKey,
   thumbnailStatesByMediaId,
@@ -270,6 +275,7 @@ export function MediaGrid({
   const scrollPersistenceUnlockedRef = useRef(false);
   const restoringScrollRef = useRef(false);
   const lastRestoredScrollKeyRef = useRef<string | undefined>(undefined);
+  const lastCenteredLayoutTransitionKeyRef = useRef(sidebarLayoutTransitionKey);
   const [viewportSize, setViewportSize] = useState({ height: 0, width: 0 });
   const [scrollTop, setScrollTop] = useState(savedScrollTop);
 
@@ -619,6 +625,65 @@ export function MediaGrid({
     overscan: layoutMode === "waterfall" ? 10 : 8,
   });
   const virtualItems = virtualRows.getVirtualItems();
+
+  useLayoutEffect(() => {
+    if (
+      sidebarLayoutTransitionKey === undefined ||
+      lastCenteredLayoutTransitionKeyRef.current === sidebarLayoutTransitionKey
+    ) {
+      return;
+    }
+    const element = parentRef.current;
+    if (!element || element.clientHeight <= 0 || selectedMediaId === null) {
+      return;
+    }
+    const measuredViewport = measureVirtualGridViewport(element);
+    if (
+      measuredViewport.width !== viewportSize.width ||
+      measuredViewport.height !== viewportSize.height
+    ) {
+      return;
+    }
+
+    let mediaSegmentIndex: number | undefined;
+    if (windowedMedia) {
+      const slotIndex = slotIndexById.get(selectedMediaId);
+      if (slotIndex === undefined) return;
+      mediaSegmentIndex = Math.floor(slotIndex / mediaWindow.columnCount);
+    } else {
+      let placementIndex = layoutItemIndexById.get(selectedMediaId);
+      if (placementIndex === undefined) {
+        placementIndex = layout.placements.findIndex(
+          (placement) => placement.item?.id === selectedMediaId
+        );
+        if (placementIndex < 0) return;
+      }
+      mediaSegmentIndex = placementSegmentIndexByPlacementIndex.get(placementIndex);
+    }
+
+    if (mediaSegmentIndex === undefined) return;
+    const virtualSegmentIndex = resolveMediaVirtualSegmentIndex(mediaSegmentIndex);
+    if (virtualSegmentIndex === undefined) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      virtualRows.scrollToIndex(virtualSegmentIndex, { align: "center" });
+      lastCenteredLayoutTransitionKeyRef.current = sidebarLayoutTransitionKey;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [
+    layout,
+    layoutItemIndexById,
+    placementSegmentIndexByPlacementIndex,
+    mediaWindow.columnCount,
+    resolveMediaVirtualSegmentIndex,
+    selectedMediaId,
+    sidebarLayoutTransitionKey,
+    slotIndexById,
+    viewportSize.height,
+    viewportSize.width,
+    virtualRows,
+    windowedMedia
+  ]);
 
   useLayoutEffect(() => {
     const element = parentRef.current;
@@ -1410,6 +1475,7 @@ export function MediaGrid({
                     item={item}
                     layoutMode={layoutMode}
                     onContextMenu={onContextMenu}
+                    onLocateFolder={onLocateFolder}
                     onOpenPreview={onOpenPreview}
                     onRequestThumbnailStates={onRequestThumbnailStates}
                     onSelect={onSelect}
@@ -1486,6 +1552,7 @@ export function MediaGrid({
                   item={item}
                   layoutMode={layoutMode}
                   onContextMenu={onContextMenu}
+                  onLocateFolder={onLocateFolder}
                   onOpenPreview={onOpenPreview}
                   onRequestThumbnailStates={onRequestThumbnailStates}
                   onSelect={onSelect}
@@ -1565,6 +1632,7 @@ function MediaTile({
   onOpenPreview,
   onRequestThumbnailStates,
   onContextMenu,
+  onLocateFolder,
   placement,
   selected,
   thumbnail,
@@ -1578,6 +1646,7 @@ function MediaTile({
   onOpenPreview: (mediaId: number) => void;
   onRequestThumbnailStates: (mediaIds: number[], priority: ThumbnailRequestPriority) => void;
   onContextMenu?: (event: { item: MediaRecord; x: number; y: number; shiftKey: boolean }) => void;
+  onLocateFolder: (folderId: number) => void;
   placement: { frameHeight: number; thumbHeight: number; thumbWidth: number; width: number };
   selected: boolean;
   thumbnail?: ThumbnailResponse;
@@ -1596,12 +1665,15 @@ function MediaTile({
   };
 
   return (
-    <button
+    <div
       aria-label={`Select ${item.name}; press Enter or Space, or double-click, to open preview`}
       className={selected ? `media-tile media-tile--${layoutMode} selected` : `media-tile media-tile--${layoutMode}`}
       data-media-id={item.id}
       data-thumb-state={thumbnailState}
       data-interactive-pointer-target-selector=".tile-thumb"
+      role="button"
+      tabIndex={0}
+      aria-selected={selected}
       onClick={() => {
         prioritizeSelectedMedia();
         onSelect(item.id);
@@ -1647,18 +1719,43 @@ function MediaTile({
               width: "100%"
             }
       }
-      type="button"
     >
-      <ThumbnailStateView
-        allowOriginalFallback={allowOriginalFallback}
-        item={item}
-        layoutMode={layoutMode}
-        selected={selected}
-        thumbnail={thumbnail}
-        thumbnailLoadPriority={thumbnailLoadPriority}
-        thumbHeight={placement.thumbHeight}
-        thumbWidth={placement.thumbWidth}
-      />
+      <div
+        className="media-tile-thumb-shell"
+        style={{ height: placement.thumbHeight, width: placement.thumbWidth }}
+      >
+        <ThumbnailStateView
+          allowOriginalFallback={allowOriginalFallback}
+          item={item}
+          layoutMode={layoutMode}
+          selected={selected}
+          thumbnail={thumbnail}
+          thumbnailLoadPriority={thumbnailLoadPriority}
+          thumbHeight={placement.thumbHeight}
+          thumbWidth={placement.thumbWidth}
+        />
+        <button
+          aria-label={`Locate ${item.name} in folder`}
+          className="media-tile-locate-button"
+          data-interactive-pointer-target="true"
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onLocateFolder(item.folderId);
+          }}
+          onDoubleClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          type="button"
+        >
+          <FolderLocationIcon aria-hidden="true" size={15} />
+        </button>
+      </div>
       {listMode ? (
         <div className="media-tile-text" style={{ minWidth: 0 }}>
           <div
@@ -1693,7 +1790,7 @@ function MediaTile({
           {item.name}
         </div>
       )}
-    </button>
+    </div>
   );
 }
 

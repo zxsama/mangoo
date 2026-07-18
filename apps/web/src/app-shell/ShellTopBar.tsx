@@ -5,6 +5,7 @@ import {
   ChevronRight,
   History,
   ListChecks,
+  LocateFixed,
   Maximize2,
   Minimize2,
   PanelLeftClose,
@@ -26,6 +27,10 @@ type FilterMenuProps = ComponentProps<typeof FilterMenu>;
 type SearchBarProps = ComponentProps<typeof SearchBar>;
 type SortMenuProps = ComponentProps<typeof SortMenu>;
 type PreviewViewMode = "fit-long-edge" | "actual";
+
+export function FolderLocationIcon(props: ComponentProps<typeof LocateFixed>) {
+  return <LocateFixed {...props} />;
+}
 
 interface LibraryTitlebarToolbarProps {
   canNavigateFolderBack: boolean;
@@ -119,6 +124,7 @@ export function ShellTitlebarPrimaryActions({
   onOpenLibrarySwitcher,
   onOpenPlugins,
   onOpenSettings,
+  onLocateFolder,
   onToggleSidebars
 }: {
   activeLibraryColor?: string;
@@ -128,6 +134,7 @@ export function ShellTitlebarPrimaryActions({
   onOpenLibrarySwitcher: () => void;
   onOpenPlugins: () => void;
   onOpenSettings: () => void;
+  onLocateFolder: () => void;
   onToggleSidebars: () => void;
 }) {
   return (
@@ -174,6 +181,21 @@ export function ShellTitlebarPrimaryActions({
           type="button"
         >
           <Settings aria-hidden="true" size={16} />
+        </LiquidGlassButton>
+        <div
+          aria-hidden="true"
+          className="shell-titlebar-utility-separator"
+        />
+        <LiquidGlassButton
+          aria-label="Locate current folder"
+          className="titlebar-icon-button shell-titlebar-utility-button shell-locate-folder-button no-drag"
+          data-titlebar-control="locate-folder"
+          onClick={onLocateFolder}
+          title="Locate current folder"
+          tone="control"
+          type="button"
+        >
+          <FolderLocationIcon aria-hidden="true" size={16} />
         </LiquidGlassButton>
         <ShellSidebarToggle
           sidebarsHidden={sidebarsHidden}

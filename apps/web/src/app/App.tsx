@@ -48,7 +48,10 @@ import {
   type FileOpsController
 } from "../features/file-ops/useFileOps";
 import { LibraryLoadingOverlay } from "../features/library/LibraryLoadingOverlay";
-import { LibrarySidebar } from "../features/library/LibrarySidebar";
+import {
+  LibrarySidebar,
+  type LibrarySidebarLocateRequest
+} from "../features/library/LibrarySidebar";
 import { LibrarySwitcher } from "../features/library/LibrarySwitcher";
 import {
   LibraryCenterPane,
@@ -97,6 +100,9 @@ export function App() {
   const [previewDisplayedMediaId, setPreviewDisplayedMediaId] = useState<number | null>(null);
   const previewNavigationLockedRef = useRef(false);
   const [sidebarsHidden, setSidebarsHidden] = useState(false);
+  const [locateRequest, setLocateRequest] =
+    useState<LibrarySidebarLocateRequest | undefined>(undefined);
+  const locateRequestIdRef = useRef(0);
   const [previewViewState, setPreviewViewState] =
     useState<PreviewViewState>(DEFAULT_PREVIEW_VIEW_STATE);
   const [previewViewCommands, setPreviewViewCommands] =
@@ -194,6 +200,35 @@ export function App() {
   const toggleSidebars = useCallback(() => {
     setSidebarsHidden((current) => !current);
   }, []);
+
+  const locateFolder = useCallback((folderId: number | null | undefined) => {
+    if (folderId == null) {
+      return;
+    }
+    locateRequestIdRef.current += 1;
+    setSidebarsHidden(false);
+    setLocateRequest({
+      folderId,
+      requestId: locateRequestIdRef.current
+    });
+  }, []);
+
+  const locateCurrentFolder = useCallback(() => {
+    const selectedRoot =
+      library.roots.find((root) => root.id === library.selectedRootId) ?? null;
+    const folderId =
+      previewOpen && library.selectedMedia
+        ? library.selectedMedia.folderId
+        : library.selectedFolderId ?? selectedRoot?.rootFolderId ?? null;
+    locateFolder(folderId);
+  }, [
+    library.roots,
+    library.selectedFolderId,
+    library.selectedMedia,
+    library.selectedRootId,
+    locateFolder,
+    previewOpen
+  ]);
 
   useEffect(() => {
     void notifyDesktopShellReady();
@@ -590,6 +625,7 @@ export function App() {
         onOpenLibrarySwitcher={() => setSwitcherOpen(true)}
         onOpenPlugins={handleOpenPlugins}
         onOpenSettings={handleOpenSettings}
+        onLocateFolder={locateCurrentFolder}
         onToggleSidebars={toggleSidebars}
         sidebarsHidden={sidebarsHidden}
       />
@@ -600,6 +636,7 @@ export function App() {
     return (
       <LibrarySidebar
         library={library}
+        locateRequest={locateRequest}
         onFolderContextMenu={handleFolderContextMenu}
         onRootContextMenu={handleRootContextMenu}
       />
@@ -622,12 +659,14 @@ export function App() {
         onFolderContextMenu={handleFolderContextMenu}
         onMediaContextMenu={handleMediaContextMenu}
         onOpenPreview={handleOpenPreview}
+        onLocateFolder={locateFolder}
         onPreviewCommandChange={setPreviewViewCommands}
         onPreviewMediaSettled={handlePreviewMediaSettled}
         onPreviewNext={handlePreviewNext}
         onPreviewPrevious={handlePreviewPrevious}
         onPreviewViewStateChange={setPreviewViewState}
         previewOpen={previewOpen}
+        sidebarLayoutTransitionKey={sidebarsHidden ? "hidden" : "visible"}
       />
     );
   }

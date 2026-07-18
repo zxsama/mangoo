@@ -20,6 +20,8 @@ interface LibraryViewProps {
   library: LibraryState;
   layoutMode: LibraryLayoutMode;
   previewOpen: boolean;
+  sidebarLayoutTransitionKey: string;
+  onLocateFolder: (folderId: number) => void;
   onOpenPreview: (mediaId: number) => void;
   onClosePreview: () => void;
   onPreviewPrevious: () => void;
@@ -50,6 +52,7 @@ export function LibraryView({
   layoutMode,
   onClosePreview,
   onFolderContextMenu,
+  onLocateFolder,
   onMediaContextMenu,
   onOpenPreview,
   onPreviewCommandChange,
@@ -57,7 +60,8 @@ export function LibraryView({
   onPreviewNext,
   onPreviewPrevious,
   onPreviewViewStateChange,
-  previewOpen
+  previewOpen,
+  sidebarLayoutTransitionKey
 }: LibraryViewProps) {
   return (
     <>
@@ -67,6 +71,7 @@ export function LibraryView({
         layoutMode={layoutMode}
         onClosePreview={onClosePreview}
         onFolderContextMenu={onFolderContextMenu}
+        onLocateFolder={onLocateFolder}
         onMediaContextMenu={onMediaContextMenu}
         onOpenPreview={onOpenPreview}
         onPreviewCommandChange={onPreviewCommandChange}
@@ -75,6 +80,7 @@ export function LibraryView({
         onPreviewPrevious={onPreviewPrevious}
         onPreviewViewStateChange={onPreviewViewStateChange}
         previewOpen={previewOpen}
+        sidebarLayoutTransitionKey={sidebarLayoutTransitionKey}
       />
       <LibraryInspectorPane library={library} previewOpen={previewOpen} />
     </>
@@ -87,6 +93,7 @@ export function LibraryCenterPane({
   layoutMode,
   onClosePreview,
   onFolderContextMenu,
+  onLocateFolder,
   onMediaContextMenu,
   onOpenPreview,
   onPreviewCommandChange,
@@ -94,7 +101,8 @@ export function LibraryCenterPane({
   onPreviewNext,
   onPreviewPrevious,
   onPreviewViewStateChange,
-  previewOpen
+  previewOpen,
+  sidebarLayoutTransitionKey
 }: LibraryViewProps) {
   const selectedRoot = library.roots.find((root) => root.id === library.selectedRootId) ?? null;
   const selectedMedia = library.selectedMedia;
@@ -416,12 +424,14 @@ export function LibraryCenterPane({
               loadingMore={library.loadingMoreMedia}
               mediaSlots={library.mediaSlots}
               onContextMenu={onMediaContextMenu}
+              onLocateFolder={onLocateFolder}
               onOpenPreview={handleOpenPreview}
               onRequestMediaWindow={library.requestMediaWindow}
               onRequestThumbnailStates={library.requestThumbnailStates}
               onSelect={library.setSelectedMediaId}
               scrollPositionKey={mediaScrollKey}
               selectedMediaId={library.selectedMediaId}
+              sidebarLayoutTransitionKey={sidebarLayoutTransitionKey}
               thumbnailStatesByMediaId={library.thumbnailStatesByMediaId}
               totalCount={library.mediaTotalCount}
             />
