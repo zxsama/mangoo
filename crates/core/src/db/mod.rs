@@ -698,9 +698,30 @@ impl Database {
         if !self.migration_applied(18)? {
             self.connection
                 .execute_batch(migrations::THUMB_FAILURE_KIND_MIGRATION)?;
+            self.backfill_thumbnail_failure_kind()?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
+        Ok(())
+    }
+
+    /// One-time backfill: classify every existing failed thumbnail's failure_kind
+    /// from its stored error text. Idempotent — only touches rows where
+    /// failure_kind IS NULL. Run inside the 0018 migration gate.
+    pub fn backfill_thumbnail_failure_kind(&self) -> anyhow::Result<()> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT file_id, profile, coalesce(error, '') FROM thumbs WHERE state = 'failed' AND failure_kind IS NULL")?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        for (file_id, profile, error) in rows {
+            let kind = crate::thumbnails::classify_thumbnail_failure(&error).as_str();
+            self.connection.execute(
+                "UPDATE thumbs SET failure_kind = ?1 WHERE file_id = ?2 AND profile = ?3",
+                (kind, file_id, profile),
+            )?;
+        }
         Ok(())
     }
 
@@ -14852,5 +14873,131 @@ mod tests {
             resolved.is_none(),
             "cyclic folder graph must resolve to None, got: {resolved:?}"
         );
+    }
+
+    /// Seeds a root+folder+2 files, each with a `failed` thumbnail row whose
+    /// `error` text is set as given and whose `failure_kind` is explicitly
+    /// nulled out afterward — simulating rows written before migration 0018
+    /// existed. Returns (net_file_id, fmt_file_id).
+    fn seed_two_failed_thumbs_null_kind(
+        database: &Database,
+        net_error: &str,
+        fmt_error: &str,
+    ) -> (i64, i64) {
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures/failkind-backfill".to_string(),
+                display_name: "Failkind Backfill".to_string(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "failkind-backfill-root-hash".to_string(),
+                mtime: Some(10),
+            })
+            .expect("insert root folder");
+
+        let net_file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "net.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 100,
+                mtime: 100,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("insert net file");
+        database
+            .upsert_media_kind(net_file_id, "image")
+            .expect("insert net media kind");
+
+        let fmt_file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "fmt.avif".to_string(),
+                ext: ".avif".to_string(),
+                size: 100,
+                mtime: 100,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("insert fmt file");
+        database
+            .upsert_media_kind(fmt_file_id, "image")
+            .expect("insert fmt media kind");
+
+        for (file_id, error) in [(net_file_id, net_error), (fmt_file_id, fmt_error)] {
+            database
+                .upsert_thumbnail_state(ThumbnailStateUpsert {
+                    file_id,
+                    profile: crate::thumbnails::GRID_320_PROFILE.to_string(),
+                    state: "failed".to_string(),
+                    cache_key: None,
+                    width: None,
+                    height: None,
+                    byte_size: None,
+                    error: Some(error.to_string()),
+                    source_fingerprint: None,
+                })
+                .expect("seed failed thumbnail");
+            // Simulate pre-0018 data: state='failed' with error text but no
+            // failure_kind classification yet.
+            database
+                .connection
+                .execute(
+                    "UPDATE thumbs SET state = 'failed', error = ?1, failure_kind = NULL \
+                     WHERE file_id = ?2 AND profile = ?3",
+                    (error, file_id, crate::thumbnails::GRID_320_PROFILE),
+                )
+                .expect("null out failure_kind");
+        }
+
+        (net_file_id, fmt_file_id)
+    }
+
+    fn read_failure_kind(database: &Database, file_id: i64) -> Option<String> {
+        database
+            .connection
+            .query_row(
+                "SELECT failure_kind FROM thumbs WHERE file_id = ?1 AND profile = ?2",
+                (file_id, crate::thumbnails::GRID_320_PROFILE),
+                |row| row.get(0),
+            )
+            .expect("read failure_kind")
+    }
+
+    #[test]
+    fn migration_0018_backfills_failure_kind_from_error_text() {
+        let dir = unique_db_temp_dir("failkind-backfill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("bf.sqlite");
+        // Open + migrate through 0017 by applying migrations, then manually insert
+        // failed rows WITHOUT failure_kind (simulating pre-0018 data) is hard once
+        // 0018 is auto-applied; instead: open, apply_migrations (adds column), then
+        // NULL out failure_kind on inserted failed rows, then call the backfill fn.
+        let db = Database::open(&db_path).unwrap();
+        db.apply_migrations().unwrap();
+        // seed a root+folder+2 files+2 failed thumbs with known errors, failure_kind NULL
+        let (net_fid, fmt_fid) = seed_two_failed_thumbs_null_kind(
+            &db,
+            "thumbnail decode failed: 找不到网络路径。 (os error 53)",
+            "thumbnail decode failed: The image format Avif is not supported",
+        );
+        db.backfill_thumbnail_failure_kind().unwrap();
+        assert_eq!(
+            read_failure_kind(&db, net_fid),
+            Some("transient".to_string())
+        );
+        assert_eq!(
+            read_failure_kind(&db, fmt_fid),
+            Some("permanent".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
