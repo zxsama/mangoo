@@ -2348,15 +2348,20 @@ button:disabled {
   box-shadow: none;
   color: var(--text-soft);
   cursor: pointer;
-  opacity: 0.1;
-  pointer-events: auto;
+  opacity: 0;
+  pointer-events: none;
   transition: opacity 140ms ease 0ms, color 140ms ease 0ms, transform 140ms ease 0ms;
 }
 
 .media-tile-thumb-shell:hover .media-tile-locate-button {
-  opacity: 1;
+  opacity: 0.1;
   pointer-events: auto;
   transition: opacity 140ms ease 200ms, color 140ms ease 0ms, transform 140ms ease 0ms;
+}
+
+.media-tile-thumb-shell:hover .media-tile-locate-button:hover:not(:disabled) {
+  opacity: 1;
+  transition: opacity 140ms ease 0ms, color 140ms ease 0ms, transform 140ms ease 0ms;
 }
 
 .media-tile-locate-button:hover:not(:disabled),
