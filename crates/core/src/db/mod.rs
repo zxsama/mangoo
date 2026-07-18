@@ -65,6 +65,11 @@ pub struct RootRecord {
     pub last_scan_at: Option<i64>,
     pub root_folder_id: Option<i64>,
     pub media_count: i64,
+    /// Live reachability state. The DB layer always reports `true` (a root's
+    /// storage is reachable until an API-level probe says otherwise); the API
+    /// layer overlays the real-time value from `RootReachability` before the
+    /// response leaves `list_roots`.
+    pub reachable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -6314,6 +6319,7 @@ fn root_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RootRecord> {
         last_scan_at: row.get(5)?,
         root_folder_id: row.get(6)?,
         media_count: row.get(7)?,
+        reachable: true,
     })
 }
 

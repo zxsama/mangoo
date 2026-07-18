@@ -2,13 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Per-root reachability cache: root_id -> last-probed reachable state.
-#[allow(dead_code)] // consumed by Task 4 (RootRecord.reachable)
 pub type RootReachability = Arc<Mutex<HashMap<i64, bool>>>;
 
 /// True iff the root's own directory can be stat'd as a directory right now.
 /// One syscall stands in for the whole share's online status: unreachable root
 /// path == NAS offline. Any error (network down, permission, timeout) => false.
-#[allow(dead_code)] // consumed by Task 4 (RootRecord.reachable)
 pub fn probe_root_reachable(path: &str) -> bool {
     if path.is_empty() {
         return false;
@@ -17,7 +15,6 @@ pub fn probe_root_reachable(path: &str) -> bool {
 }
 
 /// Probes every root's path and replaces the cache wholesale with the fresh results.
-#[allow(dead_code)] // consumed by Task 6 (retry sweep)
 pub fn refresh_root_reachability(reach: &RootReachability, roots: &[(i64, String)]) {
     let mut next = HashMap::with_capacity(roots.len());
     for (id, path) in roots {

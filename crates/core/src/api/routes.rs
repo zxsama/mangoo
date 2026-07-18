@@ -637,7 +637,13 @@ async fn get_health() -> Json<HealthResponse> {
 }
 
 async fn list_roots(State(state): State<AppState>) -> ApiResult<Json<ListResponse<RootRecord>>> {
-    let items = run_read_database(state, |database| Ok(database.list_roots()?)).await?;
+    let reach = state.root_reachability.clone();
+    let mut items = run_read_database(state, |database| Ok(database.list_roots()?)).await?;
+    if let Ok(map) = reach.lock() {
+        for item in items.iter_mut() {
+            item.reachable = *map.get(&item.id).unwrap_or(&true);
+        }
+    }
     Ok(Json(ListResponse {
         items,
         next_cursor: None,
@@ -2077,8 +2083,10 @@ fn fallback_display_name(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Method, Request, StatusCode};
@@ -2242,6 +2250,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_roots_overlays_reachable_from_cache_default_true_when_unprobed() {
+        let database = test_database();
+        let real_path = std::env::temp_dir().to_string_lossy().to_string();
+        let root_id = database
+            .add_root(NewRoot {
+                path: real_path.clone(),
+                display_name: "Reachability Root".to_string(),
+            })
+            .expect("add root");
+
+        let state = AppState::new(database);
+        let app = router(state.clone());
+
+        // No probe has run yet: the cache has no entry for this root id, so it
+        // must default to reachable rather than reading as offline.
+        let body = get_roots_json(&app).await;
+        let item = find_root_json(&body, root_id);
+        assert_eq!(item["reachable"], true);
+
+        // A fresh probe of the real (existing) path reports reachable.
+        crate::roots::reachability::refresh_root_reachability(
+            &state.root_reachability,
+            &[(root_id, real_path)],
+        );
+        let body = get_roots_json(&app).await;
+        let item = find_root_json(&body, root_id);
+        assert_eq!(item["reachable"], true);
+
+        // Force the cache to report unreachable (simulating an offline probe)
+        // and confirm `list_roots` overlays it onto the DB-default `true`.
+        {
+            let mut guard = state
+                .root_reachability
+                .lock()
+                .expect("lock reachability cache");
+            guard.insert(root_id, false);
+        }
+        let body = get_roots_json(&app).await;
+        let item = find_root_json(&body, root_id);
+        assert_eq!(item["reachable"], false);
+    }
+
+    async fn get_roots_json(app: &axum::Router) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/roots")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("list roots");
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
+    fn find_root_json(body: &serde_json::Value, root_id: i64) -> serde_json::Value {
+        body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"].as_i64() == Some(root_id))
+            .cloned()
+            .expect("seeded root present in list_roots response")
+    }
+
+    #[tokio::test]
     async fn thumbnail_route_queues_missing_grid_320_row() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
@@ -2258,6 +2335,7 @@ mod tests {
             plugins_dir: None,
             read_database_path: None,
             _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         };
         let app = router(state.clone());
 
@@ -2400,6 +2478,7 @@ mod tests {
             plugins_dir: None,
             read_database_path: None,
             _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         };
         let app = router(state.clone());
 
@@ -2473,6 +2552,7 @@ mod tests {
             plugins_dir: None,
             read_database_path: None,
             _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         };
         let app = router(state.clone());
 
@@ -3277,6 +3357,7 @@ mod tests {
             plugins_dir: None,
             read_database_path: None,
             _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         };
         let app = router(state);
 
@@ -3385,6 +3466,7 @@ mod tests {
             plugins_dir: None,
             read_database_path: None,
             _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         };
         let app = router(state);
 
@@ -3903,6 +3985,7 @@ mod tests {
             plugins_dir: None,
             read_database_path: None,
             _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         };
         let app = router(state.clone());
 
@@ -3956,6 +4039,7 @@ mod tests {
             plugins_dir: None,
             read_database_path: None,
             _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         };
         let app = router(state.clone());
 

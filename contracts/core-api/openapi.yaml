@@ -1183,7 +1183,7 @@ components:
           nullable: true
     RootRecord:
       type: object
-      required: [id, path, displayName, enabled, createdAt, lastScanAt, rootFolderId, mediaCount]
+      required: [id, path, displayName, enabled, createdAt, lastScanAt, rootFolderId, mediaCount, reachable]
       properties:
         id:
           type: integer
@@ -1205,6 +1205,9 @@ components:
           type: integer
           minimum: 0
           description: Total active media files in this root, including every descendant folder.
+        reachable:
+          type: boolean
+          description: Live reachability of the root's storage, refreshed by a background probe every 30s. Defaults to true until first probed.
     RootListResponse:
       type: object
       required: [items, nextCursor]

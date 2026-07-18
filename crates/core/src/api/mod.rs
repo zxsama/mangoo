@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::Request;
 use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
@@ -13,6 +14,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::db::{Database, DbWriter};
+use crate::roots::reachability::{refresh_root_reachability, RootReachability};
 use crate::tasks::{start_worker, TaskSender};
 use crate::watch::{start_watcher, WatcherHandle};
 
@@ -43,6 +45,11 @@ pub struct AppState {
     /// rules as startup.
     pub plugins_dir: Option<PathBuf>,
     _watcher: Option<Arc<WatcherHandle>>,
+    /// Per-root reachability cache, refreshed by a background probe every 30s
+    /// (started in `router_with_config`) and overlaid onto `RootRecord.reachable`
+    /// by `routes::list_roots`. Absent root ids default to reachable (`true`) so
+    /// a not-yet-probed root never reads as offline right after cold start.
+    pub root_reachability: RootReachability,
 }
 
 impl AppState {
@@ -62,6 +69,7 @@ impl AppState {
             read_database_path: None,
             plugins_dir: None,
             _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -95,6 +103,7 @@ impl AppState {
             read_database_path,
             plugins_dir: None,
             _watcher: watcher,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -179,6 +188,7 @@ pub fn router_with_config(database: Database, config: ApiConfig) -> Router {
             );
         });
     }
+    spawn_root_reachability_probe(&state);
     let api_router = routes::router(state).layer(middleware::from_fn_with_state(
         config.clone(),
         require_session_token,
@@ -238,6 +248,58 @@ pub fn router_with_config(database: Database, config: ApiConfig) -> Router {
     } else {
         app
     }
+}
+
+/// Starts the background reachability probe: refreshes `state.root_reachability`
+/// immediately (so a cold start has real values as soon as possible), then again
+/// every 30s for as long as the process runs. NAS shares flap on transient network
+/// blips; without this loop a root probed unreachable once would stay stuck that
+/// way until the next explicit action, which is what let ~19k thumbnails go
+/// permanently `failed` during a brief outage instead of just skipping a cycle.
+fn spawn_root_reachability_probe(state: &AppState) {
+    let reach = state.root_reachability.clone();
+    let probe_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match enabled_root_paths(probe_state.clone()).await {
+                Ok(roots) => refresh_root_reachability(&reach, &roots),
+                Err(error) => {
+                    tracing::warn!(%error, "root reachability probe: failed to list roots");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+}
+
+/// Reads `(id, path)` for every enabled root using a dedicated read connection
+/// when one is available, so the periodic probe never contends with the single
+/// write actor. In-memory/test databases have no separate read connection and
+/// fall back to the writer, matching `routes::run_read_database`'s fallback.
+async fn enabled_root_paths(state: AppState) -> anyhow::Result<Vec<(i64, String)>> {
+    if !state.has_read_database() {
+        return state
+            .writer
+            .write(|database| {
+                Ok(database
+                    .list_roots()?
+                    .into_iter()
+                    .map(|root| (root.id, root.path))
+                    .collect())
+            })
+            .await;
+    }
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(i64, String)>> {
+        let database = state
+            .open_read_database()?
+            .ok_or_else(|| anyhow::anyhow!("read database unexpectedly unavailable"))?;
+        Ok(database
+            .list_roots()?
+            .into_iter()
+            .map(|root| (root.id, root.path))
+            .collect())
+    })
+    .await?
 }
 
 fn cors_layer(origin: HeaderValue) -> CorsLayer {
