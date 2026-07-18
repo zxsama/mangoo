@@ -499,6 +499,7 @@ pub fn classify_thumbnail_failure(error: &str) -> ThumbnailFailureKind {
     const TRANSIENT_SIGNATURES: &[&str] = &[
         "os error 53",    // Windows: network path not found
         "找不到网络路径", // localized "network path not found"
+        "网络",           // bare "network" (zh) — broader Windows network-error catch-all
         "network path",
         "database is locked",
         "Memory limit exceeded",
@@ -525,6 +526,7 @@ mod tests {
             "database is locked",
             "thumbnail decode failed: Memory limit exceeded",
             "read failed: network path not found",
+            "thumbnail decode failed: 网络名不再可用。 (os error 64)",
         ] {
             assert!(
                 matches!(classify_thumbnail_failure(e), Transient),
