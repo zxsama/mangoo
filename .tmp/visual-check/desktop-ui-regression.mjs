@@ -1249,7 +1249,7 @@ async function pluginsSecondaryWindowEvidence(client) {
           return sidebar && firstRow ? firstRow.top - sidebar.top : null;
         })(),
         controls: Object.fromEntries(
-          ["library-switcher", "open-plugins", "open-settings", "toggle-sidebars"]
+          ["library-switcher", "open-plugins", "open-settings", "locate-folder", "toggle-sidebars"]
             .map((id) => [id, controlState(id)])
         )
       };
@@ -2509,9 +2509,9 @@ try {
   }
   if (
     JSON.stringify(pluginsWindowEvidence.mainBefore?.controlOrder) !==
-    JSON.stringify(["library-switcher", "open-plugins", "open-settings", "toggle-sidebars"]) ||
+    JSON.stringify(["library-switcher", "open-plugins", "open-settings", "locate-folder", "toggle-sidebars"]) ||
     JSON.stringify(pluginsWindowEvidence.mainBefore?.utilityOrder) !==
-      JSON.stringify(["open-plugins", "open-settings", "toggle-sidebars"]) ||
+      JSON.stringify(["open-plugins", "open-settings", "locate-folder", "toggle-sidebars"]) ||
     pluginsWindowEvidence.mainBefore?.utilityRightGap > 13 ||
     pluginsWindowEvidence.mainBefore?.libraryWidth >= 168 ||
     pluginsWindowEvidence.mainBefore?.treeTopGap > 6
