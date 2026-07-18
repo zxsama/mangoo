@@ -988,17 +988,26 @@ button:disabled {
 }
 
 .tree-item[data-tree-locate-highlight="true"] {
-  animation: tree-locate-highlight 900ms ease-out;
+  animation: tree-locate-highlight 450ms ease-in-out forwards;
 }
 
 @keyframes tree-locate-highlight {
   0% {
+    background: transparent;
+    box-shadow: none;
+  }
+  25% {
     background: rgba(151, 219, 226, 0.32);
     box-shadow: 0 0 0 2px rgba(151, 219, 226, 0.42), 0 0 18px rgba(151, 219, 226, 0.24);
   }
-  100% {
+  50% {
     background: transparent;
     box-shadow: none;
+  }
+  75%,
+  100% {
+    background: rgba(151, 219, 226, 0.32);
+    box-shadow: 0 0 0 2px rgba(151, 219, 226, 0.42), 0 0 18px rgba(151, 219, 226, 0.24);
   }
 }
 

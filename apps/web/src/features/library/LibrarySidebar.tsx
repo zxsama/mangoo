@@ -6,7 +6,7 @@ import {
   FolderX
 } from "lucide-react";
 import type { CSSProperties, RefObject } from "react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { folderShowsOpenIcon, isFolderKnownChildless } from "../../core/folderTreeState";
 import { resolveFolderLocationScrollFrame } from "./folderLocationScroll";
 import type { FolderRecord, RootRecord } from "../../core/types";
@@ -46,13 +46,44 @@ export function LibrarySidebar({
   const sidebarRef = useRef<HTMLElement | null>(null);
   const [locateTarget, setLocateTarget] = useState<LibrarySidebarLocateRequest | null>(null);
   const [highlightedFolderId, setHighlightedFolderId] = useState<number | null>(null);
+  const locateAnimationActiveRef = useRef(false);
+  const locateAnimationCancelledRef = useRef(false);
   const revealFolderPath = library.revealFolderPath;
   useTreeStickyOcclusion(sidebarRef);
+
+  const stopLocateHighlight = useCallback(() => {
+    locateAnimationCancelledRef.current = true;
+    setHighlightedFolderId(null);
+  }, []);
+
+  useEffect(() => {
+    const stop = () => {
+      if (!locateAnimationActiveRef.current) {
+        stopLocateHighlight();
+      } else {
+        locateAnimationCancelledRef.current = true;
+      }
+    };
+    window.addEventListener("click", stop, true);
+    window.addEventListener("contextmenu", stop, true);
+    window.addEventListener("focusin", stop, true);
+    window.addEventListener("keydown", stop, true);
+    window.addEventListener("pointerdown", stop, true);
+    window.addEventListener("wheel", stop, { capture: true, passive: true });
+    return () => {
+      window.removeEventListener("click", stop, true);
+      window.removeEventListener("contextmenu", stop, true);
+      window.removeEventListener("focusin", stop, true);
+      window.removeEventListener("keydown", stop, true);
+      window.removeEventListener("pointerdown", stop, true);
+      window.removeEventListener("wheel", stop, true);
+    };
+  }, [stopLocateHighlight]);
 
   useEffect(() => {
     if (!locateRequest) return;
     setLocateTarget(null);
-    setHighlightedFolderId(null);
+    stopLocateHighlight();
     let cancelled = false;
     void revealFolderPath(locateRequest.folderId)
       .then((path) => {
@@ -66,7 +97,7 @@ export function LibrarySidebar({
     return () => {
       cancelled = true;
     };
-  }, [locateRequest?.folderId, locateRequest?.requestId, revealFolderPath]);
+  }, [locateRequest?.folderId, locateRequest?.requestId, revealFolderPath, stopLocateHighlight]);
 
   useLayoutEffect(() => {
     if (!locateTarget) return;
@@ -75,7 +106,6 @@ export function LibrarySidebar({
 
     let frame = 0;
     let attempts = 0;
-    let highlightTimeout = 0;
     let scrollFrame = 0;
     const locate = () => {
       frame = 0;
@@ -103,12 +133,14 @@ export function LibrarySidebar({
       const distance = Math.abs(targetTop - startTop);
       const durationMs = distance === 0 ? 0 : Math.min(420, Math.max(180, distance * 0.45));
       const startedAt = performance.now();
+      locateAnimationActiveRef.current = true;
+      locateAnimationCancelledRef.current = false;
       const finish = () => {
         sidebar.scrollTop = targetTop;
-        setHighlightedFolderId(locateTarget.folderId);
-        highlightTimeout = window.setTimeout(() => {
-          setHighlightedFolderId(null);
-        }, 900);
+        locateAnimationActiveRef.current = false;
+        if (!locateAnimationCancelledRef.current) {
+          setHighlightedFolderId(locateTarget.folderId);
+        }
       };
       const animate = (now: number) => {
         const next = resolveFolderLocationScrollFrame({
@@ -135,7 +167,7 @@ export function LibrarySidebar({
     return () => {
       if (frame) window.cancelAnimationFrame(frame);
       if (scrollFrame) window.cancelAnimationFrame(scrollFrame);
-      if (highlightTimeout) window.clearTimeout(highlightTimeout);
+      locateAnimationActiveRef.current = false;
     };
   }, [locateTarget]);
 
