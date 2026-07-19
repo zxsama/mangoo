@@ -9263,19 +9263,34 @@ mod tests {
             .execute_batch(OLD_INITIAL_MIGRATION_WITHOUT_TASK_PROGRESS)
             .expect("apply old initial migration");
 
+        // Seed a root + root_scan task directly against the OLD (pre-migration)
+        // schema via raw SQL. `add_root`/`create_root_scan_task` cannot be used
+        // here: `create_root_scan_task` calls `get_root`, whose SELECT now
+        // references `roots.pending_delete_at` (added by migration 0019), which
+        // does not exist on this old schema snapshot. Inserting the rows by hand
+        // against the OLD_INITIAL_MIGRATION_WITHOUT_TASK_PROGRESS column set is
+        // what actually proves the migration backfills pre-existing rows.
+        let now = unix_timestamp();
+        database
+            .connection
+            .execute(
+                "INSERT INTO roots(path, display_name, enabled, created_at) VALUES (?1, ?2, 1, ?3)",
+                rusqlite::params!["D:/Pictures", "Pictures", now],
+            )
+            .expect("insert root row under old schema");
+        let root_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO tasks(kind, priority, status, root_id, file_id, created_at, updated_at, error)
+                 VALUES ('root_scan', ?1, 'pending', ?2, NULL, ?3, ?3, NULL)",
+                rusqlite::params![ROOT_SCAN_TASK_PRIORITY, root_id, now],
+            )
+            .expect("insert root_scan task row under old schema");
+
         database
             .apply_migrations()
             .expect("apply current migrations");
-
-        let root_id = database
-            .add_root(NewRoot {
-                path: "D:/Pictures".to_string(),
-                display_name: "Pictures".to_string(),
-            })
-            .expect("add root after migrations");
-        database
-            .create_root_scan_task(root_id)
-            .expect("create task after migrations");
         let columns: Vec<String> = {
             let mut statement = database
                 .connection
@@ -9513,18 +9528,37 @@ mod tests {
             .connection
             .execute_batch(migrations::TASK_STATUS_CONTRACT_MIGRATION)
             .expect("apply task status contract migration");
+
+        // Seed a root + root_scan task directly against the schema as it stands
+        // right after 0007 (task_status_contract), i.e. BEFORE the v8 attempt
+        // generation migration runs. `add_root`/`create_root_scan_task` cannot be
+        // used here: `create_root_scan_task` calls `get_root`, whose SELECT now
+        // references `roots.pending_delete_at` (added by migration 0019), which
+        // does not exist yet on this snapshot. Raw SQL against the exact 0007
+        // column set is what proves v8 backfills `attempt_generation` on
+        // pre-existing rows rather than merely on freshly-inserted ones.
+        let now = unix_timestamp();
+        database
+            .connection
+            .execute(
+                "INSERT INTO roots(path, display_name, enabled, created_at) VALUES (?1, ?2, 1, ?3)",
+                rusqlite::params!["D:/Pictures", "Pictures", now],
+            )
+            .expect("insert root row before v8");
+        let root_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO tasks(kind, priority, status, root_id, file_id, created_at, updated_at, error)
+                 VALUES ('root_scan', ?1, 'pending', ?2, NULL, ?3, ?3, NULL)",
+                rusqlite::params![ROOT_SCAN_TASK_PRIORITY, root_id, now],
+            )
+            .expect("insert root_scan task row before v8");
+        let task_id = database.connection.last_insert_rowid();
+
         database
             .apply_migrations()
-            .expect("apply remaining migrations through v8+");
-        let root_id = database
-            .add_root(NewRoot {
-                path: "D:/Pictures".to_string(),
-                display_name: "Pictures".to_string(),
-            })
-            .expect("add root after all migrations");
-        let task_id = database
-            .create_root_scan_task(root_id)
-            .expect("create task after all migrations");
+            .expect("apply v8 attempt generation migration");
         let task = database
             .get_task(task_id)
             .expect("get migrated task")
