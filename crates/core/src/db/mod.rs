@@ -162,6 +162,13 @@ pub enum ThumbnailCacheRefreshMode {
     MissingOnly,
     StaleOrMissing,
     RetryFailedAndStale,
+    /// Core-internal: the background transient-retry sweep's candidate set —
+    /// ONLY `failed` rows classified `transient`. Unlike `RetryFailedAndStale`
+    /// it deliberately excludes `missing` (and `stale`), so the 60s sweep never
+    /// bulk-generates a large library's un-generated backlog behind the user's
+    /// generation mode. Not client-reachable (no `from_wire_value` mapping);
+    /// only `enqueue_transient_retry_for_root` uses it.
+    RetryTransientFailedOnly,
 }
 
 impl ThumbnailCacheRefreshMode {
@@ -170,8 +177,20 @@ impl ThumbnailCacheRefreshMode {
             "missingOnly" => Some(Self::MissingOnly),
             "staleOrMissing" => Some(Self::StaleOrMissing),
             "retryFailedAndStale" => Some(Self::RetryFailedAndStale),
+            // `RetryTransientFailedOnly` is intentionally unmapped: it is a
+            // Core-internal sweep mode, not a client-selectable refresh mode.
             _ => None,
         }
+    }
+
+    /// Whether this mode requeues transient `failed` rows (resetting them so the
+    /// worker regenerates them). Both retry modes do; the missing/stale
+    /// generation modes do not.
+    fn requeues_transient_failures(self) -> bool {
+        matches!(
+            self,
+            Self::RetryFailedAndStale | Self::RetryTransientFailedOnly
+        )
     }
 }
 
@@ -1119,10 +1138,17 @@ impl Database {
                 .transpose()?
         };
         let id = if let Some((id, enabled)) = existing {
-            if !enabled {
-                transaction.execute("DELETE FROM folders WHERE root_id = ?1", [id])?;
-                transaction.execute("DELETE FROM files WHERE root_id = ?1", [id])?;
-            }
+            // Re-enabling a previously-disabled root does NOT wipe its
+            // folders/files here. `DELETE FROM files WHERE root_id` is O(files)
+            // multiplied by the files table's many indexes; on a 600k-file root
+            // that single statement ran inside the one DB writer for minutes,
+            // freezing every other write (further add-root, viewport
+            // priority-scope, thumbnail publish) past the client request
+            // timeout. The root scan the caller enqueues right after reconciles
+            // stale rows itself — `reconcile_root_scan_completion` upserts the
+            // files it re-sees and marks any it does not as `missing` — so the
+            // wipe is redundant. Dropping it keeps add_root O(1) and preserves
+            // user_metadata/tags/thumbs across a disable -> re-enable cycle.
             transaction.execute(
                 r#"
                 UPDATE roots
@@ -2141,11 +2167,9 @@ impl Database {
         // a single-column check.
         let status: Option<String> = self
             .connection
-            .query_row(
-                "SELECT status FROM tasks WHERE id = ?1",
-                [task_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
             .optional()?;
         Ok(status.as_deref() == Some("cancelled"))
     }
@@ -3158,9 +3182,7 @@ impl Database {
             if let Some((task_id, file_id, status)) =
                 self.first_scoped_pending_bulk_thumbnail_task_to_wake(scope, refresh_mode)?
             {
-                if refresh_mode == ThumbnailCacheRefreshMode::RetryFailedAndStale
-                    && status == "failed"
-                {
+                if refresh_mode.requeues_transient_failures() && status == "failed" {
                     self.reset_failed_thumbnail_for_manual_retry(file_id, GRID_320_PROFILE)?;
                 }
                 task_id_to_wake = Some(task_id);
@@ -3259,8 +3281,7 @@ impl Database {
             }
             let file_id = entry.source.file_id;
             let status = thumbnail_cache_status(entry);
-            if refresh_mode == ThumbnailCacheRefreshMode::RetryFailedAndStale
-                && status == ThumbnailCacheStatus::Failed
+            if refresh_mode.requeues_transient_failures() && status == ThumbnailCacheStatus::Failed
             {
                 Self::reset_failed_thumbnail_for_manual_retry_in_transaction(
                     &transaction,
@@ -3309,8 +3330,7 @@ impl Database {
             }
             let file_id = entry.source.file_id;
             let status = thumbnail_cache_status(entry);
-            if refresh_mode == ThumbnailCacheRefreshMode::RetryFailedAndStale
-                && status == ThumbnailCacheStatus::Failed
+            if refresh_mode.requeues_transient_failures() && status == ThumbnailCacheStatus::Failed
             {
                 Self::reset_failed_thumbnail_for_manual_retry_in_transaction(
                     &transaction,
@@ -7095,6 +7115,11 @@ fn thumbnail_cache_refresh_mode_sql_condition(refresh_mode: ThumbnailCacheRefres
             // `retry_task` path, which does not go through this query.
             "(cache_status IN ('missing', 'stale') OR (cache_status = 'failed' AND failure_kind = 'transient'))".to_string()
         }
+        ThumbnailCacheRefreshMode::RetryTransientFailedOnly => {
+            // Sweep-only: transient failures, nothing else. Excludes missing and
+            // stale so the background sweep never bulk-generates the backlog.
+            "(cache_status = 'failed' AND failure_kind = 'transient')".to_string()
+        }
     }
 }
 
@@ -7469,6 +7494,10 @@ fn thumbnail_cache_entry_matches_refresh_mode(
         (ThumbnailCacheRefreshMode::RetryFailedAndStale, ThumbnailCacheStatus::Missing)
         | (ThumbnailCacheRefreshMode::RetryFailedAndStale, ThumbnailCacheStatus::Stale)
         | (ThumbnailCacheRefreshMode::RetryFailedAndStale, ThumbnailCacheStatus::Failed) => true,
+        // Sweep-only mode: transient failures exclusively (the `failure_kind`
+        // gate is applied by the candidate SQL, so a `Failed` entry here is
+        // already transient-classified).
+        (ThumbnailCacheRefreshMode::RetryTransientFailedOnly, ThumbnailCacheStatus::Failed) => true,
         _ => false,
     }
 }
@@ -8897,6 +8926,90 @@ mod tests {
     }
 
     #[test]
+    fn reenabling_disabled_root_preserves_files_for_scan_reconcile() {
+        // Re-adding a previously-disabled root must NOT wipe its folders/files
+        // inline. `DELETE FROM files WHERE root_id` (multiplied by the files
+        // table's many indexes) is an O(files) write; on a 600k-file root it ran
+        // inside the single DB writer and froze every other write (add-root,
+        // priority-scope, thumbnail publish) for minutes, past the client
+        // request timeout. The subsequent root scan already reconciles stale
+        // rows (upsert seen + mark unseen `missing` via
+        // `reconcile_root_scan_completion`), so the wipe is redundant; dropping
+        // it also preserves user_metadata/tags/thumbs across a disable ->
+        // re-enable cycle.
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures".to_string(),
+                display_name: "Pictures".to_string(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "root-hash".to_string(),
+                mtime: Some(10),
+            })
+            .expect("insert root folder");
+        let file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "keep.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 100,
+                mtime: 100,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("insert file");
+
+        assert!(database.disable_root(root_id).expect("disable root"));
+
+        let same_root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures".to_string(),
+                display_name: "Pictures".to_string(),
+            })
+            .expect("re-enable root");
+        assert_eq!(same_root_id, root_id);
+
+        let files_remaining: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id = ?1",
+                [root_id],
+                |row| row.get(0),
+            )
+            .expect("count files");
+        let folders_remaining: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE root_id = ?1",
+                [root_id],
+                |row| row.get(0),
+            )
+            .expect("count folders");
+        assert_eq!(files_remaining, 1, "re-enable must not delete files inline");
+        assert_eq!(
+            folders_remaining, 1,
+            "re-enable must not delete folders inline"
+        );
+        // Row identity is preserved (same file_id), so cascaded
+        // user_metadata/tags/thumbs survive the disable -> re-enable cycle.
+        let preserved: Option<i64> = database
+            .connection
+            .query_row("SELECT id FROM files WHERE id = ?1", [file_id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .expect("query file by id");
+        assert_eq!(preserved, Some(file_id));
+    }
+
+    #[test]
     fn migrations_upgrade_old_initial_tasks_table_with_progress_columns() {
         let database = Database::open_in_memory().expect("open in-memory database");
         database
@@ -10236,7 +10349,14 @@ mod tests {
     }
 
     #[test]
-    fn readding_disabled_root_does_not_resurrect_stale_index_rows_before_scan() {
+    fn readding_disabled_root_reconciles_stale_rows_on_next_scan() {
+        // Re-adding a disabled root keeps its cached rows immediately visible
+        // (no O(files) inline wipe — that `DELETE FROM files WHERE root_id`, ×
+        // the files table's many indexes, froze the single writer for minutes on
+        // a 600k-file root). The next root scan reconciles stale rows the normal
+        // way: rows it does not re-see are marked `missing` and stop showing.
+        // This is the same mark-and-sweep a routine rescan uses, so a re-add is
+        // no longer special-cased into a whole-root delete.
         let database = migrated_database();
         let (root_id, _folder_id) = seed_media_page_fixture(&database);
         database.disable_root(root_id).expect("disable root");
@@ -10252,9 +10372,10 @@ mod tests {
         let roots = database.list_roots().expect("list roots");
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].display_name, "Pictures Again");
-        assert!(roots[0].root_folder_id.is_none());
 
-        let media = database
+        // Cached rows are preserved and visible right after re-add (instant
+        // content, and user_metadata/tags/thumbs survive the disable cycle).
+        let before = database
             .list_media_page(MediaPageQuery {
                 root_id: Some(root_id),
                 folder_id: None,
@@ -10265,8 +10386,37 @@ mod tests {
                 sort: "name_asc".to_string(),
                 kind: None,
             })
-            .expect("list media");
-        assert!(media.items.is_empty());
+            .expect("list media before scan");
+        assert!(
+            !before.items.is_empty(),
+            "re-add keeps cached rows visible instead of wiping them"
+        );
+
+        // The next scan reconciles: begin a fresh generation, re-see nothing,
+        // then complete — every stale `active` row is marked `missing`.
+        let scan_generation = database
+            .begin_root_scan_reconciliation(root_id)
+            .expect("begin scan reconciliation");
+        database
+            .reconcile_root_scan_completion(root_id, scan_generation)
+            .expect("reconcile scan completion");
+
+        let after = database
+            .list_media_page(MediaPageQuery {
+                root_id: Some(root_id),
+                folder_id: None,
+                include_descendants: false,
+                limit: 10,
+                offset: None,
+                cursor: None,
+                sort: "name_asc".to_string(),
+                kind: None,
+            })
+            .expect("list media after scan");
+        assert!(
+            after.items.is_empty(),
+            "reconcile marks rows the scan did not re-see as missing"
+        );
     }
 
     #[test]
@@ -10817,14 +10967,18 @@ mod tests {
             .task_attempt_is_current(task_id, attempt - 1)
             .expect("stale attempt not current"));
         // A missing task is neither cancelled nor current.
-        assert!(!database.task_is_cancelled(999_999).expect("missing cancelled"));
+        assert!(!database
+            .task_is_cancelled(999_999)
+            .expect("missing cancelled"));
         assert!(!database
             .task_attempt_is_current(999_999, 0)
             .expect("missing not current"));
 
         // After cancel: cancelled = true.
         database.cancel_task(task_id).expect("cancel task");
-        assert!(database.task_is_cancelled(task_id).expect("cancelled after cancel"));
+        assert!(database
+            .task_is_cancelled(task_id)
+            .expect("cancelled after cancel"));
     }
 
     #[test]

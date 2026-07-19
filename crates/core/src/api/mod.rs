@@ -383,9 +383,13 @@ fn enqueue_transient_retry_for_root(database: &Database, root_id: i64) -> anyhow
         folder_id: None,
         include_descendants: false,
     };
+    // `RetryTransientFailedOnly`, NOT `RetryFailedAndStale`: the sweep retries
+    // only transient failures. `RetryFailedAndStale` also matches `missing`, so
+    // it turned this 60s background sweep into a whole-library thumbnail
+    // generator (500 missing/root/tick) that ignored the user's generation mode.
     let result = database.enqueue_thumbnail_cache_tasks(
         scope,
-        ThumbnailCacheRefreshMode::RetryFailedAndStale,
+        ThumbnailCacheRefreshMode::RetryTransientFailedOnly,
         TRANSIENT_RETRY_SWEEP_PER_ROOT_LIMIT,
         None,
     )?;
@@ -753,5 +757,78 @@ mod tests {
         let enqueued_count = run_transient_retry_sweep(&database, &reachability)
             .expect("run transient retry sweep with no roots");
         assert_eq!(enqueued_count, 0);
+    }
+
+    #[test]
+    fn transient_retry_sweep_does_not_enqueue_missing_thumbnails() {
+        // Regression: the background sweep must retry ONLY transient failures. It
+        // reused the `RetryFailedAndStale` mode, whose candidate set also matches
+        // `missing` — so on a large library every 60s tick re-enqueued up to 500
+        // un-generated (missing) thumbnails per reachable root, bulk-generating
+        // the whole library in the background regardless of the user's generation
+        // mode (e.g. `cacheOnly`). The sweep must ignore `missing`/`stale` rows
+        // and touch only transient-failed ones.
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures/sweep-missing".to_string(),
+                display_name: "Sweep Missing".to_string(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "sweep-missing-hash".to_string(),
+                mtime: Some(1),
+            })
+            .expect("insert root folder");
+
+        // A media file with NO thumbnail row is "missing" — never a sweep target.
+        let missing_file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "missing.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 4096,
+                mtime: 1,
+                ctime: None,
+                file_key: Some("sweep-missing-file".to_string()),
+            })
+            .expect("insert missing file");
+        database
+            .upsert_media_kind(missing_file_id, "image")
+            .expect("insert media kind");
+
+        // A transient-failed thumbnail is the sweep's only legitimate candidate.
+        let transient_file_id = seed_failed_thumbnail(
+            &database,
+            root_id,
+            folder_id,
+            "transient.jpg",
+            "sweep-transient",
+            "transient",
+        );
+
+        let reachability: RootReachability = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut guard = reachability.lock().expect("lock reachability cache");
+            guard.insert(root_id, true);
+        }
+
+        let enqueued =
+            run_transient_retry_sweep(&database, &reachability).expect("run transient retry sweep");
+
+        assert_eq!(
+            enqueued, 1,
+            "sweep must enqueue only the transient failure, not the 'missing' thumbnail"
+        );
+        assert_eq!(
+            thumbnail_state(&database, transient_file_id),
+            "queued",
+            "transient failure must be requeued"
+        );
     }
 }
