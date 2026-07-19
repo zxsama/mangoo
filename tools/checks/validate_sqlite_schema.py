@@ -25,6 +25,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0018_thumb_failure_kind.sql",
     ROOT / "crates" / "core" / "migrations" / "0019_root_pending_delete.sql",
     ROOT / "crates" / "core" / "migrations" / "0020_root_purge_task_kind.sql",
+    ROOT / "crates" / "core" / "migrations" / "0021_notification_outbox.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -52,6 +53,8 @@ REQUIRED_TABLES = {
     "plugins",
     "media_fts",
     "thumb_blobs",
+    "notification_operation_heads",
+    "notification_outbox",
 }
 
 REQUIRED_INDEXES = {
@@ -91,6 +94,9 @@ REQUIRED_INDEXES = {
     "idx_plugins_status",
     "idx_thumb_blobs_profile_updated_at",
     "idx_roots_pending_delete",
+    "idx_notification_heads_status_updated",
+    "idx_notification_outbox_operation_revision",
+    "idx_file_operations_group",
 }
 
 EXPECTED_MEDIA_COLUMNS = {
@@ -335,6 +341,11 @@ def main() -> None:
             ).fetchone()
             if version is None:
                 fail("migration version 16 was not recorded")
+            version = conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 21"
+            ).fetchone()
+            if version is None:
+                fail("migration version 21 was not recorded")
 
             media_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(media)").fetchall()
@@ -400,6 +411,123 @@ def main() -> None:
             missing_plugin_columns = required_plugin_columns - plugin_columns
             if missing_plugin_columns:
                 fail(f"missing plugin columns: {sorted(missing_plugin_columns)}")
+
+            head_columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(notification_operation_heads)"
+                ).fetchall()
+            }
+            required_head_columns = {
+                "operation_id",
+                "kind",
+                "status",
+                "presentation",
+                "revision",
+                "payload_json",
+                "dirty",
+                "last_outbox_at",
+                "updated_at",
+                "completed_at",
+            }
+            missing_head_columns = required_head_columns - head_columns
+            if missing_head_columns:
+                fail(
+                    "missing notification head columns: "
+                    f"{sorted(missing_head_columns)}"
+                )
+
+            outbox_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(notification_outbox)").fetchall()
+            }
+            required_outbox_columns = {
+                "sequence",
+                "operation_id",
+                "revision",
+                "payload_json",
+                "created_at",
+            }
+            missing_outbox_columns = required_outbox_columns - outbox_columns
+            if missing_outbox_columns:
+                fail(
+                    "missing notification outbox columns: "
+                    f"{sorted(missing_outbox_columns)}"
+                )
+
+            file_operation_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(file_operations)").fetchall()
+            }
+            if "operation_group_id" not in file_operation_columns:
+                fail("missing file_operations.operation_group_id")
+
+            conn.execute(
+                """
+                INSERT INTO notification_operation_heads(
+                    operation_id, kind, status, presentation, revision,
+                    payload_json, updated_at
+                )
+                VALUES ('schema-check-operation', 'scan', 'pending', 'important', 1, '{}', 1)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO notification_outbox(
+                    operation_id, revision, payload_json, created_at
+                )
+                VALUES ('schema-check-operation', 1, '{}', 1)
+                """
+            )
+            for invalid_status in ("paused", "unknown"):
+                invalid_status_rows = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_operation_heads(
+                        operation_id, kind, status, presentation, revision,
+                        payload_json, updated_at
+                    )
+                    VALUES (?, 'scan', ?, 'important', 1, '{}', 1)
+                    """,
+                    (f"invalid-status-{invalid_status}", invalid_status),
+                ).rowcount
+                if invalid_status_rows != 0:
+                    fail("notification head status must reject unsupported values")
+            invalid_presentation_rows = conn.execute(
+                """
+                INSERT OR IGNORE INTO notification_operation_heads(
+                    operation_id, kind, status, presentation, revision,
+                    payload_json, updated_at
+                )
+                VALUES ('invalid-presentation', 'scan', 'pending', 'compact', 1, '{}', 1)
+                """
+            ).rowcount
+            if invalid_presentation_rows != 0:
+                fail("notification head presentation must reject unsupported values")
+            invalid_dirty_rows = conn.execute(
+                """
+                INSERT OR IGNORE INTO notification_operation_heads(
+                    operation_id, kind, status, presentation, revision,
+                    payload_json, dirty, updated_at
+                )
+                VALUES ('invalid-dirty', 'scan', 'pending', 'important', 1, '{}', 2, 1)
+                """
+            ).rowcount
+            if invalid_dirty_rows != 0:
+                fail("notification head dirty must reject values other than 0 or 1")
+
+            conn.execute(
+                """
+                INSERT INTO file_operations(
+                    operation, source_path, target_path, status, created_at
+                )
+                VALUES ('rename', 'source', 'target', 'pending', 1)
+                """
+            )
+            operation_group = conn.execute(
+                "SELECT operation_group_id FROM file_operations WHERE id = last_insert_rowid()"
+            ).fetchone()[0]
+            if operation_group is not None:
+                fail("existing file_operations inserts must default operation_group_id to NULL")
 
             conn.execute(
                 """

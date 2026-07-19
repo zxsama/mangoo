@@ -779,6 +779,10 @@ impl Database {
             self.connection.pragma_update(None, "foreign_keys", "ON")?;
             result?;
         }
+        if !self.migration_applied(21)? {
+            self.connection
+                .execute_batch(migrations::NOTIFICATION_OUTBOX_MIGRATION)?;
+        }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
         Ok(())
@@ -16666,5 +16670,128 @@ mod tests {
                 .unwrap_or(false);
             assert!(exists, "{index_name} must survive the tasks rebuild");
         }
+    }
+
+    #[test]
+    fn migration_0021_adds_notification_schema_and_constraints() {
+        let database = migrated_database();
+
+        let head_columns: Vec<String> = database
+            .connection
+            .prepare("PRAGMA table_info(notification_operation_heads)")
+            .expect("inspect notification heads")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query notification head columns")
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .expect("collect notification head columns");
+        assert_eq!(
+            head_columns,
+            vec![
+                "operation_id",
+                "kind",
+                "status",
+                "presentation",
+                "revision",
+                "payload_json",
+                "dirty",
+                "last_outbox_at",
+                "updated_at",
+                "completed_at",
+            ]
+        );
+
+        let outbox_columns: Vec<String> = database
+            .connection
+            .prepare("PRAGMA table_info(notification_outbox)")
+            .expect("inspect notification outbox")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query notification outbox columns")
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .expect("collect notification outbox columns");
+        assert_eq!(
+            outbox_columns,
+            vec![
+                "sequence",
+                "operation_id",
+                "revision",
+                "payload_json",
+                "created_at"
+            ]
+        );
+
+        assert!(database
+            .table_has_column("file_operations", "operation_group_id")
+            .unwrap());
+        assert!(database.migration_applied(21).unwrap());
+        for index_name in [
+            "idx_notification_heads_status_updated",
+            "idx_notification_outbox_operation_revision",
+            "idx_file_operations_group",
+        ] {
+            let exists: bool = database
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index_name],
+                    |_| Ok(true),
+                )
+                .optional()
+                .expect("query notification index")
+                .unwrap_or(false);
+            assert!(exists, "{index_name} must exist");
+        }
+
+        database
+            .connection
+            .execute(
+                "INSERT INTO notification_operation_heads(operation_id, kind, status, presentation, revision, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                ("operation-1", "scan", "pending", "important", 1_i64, "{}", 1_i64),
+            )
+            .expect("valid notification head must insert");
+        database
+            .connection
+            .execute(
+                "INSERT INTO notification_outbox(operation_id, revision, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                ("operation-1", 1_i64, "{}", 1_i64),
+            )
+            .expect("valid notification outbox row must insert");
+
+        for (operation_id, status) in [("bad-status", "paused"), ("bad-status-2", "unknown")] {
+            let result = database.connection.execute(
+                "INSERT INTO notification_operation_heads(operation_id, kind, status, presentation, revision, payload_json, updated_at) VALUES (?1, 'scan', ?2, 'important', 1, '{}', 1)",
+                (operation_id, status),
+            );
+            assert!(result.is_err(), "unsupported status must be rejected");
+        }
+        let result = database.connection.execute(
+            "INSERT INTO notification_operation_heads(operation_id, kind, status, presentation, revision, payload_json, updated_at) VALUES ('bad-presentation', 'scan', 'pending', 'compact', 1, '{}', 1)",
+            [],
+        );
+        assert!(result.is_err(), "unsupported presentation must be rejected");
+        let result = database.connection.execute(
+            "INSERT INTO notification_operation_heads(operation_id, kind, status, presentation, revision, payload_json, dirty, updated_at) VALUES ('bad-dirty', 'scan', 'pending', 'important', 1, '{}', 2, 1)",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "dirty values other than 0 or 1 must be rejected"
+        );
+
+        database
+            .connection
+            .execute(
+                "INSERT INTO file_operations(operation, source_path, target_path, status, created_at) VALUES ('rename', 'source', 'target', 'pending', 1)",
+                [],
+            )
+            .expect("existing file_operations insert must remain valid");
+        let operation_group_id: Option<String> = database
+            .connection
+            .query_row(
+                "SELECT operation_group_id FROM file_operations WHERE id = last_insert_rowid()",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read default operation group");
+        assert_eq!(operation_group_id, None);
     }
 }
