@@ -364,6 +364,7 @@ if (!stylesForChecks.includes("-webkit-app-region: no-drag")) {
 assertExactSelectorHelperContracts();
 assertCssCommentStrippingContracts();
 assertJsxStructuralHelperContracts();
+assertReturnedObjectMappingHelperContracts();
 
 const noDragBlocks = cssBlocksForExactSelector(stylesForChecks, ".no-drag");
 if (
@@ -1674,14 +1675,19 @@ for (const value of ["useInterfaceStyle", "subscribePreference", "broadcastChang
     fail(`shared secondary-window material synchronization missing ${value}`);
   }
 }
-const interfaceStyleCssVariablesBody = extractFunctionBody(interfaceStyle, "interfaceStyleToCssVariables");
-for (const mapping of [
-  '"--secondary-window-pane-dark": secondaryWindowPaneDark',
-  '"--secondary-window-pane-light": secondaryWindowPaneLight',
-  '"--secondary-window-pane-end": secondaryWindowPaneEnd'
+for (const [propertyName, identifierName] of [
+  ["--secondary-window-pane-dark", "secondaryWindowPaneDark"],
+  ["--secondary-window-pane-light", "secondaryWindowPaneLight"],
+  ["--secondary-window-pane-end", "secondaryWindowPaneEnd"]
 ]) {
-  if (!interfaceStyleCssVariablesBody.includes(mapping)) {
-    fail(`interfaceStyleToCssVariables missing derived secondary-window mapping ${mapping}`);
+  if (
+    !functionDirectReturnObjectMapsIdentifiers(interfaceStyle, "interfaceStyleToCssVariables", [
+      [propertyName, identifierName]
+    ])
+  ) {
+    fail(
+      `interfaceStyleToCssVariables missing derived secondary-window mapping "${propertyName}": ${identifierName}`
+    );
   }
 }
 if (
@@ -3699,7 +3705,7 @@ function assertCssCommentStrippingContracts() {
 function assertJsxStructuralHelperContracts() {
   const groupedSource = `
     const grouped = (
-      <div className="plugins-sidebar">
+      <div className="plugins-sidebar compact">
         <div className="plugins-body-actions" />
         <div className="plugins-list" />
       </div>
@@ -3714,13 +3720,92 @@ function assertJsxStructuralHelperContracts() {
       </>
     );
   `;
+  const dataClassNameSource = `
+    const dataClassName = (
+      <div data-className="plugins-sidebar">
+        <div className="plugins-body-actions" />
+        <div className="plugins-list" />
+      </div>
+    );
+  `;
   const requiredClassNames = ["plugins-body-actions", "plugins-list"];
 
+  if (!jsxElementContainsClassDescendants(groupedSource, "grouped.tsx", "plugins-sidebar", requiredClassNames)) {
+    fail("JSX structural helper must accept static className token lists");
+  }
   if (
-    !jsxElementContainsClassDescendants(groupedSource, "grouped.tsx", "plugins-sidebar", requiredClassNames) ||
-    jsxElementContainsClassDescendants(misplacedSource, "misplaced.tsx", "plugins-sidebar", requiredClassNames)
+    jsxElementContainsClassDescendants(misplacedSource, "misplaced.tsx", "plugins-sidebar", requiredClassNames) ||
+    jsxElementContainsClassDescendants(
+      dataClassNameSource,
+      "data-class-name.tsx",
+      "plugins-sidebar",
+      requiredClassNames
+    )
   ) {
     fail("JSX structural helper must require plugin controls and list inside the sidebar element");
+  }
+}
+
+function assertReturnedObjectMappingHelperContracts() {
+  const requiredMappings = [
+    ["--secondary-window-pane-dark", "secondaryWindowPaneDark"],
+    ["--secondary-window-pane-light", "secondaryWindowPaneLight"],
+    ["--secondary-window-pane-end", "secondaryWindowPaneEnd"]
+  ];
+  const validSource = `
+    function interfaceStyleToCssVariables() {
+      return {
+        "--secondary-window-pane-dark": secondaryWindowPaneDark,
+        "--secondary-window-pane-light": secondaryWindowPaneLight,
+        "--secondary-window-pane-end": secondaryWindowPaneEnd
+      };
+    }
+  `;
+  const commentOnlySource = `
+    function interfaceStyleToCssVariables() {
+      // "--secondary-window-pane-dark": secondaryWindowPaneDark
+      // "--secondary-window-pane-light": secondaryWindowPaneLight
+      // "--secondary-window-pane-end": secondaryWindowPaneEnd
+      return {};
+    }
+  `;
+  const deadObjectSource = `
+    function interfaceStyleToCssVariables() {
+      const unused = {
+        "--secondary-window-pane-dark": secondaryWindowPaneDark,
+        "--secondary-window-pane-light": secondaryWindowPaneLight,
+        "--secondary-window-pane-end": secondaryWindowPaneEnd
+      };
+      return {
+        "--secondary-window-pane-dark": unrelatedPaneDark,
+        "--secondary-window-pane-light": unrelatedPaneLight,
+        "--secondary-window-pane-end": unrelatedPaneEnd
+      };
+    }
+  `;
+
+  if (
+    !functionDirectReturnObjectMapsIdentifiers(
+      validSource,
+      "interfaceStyleToCssVariables",
+      requiredMappings
+    )
+  ) {
+    fail("returned-object mapping helper must accept identifier mappings in a direct object return");
+  }
+  if (
+    functionDirectReturnObjectMapsIdentifiers(
+      commentOnlySource,
+      "interfaceStyleToCssVariables",
+      requiredMappings
+    ) ||
+    functionDirectReturnObjectMapsIdentifiers(
+      deadObjectSource,
+      "interfaceStyleToCssVariables",
+      requiredMappings
+    )
+  ) {
+    fail("returned-object mapping helper must ignore comments and unused object literals");
   }
 }
 
@@ -4034,8 +4119,15 @@ function jsxElementContainsClassDescendants(source, fileName, containerClassName
 
   function hasStaticClassName(node, className) {
     const openingElement = ts.isJsxElement(node) ? node.openingElement : node;
-    return new RegExp(`\\bclassName="${escapeRegExp(className)}"`).test(
-      openingElement.getText(sourceFile)
+    const classNameAttribute = openingElement.attributes.properties.find(
+      (attribute) =>
+        ts.isJsxAttribute(attribute) &&
+        attribute.name.getText(sourceFile) === "className"
+    );
+    return Boolean(
+      classNameAttribute?.initializer &&
+        ts.isStringLiteral(classNameAttribute.initializer) &&
+        classNameAttribute.initializer.text.split(/\s+/).includes(className)
     );
   }
 
@@ -4061,6 +4153,42 @@ function jsxElementContainsClassDescendants(source, fileName, containerClassName
 
   visit(sourceFile);
   return containsRequiredClasses;
+}
+
+function functionDirectReturnObjectMapsIdentifiers(source, functionName, requiredMappings) {
+  const sourceFile = ts.createSourceFile(
+    `${functionName}.ts`,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  );
+  const functionDeclaration = sourceFile.statements.find(
+    (statement) =>
+      ts.isFunctionDeclaration(statement) &&
+      statement.name?.text === functionName &&
+      statement.body
+  );
+  if (!functionDeclaration?.body) return false;
+
+  const returnStatement = functionDeclaration.body.statements.find(ts.isReturnStatement);
+  if (!returnStatement?.expression || !ts.isObjectLiteralExpression(returnStatement.expression)) {
+    return false;
+  }
+
+  const returnedMappings = new Map();
+  for (const property of returnStatement.expression.properties) {
+    if (
+      ts.isPropertyAssignment(property) &&
+      ts.isStringLiteral(property.name) &&
+      ts.isIdentifier(property.initializer)
+    ) {
+      returnedMappings.set(property.name.text, property.initializer.text);
+    }
+  }
+  return requiredMappings.every(
+    ([propertyName, identifierName]) => returnedMappings.get(propertyName) === identifierName
+  );
 }
 
 function extractFunctionBody(source, functionName) {
