@@ -1,10 +1,12 @@
 pub mod migrations;
+pub mod notification_outbox;
 pub mod writer;
 pub use writer::DbWriter;
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::functions::FunctionFlags;
 use rusqlite::types::Value;
@@ -47,6 +49,7 @@ const SQLITE_TEMP_STORE_MEMORY: i64 = 2;
 pub struct Database {
     connection: Connection,
     path: Option<PathBuf>,
+    notification_outbox_wake: Arc<tokio::sync::Notify>,
 }
 
 pub struct NewRoot {
@@ -626,6 +629,14 @@ impl Database {
     }
 
     fn from_connection(connection: Connection, path: Option<PathBuf>) -> anyhow::Result<Self> {
+        Self::from_connection_with_wake(connection, path, Arc::new(tokio::sync::Notify::new()))
+    }
+
+    fn from_connection_with_wake(
+        connection: Connection,
+        path: Option<PathBuf>,
+        notification_outbox_wake: Arc<tokio::sync::Notify>,
+    ) -> anyhow::Result<Self> {
         // Set busy_timeout BEFORE any other operation so the busy handler
         // is registered for every subsequent SQL statement, including the
         // foreign_keys PRAGMA, migration writes, and transaction
@@ -636,14 +647,30 @@ impl Database {
         }
         connection.pragma_update(None, "foreign_keys", "ON")?;
         register_thumbnail_cache_sql_functions(&connection)?;
-        Ok(Self { connection, path })
+        Ok(Self {
+            connection,
+            path,
+            notification_outbox_wake,
+        })
     }
 
     pub fn reopen(&self) -> anyhow::Result<Option<Self>> {
         let Some(path) = &self.path else {
             return Ok(None);
         };
-        Ok(Some(Self::open(path)?))
+        let connection = Connection::open(path)?;
+        Self::from_connection_with_wake(
+            connection,
+            Some(path.clone()),
+            Arc::clone(&self.notification_outbox_wake),
+        )
+        .map(Some)
+    }
+
+    /// Shared wake signal for consumers waiting for committed Outbox rows.
+    /// Reopened connections for the same Core instance intentionally share it.
+    pub fn notification_outbox_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.notification_outbox_wake)
     }
 
     pub fn path(&self) -> Option<&Path> {
