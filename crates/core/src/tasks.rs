@@ -226,6 +226,9 @@ pub fn start_worker_with_ffmpeg(
     // actor handles concurrent work, so it is safe to run directly on the worker
     // connection.
     worker_database
+        .recover_interrupted_notification_operations()
+        .expect("recover interrupted non-task notification operations");
+    worker_database
         .reset_running_root_scan_tasks_for_recovery()
         .expect("reset running root_scan tasks for startup recovery");
     worker_database

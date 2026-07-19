@@ -852,18 +852,11 @@ impl Database {
         std::env::temp_dir().join("megle-thumbnail-cache")
     }
 
-    /// Read-only access to the underlying connection. Used by sibling
-    /// modules (like `fsops`) that need ad-hoc lookups but should not own
-    /// transaction lifecycle on the shared handle.
+    /// Access to the underlying connection. Sibling modules such as `fsops`
+    /// use this for short lookups and caller-owned `BEGIN IMMEDIATE`
+    /// transactions on their dedicated handle.
     pub(crate) fn connection_for_fsops(&self) -> &Connection {
         &self.connection
-    }
-
-    /// Mutable access to the underlying connection so callers can begin
-    /// `BEGIN IMMEDIATE` transactions. Mirrors how scan batching reaches
-    /// into the connection for write-side flows.
-    pub(crate) fn connection_for_fsops_mut(&mut self) -> &mut Connection {
-        &mut self.connection
     }
 
     pub fn apply_migrations(&self) -> anyhow::Result<()> {

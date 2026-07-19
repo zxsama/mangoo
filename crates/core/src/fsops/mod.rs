@@ -20,8 +20,12 @@ use std::sync::Mutex;
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
+use uuid::Uuid;
 
-use crate::db::{Database, Page};
+use crate::db::{
+    notification_outbox::{NotificationOperation, PublishMode},
+    Database, Page,
+};
 
 /// Discriminants for `file_operations.operation`.
 #[allow(dead_code)]
@@ -59,6 +63,8 @@ pub struct FileOperationRecord {
     pub created_at: i64,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
+    #[serde(skip_serializing)]
+    pub operation_group_id: Option<String>,
 }
 
 /// Stable error codes that the API surfaces in JSON bodies.
@@ -163,9 +169,11 @@ pub fn rename(
     let new_name = request.new_name.trim().to_string();
     validate_name(&new_name)?;
 
-    match (request.file_id, request.folder_id) {
-        (Some(file_id), None) => rename_file(database, file_id, &new_name),
-        (None, Some(folder_id)) => rename_folder(database, folder_id, &new_name),
+    let mut group = begin_operation_group(database, FileOperationKind::Rename, 1)?;
+
+    let result = match (request.file_id, request.folder_id) {
+        (Some(file_id), None) => rename_file(database, file_id, &new_name, &mut group),
+        (None, Some(folder_id)) => rename_folder(database, folder_id, &new_name, &mut group),
         (Some(_), Some(_)) => Err(FsOpsError::new(
             FsOpsErrorCode::InvalidRequest,
             "exactly one of fileId or folderId must be provided",
@@ -174,7 +182,9 @@ pub fn rename(
             FsOpsErrorCode::InvalidRequest,
             "either fileId or folderId must be provided",
         )),
-    }
+    };
+    finish_operation_group(database, &mut group, result.as_ref().err())?;
+    result
 }
 
 pub fn move_items(
@@ -188,33 +198,63 @@ pub fn move_items(
         ));
     }
 
+    let mut group = begin_operation_group(
+        database,
+        FileOperationKind::Move,
+        request.file_ids.len() + request.folder_ids.len(),
+    )?;
+
     let target = {
         let guard = database.lock().expect("database mutex poisoned");
-        load_folder_path(&guard.connection_for_fsops(), request.target_folder_id)?.ok_or_else(
-            || {
-                FsOpsError::new(
+        match load_folder_path(&guard.connection_for_fsops(), request.target_folder_id) {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                let error = FsOpsError::new(
                     FsOpsErrorCode::NotFound,
                     format!("target folder not found: {}", request.target_folder_id),
-                )
-            },
-        )?
+                );
+                drop(guard);
+                finish_operation_group(database, &mut group, Some(&error))?;
+                return Err(error);
+            }
+            Err(error) => {
+                drop(guard);
+                finish_operation_group(database, &mut group, Some(&error))?;
+                return Err(error);
+            }
+        }
     };
 
     let mut records = Vec::new();
 
     for file_id in &request.file_ids {
-        records.push(move_file(database, *file_id, &target)?);
+        match move_file(database, *file_id, &target, &mut group) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                finish_operation_group(database, &mut group, Some(&error))?;
+                return Err(error);
+            }
+        }
     }
     for folder_id in &request.folder_ids {
         if *folder_id == request.target_folder_id {
-            return Err(FsOpsError::new(
+            let error = FsOpsError::new(
                 FsOpsErrorCode::InvalidRequest,
                 format!("cannot move folder {folder_id} into itself"),
-            ));
+            );
+            finish_operation_group(database, &mut group, Some(&error))?;
+            return Err(error);
         }
-        records.push(move_folder(database, *folder_id, &target)?);
+        match move_folder(database, *folder_id, &target, &mut group) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                finish_operation_group(database, &mut group, Some(&error))?;
+                return Err(error);
+            }
+        }
     }
 
+    finish_operation_group(database, &mut group, None)?;
     Ok(records)
 }
 
@@ -229,14 +269,36 @@ pub fn delete(
         ));
     }
 
+    let mut group = begin_operation_group(
+        database,
+        if request.permanent {
+            FileOperationKind::DeletePermanent
+        } else {
+            FileOperationKind::DeleteRecycle
+        },
+        request.file_ids.len() + request.folder_ids.len(),
+    )?;
     let mut records = Vec::new();
     for file_id in &request.file_ids {
-        records.push(delete_file(database, *file_id, request.permanent)?);
+        match delete_file(database, *file_id, request.permanent, &mut group) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                finish_operation_group(database, &mut group, Some(&error))?;
+                return Err(error);
+            }
+        }
     }
     for folder_id in &request.folder_ids {
-        records.push(delete_folder(database, *folder_id, request.permanent)?);
+        match delete_folder(database, *folder_id, request.permanent, &mut group) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                finish_operation_group(database, &mut group, Some(&error))?;
+                return Err(error);
+            }
+        }
     }
 
+    finish_operation_group(database, &mut group, None)?;
     Ok(records)
 }
 
@@ -257,7 +319,7 @@ pub fn list_recent(
     let guard = database.lock().expect("database mutex poisoned");
     let conn = guard.connection_for_fsops();
     let sql = format!(
-        "SELECT id, operation, source_path, target_path, status, created_at, finished_at, error \
+        "SELECT id, operation, source_path, target_path, status, created_at, finished_at, error, operation_group_id \
          FROM file_operations {} ORDER BY id DESC LIMIT {}",
         if cursor_id.is_some() {
             "WHERE id < ?1"
@@ -291,12 +353,166 @@ pub fn list_recent(
     })
 }
 
+#[derive(Debug, Clone)]
+struct FileOperationGroup {
+    id: String,
+    kind: FileOperationKind,
+    total: i64,
+    completed: i64,
+    started_at: i64,
+    terminal: bool,
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn begin_operation_group(
+    database: &Mutex<Database>,
+    kind: FileOperationKind,
+    total: usize,
+) -> FsOpsResult<FileOperationGroup> {
+    let guard = database.lock().expect("database mutex poisoned");
+    let transaction =
+        Transaction::new_unchecked(guard.connection_for_fsops(), TransactionBehavior::Immediate)?;
+    let group = FileOperationGroup {
+        id: Uuid::now_v7().to_string(),
+        kind,
+        total: total as i64,
+        completed: 0,
+        started_at: now_millis(),
+        terminal: false,
+    };
+    let mut operation = notification_for_group(&group, "pending", "queued", None, None);
+    let appended = guard.publish_notification_operation_in_transaction(
+        &transaction,
+        &mut operation,
+        PublishMode::Phase,
+    )?;
+    transaction.commit()?;
+    if appended {
+        guard.notification_outbox_wake().notify_one();
+    }
+    Ok(group)
+}
+
+fn notification_for_group(
+    group: &FileOperationGroup,
+    status: &str,
+    phase: &str,
+    error: Option<&FsOpsError>,
+    completed_at: Option<i64>,
+) -> NotificationOperation {
+    let now = now_millis();
+    NotificationOperation {
+        operation_id: group.id.clone(),
+        revision: 0,
+        kind: group.kind.as_str().to_owned(),
+        category: "file_operation".to_owned(),
+        origin: "user".to_owned(),
+        presentation: "important".to_owned(),
+        status: status.to_owned(),
+        phase: Some(phase.to_owned()),
+        title: match group.kind {
+            FileOperationKind::Rename => "Rename files",
+            FileOperationKind::Move => "Move files",
+            FileOperationKind::DeleteRecycle => "Move files to recycle bin",
+            FileOperationKind::DeletePermanent => "Delete files",
+        }
+        .to_owned(),
+        summary: None,
+        task_id: None,
+        root_id: None,
+        folder_id: None,
+        file_id: None,
+        current_value: group.completed,
+        total_value: Some(group.total),
+        unit: Some("items".to_owned()),
+        error_code: error.map(|error| error.code.as_str().to_owned()),
+        error_detail: error.map(|error| error.message.clone()),
+        cancellable: false,
+        retryable: false,
+        attempt: 1,
+        occurrence_count: 1,
+        started_at: group.started_at,
+        updated_at: now,
+        completed_at,
+    }
+}
+
+fn publish_group_item_in_transaction(
+    database: &Database,
+    transaction: &Transaction<'_>,
+    group: &FileOperationGroup,
+    completed: i64,
+    error: Option<&FsOpsError>,
+) -> FsOpsResult<(bool, bool)> {
+    let mut snapshot = group.clone();
+    snapshot.completed = completed;
+    let terminal = error.is_some() || completed >= group.total;
+    let (status, phase, completed_at, mode) = match error {
+        Some(_) => (
+            "failed",
+            "failed",
+            Some(now_millis()),
+            PublishMode::Terminal,
+        ),
+        None if terminal => (
+            "succeeded",
+            "completed",
+            Some(now_millis()),
+            PublishMode::Terminal,
+        ),
+        None => ("running", "working", None, PublishMode::Progress),
+    };
+    let mut operation = notification_for_group(&snapshot, status, phase, error, completed_at);
+    let appended = database.publish_notification_operation_in_transaction(
+        transaction,
+        &mut operation,
+        mode,
+    )?;
+    Ok((appended, terminal))
+}
+
+fn finish_operation_group(
+    database: &Mutex<Database>,
+    group: &mut FileOperationGroup,
+    error: Option<&FsOpsError>,
+) -> FsOpsResult<()> {
+    if group.terminal {
+        return Ok(());
+    }
+    let guard = database.lock().expect("database mutex poisoned");
+    let transaction =
+        Transaction::new_unchecked(guard.connection_for_fsops(), TransactionBehavior::Immediate)?;
+    let (status, phase, completed_at) = match error {
+        Some(_) => ("failed", "failed", Some(now_millis())),
+        None => ("succeeded", "completed", Some(now_millis())),
+    };
+    let mut operation = notification_for_group(group, status, phase, error, completed_at);
+    let appended = guard.publish_notification_operation_in_transaction(
+        &transaction,
+        &mut operation,
+        PublishMode::Terminal,
+    )?;
+    transaction.commit()?;
+    group.terminal = true;
+    if appended {
+        guard.notification_outbox_wake().notify_one();
+    }
+    Ok(())
+}
+
 // -------------- internal: rename ----------------------------------------
 
 fn rename_file(
     database: &Mutex<Database>,
     file_id: i64,
     new_name: &str,
+    group: &mut FileOperationGroup,
 ) -> FsOpsResult<FileOperationRecord> {
     // Step 1: brief lock to snapshot what we need for the FS rename and to
     // run the conflict check. We commit nothing here.
@@ -332,6 +548,7 @@ fn rename_file(
             FileOperationKind::Rename,
             &source_path_string,
             Some(&target_path_string),
+            group,
         );
     }
 
@@ -349,23 +566,30 @@ fn rename_file(
     let fs_result = atomic_rename(&info.path, &target_path);
 
     // Step 3: brief lock to commit DB changes and write the log row.
-    let mut guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops_mut();
+    let guard = database.lock().expect("database mutex poisoned");
+    let conn = guard.connection_for_fsops();
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
 
     if let Err(error) = fs_result {
-        record_failure(
+        let operation_error =
+            FsOpsError::new(FsOpsErrorCode::FsError, format!("rename failed: {error}"));
+        let (appended, completed, terminal) = record_failure(
+            &guard,
             &transaction,
             FileOperationKind::Rename,
             &source_path_string,
             Some(&target_path_string),
             &error.to_string(),
+            &operation_error,
+            group,
         )?;
         transaction.commit()?;
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::FsError,
-            format!("rename failed: {error}"),
-        ));
+        group.completed = completed;
+        group.terminal = terminal;
+        if appended {
+            guard.notification_outbox_wake().notify_one();
+        }
+        return Err(operation_error);
     }
 
     let new_ext = extension_from_name(new_name);
@@ -376,15 +600,22 @@ fn rename_file(
 
     crate::db::sync_media_fts_for_file_in_transaction_pub(&transaction, file_id)?;
 
-    let record = insert_operation(
+    let (record, appended, completed, terminal) = insert_operation(
+        &guard,
         &transaction,
         FileOperationKind::Rename,
         &source_path_string,
         Some(&target_path_string),
         "succeeded",
         None,
+        group,
     )?;
     transaction.commit()?;
+    group.completed = completed;
+    group.terminal = terminal;
+    if appended {
+        guard.notification_outbox_wake().notify_one();
+    }
     Ok(record)
 }
 
@@ -392,6 +623,7 @@ fn rename_folder(
     database: &Mutex<Database>,
     folder_id: i64,
     new_name: &str,
+    group: &mut FileOperationGroup,
 ) -> FsOpsResult<FileOperationRecord> {
     // Step 1: snapshot under brief lock.
     let (info, parent_dir, target_path, source_path_string, target_path_string, conflict_in_db) = {
@@ -441,6 +673,7 @@ fn rename_folder(
             FileOperationKind::Rename,
             &source_path_string,
             Some(&target_path_string),
+            group,
         );
     }
 
@@ -455,23 +688,30 @@ fn rename_folder(
     let fs_result = atomic_rename(&info.path, &target_path);
 
     // Step 3: brief lock for the commit.
-    let mut guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops_mut();
+    let guard = database.lock().expect("database mutex poisoned");
+    let conn = guard.connection_for_fsops();
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
 
     if let Err(error) = fs_result {
-        record_failure(
+        let operation_error =
+            FsOpsError::new(FsOpsErrorCode::FsError, format!("rename failed: {error}"));
+        let (appended, completed, terminal) = record_failure(
+            &guard,
             &transaction,
             FileOperationKind::Rename,
             &source_path_string,
             Some(&target_path_string),
             &error.to_string(),
+            &operation_error,
+            group,
         )?;
         transaction.commit()?;
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::FsError,
-            format!("rename failed: {error}"),
-        ));
+        group.completed = completed;
+        group.terminal = terminal;
+        if appended {
+            guard.notification_outbox_wake().notify_one();
+        }
+        return Err(operation_error);
     }
 
     transaction.execute(
@@ -484,15 +724,22 @@ fn rename_folder(
         crate::db::sync_media_fts_for_file_in_transaction_pub(&transaction, file_id)?;
     }
 
-    let record = insert_operation(
+    let (record, appended, completed, terminal) = insert_operation(
+        &guard,
         &transaction,
         FileOperationKind::Rename,
         &source_path_string,
         Some(&target_path_string),
         "succeeded",
         None,
+        group,
     )?;
     transaction.commit()?;
+    group.completed = completed;
+    group.terminal = terminal;
+    if appended {
+        guard.notification_outbox_wake().notify_one();
+    }
     Ok(record)
 }
 
@@ -502,6 +749,7 @@ fn move_file(
     database: &Mutex<Database>,
     file_id: i64,
     target: &FolderTarget,
+    group: &mut FileOperationGroup,
 ) -> FsOpsResult<FileOperationRecord> {
     // Step 1: snapshot under brief lock. Fail-fast on cross-root and
     // collision; a same-folder move is treated as a no-op.
@@ -530,6 +778,7 @@ fn move_file(
                 FileOperationKind::Move,
                 &source,
                 Some(&source),
+                group,
             );
         }
         let collision_in_db = file_exists_in_folder_conn(conn, target.folder_id, &info.name)?;
@@ -555,23 +804,30 @@ fn move_file(
     let fs_result = atomic_rename(&info.path, &target_path);
 
     // Step 3: commit under brief lock.
-    let mut guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops_mut();
+    let guard = database.lock().expect("database mutex poisoned");
+    let conn = guard.connection_for_fsops();
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
 
     if let Err(error) = fs_result {
-        record_failure(
+        let operation_error =
+            FsOpsError::new(FsOpsErrorCode::FsError, format!("move failed: {error}"));
+        let (appended, completed, terminal) = record_failure(
+            &guard,
             &transaction,
             FileOperationKind::Move,
             &source_path_string,
             Some(&target_path_string),
             &error.to_string(),
+            &operation_error,
+            group,
         )?;
         transaction.commit()?;
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::FsError,
-            format!("move failed: {error}"),
-        ));
+        group.completed = completed;
+        group.terminal = terminal;
+        if appended {
+            guard.notification_outbox_wake().notify_one();
+        }
+        return Err(operation_error);
     }
 
     transaction.execute(
@@ -580,15 +836,22 @@ fn move_file(
     )?;
     crate::db::sync_media_fts_for_file_in_transaction_pub(&transaction, file_id)?;
 
-    let record = insert_operation(
+    let (record, appended, completed, terminal) = insert_operation(
+        &guard,
         &transaction,
         FileOperationKind::Move,
         &source_path_string,
         Some(&target_path_string),
         "succeeded",
         None,
+        group,
     )?;
     transaction.commit()?;
+    group.completed = completed;
+    group.terminal = terminal;
+    if appended {
+        guard.notification_outbox_wake().notify_one();
+    }
     Ok(record)
 }
 
@@ -596,6 +859,7 @@ fn move_folder(
     database: &Mutex<Database>,
     folder_id: i64,
     target: &FolderTarget,
+    group: &mut FileOperationGroup,
 ) -> FsOpsResult<FileOperationRecord> {
     // Step 1: snapshot.
     let (info, target_path, source_path_string, target_path_string, conflict_in_db) = {
@@ -660,23 +924,30 @@ fn move_folder(
     let fs_result = atomic_rename(&info.path, &target_path);
 
     // Step 3: commit under brief lock.
-    let mut guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops_mut();
+    let guard = database.lock().expect("database mutex poisoned");
+    let conn = guard.connection_for_fsops();
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
 
     if let Err(error) = fs_result {
-        record_failure(
+        let operation_error =
+            FsOpsError::new(FsOpsErrorCode::FsError, format!("move failed: {error}"));
+        let (appended, completed, terminal) = record_failure(
+            &guard,
             &transaction,
             FileOperationKind::Move,
             &source_path_string,
             Some(&target_path_string),
             &error.to_string(),
+            &operation_error,
+            group,
         )?;
         transaction.commit()?;
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::FsError,
-            format!("move failed: {error}"),
-        ));
+        group.completed = completed;
+        group.terminal = terminal;
+        if appended {
+            guard.notification_outbox_wake().notify_one();
+        }
+        return Err(operation_error);
     }
 
     transaction.execute(
@@ -688,15 +959,22 @@ fn move_folder(
         crate::db::sync_media_fts_for_file_in_transaction_pub(&transaction, file_id)?;
     }
 
-    let record = insert_operation(
+    let (record, appended, completed, terminal) = insert_operation(
+        &guard,
         &transaction,
         FileOperationKind::Move,
         &source_path_string,
         Some(&target_path_string),
         "succeeded",
         None,
+        group,
     )?;
     transaction.commit()?;
+    group.completed = completed;
+    group.terminal = terminal;
+    if appended {
+        guard.notification_outbox_wake().notify_one();
+    }
     Ok(record)
 }
 
@@ -706,6 +984,7 @@ fn delete_file(
     database: &Mutex<Database>,
     file_id: i64,
     permanent: bool,
+    group: &mut FileOperationGroup,
 ) -> FsOpsResult<FileOperationRecord> {
     // Step 1: snapshot path + symlink state under brief lock; the symlink
     // refusal must happen before the FS work even runs.
@@ -749,17 +1028,30 @@ fn delete_file(
     };
 
     // Step 3: commit under brief lock.
-    let mut guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops_mut();
+    let guard = database.lock().expect("database mutex poisoned");
+    let conn = guard.connection_for_fsops();
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
 
     if let Err(error) = fs_result {
-        record_failure(&transaction, kind, &source_path_string, None, &error)?;
+        let operation_error =
+            FsOpsError::new(FsOpsErrorCode::FsError, format!("delete failed: {error}"));
+        let (appended, completed, terminal) = record_failure(
+            &guard,
+            &transaction,
+            kind,
+            &source_path_string,
+            None,
+            &error,
+            &operation_error,
+            group,
+        )?;
         transaction.commit()?;
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::FsError,
-            format!("delete failed: {error}"),
-        ));
+        group.completed = completed;
+        group.terminal = terminal;
+        if appended {
+            guard.notification_outbox_wake().notify_one();
+        }
+        return Err(operation_error);
     }
 
     transaction.execute(
@@ -769,15 +1061,22 @@ fn delete_file(
     transaction.execute("DELETE FROM media_fts WHERE rowid = ?1", params![file_id])?;
     crate::db::cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction)?;
 
-    let record = insert_operation(
+    let (record, appended, completed, terminal) = insert_operation(
+        &guard,
         &transaction,
         kind,
         &source_path_string,
         None,
         "succeeded",
         None,
+        group,
     )?;
     transaction.commit()?;
+    group.completed = completed;
+    group.terminal = terminal;
+    if appended {
+        guard.notification_outbox_wake().notify_one();
+    }
     Ok(record)
 }
 
@@ -785,6 +1084,7 @@ fn delete_folder(
     database: &Mutex<Database>,
     folder_id: i64,
     permanent: bool,
+    group: &mut FileOperationGroup,
 ) -> FsOpsResult<FileOperationRecord> {
     // Step 1: snapshot.
     let (info, source_path_string) = {
@@ -830,17 +1130,30 @@ fn delete_folder(
     };
 
     // Step 3: commit under brief lock.
-    let mut guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops_mut();
+    let guard = database.lock().expect("database mutex poisoned");
+    let conn = guard.connection_for_fsops();
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
 
     if let Err(error) = fs_result {
-        record_failure(&transaction, kind, &source_path_string, None, &error)?;
+        let operation_error =
+            FsOpsError::new(FsOpsErrorCode::FsError, format!("delete failed: {error}"));
+        let (appended, completed, terminal) = record_failure(
+            &guard,
+            &transaction,
+            kind,
+            &source_path_string,
+            None,
+            &error,
+            &operation_error,
+            group,
+        )?;
         transaction.commit()?;
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::FsError,
-            format!("delete failed: {error}"),
-        ));
+        group.completed = completed;
+        group.terminal = terminal;
+        if appended {
+            guard.notification_outbox_wake().notify_one();
+        }
+        return Err(operation_error);
     }
 
     let descendant_files = collect_descendant_file_ids(&transaction, folder_id)?;
@@ -877,15 +1190,22 @@ fn delete_folder(
         transaction.execute("DELETE FROM media_fts WHERE rowid = ?1", params![*file_id])?;
     }
 
-    let record = insert_operation(
+    let (record, appended, completed, terminal) = insert_operation(
+        &guard,
         &transaction,
         kind,
         &source_path_string,
         None,
         "succeeded",
         None,
+        group,
     )?;
     transaction.commit()?;
+    group.completed = completed;
+    group.terminal = terminal;
+    if appended {
+        guard.notification_outbox_wake().notify_one();
+    }
     Ok(record)
 }
 
@@ -1334,48 +1654,78 @@ fn parse_cursor(cursor: &str) -> FsOpsResult<i64> {
 }
 
 fn insert_operation(
+    database: &Database,
     transaction: &Transaction<'_>,
     kind: FileOperationKind,
     source_path: &str,
     target_path: Option<&str>,
     status: &str,
     error: Option<&str>,
-) -> FsOpsResult<FileOperationRecord> {
+    group: &FileOperationGroup,
+) -> FsOpsResult<(FileOperationRecord, bool, i64, bool)> {
     transaction.execute(
         r#"
-        INSERT INTO file_operations(operation, source_path, target_path, status, created_at, finished_at, error)
-        VALUES (?1, ?2, ?3, ?4, unixepoch(), unixepoch(), ?5)
+        INSERT INTO file_operations(
+          operation, source_path, target_path, status, created_at, finished_at, error,
+          operation_group_id
+        )
+        VALUES (?1, ?2, ?3, ?4, unixepoch(), unixepoch(), ?5, ?6)
         "#,
-        params![kind.as_str(), source_path, target_path, status, error],
+        params![
+            kind.as_str(),
+            source_path,
+            target_path,
+            status,
+            error,
+            group.id
+        ],
     )?;
     let id = transaction.last_insert_rowid();
     let record = transaction.query_row(
         r#"
-        SELECT id, operation, source_path, target_path, status, created_at, finished_at, error
+        SELECT id, operation, source_path, target_path, status, created_at, finished_at, error,
+               operation_group_id
         FROM file_operations
         WHERE id = ?1
         "#,
         params![id],
         record_from_row,
     )?;
-    Ok(record)
+    let completed = group.completed.saturating_add(1);
+    let (appended, terminal) =
+        publish_group_item_in_transaction(database, transaction, group, completed, None)?;
+    Ok((record, appended, completed, terminal))
 }
 
 fn record_failure(
+    database: &Database,
     transaction: &Transaction<'_>,
     kind: FileOperationKind,
     source_path: &str,
     target_path: Option<&str>,
     error: &str,
-) -> FsOpsResult<()> {
+    operation_error: &FsOpsError,
+    group: &FileOperationGroup,
+) -> FsOpsResult<(bool, i64, bool)> {
     transaction.execute(
         r#"
-        INSERT INTO file_operations(operation, source_path, target_path, status, created_at, finished_at, error)
-        VALUES (?1, ?2, ?3, 'failed', unixepoch(), unixepoch(), ?4)
+        INSERT INTO file_operations(
+          operation, source_path, target_path, status, created_at, finished_at, error,
+          operation_group_id
+        )
+        VALUES (?1, ?2, ?3, 'failed', unixepoch(), unixepoch(), ?4, ?5)
         "#,
-        params![kind.as_str(), source_path, target_path, error],
+        params![kind.as_str(), source_path, target_path, error, group.id],
     )?;
-    Ok(())
+    let completed = group.completed.saturating_add(1);
+    let (appended, terminal) = publish_group_item_in_transaction(
+        database,
+        transaction,
+        group,
+        completed,
+        Some(operation_error),
+    )?;
+    Ok((appended, completed, terminal))
 }
 
 /// Acquire the lock briefly, write a `succeeded` `file_operations` row,
@@ -1386,34 +1736,43 @@ fn write_succeeded_locked(
     kind: FileOperationKind,
     source_path: &str,
     target_path: Option<&str>,
+    group: &mut FileOperationGroup,
 ) -> FsOpsResult<FileOperationRecord> {
     let guard = database.lock().expect("database mutex poisoned");
-    write_succeeded_locked_with_guard(guard, kind, source_path, target_path)
+    write_succeeded_locked_with_guard(guard, kind, source_path, target_path, group)
 }
 
 /// Variant that operates on an already-held guard so callers that already
 /// snapshotted under a single lock can write the success row without
 /// dropping and re-acquiring.
 fn write_succeeded_locked_with_guard<G>(
-    mut guard: G,
+    guard: G,
     kind: FileOperationKind,
     source_path: &str,
     target_path: Option<&str>,
+    group: &mut FileOperationGroup,
 ) -> FsOpsResult<FileOperationRecord>
 where
     G: std::ops::DerefMut<Target = Database>,
 {
-    let conn = guard.connection_for_fsops_mut();
+    let conn = guard.connection_for_fsops();
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let record = insert_operation(
+    let (record, appended, completed, terminal) = insert_operation(
+        &guard,
         &transaction,
         kind,
         source_path,
         target_path,
         "succeeded",
         None,
+        group,
     )?;
     transaction.commit()?;
+    group.completed = completed;
+    group.terminal = terminal;
+    if appended {
+        guard.notification_outbox_wake().notify_one();
+    }
     Ok(record)
 }
 
@@ -1427,6 +1786,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileOperationRec
         created_at: row.get(5)?,
         finished_at: row.get(6)?,
         error: row.get(7)?,
+        operation_group_id: row.get(8)?,
     })
 }
 
@@ -1761,6 +2121,251 @@ mod tests {
         .expect("delete mixed");
         assert_eq!(records.len(), 2);
         assert!(records.iter().all(|record| record.status == "succeeded"));
+    }
+
+    #[test]
+    fn move_command_persists_one_uuid_v7_notification_group() {
+        let env = TestEnv::new("move_notification_group");
+        let target = env.add_folder(env.root_folder_id, "target");
+        let file_ids = ["a.jpg", "b.jpg", "c.jpg"]
+            .into_iter()
+            .map(|name| env.add_file(env.root_folder_id, name))
+            .collect::<Vec<_>>();
+
+        let records = move_items(
+            &env.database,
+            MoveRequest {
+                file_ids,
+                folder_ids: vec![],
+                target_folder_id: target,
+            },
+        )
+        .expect("move command");
+
+        assert_eq!(records.len(), 3);
+        let group_id = records[0]
+            .operation_group_id
+            .as_deref()
+            .expect("operation group id");
+        let parsed = uuid::Uuid::parse_str(group_id).expect("UUID operation group id");
+        assert_eq!(parsed.get_version_num(), 7);
+        assert!(records
+            .iter()
+            .all(|record| { record.operation_group_id.as_deref() == Some(group_id) }));
+
+        let guard = env.database.lock().expect("db lock");
+        let heads = guard
+            .notification_heads_for_test()
+            .expect("notification heads");
+        let operation = heads
+            .iter()
+            .find(|operation| operation.operation_id == group_id)
+            .expect("file-operation head");
+        assert_eq!(operation.category, "file_operation");
+        assert_eq!(operation.kind, "move");
+        assert_eq!(operation.status, "succeeded");
+        assert_eq!(operation.current_value, 3);
+        assert_eq!(operation.total_value, Some(3));
+        assert_eq!(
+            heads
+                .iter()
+                .filter(|operation| operation.operation_id == group_id)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rename_and_delete_persist_command_group_ids() {
+        let env = TestEnv::new("rename_delete_notification_groups");
+        let rename_id = env.add_file(env.root_folder_id, "rename.jpg");
+        let renamed = rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(rename_id),
+                folder_id: None,
+                new_name: "renamed.jpg".into(),
+            },
+        )
+        .expect("rename command");
+        let rename_group = renamed
+            .operation_group_id
+            .as_deref()
+            .expect("rename group id");
+
+        let delete_ids = ["delete-a.jpg", "delete-b.jpg"]
+            .into_iter()
+            .map(|name| env.add_file(env.root_folder_id, name))
+            .collect::<Vec<_>>();
+        let deleted = delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: delete_ids,
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .expect("delete command");
+        let delete_group = deleted[0]
+            .operation_group_id
+            .as_deref()
+            .expect("delete group id");
+
+        assert_ne!(rename_group, delete_group);
+        assert!(deleted
+            .iter()
+            .all(|record| { record.operation_group_id.as_deref() == Some(delete_group) }));
+        let guard = env.database.lock().expect("db lock");
+        let heads = guard
+            .notification_heads_for_test()
+            .expect("notification heads");
+        assert_eq!(
+            heads
+                .iter()
+                .find(|operation| operation.operation_id == rename_group)
+                .expect("rename head")
+                .status,
+            "succeeded"
+        );
+        let delete_head = heads
+            .iter()
+            .find(|operation| operation.operation_id == delete_group)
+            .expect("delete head");
+        assert_eq!(delete_head.status, "succeeded");
+        assert_eq!(delete_head.current_value, 2);
+        assert_eq!(delete_head.total_value, Some(2));
+    }
+
+    #[test]
+    fn partial_move_failure_keeps_monotonic_group_progress() {
+        let env = TestEnv::new("move_partial_failure");
+        let target = env.add_folder(env.root_folder_id, "target");
+        let first = env.add_file(env.root_folder_id, "first.jpg");
+        let second = env.add_file(env.root_folder_id, "second.jpg");
+        let _conflict = env.add_file(target, "second.jpg");
+
+        let error = move_items(
+            &env.database,
+            MoveRequest {
+                file_ids: vec![first, second],
+                folder_ids: vec![],
+                target_folder_id: target,
+            },
+        )
+        .expect_err("second item must conflict");
+        assert_eq!(error.code, FsOpsErrorCode::NameConflict);
+
+        let guard = env.database.lock().expect("db lock");
+        let operations = guard
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .into_iter()
+            .filter(|operation| operation.category == "file_operation")
+            .collect::<Vec<_>>();
+        assert_eq!(operations.len(), 1);
+        let operation = &operations[0];
+        assert_eq!(operation.kind, "move");
+        assert_eq!(operation.status, "failed");
+        assert_eq!(operation.current_value, 1);
+        assert_eq!(operation.total_value, Some(2));
+        assert_eq!(operation.error_code.as_deref(), Some("name_conflict"));
+        let events = guard
+            .list_notification_outbox(0, 200)
+            .expect("notification outbox")
+            .into_iter()
+            .filter(|event| event.operation.operation_id == operation.operation_id)
+            .collect::<Vec<_>>();
+        assert!(events
+            .windows(2)
+            .all(|window| window[0].operation.current_value <= window[1].operation.current_value));
+        assert_eq!(
+            events.last().expect("terminal event").operation.status,
+            "failed"
+        );
+        assert!(env.root_path.join("target").join("first.jpg").exists());
+        assert!(env.root_path.join("second.jpg").exists());
+    }
+
+    #[test]
+    fn filesystem_failure_persists_failed_audit_and_terminal_in_one_group() {
+        let env = TestEnv::new("delete_filesystem_failure");
+        let file_id = env.add_file(env.root_folder_id, "missing.jpg");
+        stdfs::remove_file(env.root_path.join("missing.jpg")).expect("remove source from disk");
+
+        let error = delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![file_id],
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .expect_err("filesystem delete must fail");
+        assert_eq!(error.code, FsOpsErrorCode::FsError);
+
+        let page = list_recent(&env.database, 10, None).expect("recent file operations");
+        let audit = page.items.first().expect("failed audit row");
+        assert_eq!(audit.status, "failed");
+        let group_id = audit
+            .operation_group_id
+            .as_deref()
+            .expect("failed operation group id");
+        let guard = env.database.lock().expect("db lock");
+        let operation = guard
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .into_iter()
+            .find(|operation| operation.operation_id == group_id)
+            .expect("failed operation head");
+        assert_eq!(operation.status, "failed");
+        assert_eq!(operation.current_value, 1);
+        assert_eq!(operation.total_value, Some(1));
+        assert_eq!(operation.error_code.as_deref(), Some("fs_error"));
+    }
+
+    #[test]
+    fn legacy_file_operation_json_omits_internal_group_id() {
+        let env = TestEnv::new("legacy_operation_json");
+        let file_id = env.add_file(env.root_folder_id, "legacy.jpg");
+        let record = rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(file_id),
+                folder_id: None,
+                new_name: "legacy-renamed.jpg".into(),
+            },
+        )
+        .expect("rename command");
+        assert!(record.operation_group_id.is_some());
+        let json = serde_json::to_value(record).expect("serialize legacy response");
+        assert!(json.get("operationGroupId").is_none());
+    }
+
+    #[test]
+    fn interrupted_file_operation_group_recovers_to_terminal_failure() {
+        let env = TestEnv::new("file_operation_recovery");
+        let group = begin_operation_group(&env.database, FileOperationKind::Move, 2)
+            .expect("begin file-operation group");
+
+        let guard = env.database.lock().expect("db lock");
+        assert_eq!(
+            guard
+                .recover_interrupted_notification_operations()
+                .expect("recover interrupted group"),
+            1
+        );
+        let operation = guard
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .into_iter()
+            .find(|operation| operation.operation_id == group.id)
+            .expect("recovered group");
+        assert_eq!(operation.status, "failed");
+        assert_eq!(operation.origin, "recovery");
+        assert_eq!(operation.error_code.as_deref(), Some("interrupted"));
+        assert_eq!(operation.current_value, 0);
+        assert_eq!(operation.total_value, Some(2));
+        assert!(operation.completed_at.is_some());
     }
 
     #[test]
