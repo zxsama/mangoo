@@ -585,6 +585,62 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /notifications/outbox:
+    get:
+      operationId: listNotificationOutbox
+      parameters:
+        - name: afterSequence
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+        - name: waitMs
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 30000
+      responses:
+        "200":
+          description: Notification outbox events after the requested sequence.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationOutboxResponse"
+        "400":
+          description: Invalid outbox query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /notifications/outbox/ack:
+    post:
+      operationId: ackNotificationOutbox
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NotificationOutboxAckRequest"
+      responses:
+        "200":
+          description: Notification outbox sequence acknowledged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationOutboxAckResponse"
+        "400":
+          description: Invalid outbox acknowledgement.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /tags:
     get:
       operationId: listTags
@@ -1200,6 +1256,156 @@ components:
         nextCursor:
           type: string
           nullable: true
+    NotificationOrigin:
+      type: string
+      enum: [user, background, recovery, system]
+    NotificationPresentation:
+      type: string
+      enum: [important, history_only, status_only]
+    NotificationOperationStatus:
+      type: string
+      enum: [pending, running, succeeded, failed, cancelled]
+    NotificationOperationSnapshot:
+      type: object
+      required:
+        [
+          operationId,
+          revision,
+          kind,
+          category,
+          origin,
+          presentation,
+          status,
+          phase,
+          title,
+          summary,
+          taskId,
+          rootId,
+          folderId,
+          fileId,
+          currentValue,
+          totalValue,
+          unit,
+          errorCode,
+          errorDetail,
+          cancellable,
+          retryable,
+          attempt,
+          occurrenceCount,
+          startedAt,
+          updatedAt,
+          completedAt
+        ]
+      properties:
+        operationId:
+          type: string
+        revision:
+          type: integer
+        kind:
+          type: string
+        category:
+          type: string
+          enum: [task, file_operation, error, thumbnail_cache]
+        origin:
+          $ref: "#/components/schemas/NotificationOrigin"
+        presentation:
+          $ref: "#/components/schemas/NotificationPresentation"
+        status:
+          $ref: "#/components/schemas/NotificationOperationStatus"
+        phase:
+          type: string
+          nullable: true
+        title:
+          type: string
+        summary:
+          type: string
+          nullable: true
+        taskId:
+          type: integer
+          nullable: true
+        rootId:
+          type: integer
+          nullable: true
+        folderId:
+          type: integer
+          nullable: true
+        fileId:
+          type: integer
+          nullable: true
+        currentValue:
+          type: integer
+        totalValue:
+          type: integer
+          nullable: true
+        unit:
+          type: string
+          nullable: true
+        errorCode:
+          type: string
+          nullable: true
+        errorDetail:
+          type: string
+          nullable: true
+        cancellable:
+          type: boolean
+        retryable:
+          type: boolean
+        attempt:
+          type: integer
+        occurrenceCount:
+          type: integer
+        startedAt:
+          type: integer
+        updatedAt:
+          type: integer
+        completedAt:
+          type: integer
+          nullable: true
+    NotificationOutboxEvent:
+      type: object
+      required: [sequence, operation]
+      properties:
+        sequence:
+          type: integer
+        operation:
+          $ref: "#/components/schemas/NotificationOperationSnapshot"
+    NotificationOutboxResponse:
+      type: object
+      required: [items, maxSequence]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/NotificationOutboxEvent"
+        maxSequence:
+          type: integer
+    NotificationOutboxAckRequest:
+      type: object
+      required: [maxSequence]
+      properties:
+        maxSequence:
+          type: integer
+          minimum: 0
+    NotificationOutboxAckResponse:
+      type: object
+      required: [acknowledged]
+      properties:
+        acknowledged:
+          type: boolean
+    ListNotificationOutboxParams:
+      type: object
+      properties:
+        afterSequence:
+          type: integer
+          minimum: 0
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+        waitMs:
+          type: integer
+          minimum: 0
+          maximum: 30000
     RootRecord:
       type: object
       required: [id, path, displayName, enabled, createdAt, lastScanAt, rootFolderId, mediaCount, reachable]

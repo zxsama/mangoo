@@ -105,6 +105,8 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/file-ops/move",
     "/api/file-ops/delete",
     "/api/file-ops",
+    "/api/notifications/outbox",
+    "/api/notifications/outbox/ack",
     "/api/plugins",
     "/api/plugins/discover",
     "/api/plugins/{pluginId}",

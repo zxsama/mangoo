@@ -508,6 +508,30 @@ describe("createCoreClient", () => {
     assert.equal(url.searchParams.get("cursor"), "42");
   });
 
+  test("listNotificationOutbox serializes polling parameters and forwards abort signal", async () => {
+    mockFetch({ items: [], maxSequence: 41 });
+    const controller = new AbortController();
+    await client().listNotificationOutbox(
+      { afterSequence: 41, limit: 100, waitMs: 20_000 },
+      { signal: controller.signal }
+    );
+    const url = new URL(recorded[0].url);
+    assert.equal(recorded[0].method, "GET");
+    assert.equal(url.pathname, "/api/notifications/outbox");
+    assert.equal(url.searchParams.get("afterSequence"), "41");
+    assert.equal(url.searchParams.get("limit"), "100");
+    assert.equal(url.searchParams.get("waitMs"), "20000");
+    assert.equal(recorded[0].signal, controller.signal);
+  });
+
+  test("ackNotificationOutbox posts the acknowledged sequence", async () => {
+    mockFetch({ acknowledged: true });
+    await client().ackNotificationOutbox({ maxSequence: 57 });
+    assert.equal(recorded[0].method, "POST");
+    assert.equal(recorded[0].url, `${BASE_URL}/notifications/outbox/ack`);
+    assert.deepEqual(JSON.parse(recorded[0].body!), { maxSequence: 57 });
+  });
+
   test("plugin endpoints encode the id", async () => {
     mockFetch({ deleted: true });
     await client().deletePlugin("org.example/risky");

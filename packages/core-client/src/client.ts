@@ -17,11 +17,15 @@ import type {
   FileTagsResponse,
   FolderRecord,
   InteractiveFolderScanTaskRequest,
+  ListNotificationOutboxParams,
   ListFileOperationsParams,
   ListFolderChildrenParams,
   ListMediaParams,
   MediaRecord,
   MoveRequest,
+  NotificationOutboxAckRequest,
+  NotificationOutboxAckResponse,
+  NotificationOutboxResponse,
   Page,
   PluginDiscoveryResponse,
   PluginListResponse,
@@ -401,6 +405,23 @@ export function createCoreClient(config: CoreClientConfig) {
       request<FileOperationListResponse>(`/file-ops${fileOpsQuery(params)}`, {
         requestPriority: "metadata"
       }),
+    listNotificationOutbox: (
+      params: ListNotificationOutboxParams,
+      options: CoreRequestOptions = {}
+    ) =>
+      request<NotificationOutboxResponse>(
+        `/notifications/outbox${notificationOutboxQuery(params)}`,
+        {
+          requestPriority: options.requestPriority ?? "metadata",
+          signal: options.signal
+        }
+      ),
+    ackNotificationOutbox: (body: NotificationOutboxAckRequest) =>
+      request<NotificationOutboxAckResponse>("/notifications/outbox/ack", {
+        method: "POST",
+        requestPriority: "metadata",
+        body: JSON.stringify(body)
+      }),
     listPlugins: () => request<PluginListResponse>("/plugins", { requestPriority: "metadata" }),
     getPlugin: (pluginId: string) =>
       request<PluginRecord>(`/plugins/${encodeURIComponent(pluginId)}`, {
@@ -672,6 +693,17 @@ function fileOpsQuery(params: ListFileOperationsParams): string {
   const search = new URLSearchParams();
   if (params.limit) search.set("limit", String(params.limit));
   if (params.cursor) search.set("cursor", params.cursor);
+  const value = search.toString();
+  return value ? `?${value}` : "";
+}
+
+function notificationOutboxQuery(params: ListNotificationOutboxParams): string {
+  const search = new URLSearchParams();
+  if (typeof params.afterSequence !== "undefined") {
+    search.set("afterSequence", String(params.afterSequence));
+  }
+  if (typeof params.limit !== "undefined") search.set("limit", String(params.limit));
+  if (typeof params.waitMs !== "undefined") search.set("waitMs", String(params.waitMs));
   const value = search.toString();
   return value ? `?${value}` : "";
 }

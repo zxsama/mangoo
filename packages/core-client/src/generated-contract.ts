@@ -120,6 +120,68 @@ export interface TaskRecord {
   error: string | null;
 }
 
+export type NotificationOrigin = "user" | "background" | "recovery" | "system";
+export type NotificationPresentation = "important" | "history_only" | "status_only";
+export type NotificationOperationStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export interface NotificationOperationSnapshot {
+  operationId: string;
+  revision: number;
+  kind: string;
+  category: "task" | "file_operation" | "error" | "thumbnail_cache";
+  origin: NotificationOrigin;
+  presentation: NotificationPresentation;
+  status: NotificationOperationStatus;
+  phase: string | null;
+  title: string;
+  summary: string | null;
+  taskId: number | null;
+  rootId: number | null;
+  folderId: number | null;
+  fileId: number | null;
+  currentValue: number;
+  totalValue: number | null;
+  unit: string | null;
+  errorCode: string | null;
+  errorDetail: string | null;
+  cancellable: boolean;
+  retryable: boolean;
+  attempt: number;
+  occurrenceCount: number;
+  startedAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+}
+
+export interface NotificationOutboxEvent {
+  sequence: number;
+  operation: NotificationOperationSnapshot;
+}
+
+export interface NotificationOutboxResponse {
+  items: NotificationOutboxEvent[];
+  maxSequence: number;
+}
+
+export interface NotificationOutboxAckRequest {
+  maxSequence: number;
+}
+
+export interface NotificationOutboxAckResponse {
+  acknowledged: boolean;
+}
+
+export interface ListNotificationOutboxParams {
+  afterSequence?: number;
+  limit?: number;
+  waitMs?: number;
+}
+
 export interface FolderRecord {
   id: number;
   rootId: number;
