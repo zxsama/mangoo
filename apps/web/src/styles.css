@@ -5544,6 +5544,7 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
   padding: 8px 12px;
   color: #ffd2ce;
   background: rgba(228, 124, 115, 0.13);
@@ -5552,15 +5553,24 @@ button:disabled {
   font-size: 12.5px;
 }
 
+.plugins-error span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .plugins-discovery-errors {
   display: grid;
+  flex: 0 1 auto;
   gap: 6px;
+  min-height: 0;
+  max-height: min(34%, 180px);
   padding: 10px 12px;
   color: #f6e1c7;
   background: rgba(246, 196, 124, 0.1);
   border: 1px solid rgba(246, 196, 124, 0.32);
   border-radius: 8px;
   font-size: 12px;
+  overflow: auto;
 }
 
 .plugins-discovery-summary {
@@ -5624,7 +5634,7 @@ button:disabled {
   flex: 1 1 auto;
   align-content: start;
   gap: 8px;
-  min-height: 0;
+  min-height: min(120px, 35%);
   padding-right: 4px;
   overflow: auto;
 }
