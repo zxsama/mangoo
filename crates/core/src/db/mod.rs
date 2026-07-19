@@ -794,9 +794,7 @@ impl Database {
             }),
             error_detail: task.error.clone(),
             cancellable: descriptor.cancellable && !terminal,
-            retryable: descriptor.retryable
-                && (task.status == "failed"
-                    || (task.status == "cancelled" && task.kind != "root_purge")),
+            retryable: task_retryable_in_transaction(transaction, &task)?,
             attempt: task.attempt_generation.saturating_add(1),
             occurrence_count: 1,
             started_at,
@@ -2948,6 +2946,21 @@ impl Database {
             .get_task(task_id)?
             .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
         if task.status != "failed" && task.status != "cancelled" {
+            return Err(anyhow::anyhow!(
+                "task {task_id} is not retryable; current status is {}",
+                task.status
+            ));
+        }
+        if !matches!(
+            task.kind.as_str(),
+            "root_scan" | "interactive_folder_scan" | "root_purge" | "thumbnail"
+        ) {
+            return Err(anyhow::anyhow!(
+                "task {task_id} is not retryable; unsupported kind is {}",
+                task.kind
+            ));
+        }
+        if !task_retryable_on_connection(&self.connection, &task)? {
             return Err(anyhow::anyhow!(
                 "task {task_id} is not retryable; current status is {}",
                 task.status
@@ -8704,6 +8717,72 @@ fn task_notification_recovery_origin_override(
         .then_some(NotificationOrigin::Recovery)
 }
 
+fn task_retryable_for_state(
+    task: &TaskRecord,
+    root_pending_delete: Option<bool>,
+) -> anyhow::Result<bool> {
+    if !matches!(task.status.as_str(), "failed" | "cancelled") {
+        return Ok(false);
+    }
+    if task.kind == "root_purge" {
+        return Ok(root_pending_delete.unwrap_or(false));
+    }
+    if task.kind == "thumbnail" {
+        return Ok(true);
+    }
+    Ok(task_notification_descriptor(&task.kind)?.is_some_and(|descriptor| descriptor.retryable))
+}
+
+fn task_retryable_in_transaction(
+    transaction: &Transaction<'_>,
+    task: &TaskRecord,
+) -> anyhow::Result<bool> {
+    let root_pending_delete = if task.kind == "root_purge" {
+        let Some(root_id) = task.root_id else {
+            return Ok(false);
+        };
+        Some(
+            transaction
+                .query_row(
+                    "SELECT pending_delete_at FROM roots WHERE id = ?1",
+                    [root_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten()
+                .is_some(),
+        )
+    } else {
+        None
+    };
+    task_retryable_for_state(task, root_pending_delete)
+}
+
+fn task_retryable_on_connection(
+    connection: &Connection,
+    task: &TaskRecord,
+) -> anyhow::Result<bool> {
+    let root_pending_delete = if task.kind == "root_purge" {
+        let Some(root_id) = task.root_id else {
+            return Ok(false);
+        };
+        Some(
+            connection
+                .query_row(
+                    "SELECT pending_delete_at FROM roots WHERE id = ?1",
+                    [root_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten()
+                .is_some(),
+        )
+    } else {
+        None
+    };
+    task_retryable_for_state(task, root_pending_delete)
+}
+
 fn root_purge_work_total_in_transaction(
     transaction: &Transaction<'_>,
     root_id: i64,
@@ -12608,6 +12687,13 @@ mod tests {
             .expect("cancelled task remains");
         assert_eq!(cancelled.status, "cancelled");
         assert_eq!(cancelled.items_seen, partial_current);
+        let cancelled_operation = database
+            .notification_heads_for_test()
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.operation_id == format!("task:{task_id}"))
+            .expect("cancelled purge operation");
+        assert!(cancelled_operation.retryable);
         let retried = database.retry_task(task_id).expect("retry hidden purge");
         assert_eq!(retried.id, task_id);
         assert_eq!(retried.status, "pending");
