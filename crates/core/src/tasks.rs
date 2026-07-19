@@ -234,6 +234,9 @@ pub fn start_worker_with_ffmpeg(
     worker_database
         .reset_running_thumbnail_tasks_for_recovery()
         .expect("reset running thumbnail tasks for startup recovery");
+    worker_database
+        .ensure_pending_delete_purge_tasks()
+        .expect("re-enqueue root_purge for pending-delete roots at startup recovery");
     // WAL checkpoints are run by the single writer actor between job batches
     // (see DbWriter), so no separate checkpoint thread/connection is needed.
     //

@@ -1302,7 +1302,6 @@ impl Database {
 
     /// All roots currently mid-purge (used by startup recovery). Uses the
     /// partial index `idx_roots_pending_delete`.
-    #[allow(dead_code)] // consumed by startup recovery in later tasks
     pub fn roots_pending_delete_ids(&self) -> anyhow::Result<Vec<i64>> {
         let mut stmt = self
             .connection
@@ -1311,6 +1310,34 @@ impl Database {
             .query_map([], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<i64>>>()?;
         Ok(ids)
+    }
+
+    /// Ensure every `pending_delete_at` root has a pending/running `root_purge`
+    /// task. Called at startup recovery so an interrupted purge resumes.
+    /// Returns the number of purge tasks created. Idempotent.
+    pub fn ensure_pending_delete_purge_tasks(&self) -> anyhow::Result<usize> {
+        let now = unix_timestamp();
+        let mut created = 0;
+        for root_id in self.roots_pending_delete_ids()? {
+            let has_task: bool = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM tasks WHERE root_id=?1 AND kind='root_purge' AND status IN ('pending','running') LIMIT 1",
+                    [root_id],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !has_task {
+                self.connection.execute(
+                    r#"INSERT INTO tasks(kind, priority, status, root_id, file_id, created_at, updated_at, error)
+                       VALUES ('root_purge', ?1, 'pending', ?2, NULL, ?3, ?3, NULL)"#,
+                    (ROOT_SCAN_TASK_PRIORITY, root_id, now),
+                )?;
+                created += 1;
+            }
+        }
+        Ok(created)
     }
 
     /// Delete ONE bounded batch of a root's rows, leaf-to-root, resumable.
@@ -11276,6 +11303,41 @@ mod tests {
         let ids = database.roots_pending_delete_ids().expect("pending ids");
         assert_eq!(ids, vec![root_id]);
         let _ = folder_id;
+    }
+
+    #[test]
+    fn startup_recovery_reenqueues_purge_for_pending_delete_roots() {
+        let database = migrated_database();
+        let (root_id, _f) = seed_media_page_fixture(&database);
+        database.mark_root_for_purge(root_id).expect("mark");
+        // Simulate a crash that lost the task row but kept pending_delete_at:
+        database
+            .connection
+            .execute(
+                "DELETE FROM tasks WHERE root_id=?1 AND kind='root_purge'",
+                [root_id],
+            )
+            .expect("drop purge task");
+
+        let created = database
+            .ensure_pending_delete_purge_tasks()
+            .expect("recover");
+        assert_eq!(created, 1);
+        let n: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE root_id=?1 AND kind='root_purge' AND status='pending'",
+                [root_id],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, 1);
+
+        // Idempotent: a second call with the task already present creates nothing.
+        let created_again = database
+            .ensure_pending_delete_purge_tasks()
+            .expect("recover again");
+        assert_eq!(created_again, 0);
     }
 
     #[test]
