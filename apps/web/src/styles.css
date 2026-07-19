@@ -5527,12 +5527,17 @@ button:disabled {
 
 .plugins-body {
   grid-row: 1 / -1;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
   min-height: 0;
-  padding: 16px;
   overflow: hidden;
+}
+
+.plugins-window .plugins-body {
+  background: linear-gradient(
+    108deg,
+    var(--secondary-window-pane-light) 0%,
+    var(--glass-side-fill) 52%,
+    var(--secondary-window-pane-end) 100%
+  );
 }
 
 .plugins-error {
@@ -5588,15 +5593,35 @@ button:disabled {
 
 .plugins-layout {
   display: grid;
-  flex: 1 1 auto;
+  height: 100%;
   grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
-  gap: 14px;
+  gap: 0;
   min-height: 0;
   overflow: hidden;
 }
 
+.plugins-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+  padding: 16px;
+  background: var(--secondary-window-pane-dark);
+  overflow: hidden;
+}
+
+.plugins-body-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
 .plugins-list {
   display: grid;
+  flex: 1 1 auto;
   align-content: start;
   gap: 8px;
   min-height: 0;
@@ -6904,6 +6929,24 @@ button:disabled {
 .grid-empty-search,
 .grid-empty-folder {
   border-radius: var(--radius-panel);
+}
+
+.plugins-window .plugins-detail-pane {
+  --glass-fill: transparent;
+  --glass-border-current: transparent;
+  min-width: 0;
+  min-height: 0;
+  padding: 16px 18px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.plugins-window .plugins-detail-pane::after {
+  border: 0;
+  box-shadow: none;
 }
 
 .context-menu,

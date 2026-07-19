@@ -27,88 +27,90 @@ export function PluginsView() {
   return (
     <section className="workspace simple-workspace" aria-label="Plugins workbench">
       <div className="plugins-body">
-        <div className="plugins-body-actions">
-          <div className="plugins-status-summary">
-            {totalCount === 0
-              ? "No plugins discovered"
-              : `${totalCount} registered · ${enabledCount} enabled${
-                  invalidCount > 0 ? ` · ${invalidCount} invalid` : ""
-                }`}
-          </div>
-          <button
-            className="plugins-rescan"
-            onClick={() => void runDiscover()}
-            type="button"
-            disabled={discovering}
-            aria-label="Re-scan plugin folder"
-          >
-            {discovering ? (
-              <Loader2 className="spin" size={14} />
-            ) : (
-              <RefreshCw size={14} />
-            )}
-            <span>{discovering ? "Scanning…" : "Re-scan"}</span>
-          </button>
-        </div>
-
-        {plugins.error ? (
-          <div className="plugins-error" role="alert">
-            <AlertTriangle aria-hidden="true" size={14} />
-            <span>{plugins.error}</span>
-          </div>
-        ) : null}
-
-        {plugins.lastDiscovery && plugins.lastDiscovery.errors.length > 0 ? (
-          <div className="plugins-discovery-errors" role="status">
-            <div className="plugins-discovery-summary">
-              Last scan: {plugins.lastDiscovery.discovered} discovered,{" "}
-              {plugins.lastDiscovery.errors.length} error
-              {plugins.lastDiscovery.errors.length === 1 ? "" : "s"}
-            </div>
-            <ul className="plugins-discovery-error-list">
-              {plugins.lastDiscovery.errors.map((entry, index) => (
-                <li key={`${entry.manifestPath}-${index}`}>
-                  <code title={entry.manifestPath}>{entry.manifestPath}</code>
-                  <span>{entry.message}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
-
         <div className="plugins-layout">
-          <div className="plugins-list" role="list">
-            {plugins.loading && totalCount === 0 ? (
-              <div aria-label="Refreshing plugins" className="empty-panel empty-panel-busy" role="status">
-                <MediaLoadingRing size={18} />
+          <aside className="plugins-sidebar">
+            <div className="plugins-body-actions">
+              <div className="plugins-status-summary">
+                {totalCount === 0
+                  ? "No plugins discovered"
+                  : `${totalCount} registered · ${enabledCount} enabled${
+                      invalidCount > 0 ? ` · ${invalidCount} invalid` : ""
+                    }`}
               </div>
-            ) : totalCount === 0 ? (
-              <div className="plugins-empty">
-                <p className="plugins-empty-title">No plugins discovered yet.</p>
-                <p className="plugins-empty-hint">
-                  Drop a plugin folder under{" "}
-                  <code className="dialog-code">MEGLE_PLUGINS_DIR</code> and click Re-scan.
-                </p>
+              <button
+                className="plugins-rescan"
+                onClick={() => void runDiscover()}
+                type="button"
+                disabled={discovering}
+                aria-label="Re-scan plugin folder"
+              >
+                {discovering ? (
+                  <Loader2 className="spin" size={14} />
+                ) : (
+                  <RefreshCw size={14} />
+                )}
+                <span>{discovering ? "Scanning…" : "Re-scan"}</span>
+              </button>
+            </div>
+
+            {plugins.error ? (
+              <div className="plugins-error" role="alert">
+                <AlertTriangle aria-hidden="true" size={14} />
+                <span>{plugins.error}</span>
               </div>
-            ) : (
-              plugins.plugins.map((plugin) => (
-                <PluginCard
-                  busy={plugins.busyPluginIds.has(plugin.id)}
-                  key={plugin.id}
-                  onSelect={() => plugins.selectPlugin(plugin.id)}
-                  onToggleEnabled={() => {
-                    if (plugin.enabled) {
-                      void plugins.disable(plugin.id);
-                    } else {
-                      void plugins.enable(plugin.id);
-                    }
-                  }}
-                  plugin={plugin}
-                  selected={plugins.selectedPluginId === plugin.id}
-                />
-              ))
-            )}
-          </div>
+            ) : null}
+
+            {plugins.lastDiscovery && plugins.lastDiscovery.errors.length > 0 ? (
+              <div className="plugins-discovery-errors" role="status">
+                <div className="plugins-discovery-summary">
+                  Last scan: {plugins.lastDiscovery.discovered} discovered,{" "}
+                  {plugins.lastDiscovery.errors.length} error
+                  {plugins.lastDiscovery.errors.length === 1 ? "" : "s"}
+                </div>
+                <ul className="plugins-discovery-error-list">
+                  {plugins.lastDiscovery.errors.map((entry, index) => (
+                    <li key={`${entry.manifestPath}-${index}`}>
+                      <code title={entry.manifestPath}>{entry.manifestPath}</code>
+                      <span>{entry.message}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            <div className="plugins-list" role="list">
+              {plugins.loading && totalCount === 0 ? (
+                <div aria-label="Refreshing plugins" className="empty-panel empty-panel-busy" role="status">
+                  <MediaLoadingRing size={18} />
+                </div>
+              ) : totalCount === 0 ? (
+                <div className="plugins-empty">
+                  <p className="plugins-empty-title">No plugins discovered yet.</p>
+                  <p className="plugins-empty-hint">
+                    Drop a plugin folder under{" "}
+                    <code className="dialog-code">MEGLE_PLUGINS_DIR</code> and click Re-scan.
+                  </p>
+                </div>
+              ) : (
+                plugins.plugins.map((plugin) => (
+                  <PluginCard
+                    busy={plugins.busyPluginIds.has(plugin.id)}
+                    key={plugin.id}
+                    onSelect={() => plugins.selectPlugin(plugin.id)}
+                    onToggleEnabled={() => {
+                      if (plugin.enabled) {
+                        void plugins.disable(plugin.id);
+                      } else {
+                        void plugins.enable(plugin.id);
+                      }
+                    }}
+                    plugin={plugin}
+                    selected={plugins.selectedPluginId === plugin.id}
+                  />
+                ))
+              )}
+            </div>
+          </aside>
           <LiquidGlassSurface
             as="div"
             className="plugins-detail-pane"
