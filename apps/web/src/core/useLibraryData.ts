@@ -33,6 +33,8 @@ import {
   type ThumbnailRequestPriority,
   shouldRequestThumbnailState
 } from "./mediaResources";
+import { runThumbnailCacheEnqueueBatches } from "./thumbnailCacheEnqueue";
+import { decideRootScanRefresh } from "./scanRefresh";
 import type { ThumbnailGenerationMode } from "../features/preview/previewPreferences";
 
 const INITIAL_MEDIA_WINDOW_LIMIT = 96;
@@ -544,7 +546,13 @@ export function useLibraryData(
         // longer computes whole-scope stats (that O(scope) query blocked the
         // writer). The settings tab polls real whole-library stats separately.
         // The loop terminates on acceptedCount / the derived pendingCandidateCount.
-        await runThumbnailCacheEnqueueBatches(client, scope, refreshMode, controller.signal);
+        await runThumbnailCacheEnqueueBatches(
+          client,
+          scope,
+          refreshMode,
+          controller.signal,
+          yieldToBrowser
+        );
       } catch (cause) {
         if (!isAbortError(cause)) {
           setError(errorMessage(cause));
@@ -2123,7 +2131,8 @@ export function useLibraryData(
         client,
         scope,
         "retryFailedAndStale",
-        retryController.signal
+        retryController.signal,
+        yieldToBrowser
       )
         .then(() => {
           if (retryController.signal.aborted) {
@@ -2251,17 +2260,18 @@ export function useLibraryData(
   const previousTaskStatusRef = useRef<Map<number, TaskRecord["status"]>>(new Map());
   useEffect(() => {
     const previous = previousTaskStatusRef.current;
-    let shouldReloadLibrary = false;
+    // Selected root's scan finishing reloads the whole library view; a NON-
+    // selected (background) root scan finishing only needs a lightweight roots
+    // refresh so its just-scanned sidebar entry (media count + rootFolderId,
+    // hence expandability) stops showing the empty pre-scan placeholder.
+    const { reloadLibrary: shouldReloadLibrary, refreshRootsList: shouldRefreshRootsList } =
+      decideRootScanRefresh(tasks, previous, selectedRootId);
     let interactiveRefreshScope: { rootId: number; folderId: number | null } | null = null;
     const pendingInteractiveScan = pendingInteractiveScanRequestRef.current;
     for (const task of tasks) {
       const prior = previous.get(task.id);
       const transitionedToSucceeded =
         Boolean(prior) && prior !== task.status && task.status === "succeeded";
-      if (transitionedToSucceeded && task.kind === "root_scan" && task.rootId === selectedRootId) {
-        shouldReloadLibrary = true;
-        break;
-      }
       if (
         pendingInteractiveScan &&
         task.kind === "interactive_folder_scan" &&
@@ -2286,6 +2296,11 @@ export function useLibraryData(
       void loadLibrary();
       return;
     }
+    if (shouldRefreshRootsList) {
+      void refreshRootsList().catch((cause) => {
+        setError(errorMessage(cause));
+      });
+    }
     if (interactiveRefreshScope) {
       void reloadCurrentMedia({
         rootId: interactiveRefreshScope.rootId,
@@ -2295,7 +2310,7 @@ export function useLibraryData(
         setError(errorMessage(cause));
       });
     }
-  }, [loadLibrary, reloadCurrentMedia, selectedFolderId, selectedRootId, tasks]);
+  }, [loadLibrary, reloadCurrentMedia, refreshRootsList, selectedFolderId, selectedRootId, tasks]);
 
   useEffect(() => {
     if (!scanActive || taskPollFailures >= 3) {
@@ -3320,40 +3335,6 @@ function abortAllControllers<K>(controllers: Map<K, AbortController>): void {
 
 function isAbortError(cause: unknown): boolean {
   return cause instanceof Error && cause.name === "AbortError";
-}
-
-// Shared batching/termination logic behind `enqueueThumbnailCache`: keeps
-// requesting the same scope+refreshMode until the server reports nothing left
-// to accept. Extracted so callers can drive it under their OWN AbortController
-// without going through `enqueueThumbnailCacheLoop`'s shared "bulk action" busy
-// state (see the browse-time auto-retry effect, which must not abort an
-// in-flight user-initiated "generate all"/"retry failures" Settings action).
-async function runThumbnailCacheEnqueueBatches(
-  client: ReturnType<typeof createCoreClient>,
-  scope: { rootId?: number; folderId?: number; includeDescendants?: boolean },
-  refreshMode: ThumbnailCacheRefreshMode,
-  signal: AbortSignal
-): Promise<void> {
-  while (!signal.aborted) {
-    const response = await client.enqueueThumbnailCache(
-      {
-        ...scope,
-        refreshMode,
-        limit: MEDIA_WINDOW_MAX_LIMIT
-      },
-      {
-        requestPriority: "background",
-        signal
-      }
-    );
-    const nothingLeft =
-      response.pendingCandidateCount === 0 &&
-      (refreshMode !== "retryFailedAndStale" || response.failedCount === 0);
-    if (response.acceptedCount === 0 || nothingLeft) {
-      break;
-    }
-    await yieldToBrowser();
-  }
 }
 
 function mediaPageRequestKey(
