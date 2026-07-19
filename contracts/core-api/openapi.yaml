@@ -1124,7 +1124,7 @@ components:
       enum: [background, ahead, visible, selected]
     TaskKind:
       type: string
-      enum: [root_scan, interactive_folder_scan, thumbnail]
+      enum: [root_scan, interactive_folder_scan, thumbnail, root_purge]
     TaskStatus:
       type: string
       enum: [pending, running, succeeded, failed, cancelled]

@@ -366,7 +366,7 @@ for (const line of [
 }
 
 for (const line of [
-  'export type TaskKind = "root_scan" | "interactive_folder_scan" | "thumbnail";',
+  'export type TaskKind = "root_scan" | "interactive_folder_scan" | "thumbnail" | "root_purge";',
   'export type TaskStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled";'
 ]) {
   if (!generated.includes(line)) {

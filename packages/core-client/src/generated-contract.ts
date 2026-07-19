@@ -99,7 +99,7 @@ export interface RootRecord {
   reachable: boolean;
 }
 
-export type TaskKind = "root_scan" | "interactive_folder_scan" | "thumbnail";
+export type TaskKind = "root_scan" | "interactive_folder_scan" | "thumbnail" | "root_purge";
 export type TaskStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled";
 
 export interface TaskRecord {
