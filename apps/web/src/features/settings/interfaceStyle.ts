@@ -291,6 +291,18 @@ export function interfaceStyleToCssVariables(
     normalized.sideOverlayColor,
     0.5 * normalized.sideOverlayStrength * normalized.sideOpacity
   );
+  const secondaryWindowPaneDark = colorWithAlpha(
+    normalized.sideOverlayColor,
+    0.56 * normalized.sideOverlayStrength * normalized.sideOpacity
+  );
+  const secondaryWindowPaneLight = colorWithAlpha(
+    normalized.sideOverlayColor,
+    0.2 * normalized.sideOverlayStrength * normalized.sideOpacity
+  );
+  const secondaryWindowPaneEnd = colorWithAlpha(
+    normalized.sideOverlayColor,
+    0.48 * normalized.sideOverlayStrength * normalized.sideOpacity
+  );
   const centerOverlay = colorWithAlpha(
     normalized.centerOverlayColor,
     0.38 * normalized.centerOverlayStrength * normalized.centerOpacity
@@ -344,6 +356,9 @@ export function interfaceStyleToCssVariables(
     "--glass-side-blur": `${roundCssNumber(26 * normalized.sideBlur)}px`,
     "--glass-side-fill": sideOverlay,
     "--glass-side-fill-strong": sideOverlayStrong,
+    "--secondary-window-pane-dark": secondaryWindowPaneDark,
+    "--secondary-window-pane-light": secondaryWindowPaneLight,
+    "--secondary-window-pane-end": secondaryWindowPaneEnd,
     "--glass-side-saturation": String(roundCssNumber(normalized.sideSaturation)),
     "--glass-side-stroke": rgbWithAlpha(255, 255, 255, 0.14 * normalized.sideStrokeOpacity),
     "--glass-center-blur": `${roundCssNumber(26 * normalized.centerBlur)}px`,

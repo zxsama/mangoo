@@ -15,6 +15,9 @@
   --glass-side-blur: 26px;
   --glass-side-fill: rgba(8, 12, 16, 0.38);
   --glass-side-fill-strong: rgba(8, 12, 16, 0.5);
+  --secondary-window-pane-dark: rgba(8, 12, 16, 0.56);
+  --secondary-window-pane-light: rgba(8, 12, 16, 0.2);
+  --secondary-window-pane-end: rgba(8, 12, 16, 0.48);
   --glass-side-saturation: 1.55;
   --glass-side-stroke: rgba(255, 255, 255, 0.14);
   --glass-center-blur: 26px;
@@ -4652,8 +4655,8 @@ button:disabled {
   flex-direction: column;
   gap: 6px;
   padding: 16px 12px;
-  border-right: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.02);
+  border-right: 0;
+  background: var(--secondary-window-pane-dark);
   overflow-y: auto;
 }
 
@@ -4710,6 +4713,12 @@ button:disabled {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  background: linear-gradient(
+    108deg,
+    var(--secondary-window-pane-light) 0%,
+    var(--glass-side-fill) 52%,
+    var(--secondary-window-pane-end) 100%
+  );
 }
 
 .settings-dialog-header {
