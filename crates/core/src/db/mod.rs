@@ -2942,9 +2942,9 @@ impl Database {
     }
 
     pub fn retry_task(&self, task_id: i64) -> anyhow::Result<TaskRecord> {
-        let task = self
-            .get_task(task_id)?
-            .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let task = task_record_in_transaction(&transaction, task_id)?;
         if task.status != "failed" && task.status != "cancelled" {
             return Err(anyhow::anyhow!(
                 "task {task_id} is not retryable; current status is {}",
@@ -2960,225 +2960,137 @@ impl Database {
                 task.kind
             ));
         }
-        if !task_retryable_on_connection(&self.connection, &task)? {
+        if !task_retryable_in_transaction(&transaction, &task)? {
             return Err(anyhow::anyhow!(
                 "task {task_id} is not retryable; current status is {}",
                 task.status
             ));
         }
-        match task.kind.as_str() {
-            "root_scan" => self.retry_root_scan_task(&task),
-            "interactive_folder_scan" => self.retry_interactive_folder_scan_task(&task),
-            "root_purge" => self.retry_root_purge_task(&task),
-            "thumbnail" => self.retry_thumbnail_task(&task),
-            other => Err(anyhow::anyhow!(
-                "task {task_id} is not retryable; unsupported kind is {other}"
-            )),
-        }
-    }
-
-    fn retry_root_scan_task(&self, task: &TaskRecord) -> anyhow::Result<TaskRecord> {
-        let root_id = task
-            .root_id
-            .ok_or_else(|| anyhow::anyhow!("root_scan task missing root id: {}", task.id))?;
-        let root = self
-            .get_root(root_id)?
-            .ok_or_else(|| anyhow::anyhow!("root not found: {root_id}"))?;
-        if !root.enabled {
-            return Err(anyhow::anyhow!("root is disabled: {root_id}"));
-        }
-
-        let transaction = self.connection.unchecked_transaction()?;
-        let updated = transaction.execute(
-            r#"
-            UPDATE tasks
-            SET status = 'pending',
-                updated_at = ?1,
-                attempt_generation = attempt_generation + 1,
-                items_seen = 0,
-                items_total = NULL,
-                folders_seen = 0,
-                media_files_seen = 0,
-                skipped_files = 0,
-                thumbnail_source_fingerprint = NULL,
-                error = NULL
-            WHERE id = ?2 AND status IN ('failed', 'cancelled')
-            "#,
-            (unix_timestamp(), task.id),
-        )?;
-        let appended = if updated == 1 {
-            self.publish_task_notification_in_transaction(
-                &transaction,
-                task.id,
-                None,
-                notification_outbox::PublishMode::Phase,
-            )?
-        } else {
-            false
-        };
+        let appended = self.retry_task_in_transaction(&transaction, &task)?;
         transaction.commit()?;
         self.publish_task_notification_after_commit(appended);
-        self.ensure_one_task_updated(task.id, updated, "failed or cancelled")?;
-        self.get_task(task.id)?
-            .ok_or_else(|| anyhow::anyhow!("task not found: {}", task.id))
+        self.get_task(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))
     }
 
-    fn retry_interactive_folder_scan_task(&self, task: &TaskRecord) -> anyhow::Result<TaskRecord> {
-        let folder_id = task.folder_id.ok_or_else(|| {
-            anyhow::anyhow!(
-                "interactive_folder_scan task missing folder id: {}",
-                task.id
-            )
-        })?;
-        let exists: Option<i64> = self
-            .connection
-            .query_row(
-                r#"
-                SELECT folders.id
-                FROM folders
-                JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
-                WHERE folders.id = ?1 AND folders.status = 'active'
-                "#,
-                [folder_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if exists.is_none() {
-            return Err(anyhow::anyhow!("folder not found: {folder_id}"));
-        }
-
-        let transaction = self.connection.unchecked_transaction()?;
-        let updated = transaction.execute(
-            r#"
-            UPDATE tasks
-            SET status = 'pending',
-                priority = ?1,
-                updated_at = ?2,
-                attempt_generation = attempt_generation + 1,
-                items_seen = 0,
-                items_total = NULL,
-                folders_seen = 0,
-                media_files_seen = 0,
-                skipped_files = 0,
-                thumbnail_source_fingerprint = NULL,
-                error = NULL
-            WHERE id = ?3 AND status IN ('failed', 'cancelled')
-            "#,
-            (ROOT_SCAN_TASK_PRIORITY, unix_timestamp(), task.id),
-        )?;
-        let appended = if updated == 1 {
-            self.publish_task_notification_in_transaction(
-                &transaction,
-                task.id,
-                None,
-                notification_outbox::PublishMode::Phase,
-            )?
-        } else {
-            false
-        };
-        transaction.commit()?;
-        self.publish_task_notification_after_commit(appended);
-        self.ensure_one_task_updated(task.id, updated, "failed or cancelled")?;
-        self.get_task(task.id)?
-            .ok_or_else(|| anyhow::anyhow!("task not found: {}", task.id))
-    }
-
-    fn retry_root_purge_task(&self, task: &TaskRecord) -> anyhow::Result<TaskRecord> {
-        let root_id = task
-            .root_id
-            .ok_or_else(|| anyhow::anyhow!("root_purge task missing root id: {}", task.id))?;
-        let pending_delete: Option<Option<i64>> = self
-            .connection
-            .query_row(
-                "SELECT pending_delete_at FROM roots WHERE id = ?1",
-                [root_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if pending_delete.flatten().is_none() {
-            return Err(anyhow::anyhow!(
-                "root purge task {} is no longer recoverable",
-                task.id
-            ));
-        }
-
-        let transaction = self.connection.unchecked_transaction()?;
-        let updated = transaction.execute(
-            r#"UPDATE tasks
-               SET status = 'pending', updated_at = ?1,
-                   attempt_generation = attempt_generation + 1,
-                   error = NULL
-               WHERE id = ?2 AND status IN ('failed', 'cancelled')"#,
-            (unix_timestamp(), task.id),
-        )?;
-        let appended = if updated == 1 {
-            self.publish_task_notification_in_transaction(
-                &transaction,
-                task.id,
-                None,
-                notification_outbox::PublishMode::Phase,
-            )?
-        } else {
-            false
-        };
-        transaction.commit()?;
-        self.publish_task_notification_after_commit(appended);
-        self.ensure_one_task_updated(task.id, updated, "failed or cancelled")?;
-        self.get_task(task.id)?
-            .ok_or_else(|| anyhow::anyhow!("task not found: {}", task.id))
-    }
-
-    fn retry_thumbnail_task(&self, task: &TaskRecord) -> anyhow::Result<TaskRecord> {
-        let file_id = task
-            .file_id
-            .ok_or_else(|| anyhow::anyhow!("thumbnail task missing file id: {}", task.id))?;
-        let source = self
-            .get_thumbnail_source(file_id)?
-            .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?;
-        let source_fingerprint = source.source_fingerprint(GRID_320_PROFILE);
+    fn retry_task_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        task: &TaskRecord,
+    ) -> anyhow::Result<bool> {
         let now = unix_timestamp();
-        let transaction = self.connection.unchecked_transaction()?;
-        let updated = transaction.execute(
-            r#"
-            UPDATE tasks
-            SET status = 'pending',
-                updated_at = ?1,
-                attempt_generation = attempt_generation + 1,
-                items_seen = 0,
-                items_total = NULL,
-                folders_seen = 0,
-                media_files_seen = 0,
-                skipped_files = 0,
-                thumbnail_source_fingerprint = NULL,
-                error = NULL
-            WHERE id = ?2 AND status IN ('failed', 'cancelled')
-            "#,
-            (now, task.id),
-        )?;
-        if updated != 1 {
-            return Err(anyhow::anyhow!(
-                "task {} is not retryable; current status is {}",
-                task.id,
-                task.status
-            ));
+        match task.kind.as_str() {
+            "root_scan" => {
+                let updated = transaction.execute(
+                    r#"
+                    UPDATE tasks
+                    SET status = 'pending', updated_at = ?1,
+                        attempt_generation = attempt_generation + 1,
+                        items_seen = 0, items_total = NULL,
+                        folders_seen = 0, media_files_seen = 0,
+                        skipped_files = 0, thumbnail_source_fingerprint = NULL,
+                        error = NULL
+                    WHERE id = ?2 AND status IN ('failed', 'cancelled')
+                    "#,
+                    (now, task.id),
+                )?;
+                if updated != 1 {
+                    return Err(anyhow::anyhow!(
+                        "task {} is not retryable; current status is {}",
+                        task.id,
+                        task.status
+                    ));
+                }
+            }
+            "interactive_folder_scan" => {
+                let updated = transaction.execute(
+                    r#"
+                    UPDATE tasks
+                    SET status = 'pending', priority = ?1, updated_at = ?2,
+                        attempt_generation = attempt_generation + 1,
+                        items_seen = 0, items_total = NULL,
+                        folders_seen = 0, media_files_seen = 0,
+                        skipped_files = 0, thumbnail_source_fingerprint = NULL,
+                        error = NULL
+                    WHERE id = ?3 AND status IN ('failed', 'cancelled')
+                    "#,
+                    (ROOT_SCAN_TASK_PRIORITY, now, task.id),
+                )?;
+                if updated != 1 {
+                    return Err(anyhow::anyhow!(
+                        "task {} is not retryable; current status is {}",
+                        task.id,
+                        task.status
+                    ));
+                }
+            }
+            "root_purge" => {
+                let updated = transaction.execute(
+                    r#"UPDATE tasks
+                       SET status = 'pending', updated_at = ?1,
+                           attempt_generation = attempt_generation + 1,
+                           error = NULL
+                       WHERE id = ?2 AND status IN ('failed', 'cancelled')"#,
+                    (now, task.id),
+                )?;
+                if updated != 1 {
+                    return Err(anyhow::anyhow!(
+                        "task {} is not retryable; current status is {}",
+                        task.id,
+                        task.status
+                    ));
+                }
+            }
+            "thumbnail" => {
+                let file_id = task.file_id.ok_or_else(|| {
+                    anyhow::anyhow!("thumbnail task missing file id: {}", task.id)
+                })?;
+                let source = thumbnail_source_in_transaction(transaction, file_id)?
+                    .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?;
+                let updated = transaction.execute(
+                    r#"
+                    UPDATE tasks
+                    SET status = 'pending', updated_at = ?1,
+                        attempt_generation = attempt_generation + 1,
+                        items_seen = 0, items_total = NULL,
+                        folders_seen = 0, media_files_seen = 0,
+                        skipped_files = 0, thumbnail_source_fingerprint = NULL,
+                        error = NULL
+                    WHERE id = ?2 AND status IN ('failed', 'cancelled')
+                    "#,
+                    (now, task.id),
+                )?;
+                if updated != 1 {
+                    return Err(anyhow::anyhow!(
+                        "task {} is not retryable; current status is {}",
+                        task.id,
+                        task.status
+                    ));
+                }
+                upsert_thumbnail_state_in_transaction(
+                    transaction,
+                    ThumbnailStateUpsert {
+                        file_id,
+                        profile: GRID_320_PROFILE.to_string(),
+                        state: "queued".to_string(),
+                        cache_key: None,
+                        width: None,
+                        height: None,
+                        byte_size: None,
+                        error: None,
+                        source_fingerprint: Some(source.source_fingerprint(GRID_320_PROFILE)),
+                    },
+                )?;
+                return Ok(false);
+            }
+            _ => unreachable!("retry task kind validated before transaction"),
         }
-        upsert_thumbnail_state_in_transaction(
-            &transaction,
-            ThumbnailStateUpsert {
-                file_id,
-                profile: GRID_320_PROFILE.to_string(),
-                state: "queued".to_string(),
-                cache_key: None,
-                width: None,
-                height: None,
-                byte_size: None,
-                error: None,
-                source_fingerprint: Some(source_fingerprint),
-            },
-        )?;
-        transaction.commit()?;
-        self.get_task(task.id)?
-            .ok_or_else(|| anyhow::anyhow!("task not found: {}", task.id))
+        self.publish_task_notification_in_transaction(
+            transaction,
+            task.id,
+            None,
+            notification_outbox::PublishMode::Phase,
+        )
     }
 
     pub fn task_is_cancelled(&self, task_id: i64) -> anyhow::Result<bool> {
@@ -4143,8 +4055,8 @@ impl Database {
     /// Only resets rows classified `transient` — this is the automatic bulk
     /// `RetryFailedAndStale` path (called from `enqueue_thumbnail_cache_entries`
     /// / `enqueue_thumbnail_cache_tasks_for_file_ids`, never from the explicit
-    /// per-task `retry_task` -> `retry_thumbnail_task` chain, which resets its
-    /// task/thumbnail rows directly and is unaffected by this gate).
+    /// per-task `retry_task` path, which resets its task/thumbnail rows directly
+    /// and is unaffected by this gate).
     fn reset_failed_thumbnail_for_manual_retry_in_transaction(
         transaction: &Transaction<'_>,
         file_id: i64,
@@ -5921,25 +5833,6 @@ impl Database {
             let mut rows = statement.query((root_id, name))?;
             Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
         }
-    }
-
-    fn ensure_one_task_updated(
-        &self,
-        task_id: i64,
-        updated: usize,
-        expected_status: &str,
-    ) -> anyhow::Result<()> {
-        if updated == 1 {
-            return Ok(());
-        }
-
-        let Some(task) = self.get_task(task_id)? else {
-            return Err(anyhow::anyhow!("task not found: {task_id}"));
-        };
-        Err(anyhow::anyhow!(
-            "task {task_id} is not {expected_status}; current status is {}",
-            task.status
-        ))
     }
 
     fn ensure_one_task_attempt_updated(
@@ -8717,70 +8610,78 @@ fn task_notification_recovery_origin_override(
         .then_some(NotificationOrigin::Recovery)
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct TaskRetryabilityResources {
+    root_active: bool,
+    folder_active: bool,
+    root_pending_delete: bool,
+}
+
 fn task_retryable_for_state(
     task: &TaskRecord,
-    root_pending_delete: Option<bool>,
+    resources: TaskRetryabilityResources,
 ) -> anyhow::Result<bool> {
     if !matches!(task.status.as_str(), "failed" | "cancelled") {
         return Ok(false);
     }
-    if task.kind == "root_purge" {
-        return Ok(root_pending_delete.unwrap_or(false));
+    match task.kind.as_str() {
+        "root_scan" => Ok(resources.root_active),
+        "interactive_folder_scan" => Ok(resources.folder_active),
+        "root_purge" => Ok(resources.root_pending_delete),
+        "thumbnail" => Ok(true),
+        _ => Ok(task_notification_descriptor(&task.kind)?
+            .is_some_and(|descriptor| descriptor.retryable)),
     }
-    if task.kind == "thumbnail" {
-        return Ok(true);
-    }
-    Ok(task_notification_descriptor(&task.kind)?.is_some_and(|descriptor| descriptor.retryable))
 }
 
 fn task_retryable_in_transaction(
     transaction: &Transaction<'_>,
     task: &TaskRecord,
 ) -> anyhow::Result<bool> {
-    let root_pending_delete = if task.kind == "root_purge" {
-        let Some(root_id) = task.root_id else {
-            return Ok(false);
-        };
-        Some(
-            transaction
+    let mut resources = TaskRetryabilityResources::default();
+    match task.kind.as_str() {
+        "root_scan" => {
+            let Some(root_id) = task.root_id else {
+                return Ok(false);
+            };
+            resources.root_active = transaction
                 .query_row(
-                    "SELECT pending_delete_at FROM roots WHERE id = ?1",
+                    "SELECT EXISTS(SELECT 1 FROM roots WHERE id = ?1 AND enabled = 1 AND pending_delete_at IS NULL)",
                     [root_id],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .optional()?
-                .flatten()
-                .is_some(),
-        )
-    } else {
-        None
-    };
-    task_retryable_for_state(task, root_pending_delete)
-}
-
-fn task_retryable_on_connection(
-    connection: &Connection,
-    task: &TaskRecord,
-) -> anyhow::Result<bool> {
-    let root_pending_delete = if task.kind == "root_purge" {
-        let Some(root_id) = task.root_id else {
-            return Ok(false);
-        };
-        Some(
-            connection
+                    |row| row.get::<_, i64>(0),
+                )?
+                != 0;
+        }
+        "interactive_folder_scan" => {
+            let Some(folder_id) = task.folder_id else {
+                return Ok(false);
+            };
+            resources.folder_active = transaction.query_row(
+                "SELECT EXISTS(
+                       SELECT 1 FROM folders
+                       JOIN roots ON roots.id = folders.root_id
+                       WHERE folders.id = ?1 AND folders.status = 'active'
+                         AND roots.enabled = 1 AND roots.pending_delete_at IS NULL
+                     )",
+                [folder_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+        }
+        "root_purge" => {
+            let Some(root_id) = task.root_id else {
+                return Ok(false);
+            };
+            resources.root_pending_delete = transaction
                 .query_row(
-                    "SELECT pending_delete_at FROM roots WHERE id = ?1",
+                    "SELECT EXISTS(SELECT 1 FROM roots WHERE id = ?1 AND pending_delete_at IS NOT NULL)",
                     [root_id],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .optional()?
-                .flatten()
-                .is_some(),
-        )
-    } else {
-        None
+                    |row| row.get::<_, i64>(0),
+                )?
+                != 0;
+        }
+        _ => {}
     };
-    task_retryable_for_state(task, root_pending_delete)
+    task_retryable_for_state(task, resources)
 }
 
 fn root_purge_work_total_in_transaction(
@@ -12356,6 +12257,162 @@ mod tests {
     }
 
     #[test]
+    fn root_scan_retryability_requires_active_non_pending_root() {
+        for (label, pending_delete) in [("disabled", false), ("pending-delete", true)] {
+            let database = migrated_database();
+            let root_id = database
+                .add_root(NewRoot {
+                    path: format!("D:/retry-root-{label}"),
+                    display_name: format!("retry-root-{label}"),
+                })
+                .expect("add root");
+            let task_id = database
+                .create_root_scan_task_with_origin(root_id, NotificationOrigin::User)
+                .expect("create root scan task");
+            database
+                .mark_task_running_current_attempt_for_test(task_id)
+                .expect("mark root scan running");
+            if pending_delete {
+                database
+                    .connection
+                    .execute(
+                        "UPDATE roots SET enabled = 0, pending_delete_at = 1 WHERE id = ?1",
+                        [root_id],
+                    )
+                    .expect("mark root pending delete");
+            } else {
+                database
+                    .connection
+                    .execute("UPDATE roots SET enabled = 0 WHERE id = ?1", [root_id])
+                    .expect("disable root");
+            }
+            database
+                .mark_task_failed_current_attempt_for_test(task_id, "root unavailable")
+                .expect("fail root scan");
+
+            let operation = database
+                .notification_heads_for_test()
+                .unwrap()
+                .into_iter()
+                .find(|operation| operation.task_id == Some(task_id))
+                .expect("root scan operation");
+            assert!(!operation.retryable, "invalid {label} root must not retry");
+            assert!(database.retry_task(task_id).is_err());
+        }
+    }
+
+    #[test]
+    fn interactive_scan_retryability_requires_active_folder_and_root() {
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_media_page_fixture(&database);
+        let task_id = database
+            .create_interactive_folder_scan_task_with_origin(folder_id, NotificationOrigin::User)
+            .expect("create interactive scan task");
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark interactive scan running");
+        database
+            .connection
+            .execute(
+                "UPDATE folders SET status = 'missing' WHERE id = ?1",
+                [folder_id],
+            )
+            .expect("invalidate folder");
+        database
+            .mark_task_failed_current_attempt_for_test(task_id, "folder unavailable")
+            .expect("fail interactive scan");
+
+        let operation = database
+            .notification_heads_for_test()
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.task_id == Some(task_id))
+            .expect("interactive scan operation");
+        assert!(!operation.retryable);
+        assert!(database.retry_task(task_id).is_err());
+        assert_eq!(
+            database
+                .get_task(task_id)
+                .expect("read task")
+                .expect("task remains")
+                .root_id,
+            Some(root_id)
+        );
+    }
+
+    #[test]
+    fn retry_task_rolls_back_transition_when_phase_notification_fails() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/retry-transaction".to_string(),
+                display_name: "retry-transaction".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task_with_origin(root_id, NotificationOrigin::User)
+            .expect("create root scan task");
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark running");
+        database
+            .mark_task_failed_current_attempt_for_test(task_id, "retryable failure")
+            .expect("mark failed");
+        let outbox_before_retry = database
+            .list_notification_outbox(0, 100)
+            .expect("read initial outbox")
+            .len();
+        database
+            .execute_batch_for_test(
+                "CREATE TRIGGER fail_retry_phase_notification
+                 BEFORE INSERT ON notification_outbox
+                 WHEN json_extract(NEW.payload_json, '$.status') = 'pending'
+                 BEGIN SELECT RAISE(ABORT, 'injected retry phase failure'); END;",
+            )
+            .expect("install retry phase failure trigger");
+
+        assert!(database.retry_task(task_id).is_err());
+        let task = database
+            .get_task(task_id)
+            .expect("read rolled-back task")
+            .expect("failed task remains");
+        assert_eq!(task.status, "failed");
+        let operation = database
+            .notification_heads_for_test()
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.task_id == Some(task_id))
+            .expect("failed operation remains");
+        assert_eq!(operation.status, "failed");
+        assert_eq!(
+            database
+                .list_notification_outbox(0, 100)
+                .expect("read outbox")
+                .len(),
+            outbox_before_retry
+        );
+
+        database
+            .execute_batch_for_test("DROP TRIGGER fail_retry_phase_notification;")
+            .expect("remove retry phase failure trigger");
+        let retried = database
+            .retry_task(task_id)
+            .expect("retry after failure removal");
+        assert_eq!(retried.id, task_id);
+        assert_eq!(retried.status, "pending");
+        assert_eq!(
+            database
+                .notification_heads_for_test()
+                .unwrap()
+                .into_iter()
+                .find(|operation| operation.task_id == Some(task_id))
+                .expect("pending operation")
+                .status,
+            "pending"
+        );
+    }
+
+    #[test]
     fn background_success_is_history_only_but_failure_and_user_success_are_important() {
         let database = migrated_database();
         let root_id = database
@@ -14166,8 +14223,8 @@ mod tests {
 
     #[test]
     fn manual_retry_task_still_retries_permanent_failure() {
-        // Task 5: the explicit single-task `retry_task` -> `retry_thumbnail_task`
-        // path is the user clicking "retry" on one item. It must remain able to
+        // Task 5: the explicit single-task `retry_task` path is the user clicking
+        // "retry" on one item. It must remain able to
         // retry ANY failed thumbnail task, including one whose thumbnail row was
         // classified `permanent` — the transient-only gate applies solely to the
         // automatic `RetryFailedAndStale` bulk candidate query, which this path
