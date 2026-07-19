@@ -9,22 +9,30 @@
 *.avif binary
 *.bmp binary
 *.gif binary
+*.heic binary
+*.heif binary
 *.ico binary
 *.jpeg binary
 *.jpg binary
 *.png binary
+*.psd binary
+*.raw binary
 *.tif binary
 *.tiff binary
 *.webp binary
 *.aac binary
+*.avi binary
 *.flac binary
 *.m4a binary
+*.m4v binary
+*.mkv binary
 *.mov binary
 *.mp3 binary
 *.mp4 binary
 *.ogg binary
 *.wav binary
 *.webm binary
+*.wmv binary
 
 # Binary fonts.
 *.eot binary
