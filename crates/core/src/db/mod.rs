@@ -835,6 +835,11 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn file_row_exists_for_test(&self, file_id: i64) -> anyhow::Result<bool> {
+        self.file_exists(file_id)
+    }
+
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -1736,11 +1741,13 @@ impl Database {
             (root_id, batch),
         )?;
         if n > 0 {
-            transaction.commit()?;
-            return Ok(PurgeBatchOutcome {
-                rows_deleted: n,
-                done: false,
-            });
+            return self.commit_root_purge_batch(
+                transaction,
+                task_id,
+                attempt_generation,
+                prior_items_seen,
+                n,
+            );
         }
 
         // Phase 2: thumbnail tasks referencing this root's files.
@@ -1757,11 +1764,13 @@ impl Database {
             (root_id, batch),
         )?;
         if n > 0 {
-            transaction.commit()?;
-            return Ok(PurgeBatchOutcome {
-                rows_deleted: n,
-                done: false,
-            });
+            return self.commit_root_purge_batch(
+                transaction,
+                task_id,
+                attempt_generation,
+                prior_items_seen,
+                n,
+            );
         }
 
         // Phase 3: files (cascade removes media/user_metadata/file_tags/thumbs/thumb_blobs).
@@ -1770,11 +1779,13 @@ impl Database {
             (root_id, batch),
         )?;
         if n > 0 {
-            transaction.commit()?;
-            return Ok(PurgeBatchOutcome {
-                rows_deleted: n,
-                done: false,
-            });
+            return self.commit_root_purge_batch(
+                transaction,
+                task_id,
+                attempt_generation,
+                prior_items_seen,
+                n,
+            );
         }
 
         // Phase 4: folders, LEAF-FIRST, bounded to `batch` total this call.
@@ -1810,11 +1821,13 @@ impl Database {
             folders_deleted += deleted_this_pass;
         }
         if folders_deleted > 0 {
-            transaction.commit()?;
-            return Ok(PurgeBatchOutcome {
-                rows_deleted: folders_deleted as usize,
-                done: false,
-            });
+            return self.commit_root_purge_batch(
+                transaction,
+                task_id,
+                attempt_generation,
+                prior_items_seen,
+                folders_deleted as usize,
+            );
         }
 
         // Phase 5: publish the terminal snapshot before deleting the active
@@ -1859,6 +1872,52 @@ impl Database {
         Ok(PurgeBatchOutcome {
             rows_deleted: final_rows,
             done: true,
+        })
+    }
+
+    fn commit_root_purge_batch(
+        &self,
+        transaction: Transaction<'_>,
+        task_id: Option<i64>,
+        attempt_generation: Option<i64>,
+        prior_items_seen: i64,
+        rows_deleted: usize,
+    ) -> anyhow::Result<PurgeBatchOutcome> {
+        let mut appended = false;
+        if let (Some(task_id), Some(attempt_generation)) = (task_id, attempt_generation) {
+            let current_items_seen = prior_items_seen
+                .checked_add(rows_deleted as i64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("root purge progress overflow for task {task_id}")
+                })?;
+            let updated = transaction.execute(
+                r#"UPDATE tasks
+                   SET updated_at = ?1, items_seen = ?2
+                   WHERE id = ?3 AND status = 'running' AND attempt_generation = ?4"#,
+                (
+                    unix_timestamp(),
+                    current_items_seen,
+                    task_id,
+                    attempt_generation,
+                ),
+            )?;
+            if updated != 1 {
+                return Err(anyhow::anyhow!(
+                    "task {task_id} is not running for purge attempt {attempt_generation}"
+                ));
+            }
+            appended = self.publish_task_notification_in_transaction(
+                &transaction,
+                task_id,
+                None,
+                notification_outbox::PublishMode::Progress,
+            )?;
+        }
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
+        Ok(PurgeBatchOutcome {
+            rows_deleted,
+            done: false,
         })
     }
 
@@ -12301,19 +12360,12 @@ mod tests {
             if outcome.done {
                 break;
             }
-            database
-                .update_task_scan_progress_for_attempt(
-                    task_id,
-                    attempt_generation,
-                    TaskScanProgress {
-                        items_seen: current,
-                        items_total: Some(total),
-                        folders_seen: 0,
-                        media_files_seen: 0,
-                        skipped_files: 0,
-                    },
-                )
-                .expect("publish purge progress");
+            let task = database
+                .get_task(task_id)
+                .expect("read batch progress")
+                .expect("purge task remains between batches");
+            assert_eq!(task.items_seen, current);
+            assert_eq!(task.items_total, Some(total));
         }
 
         assert_eq!(current, total);
@@ -12379,19 +12431,12 @@ mod tests {
             .expect("delete first purge batch");
         assert!(!first.done);
         let first_current = first.rows_deleted as i64;
-        database
-            .update_task_scan_progress_for_attempt(
-                task_id,
-                attempt_generation,
-                TaskScanProgress {
-                    items_seen: first_current,
-                    items_total: Some(original),
-                    folders_seen: 0,
-                    media_files_seen: 0,
-                    skipped_files: 0,
-                },
-            )
-            .expect("persist first purge progress");
+        let first_task = database
+            .get_task(task_id)
+            .expect("read first purge progress")
+            .expect("first purge task remains");
+        assert_eq!(first_task.items_seen, first_current);
+        assert_eq!(first_task.items_total, Some(original));
         database
             .reset_running_root_purge_tasks_for_recovery()
             .expect("reset interrupted purge");
@@ -12431,19 +12476,12 @@ mod tests {
             if outcome.done {
                 break;
             }
-            database
-                .update_task_scan_progress_for_attempt(
-                    task_id,
-                    attempt_generation,
-                    TaskScanProgress {
-                        items_seen: current,
-                        items_total: Some(original),
-                        folders_seen: 0,
-                        media_files_seen: 0,
-                        skipped_files: 0,
-                    },
-                )
-                .expect("persist resumed purge progress");
+            let task = database
+                .get_task(task_id)
+                .expect("read resumed purge progress")
+                .expect("resumed purge task remains");
+            assert_eq!(task.items_seen, current);
+            assert_eq!(task.items_total, Some(original));
         }
         assert_eq!(current, original);
         let terminal = database
@@ -12528,19 +12566,12 @@ mod tests {
             .expect("purge first batch");
         assert!(!outcome.done);
         let current = outcome.rows_deleted as i64;
-        database
-            .update_task_scan_progress_for_attempt(
-                task_id,
-                running.attempt_generation,
-                TaskScanProgress {
-                    items_seen: current,
-                    items_total: Some(total),
-                    folders_seen: 0,
-                    media_files_seen: 0,
-                    skipped_files: 0,
-                },
-            )
-            .expect("persist partial progress");
+        let partially_purged = database
+            .get_task(task_id)
+            .expect("read partial purge")
+            .expect("partial purge task remains");
+        assert_eq!(partially_purged.items_seen, current);
+        assert_eq!(partially_purged.items_total, Some(total));
         database
             .mark_task_failed_current_attempt_for_test(task_id, "purge write failed")
             .expect("fail purge");
