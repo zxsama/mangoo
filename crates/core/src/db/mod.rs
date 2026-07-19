@@ -590,6 +590,7 @@ struct ThumbnailTaskRequestOutcome {
 
 /// Outcome of [`Database::mark_root_for_purge`].
 #[derive(Debug)]
+#[allow(dead_code)] // consumed by remove_root route in later tasks
 pub enum MarkRootForPurge {
     NotFound,
     AlreadyPending,
@@ -1243,6 +1244,7 @@ impl Database {
     /// Begin a hard delete of `root_id`: mark it `pending_delete_at`, cancel its
     /// scan tasks, and enqueue one `root_purge` task — all in one small
     /// transaction. Deletes NO file/folder rows (the background purge does).
+    #[allow(dead_code)] // consumed by remove_root route in later tasks
     pub fn mark_root_for_purge(&self, root_id: i64) -> anyhow::Result<MarkRootForPurge> {
         let now = unix_timestamp();
         let transaction = self.connection.unchecked_transaction()?;
@@ -1288,6 +1290,7 @@ impl Database {
 
     /// All roots currently mid-purge (used by startup recovery). Uses the
     /// partial index `idx_roots_pending_delete`.
+    #[allow(dead_code)] // consumed by startup recovery in later tasks
     pub fn roots_pending_delete_ids(&self) -> anyhow::Result<Vec<i64>> {
         let mut stmt = self
             .connection
