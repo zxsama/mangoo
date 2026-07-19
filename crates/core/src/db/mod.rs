@@ -1117,7 +1117,7 @@ impl Database {
               ON root_folder.root_id = roots.id
              AND root_folder.parent_id IS NULL
              AND root_folder.name = ''
-            WHERE roots.enabled = 1
+            WHERE roots.enabled = 1 AND roots.pending_delete_at IS NULL
             ORDER BY roots.id ASC
             "#,
         )?;
@@ -1146,7 +1146,7 @@ impl Database {
               ON root_folder.root_id = roots.id
              AND root_folder.parent_id IS NULL
              AND root_folder.name = ''
-            WHERE roots.id = ?1
+            WHERE roots.id = ?1 AND roots.pending_delete_at IS NULL
             "#,
         )?;
         let mut rows = statement.query([root_id])?;
@@ -9263,19 +9263,19 @@ mod tests {
             .execute_batch(OLD_INITIAL_MIGRATION_WITHOUT_TASK_PROGRESS)
             .expect("apply old initial migration");
 
+        database
+            .apply_migrations()
+            .expect("apply current migrations");
+
         let root_id = database
             .add_root(NewRoot {
                 path: "D:/Pictures".to_string(),
                 display_name: "Pictures".to_string(),
             })
-            .expect("add root on old schema");
+            .expect("add root after migrations");
         database
             .create_root_scan_task(root_id)
-            .expect("create task on old schema");
-
-        database
-            .apply_migrations()
-            .expect("apply current migrations");
+            .expect("create task after migrations");
         let columns: Vec<String> = {
             let mut statement = database
                 .connection
@@ -9513,19 +9513,18 @@ mod tests {
             .connection
             .execute_batch(migrations::TASK_STATUS_CONTRACT_MIGRATION)
             .expect("apply task status contract migration");
+        database
+            .apply_migrations()
+            .expect("apply remaining migrations through v8+");
         let root_id = database
             .add_root(NewRoot {
                 path: "D:/Pictures".to_string(),
                 display_name: "Pictures".to_string(),
             })
-            .expect("add root before v8");
+            .expect("add root after all migrations");
         let task_id = database
             .create_root_scan_task(root_id)
-            .expect("create task before v8");
-
-        database
-            .apply_migrations()
-            .expect("apply v8 attempt generation migration");
+            .expect("create task after all migrations");
         let task = database
             .get_task(task_id)
             .expect("get migrated task")
@@ -11305,6 +11304,21 @@ mod tests {
         let ids = database.roots_pending_delete_ids().expect("pending ids");
         assert_eq!(ids, vec![root_id]);
         let _ = folder_id;
+    }
+
+    #[test]
+    fn list_roots_and_get_root_hide_pending_delete_roots() {
+        let database = migrated_database();
+        let (root_id, _f) = seed_media_page_fixture(&database);
+        database.mark_root_for_purge(root_id).expect("mark");
+        assert!(
+            database.list_roots().expect("list").is_empty(),
+            "pending-delete root hidden from list_roots"
+        );
+        assert!(
+            database.get_root(root_id).expect("get").is_none(),
+            "pending-delete root hidden from get_root"
+        );
     }
 
     #[test]
