@@ -13,6 +13,9 @@ CREATE TABLE notification_operation_heads (
   completed_at INTEGER
 );
 
+-- Outbox and file-operation group rows intentionally have no FK to heads:
+-- acknowledgement deletes events independently, while operation-head
+-- transactional helpers own consistency.
 CREATE TABLE notification_outbox (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   operation_id TEXT NOT NULL,
@@ -26,8 +29,6 @@ ALTER TABLE file_operations ADD COLUMN operation_group_id TEXT;
 
 CREATE INDEX idx_notification_heads_status_updated
   ON notification_operation_heads(status, updated_at DESC);
-CREATE INDEX idx_notification_outbox_operation_revision
-  ON notification_outbox(operation_id, revision);
 CREATE INDEX idx_file_operations_group
   ON file_operations(operation_group_id, id);
 

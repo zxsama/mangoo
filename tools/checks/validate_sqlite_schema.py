@@ -95,7 +95,6 @@ REQUIRED_INDEXES = {
     "idx_thumb_blobs_profile_updated_at",
     "idx_roots_pending_delete",
     "idx_notification_heads_status_updated",
-    "idx_notification_outbox_operation_revision",
     "idx_file_operations_group",
 }
 
@@ -140,6 +139,14 @@ def fail(message: str) -> None:
 
 def table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def index_key_columns(conn: sqlite3.Connection, index_name: str):
+    return [
+        (row[2], bool(row[3]))
+        for row in conn.execute(f"PRAGMA index_xinfo('{index_name}')")
+        if row[5] == 1
+    ]
 
 
 def apply_migration(conn: sqlite3.Connection, migration: Path) -> None:
@@ -462,6 +469,54 @@ def main() -> None:
             if "operation_group_id" not in file_operation_columns:
                 fail("missing file_operations.operation_group_id")
 
+            expected_head_index = [("status", False), ("updated_at", True)]
+            if (
+                index_key_columns(conn, "idx_notification_heads_status_updated")
+                != expected_head_index
+            ):
+                fail(
+                    "idx_notification_heads_status_updated must index "
+                    "status ASC, updated_at DESC"
+                )
+            expected_group_index = [("operation_group_id", False), ("id", False)]
+            if (
+                index_key_columns(conn, "idx_file_operations_group")
+                != expected_group_index
+            ):
+                fail(
+                    "idx_file_operations_group must index operation_group_id, id"
+                )
+
+            outbox_indexes = conn.execute(
+                "PRAGMA index_list(notification_outbox)"
+            ).fetchall()
+            unique_autoindexes = [
+                row[1] for row in outbox_indexes if row[2] == 1 and row[3] == "u"
+            ]
+            if len(unique_autoindexes) != 1:
+                fail("notification_outbox must have one UNIQUE autoindex")
+            expected_outbox_unique = [
+                ("operation_id", False),
+                ("revision", False),
+            ]
+            if (
+                index_key_columns(conn, unique_autoindexes[0])
+                != expected_outbox_unique
+            ):
+                fail(
+                    "notification_outbox UNIQUE autoindex must cover "
+                    "operation_id, revision"
+                )
+            matching_outbox_indexes = [
+                row[1]
+                for row in outbox_indexes
+                if index_key_columns(conn, row[1]) == expected_outbox_unique
+            ]
+            if len(matching_outbox_indexes) != 1:
+                fail(
+                    "notification_outbox operation/revision key must use one canonical B-tree"
+                )
+
             conn.execute(
                 """
                 INSERT INTO notification_operation_heads(
@@ -479,6 +534,33 @@ def main() -> None:
                 VALUES ('schema-check-operation', 1, '{}', 1)
                 """
             )
+            first_sequence = conn.execute(
+                "SELECT sequence FROM notification_outbox WHERE operation_id = 'schema-check-operation'"
+            ).fetchone()[0]
+            duplicate_outbox_rows = conn.execute(
+                """
+                INSERT OR IGNORE INTO notification_outbox(
+                    operation_id, revision, payload_json, created_at
+                )
+                VALUES ('schema-check-operation', 1, '{}', 2)
+                """
+            ).rowcount
+            if duplicate_outbox_rows != 0:
+                fail("notification outbox must reject duplicate operation revisions")
+            conn.execute("DELETE FROM notification_outbox")
+            conn.execute(
+                """
+                INSERT INTO notification_outbox(
+                    operation_id, revision, payload_json, created_at
+                )
+                VALUES ('schema-check-operation', 2, '{}', 3)
+                """
+            )
+            second_sequence = conn.execute(
+                "SELECT sequence FROM notification_outbox WHERE operation_id = 'schema-check-operation'"
+            ).fetchone()[0]
+            if second_sequence <= first_sequence:
+                fail("notification outbox AUTOINCREMENT sequence must not reuse values")
             for invalid_status in ("paused", "unknown"):
                 invalid_status_rows = conn.execute(
                     """

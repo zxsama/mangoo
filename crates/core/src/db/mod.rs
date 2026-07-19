@@ -16522,6 +16522,58 @@ mod tests {
         database
     }
 
+    fn database_migrated_through_20() -> Database {
+        let database = database_migrated_through_17();
+        {
+            let transaction = database.connection.unchecked_transaction().unwrap();
+            transaction
+                .execute_batch(migrations::THUMB_FAILURE_KIND_MIGRATION)
+                .expect("apply thumbnail failure kind migration");
+            backfill_thumbnail_failure_kind_in_transaction(&transaction)
+                .expect("backfill thumbnail failure kinds");
+            transaction.commit().expect("commit migration 18");
+        }
+        {
+            let transaction = database.connection.unchecked_transaction().unwrap();
+            transaction
+                .execute_batch(migrations::ROOT_PENDING_DELETE_MIGRATION)
+                .expect("apply root pending delete migration");
+            transaction.commit().expect("commit migration 19");
+        }
+        database
+            .connection
+            .execute_batch(migrations::ROOT_PURGE_TASK_KIND_MIGRATION)
+            .expect("apply root purge task kind migration");
+        database
+            .connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("re-enable foreign keys after migration 20");
+        assert!(database.migration_applied(20).unwrap());
+        assert!(!database.migration_applied(21).unwrap());
+        database
+    }
+
+    fn index_key_columns(database: &Database, index_name: &str) -> Vec<(String, bool)> {
+        let mut statement = database
+            .connection
+            .prepare(&format!("PRAGMA index_xinfo('{index_name}')"))
+            .expect("inspect index columns");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            })
+            .expect("query index columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect index columns")
+            .into_iter()
+            .filter_map(|(name, descending, is_key)| is_key.then_some((name?, descending)))
+            .collect()
+    }
+
     /// Proves the 0018 gate's atomicity: the ALTER TABLE (add
     /// `failure_kind`), the `schema_migrations` version-18 registration, and
     /// the failure_kind backfill all live inside ONE explicit transaction, so
@@ -16725,7 +16777,6 @@ mod tests {
         assert!(database.migration_applied(21).unwrap());
         for index_name in [
             "idx_notification_heads_status_updated",
-            "idx_notification_outbox_operation_revision",
             "idx_file_operations_group",
         ] {
             let exists: bool = database
@@ -16793,5 +16844,198 @@ mod tests {
             )
             .expect("read default operation group");
         assert_eq!(operation_group_id, None);
+    }
+
+    #[test]
+    fn migration_0021_upgrades_populated_v20_file_operations() {
+        let database = database_migrated_through_20();
+        database
+            .connection
+            .execute(
+                "INSERT INTO file_operations(id, operation, source_path, target_path, status, created_at, finished_at, error) VALUES (41, 'move', 'before', 'after', 'succeeded', 10, 20, NULL)",
+                [],
+            )
+            .expect("seed a version-20 file operation");
+
+        database
+            .apply_migrations()
+            .expect("upgrade populated version-20 database to version 21");
+
+        let operation: (String, String, Option<String>, String, i64, Option<i64>, Option<String>) =
+            database
+                .connection
+                .query_row(
+                    "SELECT operation, source_path, target_path, status, created_at, finished_at, operation_group_id FROM file_operations WHERE id = 41",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .expect("read preserved file operation");
+        assert_eq!(
+            operation,
+            (
+                "move".to_string(),
+                "before".to_string(),
+                Some("after".to_string()),
+                "succeeded".to_string(),
+                10,
+                Some(20),
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn migration_0021_rejects_duplicate_operation_revisions() {
+        let database = migrated_database();
+        database
+            .connection
+            .execute(
+                "INSERT INTO notification_outbox(operation_id, revision, payload_json, created_at) VALUES ('operation-1', 7, '{}', 1)",
+                [],
+            )
+            .expect("insert first outbox revision");
+        let duplicate = database.connection.execute(
+            "INSERT INTO notification_outbox(operation_id, revision, payload_json, created_at) VALUES ('operation-1', 7, '{}', 2)",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "duplicate operation revisions must fail"
+        );
+    }
+
+    #[test]
+    fn migration_0021_autoincrement_sequence_never_reuses_deleted_values() {
+        let database = migrated_database();
+        database
+            .connection
+            .execute(
+                "INSERT INTO notification_outbox(operation_id, revision, payload_json, created_at) VALUES ('operation-1', 1, '{}', 1)",
+                [],
+            )
+            .expect("insert first outbox row");
+        let first_sequence = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute("DELETE FROM notification_outbox", [])
+            .expect("delete all outbox rows");
+        database
+            .connection
+            .execute(
+                "INSERT INTO notification_outbox(operation_id, revision, payload_json, created_at) VALUES ('operation-2', 1, '{}', 2)",
+                [],
+            )
+            .expect("insert outbox row after emptying table");
+        let second_sequence = database.connection.last_insert_rowid();
+        assert!(
+            second_sequence > first_sequence,
+            "AUTOINCREMENT must not reuse an acknowledged sequence"
+        );
+    }
+
+    #[test]
+    fn migration_0021_rolls_back_every_change_before_commit() {
+        let database = database_migrated_through_20();
+        let (migration_before_commit, _) = migrations::NOTIFICATION_OUTBOX_MIGRATION
+            .rsplit_once("COMMIT;")
+            .expect("migration 21 must end in an explicit commit");
+        let failing_migration =
+            format!("{migration_before_commit}\nSELECT * FROM migration_0021_deliberate_failure;");
+
+        let result = database.connection.execute_batch(&failing_migration);
+        assert!(result.is_err(), "deliberate pre-commit failure must occur");
+        database
+            .connection
+            .execute_batch("ROLLBACK;")
+            .expect("roll back failed migration 21 transaction");
+
+        assert!(!database.migration_applied(21).unwrap());
+        assert!(!database
+            .table_has_column("file_operations", "operation_group_id")
+            .unwrap());
+        for table_name in ["notification_operation_heads", "notification_outbox"] {
+            let exists: bool = database
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table_name],
+                    |_| Ok(true),
+                )
+                .optional()
+                .expect("query rolled-back table")
+                .unwrap_or(false);
+            assert!(!exists, "{table_name} must roll back");
+        }
+        let remaining_indexes: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_notification_heads_status_updated', 'idx_file_operations_group')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query rolled-back indexes");
+        assert_eq!(remaining_indexes, 0, "migration indexes must roll back");
+    }
+
+    #[test]
+    fn migration_0021_uses_exact_nonredundant_indexes() {
+        let database = migrated_database();
+        assert_eq!(
+            index_key_columns(&database, "idx_notification_heads_status_updated"),
+            vec![
+                ("status".to_string(), false),
+                ("updated_at".to_string(), true)
+            ]
+        );
+        assert_eq!(
+            index_key_columns(&database, "idx_file_operations_group"),
+            vec![
+                ("operation_group_id".to_string(), false),
+                ("id".to_string(), false),
+            ]
+        );
+
+        let indexes: Vec<(String, bool, String)> = database
+            .connection
+            .prepare("PRAGMA index_list(notification_outbox)")
+            .expect("inspect notification outbox indexes")
+            .query_map([], |row| {
+                Ok((row.get(1)?, row.get::<_, i64>(2)? != 0, row.get(3)?))
+            })
+            .expect("query notification outbox indexes")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect notification outbox indexes");
+        let unique_autoindexes: Vec<&str> = indexes
+            .iter()
+            .filter(|(_, unique, origin)| *unique && origin == "u")
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert_eq!(unique_autoindexes.len(), 1);
+        let expected_unique_columns = vec![
+            ("operation_id".to_string(), false),
+            ("revision".to_string(), false),
+        ];
+        assert_eq!(
+            index_key_columns(&database, unique_autoindexes[0]),
+            expected_unique_columns
+        );
+        let matching_btrees = indexes
+            .iter()
+            .filter(|(name, _, _)| index_key_columns(&database, name) == expected_unique_columns)
+            .count();
+        assert_eq!(
+            matching_btrees, 1,
+            "operation_id/revision must use one canonical B-tree"
+        );
     }
 }
