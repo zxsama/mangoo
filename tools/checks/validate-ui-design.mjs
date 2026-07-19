@@ -363,6 +363,7 @@ if (!stylesForChecks.includes("-webkit-app-region: no-drag")) {
 
 assertExactSelectorHelperContracts();
 assertCssCommentStrippingContracts();
+assertJsxStructuralHelperContracts();
 
 const noDragBlocks = cssBlocksForExactSelector(stylesForChecks, ".no-drag");
 if (
@@ -1673,16 +1674,24 @@ for (const value of ["useInterfaceStyle", "subscribePreference", "broadcastChang
     fail(`shared secondary-window material synchronization missing ${value}`);
   }
 }
-for (const value of [
-  "--secondary-window-pane-dark",
-  "--secondary-window-pane-light",
-  "--secondary-window-pane-end"
+const interfaceStyleCssVariablesBody = extractFunctionBody(interfaceStyle, "interfaceStyleToCssVariables");
+for (const mapping of [
+  '"--secondary-window-pane-dark": secondaryWindowPaneDark',
+  '"--secondary-window-pane-light": secondaryWindowPaneLight',
+  '"--secondary-window-pane-end": secondaryWindowPaneEnd'
 ]) {
-  if (!interfaceStyle.includes(value)) {
-    fail(`secondary-window split material token missing ${value}`);
+  if (!interfaceStyleCssVariablesBody.includes(mapping)) {
+    fail(`interfaceStyleToCssVariables missing derived secondary-window mapping ${mapping}`);
   }
 }
-if (!pluginsView.includes('className="plugins-sidebar"')) {
+if (
+  !jsxElementContainsClassDescendants(
+    pluginsView,
+    "apps/web/src/features/plugins/PluginsView.tsx",
+    "plugins-sidebar",
+    ["plugins-body-actions", "plugins-list"]
+  )
+) {
   fail("PluginsView must group sidebar controls and the plugin list in .plugins-sidebar");
 }
 if (
@@ -1936,41 +1945,36 @@ if (
 ) {
   fail("Settings and Plugins windows must retain their independent 40px titlebar and 30px close button sizing");
 }
-const latestSecondaryWindowTitlebarBlock = secondaryWindowTitlebarBlocks.at(-1);
 if (
-  !latestSecondaryWindowTitlebarBlock ||
-  latestDeclarationValue(latestSecondaryWindowTitlebarBlock, "border-bottom") !== "1px solid var(--line)"
+  latestDeclarationValueAcrossBlocks(secondaryWindowTitlebarBlocks, "border-bottom") !==
+  "1px solid var(--line)"
 ) {
   fail("secondary window titlebar must retain its bottom border above the split body material");
 }
 const settingsDialogNavBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-dialog-nav");
 if (
-  !settingsDialogNavBlocks.some(
-    (block) =>
-      latestDeclarationValue(block, "border-right") === "0" &&
-      latestDeclarationValue(block, "background") === "var(--secondary-window-pane-dark)"
-  )
+  latestDeclarationValueAcrossBlocks(settingsDialogNavBlocks, "border-right") !== "0" ||
+  latestDeclarationValueAcrossBlocks(settingsDialogNavBlocks, "background") !==
+    "var(--secondary-window-pane-dark)"
 ) {
   fail("Settings navigation must use the dark secondary-window pane without a vertical divider");
 }
 const settingsDialogMainBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-dialog-main");
+const settingsDialogMainBackground = latestDeclarationValueAcrossBlocks(
+  settingsDialogMainBlocks,
+  "background"
+);
 if (
-  !settingsDialogMainBlocks.some((block) => {
-    const background = latestDeclarationValue(block, "background");
-    return (
-      background?.includes("linear-gradient") &&
-      background.includes("var(--secondary-window-pane-light)") &&
-      background.includes("var(--secondary-window-pane-end)")
-    );
-  })
+  !settingsDialogMainBackground?.includes("linear-gradient") ||
+  !settingsDialogMainBackground.includes("var(--secondary-window-pane-light)") ||
+  !settingsDialogMainBackground.includes("var(--secondary-window-pane-end)")
 ) {
   fail("Settings content must use the semantic light-to-dark secondary-window pane gradient");
 }
 const pluginsSidebarBlocks = cssBlocksForExactSelector(stylesForChecks, ".plugins-sidebar");
 if (
-  !pluginsSidebarBlocks.some(
-    (block) => latestDeclarationValue(block, "background") === "var(--secondary-window-pane-dark)"
-  )
+  latestDeclarationValueAcrossBlocks(pluginsSidebarBlocks, "background") !==
+  "var(--secondary-window-pane-dark)"
 ) {
   fail("Plugins sidebar must use the dark secondary-window pane material");
 }
@@ -3619,6 +3623,9 @@ function assertExactSelectorHelperContracts() {
     .shell-drag .child { -webkit-app-region: drag; }
     .no-drag * { -webkit-app-region: no-drag; }
     .no-drag, [data-no-drag="true"] { -webkit-app-region: no-drag; }
+    .split-pane { background: var(--secondary-window-pane-dark); border-right: 1px solid var(--line); }
+    .split-pane { color: white; }
+    .split-pane { border-right: 0; }
   `;
 
   if (
@@ -3635,6 +3642,15 @@ function assertExactSelectorHelperContracts() {
     )
   ) {
     fail("exact selector helper must accept .no-drag as a standalone selector in a selector list");
+  }
+
+  const splitPaneBlocks = cssBlocksForExactSelector(probe, ".split-pane");
+  if (
+    latestDeclarationValueAcrossBlocks(splitPaneBlocks, "background") !==
+      "var(--secondary-window-pane-dark)" ||
+    latestDeclarationValueAcrossBlocks(splitPaneBlocks, "border-right") !== "0"
+  ) {
+    fail("cross-block declaration helper must preserve the latest non-null value in source order");
   }
 }
 
@@ -3677,6 +3693,34 @@ function assertCssCommentStrippingContracts() {
 
   if (declarationBlocks.some((block) => hasNonNoneDeclaration(block, "backdrop-filter"))) {
     fail("CSS declaration helpers must ignore commented backdrop-filter declarations");
+  }
+}
+
+function assertJsxStructuralHelperContracts() {
+  const groupedSource = `
+    const grouped = (
+      <div className="plugins-sidebar">
+        <div className="plugins-body-actions" />
+        <div className="plugins-list" />
+      </div>
+    );
+  `;
+  const misplacedSource = `
+    const misplaced = (
+      <>
+        <div className="plugins-sidebar"></div>
+        <div className="plugins-body-actions" />
+        <div className="plugins-list" />
+      </>
+    );
+  `;
+  const requiredClassNames = ["plugins-body-actions", "plugins-list"];
+
+  if (
+    !jsxElementContainsClassDescendants(groupedSource, "grouped.tsx", "plugins-sidebar", requiredClassNames) ||
+    jsxElementContainsClassDescendants(misplacedSource, "misplaced.tsx", "plugins-sidebar", requiredClassNames)
+  ) {
+    fail("JSX structural helper must require plugin controls and list inside the sidebar element");
   }
 }
 
@@ -3835,6 +3879,17 @@ function latestDeclarationValue(block, property) {
   return latestValue;
 }
 
+function latestDeclarationValueAcrossBlocks(blocks, property) {
+  let latestValue = null;
+  for (const block of blocks) {
+    const blockValue = latestDeclarationValue(block, property);
+    if (blockValue !== null) {
+      latestValue = blockValue;
+    }
+  }
+  return latestValue;
+}
+
 function declarationValueIncludes(block, expectedValue) {
   const body = stripCssComments(block);
   const pattern = /(?:^|;)\s*[-_a-zA-Z0-9]+\s*:\s*([^;]+)/gi;
@@ -3965,6 +4020,47 @@ function extractJsxElements(source, componentName) {
   }
 
   return elements;
+}
+
+function jsxElementContainsClassDescendants(source, fileName, containerClassName, requiredClassNames) {
+  const sourceFile = ts.createSourceFile(
+    fileName,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX
+  );
+  let containsRequiredClasses = false;
+
+  function hasStaticClassName(node, className) {
+    const openingElement = ts.isJsxElement(node) ? node.openingElement : node;
+    return new RegExp(`\\bclassName="${escapeRegExp(className)}"`).test(
+      openingElement.getText(sourceFile)
+    );
+  }
+
+  function visit(node) {
+    if (containsRequiredClasses) return;
+    if (ts.isJsxElement(node) && hasStaticClassName(node, containerClassName)) {
+      const foundClassNames = new Set();
+      function collect(descendant) {
+        if (ts.isJsxElement(descendant) || ts.isJsxSelfClosingElement(descendant)) {
+          for (const className of requiredClassNames) {
+            if (hasStaticClassName(descendant, className)) {
+              foundClassNames.add(className);
+            }
+          }
+        }
+        ts.forEachChild(descendant, collect);
+      }
+      ts.forEachChild(node, collect);
+      containsRequiredClasses = requiredClassNames.every((className) => foundClassNames.has(className));
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return containsRequiredClasses;
 }
 
 function extractFunctionBody(source, functionName) {
