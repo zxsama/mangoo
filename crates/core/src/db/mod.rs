@@ -1209,8 +1209,24 @@ impl Database {
         Ok(id)
     }
 
+    /// Whether the root at `path` exists AND is currently being purged
+    /// (`pending_delete_at` set). Used to reject re-adding a path mid-removal.
+    pub fn root_pending_delete_by_path(&self, path: &str) -> anyhow::Result<bool> {
+        let pending: Option<Option<i64>> = self
+            .connection
+            .query_row(
+                "SELECT pending_delete_at FROM roots WHERE path = ?1",
+                [path],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        Ok(matches!(pending, Some(Some(_))))
+    }
+
     #[allow(dead_code)] // soft-delete path retired by remove_root (Task 7); still exercised by
-                        // recovery tests until Task 10 formally removes it.
+                        // recovery tests as a test helper for the enabled=0 state that
+                        // mark_root_for_purge still produces transiently (kept intentionally,
+                        // see hd-task-10 scope note).
     pub fn disable_root(&self, root_id: i64) -> anyhow::Result<bool> {
         let transaction = self.connection.unchecked_transaction()?;
         let updated = transaction.execute(
@@ -11389,6 +11405,30 @@ mod tests {
             database.get_root(root_id).expect("get").is_none(),
             "pending-delete root hidden from get_root"
         );
+    }
+
+    #[test]
+    fn root_pending_delete_by_path_reports_purging_paths() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Y".to_string(),
+                display_name: "Y".to_string(),
+            })
+            .expect("add");
+        // Not pending-delete yet.
+        assert!(!database
+            .root_pending_delete_by_path("D:/Y")
+            .expect("check active"));
+        database.mark_root_for_purge(root_id).expect("mark");
+        // Now pending-delete.
+        assert!(database
+            .root_pending_delete_by_path("D:/Y")
+            .expect("check pending"));
+        // Unknown path -> not pending-delete.
+        assert!(!database
+            .root_pending_delete_by_path("D:/nope")
+            .expect("check unknown"));
     }
 
     #[test]

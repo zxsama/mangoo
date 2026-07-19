@@ -677,6 +677,14 @@ async fn add_root(
         .unwrap_or_else(|| fallback_display_name(&canonical_path));
     let (root_id, task_id, attempt_generation) =
         run_shared_database(state.clone(), move |database| {
+            if database
+                .root_pending_delete_by_path(&canonical_path)
+                .map_err(CoreError::from)?
+            {
+                return Err(CoreError::conflict(format!(
+                    "root path is being removed; try again shortly: {canonical_path}"
+                )));
+            }
             let root_id = database.add_root(NewRoot {
                 path: canonical_path,
                 display_name,
@@ -4228,6 +4236,79 @@ mod tests {
             .await
             .expect("delete missing");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn add_root_rejects_path_pending_delete_with_conflict() {
+        let temp_root = unique_temp_dir();
+        fs::create_dir_all(&temp_root).expect("create root dir");
+        let database = test_database();
+        // No worker: build an AppState whose task_queue channel is never
+        // drained, mirroring `remove_root_marks_pending_delete_and_enqueues_purge`
+        // above, so the enqueued tasks are created and accepted but never run
+        // and the removed root stays pending-delete for the duration of the test.
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let state = AppState {
+            writer: crate::db::DbWriter::spawn(database),
+            fsops_database: None,
+            task_queue: sender,
+            plugins_dir: None,
+            read_database_path: None,
+            _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/roots")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "path": temp_root }).to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("post root");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        let root_id = body["rootId"].as_i64().expect("rootId");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/roots/{root_id}"))
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("delete root");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        // Re-adding the same path while the root is mid-purge -> 409, not a
+        // resurrected root.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/roots")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "path": temp_root }).to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("post root again while pending-delete");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        fs::remove_dir_all(temp_root).expect("cleanup temp root");
     }
 
     #[tokio::test]
