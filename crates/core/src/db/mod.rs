@@ -600,6 +600,18 @@ pub enum MarkRootForPurge {
     },
 }
 
+/// Number of rows deleted per phase in [`Database::purge_root_next_batch`].
+#[allow(dead_code)] // consumed by the root_purge worker branch in a later task
+pub const PURGE_BATCH_SIZE: usize = 5000;
+
+/// Outcome of one [`Database::purge_root_next_batch`] call.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // consumed by the root_purge worker branch in a later task
+pub struct PurgeBatchOutcome {
+    pub rows_deleted: usize,
+    pub done: bool,
+}
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -1299,6 +1311,101 @@ impl Database {
             .query_map([], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<i64>>>()?;
         Ok(ids)
+    }
+
+    /// Delete ONE bounded batch of a root's rows, leaf-to-root, resumable.
+    /// Phases (first non-empty runs this call): scan/interactive tasks ->
+    /// thumbnail tasks (by file) -> files (cascade) -> folders -> the roots row.
+    /// Idempotent: keyed by root_id, safe to re-run after an interruption.
+    /// `file_operations` is left (its refs go NULL) as audit history.
+    #[allow(dead_code)] // consumed by the root_purge worker branch in a later task
+    pub fn purge_root_next_batch(
+        &self,
+        root_id: i64,
+        batch_size: usize,
+    ) -> anyhow::Result<PurgeBatchOutcome> {
+        let batch = batch_size.max(1) as i64;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+
+        // Phase 1: this root's scan/interactive tasks. Deliberately EXCLUDES
+        // 'root_purge' so the worker's own active task survives for progress
+        // updates; it is swept in phase 5 with the roots row.
+        let n = transaction.execute(
+            r#"
+            DELETE FROM tasks
+            WHERE id IN (
+                SELECT id FROM tasks
+                WHERE root_id = ?1 AND kind IN ('root_scan','interactive_folder_scan')
+                LIMIT ?2
+            )
+            "#,
+            (root_id, batch),
+        )?;
+        if n > 0 {
+            transaction.commit()?;
+            return Ok(PurgeBatchOutcome {
+                rows_deleted: n,
+                done: false,
+            });
+        }
+
+        // Phase 2: thumbnail tasks referencing this root's files.
+        let n = transaction.execute(
+            r#"
+            DELETE FROM tasks
+            WHERE id IN (
+                SELECT t.id FROM tasks t
+                JOIN files f ON f.id = t.file_id
+                WHERE f.root_id = ?1 AND t.kind = 'thumbnail'
+                LIMIT ?2
+            )
+            "#,
+            (root_id, batch),
+        )?;
+        if n > 0 {
+            transaction.commit()?;
+            return Ok(PurgeBatchOutcome {
+                rows_deleted: n,
+                done: false,
+            });
+        }
+
+        // Phase 3: files (cascade removes media/user_metadata/file_tags/thumbs/thumb_blobs).
+        let n = transaction.execute(
+            "DELETE FROM files WHERE id IN (SELECT id FROM files WHERE root_id = ?1 LIMIT ?2)",
+            (root_id, batch),
+        )?;
+        if n > 0 {
+            transaction.commit()?;
+            return Ok(PurgeBatchOutcome {
+                rows_deleted: n,
+                done: false,
+            });
+        }
+
+        // Phase 4: folders.
+        let n = transaction.execute(
+            "DELETE FROM folders WHERE id IN (SELECT id FROM folders WHERE root_id = ?1 LIMIT ?2)",
+            (root_id, batch),
+        )?;
+        if n > 0 {
+            transaction.commit()?;
+            return Ok(PurgeBatchOutcome {
+                rows_deleted: n,
+                done: false,
+            });
+        }
+
+        // Phase 5: the root's remaining tasks (the active root_purge) + the roots row.
+        let mut final_rows = 0usize;
+        final_rows += transaction.execute("DELETE FROM tasks WHERE root_id = ?1", [root_id])?;
+        final_rows += transaction.execute("DELETE FROM roots WHERE id = ?1", [root_id])?;
+        transaction.commit()?;
+        Ok(PurgeBatchOutcome {
+            rows_deleted: final_rows,
+            done: true,
+        })
     }
 
     pub fn create_interactive_folder_scan_task(&self, folder_id: i64) -> anyhow::Result<i64> {
@@ -11142,6 +11249,115 @@ mod tests {
         let ids = database.roots_pending_delete_ids().expect("pending ids");
         assert_eq!(ids, vec![root_id]);
         let _ = folder_id;
+    }
+
+    #[test]
+    fn purge_root_next_batch_drains_leaf_to_root_in_bounded_batches() {
+        let database = migrated_database();
+        let (root_id, _folder_id) = seed_media_page_fixture(&database); // 4 files + media
+
+        // Prove the media cascade: 4 media rows exist now.
+        let media_before: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM media", [], |r| r.get(0))
+            .expect("media");
+        assert_eq!(media_before, 4);
+
+        // A thumbnail task referencing a file must be purged (not orphaned to file_id NULL).
+        let a_file: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM files WHERE root_id=?1 ORDER BY id LIMIT 1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .expect("a file");
+        database
+            .connection
+            .execute(
+                "INSERT INTO tasks(kind, priority, status, file_id, created_at, updated_at) VALUES ('thumbnail', -10, 'pending', ?1, 1, 1)",
+                [a_file],
+            )
+            .expect("seed thumbnail task");
+
+        database.mark_root_for_purge(root_id).expect("mark");
+
+        // Drain with a tiny batch to force multiple batches.
+        let mut batches = 0;
+        loop {
+            let outcome = database.purge_root_next_batch(root_id, 2).expect("batch");
+            assert!(
+                outcome.rows_deleted <= 4,
+                "each batch is bounded (<= batch_size for tasks/files/folders, + final root sweep)"
+            );
+            batches += 1;
+            if outcome.done {
+                break;
+            }
+            assert!(batches < 100, "must terminate");
+        }
+        assert!(batches >= 2, "small batch forces multiple batches");
+
+        for (table, col) in [("files", "root_id"), ("folders", "root_id")] {
+            let n: i64 = database
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {col}=?1"),
+                    [root_id],
+                    |r| r.get(0),
+                )
+                .expect("count");
+            assert_eq!(n, 0, "{table} not drained");
+        }
+        let roots_n: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM roots WHERE id=?1", [root_id], |r| {
+                r.get(0)
+            })
+            .expect("roots");
+        assert_eq!(roots_n, 0, "roots row removed");
+        // Media cascaded away with the files.
+        let media_after: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM media", [], |r| r.get(0))
+            .expect("media after");
+        assert_eq!(media_after, 0, "media must cascade-delete with files");
+        // No orphan thumbnail task (file_id was purged, not SET NULL).
+        let orphan_tasks: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE kind='thumbnail'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count tasks");
+        assert_eq!(orphan_tasks, 0);
+    }
+
+    #[test]
+    fn purge_root_next_batch_is_resumable_after_interruption() {
+        let database = migrated_database();
+        let (root_id, _folder_id) = seed_media_page_fixture(&database);
+        database.mark_root_for_purge(root_id).expect("mark");
+        // One batch only (simulate crash), then resume to completion.
+        let first = database.purge_root_next_batch(root_id, 2).expect("first");
+        assert!(!first.done);
+        loop {
+            if database
+                .purge_root_next_batch(root_id, 2)
+                .expect("resume")
+                .done
+            {
+                break;
+            }
+        }
+        let n: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM roots WHERE id=?1", [root_id], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(n, 0);
     }
 
     #[test]
