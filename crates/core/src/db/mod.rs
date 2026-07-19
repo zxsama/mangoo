@@ -1384,15 +1384,42 @@ impl Database {
             });
         }
 
-        // Phase 4: folders.
-        let n = transaction.execute(
-            "DELETE FROM folders WHERE id IN (SELECT id FROM folders WHERE root_id = ?1 LIMIT ?2)",
-            (root_id, batch),
-        )?;
-        if n > 0 {
+        // Phase 4: folders, LEAF-FIRST, bounded to `batch` total this call.
+        // folders.parent_id is ON DELETE CASCADE self-referential, so deleting a
+        // non-leaf folder cascades its entire subtree in one statement (unbounded;
+        // >1000 deep hits SQLite's cascade recursion cap and errors). Delete only
+        // childless folders, looping within this call: removing a leaf exposes its
+        // parent as a new leaf, which the next iteration picks up. This drains
+        // deep/linear chains within one call instead of needing one call per row,
+        // while still never deleting more than `batch` folders per invocation and
+        // never triggering a cascade (a leaf has no children).
+        let mut folders_deleted: i64 = 0;
+        loop {
+            let remaining_budget = batch - folders_deleted;
+            if remaining_budget <= 0 {
+                break;
+            }
+            let deleted_this_pass = transaction.execute(
+                r#"
+                DELETE FROM folders
+                WHERE id IN (
+                    SELECT f.id FROM folders f
+                    WHERE f.root_id = ?1
+                      AND NOT EXISTS (SELECT 1 FROM folders c WHERE c.parent_id = f.id)
+                    LIMIT ?2
+                )
+                "#,
+                (root_id, remaining_budget),
+            )? as i64;
+            if deleted_this_pass == 0 {
+                break;
+            }
+            folders_deleted += deleted_this_pass;
+        }
+        if folders_deleted > 0 {
             transaction.commit()?;
             return Ok(PurgeBatchOutcome {
-                rows_deleted: n,
+                rows_deleted: folders_deleted as usize,
                 done: false,
             });
         }
@@ -11358,6 +11385,104 @@ mod tests {
             })
             .expect("count");
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn purge_root_next_batch_deletes_folders_in_bounded_batches() {
+        // A folders-only tree (no files) so the folder phase runs first. Root folder
+        // (name '') + a chain of children. With the buggy unbounded delete, deleting
+        // the root folder cascades the whole subtree in ONE batch; leaf-first keeps
+        // each batch bounded.
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/tree".into(),
+                display_name: "tree".into(),
+            })
+            .expect("add root");
+        let mut parent: Option<i64> = None;
+        let mut ids = Vec::new();
+        for depth in 0..6 {
+            let id = database
+                .upsert_folder(FolderUpsert {
+                    root_id,
+                    parent_id: parent,
+                    name: if depth == 0 {
+                        String::new()
+                    } else {
+                        format!("d{depth}")
+                    },
+                    path_hash: format!("h{depth}"),
+                    mtime: Some(1),
+                })
+                .expect("folder");
+            ids.push(id);
+            parent = Some(id);
+        }
+        let total_before: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE root_id=?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(total_before, 6);
+
+        database.mark_root_for_purge(root_id).expect("mark");
+
+        // Drive batches until the folder phase begins (tasks first: the mark created
+        // one root_purge task, excluded from phase 1, so phase 1/2/3 are empty here
+        // and phase 4 runs immediately). One batch of 2 must delete at most 2 folders
+        // (leaf-first), NOT cascade the whole tree.
+        let outcome = database.purge_root_next_batch(root_id, 2).expect("batch");
+        assert!(
+            !outcome.done,
+            "6 folders can't be drained in one batch of 2"
+        );
+        let remaining: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE root_id=?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            remaining, 4,
+            "leaf-first batch of 2 must leave 6-2=4 folders (buggy cascade leaves 0)"
+        );
+
+        // Finish draining; must complete with the roots row gone.
+        let mut guard = 0;
+        loop {
+            if database
+                .purge_root_next_batch(root_id, 2)
+                .expect("drain")
+                .done
+            {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 100, "must terminate");
+        }
+        let roots_n: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM roots WHERE id=?1", [root_id], |r| {
+                r.get(0)
+            })
+            .expect("roots");
+        assert_eq!(roots_n, 0);
+        let folders_n: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE root_id=?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .expect("folders");
+        assert_eq!(folders_n, 0);
+        let _ = ids;
     }
 
     #[test]
