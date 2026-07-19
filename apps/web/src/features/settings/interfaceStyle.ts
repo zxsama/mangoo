@@ -291,21 +291,31 @@ export function interfaceStyleToCssVariables(
     normalized.sideOverlayColor,
     0.5 * normalized.sideOverlayStrength * normalized.sideOpacity
   );
-  const secondaryWindowPaneDark = colorWithAlpha(
+  const secondaryWindowPaneDarkColor = mixHexColors(
     normalized.sideOverlayColor,
-    0.56 * normalized.sideOverlayStrength * normalized.sideOpacity
+    "#000000",
+    0.24
   );
   const secondaryWindowPaneLightColor = mixHexColors(
     normalized.sideOverlayColor,
-    "#d6e1e3",
+    "#ffffff",
     0.18
+  );
+  const secondaryWindowPaneEndColor = mixHexColors(
+    normalized.sideOverlayColor,
+    "#000000",
+    0.12
+  );
+  const secondaryWindowPaneDark = colorWithAlpha(
+    secondaryWindowPaneDarkColor,
+    0.56 * normalized.sideOverlayStrength * normalized.sideOpacity
   );
   const secondaryWindowPaneLight = colorWithAlpha(
     secondaryWindowPaneLightColor,
     0.2 * normalized.sideOverlayStrength * normalized.sideOpacity
   );
   const secondaryWindowPaneEnd = colorWithAlpha(
-    normalized.sideOverlayColor,
+    secondaryWindowPaneEndColor,
     0.48 * normalized.sideOverlayStrength * normalized.sideOpacity
   );
   const centerOverlay = colorWithAlpha(
