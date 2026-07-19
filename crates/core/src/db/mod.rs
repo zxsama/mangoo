@@ -2135,10 +2135,19 @@ impl Database {
     }
 
     pub fn task_is_cancelled(&self, task_id: i64) -> anyhow::Result<bool> {
-        Ok(self
-            .get_task(task_id)?
-            .map(|task| task.status == "cancelled")
-            .unwrap_or(false))
+        // Read only `status` (not a full `get_task` row): the scan hot path
+        // calls this per-file, and a whole-row SELECT + `task_from_row`
+        // deserialization (17 columns, 4 String allocations) is wasted work for
+        // a single-column check.
+        let status: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status.as_deref() == Some("cancelled"))
     }
 
     pub fn ensure_task_not_cancelled(&self, task_id: i64) -> anyhow::Result<()> {
@@ -4913,10 +4922,18 @@ impl Database {
         task_id: i64,
         attempt_generation: i64,
     ) -> anyhow::Result<bool> {
-        Ok(self
-            .get_task(task_id)?
-            .map(|task| task.attempt_generation == attempt_generation)
-            .unwrap_or(false))
+        // Read only `attempt_generation` (not a full `get_task` row): the scan
+        // hot path calls this per-file; a whole-row SELECT + deserialization is
+        // wasted work for a single-column comparison.
+        let current: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT attempt_generation FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(current == Some(attempt_generation))
     }
 
     pub fn list_tags(&self) -> anyhow::Result<Vec<TagRecord>> {
@@ -10764,6 +10781,50 @@ mod tests {
             .expect("task exists");
         assert_eq!(task.status, "failed");
         assert_eq!(task.error.as_deref(), Some("scan failed"));
+    }
+
+    #[test]
+    fn task_is_cancelled_and_attempt_is_current_read_minimal_columns() {
+        // Behavior guard for the lightweight `task_is_cancelled` /
+        // `task_attempt_is_current` (they read only `status` /
+        // `attempt_generation` instead of a full `get_task` row, because the
+        // scan hot path calls them per-file). Semantics must be identical to a
+        // full-row read.
+        let database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures".to_string(),
+                display_name: "Pictures".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task(root_id)
+            .expect("create root scan task");
+        let attempt = database
+            .get_task(task_id)
+            .expect("get task")
+            .expect("task exists")
+            .attempt_generation;
+
+        // Pending, current attempt: not cancelled, attempt is current.
+        assert!(!database.task_is_cancelled(task_id).expect("cancelled?"));
+        assert!(database
+            .task_attempt_is_current(task_id, attempt)
+            .expect("attempt current?"));
+        // A stale attempt is not current.
+        assert!(!database
+            .task_attempt_is_current(task_id, attempt - 1)
+            .expect("stale attempt not current"));
+        // A missing task is neither cancelled nor current.
+        assert!(!database.task_is_cancelled(999_999).expect("missing cancelled"));
+        assert!(!database
+            .task_attempt_is_current(999_999, 0)
+            .expect("missing not current"));
+
+        // After cancel: cancelled = true.
+        database.cancel_task(task_id).expect("cancel task");
+        assert!(database.task_is_cancelled(task_id).expect("cancelled after cancel"));
     }
 
     #[test]

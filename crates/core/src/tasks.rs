@@ -15,6 +15,17 @@ use crate::thumbnails::{
 };
 
 const TASK_PROGRESS_FLUSH_INTERVAL_ITEMS: i64 = 100;
+// Minimum wall-clock gap between real cancellation/attempt/yield checks during a
+// scan. The scan hot path calls the cancellation callback multiple times per
+// file; without throttling that runs 4 DB queries per call (cancel + attempt +
+// two pending-task probes), dominating scan throughput on large NAS libraries.
+// The checks' results barely change between files, so we do the real work at
+// most once per this interval — cancel/yield still respond within ~200ms (well
+// under any user-perceivable delay), and an attempt superseded between checks
+// only lets the stale attempt write a few hundred more idempotent, scan-
+// generation-stamped upserts before it's caught (reconciled away on completion).
+const SCAN_CANCELLATION_CHECK_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(200);
 const THUMBNAIL_SOURCE_CHANGED_ERROR: &str = "thumbnail source changed while processing";
 const FFMPEG_NOT_AVAILABLE_ERROR: &str = "ffmpeg not available";
 const THUMBNAIL_SELECTED_WORKER_CONCURRENCY: usize = 1;
@@ -824,7 +835,20 @@ fn run_task_with_database(
                     }
                 }
             };
+            let mut last_cancellation_check: Option<std::time::Instant> = None;
             let mut cancellation_callback = || {
+                // Time-throttle the real (multi-query) check: do it at most once
+                // per SCAN_CANCELLATION_CHECK_MIN_INTERVAL. The hot path calls
+                // this per-file; running four DB queries every file was the
+                // dominant scan cost. Skipping is safe — cancel/yield still land
+                // within the interval.
+                let now = std::time::Instant::now();
+                if let Some(last) = last_cancellation_check {
+                    if now.duration_since(last) < SCAN_CANCELLATION_CHECK_MIN_INTERVAL {
+                        return Ok(());
+                    }
+                }
+                last_cancellation_check = Some(now);
                 if let Some(progress_database) = progress_database.borrow_mut().as_mut() {
                     progress_database.ensure_task_not_cancelled(task_id)?;
                     if !progress_database.task_attempt_is_current(task_id, attempt_generation)? {
@@ -930,7 +954,17 @@ fn run_task_with_database(
                     }
                 }
             };
+            let mut last_cancellation_check: Option<std::time::Instant> = None;
             let mut cancellation_callback = || {
+                // Same per-file cancellation-check throttle as the root scan
+                // (see SCAN_CANCELLATION_CHECK_MIN_INTERVAL).
+                let now = std::time::Instant::now();
+                if let Some(last) = last_cancellation_check {
+                    if now.duration_since(last) < SCAN_CANCELLATION_CHECK_MIN_INTERVAL {
+                        return Ok(());
+                    }
+                }
+                last_cancellation_check = Some(now);
                 if let Some(progress_database) = progress_database.borrow_mut().as_mut() {
                     progress_database.ensure_task_not_cancelled(task_id)?;
                     if !progress_database.task_attempt_is_current(task_id, attempt_generation)? {
