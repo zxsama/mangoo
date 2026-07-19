@@ -1043,7 +1043,10 @@ fn run_task_with_database(
             let root_id = task
                 .root_id
                 .ok_or_else(|| anyhow::anyhow!("root_purge task missing root id: {task_id}"))?;
-            let mut total_deleted: i64 = 0;
+            let mut total_deleted = database
+                .get_task(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("root_purge task disappeared: {task_id}"))?
+                .items_seen;
             loop {
                 database.ensure_task_not_cancelled(task_id)?;
                 // One bounded batch = one short writer job (or inline when there is no
@@ -1081,28 +1084,34 @@ fn run_task_with_database(
                     media_files_seen: 0,
                     skipped_files: 0,
                 };
-                match writer {
-                    Some(writer) => {
-                        let _ = writer.write_blocking(move |db| {
-                            db.update_task_scan_progress_for_attempt(
-                                task_id,
-                                attempt_generation,
-                                progress,
-                            )
-                        });
-                    }
-                    None => {
-                        let _ = database.update_task_scan_progress_for_attempt(
-                            task_id,
-                            attempt_generation,
-                            progress,
-                        );
-                    }
-                }
+                persist_root_purge_progress(
+                    database,
+                    writer,
+                    task_id,
+                    attempt_generation,
+                    progress,
+                )?;
             }
             Ok(())
         }
         other => Err(anyhow::anyhow!("unsupported task kind: {other}")),
+    }
+}
+
+fn persist_root_purge_progress(
+    database: &Database,
+    writer: Option<&DbWriter>,
+    task_id: i64,
+    attempt_generation: i64,
+    progress: TaskScanProgress,
+) -> anyhow::Result<()> {
+    match writer {
+        Some(writer) => writer.write_blocking(move |db| {
+            db.update_task_scan_progress_for_attempt(task_id, attempt_generation, progress)
+        }),
+        None => {
+            database.update_task_scan_progress_for_attempt(task_id, attempt_generation, progress)
+        }
     }
 }
 
@@ -4971,6 +4980,142 @@ mod tests {
             terminal.operation.current_value,
             terminal.operation.total_value.expect("terminal total")
         );
+    }
+
+    #[test]
+    fn root_purge_progress_write_errors_are_propagated_without_fake_completion() {
+        let database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/purge-progress-error".to_string(),
+                display_name: "purge-progress-error".to_string(),
+            })
+            .expect("add root");
+        let task_id = match database.mark_root_for_purge(root_id).expect("mark") {
+            crate::db::MarkRootForPurge::Marked {
+                task_id,
+                attempt_generation,
+            } => {
+                database
+                    .mark_task_running_for_attempt(task_id, attempt_generation)
+                    .expect("run purge");
+                task_id
+            }
+            other => panic!("expected Marked, got {other:?}"),
+        };
+        let broken_writer = DbWriter::spawn(Database::open_in_memory().expect("broken writer"));
+        let error = persist_root_purge_progress(
+            &database,
+            Some(&broken_writer),
+            task_id,
+            database
+                .current_task_attempt_generation(task_id)
+                .expect("attempt"),
+            TaskScanProgress {
+                items_seen: 1,
+                items_total: Some(10),
+                folders_seen: 0,
+                media_files_seen: 0,
+                skipped_files: 0,
+            },
+        )
+        .expect_err("progress persistence error must propagate");
+        assert!(
+            error.to_string().contains("no such table") || error.to_string().contains("writer")
+        );
+        let task = database
+            .get_task(task_id)
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(task.status, "running");
+        assert_eq!(task.items_seen, 0);
+        assert!(database
+            .notification_heads_for_test()
+            .expect("read notifications")
+            .iter()
+            .all(|operation| operation.status != "succeeded"));
+        drop(broken_writer);
+    }
+
+    #[test]
+    fn root_purge_progress_failure_marks_same_operation_failed() {
+        let db_dir = unique_temp_dir("purge-progress-trigger");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+        let db_path = db_dir.join("megle.sqlite");
+        let mut database = Database::open(&db_path).expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/purge-progress-trigger".to_string(),
+                display_name: "purge-progress-trigger".to_string(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "purge-progress-trigger-folder".to_string(),
+                mtime: Some(1),
+            })
+            .expect("insert folder");
+        let file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "purge.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 1,
+                mtime: 1,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("insert file");
+        database
+            .upsert_media_kind(file_id, "image")
+            .expect("insert media kind");
+        let task_id = match database.mark_root_for_purge(root_id).expect("mark") {
+            crate::db::MarkRootForPurge::Marked { task_id, .. } => task_id,
+            other => panic!("expected Marked, got {other:?}"),
+        };
+        database
+            .execute_batch_for_test(
+                "CREATE TRIGGER fail_root_purge_progress
+                 BEFORE UPDATE OF items_seen ON tasks
+                 WHEN NEW.kind = 'root_purge'
+                 BEGIN SELECT RAISE(ABORT, 'injected progress failure'); END;",
+            )
+            .expect("install progress failure trigger");
+        let writer = DbWriter::spawn(Database::open(&db_path).expect("open writer database"));
+
+        run_task(&mut database, Some(&writer), task_id, true);
+        drop(writer);
+
+        let task = database
+            .get_task(task_id)
+            .expect("read failed task")
+            .expect("failed task remains for retry");
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.items_seen, 0);
+        let events = database
+            .list_notification_outbox(0, 200)
+            .expect("read failed operation");
+        let terminal = events
+            .iter()
+            .find(|event| {
+                event.operation.task_id == Some(task_id) && event.operation.status == "failed"
+            })
+            .expect("failed terminal operation");
+        assert_eq!(terminal.operation.current_value, 0);
+        assert!(events.iter().all(|event| {
+            event.operation.task_id != Some(task_id) || event.operation.status != "succeeded"
+        }));
+        assert!(database
+            .roots_pending_delete_ids()
+            .expect("read pending-delete roots")
+            .contains(&root_id));
+        let _ = fs::remove_dir_all(db_dir);
     }
 
     #[test]
