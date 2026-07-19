@@ -1673,6 +1673,18 @@ for (const value of ["useInterfaceStyle", "subscribePreference", "broadcastChang
     fail(`shared secondary-window material synchronization missing ${value}`);
   }
 }
+for (const value of [
+  "--secondary-window-pane-dark",
+  "--secondary-window-pane-light",
+  "--secondary-window-pane-end"
+]) {
+  if (!interfaceStyle.includes(value)) {
+    fail(`secondary-window split material token missing ${value}`);
+  }
+}
+if (!pluginsView.includes('className="plugins-sidebar"')) {
+  fail("PluginsView must group sidebar controls and the plugin list in .plugins-sidebar");
+}
 if (
   !settingsWindow.includes("useSecondaryWindowInterfaceStyle({ broadcastChanges: true })") ||
   !pluginsWindow.includes("useSecondaryWindowInterfaceStyle()")
@@ -1923,6 +1935,44 @@ if (
   )
 ) {
   fail("Settings and Plugins windows must retain their independent 40px titlebar and 30px close button sizing");
+}
+const latestSecondaryWindowTitlebarBlock = secondaryWindowTitlebarBlocks.at(-1);
+if (
+  !latestSecondaryWindowTitlebarBlock ||
+  latestDeclarationValue(latestSecondaryWindowTitlebarBlock, "border-bottom") !== "1px solid var(--line)"
+) {
+  fail("secondary window titlebar must retain its bottom border above the split body material");
+}
+const settingsDialogNavBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-dialog-nav");
+if (
+  !settingsDialogNavBlocks.some(
+    (block) =>
+      latestDeclarationValue(block, "border-right") === "0" &&
+      latestDeclarationValue(block, "background") === "var(--secondary-window-pane-dark)"
+  )
+) {
+  fail("Settings navigation must use the dark secondary-window pane without a vertical divider");
+}
+const settingsDialogMainBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-dialog-main");
+if (
+  !settingsDialogMainBlocks.some((block) => {
+    const background = latestDeclarationValue(block, "background");
+    return (
+      background?.includes("linear-gradient") &&
+      background.includes("var(--secondary-window-pane-light)") &&
+      background.includes("var(--secondary-window-pane-end)")
+    );
+  })
+) {
+  fail("Settings content must use the semantic light-to-dark secondary-window pane gradient");
+}
+const pluginsSidebarBlocks = cssBlocksForExactSelector(stylesForChecks, ".plugins-sidebar");
+if (
+  !pluginsSidebarBlocks.some(
+    (block) => latestDeclarationValue(block, "background") === "var(--secondary-window-pane-dark)"
+  )
+) {
+  fail("Plugins sidebar must use the dark secondary-window pane material");
 }
 const secondaryWindowBlocks = cssBlocksForExactSelector(stylesForChecks, ".secondary-window");
 if (
