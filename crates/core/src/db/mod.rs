@@ -5095,12 +5095,16 @@ impl Database {
     }
 
     pub fn root_enabled(&self, root_id: i64) -> anyhow::Result<bool> {
-        let enabled: i64 = self.connection.query_row(
-            "SELECT enabled FROM roots WHERE id = ?1",
-            [root_id],
-            |row| row.get(0),
-        )?;
-        Ok(enabled != 0)
+        let writable: bool = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM roots WHERE id = ?1 AND enabled = 1 AND pending_delete_at IS NULL",
+                [root_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        Ok(writable)
     }
 
     #[allow(dead_code)]
@@ -6029,15 +6033,20 @@ fn ensure_root_enabled_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     root_id: i64,
 ) -> anyhow::Result<()> {
-    let enabled: i64 = transaction.query_row(
-        "SELECT enabled FROM roots WHERE id = ?1",
-        [root_id],
-        |row| row.get(0),
-    )?;
-    if enabled != 0 {
+    let writable: bool = transaction
+        .query_row(
+            "SELECT 1 FROM roots WHERE id = ?1 AND enabled = 1 AND pending_delete_at IS NULL",
+            [root_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if writable {
         return Ok(());
     }
-    Err(anyhow::anyhow!("root is disabled: {root_id}"))
+    Err(anyhow::anyhow!(
+        "root {root_id} is disabled or being removed"
+    ))
 }
 
 fn active_scan_generation_in_transaction(
@@ -11115,6 +11124,33 @@ mod tests {
             .expect("count files");
         assert_eq!(folder_count, 0);
         assert_eq!(file_count, 0);
+    }
+
+    #[test]
+    fn commit_scan_batch_refuses_pending_delete_root() {
+        let mut database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/X".to_string(),
+                display_name: "X".to_string(),
+            })
+            .expect("add root");
+        database.mark_root_for_purge(root_id).expect("mark");
+        let result = database.commit_scan_batch(ScanWriteBatch {
+            folders: vec![FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "h".to_string(),
+                mtime: Some(1),
+            }],
+            files: Vec::new(),
+            scan_generation: None,
+        });
+        assert!(
+            result.is_err(),
+            "must refuse to write into a pending-delete root"
+        );
     }
 
     #[test]
