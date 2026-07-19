@@ -23,6 +23,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0016_folder_status_browsing_indexes.sql",
     ROOT / "crates" / "core" / "migrations" / "0017_thumbnail_task_indexes.sql",
     ROOT / "crates" / "core" / "migrations" / "0018_thumb_failure_kind.sql",
+    ROOT / "crates" / "core" / "migrations" / "0019_root_pending_delete.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -88,6 +89,7 @@ REQUIRED_INDEXES = {
     "idx_file_operations_status_created",
     "idx_plugins_status",
     "idx_thumb_blobs_profile_updated_at",
+    "idx_roots_pending_delete",
 }
 
 EXPECTED_MEDIA_COLUMNS = {

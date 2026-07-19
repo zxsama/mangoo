@@ -736,6 +736,10 @@ impl Database {
             backfill_thumbnail_failure_kind_in_transaction(&transaction)?;
             transaction.commit()?;
         }
+        if !self.migration_applied(19)? {
+            self.connection
+                .execute_batch(migrations::ROOT_PENDING_DELETE_MIGRATION)?;
+        }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
         Ok(())
@@ -15855,5 +15859,32 @@ mod tests {
             read_failure_kind(&database, fmt_fid),
             Some("permanent".to_string())
         );
+    }
+
+    #[test]
+    fn migration_0019_adds_root_pending_delete_column_and_index() {
+        let database = migrated_database();
+        let columns: Vec<String> = {
+            let mut stmt = database
+                .connection
+                .prepare("PRAGMA table_info(roots)")
+                .expect("inspect roots");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query columns")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("collect columns")
+        };
+        assert!(columns.iter().any(|c| c == "pending_delete_at"));
+        let has_index: bool = database
+            .connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_roots_pending_delete'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .expect("query index")
+            .unwrap_or(false);
+        assert!(has_index, "partial index must exist");
     }
 }

@@ -32,3 +32,5 @@ pub const THUMBNAIL_TASK_INDEXES_MIGRATION: &str =
     include_str!("../../migrations/0017_thumbnail_task_indexes.sql");
 pub const THUMB_FAILURE_KIND_MIGRATION: &str =
     include_str!("../../migrations/0018_thumb_failure_kind.sql");
+pub const ROOT_PENDING_DELETE_MIGRATION: &str =
+    include_str!("../../migrations/0019_root_pending_delete.sql");
