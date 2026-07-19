@@ -588,6 +588,17 @@ struct ThumbnailTaskRequestOutcome {
     terminal_thumbnail: Option<ThumbnailRecord>,
 }
 
+/// Outcome of [`Database::mark_root_for_purge`].
+#[derive(Debug)]
+pub enum MarkRootForPurge {
+    NotFound,
+    AlreadyPending,
+    Marked {
+        task_id: i64,
+        attempt_generation: i64,
+    },
+}
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -739,6 +750,13 @@ impl Database {
         if !self.migration_applied(19)? {
             self.connection
                 .execute_batch(migrations::ROOT_PENDING_DELETE_MIGRATION)?;
+        }
+        if !self.migration_applied(20)? {
+            let result = self
+                .connection
+                .execute_batch(migrations::ROOT_PURGE_TASK_KIND_MIGRATION);
+            self.connection.pragma_update(None, "foreign_keys", "ON")?;
+            result?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
@@ -1220,6 +1238,64 @@ impl Database {
             )?;
         }
         Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Begin a hard delete of `root_id`: mark it `pending_delete_at`, cancel its
+    /// scan tasks, and enqueue one `root_purge` task — all in one small
+    /// transaction. Deletes NO file/folder rows (the background purge does).
+    pub fn mark_root_for_purge(&self, root_id: i64) -> anyhow::Result<MarkRootForPurge> {
+        let now = unix_timestamp();
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing: Option<Option<i64>> = transaction
+            .query_row(
+                "SELECT pending_delete_at FROM roots WHERE id = ?1",
+                [root_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        let Some(pending_delete_at) = existing else {
+            return Ok(MarkRootForPurge::NotFound);
+        };
+        if pending_delete_at.is_some() {
+            return Ok(MarkRootForPurge::AlreadyPending);
+        }
+        transaction.execute(
+            "UPDATE roots SET pending_delete_at = ?1, enabled = 0 WHERE id = ?2",
+            (now, root_id),
+        )?;
+        cancel_root_scan_tasks_in_transaction(&transaction, root_id)?;
+        transaction.execute(
+            r#"
+            INSERT INTO tasks(kind, priority, status, root_id, file_id, created_at, updated_at, error)
+            VALUES ('root_purge', ?1, 'pending', ?2, NULL, ?3, ?3, NULL)
+            "#,
+            (ROOT_SCAN_TASK_PRIORITY, root_id, now),
+        )?;
+        let task_id = transaction.last_insert_rowid();
+        let attempt_generation: i64 = transaction
+            .query_row(
+                "SELECT attempt_generation FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        transaction.commit()?;
+        Ok(MarkRootForPurge::Marked {
+            task_id,
+            attempt_generation,
+        })
+    }
+
+    /// All roots currently mid-purge (used by startup recovery). Uses the
+    /// partial index `idx_roots_pending_delete`.
+    pub fn roots_pending_delete_ids(&self) -> anyhow::Result<Vec<i64>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id FROM roots WHERE pending_delete_at IS NOT NULL ORDER BY id ASC")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
     }
 
     pub fn create_interactive_folder_scan_task(&self, folder_id: i64) -> anyhow::Result<i64> {
@@ -10986,6 +11062,86 @@ mod tests {
     }
 
     #[test]
+    fn mark_root_for_purge_is_o1_and_idempotent() {
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_media_page_fixture(&database); // 4 files
+                                                                       // Also seed a pending root_scan task to prove it gets cancelled.
+        let scan_task = database.create_root_scan_task(root_id).expect("scan task");
+
+        let files_before: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id=?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .expect("count files");
+        assert_eq!(files_before, 4);
+
+        let first = database.mark_root_for_purge(root_id).expect("mark");
+        let (task_id, _gen) = match first {
+            MarkRootForPurge::Marked {
+                task_id,
+                attempt_generation,
+            } => (task_id, attempt_generation),
+            other => panic!("expected Marked, got {other:?}"),
+        };
+
+        // O(1): no files deleted by marking.
+        let files_after: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id=?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .expect("count files");
+        assert_eq!(files_after, 4, "marking must not delete files");
+
+        // pending_delete_at is set; a root_purge task exists.
+        let pending: Option<i64> = database
+            .connection
+            .query_row(
+                "SELECT pending_delete_at FROM roots WHERE id=?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .expect("read pending");
+        assert!(pending.is_some());
+        let kind: String = database
+            .connection
+            .query_row("SELECT kind FROM tasks WHERE id=?1", [task_id], |r| {
+                r.get(0)
+            })
+            .expect("task kind");
+        assert_eq!(kind, "root_purge");
+        // The pre-existing scan task was cancelled (marked failed).
+        let scan_status: String = database
+            .connection
+            .query_row("SELECT status FROM tasks WHERE id=?1", [scan_task], |r| {
+                r.get(0)
+            })
+            .expect("scan status");
+        assert_eq!(scan_status, "failed");
+
+        // Idempotent: a second mark makes no new task.
+        assert!(matches!(
+            database.mark_root_for_purge(root_id).expect("second mark"),
+            MarkRootForPurge::AlreadyPending
+        ));
+
+        // Unknown root -> NotFound.
+        assert!(matches!(
+            database.mark_root_for_purge(999_999).expect("missing"),
+            MarkRootForPurge::NotFound
+        ));
+
+        let ids = database.roots_pending_delete_ids().expect("pending ids");
+        assert_eq!(ids, vec![root_id]);
+        let _ = folder_id;
+    }
+
+    #[test]
     fn create_interactive_folder_scan_task_persists_folder_id_and_lists_pending_task() {
         let database = migrated_database();
         let root_id = database
@@ -15886,5 +16042,55 @@ mod tests {
             .expect("query index")
             .unwrap_or(false);
         assert!(has_index, "partial index must exist");
+    }
+
+    #[test]
+    fn migration_0020_widens_task_kind_check_to_accept_root_purge() {
+        let database = migrated_database();
+        let (root_id, _folder_id) = seed_media_page_fixture(&database);
+
+        // The new kind is accepted...
+        database
+            .connection
+            .execute(
+                r#"
+                INSERT INTO tasks(kind, priority, status, root_id, file_id, created_at, updated_at, error)
+                VALUES ('root_purge', 0, 'pending', ?1, NULL, 0, 0, NULL)
+                "#,
+                [root_id],
+            )
+            .expect("root_purge kind must be accepted by the CHECK constraint");
+
+        // ...but the CHECK constraint still rejects unsupported kinds.
+        let rejected = database.connection.execute(
+            r#"
+            INSERT INTO tasks(kind, priority, status, root_id, file_id, created_at, updated_at, error)
+            VALUES ('bogus_kind', 0, 'pending', ?1, NULL, 0, 0, NULL)
+            "#,
+            [root_id],
+        );
+        assert!(
+            rejected.is_err(),
+            "unsupported task kinds must still be rejected"
+        );
+
+        // The rebuild must not have dropped any of the tasks indexes.
+        for index_name in [
+            "idx_tasks_status_priority",
+            "idx_tasks_kind_file_status",
+            "idx_tasks_kind_status_priority",
+        ] {
+            let exists: bool = database
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index_name],
+                    |_| Ok(true),
+                )
+                .optional()
+                .expect("query index")
+                .unwrap_or(false);
+            assert!(exists, "{index_name} must survive the tasks rebuild");
+        }
     }
 }

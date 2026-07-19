@@ -24,6 +24,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0017_thumbnail_task_indexes.sql",
     ROOT / "crates" / "core" / "migrations" / "0018_thumb_failure_kind.sql",
     ROOT / "crates" / "core" / "migrations" / "0019_root_pending_delete.sql",
+    ROOT / "crates" / "core" / "migrations" / "0020_root_purge_task_kind.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -156,6 +157,20 @@ def apply_migration(conn: sqlite3.Connection, migration: Path) -> None:
         if not table_has_column(conn, "media", "preview_placeholder_format"):
             conn.execute(
                 "ALTER TABLE media ADD COLUMN preview_placeholder_format TEXT NOT NULL DEFAULT 'image/webp'"
+            )
+        conn.executescript(migration.read_text(encoding="utf-8"))
+        return
+    if name == "0020_root_purge_task_kind.sql":
+        # This migration's Rust counterpart always runs after the in-code
+        # `interactive_folder_scan_task_contract` migration (version 14, which
+        # adds `tasks.folder_id` and is never mirrored here as a standalone
+        # file), so by the time it runs on a real database `folder_id` already
+        # exists. This standalone schema check applies the numbered .sql files
+        # only, so backfill that prerequisite column first, same defensive
+        # shape as the 0009 special case above.
+        if not table_has_column(conn, "tasks", "folder_id"):
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL"
             )
         conn.executescript(migration.read_text(encoding="utf-8"))
         return
