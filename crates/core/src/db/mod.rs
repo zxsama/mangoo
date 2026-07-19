@@ -1209,6 +1209,8 @@ impl Database {
         Ok(id)
     }
 
+    #[allow(dead_code)] // soft-delete path retired by remove_root (Task 7); still exercised by
+                        // recovery tests until Task 10 formally removes it.
     pub fn disable_root(&self, root_id: i64) -> anyhow::Result<bool> {
         let transaction = self.connection.unchecked_transaction()?;
         let updated = transaction.execute(

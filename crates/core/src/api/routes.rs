@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 
 use crate::api::AppState;
 use crate::db::{
-    Database, FolderRecord, MediaPageQuery, MediaRecord, NewRoot, PluginRecord, RootRecord,
-    SearchQuery, TagError, TagRecord, TaskRecord, ThumbBlobRecord, ThumbnailCacheClearResult,
-    ThumbnailCacheEnqueueResult, ThumbnailCacheRefreshMode, ThumbnailCacheScope,
-    ThumbnailCacheStats, ThumbnailRecord, ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority,
-    UserMetadataPatch, UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
+    Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot, PluginRecord,
+    RootRecord, SearchQuery, TagError, TagRecord, TaskRecord, ThumbBlobRecord,
+    ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult, ThumbnailCacheRefreshMode,
+    ThumbnailCacheScope, ThumbnailCacheStats, ThumbnailRecord, ThumbnailScopeLeaverPolicy,
+    ThumbnailTaskPriority, UserMetadataPatch, UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
 };
 use crate::fsops::{
     self, DeleteRequest, FileOperationRecord, FsOpsError, FsOpsErrorCode, MoveRequest,
@@ -702,14 +702,25 @@ async fn remove_root(
     State(state): State<AppState>,
     Path(root_id): Path<i64>,
 ) -> ApiResult<(StatusCode, Json<AcceptedResponse>)> {
-    run_shared_database(state, move |database| {
-        if !database.disable_root(root_id)? {
-            return Err(CoreError::not_found(format!("root not found: {root_id}")));
-        }
-        Ok(())
+    let outcome = run_shared_database(state.clone(), move |database| {
+        database
+            .mark_root_for_purge(root_id)
+            .map_err(CoreError::from)
     })
     .await?;
-    Ok((StatusCode::ACCEPTED, Json(accepted())))
+    match outcome {
+        MarkRootForPurge::NotFound => {
+            Err(CoreError::not_found(format!("root not found: {root_id}")))
+        }
+        MarkRootForPurge::AlreadyPending => Ok((StatusCode::ACCEPTED, Json(accepted()))),
+        MarkRootForPurge::Marked {
+            task_id,
+            attempt_generation,
+        } => {
+            enqueue_task(&state, task_id, attempt_generation).await?;
+            Ok((StatusCode::ACCEPTED, Json(accepted())))
+        }
+    }
 }
 
 async fn list_folder_children(
@@ -4102,6 +4113,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_root_marks_pending_delete_and_enqueues_purge() {
+        let database = test_database();
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "D:/purge-route".to_string(),
+                display_name: "Purge".to_string(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(crate::db::FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "h".to_string(),
+                mtime: Some(1),
+            })
+            .expect("folder");
+        let file_id = database
+            .upsert_file(crate::db::FileUpsert {
+                root_id,
+                folder_id,
+                name: "a.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 1,
+                mtime: 1,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("file");
+        database.upsert_media_kind(file_id, "image").expect("media");
+        // No worker: build an AppState whose task_queue channel is never
+        // drained (the receiver is held but never `.recv()`'d), so the
+        // enqueued root_purge task is created and accepted but never run.
+        // Mirrors `enqueue_scan_route_does_not_wait_for_full_worker_channel`'s
+        // manual AppState construction above. `AppState::new` can't be used
+        // here: for an in-memory database it drops the receiver immediately,
+        // which closes the channel and makes enqueue fail hard.
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let state = AppState {
+            writer: crate::db::DbWriter::spawn(database),
+            fsops_database: None,
+            task_queue: sender,
+            plugins_dir: None,
+            read_database_path: None,
+            _watcher: None,
+            root_reachability: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/roots/{root_id}"))
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("delete root");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        // Root hidden from GET /api/roots immediately.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/roots")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("list roots");
+        let body = response_json(response).await;
+        assert!(
+            body["items"].as_array().expect("items").is_empty(),
+            "root hidden"
+        );
+
+        // A root_purge task was enqueued; files are still present (async purge
+        // was never run — there is no worker in this test's AppState).
+        let tasks = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/tasks")
+                        .body(Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("list tasks"),
+        )
+        .await;
+        let has_purge = tasks["items"]
+            .as_array()
+            .expect("task items")
+            .iter()
+            .any(|task| task["kind"] == "root_purge");
+        assert!(has_purge, "root_purge task enqueued");
+
+        // DELETE of a missing root -> 404.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/roots/999999")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("delete missing");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn remove_root_hides_root_media_and_rejects_future_scans() {
         let temp_root = unique_temp_dir();
         fs::create_dir_all(&temp_root).expect("create root dir");
@@ -4166,6 +4295,38 @@ mod tests {
         let body = response_json(response).await;
         assert!(body["items"].as_array().expect("media items").is_empty());
 
+        // `DELETE /api/roots/{id}` now hard-deletes: it marks the root
+        // pending-delete and enqueues a `root_purge` task (Task 7) that a real
+        // worker (this test uses `AppState::new_with_worker`) drains in the
+        // background. Find that task and wait for it to actually finish
+        // before asserting the scan-enqueue status below, otherwise this
+        // assertion races the purge worker. The task self-deletes on
+        // completion instead of reaching a terminal status (see tasks.rs:
+        // "the final batch deleted this task's own row + the roots row"), so
+        // wait for its row to disappear rather than for a "succeeded" status
+        // it will never reach.
+        let tasks_after_delete = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/tasks")
+                        .body(Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("list tasks after delete"),
+        )
+        .await;
+        let purge_task_id = tasks_after_delete["items"]
+            .as_array()
+            .expect("task items")
+            .iter()
+            .find(|task| task["kind"] == "root_purge" && task["rootId"] == root_id)
+            .and_then(|task| task["id"].as_i64())
+            .expect("root_purge task enqueued for removed root");
+        wait_for_task_absent(&app, purge_task_id).await;
+
         let response = app
             .clone()
             .oneshot(
@@ -4179,8 +4340,12 @@ mod tests {
                     .expect("build request"),
             )
             .await
-            .expect("enqueue scan for disabled root");
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+            .expect("enqueue scan for removed root");
+        // Once the purge worker finishes, the `roots` row itself is gone (not
+        // merely disabled), so `enqueue_scan`'s `get_root` lookup fails and
+        // the route now returns 404 NOT_FOUND instead of the old soft-delete
+        // behavior's 409 CONFLICT (root exists but disabled).
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         drop(app);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -5431,6 +5596,38 @@ mod tests {
             "task {task_id} did not reach status {expected_status}; last status was {:?}",
             last_status
         );
+    }
+
+    /// Polls `GET /api/tasks` until `task_id` is no longer present. Used for
+    /// tasks that self-delete on completion (e.g. `root_purge`) instead of
+    /// reaching a terminal status, so `wait_for_task_status` cannot observe
+    /// them finishing.
+    async fn wait_for_task_absent(app: &axum::Router, task_id: i64) {
+        for _ in 0..250 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/tasks")
+                        .body(Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("list tasks");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            let present = body["items"]
+                .as_array()
+                .expect("task items")
+                .iter()
+                .any(|task| task["id"] == task_id);
+            if !present {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("task {task_id} did not disappear (root_purge did not complete in time)");
     }
 
     async fn wait_for_media_count(app: &axum::Router, root_id: i64, expected_count: usize) {
