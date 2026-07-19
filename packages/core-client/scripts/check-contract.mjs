@@ -112,6 +112,19 @@ function assertInterfaceMatchesSchema(name) {
   }
 }
 
+function generatedTypeBody(name) {
+  const match = generated.match(new RegExp(`export\\s+type\\s+${name}\\s*=([\\s\\S]*?);`));
+  return match?.[1]?.replace(/\s+/g, " ").replace(/^\s*\|\s*/, "").trim() ?? "";
+}
+
+function assertEnumMatchesGeneratedType(name) {
+  const expected = (schema(name).enum ?? []).map((item) => JSON.stringify(item)).join(" | ");
+  const actual = generatedTypeBody(name);
+  if (actual !== expected) {
+    fail(`generated-contract.ts ${name} must equal OpenAPI enum ${expected}`);
+  }
+}
+
 function parameterName(parameter) {
   return dereference(parameter)?.name;
 }
@@ -139,11 +152,46 @@ function assertOperationParameters(operationId, names) {
   }
 }
 
+function assertExactOperationParameters(operationId, names) {
+  const found = operation(operationId);
+  if (!found) return;
+  const actual = (found.operation.parameters ?? []).map(parameterName);
+  if (actual.length !== names.length || names.some((name) => !actual.includes(name))) {
+    fail(`OpenAPI operation ${operationId} parameters must be exactly ${names.join(", ")}`);
+  }
+}
+
+function assertOperationRoute(operationId, method, route) {
+  const found = operation(operationId);
+  if (!found) return;
+  if (found.method !== method || found.route !== route) {
+    fail(`OpenAPI operation ${operationId} must be ${method.toUpperCase()} ${route}`);
+  }
+}
+
 function operationParameter(operationId, name) {
   const found = operation(operationId);
   return (found?.operation.parameters ?? [])
     .map(dereference)
     .find((parameter) => parameter?.name === name);
+}
+
+function assertIntegerParameterBounds(operationId, name, minimum, maximum) {
+  const parameter = operationParameter(operationId, name);
+  if (!parameter) {
+    fail(`OpenAPI operation ${operationId} missing parameter ${name}`);
+    return;
+  }
+  const parameterSchema = dereference(parameter.schema);
+  if (parameterSchema?.type !== "integer") {
+    fail(`OpenAPI parameter ${name} for ${operationId} must be an integer`);
+  }
+  if (parameterSchema?.minimum !== minimum) {
+    fail(`OpenAPI parameter ${name} for ${operationId} must have minimum ${minimum}`);
+  }
+  if (parameterSchema?.maximum !== maximum) {
+    fail(`OpenAPI parameter ${name} for ${operationId} must have maximum ${maximum}`);
+  }
 }
 
 function assertParamLine(interfaceName, parameterName, line) {
@@ -164,6 +212,10 @@ const client = read("packages/core-client/src/client.ts");
 
 const schemas = contract.components?.schemas ?? {};
 
+if (schemas.ListNotificationOutboxParams) {
+  fail("OpenAPI must define notification outbox query parameters on the endpoint, not a duplicate component schema");
+}
+
 for (const name of [
   "AcceptedRootResponse",
   "ScanTaskRequest",
@@ -183,6 +235,14 @@ for (const name of [
   "TaskStatus",
   "TaskRecord",
   "TaskListResponse",
+  "NotificationOrigin",
+  "NotificationPresentation",
+  "NotificationOperationStatus",
+  "NotificationOperationSnapshot",
+  "NotificationOutboxEvent",
+  "NotificationOutboxResponse",
+  "NotificationOutboxAckRequest",
+  "NotificationOutboxAckResponse",
   "TagRecord",
   "TagListResponse",
   "CreateTagRequest",
@@ -218,6 +278,11 @@ assertInterfaceMatchesSchema("MediaRecord");
 assertInterfaceMatchesSchema("ThumbnailAsset");
 assertInterfaceMatchesSchema("ThumbnailResponse");
 assertInterfaceMatchesSchema("TaskRecord");
+assertInterfaceMatchesSchema("NotificationOperationSnapshot");
+assertInterfaceMatchesSchema("NotificationOutboxEvent");
+assertInterfaceMatchesSchema("NotificationOutboxResponse");
+assertInterfaceMatchesSchema("NotificationOutboxAckRequest");
+assertInterfaceMatchesSchema("NotificationOutboxAckResponse");
 assertInterfaceMatchesSchema("TagRecord");
 assertInterfaceMatchesSchema("CreateTagRequest");
 assertInterfaceMatchesSchema("DeleteTagResponse");
@@ -235,6 +300,17 @@ assertInterfaceMatchesSchema("PluginRecord");
 assertInterfaceMatchesSchema("PluginDiscoveryError");
 assertInterfaceMatchesSchema("PluginDiscoveryResponse");
 assertInterfaceMatchesSchema("DeletePluginResponse");
+
+for (const name of ["NotificationOrigin", "NotificationPresentation", "NotificationOperationStatus"]) {
+  assertEnumMatchesGeneratedType(name);
+}
+
+const notificationSnapshotBody = interfaceBody("NotificationOperationSnapshot");
+requireLine(
+  notificationSnapshotBody,
+  'category: "task" | "file_operation" | "error" | "thumbnail_cache";',
+  "generated-contract.ts NotificationOperationSnapshot"
+);
 
 const pageBody = interfaceBody("Page");
 for (const line of ["items: T[];", "nextCursor: string | null;", "totalCount?: number;"]) {
@@ -274,6 +350,20 @@ assertOperationParameters("getThumbnail", ["fileId", "target", "priority"]);
 assertOperationParameters("getThumbnailBlob", ["fileId", "target"]);
 operation("syncThumbnailPriorityScope");
 assertOperationParameters("searchMedia", ["rootId", "folderId", "limit", "offset", "cursor", "sort", "kind"]);
+assertOperationRoute("listNotificationOutbox", "get", "/notifications/outbox");
+assertOperationRoute("ackNotificationOutbox", "post", "/notifications/outbox/ack");
+assertExactOperationParameters("listNotificationOutbox", ["afterSequence", "limit", "waitMs"]);
+assertIntegerParameterBounds("listNotificationOutbox", "limit", 1, 200);
+assertIntegerParameterBounds("listNotificationOutbox", "waitMs", 0, 30000);
+
+const listNotificationOutboxBody = interfaceBody("ListNotificationOutboxParams");
+for (const line of [
+  "afterSequence?: number;",
+  "limit?: number;",
+  "waitMs?: number;"
+]) {
+  requireLine(listNotificationOutboxBody, line, "generated-contract.ts ListNotificationOutboxParams");
+}
 
 for (const method of [
   "listRoots",
@@ -305,6 +395,8 @@ for (const method of [
   "moveFileOps",
   "deleteFileOps",
   "listFileOperations",
+  "listNotificationOutbox",
+  "ackNotificationOutbox",
   "listPlugins",
   "getPlugin",
   "discoverPlugins",
@@ -315,6 +407,30 @@ for (const method of [
   if (!client.includes(`${method}:`)) {
     fail(`client.ts missing operation ${method}`);
   }
+}
+
+if (
+  !/listNotificationOutbox:\s*\(\s*params:\s*ListNotificationOutboxParams,\s*options:\s*CoreRequestOptions\s*=\s*\{\}\s*\)\s*=>[\s\S]*?request<NotificationOutboxResponse>\(\s*`\/notifications\/outbox\$\{notificationOutboxQuery\(params\)\}`,\s*\{[\s\S]*?requestPriority:\s*options\.requestPriority\s*\?\?\s*"metadata",[\s\S]*?signal:\s*options\.signal[\s\S]*?\}\s*\)/.test(
+    client
+  )
+) {
+  fail("client.ts listNotificationOutbox must serialize the typed query and forward metadata priority overrides and abort signals");
+}
+
+if (
+  !/ackNotificationOutbox:\s*\(body:\s*NotificationOutboxAckRequest\)\s*=>\s*request<NotificationOutboxAckResponse>\("\/notifications\/outbox\/ack",\s*\{[\s\S]*?method:\s*"POST",[\s\S]*?requestPriority:\s*"metadata",[\s\S]*?body:\s*JSON\.stringify\(body\)[\s\S]*?\}\s*\)/.test(
+    client
+  )
+) {
+  fail("client.ts ackNotificationOutbox must POST the typed acknowledgement at metadata priority");
+}
+
+if (
+  !/function notificationOutboxQuery\(params:\s*ListNotificationOutboxParams\):\s*string[\s\S]*?typeof params\.afterSequence !== "undefined"[\s\S]*?typeof params\.limit !== "undefined"[\s\S]*?typeof params\.waitMs !== "undefined"/.test(
+    client
+  )
+) {
+  fail("client.ts notificationOutboxQuery must serialize only defined query values");
 }
 
 const thumbnailBody = interfaceBody("ThumbnailResponse");

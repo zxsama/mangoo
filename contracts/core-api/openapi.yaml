@@ -1392,20 +1392,6 @@ components:
       properties:
         acknowledged:
           type: boolean
-    ListNotificationOutboxParams:
-      type: object
-      properties:
-        afterSequence:
-          type: integer
-          minimum: 0
-        limit:
-          type: integer
-          minimum: 1
-          maximum: 200
-        waitMs:
-          type: integer
-          minimum: 0
-          maximum: 30000
     RootRecord:
       type: object
       required: [id, path, displayName, enabled, createdAt, lastScanAt, rootFolderId, mediaCount, reachable]

@@ -517,6 +517,7 @@ describe("createCoreClient", () => {
     );
     const url = new URL(recorded[0].url);
     assert.equal(recorded[0].method, "GET");
+    assert.equal(recorded[0].headers["x-megle-session"], "secret");
     assert.equal(url.pathname, "/api/notifications/outbox");
     assert.equal(url.searchParams.get("afterSequence"), "41");
     assert.equal(url.searchParams.get("limit"), "100");
@@ -529,7 +530,28 @@ describe("createCoreClient", () => {
     await client().ackNotificationOutbox({ maxSequence: 57 });
     assert.equal(recorded[0].method, "POST");
     assert.equal(recorded[0].url, `${BASE_URL}/notifications/outbox/ack`);
+    assert.equal(recorded[0].headers["x-megle-session"], "secret");
+    assert.equal(recorded[0].headers["content-type"], "application/json");
     assert.deepEqual(JSON.parse(recorded[0].body!), { maxSequence: 57 });
+  });
+
+  test("listNotificationOutbox preserves zero query values and omits undefined values", async () => {
+    mockFetch({ items: [], maxSequence: 0 });
+    await client().listNotificationOutbox({ afterSequence: 0, limit: 0, waitMs: 0 });
+    const zeroUrl = new URL(recorded[0].url);
+    assert.equal(zeroUrl.searchParams.get("afterSequence"), "0");
+    assert.equal(zeroUrl.searchParams.get("limit"), "0");
+    assert.equal(zeroUrl.searchParams.get("waitMs"), "0");
+
+    await client().listNotificationOutbox({
+      afterSequence: undefined,
+      limit: undefined,
+      waitMs: undefined
+    });
+    const undefinedUrl = new URL(recorded[1].url);
+    assert.equal(undefinedUrl.searchParams.has("afterSequence"), false);
+    assert.equal(undefinedUrl.searchParams.has("limit"), false);
+    assert.equal(undefinedUrl.searchParams.has("waitMs"), false);
   });
 
   test("plugin endpoints encode the id", async () => {
