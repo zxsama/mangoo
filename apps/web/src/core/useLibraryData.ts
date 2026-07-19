@@ -2507,14 +2507,22 @@ export function useLibraryData(
   const removeRoot = useCallback(
     async (rootId: number) => {
       setError(null);
+      // Optimistic: drop the root from the sidebar immediately.
+      setRoots((current) => current.filter((root) => root.id !== rootId));
+      if (selectedRootIdRef.current === rootId) {
+        selectRoot(null);
+      }
       try {
         await client.removeRoot(rootId);
-        await loadLibrary({ rootId: null, folderId: null });
+        // Purge runs in the background; resync the lightweight roots list so any
+        // server-side correction reconciles (without a full loadLibrary reflow).
+        await refreshRootsList();
       } catch (cause) {
         setError(errorMessage(cause));
+        await refreshRootsList();
       }
     },
-    [client, loadLibrary]
+    [client, refreshRootsList]
   );
 
   const markTaskBusy = useCallback((taskId: number, busy: boolean) => {

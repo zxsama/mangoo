@@ -7590,3 +7590,27 @@ button:disabled {
 }
 .library-switcher-footer { display: flex; flex-direction: column; padding: 8px; gap: 2px; border-top: 1px solid var(--line); }
 .library-switcher-footer button { text-align: left; background: transparent; border: 1px solid transparent; color: var(--text-soft); padding: 8px; border-radius: var(--radius-control); cursor: pointer; font-size: 13px; }
+/* Two-step remove-folder confirmation, layered above the switcher popup itself
+   (higher z-index backdrop) so cancelling it never closes the switcher. */
+.library-switcher-confirm-backdrop {
+  position: fixed; inset: 0; z-index: 50;
+  display: grid; place-items: center;
+  background: rgba(0, 0, 0, 0.35);
+}
+.library-switcher-confirm {
+  width: 340px; max-width: calc(100vw - 32px);
+  background: var(--surface-elevated, #1c1c1e); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: var(--shadow-elevated, 0 18px 48px rgba(0, 0, 0, 0.45));
+  padding: 16px; color: var(--text-soft);
+}
+.library-switcher-confirm-title { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+.library-switcher-confirm-body { display: grid; gap: 4px; margin-bottom: 14px; }
+.library-switcher-confirm-body p { margin: 0; font-size: 12px; line-height: 1.5; color: var(--text-muted); white-space: pre-wrap; }
+.library-switcher-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.library-switcher-confirm-cancel,
+.library-switcher-confirm-remove {
+  padding: 6px 14px; border-radius: var(--radius-control); border: 1px solid transparent;
+  font-size: 13px; cursor: pointer;
+}
+.library-switcher-confirm-cancel { background: transparent; border-color: var(--line); color: var(--text-soft); }
+.library-switcher-confirm-remove { background: var(--danger, #e5484d); color: #fff; }
