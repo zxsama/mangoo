@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::db::{
-    Database, DbWriter, TaskScanProgress, ThumbBlobRecord, ThumbnailStateUpsert,
+    Database, DbWriter, TaskScanProgress, ThumbBlobRecord, ThumbnailStateUpsert, PURGE_BATCH_SIZE,
     ROOT_SCAN_TASK_PRIORITY, THUMBNAIL_SELECTED_PRIORITY,
 };
 use crate::scan::{ScanOptions, TaskAttemptGuard};
@@ -1029,6 +1029,57 @@ fn run_task_with_database(
                 &cache_root,
                 ffmpeg_available,
             )
+        }
+        "root_purge" => {
+            database.mark_task_running_for_attempt(task_id, attempt_generation)?;
+            invoke_worker_task_hook("root_purge", task_id, database.path());
+            let root_id = task
+                .root_id
+                .ok_or_else(|| anyhow::anyhow!("root_purge task missing root id: {task_id}"))?;
+            let mut total_deleted: i64 = 0;
+            loop {
+                // One bounded batch = one short writer job (or inline when there is no
+                // writer, i.e. in-memory tests).
+                let outcome = match writer {
+                    Some(writer) => writer.write_blocking(move |db| {
+                        db.purge_root_next_batch(root_id, PURGE_BATCH_SIZE)
+                    })?,
+                    None => database.purge_root_next_batch(root_id, PURGE_BATCH_SIZE)?,
+                };
+                total_deleted += outcome.rows_deleted as i64;
+                if outcome.done {
+                    // The final batch deleted this task's own row + the roots row, so
+                    // there is nothing left to mark succeeded or to update progress on.
+                    break;
+                }
+                // Task row still exists between batches: surface progress for the Task Center.
+                let progress = TaskScanProgress {
+                    items_seen: total_deleted,
+                    items_total: None,
+                    folders_seen: 0,
+                    media_files_seen: 0,
+                    skipped_files: 0,
+                };
+                match writer {
+                    Some(writer) => {
+                        let _ = writer.write_blocking(move |db| {
+                            db.update_task_scan_progress_for_attempt(
+                                task_id,
+                                attempt_generation,
+                                progress,
+                            )
+                        });
+                    }
+                    None => {
+                        let _ = database.update_task_scan_progress_for_attempt(
+                            task_id,
+                            attempt_generation,
+                            progress,
+                        );
+                    }
+                }
+            }
+            Ok(())
         }
         other => Err(anyhow::anyhow!("unsupported task kind: {other}")),
     }
@@ -4821,5 +4872,63 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&writer_db_dir);
+    }
+
+    #[test]
+    fn root_purge_task_drains_root_and_completes() {
+        let mut database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/purge".to_string(),
+                display_name: "purge".to_string(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "root-purge-task-folder".to_string(),
+                mtime: Some(1),
+            })
+            .expect("folder");
+        let file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "a.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 1,
+                mtime: 1,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("file");
+        database
+            .upsert_media_kind(file_id, "image")
+            .expect("media kind");
+
+        let task_id = match database.mark_root_for_purge(root_id).expect("mark") {
+            crate::db::MarkRootForPurge::Marked { task_id, .. } => task_id,
+            other => panic!("expected Marked, got {other:?}"),
+        };
+
+        // No writer (in-memory): purge runs inline. Drive the task through the worker.
+        run_task(&mut database, None, task_id, true);
+
+        // Root + all its rows are gone; the task self-deleted.
+        assert!(
+            database.get_root(root_id).expect("get root").is_none(),
+            "root purged"
+        );
+        assert!(
+            database.get_media(file_id).expect("get media").is_none(),
+            "files purged"
+        );
+        assert!(
+            database.get_task(task_id).expect("get task").is_none(),
+            "root_purge task self-deleted"
+        );
     }
 }
