@@ -347,14 +347,42 @@ fn collect_recovery_candidates(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
+    use std::thread;
     use std::time::Duration;
 
     use super::*;
+
+    static NEXT_TEMP_DATABASE: AtomicUsize = AtomicUsize::new(0);
 
     fn migrated_database() -> Database {
         let database = Database::open_in_memory().expect("open database");
         database.apply_migrations().expect("apply migrations");
         database
+    }
+
+    fn temporary_database_path(label: &str) -> PathBuf {
+        let serial = NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "megle-notification-{label}-{}-{}-{serial}.sqlite",
+            std::process::id(),
+            super::super::unix_timestamp_millis()
+        ))
+    }
+
+    fn head_revision_and_dirty(database: &Database, operation_id: &str) -> (i64, i64) {
+        database
+            .connection
+            .query_row(
+                "SELECT revision, dirty FROM notification_operation_heads WHERE operation_id = ?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("notification head")
     }
 
     fn fixture_operation(
@@ -459,6 +487,82 @@ mod tests {
     }
 
     #[test]
+    fn dirty_flush_is_idempotent_and_clears_the_head() {
+        let db = migrated_database();
+        let mut operation = fixture_operation("task:flush", "root_scan", "running", 1_000);
+        assert!(db
+            .publish_notification_operation(&mut operation, PublishMode::Phase)
+            .unwrap());
+        operation.current_value = 20;
+        operation.updated_at += 100;
+        assert!(!db
+            .publish_notification_operation(&mut operation, PublishMode::Progress)
+            .unwrap());
+        assert_eq!(head_revision_and_dirty(&db, "task:flush"), (2, 1));
+        assert_eq!(db.list_notification_outbox(0, 100).unwrap().len(), 1);
+
+        assert_eq!(db.flush_dirty_notification_heads().unwrap(), 1);
+        assert_eq!(head_revision_and_dirty(&db, "task:flush"), (2, 0));
+        let flushed = db.list_notification_outbox(0, 100).unwrap();
+        assert_eq!(flushed.len(), 2);
+        assert_eq!(flushed[1].operation.current_value, 20);
+
+        assert_eq!(db.flush_dirty_notification_heads().unwrap(), 0);
+        assert_eq!(db.list_notification_outbox(0, 100).unwrap(), flushed);
+        assert_eq!(head_revision_and_dirty(&db, "task:flush"), (2, 0));
+    }
+
+    #[test]
+    fn failed_dirty_flush_rolls_back_all_outbox_and_dirty_changes() {
+        let db = migrated_database();
+        for operation_id in ["task:flush-a", "task:flush-b"] {
+            let mut operation = fixture_operation(operation_id, "root_scan", "running", 1_000);
+            assert!(db
+                .publish_notification_operation(&mut operation, PublishMode::Phase)
+                .unwrap());
+            operation.current_value = 20;
+            operation.updated_at += 100;
+            assert!(!db
+                .publish_notification_operation(&mut operation, PublishMode::Progress)
+                .unwrap());
+        }
+        assert_eq!(head_revision_and_dirty(&db, "task:flush-a"), (2, 1));
+        assert_eq!(head_revision_and_dirty(&db, "task:flush-b"), (2, 1));
+        let before = db.list_notification_outbox(0, 100).unwrap();
+
+        db.connection
+            .execute(
+                "UPDATE notification_operation_heads SET payload_json = ?2 WHERE operation_id = ?1",
+                params!["task:flush-b", "not-json"],
+            )
+            .expect("corrupt second dirty payload for rollback test");
+        assert!(db.flush_dirty_notification_heads().is_err());
+
+        assert_eq!(db.list_notification_outbox(0, 100).unwrap(), before);
+        assert_eq!(head_revision_and_dirty(&db, "task:flush-a"), (2, 1));
+        assert_eq!(head_revision_and_dirty(&db, "task:flush-b"), (2, 1));
+    }
+
+    #[test]
+    fn failed_publish_rolls_back_head_and_outbox() {
+        let db = migrated_database();
+        let mut operation = fixture_operation("task:publish", "root_scan", "running", 1_000);
+        assert!(db
+            .publish_notification_operation(&mut operation, PublishMode::Phase)
+            .unwrap());
+        let before = db.list_notification_outbox(0, 100).unwrap();
+
+        operation.status = "invalid-status".to_string();
+        operation.updated_at += 100;
+        assert!(db
+            .publish_notification_operation(&mut operation, PublishMode::Progress)
+            .is_err());
+
+        assert_eq!(db.list_notification_outbox(0, 100).unwrap(), before);
+        assert_eq!(head_revision_and_dirty(&db, "task:publish"), (1, 0));
+    }
+
+    #[test]
     fn thumbnail_task_is_rejected_but_aggregate_is_allowed() {
         let db = migrated_database();
         let mut thumbnail_task = fixture_operation("task:thumb", "thumbnail", "running", 10);
@@ -508,11 +612,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn wake_is_sent_after_commit_and_shared_by_reopened_database() {
-        let path = std::env::temp_dir().join(format!(
-            "megle-notification-wake-{}-{}.sqlite",
-            std::process::id(),
-            super::super::unix_timestamp_millis()
-        ));
+        let path = temporary_database_path("wake");
         let _ = std::fs::remove_file(&path);
         let db = Database::open(&path).expect("open file database");
         db.apply_migrations().expect("apply migrations");
@@ -531,6 +631,86 @@ mod tests {
             .expect("waiter task");
         drop(reopened);
         drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rollback_does_not_wake_but_successful_commit_does() {
+        let db = migrated_database();
+        let wake = db.notification_outbox_wake();
+
+        let failed_notification = wake.notified();
+        let mut invalid = fixture_operation("task:rollback", "root_scan", "running", 1_000);
+        invalid.status = "invalid-status".to_string();
+        assert!(db
+            .publish_notification_operation(&mut invalid, PublishMode::Phase)
+            .is_err());
+        assert!(db.list_notification_outbox(0, 100).unwrap().is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), failed_notification)
+                .await
+                .is_err()
+        );
+
+        let committed_notification = wake.notified();
+        let mut valid = fixture_operation("task:commit", "root_scan", "running", 1_000);
+        assert!(db
+            .publish_notification_operation(&mut valid, PublishMode::Phase)
+            .unwrap());
+        tokio::time::timeout(Duration::from_secs(1), committed_notification)
+            .await
+            .expect("successful commit should wake");
+    }
+
+    #[test]
+    fn concurrent_phase_publishes_have_unique_contiguous_revisions() {
+        const PUBLISHERS: usize = 8;
+        let path = temporary_database_path("concurrent");
+        let database = Database::open(&path).expect("open file database");
+        database.apply_migrations().expect("apply migrations");
+        drop(database);
+
+        let barrier = Arc::new(Barrier::new(PUBLISHERS));
+        let mut handles = Vec::with_capacity(PUBLISHERS);
+        for index in 0..PUBLISHERS {
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            handles.push(thread::spawn(move || -> Result<(), String> {
+                let database = Database::open(&path).map_err(|error| error.to_string())?;
+                barrier.wait();
+                let mut operation = fixture_operation(
+                    "task:concurrent",
+                    "root_scan",
+                    "running",
+                    1_000 + index as i64,
+                );
+                database
+                    .publish_notification_operation(&mut operation, PublishMode::Phase)
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("publisher thread should not panic")
+                .expect("publish should succeed");
+        }
+
+        let database = Database::open(&path).expect("reopen file database");
+        let events = database.list_notification_outbox(0, 100).unwrap();
+        assert_eq!(events.len(), PUBLISHERS);
+        let mut revisions: Vec<_> = events
+            .iter()
+            .map(|event| event.operation.revision)
+            .collect();
+        revisions.sort_unstable();
+        assert_eq!(revisions, (1..=PUBLISHERS as i64).collect::<Vec<_>>());
+        let mut sequences: Vec<_> = events.iter().map(|event| event.sequence).collect();
+        sequences.sort_unstable();
+        sequences.dedup();
+        assert_eq!(sequences.len(), PUBLISHERS);
+        drop(database);
         let _ = std::fs::remove_file(path);
     }
 }
