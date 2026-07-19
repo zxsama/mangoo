@@ -761,8 +761,16 @@ impl Database {
             transaction.commit()?;
         }
         if !self.migration_applied(19)? {
-            self.connection
-                .execute_batch(migrations::ROOT_PENDING_DELETE_MIGRATION)?;
+            // Atomicity: the ALTER TABLE + partial index + schema_migrations
+            // registration must commit together (same pattern as the
+            // migration-18 gate above). Without a transaction, a crash between
+            // the ALTER and the schema_migrations INSERT leaves the column
+            // added but `migration_applied(19)` still false, so the next
+            // startup re-runs `ALTER TABLE ADD COLUMN` and fails with
+            // "duplicate column name" — the library would never open again.
+            let transaction = self.connection.unchecked_transaction()?;
+            transaction.execute_batch(migrations::ROOT_PENDING_DELETE_MIGRATION)?;
+            transaction.commit()?;
         }
         if !self.migration_applied(20)? {
             let result = self
@@ -1579,6 +1587,20 @@ impl Database {
         Ok(updated)
     }
 
+    /// Reset a `root_purge` task stuck `running` from a crash mid-purge back to
+    /// `pending`, so startup recovery's drain (see `pending_drain_task_ids`)
+    /// picks it up. Must run BEFORE `ensure_pending_delete_purge_tasks`: once
+    /// reset to `pending`, that call's `status IN ('pending','running')` guard
+    /// sees an existing task and creates no duplicate.
+    pub fn reset_running_root_purge_tasks_for_recovery(&self) -> anyhow::Result<usize> {
+        let updated = self.connection.execute(
+            r#"UPDATE tasks SET status = 'pending', updated_at = ?1, error = NULL
+               WHERE kind = 'root_purge' AND status = 'running'"#,
+            [unix_timestamp()],
+        )?;
+        Ok(updated)
+    }
+
     pub fn reset_running_thumbnail_tasks_for_recovery(&self) -> anyhow::Result<usize> {
         let now = unix_timestamp();
         let transaction = self.connection.unchecked_transaction()?;
@@ -1629,6 +1651,26 @@ impl Database {
         )?;
         let rows = statement.query_map([], |row| row.get(0))?;
 
+        let mut task_ids = Vec::new();
+        for row in rows {
+            task_ids.push(row?);
+        }
+        Ok(task_ids)
+    }
+
+    /// Pending `root_purge` task ids, for the startup/idle drain. Deliberately
+    /// does NOT join `roots ON roots.enabled = 1`: a root mid-purge is marked
+    /// `enabled = 0` (see `mark_root_for_purge`), so requiring enabled=1 would
+    /// exclude the very tasks this drain exists to resume.
+    pub fn list_pending_root_purge_task_ids(&self) -> anyhow::Result<Vec<i64>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT id FROM tasks
+            WHERE kind = 'root_purge' AND status = 'pending'
+            ORDER BY priority DESC, created_at ASC, id ASC
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
         let mut task_ids = Vec::new();
         for row in rows {
             task_ids.push(row?);

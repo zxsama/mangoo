@@ -235,6 +235,9 @@ pub fn start_worker_with_ffmpeg(
         .reset_running_thumbnail_tasks_for_recovery()
         .expect("reset running thumbnail tasks for startup recovery");
     worker_database
+        .reset_running_root_purge_tasks_for_recovery()
+        .expect("reset running root_purge tasks for startup recovery");
+    worker_database
         .ensure_pending_delete_purge_tasks()
         .expect("re-enqueue root_purge for pending-delete roots at startup recovery");
     // WAL checkpoints are run by the single writer actor between job batches
@@ -363,6 +366,7 @@ fn pending_drain_task_ids(database: &Database) -> anyhow::Result<Vec<i64>> {
     task_ids.extend(database.list_pending_foreground_thumbnail_task_ids()?);
     task_ids.extend(database.list_pending_interactive_folder_scan_task_ids()?);
     task_ids.extend(database.list_pending_root_scan_task_ids()?);
+    task_ids.extend(database.list_pending_root_purge_task_ids()?);
     task_ids.extend(database.list_pending_background_thumbnail_task_ids()?);
     Ok(task_ids)
 }
@@ -4932,6 +4936,104 @@ mod tests {
         assert!(
             database.get_task(task_id).expect("get task").is_none(),
             "root_purge task self-deleted"
+        );
+    }
+
+    #[test]
+    fn worker_drain_picks_up_persisted_pending_root_purge_task_after_crash_before_send() {
+        // Regression for Critical 1: `mark_root_for_purge` persists a pending
+        // `root_purge` task, but if the process crashes (or the enqueue send
+        // is otherwise never delivered) before that task id reaches the
+        // in-memory worker channel, the ONLY other path that can ever run it
+        // is the startup/idle drain (`pending_drain_task_ids`). Before this
+        // fix that function did not list `root_purge` tasks at all, so a
+        // pending-delete root would be stuck forever: hidden from
+        // list_roots/get_root, its files never deleted, and any future
+        // add_root of the same path permanently 409ing.
+        let mut database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/purge-drain".to_string(),
+                display_name: "purge-drain".to_string(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "root-purge-drain-folder".to_string(),
+                mtime: Some(1),
+            })
+            .expect("folder");
+        let file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "a.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 1,
+                mtime: 1,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("file");
+        database
+            .upsert_media_kind(file_id, "image")
+            .expect("media kind");
+
+        // Mark the root for purge exactly like the remove_root route does.
+        // This persists a pending `root_purge` task but — unlike the live
+        // route path — we deliberately never deliver the task id to a worker
+        // channel, modeling a crash (or a dropped/failed send) between the DB
+        // commit and the enqueue.
+        let task_id = match database
+            .mark_root_for_purge(root_id)
+            .expect("mark for purge")
+        {
+            crate::db::MarkRootForPurge::Marked { task_id, .. } => task_id,
+            other => panic!("expected Marked, got {other:?}"),
+        };
+
+        // Sanity: the root is hidden from get_root (pending-delete), its row
+        // is still present pre-drain (only the background purge deletes it),
+        // and the purge task is sitting pending in the DB, never having
+        // touched a channel.
+        assert!(
+            database.get_root(root_id).expect("get root").is_none(),
+            "pending-delete root must already be hidden from get_root"
+        );
+        assert_eq!(
+            database
+                .roots_pending_delete_ids()
+                .expect("list pending-delete roots"),
+            vec![root_id],
+            "root row still present pre-drain, marked pending-delete"
+        );
+        let task = database
+            .get_task(task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(task.kind, "root_purge");
+        assert_eq!(task.status, "pending");
+
+        // Drive the SAME scheduler/idle-drain path startup recovery relies on
+        // (not `run_task` directly): it must discover the persisted pending
+        // root_purge task and run it to completion.
+        drain_pending_persisted_tasks(&mut database, true);
+
+        assert!(
+            database.get_root(root_id).expect("get root").is_none(),
+            "root_purge task must be discovered and run by the drain, deleting the root"
+        );
+        assert!(
+            database.get_media(file_id).expect("get media").is_none(),
+            "root_purge task must delete the root's files"
+        );
+        assert!(
+            database.get_task(task_id).expect("get task").is_none(),
+            "root_purge task self-deletes on completion"
         );
     }
 }
