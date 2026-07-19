@@ -295,8 +295,13 @@ export function interfaceStyleToCssVariables(
     normalized.sideOverlayColor,
     0.56 * normalized.sideOverlayStrength * normalized.sideOpacity
   );
-  const secondaryWindowPaneLight = colorWithAlpha(
+  const secondaryWindowPaneLightColor = mixHexColors(
     normalized.sideOverlayColor,
+    "#d6e1e3",
+    0.18
+  );
+  const secondaryWindowPaneLight = colorWithAlpha(
+    secondaryWindowPaneLightColor,
     0.2 * normalized.sideOverlayStrength * normalized.sideOpacity
   );
   const secondaryWindowPaneEnd = colorWithAlpha(
@@ -465,6 +470,20 @@ function hexToRgb(color: string) {
     green: Number.parseInt(normalized.slice(3, 5), 16),
     blue: Number.parseInt(normalized.slice(5, 7), 16)
   };
+}
+
+function mixHexColors(startColor: string, endColor: string, ratio: number) {
+  const start = hexToRgb(startColor);
+  const end = hexToRgb(endColor);
+  const clampedRatio = Math.min(1, Math.max(0, ratio));
+  const mixChannel = (startChannel: number, endChannel: number) =>
+    Math.round(startChannel + (endChannel - startChannel) * clampedRatio);
+  const channels = [
+    mixChannel(start.red, end.red),
+    mixChannel(start.green, end.green),
+    mixChannel(start.blue, end.blue)
+  ];
+  return `#${channels.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function clampRounded(value: number, min: number, max: number) {
