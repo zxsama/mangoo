@@ -672,7 +672,17 @@ fn run_task(
     task_id: i64,
     ffmpeg_available: bool,
 ) {
-    let attempt_generation = database.current_task_attempt_generation(task_id).ok();
+    let attempt_generation = match database.current_task_attempt_generation(task_id) {
+        Ok(attempt_generation) => Some(attempt_generation),
+        Err(error) => {
+            tracing::error!(
+                task_id,
+                %error,
+                "failed to read task attempt before handling worker error"
+            );
+            None
+        }
+    };
     if let Err(error) = run_task_with_database(database, writer, task_id, ffmpeg_available) {
         if error.downcast_ref::<CooperativeRootScanYield>().is_some() {
             return;
@@ -695,8 +705,18 @@ fn run_task(
 }
 
 fn handle_task_error(database: &mut Database, task_id: i64, error: anyhow::Error) {
-    if let Ok(attempt_generation) = database.current_task_attempt_generation(task_id) {
-        handle_task_error_for_attempt(database, task_id, attempt_generation, error);
+    match database.current_task_attempt_generation(task_id) {
+        Ok(attempt_generation) => {
+            handle_task_error_for_attempt(database, task_id, attempt_generation, error);
+        }
+        Err(database_error) => {
+            tracing::error!(
+                task_id,
+                error = %error,
+                %database_error,
+                "failed to resolve task attempt while handling worker error"
+            );
+        }
     }
 }
 
@@ -706,45 +726,103 @@ fn handle_task_error_for_attempt(
     attempt_generation: i64,
     error: anyhow::Error,
 ) {
-    if !database
-        .task_attempt_is_current(task_id, attempt_generation)
-        .unwrap_or(false)
-    {
-        return;
+    match database.task_attempt_is_current(task_id, attempt_generation) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                task_id,
+                attempt_generation,
+                "discarding worker error for stale task attempt"
+            );
+            return;
+        }
+        Err(database_error) => {
+            tracing::error!(
+                task_id,
+                attempt_generation,
+                %database_error,
+                "failed to verify task attempt while handling worker error"
+            );
+            return;
+        }
     }
-    if database.task_is_cancelled(task_id).unwrap_or(false) {
-        return;
+    match database.task_is_cancelled(task_id) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(database_error) => {
+            tracing::error!(
+                task_id,
+                attempt_generation,
+                %database_error,
+                "failed to check task cancellation while handling worker error"
+            );
+            return;
+        }
     }
     let error_message = error.to_string();
-    if let Ok(Some(task)) = database.get_task(task_id) {
-        if task.kind == "thumbnail" {
+    match database.get_task(task_id) {
+        Ok(Some(task)) if task.kind == "thumbnail" => {
             if let Some(file_id) = task.file_id {
-                if error_message.contains(THUMBNAIL_SOURCE_CHANGED_ERROR) {
-                    let _ = database.reset_thumbnail_after_stale_source_for_task_attempt(
+                let auxiliary_result = if error_message.contains(THUMBNAIL_SOURCE_CHANGED_ERROR) {
+                    database.reset_thumbnail_after_stale_source_for_task_attempt(
                         file_id,
                         GRID_320_PROFILE,
                         &error_message,
                         task_id,
                         attempt_generation,
-                    );
+                    )
                 } else {
                     let failure_kind =
                         crate::thumbnails::classify_thumbnail_failure(&error_message).as_str();
-                    let _ = database
-                        .publish_thumbnail_failure_for_attempted_source_for_task_attempt(
-                            file_id,
-                            GRID_320_PROFILE,
-                            task.thumbnail_source_fingerprint.as_deref(),
-                            &error_message,
-                            failure_kind,
-                            task_id,
-                            attempt_generation,
-                        );
+                    database.publish_thumbnail_failure_for_attempted_source_for_task_attempt(
+                        file_id,
+                        GRID_320_PROFILE,
+                        task.thumbnail_source_fingerprint.as_deref(),
+                        &error_message,
+                        failure_kind,
+                        task_id,
+                        attempt_generation,
+                    )
+                };
+                if let Err(database_error) = auxiliary_result {
+                    tracing::warn!(
+                        task_id,
+                        attempt_generation,
+                        %database_error,
+                        "failed to update thumbnail failure state while handling worker error"
+                    );
                 }
             }
         }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::error!(
+                task_id,
+                attempt_generation,
+                "task disappeared while handling worker error"
+            );
+        }
+        Err(database_error) => {
+            tracing::error!(
+                task_id,
+                attempt_generation,
+                %database_error,
+                "failed to load task while handling worker error"
+            );
+        }
     }
-    let _ = database.mark_task_failed_for_attempt(task_id, attempt_generation, &error_message);
+    if let Err(database_error) =
+        database.mark_task_failed_for_attempt(task_id, attempt_generation, &error_message)
+    {
+        tracing::error!(
+            task_id,
+            attempt_generation,
+            error = %error_message,
+            %database_error,
+            recovery = "startup reset of running tasks",
+            "failed to persist worker task failure; task will remain recoverable by startup"
+        );
+    }
 }
 
 fn yield_thumbnail_if_higher_priority_pending(
@@ -5091,6 +5169,70 @@ mod tests {
             1
         );
         let _ = fs::remove_dir_all(db_dir);
+    }
+
+    #[test]
+    fn task_error_terminal_notification_failure_is_recoverable_and_logged() {
+        let mut database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/terminal-notification-failure".to_string(),
+                display_name: "terminal-notification-failure".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task_with_origin(root_id, crate::db::NotificationOrigin::User)
+            .expect("create root scan task");
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark task running");
+        database
+            .execute_batch_for_test(
+                "CREATE TRIGGER fail_task_terminal_notification
+                 BEFORE INSERT ON notification_outbox
+                 WHEN json_extract(NEW.payload_json, '$.status') = 'failed'
+                 BEGIN SELECT RAISE(ABORT, 'injected terminal notification failure'); END;",
+            )
+            .expect("install terminal notification failure trigger");
+
+        handle_task_error(&mut database, task_id, anyhow::anyhow!("worker failure"));
+
+        let task = database
+            .get_task(task_id)
+            .expect("read task after failed terminal publish")
+            .expect("task remains for recovery");
+        assert_eq!(task.status, "running");
+        assert!(database
+            .notification_heads_for_test()
+            .expect("read operation head")
+            .into_iter()
+            .find(|operation| operation.task_id == Some(task_id))
+            .is_some_and(|operation| operation.status == "running"));
+        assert!(database
+            .list_notification_outbox(0, 100)
+            .expect("read failed terminal events")
+            .into_iter()
+            .all(|event| event.operation.task_id != Some(task_id)
+                || event.operation.status != "failed"));
+
+        database
+            .execute_batch_for_test("DROP TRIGGER fail_task_terminal_notification;")
+            .expect("remove terminal notification failure trigger");
+        assert_eq!(
+            database
+                .reset_running_root_scan_tasks_for_recovery()
+                .expect("recover failed task"),
+            1
+        );
+        assert_eq!(
+            database
+                .get_task(task_id)
+                .expect("read recovered task")
+                .expect("recovered task")
+                .status,
+            "pending"
+        );
     }
 
     #[test]
