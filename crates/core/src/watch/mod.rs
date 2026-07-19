@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::db::{Database, DbWriter, FileUpsert, RootRecord};
+use crate::db::{Database, DbWriter, FileUpsert, NotificationOrigin, RootRecord};
 use crate::tasks::TaskSender;
 
 const EVENT_COALESCE_WINDOW: Duration = Duration::from_millis(100);
@@ -373,7 +373,8 @@ fn queue_root_rescan(
     if database.has_pending_root_scan_task(root_id)? {
         return Ok(false);
     }
-    let task_id = database.create_root_scan_task(root_id)?;
+    let task_id =
+        database.create_root_scan_task_with_origin(root_id, NotificationOrigin::Background)?;
     match task_queue.try_send(task_id) {
         Ok(()) => {}
         Err(error) => {
@@ -724,6 +725,14 @@ mod tests {
             .expect("queued root scan task");
         assert!(first_task_id > 0);
         assert!(task_receiver.try_recv().is_err());
+        let operation = state
+            .database
+            .notification_heads_for_test()
+            .expect("read watcher notification")
+            .into_iter()
+            .find(|operation| operation.task_id == Some(first_task_id))
+            .expect("watcher task notification");
+        assert_eq!(operation.origin, "background");
 
         let _ = fs::remove_dir_all(temp_root);
         let _ = fs::remove_dir_all(db_dir);

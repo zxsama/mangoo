@@ -1045,13 +1045,24 @@ fn run_task_with_database(
                 .ok_or_else(|| anyhow::anyhow!("root_purge task missing root id: {task_id}"))?;
             let mut total_deleted: i64 = 0;
             loop {
+                database.ensure_task_not_cancelled(task_id)?;
                 // One bounded batch = one short writer job (or inline when there is no
                 // writer, i.e. in-memory tests).
                 let outcome = match writer {
                     Some(writer) => writer.write_blocking(move |db| {
-                        db.purge_root_next_batch(root_id, PURGE_BATCH_SIZE)
+                        db.purge_root_next_batch_for_task(
+                            root_id,
+                            task_id,
+                            attempt_generation,
+                            PURGE_BATCH_SIZE,
+                        )
                     })?,
-                    None => database.purge_root_next_batch(root_id, PURGE_BATCH_SIZE)?,
+                    None => database.purge_root_next_batch_for_task(
+                        root_id,
+                        task_id,
+                        attempt_generation,
+                        PURGE_BATCH_SIZE,
+                    )?,
                 };
                 total_deleted += outcome.rows_deleted as i64;
                 if outcome.done {
@@ -1060,9 +1071,12 @@ fn run_task_with_database(
                     break;
                 }
                 // Task row still exists between batches: surface progress for the Task Center.
+                let items_total = database
+                    .get_task(task_id)?
+                    .and_then(|task| task.items_total);
                 let progress = TaskScanProgress {
                     items_seen: total_deleted,
-                    items_total: None,
+                    items_total,
                     folders_seen: 0,
                     media_files_seen: 0,
                     skipped_files: 0,
@@ -4936,6 +4950,26 @@ mod tests {
         assert!(
             database.get_task(task_id).expect("get task").is_none(),
             "root_purge task self-deleted"
+        );
+        let events = database
+            .list_notification_outbox(0, 200)
+            .expect("read root purge notifications");
+        let running = events
+            .iter()
+            .find(|event| {
+                event.operation.task_id == Some(task_id) && event.operation.status == "running"
+            })
+            .expect("root purge running event");
+        assert!(running.operation.total_value.is_some_and(|total| total > 0));
+        let terminal = events
+            .iter()
+            .find(|event| {
+                event.operation.task_id == Some(task_id) && event.operation.status == "succeeded"
+            })
+            .expect("root purge terminal event survives self-delete");
+        assert_eq!(
+            terminal.operation.current_value,
+            terminal.operation.total_value.expect("terminal total")
         );
     }
 

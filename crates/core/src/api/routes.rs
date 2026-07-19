@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 
 use crate::api::AppState;
 use crate::db::{
-    Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot, PluginRecord,
-    RootRecord, SearchQuery, TagError, TagRecord, TaskRecord, ThumbBlobRecord,
-    ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult, ThumbnailCacheRefreshMode,
-    ThumbnailCacheScope, ThumbnailCacheStats, ThumbnailRecord, ThumbnailScopeLeaverPolicy,
-    ThumbnailTaskPriority, UserMetadataPatch, UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
+    Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot,
+    NotificationOrigin, PluginRecord, RootRecord, SearchQuery, TagError, TagRecord, TaskRecord,
+    ThumbBlobRecord, ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult,
+    ThumbnailCacheRefreshMode, ThumbnailCacheScope, ThumbnailCacheStats, ThumbnailRecord,
+    ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority, UserMetadataPatch, UserMetadataRecord,
+    THUMBNAIL_BULK_PRIORITY,
 };
 use crate::fsops::{
     self, DeleteRequest, FileOperationRecord, FsOpsError, FsOpsErrorCode, MoveRequest,
@@ -691,7 +692,8 @@ async fn add_root(
                 path: canonical_path,
                 display_name,
             })?;
-            let task_id = database.create_root_scan_task(root_id)?;
+            let task_id =
+                database.create_root_scan_task_with_origin(root_id, NotificationOrigin::User)?;
             let attempt_generation = database.current_task_attempt_generation(task_id)?;
             Ok((root_id, task_id, attempt_generation))
         })
@@ -714,7 +716,7 @@ async fn remove_root(
 ) -> ApiResult<(StatusCode, Json<AcceptedResponse>)> {
     let outcome = run_shared_database(state.clone(), move |database| {
         database
-            .mark_root_for_purge(root_id)
+            .mark_root_for_purge_with_origin(root_id, NotificationOrigin::User)
             .map_err(CoreError::from)
     })
     .await?;
@@ -1191,7 +1193,8 @@ async fn enqueue_scan(
                 root_id
             )));
         }
-        let task_id = database.create_root_scan_task(root_id)?;
+        let task_id =
+            database.create_root_scan_task_with_origin(root_id, NotificationOrigin::User)?;
         let attempt_generation = database.current_task_attempt_generation(task_id)?;
         Ok((task_id, attempt_generation))
     })
@@ -1221,7 +1224,10 @@ async fn enqueue_interactive_folder_scan(
                     folder_id
                 )));
             }
-            let task_id = database.create_interactive_folder_scan_task(folder_id)?;
+            let task_id = database.create_interactive_folder_scan_task_with_origin(
+                folder_id,
+                NotificationOrigin::User,
+            )?;
             let task = database
                 .get_task(task_id)?
                 .ok_or_else(|| CoreError::not_found(format!("task not found: {task_id}")))?;
@@ -3731,6 +3737,16 @@ mod tests {
         }));
 
         wait_for_task_status(&app, task_id, "succeeded").await;
+        let notification_database =
+            Database::open(db_dir.join("megle.sqlite")).expect("open notification database");
+        let operation = notification_database
+            .notification_heads_for_test()
+            .expect("read route notification")
+            .into_iter()
+            .find(|operation| operation.task_id == Some(task_id))
+            .expect("scan route notification");
+        assert_eq!(operation.origin, "user");
+        drop(notification_database);
         let _ = fs::remove_dir_all(temp_root);
         drop(app);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

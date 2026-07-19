@@ -454,6 +454,64 @@ pub struct TaskRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationOrigin {
+    User,
+    Background,
+    Recovery,
+}
+
+impl NotificationOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Background => "background",
+            Self::Recovery => "recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TaskNotificationDescriptor {
+    kind: &'static str,
+    title: &'static str,
+    presentation: &'static str,
+    cancellable: bool,
+    retryable: bool,
+}
+
+fn task_notification_descriptor(kind: &str) -> anyhow::Result<Option<TaskNotificationDescriptor>> {
+    Ok(match kind {
+        "root_scan" => Some(TaskNotificationDescriptor {
+            kind: "root_scan",
+            title: "Scan library",
+            presentation: "important",
+            cancellable: true,
+            retryable: true,
+        }),
+        "interactive_folder_scan" => Some(TaskNotificationDescriptor {
+            kind: "interactive_folder_scan",
+            title: "Scan folder",
+            presentation: "important",
+            cancellable: true,
+            retryable: true,
+        }),
+        "root_purge" => Some(TaskNotificationDescriptor {
+            kind: "root_purge",
+            title: "Remove library",
+            presentation: "important",
+            cancellable: true,
+            retryable: false,
+        }),
+        "thumbnail" => None,
+        other => {
+            return Err(anyhow::anyhow!(
+                "task kind {other} is missing a notification descriptor"
+            ))
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskScanProgress {
     pub items_seen: i64,
     pub items_total: Option<i64>,
@@ -671,6 +729,96 @@ impl Database {
     /// Reopened connections for the same Core instance intentionally share it.
     pub fn notification_outbox_wake(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.notification_outbox_wake)
+    }
+
+    fn publish_task_notification_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        task_id: i64,
+        origin_override: Option<NotificationOrigin>,
+        mode: notification_outbox::PublishMode,
+    ) -> anyhow::Result<bool> {
+        let task = task_record_in_transaction(transaction, task_id)?;
+        let Some(descriptor) = task_notification_descriptor(&task.kind)? else {
+            return Ok(false);
+        };
+        let origin = origin_override
+            .map(NotificationOrigin::as_str)
+            .map(str::to_owned)
+            .or_else(|| task_notification_origin_in_transaction(transaction, task_id))
+            .unwrap_or_else(|| NotificationOrigin::Background.as_str().to_owned());
+        let terminal = matches!(task.status.as_str(), "succeeded" | "failed" | "cancelled");
+        let started_at = task.created_at.saturating_mul(1_000);
+        let updated_at = task.updated_at.saturating_mul(1_000);
+        let operation = notification_outbox::NotificationOperation {
+            operation_id: format!("task:{}", task.id),
+            revision: 0,
+            kind: descriptor.kind.to_owned(),
+            category: "task".to_owned(),
+            origin,
+            presentation: descriptor.presentation.to_owned(),
+            status: task.status.clone(),
+            phase: Some(
+                match task.status.as_str() {
+                    "pending" => "queued",
+                    "running" => "working",
+                    "succeeded" => "completed",
+                    "failed" => "failed",
+                    "cancelled" => "cancelled",
+                    _ => "unknown",
+                }
+                .to_owned(),
+            ),
+            title: descriptor.title.to_owned(),
+            summary: task.root_id.map(|root_id| format!("Root {root_id}")),
+            task_id: Some(task.id),
+            root_id: task.root_id,
+            folder_id: task.folder_id,
+            file_id: None,
+            current_value: task.items_seen,
+            total_value: task.items_total,
+            unit: Some("items".to_owned()),
+            error_code: task.error.as_ref().map(|_| {
+                if task.status == "cancelled" {
+                    "cancelled".to_owned()
+                } else {
+                    "failed".to_owned()
+                }
+            }),
+            error_detail: task.error.clone(),
+            cancellable: descriptor.cancellable && !terminal,
+            retryable: descriptor.retryable
+                && matches!(task.status.as_str(), "failed" | "cancelled"),
+            attempt: task.attempt_generation.saturating_add(1),
+            occurrence_count: 1,
+            started_at,
+            updated_at,
+            completed_at: terminal.then_some(updated_at),
+        };
+        let mut operation = operation;
+        self.publish_notification_operation_in_transaction(transaction, &mut operation, mode)
+    }
+
+    fn publish_task_notification_after_commit(&self, appended: bool) {
+        if appended {
+            self.notification_outbox_wake.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notification_heads_for_test(
+        &self,
+    ) -> anyhow::Result<Vec<notification_outbox::NotificationOperation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT payload_json FROM notification_operation_heads ORDER BY operation_id ASC",
+        )?;
+        let payloads = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        payloads
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .collect()
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -1272,15 +1420,25 @@ impl Database {
             "UPDATE roots SET enabled = 0 WHERE id = ?1 AND enabled = 1",
             [root_id],
         )?;
+        let mut appended = false;
         if updated != 0 {
-            cancel_root_scan_tasks_in_transaction(&transaction, root_id)?;
+            appended |= self.cancel_root_scan_tasks_in_transaction(&transaction, root_id)?;
             cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction)?;
         }
         transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         Ok(updated != 0)
     }
 
     pub fn create_root_scan_task(&self, root_id: i64) -> anyhow::Result<i64> {
+        self.create_root_scan_task_with_origin(root_id, NotificationOrigin::Background)
+    }
+
+    pub fn create_root_scan_task_with_origin(
+        &self,
+        root_id: i64,
+        origin: NotificationOrigin,
+    ) -> anyhow::Result<i64> {
         let root = self
             .get_root(root_id)?
             .ok_or_else(|| anyhow::anyhow!("root not found: {root_id}"))?;
@@ -1288,8 +1446,11 @@ impl Database {
             return Err(anyhow::anyhow!("root is disabled: {root_id}"));
         }
         let now = unix_timestamp();
-        if self.table_has_column("tasks", "folder_id")? {
-            self.connection.execute(
+        let has_folder_column = self.table_has_column("tasks", "folder_id")?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if has_folder_column {
+            transaction.execute(
                 r#"
                 INSERT INTO tasks(
                     kind, priority, status, root_id, folder_id, file_id, created_at, updated_at, error
@@ -1299,7 +1460,7 @@ impl Database {
                 (ROOT_SCAN_TASK_PRIORITY, root_id, now),
             )?;
         } else {
-            self.connection.execute(
+            transaction.execute(
                 r#"
                 INSERT INTO tasks(kind, priority, status, root_id, file_id, created_at, updated_at, error)
                 VALUES ('root_scan', ?1, 'pending', ?2, NULL, ?3, ?3, NULL)
@@ -1307,7 +1468,16 @@ impl Database {
                 (ROOT_SCAN_TASK_PRIORITY, root_id, now),
             )?;
         }
-        Ok(self.connection.last_insert_rowid())
+        let task_id = transaction.last_insert_rowid();
+        let appended = self.publish_task_notification_in_transaction(
+            &transaction,
+            task_id,
+            Some(origin),
+            notification_outbox::PublishMode::Phase,
+        )?;
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
+        Ok(task_id)
     }
 
     /// Begin a hard delete of `root_id`: mark it `pending_delete_at`, cancel its
@@ -1315,6 +1485,14 @@ impl Database {
     /// transaction. Deletes NO file/folder rows (the background purge does).
     #[allow(dead_code)] // consumed by remove_root route in later tasks
     pub fn mark_root_for_purge(&self, root_id: i64) -> anyhow::Result<MarkRootForPurge> {
+        self.mark_root_for_purge_with_origin(root_id, NotificationOrigin::Background)
+    }
+
+    pub fn mark_root_for_purge_with_origin(
+        &self,
+        root_id: i64,
+        origin: NotificationOrigin,
+    ) -> anyhow::Result<MarkRootForPurge> {
         let now = unix_timestamp();
         let transaction = self.connection.unchecked_transaction()?;
         let existing: Option<Option<i64>> = transaction
@@ -1334,7 +1512,8 @@ impl Database {
             "UPDATE roots SET pending_delete_at = ?1, enabled = 0 WHERE id = ?2",
             (now, root_id),
         )?;
-        cancel_root_scan_tasks_in_transaction(&transaction, root_id)?;
+        let mut appended = false;
+        appended |= self.cancel_root_scan_tasks_in_transaction(&transaction, root_id)?;
         transaction.execute(
             r#"
             INSERT INTO tasks(kind, priority, status, root_id, file_id, created_at, updated_at, error)
@@ -1350,7 +1529,14 @@ impl Database {
                 |row| row.get(0),
             )
             .unwrap_or(0);
+        appended |= self.publish_task_notification_in_transaction(
+            &transaction,
+            task_id,
+            Some(origin),
+            notification_outbox::PublishMode::Phase,
+        )?;
         transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         Ok(MarkRootForPurge::Marked {
             task_id,
             attempt_generation,
@@ -1374,10 +1560,21 @@ impl Database {
     /// Returns the number of purge tasks created. Idempotent.
     pub fn ensure_pending_delete_purge_tasks(&self) -> anyhow::Result<usize> {
         let now = unix_timestamp();
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let mut created = 0;
-        for root_id in self.roots_pending_delete_ids()? {
-            let has_task: bool = self
-                .connection
+        let mut appended = false;
+        let mut root_ids = Vec::new();
+        {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM roots WHERE pending_delete_at IS NOT NULL ORDER BY id ASC",
+            )?;
+            for row in statement.query_map([], |row| row.get::<_, i64>(0))? {
+                root_ids.push(row?);
+            }
+        }
+        for root_id in root_ids {
+            let has_task: bool = transaction
                 .query_row(
                     "SELECT 1 FROM tasks WHERE root_id=?1 AND kind='root_purge' AND status IN ('pending','running') LIMIT 1",
                     [root_id],
@@ -1386,14 +1583,23 @@ impl Database {
                 .optional()?
                 .unwrap_or(false);
             if !has_task {
-                self.connection.execute(
+                transaction.execute(
                     r#"INSERT INTO tasks(kind, priority, status, root_id, file_id, created_at, updated_at, error)
                        VALUES ('root_purge', ?1, 'pending', ?2, NULL, ?3, ?3, NULL)"#,
                     (ROOT_SCAN_TASK_PRIORITY, root_id, now),
                 )?;
+                let task_id = transaction.last_insert_rowid();
+                appended |= self.publish_task_notification_in_transaction(
+                    &transaction,
+                    task_id,
+                    Some(NotificationOrigin::Recovery),
+                    notification_outbox::PublishMode::Phase,
+                )?;
                 created += 1;
             }
         }
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         Ok(created)
     }
 
@@ -1408,9 +1614,51 @@ impl Database {
         root_id: i64,
         batch_size: usize,
     ) -> anyhow::Result<PurgeBatchOutcome> {
+        self.purge_root_next_batch_internal(root_id, None, None, batch_size)
+    }
+
+    pub fn purge_root_next_batch_for_task(
+        &self,
+        root_id: i64,
+        task_id: i64,
+        attempt_generation: i64,
+        batch_size: usize,
+    ) -> anyhow::Result<PurgeBatchOutcome> {
+        self.purge_root_next_batch_internal(
+            root_id,
+            Some(task_id),
+            Some(attempt_generation),
+            batch_size,
+        )
+    }
+
+    fn purge_root_next_batch_internal(
+        &self,
+        root_id: i64,
+        task_id: Option<i64>,
+        attempt_generation: Option<i64>,
+        batch_size: usize,
+    ) -> anyhow::Result<PurgeBatchOutcome> {
         let batch = batch_size.max(1) as i64;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let prior_items_seen = match (task_id, attempt_generation) {
+            (Some(task_id), Some(attempt_generation)) => {
+                let (status, current_attempt, items_seen): (String, i64, i64) = transaction
+                    .query_row(
+                        "SELECT status, attempt_generation, items_seen FROM tasks WHERE id = ?1",
+                        [task_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?;
+                if status != "running" || current_attempt != attempt_generation {
+                    return Err(anyhow::anyhow!(
+                        "task {task_id} is not running for purge attempt {attempt_generation}"
+                    ));
+                }
+                items_seen
+            }
+            _ => 0,
+        };
 
         // Phase 1: this root's scan/interactive tasks. Deliberately EXCLUDES
         // 'root_purge' so the worker's own active task survives for progress
@@ -1508,11 +1756,45 @@ impl Database {
             });
         }
 
-        // Phase 5: the root's remaining tasks (the active root_purge) + the roots row.
-        let mut final_rows = 0usize;
-        final_rows += transaction.execute("DELETE FROM tasks WHERE root_id = ?1", [root_id])?;
-        final_rows += transaction.execute("DELETE FROM roots WHERE id = ?1", [root_id])?;
+        // Phase 5: publish the terminal snapshot before deleting the active
+        // root-purge task and the roots row. The final row count is known before
+        // either delete, so determinate progress reaches its exact total.
+        let task_rows: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE root_id = ?1",
+            [root_id],
+            |row| row.get(0),
+        )?;
+        let root_rows: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM roots WHERE id = ?1",
+            [root_id],
+            |row| row.get(0),
+        )?;
+        let final_rows = (task_rows + root_rows) as usize;
+        let mut appended = false;
+        if let (Some(task_id), Some(_attempt_generation)) = (task_id, attempt_generation) {
+            transaction.execute(
+                r#"UPDATE tasks
+                   SET status = 'succeeded', updated_at = ?1, items_seen = ?2,
+                       items_total = COALESCE(items_total, ?3), error = NULL
+                   WHERE id = ?4"#,
+                (
+                    unix_timestamp(),
+                    prior_items_seen + final_rows as i64,
+                    prior_items_seen + final_rows as i64,
+                    task_id,
+                ),
+            )?;
+            appended = self.publish_task_notification_in_transaction(
+                &transaction,
+                task_id,
+                None,
+                notification_outbox::PublishMode::Terminal,
+            )?;
+        }
+        transaction.execute("DELETE FROM tasks WHERE root_id = ?1", [root_id])?;
+        transaction.execute("DELETE FROM roots WHERE id = ?1", [root_id])?;
         transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         Ok(PurgeBatchOutcome {
             rows_deleted: final_rows,
             done: true,
@@ -1520,6 +1802,17 @@ impl Database {
     }
 
     pub fn create_interactive_folder_scan_task(&self, folder_id: i64) -> anyhow::Result<i64> {
+        self.create_interactive_folder_scan_task_with_origin(
+            folder_id,
+            NotificationOrigin::Background,
+        )
+    }
+
+    pub fn create_interactive_folder_scan_task_with_origin(
+        &self,
+        folder_id: i64,
+        origin: NotificationOrigin,
+    ) -> anyhow::Result<i64> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let root_id: i64 = transaction
@@ -1570,6 +1863,12 @@ impl Database {
                 "#,
                 (folder_id, now, keeper_task_id),
             )?;
+            let mut appended = self.publish_task_notification_in_transaction(
+                &transaction,
+                keeper_task_id,
+                Some(origin),
+                notification_outbox::PublishMode::Phase,
+            )?;
             if pending_task_ids.len() > 1 {
                 for task_id in pending_task_ids.iter().skip(1) {
                     transaction.execute(
@@ -1582,9 +1881,16 @@ impl Database {
                         "#,
                         (now, task_id),
                     )?;
+                    appended |= self.publish_task_notification_in_transaction(
+                        &transaction,
+                        *task_id,
+                        None,
+                        notification_outbox::PublishMode::Terminal,
+                    )?;
                 }
             }
             transaction.commit()?;
+            self.publish_task_notification_after_commit(appended);
             return Ok(keeper_task_id);
         }
         transaction.execute(
@@ -1602,19 +1908,40 @@ impl Database {
             ),
         )?;
         let task_id = transaction.last_insert_rowid();
+        let appended = self.publish_task_notification_in_transaction(
+            &transaction,
+            task_id,
+            Some(origin),
+            notification_outbox::PublishMode::Phase,
+        )?;
         transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         Ok(task_id)
     }
 
     pub fn reset_running_root_scan_tasks_for_recovery(&self) -> anyhow::Result<usize> {
-        let updated = self.connection.execute(
-            r#"
-            UPDATE tasks
-            SET status = 'pending', updated_at = ?1, error = NULL
-            WHERE kind IN ('root_scan', 'interactive_folder_scan') AND status = 'running'
-            "#,
-            [unix_timestamp()],
+        let transaction = self.connection.unchecked_transaction()?;
+        let task_ids = task_ids_by_status_in_transaction(
+            &transaction,
+            "kind IN ('root_scan', 'interactive_folder_scan') AND status = 'running'",
         )?;
+        let now = unix_timestamp();
+        let mut appended = false;
+        for task_id in &task_ids {
+            transaction.execute(
+                "UPDATE tasks SET status = 'pending', updated_at = ?1, error = NULL WHERE id = ?2",
+                (now, task_id),
+            )?;
+            appended |= self.publish_task_notification_in_transaction(
+                &transaction,
+                *task_id,
+                Some(NotificationOrigin::Recovery),
+                notification_outbox::PublishMode::Phase,
+            )?;
+        }
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
+        let updated = task_ids.len();
         Ok(updated)
     }
 
@@ -1624,11 +1951,28 @@ impl Database {
     /// reset to `pending`, that call's `status IN ('pending','running')` guard
     /// sees an existing task and creates no duplicate.
     pub fn reset_running_root_purge_tasks_for_recovery(&self) -> anyhow::Result<usize> {
-        let updated = self.connection.execute(
-            r#"UPDATE tasks SET status = 'pending', updated_at = ?1, error = NULL
-               WHERE kind = 'root_purge' AND status = 'running'"#,
-            [unix_timestamp()],
+        let transaction = self.connection.unchecked_transaction()?;
+        let task_ids = task_ids_by_status_in_transaction(
+            &transaction,
+            "kind = 'root_purge' AND status = 'running'",
         )?;
+        let now = unix_timestamp();
+        let mut appended = false;
+        for task_id in &task_ids {
+            transaction.execute(
+                "UPDATE tasks SET status = 'pending', updated_at = ?1, error = NULL WHERE id = ?2",
+                (now, task_id),
+            )?;
+            appended |= self.publish_task_notification_in_transaction(
+                &transaction,
+                *task_id,
+                Some(NotificationOrigin::Recovery),
+                notification_outbox::PublishMode::Phase,
+            )?;
+        }
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
+        let updated = task_ids.len();
         Ok(updated)
     }
 
@@ -1889,18 +2233,28 @@ impl Database {
     }
 
     pub fn fail_pending_root_scan_tasks_for_disabled_roots(&self) -> anyhow::Result<usize> {
-        let updated = self.connection.execute(
-            r#"
-            UPDATE tasks
-            SET status = 'failed',
-                updated_at = ?1,
-                error = 'root is disabled'
-            WHERE kind IN ('root_scan', 'interactive_folder_scan')
-              AND status = 'pending'
-              AND root_id IN (SELECT id FROM roots WHERE enabled = 0)
-            "#,
-            [unix_timestamp()],
+        let transaction = self.connection.unchecked_transaction()?;
+        let task_ids = task_ids_by_status_in_transaction(
+            &transaction,
+            "kind IN ('root_scan', 'interactive_folder_scan') AND status = 'pending' AND root_id IN (SELECT id FROM roots WHERE enabled = 0)",
         )?;
+        let now = unix_timestamp();
+        let mut appended = false;
+        for task_id in &task_ids {
+            transaction.execute(
+                "UPDATE tasks SET status = 'failed', updated_at = ?1, error = 'root is disabled' WHERE id = ?2",
+                (now, task_id),
+            )?;
+            appended |= self.publish_task_notification_in_transaction(
+                &transaction,
+                *task_id,
+                Some(NotificationOrigin::Recovery),
+                notification_outbox::PublishMode::Terminal,
+            )?;
+        }
+        let updated = task_ids.len();
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         Ok(updated)
     }
 
@@ -2056,10 +2410,35 @@ impl Database {
         task_id: i64,
         attempt_generation: i64,
     ) -> anyhow::Result<()> {
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             "UPDATE tasks SET status = 'running', updated_at = ?1, error = NULL WHERE id = ?2 AND status = 'pending' AND attempt_generation = ?3",
             (unix_timestamp(), task_id, attempt_generation),
         )?;
+        let mut appended = false;
+        if updated == 1 {
+            let task = task_record_in_transaction(&transaction, task_id)?;
+            if task.kind == "root_purge" {
+                let total = root_purge_work_total_in_transaction(
+                    &transaction,
+                    task.root_id.ok_or_else(|| {
+                        anyhow::anyhow!("root_purge task missing root id: {task_id}")
+                    })?,
+                )?;
+                transaction.execute(
+                    "UPDATE tasks SET items_seen = 0, items_total = ?1 WHERE id = ?2",
+                    (total, task_id),
+                )?;
+            }
+            appended = self.publish_task_notification_in_transaction(
+                &transaction,
+                task_id,
+                None,
+                notification_outbox::PublishMode::Phase,
+            )?;
+        }
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         self.ensure_one_task_attempt_updated(task_id, updated, "pending", attempt_generation)?;
         Ok(())
     }
@@ -2142,10 +2521,23 @@ impl Database {
         task_id: i64,
         attempt_generation: i64,
     ) -> anyhow::Result<()> {
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             "UPDATE tasks SET status = 'succeeded', updated_at = ?1, error = NULL WHERE id = ?2 AND status = 'running' AND attempt_generation = ?3",
             (unix_timestamp(), task_id, attempt_generation),
         )?;
+        let appended = if updated == 1 {
+            self.publish_task_notification_in_transaction(
+                &transaction,
+                task_id,
+                None,
+                notification_outbox::PublishMode::Terminal,
+            )?
+        } else {
+            false
+        };
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         self.ensure_one_task_attempt_updated(task_id, updated, "running", attempt_generation)?;
         Ok(())
     }
@@ -2166,10 +2558,23 @@ impl Database {
         attempt_generation: i64,
         error: &str,
     ) -> anyhow::Result<()> {
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             "UPDATE tasks SET status = 'failed', updated_at = ?1, error = ?2 WHERE id = ?3 AND status IN ('pending', 'running') AND attempt_generation = ?4",
             (unix_timestamp(), error, task_id, attempt_generation),
         )?;
+        let appended = if updated == 1 {
+            self.publish_task_notification_in_transaction(
+                &transaction,
+                task_id,
+                None,
+                notification_outbox::PublishMode::Terminal,
+            )?
+        } else {
+            false
+        };
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         if updated == 0 {
             return self.ensure_one_task_attempt_updated(
                 task_id,
@@ -2211,7 +2616,8 @@ impl Database {
         attempt_generation: i64,
         next_priority: i64,
     ) -> anyhow::Result<()> {
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             r#"
             UPDATE tasks
             SET status = 'pending',
@@ -2232,6 +2638,18 @@ impl Database {
             "#,
             (next_priority, unix_timestamp(), task_id, attempt_generation),
         )?;
+        let appended = if updated == 1 {
+            self.publish_task_notification_in_transaction(
+                &transaction,
+                task_id,
+                None,
+                notification_outbox::PublishMode::Phase,
+            )?
+        } else {
+            false
+        };
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         self.ensure_one_task_attempt_updated(
             task_id,
             updated,
@@ -2246,7 +2664,8 @@ impl Database {
         task_id: i64,
         attempt_generation: i64,
     ) -> anyhow::Result<()> {
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             r#"
             UPDATE tasks
             SET status = 'pending',
@@ -2272,6 +2691,18 @@ impl Database {
                 attempt_generation,
             ),
         )?;
+        let appended = if updated == 1 {
+            self.publish_task_notification_in_transaction(
+                &transaction,
+                task_id,
+                None,
+                notification_outbox::PublishMode::Phase,
+            )?
+        } else {
+            false
+        };
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         self.ensure_one_task_attempt_updated(
             task_id,
             updated,
@@ -2318,7 +2749,8 @@ impl Database {
     }
 
     pub fn cancel_task(&self, task_id: i64) -> anyhow::Result<TaskRecord> {
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             r#"
             UPDATE tasks
             SET status = 'cancelled',
@@ -2328,6 +2760,18 @@ impl Database {
             "#,
             (unix_timestamp(), task_id),
         )?;
+        let appended = if updated == 1 {
+            self.publish_task_notification_in_transaction(
+                &transaction,
+                task_id,
+                None,
+                notification_outbox::PublishMode::Terminal,
+            )?
+        } else {
+            false
+        };
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         if updated == 0 {
             let Some(task) = self.get_task(task_id)? else {
                 return Err(anyhow::anyhow!("task not found: {task_id}"));
@@ -2373,7 +2817,8 @@ impl Database {
             return Err(anyhow::anyhow!("root is disabled: {root_id}"));
         }
 
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             r#"
             UPDATE tasks
             SET status = 'pending',
@@ -2390,6 +2835,18 @@ impl Database {
             "#,
             (unix_timestamp(), task.id),
         )?;
+        let appended = if updated == 1 {
+            self.publish_task_notification_in_transaction(
+                &transaction,
+                task.id,
+                None,
+                notification_outbox::PublishMode::Phase,
+            )?
+        } else {
+            false
+        };
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         self.ensure_one_task_updated(task.id, updated, "failed or cancelled")?;
         self.get_task(task.id)?
             .ok_or_else(|| anyhow::anyhow!("task not found: {}", task.id))
@@ -2419,7 +2876,8 @@ impl Database {
             return Err(anyhow::anyhow!("folder not found: {folder_id}"));
         }
 
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             r#"
             UPDATE tasks
             SET status = 'pending',
@@ -2437,6 +2895,18 @@ impl Database {
             "#,
             (ROOT_SCAN_TASK_PRIORITY, unix_timestamp(), task.id),
         )?;
+        let appended = if updated == 1 {
+            self.publish_task_notification_in_transaction(
+                &transaction,
+                task.id,
+                None,
+                notification_outbox::PublishMode::Phase,
+            )?
+        } else {
+            false
+        };
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         self.ensure_one_task_updated(task.id, updated, "failed or cancelled")?;
         self.get_task(task.id)?
             .ok_or_else(|| anyhow::anyhow!("task not found: {}", task.id))
@@ -2554,7 +3024,8 @@ impl Database {
         attempt_generation: i64,
         progress: TaskScanProgress,
     ) -> anyhow::Result<()> {
-        let updated = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let updated = transaction.execute(
             r#"
             UPDATE tasks
             SET updated_at = ?1,
@@ -2576,6 +3047,18 @@ impl Database {
                 attempt_generation,
             ),
         )?;
+        let appended = if updated == 1 {
+            self.publish_task_notification_in_transaction(
+                &transaction,
+                task_id,
+                None,
+                notification_outbox::PublishMode::Progress,
+            )?
+        } else {
+            false
+        };
+        transaction.commit()?;
+        self.publish_task_notification_after_commit(appended);
         self.ensure_one_task_attempt_updated(task_id, updated, "running", attempt_generation)?;
         Ok(())
     }
@@ -6238,23 +6721,39 @@ fn ensure_task_attempt_running_in_transaction(
     ))
 }
 
-fn cancel_root_scan_tasks_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-    root_id: i64,
-) -> anyhow::Result<usize> {
-    let updated = transaction.execute(
-        r#"
-        UPDATE tasks
-        SET status = 'failed',
-            updated_at = ?1,
-            error = 'root is disabled'
-        WHERE kind IN ('root_scan', 'interactive_folder_scan')
-          AND root_id = ?2
-          AND status IN ('pending', 'running')
-        "#,
-        (unix_timestamp(), root_id),
-    )?;
-    Ok(updated)
+impl Database {
+    fn cancel_root_scan_tasks_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        root_id: i64,
+    ) -> anyhow::Result<bool> {
+        let mut statement = transaction.prepare(
+            r#"SELECT id FROM tasks
+               WHERE kind IN ('root_scan', 'interactive_folder_scan')
+                 AND root_id = ?1 AND status IN ('pending', 'running')
+               ORDER BY id ASC"#,
+        )?;
+        let task_ids = statement
+            .query_map([root_id], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let now = unix_timestamp();
+        let mut appended = false;
+        for task_id in &task_ids {
+            transaction.execute(
+                "UPDATE tasks SET status = 'failed', updated_at = ?1, error = 'root is disabled' WHERE id = ?2",
+                (now, task_id),
+            )?;
+            appended |= self.publish_task_notification_in_transaction(
+                transaction,
+                *task_id,
+                None,
+                notification_outbox::PublishMode::Terminal,
+            )?;
+        }
+        Ok(appended)
+    }
 }
 
 fn reusable_file_id_for_content_identity_in_transaction(
@@ -7951,6 +8450,78 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         attempt_generation: row.get(15)?,
         error: row.get(16)?,
     })
+}
+
+fn task_record_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: i64,
+) -> anyhow::Result<TaskRecord> {
+    transaction
+        .query_row(
+            r#"
+            SELECT id, kind, priority, status, root_id, folder_id, file_id, created_at, updated_at,
+                   items_seen, items_total, folders_seen, media_files_seen, skipped_files,
+                   thumbnail_source_fingerprint, attempt_generation, error
+            FROM tasks
+            WHERE id = ?1
+            "#,
+            [task_id],
+            task_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))
+}
+
+fn task_notification_origin_in_transaction(
+    transaction: &Transaction<'_>,
+    task_id: i64,
+) -> Option<String> {
+    let payload: Option<String> = transaction
+        .query_row(
+            "SELECT payload_json FROM notification_operation_heads WHERE operation_id = ?1",
+            [format!("task:{task_id}")],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    payload
+        .and_then(|payload| {
+            serde_json::from_str::<notification_outbox::NotificationOperation>(&payload).ok()
+        })
+        .map(|operation| operation.origin)
+}
+
+fn root_purge_work_total_in_transaction(
+    transaction: &Transaction<'_>,
+    root_id: i64,
+) -> anyhow::Result<i64> {
+    transaction
+        .query_row(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM tasks WHERE root_id = ?1 AND kind <> 'thumbnail') +
+              (SELECT COUNT(*) FROM tasks t JOIN files f ON f.id = t.file_id
+                 WHERE t.kind = 'thumbnail' AND f.root_id = ?1) +
+              (SELECT COUNT(*) FROM files WHERE root_id = ?1) +
+              (SELECT COUNT(*) FROM folders WHERE root_id = ?1) +
+              (SELECT COUNT(*) FROM roots WHERE id = ?1)
+            "#,
+            [root_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn task_ids_by_status_in_transaction(
+    transaction: &Transaction<'_>,
+    predicate: &str,
+) -> anyhow::Result<Vec<i64>> {
+    let mut statement = transaction.prepare(&format!("SELECT id FROM tasks WHERE {predicate}"))?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
 }
 
 fn plugin_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PluginRecord> {
@@ -11335,6 +11906,271 @@ mod tests {
             .expect("task exists");
         assert_eq!(task.status, "failed");
         assert_eq!(task.error.as_deref(), Some("scan failed"));
+    }
+
+    #[test]
+    fn root_scan_lifecycle_updates_one_notification_operation() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures".to_string(),
+                display_name: "Pictures".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task_with_origin(root_id, NotificationOrigin::User)
+            .expect("create root scan task");
+
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark task running");
+        database
+            .update_task_scan_progress_current_attempt_for_test(
+                task_id,
+                TaskScanProgress {
+                    items_seen: 50,
+                    items_total: Some(100),
+                    folders_seen: 4,
+                    media_files_seen: 46,
+                    skipped_files: 0,
+                },
+            )
+            .expect("update task progress");
+        database
+            .mark_task_succeeded_current_attempt_for_test(task_id)
+            .expect("mark task succeeded");
+
+        let heads = database
+            .notification_heads_for_test()
+            .expect("read notification heads");
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].operation_id, format!("task:{task_id}"));
+        assert_eq!(heads[0].status, "succeeded");
+        assert_eq!(heads[0].origin, "user");
+        assert_eq!(heads[0].current_value, 50);
+        assert_eq!(heads[0].total_value, Some(100));
+    }
+
+    #[test]
+    fn task_terminal_notifications_cover_failure_and_cancellation() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures".to_string(),
+                display_name: "Pictures".to_string(),
+            })
+            .expect("add root");
+        let failed_task = database
+            .create_root_scan_task(root_id)
+            .expect("create failed task");
+        let cancelled_task = database
+            .create_root_scan_task(root_id)
+            .expect("create cancelled task");
+
+        database
+            .mark_task_failed_current_attempt_for_test(failed_task, "scan failed")
+            .expect("mark task failed");
+        database.cancel_task(cancelled_task).expect("cancel task");
+
+        let heads = database
+            .notification_heads_for_test()
+            .expect("read notification heads");
+        let failed = heads
+            .iter()
+            .find(|operation| operation.task_id == Some(failed_task))
+            .expect("failed task head");
+        let cancelled = heads
+            .iter()
+            .find(|operation| operation.task_id == Some(cancelled_task))
+            .expect("cancelled task head");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.error_code.as_deref(), Some("failed"));
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn thumbnail_tasks_never_create_notification_heads() {
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_media_page_fixture(&database);
+        let file_id = database
+            .upsert_file(FileUpsert {
+                root_id,
+                folder_id,
+                name: "thumbnail-only.jpg".to_string(),
+                ext: ".jpg".to_string(),
+                size: 100,
+                mtime: 10,
+                ctime: None,
+                file_key: Some("thumbnail-only".to_string()),
+            })
+            .expect("insert file");
+        database
+            .upsert_media_kind(file_id, "image")
+            .expect("insert media");
+        let task_id = database
+            .request_thumbnail_task(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                ThumbnailTaskPriority::Background,
+            )
+            .expect("request thumbnail")
+            .task_id
+            .expect("thumbnail task id");
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark thumbnail running");
+        database
+            .mark_task_failed_current_attempt_for_test(task_id, "fixture failure")
+            .expect("mark thumbnail failed");
+
+        assert!(database
+            .notification_heads_for_test()
+            .expect("read notification heads")
+            .is_empty());
+    }
+
+    #[test]
+    fn task_notification_descriptors_exclude_only_thumbnail_work() {
+        for kind in ["root_scan", "interactive_folder_scan", "root_purge"] {
+            assert!(task_notification_descriptor(kind)
+                .expect("known task kind")
+                .is_some());
+        }
+        assert!(task_notification_descriptor("thumbnail")
+            .expect("thumbnail exclusion")
+            .is_none());
+        assert!(task_notification_descriptor("future_non_thumbnail_kind").is_err());
+    }
+
+    #[test]
+    fn root_purge_progress_is_determinate_and_terminal_before_self_delete() {
+        let database = migrated_database();
+        let (root_id, _folder_id) = seed_media_page_fixture(&database);
+        let file_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM files WHERE root_id = ?1 ORDER BY id LIMIT 1",
+                [root_id],
+                |row| row.get(0),
+            )
+            .expect("read purge file");
+        database
+            .request_thumbnail_task(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                ThumbnailTaskPriority::Background,
+            )
+            .expect("queue thumbnail for purge");
+        let mark = database
+            .mark_root_for_purge_with_origin(root_id, NotificationOrigin::User)
+            .expect("mark root for purge");
+        let (task_id, attempt_generation) = match mark {
+            MarkRootForPurge::Marked {
+                task_id,
+                attempt_generation,
+            } => (task_id, attempt_generation),
+            other => panic!("unexpected purge mark result: {other:?}"),
+        };
+        database
+            .mark_task_running_for_attempt(task_id, attempt_generation)
+            .expect("mark purge running");
+        let total = database
+            .get_task(task_id)
+            .expect("read purge task")
+            .expect("purge task exists")
+            .items_total
+            .expect("purge total");
+        assert!(total > 0);
+
+        let mut current = 0;
+        loop {
+            let outcome = database
+                .purge_root_next_batch_for_task(root_id, task_id, attempt_generation, 1)
+                .expect("purge batch");
+            current += outcome.rows_deleted as i64;
+            if outcome.done {
+                break;
+            }
+            database
+                .update_task_scan_progress_for_attempt(
+                    task_id,
+                    attempt_generation,
+                    TaskScanProgress {
+                        items_seen: current,
+                        items_total: Some(total),
+                        folders_seen: 0,
+                        media_files_seen: 0,
+                        skipped_files: 0,
+                    },
+                )
+                .expect("publish purge progress");
+        }
+
+        assert_eq!(current, total);
+        assert!(database
+            .get_task(task_id)
+            .expect("read deleted task")
+            .is_none());
+        assert!(database
+            .get_root(root_id)
+            .expect("read deleted root")
+            .is_none());
+        let events = database
+            .list_notification_outbox(0, 200)
+            .expect("read purge notifications");
+        let purge_snapshots = events
+            .iter()
+            .filter(|event| event.operation.task_id == Some(task_id))
+            .collect::<Vec<_>>();
+        assert!(purge_snapshots
+            .windows(2)
+            .all(|pair| { pair[0].operation.current_value <= pair[1].operation.current_value }));
+        let running = purge_snapshots
+            .iter()
+            .find(|event| event.operation.status == "running")
+            .expect("running purge event");
+        assert_eq!(running.operation.total_value, Some(total));
+        let terminal = events
+            .iter()
+            .find(|event| {
+                event.operation.task_id == Some(task_id) && event.operation.status == "succeeded"
+            })
+            .expect("terminal purge event");
+        assert_eq!(terminal.operation.current_value, total);
+        assert_eq!(terminal.operation.total_value, Some(total));
+    }
+
+    #[test]
+    fn task_recovery_republishes_pending_state_with_recovery_origin() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures".to_string(),
+                display_name: "Pictures".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task(root_id)
+            .expect("create root scan task");
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark task running");
+        assert_eq!(
+            database
+                .reset_running_root_scan_tasks_for_recovery()
+                .expect("reset running task"),
+            1
+        );
+
+        let operation = database
+            .notification_heads_for_test()
+            .expect("read notification heads")
+            .into_iter()
+            .find(|operation| operation.task_id == Some(task_id))
+            .expect("recovered task head");
+        assert_eq!(operation.status, "pending");
+        assert_eq!(operation.origin, "recovery");
     }
 
     #[test]
