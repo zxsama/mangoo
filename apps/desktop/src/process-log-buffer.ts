@@ -55,21 +55,29 @@ const MAX_METADATA_STRING_LENGTH = 4 * 1024;
 const REDACTED = "[redacted]";
 const UNREADABLE = "[unreadable]";
 
-const SECRET_TEXT_PATTERN =
-  /((?:MEGLE_SESSION_TOKEN|SESSION_TOKEN|SESSIONTOKEN|X-MEGLE-SESSION|AUTHORIZATION|BEARER|TOKEN)\s*[:=]\s*)([^\s,;]+)/gi;
-const SECRET_JSON_PATTERN =
-  /((?:["']?(?:sessionToken|session_token|session-token|token|auth|authorization|bearer|secret|password|cookie)["']?)\s*:\s*["'])([^"']*)(["'])/gi;
+const SENSITIVE_KEY_SOURCE = String.raw`(?:megle[-_]?session[-_]?token|megle[-_]?session|x[-_]?megle[-_]?session(?:[-_]?token)?|x[-_]?session[-_]?token|session[-_]?token|sessiontoken|access[-_]?token|refresh[-_]?token|token|auth|authorization|proxy[-_]?authorization|bearer|secret|password|cookie|set[-_]?cookie|api[-_]?key|x[-_]?api[-_]?key)`;
+const SECRET_TEXT_PATTERN = new RegExp(
+  `((?:${SENSITIVE_KEY_SOURCE})\\s*[:=]\\s*)([^\\r\\n,;]+)`,
+  "gi"
+);
+const SECRET_JSON_PATTERN = new RegExp(
+  `((?:["']?(?:${SENSITIVE_KEY_SOURCE})["']?)\\s*:\\s*["'])([^"']*)(["'])`,
+  "gi"
+);
 const WINDOWS_PATH_PATTERN = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+/g;
 const UNIX_SENSITIVE_PATH_PATTERN = /(?:\/Users\/|\/home\/|\/private\/var\/|\/tmp\/)[^\s"'`<>]+/gi;
-const SENSITIVE_METADATA_KEY_PATTERN =
-  /(?:sessiontoken|session_token|session-token|token|auth|authorization|bearer|secret|password|cookie|(?:^|[_-])path$|(?:^|[_-])filepath$|(?:^|[_-])directory$|(?:^|[_-])rootpath$)/i;
+const SENSITIVE_METADATA_KEY_PATTERN = new RegExp(
+  `^(?:${SENSITIVE_KEY_SOURCE}|path|file[-_]?path|directory|root[-_]?path)$`,
+  "i"
+);
 
 export function sanitizeProcessLogMessage(value: string): string {
-  let message = value.replace(/\r\n?/g, "\\n");
+  let message = value;
   message = message.replace(SECRET_TEXT_PATTERN, `$1${REDACTED}`);
   message = message.replace(SECRET_JSON_PATTERN, `$1${REDACTED}$3`);
   message = message.replace(WINDOWS_PATH_PATTERN, REDACTED);
   message = message.replace(UNIX_SENSITIVE_PATH_PATTERN, REDACTED);
+  message = message.replace(/\r\n?/g, "\\n");
   return truncateUtf8(message, MAX_MESSAGE_BYTES);
 }
 

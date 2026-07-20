@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter, once } from "node:events";
+import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import {
   DEFAULT_PROCESS_LOG_MAX_BYTES,
@@ -125,6 +127,52 @@ test("uses the same recursive redaction for structured messages and metadata", a
   assert.equal(JSON.stringify(line.metadata).includes("top-secret"), false);
   assert.equal(JSON.stringify(line.metadata).includes("nested-secret"), false);
   assert.equal(JSON.stringify(line.metadata).includes("bearer-secret"), false);
+});
+
+test("redacts x-megle-session and synonymous headers in nested objects and raw text", async () => {
+  const secrets = [
+    "megle-secret",
+    "megle-token-secret",
+    "session-token-secret",
+    "authorization-secret",
+    "proxy-secret",
+    "cookie-secret",
+    "api-key-secret",
+    "env-secret",
+    "raw-megle-secret",
+    "raw-auth-secret"
+  ];
+  const payload = {
+    nested: {
+      headers: {
+        "x-megle-session": secrets[0],
+        "X-Megle-Session-Token": secrets[1],
+        "x-session-token": secrets[2],
+        Authorization: `Bearer ${secrets[3]}`,
+        "Proxy-Authorization": `Basic ${secrets[4]}`,
+        Cookie: `sid=${secrets[5]}`,
+        "X-Api-Key": secrets[6]
+      }
+    },
+    list: [{ MEGLE_SESSION_TOKEN: secrets[7] }]
+  };
+  const buffer = new ProcessLogBuffer();
+  const logger = new DesktopLogger({ buffer, console: { info: () => undefined, warn: () => undefined } });
+
+  logger.info("renderer", payload);
+  logger.warn(
+    "renderer",
+    `X-Megle-Session: ${secrets[8]}\nAuthorization: Bearer ${secrets[9]}`
+  );
+  await logger.flush();
+
+  const snapshot = buffer.snapshot({});
+  const serialized = JSON.stringify(snapshot);
+  for (const secret of secrets) {
+    assert.equal(snapshot.some((line) => line.message.includes(secret)), false);
+    assert.equal(snapshot.some((line) => (JSON.stringify(line.metadata) ?? "").includes(secret)), false);
+    assert.equal(serialized.includes(secret), false);
+  }
 });
 
 test("keeps append alive when getters, invalid dates, proxies, or structured clone fail", () => {
@@ -264,7 +312,56 @@ test("splits Core stdout and stderr chunks without losing partial lines", () => 
   assert.deepEqual(stderr, ["警告"]);
 });
 
-test("real Core lifecycle drains both streams and records non-zero exit before stop resolves", async () => {
+test("intentional mocked Core stop does not create a false error", async () => {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = Object.assign(new EventEmitter(), {
+    stdout,
+    stderr,
+    kill: () => {
+      queueMicrotask(() => {
+        stdout.end();
+        stderr.end();
+        child.emit("exit", 1, "SIGTERM");
+        child.emit("close", 1, "SIGTERM");
+      });
+      return true;
+    }
+  });
+  const logs: Array<{ level: string; message: string }> = [];
+  const lifecycle = attachCoreProcessLifecycle(
+    child as unknown as ChildProcess,
+    (_source, level, message) => logs.push({ level, message })
+  );
+  stdout.write("mock partial");
+
+  await lifecycle.stop();
+
+  assert.equal(logs.some((line) => line.level === "error"), false);
+  assert.equal(logs.some((line) => line.message.includes("mock partial")), true);
+  assert.equal(logs.some((line) => line.message.includes("stopped intentionally")), true);
+});
+
+test("intentional real running Core stop is informational on Windows and POSIX", async () => {
+  const logs: Array<{ level: string; message: string }> = [];
+  const child = spawn(
+    process.execPath,
+    ["-e", "process.stdout.write('real partial'); setInterval(() => {}, 1000);"],
+    { stdio: ["ignore", "pipe", "pipe"] }
+  );
+  const lifecycle = attachCoreProcessLifecycle(child, (_source, level, message) => {
+    logs.push({ level, message });
+  });
+  await once(child.stdout!, "data");
+
+  await lifecycle.stop();
+
+  assert.equal(logs.some((line) => line.level === "error"), false);
+  assert.equal(logs.some((line) => line.message.includes("real partial")), true);
+  assert.equal(logs.some((line) => line.message.includes("stopped intentionally")), true);
+});
+
+test("natural non-zero Core exit remains an error before a later stop call", async () => {
   const logs: Array<{ level: string; message: string }> = [];
   const child = spawn(
     process.execPath,

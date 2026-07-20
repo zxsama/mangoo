@@ -106,6 +106,8 @@ export function attachCoreProcessLifecycle(
   const stdoutSplitter = createCoreOutputLineSplitter((line) => emitCoreLog(onLog, "info", line));
   const stderrSplitter = createCoreOutputLineSplitter((line) => emitCoreLog(onLog, "warn", line));
   let settled = false;
+  let exitObserved = false;
+  let stopState: "running" | "stopping" | "stopped" = "running";
   let stopPromise: Promise<void> | null = null;
   let resolveExit!: () => void;
   let exitCode: number | null = null;
@@ -118,11 +120,19 @@ export function attachCoreProcessLifecycle(
   const settle = (code: number | null, signal: NodeJS.Signals | null, error?: unknown): void => {
     if (settled) return;
     settled = true;
+    const intentionalStop = stopState === "stopping";
+    stopState = "stopped";
     stdoutSplitter.flush();
     stderrSplitter.flush();
-    if (error !== undefined) {
+    if (intentionalStop) {
+      emitCoreLog(
+        onLog,
+        "info",
+        `Core stopped intentionally code=${code} signal=${signal ?? "none"}`
+      );
+    } else if (error !== undefined) {
       emitCoreLog(onLog, "error", `Core process error: ${formatCoreError(error)}`);
-    } else if (code !== 0 && signal !== "SIGTERM") {
+    } else if (code !== 0 || signal !== null) {
       emitCoreLog(onLog, "error", `Core exited with code=${code} signal=${signal ?? "none"}`);
     }
     resolveExit();
@@ -131,6 +141,7 @@ export function attachCoreProcessLifecycle(
   child.stdout?.on("data", (chunk: Buffer) => stdoutSplitter.push(chunk));
   child.stderr?.on("data", (chunk: Buffer) => stderrSplitter.push(chunk));
   child.once("exit", (code, signal) => {
+    exitObserved = true;
     exitCode = code;
     exitSignal = signal;
   });
@@ -146,15 +157,20 @@ export function attachCoreProcessLifecycle(
       await waitForExit;
       return;
     }
+    if (exitObserved || processError !== undefined) {
+      await waitForExit;
+      return;
+    }
     if (!stopPromise) {
+      stopState = "stopping";
       stopPromise = (async () => {
         try {
           stopCoreProcessTree(child);
         } catch (error) {
           emitCoreLog(onLog, "error", `Core stop request failed: ${formatCoreError(error)}`);
         }
-        await Promise.race([waitForExit, delay(CORE_STOP_TIMEOUT_MS)]);
-        if (!settled) {
+        const didExit = await waitForCoreExit(waitForExit, CORE_STOP_TIMEOUT_MS);
+        if (!didExit) {
           stdoutSplitter.flush();
           stderrSplitter.flush();
           emitCoreLog(onLog, "error", `Core stop timed out after ${CORE_STOP_TIMEOUT_MS}ms`);
@@ -187,6 +203,16 @@ function formatCoreError(error: unknown): string {
   } catch {
     return "[unreadable error]";
   }
+}
+
+async function waitForCoreExit(waitForExit: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+  const didExit = await Promise.race([waitForExit.then(() => true), timedOut]);
+  if (timer) clearTimeout(timer);
+  return didExit;
 }
 
 function defaultCoreProcessLogHandler(
