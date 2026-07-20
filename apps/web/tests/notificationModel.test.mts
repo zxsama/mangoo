@@ -1,0 +1,533 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+
+import type {
+  DesktopNotificationCompactSnapshot,
+  DesktopNotificationHistoryPage,
+  DesktopNotificationOperation,
+  DesktopNotificationsBridge,
+  DesktopThumbnailCacheSummary
+} from "@megle/notification-contract";
+import {
+  buildCompactNotificationModel,
+  mergeNotificationHistoryPages,
+  notificationIndicator,
+  progressView
+} from "../src/features/notifications/notificationModel.ts";
+import { createNotificationStore } from "../src/features/notifications/useNotifications.ts";
+
+function operation(
+  operationId: string,
+  overrides: Partial<DesktopNotificationOperation> = {}
+): DesktopNotificationOperation {
+  return {
+    operationId,
+    revision: 1,
+    kind: "root_scan",
+    category: "task",
+    origin: "user",
+    presentation: "important",
+    status: "running",
+    phase: "扫描中",
+    title: operationId,
+    summary: null,
+    taskId: 1,
+    rootId: 1,
+    folderId: null,
+    fileId: null,
+    currentValue: 30,
+    totalValue: 100,
+    unit: "items",
+    errorCode: null,
+    errorDetail: null,
+    cancellable: true,
+    retryable: false,
+    attempt: 1,
+    occurrenceCount: 1,
+    startedAt: 100,
+    updatedAt: 200,
+    completedAt: null,
+    libraryId: "library-a",
+    libraryName: "Artists",
+    ...overrides
+  };
+}
+
+function terminal(
+  operationId: string,
+  completedAt: number,
+  overrides: Partial<DesktopNotificationOperation> = {}
+): DesktopNotificationOperation {
+  return operation(operationId, {
+    status: "succeeded",
+    phase: "完成",
+    currentValue: 100,
+    completedAt,
+    updatedAt: completedAt,
+    cancellable: false,
+    ...overrides
+  });
+}
+
+function thumbnail(
+  libraryId: string,
+  overrides: Partial<DesktopThumbnailCacheSummary> = {}
+): DesktopThumbnailCacheSummary {
+  return {
+    libraryId,
+    libraryName: libraryId === "library-a" ? "Artists" : "References",
+    observedAt: 500,
+    cachedCount: 80,
+    totalCandidateCount: 100,
+    missingCount: 10,
+    staleCount: 4,
+    failedCount: 1,
+    pendingCount: 5,
+    activeBulkTaskCount: 1,
+    totalCacheBytes: 1024,
+    completionPercent: 80,
+    ...overrides
+  };
+}
+
+function compact(
+  overrides: Partial<DesktopNotificationCompactSnapshot> = {}
+): DesktopNotificationCompactSnapshot {
+  return {
+    active: [],
+    thumbnailSummaries: [],
+    latestImportantResults: [],
+    syncHealth: {
+      state: "healthy",
+      libraryId: "library-a",
+      detail: null,
+      updatedAt: 1
+    },
+    ...overrides
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function bridge(
+  overrides: Partial<DesktopNotificationsBridge> = {}
+): DesktopNotificationsBridge {
+  return {
+    getCompactSnapshot: async () => compact(),
+    listHistory: async () => ({ items: [], total: 0, nextOffset: null }),
+    cancel: async () => ({ ok: true, message: null }),
+    retry: async () => ({ ok: true, message: null }),
+    reportError: async () => true,
+    publishThumbnailSummary: async () => true,
+    onChanged: () => () => undefined,
+    getLogs: async () => ({ lines: [], hasMore: false, nextBeforeSequence: null }),
+    snapshotAndSubscribeLogs: () => ({
+      ready: Promise.resolve({ snapshot: [], afterSequence: 0 }),
+      unsubscribe: () => undefined
+    }),
+    clearLogs: async () => true,
+    emitRendererLogs: () => undefined,
+    ...overrides
+  };
+}
+
+describe("notification selectors", () => {
+  it("keeps all active logical operations and limits important terminal results to three", () => {
+    const model = buildCompactNotificationModel(
+      compact({
+        active: [
+          operation("pending", { status: "pending", origin: "background" }),
+          operation("running", { presentation: "status_only" }),
+          terminal("not-active", 600)
+        ],
+        latestImportantResults: [
+          terminal("result:2", 200),
+          terminal("history-only", 700, { presentation: "history_only" }),
+          terminal("result:4", 400),
+          terminal("result:1", 100),
+          terminal("result:3", 300),
+          operation("still-running", { presentation: "important" })
+        ]
+      })
+    );
+
+    assert.deepEqual(model.active.map((item) => item.operationId), ["pending", "running"]);
+    assert.deepEqual(model.results.map((item) => item.operationId), [
+      "result:4",
+      "result:3",
+      "result:2"
+    ]);
+    assert.equal(model.active[0]?.libraryLabel, "Artists");
+  });
+
+  it("deduplicates operation revisions before sorting", () => {
+    const model = buildCompactNotificationModel(
+      compact({
+        active: [
+          operation("scan", { revision: 1, currentValue: 10 }),
+          operation("scan", { revision: 2, currentValue: 40 })
+        ],
+        latestImportantResults: [
+          terminal("done", 100, { revision: 1, summary: "old" }),
+          terminal("done", 100, { revision: 2, summary: "new" })
+        ]
+      })
+    );
+
+    assert.equal(model.active.length, 1);
+    assert.equal(model.active[0]?.revision, 2);
+    assert.equal(model.results.length, 1);
+    assert.equal(model.results[0]?.summary, "new");
+  });
+
+  it("uses retryable failure over active for the subtle status dot", () => {
+    assert.equal(notificationIndicator({ active: true, retryableFailure: true }), "failure");
+    assert.equal(notificationIndicator({ active: true, retryableFailure: false }), "active");
+    assert.equal(notificationIndicator({ active: false, retryableFailure: false }), "idle");
+
+    const model = buildCompactNotificationModel(
+      compact({
+        active: [operation("scan")],
+        latestImportantResults: [
+          terminal("failed", 300, { status: "failed", retryable: true, origin: "background" })
+        ]
+      })
+    );
+    assert.equal(model.indicator, "failure");
+  });
+
+  it("builds determinate and indeterminate progress without false percentages", () => {
+    assert.deepEqual(progressView(operation("known")), {
+      determinate: true,
+      percent: 30,
+      label: "30 / 100"
+    });
+    assert.deepEqual(
+      progressView(operation("unknown", { totalValue: null, phase: "等待媒体" })),
+      { determinate: false, percent: null, label: "等待媒体" }
+    );
+    assert.equal(progressView(operation("overflow", { currentValue: 140 })).percent, 100);
+  });
+
+  it("combines thumbnail status without creating per-thumbnail rows", () => {
+    const model = buildCompactNotificationModel(
+      compact({
+        thumbnailSummaries: [
+          thumbnail("library-b", { cachedCount: 20, totalCandidateCount: 50 }),
+          thumbnail("library-a"),
+          thumbnail("library-a", { observedAt: 400, cachedCount: 1 })
+        ]
+      })
+    );
+
+    assert.deepEqual(model.thumbnail.summaries.map((item) => item.libraryId), [
+      "library-a",
+      "library-b"
+    ]);
+    assert.equal(model.thumbnail.cachedCount, 100);
+    assert.equal(model.thumbnail.totalCandidateCount, 150);
+    assert.equal(model.thumbnail.completionPercent, 67);
+    assert.equal(model.thumbnail.active, true);
+  });
+
+  it("exposes degraded health and never introduces read state", () => {
+    const model = buildCompactNotificationModel(
+      compact({
+        syncHealth: {
+          state: "degraded",
+          libraryId: null,
+          detail: "store unavailable",
+          updatedAt: 2
+        }
+      })
+    );
+
+    assert.equal(model.degraded, true);
+    assert.equal(model.healthDetail, "store unavailable");
+    assert.equal("read" in model, false);
+    assert.equal("unread" in model, false);
+  });
+});
+
+describe("notification history model", () => {
+  it("merges overlapping pages by revision with stable terminal ordering", () => {
+    const first: DesktopNotificationHistoryPage = {
+      items: [
+        terminal("b", 300, { libraryId: "library-b", libraryName: "References" }),
+        terminal("same", 200, { revision: 1, summary: "old" })
+      ],
+      total: 3,
+      nextOffset: 2
+    };
+    const second: DesktopNotificationHistoryPage = {
+      items: [
+        terminal("same", 200, { revision: 2, summary: "new" }),
+        terminal("a", 300, { libraryId: "library-a", libraryName: "Artists" })
+      ],
+      total: 3,
+      nextOffset: null
+    };
+
+    const merged = mergeNotificationHistoryPages([
+      { offset: 0, page: first },
+      { offset: 2, page: second }
+    ]);
+
+    assert.deepEqual(merged.items.map((item) => item.operationId), ["a", "b", "same"]);
+    assert.equal(merged.items.find((item) => item.operationId === "same")?.revision, 2);
+    assert.equal(merged.total, 3);
+    assert.equal(merged.nextOffset, null);
+  });
+
+  it("keeps the next offset at the first missing contiguous page", () => {
+    const page = { items: [terminal("late", 100)], total: 3, nextOffset: null };
+    assert.equal(mergeNotificationHistoryPages([{ offset: 2, page }]).nextOffset, 0);
+  });
+});
+
+describe("notification external store", () => {
+  it("shares one bridge subscription across consumers and survives StrictMode resubscribe", async () => {
+    let subscribeCalls = 0;
+    let unsubscribeCalls = 0;
+    const disconnects: Array<() => void> = [];
+    const testBridge = bridge({
+      onChanged: () => {
+        subscribeCalls += 1;
+        return () => {
+          unsubscribeCalls += 1;
+        };
+      }
+    });
+    const store = createNotificationStore({
+      getBridge: () => testBridge,
+      deferDisconnect: (callback) => disconnects.push(callback)
+    });
+
+    const offFirst = store.subscribe(() => undefined);
+    const offSecond = store.subscribe(() => undefined);
+    offFirst();
+    offSecond();
+    const offStrictModeReplay = store.subscribe(() => undefined);
+
+    assert.equal(subscribeCalls, 1);
+    disconnects.splice(0).forEach((callback) => callback());
+    assert.equal(unsubscribeCalls, 0);
+
+    offStrictModeReplay();
+    disconnects.splice(0).forEach((callback) => callback());
+    assert.equal(unsubscribeCalls, 1);
+  });
+
+  it("loads the initial snapshot and applies changed snapshots", async () => {
+    let changed: ((snapshot: DesktopNotificationCompactSnapshot) => void) | null = null;
+    const testBridge = bridge({
+      getCompactSnapshot: async () => compact({ active: [operation("initial")] }),
+      onChanged: (callback) => {
+        changed = callback;
+        return () => undefined;
+      }
+    });
+    const store = createNotificationStore({ getBridge: () => testBridge });
+    const off = store.subscribe(() => undefined);
+    await store.whenIdle();
+    assert.deepEqual(store.getSnapshot().compact.active.map((item) => item.operationId), ["initial"]);
+
+    changed?.(compact({ active: [operation("changed")] }));
+    assert.deepEqual(store.getSnapshot().compact.active.map((item) => item.operationId), ["changed"]);
+    off();
+  });
+
+  it("ignores a stale initial snapshot that resolves after a change event", async () => {
+    const initial = deferred<DesktopNotificationCompactSnapshot>();
+    let changed: ((snapshot: DesktopNotificationCompactSnapshot) => void) | null = null;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          getCompactSnapshot: () => initial.promise,
+          onChanged: (callback) => {
+            changed = callback;
+            return () => undefined;
+          }
+        })
+    });
+
+    const off = store.subscribe(() => undefined);
+    changed?.(compact({ active: [operation("newer")] }));
+    initial.resolve(compact({ active: [operation("stale")] }));
+    await store.whenIdle();
+
+    assert.deepEqual(store.getSnapshot().compact.active.map((item) => item.operationId), ["newer"]);
+    off();
+  });
+
+  it("ignores an initial snapshot from a disconnected bridge generation", async () => {
+    const stale = deferred<DesktopNotificationCompactSnapshot>();
+    const disconnects: Array<() => void> = [];
+    let generation = 0;
+    const store = createNotificationStore({
+      getBridge: () => {
+        generation += 1;
+        return bridge({
+          getCompactSnapshot: () =>
+            generation === 1
+              ? stale.promise
+              : Promise.resolve(compact({ active: [operation("current")] }))
+        });
+      },
+      deferDisconnect: (callback) => disconnects.push(callback)
+    });
+
+    const offStale = store.subscribe(() => undefined);
+    offStale();
+    disconnects.splice(0).forEach((callback) => callback());
+    const offCurrent = store.subscribe(() => undefined);
+    await store.whenIdle();
+    stale.resolve(compact({ active: [operation("stale-generation")] }));
+    await Promise.resolve();
+
+    assert.deepEqual(store.getSnapshot().compact.active.map((item) => item.operationId), [
+      "current"
+    ]);
+    offCurrent();
+  });
+
+  it("keeps a changed snapshot when the concurrent initial request fails", async () => {
+    const initial = deferred<DesktopNotificationCompactSnapshot>();
+    let changed: ((snapshot: DesktopNotificationCompactSnapshot) => void) | null = null;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          getCompactSnapshot: () => initial.promise,
+          onChanged: (callback) => {
+            changed = callback;
+            return () => undefined;
+          }
+        })
+    });
+
+    const off = store.subscribe(() => undefined);
+    changed?.(compact({ active: [operation("newer")] }));
+    initial.reject(new Error("initial unavailable"));
+    await store.whenIdle();
+
+    assert.deepEqual(store.getSnapshot().compact.active.map((item) => item.operationId), ["newer"]);
+    off();
+  });
+
+  it("provides a stable degraded model when the bridge is unavailable or fails", async () => {
+    const unavailable = createNotificationStore({ getBridge: () => null });
+    const before = unavailable.getSnapshot();
+    const offUnavailable = unavailable.subscribe(() => undefined);
+    await unavailable.whenIdle();
+    assert.equal(unavailable.getSnapshot(), before);
+    assert.equal(before.compact.degraded, true);
+    offUnavailable();
+
+    const failing = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          getCompactSnapshot: async () => {
+            throw new Error("IPC closed");
+          },
+          onChanged: () => {
+            throw new Error("subscription failed");
+          }
+        })
+    });
+    const offFailing = failing.subscribe(() => undefined);
+    await failing.whenIdle();
+    assert.equal(failing.getSnapshot().compact.degraded, true);
+    assert.match(failing.getSnapshot().compact.healthDetail ?? "", /IPC closed|subscription failed/);
+    offFailing();
+  });
+
+  it("deduplicates concurrent history pages and ignores stale query responses", async () => {
+    const first = deferred<DesktopNotificationHistoryPage>();
+    const second = deferred<DesktopNotificationHistoryPage>();
+    const calls: Array<{ search?: string; offset?: number }> = [];
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          listHistory: (query) => {
+            calls.push({ search: query.search, offset: query.offset });
+            return query.search === "first" ? first.promise : second.promise;
+          }
+        })
+    });
+
+    const staleRequest = store.loadHistory({ search: "first", limit: 20 });
+    const currentRequest = store.loadHistory({ search: "second", limit: 20 });
+    second.resolve({ items: [terminal("current", 200)], total: 1, nextOffset: null });
+    await currentRequest;
+    first.resolve({ items: [terminal("stale", 300)], total: 1, nextOffset: null });
+    await staleRequest;
+
+    assert.deepEqual(store.getSnapshot().history.items.map((item) => item.operationId), [
+      "current"
+    ]);
+
+    const page = deferred<DesktopNotificationHistoryPage>();
+    let pagingCalls = 0;
+    const pagingStore = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          listHistory: () => {
+            pagingCalls += 1;
+            return page.promise;
+          }
+        })
+    });
+    const one = pagingStore.loadHistory({ limit: 20 });
+    const two = pagingStore.loadMoreHistory();
+    assert.equal(pagingCalls, 1);
+    page.resolve({ items: [], total: 0, nextOffset: null });
+    await Promise.all([one, two]);
+  });
+
+  it("returns typed action failures without mutating a newer compact revision", async () => {
+    const action = deferred<{ ok: boolean; message: string | null }>();
+    let changed: ((snapshot: DesktopNotificationCompactSnapshot) => void) | null = null;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          cancel: () => action.promise,
+          onChanged: (callback) => {
+            changed = callback;
+            return () => undefined;
+          }
+        })
+    });
+    const off = store.subscribe(() => undefined);
+    const pending = store.cancel("library-a", "scan");
+    changed?.(compact({ active: [operation("scan", { revision: 2, currentValue: 60 })] }));
+    action.resolve({ ok: false, message: "already completed" });
+
+    assert.deepEqual(await pending, { ok: false, message: "already completed" });
+    assert.equal(store.getSnapshot().compact.active[0]?.revision, 2);
+    off();
+  });
+
+  it("converts bridge action exceptions into typed failures", async () => {
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          retry: async () => {
+            throw new Error("IPC unavailable");
+          }
+        })
+    });
+
+    assert.deepEqual(await store.retry("library-a", "scan"), {
+      ok: false,
+      message: "IPC unavailable"
+    });
+  });
+});
