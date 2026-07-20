@@ -314,6 +314,19 @@ assertInterfaceMatchesSchema("PluginDiscoveryError");
 assertInterfaceMatchesSchema("PluginDiscoveryResponse");
 assertInterfaceMatchesSchema("DeletePluginResponse");
 
+const fileOperationSchema = schema("FileOperationRecord");
+const operationGroupSchema = fileOperationSchema.properties?.operationGroupId;
+if (!operationGroupSchema) {
+  fail("OpenAPI FileOperationRecord must expose operationGroupId");
+} else {
+  if ((fileOperationSchema.required ?? []).includes("operationGroupId")) {
+    fail("OpenAPI FileOperationRecord.operationGroupId must remain optional");
+  }
+  if (!schemaAllowsNull(operationGroupSchema)) {
+    fail("OpenAPI FileOperationRecord.operationGroupId must remain nullable");
+  }
+}
+
 for (const name of ["NotificationOrigin", "NotificationPresentation", "NotificationOperationStatus"]) {
   assertEnumMatchesGeneratedType(name);
 }

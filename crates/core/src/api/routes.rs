@@ -5979,6 +5979,9 @@ mod tests {
         let items = body["items"].as_array().expect("items");
         assert_eq!(items.len(), 2);
         assert!(items[0]["id"].as_i64().unwrap() > items[1]["id"].as_i64().unwrap());
+        assert!(items
+            .iter()
+            .all(|item| item["operationGroupId"].is_string()));
         assert!(body["nextCursor"].is_string());
 
         drop(app);

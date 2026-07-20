@@ -341,6 +341,7 @@ export interface FileOperationRecord {
   createdAt: number;
   finishedAt: number | null;
   error: string | null;
+  operationGroupId?: string | null;
 }
 
 export interface FileOperationListResponse {

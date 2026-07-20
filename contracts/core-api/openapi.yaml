@@ -1852,6 +1852,9 @@ components:
         error:
           type: string
           nullable: true
+        operationGroupId:
+          type: string
+          nullable: true
     FileOperationListResponse:
       type: object
       required: [items, nextCursor]

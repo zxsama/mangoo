@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { afterEach, beforeEach, describe, test } from "node:test";
 
 import { createCoreClient } from "../src/client.ts";
+import type { FileOperationRecord } from "../src/generated-contract.ts";
 
 interface RecordedRequest {
   url: string;
@@ -484,7 +485,7 @@ describe("createCoreClient", () => {
   });
 
   test("file ops rename posts to /file-ops/rename", async () => {
-    mockFetch({
+    const fixture: FileOperationRecord = {
       id: 1,
       operation: "rename",
       sourcePath: "/old",
@@ -492,12 +493,15 @@ describe("createCoreClient", () => {
       status: "succeeded",
       createdAt: 0,
       finishedAt: 0,
-      error: null
-    });
-    await client().renameFileOp({ fileId: 5, newName: "new.jpg" });
+      error: null,
+      operationGroupId: "019-group"
+    };
+    mockFetch(fixture);
+    const result = await client().renameFileOp({ fileId: 5, newName: "new.jpg" });
     assert.equal(recorded[0].method, "POST");
     assert.equal(recorded[0].url, `${BASE_URL}/file-ops/rename`);
     assert.deepEqual(JSON.parse(recorded[0].body!), { fileId: 5, newName: "new.jpg" });
+    assert.equal(result.operationGroupId, "019-group");
   });
 
   test("listFileOperations attaches limit and cursor", async () => {

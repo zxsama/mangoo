@@ -353,6 +353,22 @@ for (const value of ["rename", "move", "delete_recycle", "delete_permanent"]) {
   }
 }
 
+const fileOperationSchemaBlock = openApi.match(
+  /    FileOperationRecord:\n[\s\S]*?(?=    FileOperationListResponse:)/
+)?.[0];
+if (!fileOperationSchemaBlock?.includes("        operationGroupId:")) {
+  fail("OpenAPI FileOperationRecord must expose operationGroupId");
+}
+if (!/operationGroupId:\n\s+type: string\n\s+nullable: true/.test(fileOperationSchemaBlock ?? "")) {
+  fail("OpenAPI FileOperationRecord.operationGroupId must be a nullable string");
+}
+if (/required:\s*\[[^\]]*operationGroupId/.test(fileOperationSchemaBlock ?? "")) {
+  fail("OpenAPI FileOperationRecord.operationGroupId must remain optional");
+}
+if (/skip_serializing[^\n]*\n\s*pub operation_group_id/.test(fsopsRs)) {
+  fail("Core FileOperationRecord.operation_group_id must be serialized");
+}
+
 if (!dbModRs.includes('pub const WAL_MODE: &str = "WAL"')) {
   fail('WAL_MODE must remain "WAL"');
 }

@@ -62,7 +62,6 @@ pub struct FileOperationRecord {
     pub created_at: i64,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
-    #[serde(skip_serializing)]
     pub operation_group_id: Option<String>,
 }
 
@@ -1480,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_file_operation_json_omits_internal_group_id() {
+    fn file_operation_json_exposes_nullable_group_id() {
         let env = TestEnv::new("legacy_operation_json");
         let file_id = env.add_file(env.root_folder_id, "legacy.jpg");
         let record = rename(
@@ -1492,9 +1491,26 @@ mod tests {
             },
         )
         .expect("rename command");
-        assert!(record.operation_group_id.is_some());
-        let json = serde_json::to_value(record).expect("serialize legacy response");
-        assert!(json.get("operationGroupId").is_none());
+        let group_id = record
+            .operation_group_id
+            .clone()
+            .expect("command operation group");
+        let json = serde_json::to_value(record).expect("serialize grouped response");
+        assert_eq!(json["operationGroupId"], group_id);
+
+        let legacy = FileOperationRecord {
+            id: 1,
+            operation: "move".to_owned(),
+            source_path: "old".to_owned(),
+            target_path: Some("new".to_owned()),
+            status: "succeeded".to_owned(),
+            created_at: 1,
+            finished_at: Some(2),
+            error: None,
+            operation_group_id: None,
+        };
+        let legacy_json = serde_json::to_value(legacy).expect("serialize legacy response");
+        assert!(legacy_json["operationGroupId"].is_null());
     }
 
     #[test]

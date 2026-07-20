@@ -11,6 +11,7 @@
     "build": "tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('src/preload.cjs', 'dist/preload.cjs')\""
   },
   "dependencies": {
+    "@megle/core-client": "*",
     "electron": "43.1.0"
   },
   "devDependencies": {

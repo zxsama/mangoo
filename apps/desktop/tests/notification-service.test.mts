@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
+import type { FileOperationRecord } from "@megle/core-client/generated-contract";
 
 import {
   createNotificationService,
@@ -84,6 +85,22 @@ function event(sequence: number, value = operation(`task:${sequence}`)): Notific
   return { sequence, operation: value };
 }
 
+function fileOperationRecord(
+  overrides: Partial<FileOperationRecord> = {}
+): FileOperationRecord {
+  return {
+    id: 1,
+    operation: "move",
+    sourcePath: "source",
+    targetPath: "target",
+    status: "succeeded",
+    createdAt: NOW - 1_000,
+    finishedAt: NOW - 500,
+    error: null,
+    ...overrides
+  };
+}
+
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -102,6 +119,7 @@ class FakeStore implements NotificationServiceStore {
   readonly summaries = new Map<string, ThumbnailCacheSummary>();
   readonly imported = new Set<string>();
   readonly calls: string[] = [];
+  readonly getOperationCalls: string[] = [];
   cleanupCalls = 0;
   failApply = false;
   failActionError = false;
@@ -194,6 +212,7 @@ class FakeStore implements NotificationServiceStore {
   }
 
   async getOperation(libraryId: string, operationId: string): Promise<DesktopNotificationOperation | null> {
+    this.getOperationCalls.push(`${libraryId}/${operationId}`);
     return this.operations.get(`${libraryId}/${operationId}`) ?? null;
   }
 
@@ -464,41 +483,39 @@ describe("notification service", () => {
     await service.close();
   });
 
-  it("aggregates legacy rows into bounded logical history operations", async () => {
+  it("aggregates contract-shaped legacy rows by operationGroupId", async () => {
     const store = new FakeStore();
     const requested: string[] = [];
     const recent = NOW - 1_000;
-    const old = NOW - 31 * 24 * 60 * 60 * 1_000;
-    const ungrouped = Array.from({ length: 1_000 }, (_, index) => ({
-      id: 2_000 - index,
-      operation: "move",
-      sourcePath: `source-${index}`,
-      targetPath: `target-${index}`,
-      status: index === 999 ? "failed" : "succeeded",
-      createdAt: recent - index,
-      finishedAt: recent - index,
-      error: index === 999 ? "busy" : null
-    }));
     const service = await createNotificationService({
       store,
       fetch: async (input) => {
         const url = new URL(String(input));
         requested.push(url.searchParams.get("cursor") ?? "first");
-        if (!url.searchParams.has("cursor")) {
-          return response({
-            items: [
-              ...ungrouped,
-              { id: 9, operationGroupId: "file-group:9", operation: "delete_recycle", sourcePath: "a", targetPath: null, status: "succeeded", createdAt: recent, finishedAt: recent, error: null },
-              { id: 8, operationGroupId: "file-group:9", operation: "delete_recycle", sourcePath: "b", targetPath: null, status: "failed", createdAt: recent - 1, finishedAt: recent, error: "locked" }
-            ],
-            nextCursor: "8"
-          });
-        }
         return response({
           items: [
-            { id: 7, operation: "rename", sourcePath: "old", targetPath: "older", status: "succeeded", createdAt: old, finishedAt: old, error: null }
+            fileOperationRecord({
+              id: 9,
+              operationGroupId: "file-group:9",
+              operation: "delete_recycle",
+              sourcePath: "a",
+              targetPath: null,
+              createdAt: recent,
+              finishedAt: recent
+            }),
+            fileOperationRecord({
+              id: 8,
+              operationGroupId: "file-group:9",
+              operation: "delete_recycle",
+              sourcePath: "b",
+              targetPath: null,
+              status: "failed",
+              createdAt: recent - 1,
+              finishedAt: recent,
+              error: "locked"
+            })
           ],
-          nextCursor: "7"
+          nextCursor: null
         });
       },
       now: () => NOW
@@ -506,17 +523,43 @@ describe("notification service", () => {
 
     await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
     await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
-    assert.deepEqual(requested, ["first", "8"]);
+    assert.deepEqual(requested, ["first"]);
     assert.equal(store.imported.has(LIBRARY_A.id), true);
-    assert.equal(store.operations.size, 2, "1,002 rows must not become 1,002 notifications");
-    const move = [...store.operations.values()].find((item) => item.kind === "move");
-    assert.equal(move?.presentation, "history_only");
-    assert.equal(move?.totalValue, 1_000);
-    assert.equal(move?.status, "failed");
-    assert.match(move?.summary ?? "", /999 succeeded.*1 failed/i);
+    assert.equal(store.operations.size, 1);
     const grouped = store.operations.get(`${LIBRARY_A.id}/file-group:9`);
     assert.equal(grouped?.totalValue, 2);
+    assert.equal(grouped?.status, "failed");
     assert.equal(grouped?.revision, 0, "legacy group snapshots must yield to Core revisions");
+    await service.close();
+  });
+
+  it("summarizes truly ungrouped legacy rows once for the library", async () => {
+    const store = new FakeStore();
+    const service = await createNotificationService({
+      store,
+      fetch: async () =>
+        response({
+          items: [
+            fileOperationRecord({ id: 4, operation: "move" }),
+            fileOperationRecord({ id: 3, operation: "move", status: "failed", error: "busy" }),
+            fileOperationRecord({ id: 2, operation: "rename" }),
+            fileOperationRecord({ id: 1, operation: "delete_recycle", targetPath: null })
+          ],
+          nextCursor: null
+        }),
+      now: () => NOW
+    });
+
+    await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
+    assert.equal(store.operations.size, 1);
+    const summary = store.operations.get(`${LIBRARY_A.id}/legacy-import:${LIBRARY_A.id}`);
+    assert.equal(summary?.kind, "legacy_file_operations");
+    assert.equal(summary?.presentation, "history_only");
+    assert.equal(summary?.totalValue, 4);
+    assert.equal(summary?.status, "failed");
+    assert.match(summary?.summary ?? "", /move: 2/i);
+    assert.match(summary?.summary ?? "", /rename: 1/i);
+    assert.match(summary?.summary ?? "", /recycle bin: 1/i);
     await service.close();
   });
 
@@ -533,7 +576,7 @@ describe("notification service", () => {
       fetch: async () =>
         response({
           items: [
-            {
+            fileOperationRecord({
               id: 1,
               operationGroupId: "file-group:existing",
               operation: "move",
@@ -543,7 +586,7 @@ describe("notification service", () => {
               createdAt: NOW - 100,
               finishedAt: NOW - 50,
               error: null
-            }
+            })
           ],
           nextCursor: null
         }),
@@ -553,6 +596,47 @@ describe("notification service", () => {
     await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
     assert.equal(store.operations.size, 1);
     assert.equal(store.operations.get(`${LIBRARY_A.id}/file-group:existing`)?.revision, 3);
+    assert.deepEqual(store.getOperationCalls, [`${LIBRARY_A.id}/file-group:existing`]);
+    await service.close();
+  });
+
+  it("imports 1,000 ungrouped rows through bounded pages into one summary", async () => {
+    const store = new FakeStore();
+    const rows = Array.from({ length: 1_000 }, (_, index) =>
+      fileOperationRecord({
+        id: 1_000 - index,
+        operation: index % 2 === 0 ? "move" : "rename",
+        sourcePath: `source-${index}`,
+        targetPath: `target-${index}`,
+        status: index === 999 ? "failed" : "succeeded",
+        createdAt: NOW - 1_000 - index,
+        finishedAt: NOW - 500 - index,
+        error: index === 999 ? "busy" : null
+      })
+    );
+    const requestedLimits: string[] = [];
+    const service = await createNotificationService({
+      store,
+      fetch: async (input) => {
+        const url = new URL(String(input));
+        requestedLimits.push(url.searchParams.get("limit") ?? "missing");
+        const offset = Number(url.searchParams.get("cursor") ?? 0);
+        const items = rows.slice(offset, offset + 200);
+        const nextOffset = offset + items.length;
+        return response({
+          items,
+          nextCursor: nextOffset < rows.length ? String(nextOffset) : null
+        });
+      },
+      now: () => NOW
+    });
+
+    await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
+    assert.deepEqual(requestedLimits, ["200", "200", "200", "200", "200"]);
+    assert.equal(store.operations.size, 1);
+    const summary = store.operations.get(`${LIBRARY_A.id}/legacy-import:${LIBRARY_A.id}`);
+    assert.equal(summary?.totalValue, 1_000);
+    assert.match(summary?.summary ?? "", /999 succeeded.*1 failed/i);
     await service.close();
   });
 

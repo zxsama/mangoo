@@ -1,3 +1,8 @@
+import type {
+  FileOperationKind,
+  FileOperationRecord
+} from "@megle/core-client/generated-contract";
+
 import type { CoreSession } from "./core-session.js";
 import type {
   DesktopNotificationOperation,
@@ -29,6 +34,18 @@ const OPERATION_CATEGORIES = new Set(["task", "file_operation", "error", "thumbn
 const OPERATION_ORIGINS = new Set(["user", "background", "recovery", "system"]);
 const OPERATION_PRESENTATIONS = new Set(["important", "history_only", "status_only"]);
 const OPERATION_STATUSES = new Set(["pending", "running", "succeeded", "failed", "cancelled"]);
+const LEGACY_OPERATION_KINDS = [
+  "rename",
+  "move",
+  "delete_recycle",
+  "delete_permanent"
+] as const satisfies readonly FileOperationKind[];
+const LEGACY_OPERATION_LABELS: Record<FileOperationKind, string> = {
+  rename: "Rename",
+  move: "Move",
+  delete_recycle: "Move to recycle bin",
+  delete_permanent: "Delete permanently"
+};
 
 export type NotificationCoreSession = Pick<CoreSession, "baseUrl" | "sessionToken">;
 
@@ -99,18 +116,6 @@ interface PendingRendererError {
   occurrenceIncrement: number;
 }
 
-interface LegacyFileOperation {
-  id: number;
-  operation: "rename" | "move" | "delete_recycle" | "delete_permanent";
-  sourcePath: string;
-  targetPath: string | null;
-  status: "succeeded" | "failed";
-  createdAt: number;
-  finishedAt: number | null;
-  error: string | null;
-  operationGroupId?: string | null;
-}
-
 interface PendingActionError {
   operation: DesktopNotificationOperation;
   detail: string | null;
@@ -118,7 +123,7 @@ interface PendingActionError {
 }
 
 interface LegacyFileOperationPage {
-  items: LegacyFileOperation[];
+  items: FileOperationRecord[];
   nextCursor: string | null;
 }
 
@@ -218,13 +223,26 @@ function validateOutboxOperation(value: unknown): NotificationOperationInput {
 
 interface LegacyOperationAggregate {
   operationId: string;
-  operation: LegacyFileOperation["operation"];
+  operation: FileOperationKind;
   total: number;
   succeeded: number;
   failed: number;
   startedAt: number;
   completedAt: number;
   firstError: string | null;
+}
+
+interface LegacyKindSummary {
+  total: number;
+  succeeded: number;
+  failed: number;
+}
+
+interface LegacyImportSummaryAggregate extends LegacyKindSummary {
+  startedAt: number | null;
+  completedAt: number | null;
+  firstError: string | null;
+  byKind: Record<FileOperationKind, LegacyKindSummary>;
 }
 
 function validateHistoryQuery(query: NotificationHistoryQuery): void {
@@ -740,7 +758,21 @@ export class NotificationService {
     if (await store.hasLegacyImport(library.id)) return;
 
     const cutoff = this.now() - LEGACY_RETENTION_MS;
-    const aggregates = new Map<string, LegacyOperationAggregate>();
+    const groupedOperations = new Map<string, LegacyOperationAggregate>();
+    const ungroupedSummary: LegacyImportSummaryAggregate = {
+      total: 0,
+      succeeded: 0,
+      failed: 0,
+      startedAt: null,
+      completedAt: null,
+      firstError: null,
+      byKind: {
+        rename: { total: 0, succeeded: 0, failed: 0 },
+        move: { total: 0, succeeded: 0, failed: 0 },
+        delete_recycle: { total: 0, succeeded: 0, failed: 0 },
+        delete_permanent: { total: 0, succeeded: 0, failed: 0 }
+      }
+    };
     let cursor: string | null = null;
     let reachedLogicalLimit = false;
     while (!signal.aborted) {
@@ -750,26 +782,42 @@ export class NotificationService {
       const page = this.parseLegacyPage(body);
       const eligible = page.items.filter((item) => item.createdAt >= cutoff);
       for (const item of eligible) {
-        const aggregateKey = item.operationGroupId
-          ? `group:${item.operationGroupId}`
-          : `batch:${item.operation}`;
-        const existing = aggregates.get(aggregateKey);
-        if (!existing && item.operationGroupId && aggregates.size >= LEGACY_LOGICAL_LIMIT) {
-          reachedLogicalLimit = true;
-          break;
-        }
         const completedAt = item.finishedAt ?? item.createdAt;
-        aggregates.set(aggregateKey, {
-          operationId:
-            item.operationGroupId ?? `legacy-import:${library.id}:${item.operation}`,
-          operation: existing?.operation ?? item.operation,
-          total: (existing?.total ?? 0) + 1,
-          succeeded: (existing?.succeeded ?? 0) + (item.status === "succeeded" ? 1 : 0),
-          failed: (existing?.failed ?? 0) + (item.status === "failed" ? 1 : 0),
-          startedAt: Math.min(existing?.startedAt ?? item.createdAt, item.createdAt),
-          completedAt: Math.max(existing?.completedAt ?? completedAt, completedAt),
-          firstError: existing?.firstError ?? item.error
-        });
+        if (item.operationGroupId) {
+          const existing = groupedOperations.get(item.operationGroupId);
+          if (!existing && groupedOperations.size >= LEGACY_LOGICAL_LIMIT) {
+            reachedLogicalLimit = true;
+            break;
+          }
+          groupedOperations.set(item.operationGroupId, {
+            operationId: item.operationGroupId,
+            operation: existing?.operation ?? item.operation,
+            total: (existing?.total ?? 0) + 1,
+            succeeded: (existing?.succeeded ?? 0) + (item.status === "succeeded" ? 1 : 0),
+            failed: (existing?.failed ?? 0) + (item.status === "failed" ? 1 : 0),
+            startedAt: Math.min(existing?.startedAt ?? item.createdAt, item.createdAt),
+            completedAt: Math.max(existing?.completedAt ?? completedAt, completedAt),
+            firstError: existing?.firstError ?? item.error
+          });
+          continue;
+        }
+
+        const kind = ungroupedSummary.byKind[item.operation];
+        ungroupedSummary.total += 1;
+        ungroupedSummary.succeeded += item.status === "succeeded" ? 1 : 0;
+        ungroupedSummary.failed += item.status === "failed" ? 1 : 0;
+        ungroupedSummary.startedAt = Math.min(
+          ungroupedSummary.startedAt ?? item.createdAt,
+          item.createdAt
+        );
+        ungroupedSummary.completedAt = Math.max(
+          ungroupedSummary.completedAt ?? completedAt,
+          completedAt
+        );
+        ungroupedSummary.firstError ??= item.error;
+        kind.total += 1;
+        kind.succeeded += item.status === "succeeded" ? 1 : 0;
+        kind.failed += item.status === "failed" ? 1 : 0;
       }
       const reachedCutoff = page.items.some((item) => item.createdAt < cutoff);
       if (
@@ -783,9 +831,14 @@ export class NotificationService {
       cursor = page.nextCursor;
     }
     if (signal.aborted) throw signal.reason;
-    const operations = [...aggregates.values()].map((aggregate) =>
-      this.legacyOperation(aggregate)
-    );
+    const operations: NotificationOperationInput[] = [];
+    for (const aggregate of groupedOperations.values()) {
+      if (await store.getOperation(library.id, aggregate.operationId)) continue;
+      operations.push(this.legacyOperation(aggregate));
+    }
+    if (ungroupedSummary.total > 0) {
+      operations.push(this.legacyImportSummaryOperation(library.id, ungroupedSummary));
+    }
     for (let index = 0; index < operations.length; index += LEGACY_PAGE_LIMIT) {
       await store.upsertOperations(library, operations.slice(index, index + LEGACY_PAGE_LIMIT));
     }
@@ -804,11 +857,11 @@ export class NotificationService {
     }
     const items = (body as { items: unknown[] }).items.map((value) => {
       if (!value || typeof value !== "object") throw new TypeError("invalid legacy file operation");
-      const item = value as Partial<LegacyFileOperation>;
+      const item = value as Partial<FileOperationRecord>;
       assertSafeSequence(item.id, "legacy file operation id");
       assertSafeSequence(item.createdAt, "legacy file operation createdAt");
       if (item.finishedAt !== null) assertSafeSequence(item.finishedAt, "legacy file operation finishedAt");
-      if (!(["rename", "move", "delete_recycle", "delete_permanent"] as unknown[]).includes(item.operation)) {
+      if (!(LEGACY_OPERATION_KINDS as readonly unknown[]).includes(item.operation)) {
         throw new TypeError("invalid legacy file operation kind");
       }
       if (item.status !== "succeeded" && item.status !== "failed") {
@@ -828,18 +881,12 @@ export class NotificationService {
       ) {
         throw new TypeError("invalid legacy operationGroupId");
       }
-      return item as LegacyFileOperation;
+      return item as FileOperationRecord;
     });
     return { items, nextCursor: nextCursor ?? null };
   }
 
   private legacyOperation(aggregate: LegacyOperationAggregate): NotificationOperationInput {
-    const labels: Record<LegacyFileOperation["operation"], string> = {
-      rename: "Rename",
-      move: "Move",
-      delete_recycle: "Move to recycle bin",
-      delete_permanent: "Delete permanently"
-    };
     const status = aggregate.failed > 0 ? "failed" : "succeeded";
     return {
       operationId: aggregate.operationId,
@@ -850,7 +897,7 @@ export class NotificationService {
       presentation: "history_only",
       status,
       phase: "completed",
-      title: labels[aggregate.operation],
+      title: LEGACY_OPERATION_LABELS[aggregate.operation],
       summary: `${aggregate.succeeded} succeeded, ${aggregate.failed} failed (${aggregate.total} total)`,
       taskId: null,
       rootId: null,
@@ -868,6 +915,50 @@ export class NotificationService {
       startedAt: aggregate.startedAt,
       updatedAt: aggregate.completedAt,
       completedAt: aggregate.completedAt
+    };
+  }
+
+  private legacyImportSummaryOperation(
+    libraryId: string,
+    aggregate: LegacyImportSummaryAggregate
+  ): NotificationOperationInput {
+    const status = aggregate.failed > 0 ? "failed" : "succeeded";
+    const kindSummary = LEGACY_OPERATION_KINDS.filter(
+      (kind) => aggregate.byKind[kind].total > 0
+    )
+      .map((kind) => {
+        const counts = aggregate.byKind[kind];
+        return `${LEGACY_OPERATION_LABELS[kind]}: ${counts.total} (${counts.succeeded} succeeded, ${counts.failed} failed)`;
+      })
+      .join("; ");
+    const completedAt = aggregate.completedAt ?? this.now();
+    return {
+      operationId: `legacy-import:${libraryId}`,
+      revision: 0,
+      kind: "legacy_file_operations",
+      category: "file_operation",
+      origin: "user",
+      presentation: "history_only",
+      status,
+      phase: "imported",
+      title: "Imported legacy file operations",
+      summary: `${aggregate.succeeded} succeeded, ${aggregate.failed} failed (${aggregate.total} total); ${kindSummary}`,
+      taskId: null,
+      rootId: null,
+      folderId: null,
+      fileId: null,
+      currentValue: aggregate.total,
+      totalValue: aggregate.total,
+      unit: "items",
+      errorCode: status === "failed" ? "legacy_file_operation_failed" : null,
+      errorDetail: aggregate.firstError,
+      cancellable: false,
+      retryable: false,
+      attempt: 1,
+      occurrenceCount: 1,
+      startedAt: aggregate.startedAt ?? completedAt,
+      updatedAt: completedAt,
+      completedAt
     };
   }
 
