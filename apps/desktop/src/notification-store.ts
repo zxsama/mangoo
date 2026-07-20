@@ -172,6 +172,7 @@ export class NotificationStore {
 
   private async closeWorker(): Promise<void> {
     this.closing = true;
+    this.rejectPending(new Error("notification store is closing"));
     try {
       if (!this.failure) {
         const closeRequest = this.request<void>({

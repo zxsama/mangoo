@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
+import { Worker } from "node:worker_threads";
 
 import {
   createNotificationStore,
@@ -13,6 +14,7 @@ import type {
   NotificationLibraryIdentity,
   NotificationOperationInput,
   NotificationStoreEvent,
+  NotificationStoreWorkerMessage,
   ThumbnailCacheSummary
 } from "../src/notification-types.ts";
 
@@ -32,6 +34,34 @@ function testDatabasePath(): string {
 
 function createTestStore(databasePath = testDatabasePath()) {
   return createNotificationStore({ databasePath, workerUrl: TEST_WORKER_URL });
+}
+
+function waitForWorkerMessage(worker: Worker, timeoutMs = 500): Promise<NotificationStoreWorkerMessage> {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      cleanup();
+      reject(new Error("timed out waiting for worker message"));
+    }, timeoutMs);
+    const onMessage = (message: NotificationStoreWorkerMessage) => {
+      cleanup();
+      resolve(message);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      clearTimeout(timeoutId);
+      worker.off("message", onMessage);
+      worker.off("error", onError);
+    };
+    worker.once("message", onMessage);
+    worker.once("error", onError);
+  });
+}
+
+function dataWorkerUrl(source: string): URL {
+  return new URL(`data:text/javascript,${encodeURIComponent(source)}`, import.meta.url);
 }
 
 function operation(
@@ -321,7 +351,7 @@ describe("notification store", () => {
     const inspection = new DatabaseSync(databasePath, { readOnly: true });
     try {
       assert.equal(inspection.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
-      assert.equal(inspection.prepare("PRAGMA user_version").get()?.user_version, 1);
+      assert.equal(inspection.prepare("PRAGMA user_version").get()?.user_version, 2);
       const tables = inspection
         .prepare(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
@@ -338,12 +368,44 @@ describe("notification store", () => {
       inspection.close();
     }
 
+    const v1Database = new DatabaseSync(databasePath);
+    v1Database.exec(`
+      DROP INDEX idx_operations_history;
+      CREATE INDEX idx_operations_history ON operations(completed_at DESC, updated_at DESC);
+      PRAGMA user_version = 1;
+    `);
+    v1Database.close();
+
     store = await createTestStore(databasePath);
     try {
       assert.equal((await store.history({ limit: 10, offset: 0 })).items[0]?.operationId, "persisted");
       assert.equal(await store.cursor(LIBRARY_A.id), 1);
     } finally {
       await store.close();
+    }
+
+    const upgraded = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 2);
+      const indexSql = upgraded
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_operations_history'")
+        .get()?.sql as string;
+      assert.match(indexSql, /COALESCE\s*\(completed_at, updated_at\)/i);
+      assert.match(indexSql, /WHERE\s+status\s+NOT\s+IN/i);
+      const queryPlan = upgraded
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT library_id, library_name, payload_json
+           FROM operations
+           WHERE status NOT IN ('pending', 'running')
+           ORDER BY COALESCE(completed_at, updated_at) DESC, updated_at DESC`
+        )
+        .all()
+        .map((row) => String(row.detail))
+        .join("\n");
+      assert.match(queryPlan, /idx_operations_history/i);
+    } finally {
+      upgraded.close();
     }
   });
 
@@ -395,6 +457,44 @@ describe("notification store", () => {
     );
   });
 
+  it("guards malformed worker messages without undefined responses or worker crashes", async () => {
+    const worker = new Worker(TEST_WORKER_URL, { workerData: { databasePath: testDatabasePath() } });
+    try {
+      assert.deepEqual(await waitForWorkerMessage(worker), { type: "ready" });
+
+      worker.postMessage(null);
+      await assert.rejects(waitForWorkerMessage(worker, 80), /timed out/);
+
+      worker.postMessage({ requestId: 42, method: "cursor", params: {} });
+      await assert.rejects(waitForWorkerMessage(worker, 80), /timed out/);
+
+      worker.postMessage({ requestId: "unknown-method", method: "explode", params: {} });
+      const protocolError = await waitForWorkerMessage(worker);
+      assert.equal(protocolError.type, "response");
+      assert.equal(protocolError.requestId, "unknown-method");
+      assert.equal(protocolError.ok, false);
+      if (protocolError.type === "response" && !protocolError.ok) {
+        assert.match(protocolError.error.message, /unknown.*method/i);
+      }
+
+      worker.postMessage({ requestId: "valid", method: "cursor", params: { libraryId: "library-a" } });
+      const validResponse = await waitForWorkerMessage(worker);
+      assert.deepEqual(validResponse, {
+        type: "response",
+        requestId: "valid",
+        ok: true,
+        result: 0
+      });
+
+      worker.postMessage({ requestId: "close", method: "close", params: {} });
+      const closeResponse = await waitForWorkerMessage(worker);
+      assert.equal(closeResponse.type, "response");
+      assert.equal(closeResponse.requestId, "close");
+    } finally {
+      await worker.terminate();
+    }
+  });
+
   it("rejects pending requests when a ready worker crashes", async () => {
     const workerUrl = new URL(
       "data:text/javascript,import%20%7BparentPort%7D%20from%20%27node%3Aworker_threads%27%3BparentPort.postMessage(%7Btype%3A%27ready%27%7D)%3BparentPort.on(%27message%27%2C()%3D%3E%7Bthrow%20new%20Error(%27worker-boom%27)%7D)",
@@ -421,5 +521,37 @@ describe("notification store", () => {
     const startedAt = Date.now();
     await store.close();
     assert.ok(Date.now() - startedAt < 3_000, "close should have a bounded fallback");
+  });
+
+  it("rejects an in-flight request immediately during close and ignores its late response", async () => {
+    const workerUrl = dataWorkerUrl(`
+      import { parentPort } from "node:worker_threads";
+      parentPort.postMessage({ type: "ready" });
+      parentPort.on("message", (message) => {
+        if (message.method === "cursor") {
+          setTimeout(() => parentPort.postMessage({
+            type: "response", requestId: message.requestId, ok: true, result: 99
+          }), 20);
+        }
+        if (message.method === "close") {
+          setTimeout(() => parentPort.postMessage({
+            type: "response", requestId: message.requestId, ok: true, result: null
+          }), 80);
+        }
+      });
+    `);
+    const store = await createNotificationStore({
+      databasePath: testDatabasePath(),
+      workerUrl
+    });
+    const pending = store.cursor(LIBRARY_A.id);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const startedAt = Date.now();
+    const firstClose = store.close();
+    const secondClose = store.close();
+    await assert.rejects(pending, /closing|closed/i);
+    assert.ok(Date.now() - startedAt < 50, "pending requests should reject when close starts");
+    await Promise.all([firstClose, secondClose]);
+    await assert.rejects(store.cursor(LIBRARY_A.id), /closed/i);
   });
 });

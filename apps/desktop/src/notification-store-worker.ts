@@ -15,7 +15,7 @@ import type {
   ThumbnailCacheSummary
 } from "./notification-types.js";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const COMPLETED_RETENTION_LIMIT = 2_000;
 const COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const ACTIVE_STATUSES = new Set(["pending", "running"]);
@@ -23,6 +23,11 @@ const OPERATION_STATUSES = new Set(["pending", "running", "succeeded", "failed",
 const CATEGORIES = new Set(["task", "file_operation", "error", "thumbnail_cache"]);
 const ORIGINS = new Set(["user", "background", "recovery", "system"]);
 const PRESENTATIONS = new Set(["important", "history_only", "status_only"]);
+const HISTORY_INDEX_SQL = `
+  CREATE INDEX idx_operations_history
+    ON operations(COALESCE(completed_at, updated_at) DESC, updated_at DESC)
+    WHERE status NOT IN ('pending', 'running');
+`;
 
 interface WorkerOptions {
   databasePath: string;
@@ -176,8 +181,7 @@ function openDatabase(databasePath: string): DatabaseSync {
           payload_json TEXT NOT NULL,
           PRIMARY KEY(library_id, operation_id)
         );
-        CREATE INDEX idx_operations_history
-          ON operations(completed_at DESC, updated_at DESC);
+        ${HISTORY_INDEX_SQL}
         CREATE INDEX idx_operations_status
           ON operations(status, updated_at DESC);
         CREATE TABLE sync_cursors (
@@ -196,6 +200,19 @@ function openDatabase(databasePath: string): DatabaseSync {
         );
         PRAGMA user_version = ${SCHEMA_VERSION};
       `);
+      database.exec("COMMIT;");
+    } catch (error) {
+      database.exec("ROLLBACK;");
+      database.close();
+      throw error;
+    }
+  }
+  if (version === 1) {
+    database.exec("BEGIN IMMEDIATE;");
+    try {
+      database.exec("DROP INDEX IF EXISTS idx_operations_history;");
+      database.exec(HISTORY_INDEX_SQL);
+      database.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       database.exec("COMMIT;");
     } catch (error) {
       database.exec("ROLLBACK;");
@@ -500,11 +517,12 @@ function rowToOperation(row: OperationRow): DesktopNotificationOperation {
 function executeRequest(store: NotificationStoreDatabase, request: NotificationStoreRequest): unknown {
   switch (request.method) {
     case "applyOutboxBatch":
-      return store.applyOutboxBatch(
+      store.applyOutboxBatch(
         request.params.library,
         request.params.events,
         request.params.maxSequence
       );
+      return null;
     case "cursor":
       return store.cursor(request.params.libraryId);
     case "compactSnapshot":
@@ -512,16 +530,82 @@ function executeRequest(store: NotificationStoreDatabase, request: NotificationS
     case "history":
       return store.history(request.params.query);
     case "publishThumbnailSummary":
-      return store.publishThumbnailSummary(request.params.summary);
+      store.publishThumbnailSummary(request.params.summary);
+      return null;
     case "hasLegacyImport":
       return store.hasLegacyImport(request.params.libraryId);
     case "markLegacyImported":
-      return store.markLegacyImported(request.params.libraryId, request.params.importedAt);
+      store.markLegacyImported(request.params.libraryId, request.params.importedAt);
+      return null;
     case "cleanupRetention":
       return store.cleanupRetention(request.params.now);
     case "close":
-      return undefined;
+      return null;
   }
+}
+
+const REQUEST_METHODS = new Set<NotificationStoreRequest["method"]>([
+  "applyOutboxBatch",
+  "cursor",
+  "compactSnapshot",
+  "history",
+  "publishThumbnailSummary",
+  "hasLegacyImport",
+  "markLegacyImported",
+  "cleanupRetention",
+  "close"
+]);
+
+function requestIdFromMessage(message: unknown): string | null {
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    return null;
+  }
+  const requestId = (message as { requestId?: unknown }).requestId;
+  return typeof requestId === "string" && requestId.length > 0 ? requestId : null;
+}
+
+function validateRequestMessage(
+  message: unknown
+): { request: NotificationStoreRequest } | { requestId: string | null; message: string } {
+  const requestId = requestIdFromMessage(message);
+  if (!requestId) {
+    return {
+      requestId: null,
+      message: "Ignoring notification store message without a correlatable requestId"
+    };
+  }
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    return { requestId, message: "notification store request must be an object" };
+  }
+  const method = (message as { method?: unknown }).method;
+  if (typeof method !== "string") {
+    return { requestId, message: "notification store request method must be a string" };
+  }
+  if (!REQUEST_METHODS.has(method as NotificationStoreRequest["method"])) {
+    return { requestId, message: `unknown notification store method: ${method}` };
+  }
+  return { request: message as NotificationStoreRequest };
+}
+
+function postMessageSafely(message: NotificationStoreWorkerMessage): void {
+  if (!port) {
+    console.error("[notification-store-worker] parent port is unavailable");
+    return;
+  }
+  try {
+    port.postMessage(message);
+  } catch (error) {
+    console.error("[notification-store-worker] failed to post response", serializeError(error));
+  }
+}
+
+function postProtocolError(requestId: string, message: string): void {
+  postMessageSafely({
+    type: "response",
+    requestId,
+    ok: false,
+    error: { name: "NotificationStoreProtocolError", message }
+  });
 }
 
 const port = parentPort;
@@ -534,44 +618,55 @@ try {
   const options = workerData as WorkerOptions;
   assertObject(options, "workerData");
   store = new NotificationStoreDatabase(openDatabase(options.databasePath));
-  port.postMessage({ type: "ready" } satisfies NotificationStoreWorkerMessage);
-  port.on("message", (request: NotificationStoreRequest) => {
+  postMessageSafely({ type: "ready" });
+  port.on("message", (message: unknown) => {
+    const validated = validateRequestMessage(message);
+    if ("message" in validated) {
+      if (validated.requestId) {
+        postProtocolError(validated.requestId, validated.message);
+      } else {
+        console.error("[notification-store-worker]", validated.message);
+      }
+      return;
+    }
+    const request = validated.request;
     if (!store) {
+      postProtocolError(request.requestId, "notification store worker is closing");
       return;
     }
     try {
       if (request.method === "close") {
         store.close();
         store = null;
-        port.postMessage({
+        postMessageSafely({
           type: "response",
           requestId: request.requestId,
           ok: true,
-          result: undefined
-        } satisfies NotificationStoreWorkerMessage);
+          result: null
+        });
         port.close();
         return;
       }
       const result = executeRequest(store, request);
-      port.postMessage({
+      postMessageSafely({
         type: "response",
         requestId: request.requestId,
         ok: true,
         result
-      } satisfies NotificationStoreWorkerMessage);
+      });
     } catch (error) {
-      port.postMessage({
+      postMessageSafely({
         type: "response",
         requestId: request.requestId,
         ok: false,
         error: serializeError(error)
-      } satisfies NotificationStoreWorkerMessage);
+      });
     }
   });
 } catch (error) {
-  port.postMessage({
+  postMessageSafely({
     type: "startupError",
     error: serializeError(error)
-  } satisfies NotificationStoreWorkerMessage);
+  });
   port.close();
 }
