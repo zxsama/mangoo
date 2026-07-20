@@ -225,6 +225,8 @@ pub fn start_worker_with_ffmpeg(
     // Startup recovery runs once, before any task dispatch and before the writer
     // actor handles concurrent work, so it is safe to run directly on the worker
     // connection.
+    crate::fsops::recover_pending_file_operations(&worker_database)
+        .expect("reconcile pending file-operation journal intents");
     worker_database
         .recover_interrupted_notification_operations()
         .expect("recover interrupted non-task notification operations");

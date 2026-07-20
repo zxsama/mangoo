@@ -26,6 +26,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0019_root_pending_delete.sql",
     ROOT / "crates" / "core" / "migrations" / "0020_root_purge_task_kind.sql",
     ROOT / "crates" / "core" / "migrations" / "0021_notification_outbox.sql",
+    ROOT / "crates" / "core" / "migrations" / "0022_file_operation_journal.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -96,6 +97,7 @@ REQUIRED_INDEXES = {
     "idx_roots_pending_delete",
     "idx_notification_heads_status_updated",
     "idx_file_operations_group",
+    "idx_file_operations_pending",
 }
 
 EXPECTED_MEDIA_COLUMNS = {
@@ -353,6 +355,11 @@ def main() -> None:
             ).fetchone()
             if version is None:
                 fail("migration version 21 was not recorded")
+            version = conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 22"
+            ).fetchone()
+            if version is None:
+                fail("migration version 22 was not recorded")
 
             media_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(media)").fetchall()
@@ -466,8 +473,22 @@ def main() -> None:
                 row[1]
                 for row in conn.execute("PRAGMA table_info(file_operations)").fetchall()
             }
-            if "operation_group_id" not in file_operation_columns:
-                fail("missing file_operations.operation_group_id")
+            required_file_operation_columns = {
+                "operation_group_id",
+                "entity_kind",
+                "entity_id",
+                "target_folder_id",
+                "attempt_count",
+                "error_code",
+            }
+            missing_file_operation_columns = (
+                required_file_operation_columns - file_operation_columns
+            )
+            if missing_file_operation_columns:
+                fail(
+                    "missing file-operation journal columns: "
+                    f"{sorted(missing_file_operation_columns)}"
+                )
 
             expected_head_index = [("status", False), ("updated_at", True)]
             if (
@@ -486,6 +507,10 @@ def main() -> None:
                 fail(
                     "idx_file_operations_group must index operation_group_id, id"
                 )
+            if index_key_columns(conn, "idx_file_operations_pending") != [
+                ("id", False)
+            ]:
+                fail("idx_file_operations_pending must index id")
 
             outbox_indexes = conn.execute(
                 "PRAGMA index_list(notification_outbox)"
@@ -605,11 +630,15 @@ def main() -> None:
                 VALUES ('rename', 'source', 'target', 'pending', 1)
                 """
             )
-            operation_group = conn.execute(
-                "SELECT operation_group_id FROM file_operations WHERE id = last_insert_rowid()"
-            ).fetchone()[0]
-            if operation_group is not None:
-                fail("existing file_operations inserts must default operation_group_id to NULL")
+            legacy_defaults = conn.execute(
+                """SELECT operation_group_id, entity_kind, entity_id,
+                          target_folder_id, attempt_count, error_code
+                   FROM file_operations WHERE id = last_insert_rowid()"""
+            ).fetchone()
+            if legacy_defaults != (None, None, None, None, 0, None):
+                fail(
+                    "existing file_operations inserts must preserve legacy defaults"
+                )
 
             conn.execute(
                 """

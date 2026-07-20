@@ -1,31 +1,29 @@
 //! File operations: rename, move, delete (recycle / permanent).
 //!
-//! Each public entry point performs:
-//!   1. Source/target resolution from the database.
-//!   2. Input validation (illegal name, path separator, traversal,
-//!      Windows-reserved names, length).
-//!   3. Conflict checks against the database and the filesystem.
-//!   4. A `BEGIN IMMEDIATE` transaction that performs the FS mutation and
-//!      DB updates as a single unit; FS errors roll back DB changes and
-//!      record a `failed` row in `file_operations`.
-//!   5. FTS sync for any affected files so search reflects renames.
+//! Each public entry point uses a recoverable two-phase journal:
+//!   1. Resolve and validate every requested item.
+//!   2. Persist all `pending` intents and the logical operation head in one
+//!      SQLite transaction.
+//!   3. Perform filesystem work without holding the SQLite mutex.
+//!   4. Finalize the intent, index/audit row, progress, and Outbox event in one
+//!      SQLite transaction.
+//!   5. On restart, reconcile pending intents against the actual old/new paths
+//!      before generic interrupted-operation recovery runs.
 //!
 //! The contract surfaces operation kinds `rename`, `move`,
 //! `delete_recycle`, `delete_permanent` — see
 //! `contracts/core-api/openapi.yaml`.
 
+mod journal;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::Serialize;
-use uuid::Uuid;
 
-use crate::db::{
-    notification_outbox::{NotificationOperation, PublishMode},
-    Database, Page,
-};
+use crate::db::{Database, Page};
 
 /// Discriminants for `file_operations.operation`.
 #[allow(dead_code)]
@@ -102,7 +100,7 @@ impl FsOpsErrorCode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FsOpsError {
     pub code: FsOpsErrorCode,
     pub message: String,
@@ -166,140 +164,25 @@ pub fn rename(
     database: &Mutex<Database>,
     request: RenameRequest,
 ) -> FsOpsResult<FileOperationRecord> {
-    let new_name = request.new_name.trim().to_string();
-    validate_name(&new_name)?;
-
-    let mut group = begin_operation_group(database, FileOperationKind::Rename, 1)?;
-
-    let result = match (request.file_id, request.folder_id) {
-        (Some(file_id), None) => rename_file(database, file_id, &new_name, &mut group),
-        (None, Some(folder_id)) => rename_folder(database, folder_id, &new_name, &mut group),
-        (Some(_), Some(_)) => Err(FsOpsError::new(
-            FsOpsErrorCode::InvalidRequest,
-            "exactly one of fileId or folderId must be provided",
-        )),
-        (None, None) => Err(FsOpsError::new(
-            FsOpsErrorCode::InvalidRequest,
-            "either fileId or folderId must be provided",
-        )),
-    };
-    finish_operation_group(database, &mut group, result.as_ref().err())?;
-    result
+    journal::rename(database, request)
 }
 
 pub fn move_items(
     database: &Mutex<Database>,
     request: MoveRequest,
 ) -> FsOpsResult<Vec<FileOperationRecord>> {
-    if request.file_ids.is_empty() && request.folder_ids.is_empty() {
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::InvalidRequest,
-            "at least one fileId or folderId must be provided",
-        ));
-    }
-
-    let mut group = begin_operation_group(
-        database,
-        FileOperationKind::Move,
-        request.file_ids.len() + request.folder_ids.len(),
-    )?;
-
-    let target = {
-        let guard = database.lock().expect("database mutex poisoned");
-        match load_folder_path(&guard.connection_for_fsops(), request.target_folder_id) {
-            Ok(Some(target)) => target,
-            Ok(None) => {
-                let error = FsOpsError::new(
-                    FsOpsErrorCode::NotFound,
-                    format!("target folder not found: {}", request.target_folder_id),
-                );
-                drop(guard);
-                finish_operation_group(database, &mut group, Some(&error))?;
-                return Err(error);
-            }
-            Err(error) => {
-                drop(guard);
-                finish_operation_group(database, &mut group, Some(&error))?;
-                return Err(error);
-            }
-        }
-    };
-
-    let mut records = Vec::new();
-
-    for file_id in &request.file_ids {
-        match move_file(database, *file_id, &target, &mut group) {
-            Ok(record) => records.push(record),
-            Err(error) => {
-                finish_operation_group(database, &mut group, Some(&error))?;
-                return Err(error);
-            }
-        }
-    }
-    for folder_id in &request.folder_ids {
-        if *folder_id == request.target_folder_id {
-            let error = FsOpsError::new(
-                FsOpsErrorCode::InvalidRequest,
-                format!("cannot move folder {folder_id} into itself"),
-            );
-            finish_operation_group(database, &mut group, Some(&error))?;
-            return Err(error);
-        }
-        match move_folder(database, *folder_id, &target, &mut group) {
-            Ok(record) => records.push(record),
-            Err(error) => {
-                finish_operation_group(database, &mut group, Some(&error))?;
-                return Err(error);
-            }
-        }
-    }
-
-    finish_operation_group(database, &mut group, None)?;
-    Ok(records)
+    journal::move_items(database, request)
 }
 
 pub fn delete(
     database: &Mutex<Database>,
     request: DeleteRequest,
 ) -> FsOpsResult<Vec<FileOperationRecord>> {
-    if request.file_ids.is_empty() && request.folder_ids.is_empty() {
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::InvalidRequest,
-            "at least one fileId or folderId must be provided",
-        ));
-    }
+    journal::delete(database, request)
+}
 
-    let mut group = begin_operation_group(
-        database,
-        if request.permanent {
-            FileOperationKind::DeletePermanent
-        } else {
-            FileOperationKind::DeleteRecycle
-        },
-        request.file_ids.len() + request.folder_ids.len(),
-    )?;
-    let mut records = Vec::new();
-    for file_id in &request.file_ids {
-        match delete_file(database, *file_id, request.permanent, &mut group) {
-            Ok(record) => records.push(record),
-            Err(error) => {
-                finish_operation_group(database, &mut group, Some(&error))?;
-                return Err(error);
-            }
-        }
-    }
-    for folder_id in &request.folder_ids {
-        match delete_folder(database, *folder_id, request.permanent, &mut group) {
-            Ok(record) => records.push(record),
-            Err(error) => {
-                finish_operation_group(database, &mut group, Some(&error))?;
-                return Err(error);
-            }
-        }
-    }
-
-    finish_operation_group(database, &mut group, None)?;
-    Ok(records)
+pub(crate) fn recover_pending_file_operations(database: &Database) -> FsOpsResult<usize> {
+    journal::recover_pending_file_operations(database)
 }
 
 pub fn list_recent(
@@ -322,9 +205,9 @@ pub fn list_recent(
         "SELECT id, operation, source_path, target_path, status, created_at, finished_at, error, operation_group_id \
          FROM file_operations {} ORDER BY id DESC LIMIT {}",
         if cursor_id.is_some() {
-            "WHERE id < ?1"
+            "WHERE status <> 'pending' AND id < ?1"
         } else {
-            ""
+            "WHERE status <> 'pending'"
         },
         if cursor_id.is_some() { "?2" } else { "?1" }
     );
@@ -351,862 +234,6 @@ pub fn list_recent(
         next_cursor,
         total_count: None,
     })
-}
-
-#[derive(Debug, Clone)]
-struct FileOperationGroup {
-    id: String,
-    kind: FileOperationKind,
-    total: i64,
-    completed: i64,
-    started_at: i64,
-    terminal: bool,
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-fn begin_operation_group(
-    database: &Mutex<Database>,
-    kind: FileOperationKind,
-    total: usize,
-) -> FsOpsResult<FileOperationGroup> {
-    let guard = database.lock().expect("database mutex poisoned");
-    let transaction =
-        Transaction::new_unchecked(guard.connection_for_fsops(), TransactionBehavior::Immediate)?;
-    let group = FileOperationGroup {
-        id: Uuid::now_v7().to_string(),
-        kind,
-        total: total as i64,
-        completed: 0,
-        started_at: now_millis(),
-        terminal: false,
-    };
-    let mut operation = notification_for_group(&group, "pending", "queued", None, None);
-    let appended = guard.publish_notification_operation_in_transaction(
-        &transaction,
-        &mut operation,
-        PublishMode::Phase,
-    )?;
-    transaction.commit()?;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
-    }
-    Ok(group)
-}
-
-fn notification_for_group(
-    group: &FileOperationGroup,
-    status: &str,
-    phase: &str,
-    error: Option<&FsOpsError>,
-    completed_at: Option<i64>,
-) -> NotificationOperation {
-    let now = now_millis();
-    NotificationOperation {
-        operation_id: group.id.clone(),
-        revision: 0,
-        kind: group.kind.as_str().to_owned(),
-        category: "file_operation".to_owned(),
-        origin: "user".to_owned(),
-        presentation: "important".to_owned(),
-        status: status.to_owned(),
-        phase: Some(phase.to_owned()),
-        title: match group.kind {
-            FileOperationKind::Rename => "Rename files",
-            FileOperationKind::Move => "Move files",
-            FileOperationKind::DeleteRecycle => "Move files to recycle bin",
-            FileOperationKind::DeletePermanent => "Delete files",
-        }
-        .to_owned(),
-        summary: None,
-        task_id: None,
-        root_id: None,
-        folder_id: None,
-        file_id: None,
-        current_value: group.completed,
-        total_value: Some(group.total),
-        unit: Some("items".to_owned()),
-        error_code: error.map(|error| error.code.as_str().to_owned()),
-        error_detail: error.map(|error| error.message.clone()),
-        cancellable: false,
-        retryable: false,
-        attempt: 1,
-        occurrence_count: 1,
-        started_at: group.started_at,
-        updated_at: now,
-        completed_at,
-    }
-}
-
-fn publish_group_item_in_transaction(
-    database: &Database,
-    transaction: &Transaction<'_>,
-    group: &FileOperationGroup,
-    completed: i64,
-    error: Option<&FsOpsError>,
-) -> FsOpsResult<(bool, bool)> {
-    let mut snapshot = group.clone();
-    snapshot.completed = completed;
-    let terminal = error.is_some() || completed >= group.total;
-    let (status, phase, completed_at, mode) = match error {
-        Some(_) => (
-            "failed",
-            "failed",
-            Some(now_millis()),
-            PublishMode::Terminal,
-        ),
-        None if terminal => (
-            "succeeded",
-            "completed",
-            Some(now_millis()),
-            PublishMode::Terminal,
-        ),
-        None => ("running", "working", None, PublishMode::Progress),
-    };
-    let mut operation = notification_for_group(&snapshot, status, phase, error, completed_at);
-    let appended = database.publish_notification_operation_in_transaction(
-        transaction,
-        &mut operation,
-        mode,
-    )?;
-    Ok((appended, terminal))
-}
-
-fn finish_operation_group(
-    database: &Mutex<Database>,
-    group: &mut FileOperationGroup,
-    error: Option<&FsOpsError>,
-) -> FsOpsResult<()> {
-    if group.terminal {
-        return Ok(());
-    }
-    let guard = database.lock().expect("database mutex poisoned");
-    let transaction =
-        Transaction::new_unchecked(guard.connection_for_fsops(), TransactionBehavior::Immediate)?;
-    let (status, phase, completed_at) = match error {
-        Some(_) => ("failed", "failed", Some(now_millis())),
-        None => ("succeeded", "completed", Some(now_millis())),
-    };
-    let mut operation = notification_for_group(group, status, phase, error, completed_at);
-    let appended = guard.publish_notification_operation_in_transaction(
-        &transaction,
-        &mut operation,
-        PublishMode::Terminal,
-    )?;
-    transaction.commit()?;
-    group.terminal = true;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
-    }
-    Ok(())
-}
-
-// -------------- internal: rename ----------------------------------------
-
-fn rename_file(
-    database: &Mutex<Database>,
-    file_id: i64,
-    new_name: &str,
-    group: &mut FileOperationGroup,
-) -> FsOpsResult<FileOperationRecord> {
-    // Step 1: brief lock to snapshot what we need for the FS rename and to
-    // run the conflict check. We commit nothing here.
-    let (info, source_path_string, target_path, target_path_string, conflict_in_db) = {
-        let guard = database.lock().expect("database mutex poisoned");
-        let conn = guard.connection_for_fsops();
-        let info = match load_file_info(conn, file_id)? {
-            Some(info) => info,
-            None => {
-                return Err(FsOpsError::new(
-                    FsOpsErrorCode::NotFound,
-                    format!("file not found: {file_id}"),
-                ))
-            }
-        };
-        let target_path = info.parent_dir.join(new_name);
-        let source_path_string = info.path.to_string_lossy().to_string();
-        let target_path_string = target_path.to_string_lossy().to_string();
-        let conflict_in_db = file_exists_in_folder_conn(conn, info.folder_id, new_name)?;
-        (
-            info,
-            source_path_string,
-            target_path,
-            target_path_string,
-            conflict_in_db,
-        )
-    };
-
-    if info.name == new_name {
-        // Nothing to do; record an idempotent succeeded row.
-        return write_succeeded_locked(
-            database,
-            FileOperationKind::Rename,
-            &source_path_string,
-            Some(&target_path_string),
-            group,
-        );
-    }
-
-    // The TOCTOU window between this check and `fs::rename` remains real on
-    // Unix because `fs::rename` overwrites silently. `reserve_target_for_rename`
-    // probes atomically on Unix (`O_CREATE_NEW`) before the actual rename.
-    if conflict_in_db || target_path.exists() {
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::NameConflict,
-            format!("a file named '{new_name}' already exists in this folder"),
-        ));
-    }
-
-    // Step 2: do the FS work with the lock released.
-    let fs_result = atomic_rename(&info.path, &target_path);
-
-    // Step 3: brief lock to commit DB changes and write the log row.
-    let guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops();
-    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-
-    if let Err(error) = fs_result {
-        let operation_error =
-            FsOpsError::new(FsOpsErrorCode::FsError, format!("rename failed: {error}"));
-        let (appended, completed, terminal) = record_failure(
-            &guard,
-            &transaction,
-            FileOperationKind::Rename,
-            &source_path_string,
-            Some(&target_path_string),
-            &error.to_string(),
-            &operation_error,
-            group,
-        )?;
-        transaction.commit()?;
-        group.completed = completed;
-        group.terminal = terminal;
-        if appended {
-            guard.notification_outbox_wake().notify_one();
-        }
-        return Err(operation_error);
-    }
-
-    let new_ext = extension_from_name(new_name);
-    transaction.execute(
-        "UPDATE files SET name = ?1, ext = ?2 WHERE id = ?3",
-        params![new_name, new_ext, file_id],
-    )?;
-
-    crate::db::sync_media_fts_for_file_in_transaction_pub(&transaction, file_id)?;
-
-    let (record, appended, completed, terminal) = insert_operation(
-        &guard,
-        &transaction,
-        FileOperationKind::Rename,
-        &source_path_string,
-        Some(&target_path_string),
-        "succeeded",
-        None,
-        group,
-    )?;
-    transaction.commit()?;
-    group.completed = completed;
-    group.terminal = terminal;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
-    }
-    Ok(record)
-}
-
-fn rename_folder(
-    database: &Mutex<Database>,
-    folder_id: i64,
-    new_name: &str,
-    group: &mut FileOperationGroup,
-) -> FsOpsResult<FileOperationRecord> {
-    // Step 1: snapshot under brief lock.
-    let (info, parent_dir, target_path, source_path_string, target_path_string, conflict_in_db) = {
-        let guard = database.lock().expect("database mutex poisoned");
-        let conn = guard.connection_for_fsops();
-        let info = match load_folder_info(conn, folder_id)? {
-            Some(info) => info,
-            None => {
-                return Err(FsOpsError::new(
-                    FsOpsErrorCode::NotFound,
-                    format!("folder not found: {folder_id}"),
-                ))
-            }
-        };
-        if info.parent_id.is_none() {
-            return Err(FsOpsError::new(
-                FsOpsErrorCode::InvalidRequest,
-                "cannot rename a root folder",
-            ));
-        }
-        let parent_dir = info
-            .path
-            .parent()
-            .ok_or_else(|| {
-                FsOpsError::new(FsOpsErrorCode::InvalidRequest, "folder has no parent path")
-            })?
-            .to_path_buf();
-        let target_path = parent_dir.join(new_name);
-        let source_path_string = info.path.to_string_lossy().to_string();
-        let target_path_string = target_path.to_string_lossy().to_string();
-        let conflict_in_db =
-            folder_name_exists_in_parent_conn(conn, info.parent_id, info.root_id, new_name)?;
-        (
-            info,
-            parent_dir,
-            target_path,
-            source_path_string,
-            target_path_string,
-            conflict_in_db,
-        )
-    };
-    let _ = parent_dir;
-
-    if info.name == new_name {
-        return write_succeeded_locked(
-            database,
-            FileOperationKind::Rename,
-            &source_path_string,
-            Some(&target_path_string),
-            group,
-        );
-    }
-
-    if conflict_in_db || target_path.exists() {
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::NameConflict,
-            format!("a folder named '{new_name}' already exists in this parent"),
-        ));
-    }
-
-    // Step 2: FS work outside the lock.
-    let fs_result = atomic_rename(&info.path, &target_path);
-
-    // Step 3: brief lock for the commit.
-    let guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops();
-    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-
-    if let Err(error) = fs_result {
-        let operation_error =
-            FsOpsError::new(FsOpsErrorCode::FsError, format!("rename failed: {error}"));
-        let (appended, completed, terminal) = record_failure(
-            &guard,
-            &transaction,
-            FileOperationKind::Rename,
-            &source_path_string,
-            Some(&target_path_string),
-            &error.to_string(),
-            &operation_error,
-            group,
-        )?;
-        transaction.commit()?;
-        group.completed = completed;
-        group.terminal = terminal;
-        if appended {
-            guard.notification_outbox_wake().notify_one();
-        }
-        return Err(operation_error);
-    }
-
-    transaction.execute(
-        "UPDATE folders SET name = ?1 WHERE id = ?2",
-        params![new_name, folder_id],
-    )?;
-
-    let descendant_files = collect_descendant_file_ids(&transaction, folder_id)?;
-    for file_id in descendant_files {
-        crate::db::sync_media_fts_for_file_in_transaction_pub(&transaction, file_id)?;
-    }
-
-    let (record, appended, completed, terminal) = insert_operation(
-        &guard,
-        &transaction,
-        FileOperationKind::Rename,
-        &source_path_string,
-        Some(&target_path_string),
-        "succeeded",
-        None,
-        group,
-    )?;
-    transaction.commit()?;
-    group.completed = completed;
-    group.terminal = terminal;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
-    }
-    Ok(record)
-}
-
-// -------------- internal: move ------------------------------------------
-
-fn move_file(
-    database: &Mutex<Database>,
-    file_id: i64,
-    target: &FolderTarget,
-    group: &mut FileOperationGroup,
-) -> FsOpsResult<FileOperationRecord> {
-    // Step 1: snapshot under brief lock. Fail-fast on cross-root and
-    // collision; a same-folder move is treated as a no-op.
-    let snapshot = {
-        let guard = database.lock().expect("database mutex poisoned");
-        let conn = guard.connection_for_fsops();
-        let info = match load_file_info(conn, file_id)? {
-            Some(info) => info,
-            None => {
-                return Err(FsOpsError::new(
-                    FsOpsErrorCode::NotFound,
-                    format!("file not found: {file_id}"),
-                ))
-            }
-        };
-        if info.root_id != target.root_id {
-            return Err(FsOpsError::new(
-                FsOpsErrorCode::CrossRoot,
-                "cross_root: source and target are in different roots",
-            ));
-        }
-        if info.folder_id == target.folder_id {
-            let source = info.path.to_string_lossy().to_string();
-            return write_succeeded_locked_with_guard(
-                guard,
-                FileOperationKind::Move,
-                &source,
-                Some(&source),
-                group,
-            );
-        }
-        let collision_in_db = file_exists_in_folder_conn(conn, target.folder_id, &info.name)?;
-        (info, collision_in_db)
-    };
-    let (info, collision_in_db) = snapshot;
-
-    let target_path = target.path.join(&info.name);
-    if collision_in_db || target_path.exists() {
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::NameConflict,
-            format!(
-                "a file named '{}' already exists in target folder",
-                info.name
-            ),
-        ));
-    }
-
-    let source_path_string = info.path.to_string_lossy().to_string();
-    let target_path_string = target_path.to_string_lossy().to_string();
-
-    // Step 2: FS work outside the lock.
-    let fs_result = atomic_rename(&info.path, &target_path);
-
-    // Step 3: commit under brief lock.
-    let guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops();
-    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-
-    if let Err(error) = fs_result {
-        let operation_error =
-            FsOpsError::new(FsOpsErrorCode::FsError, format!("move failed: {error}"));
-        let (appended, completed, terminal) = record_failure(
-            &guard,
-            &transaction,
-            FileOperationKind::Move,
-            &source_path_string,
-            Some(&target_path_string),
-            &error.to_string(),
-            &operation_error,
-            group,
-        )?;
-        transaction.commit()?;
-        group.completed = completed;
-        group.terminal = terminal;
-        if appended {
-            guard.notification_outbox_wake().notify_one();
-        }
-        return Err(operation_error);
-    }
-
-    transaction.execute(
-        "UPDATE files SET folder_id = ?1 WHERE id = ?2",
-        params![target.folder_id, file_id],
-    )?;
-    crate::db::sync_media_fts_for_file_in_transaction_pub(&transaction, file_id)?;
-
-    let (record, appended, completed, terminal) = insert_operation(
-        &guard,
-        &transaction,
-        FileOperationKind::Move,
-        &source_path_string,
-        Some(&target_path_string),
-        "succeeded",
-        None,
-        group,
-    )?;
-    transaction.commit()?;
-    group.completed = completed;
-    group.terminal = terminal;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
-    }
-    Ok(record)
-}
-
-fn move_folder(
-    database: &Mutex<Database>,
-    folder_id: i64,
-    target: &FolderTarget,
-    group: &mut FileOperationGroup,
-) -> FsOpsResult<FileOperationRecord> {
-    // Step 1: snapshot.
-    let (info, target_path, source_path_string, target_path_string, conflict_in_db) = {
-        let guard = database.lock().expect("database mutex poisoned");
-        let conn = guard.connection_for_fsops();
-        let info = match load_folder_info(conn, folder_id)? {
-            Some(info) => info,
-            None => {
-                return Err(FsOpsError::new(
-                    FsOpsErrorCode::NotFound,
-                    format!("folder not found: {folder_id}"),
-                ))
-            }
-        };
-        if info.parent_id.is_none() {
-            return Err(FsOpsError::new(
-                FsOpsErrorCode::InvalidRequest,
-                "cannot move a root folder",
-            ));
-        }
-        if info.root_id != target.root_id {
-            return Err(FsOpsError::new(
-                FsOpsErrorCode::CrossRoot,
-                "cross_root: source and target are in different roots",
-            ));
-        }
-        if folder_is_ancestor_of(conn, folder_id, target.folder_id)? {
-            return Err(FsOpsError::new(
-                FsOpsErrorCode::InvalidRequest,
-                "cannot move a folder into its own descendant",
-            ));
-        }
-        let conflict_in_db = folder_name_exists_in_parent_conn(
-            conn,
-            Some(target.folder_id),
-            info.root_id,
-            &info.name,
-        )?;
-        let target_path = target.path.join(&info.name);
-        let source_path_string = info.path.to_string_lossy().to_string();
-        let target_path_string = target_path.to_string_lossy().to_string();
-        (
-            info,
-            target_path,
-            source_path_string,
-            target_path_string,
-            conflict_in_db,
-        )
-    };
-
-    if conflict_in_db || target_path.exists() {
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::NameConflict,
-            format!(
-                "a folder named '{}' already exists in target folder",
-                info.name
-            ),
-        ));
-    }
-
-    // Step 2: FS work outside the lock.
-    let fs_result = atomic_rename(&info.path, &target_path);
-
-    // Step 3: commit under brief lock.
-    let guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops();
-    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-
-    if let Err(error) = fs_result {
-        let operation_error =
-            FsOpsError::new(FsOpsErrorCode::FsError, format!("move failed: {error}"));
-        let (appended, completed, terminal) = record_failure(
-            &guard,
-            &transaction,
-            FileOperationKind::Move,
-            &source_path_string,
-            Some(&target_path_string),
-            &error.to_string(),
-            &operation_error,
-            group,
-        )?;
-        transaction.commit()?;
-        group.completed = completed;
-        group.terminal = terminal;
-        if appended {
-            guard.notification_outbox_wake().notify_one();
-        }
-        return Err(operation_error);
-    }
-
-    transaction.execute(
-        "UPDATE folders SET parent_id = ?1 WHERE id = ?2",
-        params![target.folder_id, folder_id],
-    )?;
-    let descendant_files = collect_descendant_file_ids(&transaction, folder_id)?;
-    for file_id in descendant_files {
-        crate::db::sync_media_fts_for_file_in_transaction_pub(&transaction, file_id)?;
-    }
-
-    let (record, appended, completed, terminal) = insert_operation(
-        &guard,
-        &transaction,
-        FileOperationKind::Move,
-        &source_path_string,
-        Some(&target_path_string),
-        "succeeded",
-        None,
-        group,
-    )?;
-    transaction.commit()?;
-    group.completed = completed;
-    group.terminal = terminal;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
-    }
-    Ok(record)
-}
-
-// -------------- internal: delete ----------------------------------------
-
-fn delete_file(
-    database: &Mutex<Database>,
-    file_id: i64,
-    permanent: bool,
-    group: &mut FileOperationGroup,
-) -> FsOpsResult<FileOperationRecord> {
-    // Step 1: snapshot path + symlink state under brief lock; the symlink
-    // refusal must happen before the FS work even runs.
-    let (info, source_path_string) = {
-        let guard = database.lock().expect("database mutex poisoned");
-        let conn = guard.connection_for_fsops();
-        let info = match load_file_info(conn, file_id)? {
-            Some(info) => info,
-            None => {
-                return Err(FsOpsError::new(
-                    FsOpsErrorCode::NotFound,
-                    format!("file not found: {file_id}"),
-                ))
-            }
-        };
-        if permanent {
-            ensure_inside_enabled_root(conn, info.root_id, &info.path)?;
-        }
-        let source = info.path.to_string_lossy().to_string();
-        (info, source)
-    };
-
-    let kind = if permanent {
-        FileOperationKind::DeletePermanent
-    } else {
-        FileOperationKind::DeleteRecycle
-    };
-
-    if permanent {
-        // Refuse to follow symlinks even though the path was inside an
-        // enabled root: the link's *target* may not be. This check sits
-        // outside the lock because it only reads the filesystem.
-        refuse_if_symlink(&info.path)?;
-    }
-
-    // Step 2: FS work outside the lock.
-    let fs_result = if permanent {
-        fs::remove_file(&info.path).map_err(|error| error.to_string())
-    } else {
-        trash::delete(&info.path).map_err(|error| error.to_string())
-    };
-
-    // Step 3: commit under brief lock.
-    let guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops();
-    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-
-    if let Err(error) = fs_result {
-        let operation_error =
-            FsOpsError::new(FsOpsErrorCode::FsError, format!("delete failed: {error}"));
-        let (appended, completed, terminal) = record_failure(
-            &guard,
-            &transaction,
-            kind,
-            &source_path_string,
-            None,
-            &error,
-            &operation_error,
-            group,
-        )?;
-        transaction.commit()?;
-        group.completed = completed;
-        group.terminal = terminal;
-        if appended {
-            guard.notification_outbox_wake().notify_one();
-        }
-        return Err(operation_error);
-    }
-
-    transaction.execute(
-        "UPDATE files SET status = 'deleted' WHERE id = ?1",
-        params![file_id],
-    )?;
-    transaction.execute("DELETE FROM media_fts WHERE rowid = ?1", params![file_id])?;
-    crate::db::cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction)?;
-
-    let (record, appended, completed, terminal) = insert_operation(
-        &guard,
-        &transaction,
-        kind,
-        &source_path_string,
-        None,
-        "succeeded",
-        None,
-        group,
-    )?;
-    transaction.commit()?;
-    group.completed = completed;
-    group.terminal = terminal;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
-    }
-    Ok(record)
-}
-
-fn delete_folder(
-    database: &Mutex<Database>,
-    folder_id: i64,
-    permanent: bool,
-    group: &mut FileOperationGroup,
-) -> FsOpsResult<FileOperationRecord> {
-    // Step 1: snapshot.
-    let (info, source_path_string) = {
-        let guard = database.lock().expect("database mutex poisoned");
-        let conn = guard.connection_for_fsops();
-        let info = match load_folder_info(conn, folder_id)? {
-            Some(info) => info,
-            None => {
-                return Err(FsOpsError::new(
-                    FsOpsErrorCode::NotFound,
-                    format!("folder not found: {folder_id}"),
-                ))
-            }
-        };
-        if info.parent_id.is_none() {
-            return Err(FsOpsError::new(
-                FsOpsErrorCode::InvalidRequest,
-                "cannot delete a root folder",
-            ));
-        }
-        if permanent {
-            ensure_inside_enabled_root(conn, info.root_id, &info.path)?;
-        }
-        let source = info.path.to_string_lossy().to_string();
-        (info, source)
-    };
-
-    let kind = if permanent {
-        FileOperationKind::DeletePermanent
-    } else {
-        FileOperationKind::DeleteRecycle
-    };
-
-    if permanent {
-        refuse_if_symlink(&info.path)?;
-    }
-
-    // Step 2: FS work outside the lock.
-    let fs_result = if permanent {
-        fs::remove_dir_all(&info.path).map_err(|error| error.to_string())
-    } else {
-        trash::delete(&info.path).map_err(|error| error.to_string())
-    };
-
-    // Step 3: commit under brief lock.
-    let guard = database.lock().expect("database mutex poisoned");
-    let conn = guard.connection_for_fsops();
-    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-
-    if let Err(error) = fs_result {
-        let operation_error =
-            FsOpsError::new(FsOpsErrorCode::FsError, format!("delete failed: {error}"));
-        let (appended, completed, terminal) = record_failure(
-            &guard,
-            &transaction,
-            kind,
-            &source_path_string,
-            None,
-            &error,
-            &operation_error,
-            group,
-        )?;
-        transaction.commit()?;
-        group.completed = completed;
-        group.terminal = terminal;
-        if appended {
-            guard.notification_outbox_wake().notify_one();
-        }
-        return Err(operation_error);
-    }
-
-    let descendant_files = collect_descendant_file_ids(&transaction, folder_id)?;
-    transaction.execute(
-        r#"
-        WITH RECURSIVE subtree(id) AS (
-          SELECT id FROM folders WHERE id = ?1
-          UNION ALL
-          SELECT folders.id
-          FROM folders
-          JOIN subtree ON folders.parent_id = subtree.id
-        )
-        UPDATE folders SET status = 'deleted'
-        WHERE id IN (SELECT id FROM subtree)
-        "#,
-        params![folder_id],
-    )?;
-    transaction.execute(
-        r#"
-        WITH RECURSIVE subtree(id) AS (
-          SELECT id FROM folders WHERE id = ?1
-          UNION ALL
-          SELECT folders.id
-          FROM folders
-          JOIN subtree ON folders.parent_id = subtree.id
-        )
-        UPDATE files SET status = 'deleted'
-        WHERE folder_id IN (SELECT id FROM subtree)
-        "#,
-        params![folder_id],
-    )?;
-    crate::db::cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction)?;
-    for file_id in &descendant_files {
-        transaction.execute("DELETE FROM media_fts WHERE rowid = ?1", params![*file_id])?;
-    }
-
-    let (record, appended, completed, terminal) = insert_operation(
-        &guard,
-        &transaction,
-        kind,
-        &source_path_string,
-        None,
-        "succeeded",
-        None,
-        group,
-    )?;
-    transaction.commit()?;
-    group.completed = completed;
-    group.terminal = terminal;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
-    }
-    Ok(record)
 }
 
 // -------------- helpers -------------------------------------------------
@@ -1459,55 +486,9 @@ fn collect_descendant_file_ids(
     Ok(ids)
 }
 
-fn ensure_inside_enabled_root(
-    conn: &rusqlite::Connection,
-    root_id: i64,
-    path: &Path,
-) -> FsOpsResult<()> {
-    let row: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT path, enabled FROM roots WHERE id = ?1",
-            params![root_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()?;
-    let Some((root_path, enabled)) = row else {
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::OutsideRoot,
-            "root not found",
-        ));
-    };
-    if enabled == 0 {
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::OutsideRoot,
-            "permanent delete is not allowed in disabled roots",
-        ));
-    }
-    // Prefer canonicalized comparison so a symlink inside the root that
-    // points outside cannot smuggle a permanent delete past the boundary.
-    // If either side fails to canonicalize (e.g. the entry already
-    // disappeared), fall back to the raw prefix check; the caller's
-    // `refuse_if_symlink` guard catches the more dangerous symlink case.
-    let prefix_ok = match (fs::canonicalize(path), fs::canonicalize(&root_path)) {
-        (Ok(canonical_path), Ok(canonical_root)) => canonical_path.starts_with(&canonical_root),
-        _ => path.starts_with(&root_path),
-    };
-    if !prefix_ok {
-        return Err(FsOpsError::new(
-            FsOpsErrorCode::OutsideRoot,
-            format!(
-                "permanent delete refused: path is outside root {}",
-                root_path
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Refuse to permanently delete an entry whose `symlink_metadata` reports a
-/// symlink. We never want to follow a link out of the user's root; the
-/// canonicalize check in `ensure_inside_enabled_root` is best-effort, but
-/// this guard returns a clear error code so the UI can render it.
+/// symlink. This is kept separate from the journal's root-boundary check so
+/// neither check holds a SQLite connection during filesystem I/O.
 fn refuse_if_symlink(path: &Path) -> FsOpsResult<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1653,129 +634,6 @@ fn parse_cursor(cursor: &str) -> FsOpsResult<i64> {
     })
 }
 
-fn insert_operation(
-    database: &Database,
-    transaction: &Transaction<'_>,
-    kind: FileOperationKind,
-    source_path: &str,
-    target_path: Option<&str>,
-    status: &str,
-    error: Option<&str>,
-    group: &FileOperationGroup,
-) -> FsOpsResult<(FileOperationRecord, bool, i64, bool)> {
-    transaction.execute(
-        r#"
-        INSERT INTO file_operations(
-          operation, source_path, target_path, status, created_at, finished_at, error,
-          operation_group_id
-        )
-        VALUES (?1, ?2, ?3, ?4, unixepoch(), unixepoch(), ?5, ?6)
-        "#,
-        params![
-            kind.as_str(),
-            source_path,
-            target_path,
-            status,
-            error,
-            group.id
-        ],
-    )?;
-    let id = transaction.last_insert_rowid();
-    let record = transaction.query_row(
-        r#"
-        SELECT id, operation, source_path, target_path, status, created_at, finished_at, error,
-               operation_group_id
-        FROM file_operations
-        WHERE id = ?1
-        "#,
-        params![id],
-        record_from_row,
-    )?;
-    let completed = group.completed.saturating_add(1);
-    let (appended, terminal) =
-        publish_group_item_in_transaction(database, transaction, group, completed, None)?;
-    Ok((record, appended, completed, terminal))
-}
-
-fn record_failure(
-    database: &Database,
-    transaction: &Transaction<'_>,
-    kind: FileOperationKind,
-    source_path: &str,
-    target_path: Option<&str>,
-    error: &str,
-    operation_error: &FsOpsError,
-    group: &FileOperationGroup,
-) -> FsOpsResult<(bool, i64, bool)> {
-    transaction.execute(
-        r#"
-        INSERT INTO file_operations(
-          operation, source_path, target_path, status, created_at, finished_at, error,
-          operation_group_id
-        )
-        VALUES (?1, ?2, ?3, 'failed', unixepoch(), unixepoch(), ?4, ?5)
-        "#,
-        params![kind.as_str(), source_path, target_path, error, group.id],
-    )?;
-    let completed = group.completed.saturating_add(1);
-    let (appended, terminal) = publish_group_item_in_transaction(
-        database,
-        transaction,
-        group,
-        completed,
-        Some(operation_error),
-    )?;
-    Ok((appended, completed, terminal))
-}
-
-/// Acquire the lock briefly, write a `succeeded` `file_operations` row,
-/// and release. Used for idempotent no-op paths (e.g. rename to same name,
-/// move into the same folder).
-fn write_succeeded_locked(
-    database: &Mutex<Database>,
-    kind: FileOperationKind,
-    source_path: &str,
-    target_path: Option<&str>,
-    group: &mut FileOperationGroup,
-) -> FsOpsResult<FileOperationRecord> {
-    let guard = database.lock().expect("database mutex poisoned");
-    write_succeeded_locked_with_guard(guard, kind, source_path, target_path, group)
-}
-
-/// Variant that operates on an already-held guard so callers that already
-/// snapshotted under a single lock can write the success row without
-/// dropping and re-acquiring.
-fn write_succeeded_locked_with_guard<G>(
-    guard: G,
-    kind: FileOperationKind,
-    source_path: &str,
-    target_path: Option<&str>,
-    group: &mut FileOperationGroup,
-) -> FsOpsResult<FileOperationRecord>
-where
-    G: std::ops::DerefMut<Target = Database>,
-{
-    let conn = guard.connection_for_fsops();
-    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let (record, appended, completed, terminal) = insert_operation(
-        &guard,
-        &transaction,
-        kind,
-        source_path,
-        target_path,
-        "succeeded",
-        None,
-        group,
-    )?;
-    transaction.commit()?;
-    group.completed = completed;
-    group.terminal = terminal;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
-    }
-    Ok(record)
-}
-
 fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileOperationRecord> {
     Ok(FileOperationRecord {
         id: row.get(0)?,
@@ -1802,6 +660,7 @@ mod tests {
         root_id: i64,
         root_folder_id: i64,
         root_path: PathBuf,
+        database_path: Option<PathBuf>,
     }
 
     impl TestEnv {
@@ -1809,6 +668,23 @@ mod tests {
             let root_path = unique_temp_dir(label);
             stdfs::create_dir_all(&root_path).expect("create root path");
             let database = Database::open_in_memory().expect("open database");
+            Self::from_database(label, root_path, database, None)
+        }
+
+        fn new_file_backed(label: &str) -> Self {
+            let root_path = unique_temp_dir(label);
+            stdfs::create_dir_all(&root_path).expect("create root path");
+            let database_path = root_path.join("library.sqlite");
+            let database = Database::open(&database_path).expect("open file database");
+            Self::from_database(label, root_path, database, Some(database_path))
+        }
+
+        fn from_database(
+            label: &str,
+            root_path: PathBuf,
+            database: Database,
+            database_path: Option<PathBuf>,
+        ) -> Self {
             database.apply_migrations().expect("apply migrations");
             let root_id = database
                 .add_root(NewRoot {
@@ -1830,7 +706,25 @@ mod tests {
                 root_id,
                 root_folder_id,
                 root_path,
+                database_path,
             }
+        }
+
+        fn reopened_database(&self) -> Database {
+            self.database
+                .lock()
+                .expect("db lock")
+                .reopen()
+                .expect("reopen database")
+                .expect("file-backed database")
+        }
+
+        async fn run_startup_recovery(&self) {
+            let worker_database = self.reopened_database();
+            let writer = crate::db::DbWriter::spawn(self.reopened_database());
+            let sender = crate::tasks::start_worker_with_ffmpeg(worker_database, writer, true);
+            drop(sender);
+            tokio::task::yield_now().await;
         }
 
         fn add_file(&self, folder_id: i64, name: &str) -> i64 {
@@ -1878,6 +772,7 @@ mod tests {
 
     impl Drop for TestEnv {
         fn drop(&mut self) {
+            let _ = self.database_path.take();
             let _ = stdfs::remove_dir_all(&self.root_path);
         }
     }
@@ -2242,12 +1137,13 @@ mod tests {
         let target = env.add_folder(env.root_folder_id, "target");
         let first = env.add_file(env.root_folder_id, "first.jpg");
         let second = env.add_file(env.root_folder_id, "second.jpg");
+        let third = env.add_file(env.root_folder_id, "third.jpg");
         let _conflict = env.add_file(target, "second.jpg");
 
         let error = move_items(
             &env.database,
             MoveRequest {
-                file_ids: vec![first, second],
+                file_ids: vec![first, second, third],
                 folder_ids: vec![],
                 target_folder_id: target,
             },
@@ -2266,9 +1162,30 @@ mod tests {
         let operation = &operations[0];
         assert_eq!(operation.kind, "move");
         assert_eq!(operation.status, "failed");
-        assert_eq!(operation.current_value, 1);
-        assert_eq!(operation.total_value, Some(2));
+        assert_eq!(operation.current_value, 3);
+        assert_eq!(operation.total_value, Some(3));
         assert_eq!(operation.error_code.as_deref(), Some("name_conflict"));
+        let audit_rows: Vec<(String, String)> = guard
+            .connection_for_fsops()
+            .prepare(
+                "SELECT operation_group_id, status FROM file_operations WHERE operation_group_id = ?1 ORDER BY id",
+            )
+            .expect("prepare grouped audit query")
+            .query_map([&operation.operation_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query grouped audit rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect grouped audit rows");
+        assert_eq!(audit_rows.len(), 3);
+        assert!(audit_rows
+            .iter()
+            .all(|(group_id, _)| group_id == &operation.operation_id));
+        assert_eq!(
+            audit_rows
+                .iter()
+                .filter(|(_, status)| status == "failed")
+                .count(),
+            1
+        );
         let events = guard
             .list_notification_outbox(0, 200)
             .expect("notification outbox")
@@ -2284,18 +1201,21 @@ mod tests {
         );
         assert!(env.root_path.join("target").join("first.jpg").exists());
         assert!(env.root_path.join("second.jpg").exists());
+        assert!(env.root_path.join("target").join("third.jpg").exists());
     }
 
     #[test]
     fn filesystem_failure_persists_failed_audit_and_terminal_in_one_group() {
         let env = TestEnv::new("delete_filesystem_failure");
         let file_id = env.add_file(env.root_folder_id, "missing.jpg");
+        let second = env.add_file(env.root_folder_id, "second.jpg");
+        let third = env.add_file(env.root_folder_id, "third.jpg");
         stdfs::remove_file(env.root_path.join("missing.jpg")).expect("remove source from disk");
 
         let error = delete(
             &env.database,
             DeleteRequest {
-                file_ids: vec![file_id],
+                file_ids: vec![file_id, second, third],
                 folder_ids: vec![],
                 permanent: true,
             },
@@ -2304,12 +1224,22 @@ mod tests {
         assert_eq!(error.code, FsOpsErrorCode::FsError);
 
         let page = list_recent(&env.database, 10, None).expect("recent file operations");
-        let audit = page.items.first().expect("failed audit row");
-        assert_eq!(audit.status, "failed");
-        let group_id = audit
+        assert_eq!(page.items.len(), 3);
+        let group_id = page.items[0]
             .operation_group_id
             .as_deref()
             .expect("failed operation group id");
+        assert!(page
+            .items
+            .iter()
+            .all(|audit| { audit.operation_group_id.as_deref() == Some(group_id) }));
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|audit| audit.status == "failed")
+                .count(),
+            1
+        );
         let guard = env.database.lock().expect("db lock");
         let operation = guard
             .notification_heads_for_test()
@@ -2318,9 +1248,11 @@ mod tests {
             .find(|operation| operation.operation_id == group_id)
             .expect("failed operation head");
         assert_eq!(operation.status, "failed");
-        assert_eq!(operation.current_value, 1);
-        assert_eq!(operation.total_value, Some(1));
+        assert_eq!(operation.current_value, 3);
+        assert_eq!(operation.total_value, Some(3));
         assert_eq!(operation.error_code.as_deref(), Some("fs_error"));
+        assert!(!env.root_path.join("second.jpg").exists());
+        assert!(!env.root_path.join("third.jpg").exists());
     }
 
     #[test]
@@ -2344,7 +1276,7 @@ mod tests {
     #[test]
     fn interrupted_file_operation_group_recovers_to_terminal_failure() {
         let env = TestEnv::new("file_operation_recovery");
-        let group = begin_operation_group(&env.database, FileOperationKind::Move, 2)
+        let group_id = journal::begin_test_group(&env.database, FileOperationKind::Move, 2)
             .expect("begin file-operation group");
 
         let guard = env.database.lock().expect("db lock");
@@ -2358,7 +1290,7 @@ mod tests {
             .notification_heads_for_test()
             .expect("notification heads")
             .into_iter()
-            .find(|operation| operation.operation_id == group.id)
+            .find(|operation| operation.operation_id == group_id)
             .expect("recovered group");
         assert_eq!(operation.status, "failed");
         assert_eq!(operation.origin, "recovery");
@@ -2366,6 +1298,268 @@ mod tests {
         assert_eq!(operation.current_value, 0);
         assert_eq!(operation.total_value, Some(2));
         assert!(operation.completed_at.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_finalizes_pending_intent_when_fs_already_completed() {
+        let env = TestEnv::new_file_backed("journal_fs_done");
+        let file_id = env.add_file(env.root_folder_id, "before.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_finalize
+                BEFORE UPDATE OF status ON file_operations
+                WHEN OLD.status = 'pending' AND NEW.status <> 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced finalize failure');
+                END;
+                "#,
+            )
+            .expect("install finalize failure trigger");
+
+        let error = rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(file_id),
+                folder_id: None,
+                new_name: "after.jpg".into(),
+            },
+        )
+        .expect_err("finalize failure must surface without losing the intent");
+        assert_eq!(error.code, FsOpsErrorCode::FsError);
+        assert!(!env.root_path.join("before.jpg").exists());
+        assert!(env.root_path.join("after.jpg").exists());
+
+        let (journal_id, group_id, status): (i64, String, String) = env
+            .database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .query_row(
+                "SELECT id, operation_group_id, status FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("pending journal intent");
+        assert_eq!(status, "pending");
+        assert!(
+            list_recent(&env.database, 10, None)
+                .expect("legacy recent operations")
+                .items
+                .is_empty(),
+            "legacy API must not expose journal-only pending status"
+        );
+        let before_recovery = env
+            .database
+            .lock()
+            .expect("db lock")
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .into_iter()
+            .find(|operation| operation.operation_id == group_id)
+            .expect("operation head before recovery");
+        assert_ne!(before_recovery.status, "failed");
+        let indexed_name_before_recovery: String = env
+            .database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .query_row("SELECT name FROM files WHERE id = ?1", [file_id], |row| {
+                row.get(0)
+            })
+            .expect("index update must have rolled back with finalize");
+        assert_eq!(indexed_name_before_recovery, "before.jpg");
+
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_finalize;")
+            .expect("remove finalize failure trigger");
+        env.run_startup_recovery().await;
+
+        let guard = env.database.lock().expect("db lock");
+        let recovered_status: String = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status FROM file_operations WHERE id = ?1",
+                [journal_id],
+                |row| row.get(0),
+            )
+            .expect("recovered journal status");
+        let indexed_name: String = guard
+            .connection_for_fsops()
+            .query_row("SELECT name FROM files WHERE id = ?1", [file_id], |row| {
+                row.get(0)
+            })
+            .expect("reconciled file row");
+        let recovered = guard
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .into_iter()
+            .find(|operation| operation.operation_id == group_id)
+            .expect("recovered operation head");
+        assert_eq!(recovered_status, "succeeded");
+        assert_eq!(indexed_name, "after.jpg");
+        assert_eq!(recovered.status, "succeeded");
+        assert_eq!(recovered.current_value, 1);
+        assert_eq!(recovered.total_value, Some(1));
+        let terminal_event = guard
+            .list_notification_outbox(0, 200)
+            .expect("notification outbox")
+            .into_iter()
+            .filter(|event| event.operation.operation_id == group_id)
+            .last()
+            .expect("terminal recovery outbox event");
+        assert_eq!(terminal_event.operation.status, "succeeded");
+        assert_eq!(terminal_event.operation.current_value, 1);
+        assert_eq!(terminal_event.operation.total_value, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_retries_pending_intent_when_fs_not_started() {
+        let env = TestEnv::new_file_backed("journal_fs_not_started");
+        let file_id = env.add_file(env.root_folder_id, "before.jpg");
+        let group_id = journal::begin_test_group(&env.database, FileOperationKind::Rename, 1)
+            .expect("begin operation group");
+        let source = env.root_path.join("before.jpg");
+        let target = env.root_path.join("after.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute(
+                r#"INSERT INTO file_operations(
+                     operation, source_path, target_path, status, created_at,
+                     operation_group_id, entity_kind, entity_id, attempt_count
+                   ) VALUES ('rename', ?1, ?2, 'pending', unixepoch(), ?3, 'file', ?4, 0)"#,
+                params![
+                    source.to_string_lossy(),
+                    target.to_string_lossy(),
+                    group_id,
+                    file_id
+                ],
+            )
+            .expect("persist pending intent before filesystem work");
+
+        env.run_startup_recovery().await;
+
+        assert!(!source.exists());
+        assert!(target.exists());
+        let guard = env.database.lock().expect("db lock");
+        let (status, attempt_count): (String, i64) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, attempt_count FROM file_operations WHERE operation_group_id = ?1",
+                [&group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("recovered journal row");
+        let indexed_name: String = guard
+            .connection_for_fsops()
+            .query_row("SELECT name FROM files WHERE id = ?1", [file_id], |row| {
+                row.get(0)
+            })
+            .expect("reconciled file row");
+        let recovered = guard
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .into_iter()
+            .find(|operation| operation.operation_id == group_id)
+            .expect("recovered operation head");
+        assert_eq!(status, "succeeded");
+        assert!(attempt_count >= 1);
+        assert_eq!(indexed_name, "after.jpg");
+        assert_eq!(recovered.status, "succeeded");
+        assert_eq!(recovered.current_value, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_records_failed_retry_for_unexecutable_pending_intent() {
+        let env = TestEnv::new_file_backed("journal_retry_failure");
+        let file_id = env.add_file(env.root_folder_id, "before.jpg");
+        let group_id = journal::begin_test_group(&env.database, FileOperationKind::Rename, 1)
+            .expect("begin operation group");
+        let source = env.root_path.join("before.jpg");
+        let target = env.root_path.join("missing-parent").join("after.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute(
+                r#"INSERT INTO file_operations(
+                     operation, source_path, target_path, status, created_at,
+                     operation_group_id, entity_kind, entity_id, attempt_count
+                   ) VALUES ('rename', ?1, ?2, 'pending', unixepoch(), ?3, 'file', ?4, 0)"#,
+                params![
+                    source.to_string_lossy(),
+                    target.to_string_lossy(),
+                    group_id,
+                    file_id
+                ],
+            )
+            .expect("persist pending intent");
+
+        env.run_startup_recovery().await;
+
+        assert!(source.exists());
+        assert!(!target.exists());
+        let guard = env.database.lock().expect("db lock");
+        let (status, attempt_count, error_code): (String, i64, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, attempt_count, error_code FROM file_operations WHERE operation_group_id = ?1",
+                [&group_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("failed recovered journal row");
+        let recovered = guard
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .into_iter()
+            .find(|operation| operation.operation_id == group_id)
+            .expect("failed recovered operation head");
+        assert_eq!(status, "failed");
+        assert_eq!(attempt_count, 1);
+        assert_eq!(error_code.as_deref(), Some("fs_error"));
+        assert_eq!(recovered.status, "failed");
+        assert_eq!(recovered.current_value, 1);
+        assert_eq!(recovered.total_value, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_recovery_ignores_legacy_pending_audit_without_journal_metadata() {
+        let env = TestEnv::new_file_backed("legacy_pending_audit");
+        let audit_id = env
+            .database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .query_row(
+                r#"INSERT INTO file_operations(
+                     operation, source_path, target_path, status, created_at
+                   ) VALUES ('rename', 'legacy-old', 'legacy-new', 'pending', 1)
+                   RETURNING id"#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("seed pre-journal pending audit");
+
+        env.run_startup_recovery().await;
+
+        let guard = env.database.lock().expect("db lock");
+        let row: (String, Option<String>, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, operation_group_id, entity_kind FROM file_operations WHERE id = ?1",
+                [audit_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("legacy audit survives startup recovery");
+        assert_eq!(row, ("pending".to_owned(), None, None));
     }
 
     #[test]

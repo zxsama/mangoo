@@ -968,6 +968,10 @@ impl Database {
             self.connection
                 .execute_batch(migrations::NOTIFICATION_OUTBOX_MIGRATION)?;
         }
+        if !self.migration_applied(22)? {
+            self.connection
+                .execute_batch(migrations::FILE_OPERATION_JOURNAL_MIGRATION)?;
+        }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
         Ok(())
@@ -18586,6 +18590,139 @@ mod tests {
             )
             .expect("read default operation group");
         assert_eq!(operation_group_id, None);
+    }
+
+    #[test]
+    fn migration_0022_adds_recoverable_file_operation_journal() {
+        let database = migrated_database();
+        let columns = database
+            .connection
+            .prepare("PRAGMA table_info(file_operations)")
+            .expect("inspect file-operation journal")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query file-operation columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect file-operation columns");
+        for column in [
+            "operation_group_id",
+            "entity_kind",
+            "entity_id",
+            "target_folder_id",
+            "attempt_count",
+            "error_code",
+        ] {
+            assert!(
+                columns.iter().any(|actual| actual == column),
+                "missing {column}"
+            );
+        }
+        assert!(database.migration_applied(22).unwrap());
+        let pending_index: Option<String> = database
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_file_operations_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query pending journal index");
+        assert!(
+            pending_index
+                .as_deref()
+                .is_some_and(|sql| sql.contains("WHERE status = 'pending'")),
+            "pending journal index must be partial"
+        );
+
+        database
+            .connection
+            .execute(
+                r#"INSERT INTO file_operations(
+                     operation, source_path, target_path, status, created_at,
+                     operation_group_id, entity_kind, entity_id, target_folder_id,
+                     attempt_count, error_code
+                   ) VALUES ('move', 'old', 'new', 'pending', 1,
+                             'group', 'file', 7, 9, 0, NULL)"#,
+                [],
+            )
+            .expect("valid pending journal intent");
+        let invalid_kind = database.connection.execute(
+            r#"INSERT INTO file_operations(
+                 operation, source_path, status, created_at, operation_group_id,
+                 entity_kind, entity_id, attempt_count
+               ) VALUES ('move', 'old', 'pending', 1, 'bad', 'root', 7, 0)"#,
+            [],
+        );
+        assert!(invalid_kind.is_err(), "unsupported journal entity kind");
+    }
+
+    #[test]
+    fn migration_0022_preserves_legacy_file_operation_rows() {
+        let database = database_migrated_through_20();
+        database
+            .connection
+            .execute_batch(migrations::NOTIFICATION_OUTBOX_MIGRATION)
+            .expect("apply migration 21");
+        database
+            .connection
+            .execute(
+                "INSERT INTO file_operations(id, operation, source_path, target_path, status, created_at, finished_at, error, operation_group_id) VALUES (71, 'rename', 'old', 'new', 'succeeded', 1, 2, NULL, 'legacy-group')",
+                [],
+            )
+            .expect("seed version-21 operation");
+
+        database
+            .apply_migrations()
+            .expect("upgrade through migration 22");
+
+        let preserved: (String, Option<String>, Option<i64>, i64, Option<String>) = database
+            .connection
+            .query_row(
+                "SELECT status, entity_kind, entity_id, attempt_count, error_code FROM file_operations WHERE id = 71",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read preserved operation");
+        assert_eq!(preserved, ("succeeded".to_owned(), None, None, 0, None));
+    }
+
+    #[test]
+    fn migration_0022_rolls_back_journal_columns_and_index_before_commit() {
+        let database = database_migrated_through_20();
+        database
+            .connection
+            .execute_batch(migrations::NOTIFICATION_OUTBOX_MIGRATION)
+            .expect("apply migration 21");
+        let (before_commit, _) = migrations::FILE_OPERATION_JOURNAL_MIGRATION
+            .rsplit_once("COMMIT;")
+            .expect("migration 22 must end with an explicit commit");
+        let failing = format!("{before_commit}\nSELECT * FROM migration_0022_deliberate_failure;");
+
+        assert!(database.connection.execute_batch(&failing).is_err());
+        database
+            .connection
+            .execute_batch("ROLLBACK;")
+            .expect("roll back failed migration 22");
+
+        assert!(!database.migration_applied(22).unwrap());
+        assert!(!database
+            .table_has_column("file_operations", "entity_kind")
+            .unwrap());
+        let pending_index: Option<String> = database
+            .connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_file_operations_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query rolled-back pending index");
+        assert!(pending_index.is_none());
+
+        database.apply_migrations().expect("rerun migration 22");
+        assert!(database.migration_applied(22).unwrap());
+        assert!(database
+            .table_has_column("file_operations", "entity_kind")
+            .unwrap());
     }
 
     #[test]

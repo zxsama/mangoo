@@ -38,3 +38,5 @@ pub const ROOT_PURGE_TASK_KIND_MIGRATION: &str =
     include_str!("../../migrations/0020_root_purge_task_kind.sql");
 pub const NOTIFICATION_OUTBOX_MIGRATION: &str =
     include_str!("../../migrations/0021_notification_outbox.sql");
+pub const FILE_OPERATION_JOURNAL_MIGRATION: &str =
+    include_str!("../../migrations/0022_file_operation_journal.sql");
