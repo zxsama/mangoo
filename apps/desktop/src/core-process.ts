@@ -6,6 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import type { CoreSession } from "./core-session.js";
 import type { ProcessLogLevel } from "./process-log-buffer.js";
+import { LifecycleCancelledError, throwIfLifecycleAborted } from "./core-lifecycle-queue.js";
 
 export interface CoreProcessHandle {
   process: ChildProcess | null;
@@ -311,26 +312,30 @@ function emitCoreLog(
 export async function waitForCoreHealth(
   baseUrl: string,
   sessionToken: string,
-  timeoutMs = 12_000
+  timeoutMs = 12_000,
+  signal?: AbortSignal
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
 
   while (Date.now() < deadline) {
+    if (signal) throwIfLifecycleAborted(signal);
     try {
       const response = await fetch(new URL("health", ensureTrailingSlash(baseUrl)), {
         headers: {
           "x-megle-session": sessionToken
-        }
+        },
+        signal
       });
       if (response.ok) {
         return;
       }
       lastError = new Error(`health returned ${response.status}`);
     } catch (error) {
+      if (signal?.aborted) throw new LifecycleCancelledError();
       lastError = error;
     }
-    await delay(250);
+    await delay(250, signal);
   }
 
   throw new Error(`Core did not become healthy: ${String(lastError)}`);
@@ -352,9 +357,31 @@ function ensureTrailingSlash(value: string): string {
   return value.endsWith("/") ? value : `${value}/`;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!signal) {
+      setTimeout(resolve, ms);
+      return;
+    }
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const timer = setTimeout(() => {
+      settled = true;
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(new LifecycleCancelledError());
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 

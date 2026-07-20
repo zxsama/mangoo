@@ -141,7 +141,20 @@ function isLoopbackOrIpLiteral(host: string): boolean {
 // Build a session for a different database file that reuses the same bind
 // address + session token, so a Core restart does not require the renderer to
 // re-read its coreUrl/token (spec Decision 6).
-export function sessionForDbPath(base: CoreSession, dbPath: string): CoreSession {
+export function sessionForDbPath(
+  base: CoreSession,
+  dbPath: string,
+  candidate?: CoreSession | null
+): CoreSession {
+  if (
+    candidate?.dbPath === dbPath &&
+    candidate.baseUrl === base.baseUrl &&
+    candidate.bindAddress === base.bindAddress &&
+    candidate.sessionToken === base.sessionToken &&
+    candidate.allowedOrigin === base.allowedOrigin
+  ) {
+    return candidate;
+  }
   return { ...base, dbPath };
 }
 

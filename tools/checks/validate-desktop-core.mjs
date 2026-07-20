@@ -43,6 +43,7 @@ function functionBody(source, signature) {
 const main = read("apps/desktop/src/main.ts");
 const session = read("apps/desktop/src/core-session.ts");
 const processFile = read("apps/desktop/src/core-process.ts");
+const lifecycleQueue = read("apps/desktop/src/core-lifecycle-queue.ts");
 const preload = read("apps/desktop/src/preload.cjs");
 const secondaryReveal = read("apps/desktop/src/secondary-window-reveal.ts");
 const desktopPackage = read("apps/desktop/package.json");
@@ -56,6 +57,9 @@ for (const value of [
   "AUTO_CORE_STARTUP_MAX_ATTEMPTS",
   "shouldRetryAutoCoreStartup",
   "handleDesktopStartupFailure",
+  "CoreLifecycleQueue",
+  "coreLifecycleQueue.enqueue",
+  "coreLifecycleQueue.shutdown",
   "additionalArguments",
   "--megle-core-url=",
   "--megle-session-token=",
@@ -373,9 +377,13 @@ if (startCoreCalls !== 2) {
     `desktop main must start Core from exactly two call sites (startCoreSession + restartCoreForLibrary); found ${startCoreCalls} calls`
   );
 }
+const lifecycleEnqueueCalls = [...main.matchAll(/coreLifecycleQueue\.enqueue\(/g)].length;
+if (lifecycleEnqueueCalls < 4) {
+  fail("desktop library/startup lifecycle operations must all enter the shared Core lifecycle queue");
+}
 const restartCoreForLibraryBody = functionBody(
   main,
-  "async function restartCoreForLibrary(dbPath: string): Promise<void>"
+  "async function restartCoreForLibrary(dbPath: string, signal: AbortSignal): Promise<void>"
 );
 if (!restartCoreForLibraryBody) {
   fail("desktop main must expose restartCoreForLibrary to restart Core for a library switch");
@@ -389,6 +397,14 @@ if (!restartCoreForLibraryBody) {
   if (!restartCoreForLibraryBody.includes("sessionForDbPath(")) {
     fail("desktop main restartCoreForLibrary must reuse the existing bind address/session token via sessionForDbPath");
   }
+  for (const value of ["pendingCoreSession", "throwIfLifecycleAborted(signal)", "pendingCoreSession = null"]) {
+    if (!restartCoreForLibraryBody.includes(value)) {
+      fail(`desktop main restartCoreForLibrary must preserve candidate session lifecycle state: ${value}`);
+    }
+  }
+  if (restartCoreForLibraryBody.includes("coreSession = null")) {
+    fail("desktop main must retain the last-known coreSession while a library candidate is unhealthy");
+  }
 }
 if (!main.includes("ensureCoreReady")) {
   fail("desktop main must centralize Core startup outside createWindow");
@@ -399,11 +415,17 @@ if (!main.includes("coreReadyPromise")) {
 if (!main.includes("pendingCoreProcess")) {
   fail("desktop main must track pending Core process for app quit cleanup");
 }
-if (!main.includes("waitForCoreHealth(session.baseUrl, session.sessionToken")) {
+if (!main.includes("waitForCoreHealth(session.baseUrl, session.sessionToken,")) {
   fail("desktop main must pass session token to health wait");
 }
+if (!lifecycleQueue.includes("this.active?.controller.abort()") || !lifecycleQueue.includes("this.pending.splice(0)")) {
+  fail("Core lifecycle queue must cancel active work and discard queued work on shutdown");
+}
+if (!lifecycleQueue.includes("this.shutdownRequested || this.closed")) {
+  fail("Core lifecycle queue must reject work after shutdown begins");
+}
 const ensureCoreReadyBody = functionBody(main, "async function ensureCoreReady(): Promise<CoreSession>");
-const startCoreSessionBody = functionBody(main, "async function startCoreSession(): Promise<CoreSession>");
+const startCoreSessionBody = functionBody(main, "async function startCoreSession(signal: AbortSignal): Promise<CoreSession>");
 if (!ensureCoreReadyBody) {
   fail("desktop main must keep ensureCoreReady as an async CoreSession function");
 } else {
