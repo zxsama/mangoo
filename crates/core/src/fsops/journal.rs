@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::{collections::BTreeSet, collections::HashSet, sync::OnceLock, thread, time::Duration};
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -46,6 +46,8 @@ struct PreparedIntent {
     target_folder_id: Option<i64>,
     delete_root_path: Option<PathBuf>,
     source_identity: Option<String>,
+    target_parent_identity: Option<String>,
+    staging_identity: Option<String>,
     preflight_error: Option<FsOpsError>,
 }
 
@@ -54,6 +56,35 @@ enum JournalPhase {
     Legacy,
     Prepared,
     Executing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecyclePhase {
+    None,
+    Staged,
+    ShellCompleted,
+}
+
+impl RecyclePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Staged => "staged",
+            Self::ShellCompleted => "shell_completed",
+        }
+    }
+
+    fn parse(value: &str) -> FsOpsResult<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "staged" => Ok(Self::Staged),
+            "shell_completed" => Ok(Self::ShellCompleted),
+            _ => Err(FsOpsError::new(
+                FsOpsErrorCode::FsError,
+                format!("unsupported recycle handoff phase: {value}"),
+            )),
+        }
+    }
 }
 
 impl JournalPhase {
@@ -84,6 +115,9 @@ struct JournalIntent {
     attempt_count: i64,
     phase: JournalPhase,
     source_identity: Option<String>,
+    target_parent_identity: Option<String>,
+    staging_identity: Option<String>,
+    recycle_phase: RecyclePhase,
     pending_error_code: Option<String>,
     pending_error_detail: Option<String>,
 }
@@ -117,12 +151,12 @@ pub(super) fn rename(
 }
 
 pub(super) fn rename_with_writer(
-    database: &Mutex<Database>,
+    database: &Arc<Mutex<Database>>,
     writer: &crate::db::DbWriter,
     request: RenameRequest,
 ) -> FsOpsResult<FileOperationRecord> {
     let prepared = prepare_rename(database, request)?;
-    let store = WriterJournalStore { database, writer };
+    let store = WriterJournalStore::new(Arc::clone(database), writer.clone());
     let mut records = execute_prepared(&store, FileOperationKind::Rename, vec![prepared])?;
     records.pop().ok_or_else(|| {
         FsOpsError::new(
@@ -151,7 +185,7 @@ pub(super) fn move_items(
 }
 
 pub(super) fn move_items_with_writer(
-    database: &Mutex<Database>,
+    database: &Arc<Mutex<Database>>,
     writer: &crate::db::DbWriter,
     request: MoveRequest,
 ) -> FsOpsResult<Vec<FileOperationRecord>> {
@@ -162,7 +196,7 @@ pub(super) fn move_items_with_writer(
         ));
     }
     let prepared = prepare_move(database, &request)?;
-    let store = WriterJournalStore { database, writer };
+    let store = WriterJournalStore::new(Arc::clone(database), writer.clone());
     execute_prepared(&store, FileOperationKind::Move, prepared)
 }
 
@@ -189,7 +223,7 @@ pub(super) fn delete(
 }
 
 pub(super) fn delete_with_writer(
-    database: &Mutex<Database>,
+    database: &Arc<Mutex<Database>>,
     writer: &crate::db::DbWriter,
     request: DeleteRequest,
 ) -> FsOpsResult<Vec<FileOperationRecord>> {
@@ -205,7 +239,7 @@ pub(super) fn delete_with_writer(
         FileOperationKind::DeleteRecycle
     };
     let prepared = prepare_delete(database, &request, kind)?;
-    let store = WriterJournalStore { database, writer };
+    let store = WriterJournalStore::new(Arc::clone(database), writer.clone());
     execute_prepared(&store, kind, prepared)
 }
 
@@ -235,39 +269,104 @@ pub(crate) fn recover_pending_file_operations(database: &Database) -> FsOpsResul
     }
 }
 
-pub(crate) fn schedule_pending_repair(database: &Mutex<Database>) {
-    let path = database
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .path()
-        .map(Path::to_path_buf);
-    if let Some(path) = path {
-        schedule_pending_repair_for_path(path);
-    } else {
-        tracing::warn!("cannot schedule file-operation repair for an in-memory database");
+fn recover_pending_file_operations_with_writer(
+    database: Arc<Mutex<Database>>,
+    writer: crate::db::DbWriter,
+) -> FsOpsResult<usize> {
+    let intents = {
+        let guard = database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        load_pending_intents(&guard)?
+    };
+    let store = WriterJournalStore::new(database, writer);
+    let mut recovered = 0usize;
+    let mut first_error = None;
+    for mut intent in intents {
+        match reconcile_intent_with_store(&store, &mut intent) {
+            Ok(Ok(_)) | Ok(Err(_)) => recovered += 1,
+            Err(error) => {
+                tracing::error!(
+                    intent_id = intent.id,
+                    operation_group_id = %intent.group_id,
+                    %error,
+                    "single-writer file-operation repair failed"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(recovered),
     }
 }
 
-pub(crate) fn schedule_pending_repair_for_database(database: &Database) {
-    if let Some(path) = database.path().map(Path::to_path_buf) {
-        schedule_pending_repair_for_path(path);
-    } else {
-        tracing::warn!("cannot schedule file-operation repair for an in-memory database");
+fn reconcile_intent_with_store(
+    store: &WriterJournalStore,
+    intent: &mut JournalIntent,
+) -> FsOpsResult<FsOpsResult<FileOperationRecord>> {
+    if let Some(code) = intent.pending_error_code.as_deref() {
+        let error = persisted_error(code, intent.pending_error_detail.as_deref());
+        store.finalize(intent, Some(&error))?;
+        return Ok(Err(error));
+    }
+    if intent.entity_kind.is_none() || intent.entity_id.is_none() {
+        let error = FsOpsError::new(
+            FsOpsErrorCode::FsError,
+            "pending file operation is missing replay metadata",
+        );
+        store.finalize(intent, Some(&error))?;
+        return Ok(Err(error));
+    }
+
+    let action = {
+        let guard = store
+            .database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reconcile_filesystem_state(&guard, intent)
+    };
+    match action {
+        ReconcileAction::FinalizeSuccess => store.finalize(intent, None).map(Ok),
+        ReconcileAction::Retry => execute_intent_with_store(store, intent),
+        ReconcileAction::RestoreRecycle => {
+            restore_recycle_staging(intent)?;
+            let journal_intent = intent.clone();
+            let (phase, recycle_phase) = store
+                .writer
+                .write_blocking(move |database| {
+                    let mut journal_intent = journal_intent;
+                    reset_recycle_for_retry(database, &mut journal_intent)
+                        .map_err(anyhow::Error::new)?;
+                    Ok((journal_intent.phase, journal_intent.recycle_phase))
+                })
+                .map_err(FsOpsError::from)?;
+            intent.phase = phase;
+            intent.recycle_phase = recycle_phase;
+            execute_intent_with_store(store, intent)
+        }
+        ReconcileAction::Fail(error) => {
+            store.finalize(intent, Some(&error))?;
+            Ok(Err(error))
+        }
     }
 }
 
-fn schedule_pending_repair_for_path(path: PathBuf) {
-    static ACTIVE_REPAIRS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+pub(crate) fn schedule_pending_repair(database: Arc<Mutex<Database>>, writer: crate::db::DbWriter) {
+    static ACTIVE_REPAIRS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
     let active = ACTIVE_REPAIRS.get_or_init(|| Mutex::new(HashSet::new()));
+    let writer_id = writer.instance_id();
     if !active
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(path.clone())
+        .insert(writer_id)
     {
         return;
     }
 
-    let repair_path = path.clone();
     let spawn_result = thread::Builder::new()
         .name("megle-fsops-repair".to_owned())
         .spawn(move || {
@@ -280,23 +379,23 @@ fn schedule_pending_repair_for_path(path: PathBuf) {
             ];
             for (attempt, delay) in RETRY_DELAYS.into_iter().enumerate() {
                 thread::sleep(delay);
-                let database = match Database::open(&repair_path) {
-                    Ok(database) => database,
-                    Err(error) => {
-                        tracing::error!(
-                            database_path = %repair_path.display(),
-                            attempt = attempt + 1,
-                            %error,
-                            "cannot open database for file-operation repair"
-                        );
-                        continue;
-                    }
-                };
-                match recover_pending_file_operations(&database) {
+                match recover_pending_file_operations_with_writer(
+                    Arc::clone(&database),
+                    writer.clone(),
+                ) {
                     Ok(recovered) => {
-                        let pending = pending_intent_count(&database).unwrap_or(i64::MAX);
+                        let pending = database
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .connection_for_fsops()
+                            .query_row(
+                                "SELECT COUNT(*) FROM file_operations WHERE status = 'pending' AND operation_group_id IS NOT NULL",
+                                [],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .unwrap_or(i64::MAX);
                         tracing::info!(
-                            database_path = %repair_path.display(),
+                            writer_id,
                             attempt = attempt + 1,
                             recovered,
                             pending,
@@ -307,7 +406,7 @@ fn schedule_pending_repair_for_path(path: PathBuf) {
                         }
                     }
                     Err(error) => tracing::warn!(
-                        database_path = %repair_path.display(),
+                        writer_id,
                         attempt = attempt + 1,
                         %error,
                         "file-operation repair pass will retry"
@@ -317,23 +416,15 @@ fn schedule_pending_repair_for_path(path: PathBuf) {
             active
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&repair_path);
+                .remove(&writer_id);
         });
     if let Err(error) = spawn_result {
         active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&path);
+            .remove(&writer_id);
         tracing::error!(%error, "failed to spawn file-operation repair thread");
     }
-}
-
-fn pending_intent_count(database: &Database) -> FsOpsResult<i64> {
-    Ok(database.connection_for_fsops().query_row(
-        "SELECT COUNT(*) FROM file_operations WHERE status = 'pending' AND operation_group_id IS NOT NULL",
-        [],
-        |row| row.get(0),
-    )?)
 }
 
 #[cfg(test)]
@@ -407,6 +498,12 @@ trait JournalStore {
         &self,
         intent: &mut JournalIntent,
         source_identity: &str,
+        target_parent_identity: Option<&str>,
+    ) -> FsOpsResult<()>;
+    fn record_recycle_phase(
+        &self,
+        intent: &mut JournalIntent,
+        phase: RecyclePhase,
     ) -> FsOpsResult<()>;
     fn finalize(
         &self,
@@ -439,13 +536,26 @@ impl JournalStore for DirectJournalStore<'_> {
         &self,
         intent: &mut JournalIntent,
         source_identity: &str,
+        target_parent_identity: Option<&str>,
     ) -> FsOpsResult<()> {
         let guard = self
             .database
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        validate_execution_source(&guard, intent, source_identity)?;
+        validate_execution_source(&guard, intent, source_identity, target_parent_identity)?;
         mark_attempt(&guard, intent)
+    }
+
+    fn record_recycle_phase(
+        &self,
+        intent: &mut JournalIntent,
+        phase: RecyclePhase,
+    ) -> FsOpsResult<()> {
+        let guard = self
+            .database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update_recycle_phase(&guard, intent, phase)
     }
 
     fn finalize(
@@ -461,16 +571,22 @@ impl JournalStore for DirectJournalStore<'_> {
     }
 
     fn schedule_repair(&self) {
-        schedule_pending_repair(self.database);
+        tracing::warn!("direct test journal store cannot schedule production single-writer repair");
     }
 }
 
-struct WriterJournalStore<'a> {
-    database: &'a Mutex<Database>,
-    writer: &'a crate::db::DbWriter,
+struct WriterJournalStore {
+    database: Arc<Mutex<Database>>,
+    writer: crate::db::DbWriter,
 }
 
-impl JournalStore for WriterJournalStore<'_> {
+impl WriterJournalStore {
+    fn new(database: Arc<Mutex<Database>>, writer: crate::db::DbWriter) -> Self {
+        Self { database, writer }
+    }
+}
+
+impl JournalStore for WriterJournalStore {
     fn persist(
         &self,
         kind: FileOperationKind,
@@ -487,20 +603,44 @@ impl JournalStore for WriterJournalStore<'_> {
         &self,
         intent: &mut JournalIntent,
         source_identity: &str,
+        target_parent_identity: Option<&str>,
     ) -> FsOpsResult<()> {
         let mut journal_intent = intent.clone();
         let source_identity = source_identity.to_owned();
+        let target_parent_identity = target_parent_identity.map(str::to_owned);
         let (attempt_count, phase) = self
             .writer
             .write_blocking(move |database| {
-                validate_execution_source(database, &journal_intent, &source_identity)
-                    .map_err(anyhow::Error::new)?;
+                validate_execution_source(
+                    database,
+                    &journal_intent,
+                    &source_identity,
+                    target_parent_identity.as_deref(),
+                )
+                .map_err(anyhow::Error::new)?;
                 mark_attempt(database, &mut journal_intent).map_err(anyhow::Error::new)?;
                 Ok((journal_intent.attempt_count, journal_intent.phase))
             })
             .map_err(FsOpsError::from)?;
         intent.attempt_count = attempt_count;
         intent.phase = phase;
+        Ok(())
+    }
+
+    fn record_recycle_phase(
+        &self,
+        intent: &mut JournalIntent,
+        phase: RecyclePhase,
+    ) -> FsOpsResult<()> {
+        let journal_intent = intent.clone();
+        self.writer
+            .write_blocking(move |database| {
+                let mut journal_intent = journal_intent;
+                update_recycle_phase(database, &mut journal_intent, phase)
+                    .map_err(anyhow::Error::new)
+            })
+            .map_err(FsOpsError::from)?;
+        intent.recycle_phase = phase;
         Ok(())
     }
 
@@ -519,7 +659,7 @@ impl JournalStore for WriterJournalStore<'_> {
     }
 
     fn schedule_repair(&self) {
-        schedule_pending_repair(self.database);
+        schedule_pending_repair(Arc::clone(&self.database), self.writer.clone());
     }
 }
 
@@ -538,19 +678,36 @@ fn execute_intent_with_store(
     }
 
     let source = open_verified_execution_source(intent)?;
-    store.validate_and_mark(intent, source.identity())?;
-    let fs_result = perform_filesystem_action(intent, source);
+    let target_parent = open_verified_execution_target_parent(intent)?;
+    store.validate_and_mark(
+        intent,
+        source.identity(),
+        target_parent.as_ref().map(|parent| parent.identity()),
+    )?;
+    let fs_result = if intent.kind == FileOperationKind::DeleteRecycle {
+        match perform_recycle_action_with_store(
+            store,
+            intent,
+            source,
+            target_parent.as_ref().ok_or_else(|| {
+                interrupted_error("recycle execution has no protected staging parent")
+            })?,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                store.schedule_repair();
+                return Err(error);
+            }
+        }
+    } else {
+        perform_filesystem_action(intent, source, target_parent.as_ref())
+    };
     match fs_result {
         Ok(()) => store.finalize(intent, None).map(Ok),
         Err(error) => {
             let operation_error = filesystem_operation_error(intent, error);
             if intent.kind == FileOperationKind::DeleteRecycle {
-                match reconcile_recycle_action_failure(intent)? {
-                    RecycleFailureState::Completed => {
-                        return store.finalize(intent, None).map(Ok);
-                    }
-                    RecycleFailureState::Restored => {}
-                }
+                reconcile_recycle_action_failure(intent)?;
             }
             store.finalize(intent, Some(&operation_error))?;
             Ok(Err(operation_error))
@@ -573,19 +730,32 @@ fn execute_intent(
     }
 
     let source = open_verified_execution_source(intent)?;
-    validate_execution_source(database, intent, source.identity())?;
+    let target_parent = open_verified_execution_target_parent(intent)?;
+    validate_execution_source(
+        database,
+        intent,
+        source.identity(),
+        target_parent.as_ref().map(|parent| parent.identity()),
+    )?;
     mark_attempt(database, intent)?;
-    match perform_filesystem_action(intent, source) {
+    let fs_result = if intent.kind == FileOperationKind::DeleteRecycle {
+        perform_recycle_action_direct(
+            database,
+            intent,
+            source,
+            target_parent.as_ref().ok_or_else(|| {
+                interrupted_error("recycle execution has no protected staging parent")
+            })?,
+        )?
+    } else {
+        perform_filesystem_action(intent, source, target_parent.as_ref())
+    };
+    match fs_result {
         Ok(()) => finalize_intent(database, intent, None).map(Ok),
         Err(error) => {
             let operation_error = filesystem_operation_error(intent, error);
             if intent.kind == FileOperationKind::DeleteRecycle {
-                match reconcile_recycle_action_failure(intent)? {
-                    RecycleFailureState::Completed => {
-                        return finalize_intent(database, intent, None).map(Ok);
-                    }
-                    RecycleFailureState::Restored => {}
-                }
+                reconcile_recycle_action_failure(intent)?;
             }
             finalize_intent(database, intent, Some(&operation_error))?;
             Ok(Err(operation_error))
@@ -689,11 +859,21 @@ fn reconcile_recycle_filesystem_state(
         ));
     }
     match (source, staging, intent.phase) {
+        (PathProbe::NotFound, PathProbe::NotFound, JournalPhase::Executing)
+            if intent.recycle_phase == RecyclePhase::ShellCompleted =>
+        {
+            match verify_entity_snapshot(database, intent) {
+                Ok(()) => ReconcileAction::FinalizeSuccess,
+                Err(error) => ReconcileAction::Fail(error),
+            }
+        }
         (PathProbe::NotFound, PathProbe::NotFound, JournalPhase::Executing) => {
-            ReconcileAction::FinalizeSuccess
+            ReconcileAction::Fail(interrupted_error(
+                "recycle source and staging are missing without a durable Shell completion",
+            ))
         }
         (PathProbe::NotFound, PathProbe::Exists(metadata), JournalPhase::Executing) => {
-            match verify_source_identity(intent, staging_path, &metadata) {
+            match verify_staging_identity(intent, staging_path, &metadata) {
                 Ok(()) => ReconcileAction::RestoreRecycle,
                 Err(error) => ReconcileAction::Fail(error),
             }
@@ -738,12 +918,17 @@ fn restore_staged_recycle_for_retry(
     intent: &mut JournalIntent,
 ) -> FsOpsResult<FsOpsResult<FileOperationRecord>> {
     restore_recycle_staging(intent)?;
+    reset_recycle_for_retry(database, intent)?;
+    execute_intent(database, intent)
+}
+
+fn reset_recycle_for_retry(database: &Database, intent: &mut JournalIntent) -> FsOpsResult<()> {
     let transaction = Transaction::new_unchecked(
         database.connection_for_fsops(),
         TransactionBehavior::Immediate,
     )?;
     let updated = transaction.execute(
-        "UPDATE file_operations SET journal_phase = 'prepared' WHERE id = ?1 AND status = 'pending' AND journal_phase = 'executing'",
+        "UPDATE file_operations SET journal_phase = 'prepared', recycle_phase = 'none' WHERE id = ?1 AND status = 'pending' AND journal_phase = 'executing'",
         [intent.id],
     )?;
     if updated != 1 {
@@ -754,7 +939,8 @@ fn restore_staged_recycle_for_retry(
     }
     transaction.commit()?;
     intent.phase = JournalPhase::Prepared;
-    execute_intent(database, intent)
+    intent.recycle_phase = RecyclePhase::None;
+    Ok(())
 }
 
 fn restore_recycle_staging(intent: &JournalIntent) -> FsOpsResult<()> {
@@ -768,17 +954,36 @@ fn restore_recycle_staging(intent: &JournalIntent) -> FsOpsResult<()> {
             staging_path.display()
         ))
     })?;
-    let expected = intent
-        .source_identity
-        .as_deref()
-        .ok_or_else(|| interrupted_error("recycle intent has no stable source identity"))?;
+    let expected = required_staging_identity(intent)?;
     if staged.identity() != expected {
         return Err(interrupted_error(
             "recycle staging identity changed before restoration",
         ));
     }
+    let source_parent_path = intent
+        .source_path
+        .parent()
+        .ok_or_else(|| interrupted_error("recycle source has no parent directory"))?;
+    let source_parent =
+        super::platform::VerifiedTargetParent::open(source_parent_path).map_err(|error| {
+            interrupted_error(format!(
+                "cannot open recycle restore parent '{}': {error}",
+                source_parent_path.display()
+            ))
+        })?;
+    if source_parent.identity() != intent.target_parent_identity.as_deref().unwrap_or_default() {
+        return Err(interrupted_error(
+            "recycle restore parent identity changed after staging",
+        ));
+    }
     staged
-        .rename_no_replace(&intent.source_path)
+        .rename_no_replace(
+            &source_parent,
+            intent
+                .source_path
+                .file_name()
+                .ok_or_else(|| interrupted_error("recycle source has no relative leaf"))?,
+        )
         .map_err(|error| {
             interrupted_error(format!(
                 "cannot restore recycle staging to '{}': {error}",
@@ -787,30 +992,30 @@ fn restore_recycle_staging(intent: &JournalIntent) -> FsOpsResult<()> {
         })
 }
 
-enum RecycleFailureState {
-    Completed,
-    Restored,
-}
-
-fn reconcile_recycle_action_failure(intent: &JournalIntent) -> FsOpsResult<RecycleFailureState> {
+fn reconcile_recycle_action_failure(intent: &JournalIntent) -> FsOpsResult<()> {
     let staging_path = intent
         .target_path
         .as_deref()
         .ok_or_else(|| interrupted_error("recycle action failed without a staging path"))?;
     match (probe_path(&intent.source_path), probe_path(staging_path)) {
-        (PathProbe::NotFound, PathProbe::NotFound) => Ok(RecycleFailureState::Completed),
+        (PathProbe::NotFound, PathProbe::NotFound) => Err(interrupted_error(
+            "recycle source and staging disappeared before Shell completion was durably recorded",
+        )),
         (PathProbe::NotFound, PathProbe::Exists(metadata)) => {
-            verify_source_identity(intent, staging_path, &metadata)?;
+            verify_staging_identity(intent, staging_path, &metadata)?;
             restore_recycle_staging(intent)?;
-            Ok(RecycleFailureState::Restored)
+            Ok(())
         }
         (PathProbe::Exists(metadata), PathProbe::NotFound) => {
             verify_source_identity(intent, &intent.source_path, &metadata)?;
-            Ok(RecycleFailureState::Restored)
+            Ok(())
         }
-        (PathProbe::Exists(source_metadata), PathProbe::Exists(_)) => {
+        (PathProbe::Exists(source_metadata), PathProbe::Exists(staging_metadata)) => {
             verify_source_identity(intent, &intent.source_path, &source_metadata)?;
-            Ok(RecycleFailureState::Restored)
+            verify_staging_identity(intent, staging_path, &staging_metadata)?;
+            Err(interrupted_error(
+                "recycle source and staging both exist after Shell failure",
+            ))
         }
         (PathProbe::Error(error), _) => Err(probe_interrupted_error(
             &intent.source_path,
@@ -1063,7 +1268,15 @@ fn validate_prepared_source_replay(
     metadata: &fs::Metadata,
 ) -> FsOpsResult<()> {
     verify_entity_snapshot(database, intent)?;
-    verify_source_identity(intent, &intent.source_path, metadata)
+    verify_source_identity(intent, &intent.source_path, metadata)?;
+    validate_target_parent_snapshot(intent)
+}
+
+fn validate_target_parent_snapshot(intent: &JournalIntent) -> FsOpsResult<()> {
+    if intent.kind == FileOperationKind::DeletePermanent {
+        return Ok(());
+    }
+    open_verified_execution_target_parent(intent).map(|_| ())
 }
 
 fn verify_source_identity(
@@ -1079,6 +1292,22 @@ fn verify_source_identity(
     if actual != expected {
         return Err(interrupted_error(
             "file-operation source identity changed before recovery",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_staging_identity(
+    intent: &JournalIntent,
+    staging_path: &Path,
+    metadata: &fs::Metadata,
+) -> FsOpsResult<()> {
+    let expected = required_staging_identity(intent)?;
+    let actual = filesystem_identity(staging_path, metadata)
+        .ok_or_else(|| interrupted_error("filesystem did not provide a stable staging identity"))?;
+    if actual != expected {
+        return Err(interrupted_error(
+            "recycle staging identity changed before recovery",
         ));
     }
     Ok(())
@@ -1107,14 +1336,51 @@ fn open_verified_execution_source(
     Ok(source)
 }
 
+fn open_verified_execution_target_parent(
+    intent: &JournalIntent,
+) -> FsOpsResult<Option<super::platform::VerifiedTargetParent>> {
+    if intent.kind == FileOperationKind::DeletePermanent {
+        return Ok(None);
+    }
+    let target_parent_path = intent
+        .target_path
+        .as_deref()
+        .and_then(Path::parent)
+        .ok_or_else(|| interrupted_error("file-operation target has no parent directory"))?;
+    let expected = intent.target_parent_identity.as_deref().ok_or_else(|| {
+        interrupted_error("file-operation execution requires a persisted target-parent identity")
+    })?;
+    let parent =
+        super::platform::VerifiedTargetParent::open(target_parent_path).map_err(|error| {
+            interrupted_error(format!(
+                "cannot open protected target parent '{}': {error}",
+                target_parent_path.display()
+            ))
+        })?;
+    if parent.identity() != expected {
+        return Err(interrupted_error(
+            "file-operation target parent identity changed before execution",
+        ));
+    }
+    Ok(Some(parent))
+}
+
 fn validate_execution_source(
     database: &Database,
     intent: &JournalIntent,
     source_identity: &str,
+    target_parent_identity: Option<&str>,
 ) -> FsOpsResult<()> {
     if source_identity != intent.source_identity.as_deref().unwrap_or_default() {
         return Err(interrupted_error(
             "protected file-operation handle does not match the journal identity",
+        ));
+    }
+    if intent.kind != FileOperationKind::DeletePermanent
+        && target_parent_identity != intent.target_parent_identity.as_deref()
+    {
+        return Err(interrupted_error(
+            "protected target-parent handle does not match the journal identity",
         ));
     }
     verify_entity_snapshot(database, intent)?;
@@ -1260,25 +1526,125 @@ fn filesystem_identity(_path: &Path, _metadata: &fs::Metadata) -> Option<String>
 fn perform_filesystem_action(
     intent: &JournalIntent,
     source: super::platform::VerifiedSource,
+    target_parent: Option<&super::platform::VerifiedTargetParent>,
 ) -> std::io::Result<()> {
     match intent.kind {
         FileOperationKind::Rename | FileOperationKind::Move => {
-            source.rename_no_replace(intent.target_path.as_deref().ok_or_else(|| {
+            let target_path = intent.target_path.as_deref().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing target path")
-            })?)
+            })?;
+            source.rename_no_replace(
+                target_parent.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "missing protected target parent",
+                    )
+                })?,
+                target_path.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "target path has no relative leaf",
+                    )
+                })?,
+            )
         }
         FileOperationKind::DeletePermanent => source.delete_permanent(),
-        FileOperationKind::DeleteRecycle => {
-            let staging_path = intent.target_path.as_deref().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "recycle intent has no protected staging path",
-                )
-            })?;
-            source.rename_no_replace(staging_path)?;
-            trash::delete(staging_path).map_err(|error| std::io::Error::other(error.to_string()))
-        }
+        FileOperationKind::DeleteRecycle => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recycle requires the journaled handoff path",
+        )),
     }
+}
+
+fn perform_recycle_action_with_store(
+    store: &impl JournalStore,
+    intent: &mut JournalIntent,
+    source: super::platform::VerifiedSource,
+    target_parent: &super::platform::VerifiedTargetParent,
+) -> FsOpsResult<std::io::Result<()>> {
+    let staging_path = required_recycle_staging_path(intent)?.to_path_buf();
+    if source.identity() != required_staging_identity(intent)? {
+        return Err(interrupted_error(
+            "protected recycle source does not match the persisted staging identity",
+        ));
+    }
+    if let Err(error) = source.rename_no_replace(
+        target_parent,
+        staging_path
+            .file_name()
+            .ok_or_else(|| interrupted_error("recycle staging path has no relative leaf"))?,
+    ) {
+        return Ok(Err(error));
+    }
+    store.record_recycle_phase(intent, RecyclePhase::Staged)?;
+
+    let recycle_guard = match source.recycle_identity_guard() {
+        Ok(guard) => guard,
+        Err(error) => return Ok(Err(error)),
+    };
+    // trash 5.2.6 creates an IShellItem from a parsing name. Keep a second
+    // same-object handle that shares DELETE while releasing the exclusive
+    // source handle; after Shell returns, the guard proves that this file id
+    // moved into $Recycle.Bin before shell_completed becomes durable.
+    drop(source);
+    if let Err(error) = trash::delete(&staging_path) {
+        return Ok(Err(std::io::Error::other(error.to_string())));
+    }
+    if let Err(error) = recycle_guard.verify_shell_handoff(required_staging_identity(intent)?) {
+        return Ok(Err(error));
+    }
+    store.record_recycle_phase(intent, RecyclePhase::ShellCompleted)?;
+    Ok(Ok(()))
+}
+
+fn perform_recycle_action_direct(
+    database: &Database,
+    intent: &mut JournalIntent,
+    source: super::platform::VerifiedSource,
+    target_parent: &super::platform::VerifiedTargetParent,
+) -> FsOpsResult<std::io::Result<()>> {
+    let staging_path = required_recycle_staging_path(intent)?.to_path_buf();
+    if source.identity() != required_staging_identity(intent)? {
+        return Err(interrupted_error(
+            "protected recycle source does not match the persisted staging identity",
+        ));
+    }
+    if let Err(error) = source.rename_no_replace(
+        target_parent,
+        staging_path
+            .file_name()
+            .ok_or_else(|| interrupted_error("recycle staging path has no relative leaf"))?,
+    ) {
+        return Ok(Err(error));
+    }
+    update_recycle_phase(database, intent, RecyclePhase::Staged)?;
+    let recycle_guard = match source.recycle_identity_guard() {
+        Ok(guard) => guard,
+        Err(error) => return Ok(Err(error)),
+    };
+    drop(source);
+    if let Err(error) = trash::delete(&staging_path) {
+        return Ok(Err(std::io::Error::other(error.to_string())));
+    }
+    if let Err(error) = recycle_guard.verify_shell_handoff(required_staging_identity(intent)?) {
+        return Ok(Err(error));
+    }
+    update_recycle_phase(database, intent, RecyclePhase::ShellCompleted)?;
+    Ok(Ok(()))
+}
+
+fn required_recycle_staging_path(intent: &JournalIntent) -> FsOpsResult<&Path> {
+    intent
+        .target_path
+        .as_deref()
+        .ok_or_else(|| interrupted_error("recycle intent has no protected staging path"))
+}
+
+fn required_staging_identity(intent: &JournalIntent) -> FsOpsResult<&str> {
+    intent
+        .staging_identity
+        .as_deref()
+        .ok_or_else(|| interrupted_error("recycle intent has no persisted staging identity"))
 }
 
 fn filesystem_operation_error(intent: &JournalIntent, error: std::io::Error) -> FsOpsError {
@@ -1329,10 +1695,12 @@ fn persist_intents(
                  operation, source_path, target_path, status, created_at, finished_at,
                  operation_group_id, entity_kind, entity_id, root_id,
                  target_folder_id, attempt_count, journal_phase,
-                 source_identity, error_code, error
+                 source_identity, target_parent_identity, staging_identity,
+                 recycle_phase, error_code, error
                ) VALUES (?1, ?2, ?3, ?4, unixepoch(),
                          CASE WHEN ?4 = 'failed' THEN unixepoch() ELSE NULL END,
-                         ?5, ?6, ?7, ?8, ?9, 0, 'prepared', ?10, ?11, ?12)"#,
+                         ?5, ?6, ?7, ?8, ?9, 0, 'prepared', ?10, ?11, ?12,
+                         'none', ?13, ?14)"#,
             params![
                 prepared.kind.as_str(),
                 prepared.source_path,
@@ -1344,6 +1712,8 @@ fn persist_intents(
                 prepared.root_id,
                 prepared.target_folder_id,
                 prepared.source_identity,
+                prepared.target_parent_identity,
+                prepared.staging_identity,
                 error_code,
                 error_detail,
             ],
@@ -1368,6 +1738,9 @@ fn persist_intents(
             attempt_count: 0,
             phase: JournalPhase::Prepared,
             source_identity: prepared.source_identity,
+            target_parent_identity: prepared.target_parent_identity,
+            staging_identity: prepared.staging_identity,
+            recycle_phase: RecyclePhase::None,
             pending_error_code: error_code.map(str::to_owned),
             pending_error_detail: error_detail.map(str::to_owned),
         });
@@ -1412,6 +1785,35 @@ fn mark_attempt(database: &Database, intent: &mut JournalIntent) -> FsOpsResult<
     transaction.commit()?;
     intent.attempt_count = intent.attempt_count.saturating_add(1);
     intent.phase = JournalPhase::Executing;
+    Ok(())
+}
+
+fn update_recycle_phase(
+    database: &Database,
+    intent: &mut JournalIntent,
+    phase: RecyclePhase,
+) -> FsOpsResult<()> {
+    let transaction = Transaction::new_unchecked(
+        database.connection_for_fsops(),
+        TransactionBehavior::Immediate,
+    )?;
+    let updated = transaction.execute(
+        r#"UPDATE file_operations SET recycle_phase = ?1
+           WHERE id = ?2 AND status = 'pending' AND journal_phase = 'executing'"#,
+        params![phase.as_str(), intent.id],
+    )?;
+    if updated != 1 {
+        return Err(FsOpsError::new(
+            FsOpsErrorCode::FsError,
+            format!(
+                "recycle intent {} could not record phase {}",
+                intent.id,
+                phase.as_str()
+            ),
+        ));
+    }
+    transaction.commit()?;
+    intent.recycle_phase = phase;
     Ok(())
 }
 
@@ -1742,7 +2144,9 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
     let mut statement = database.connection_for_fsops().prepare(
         r#"SELECT id, operation_group_id, operation, entity_kind, entity_id,
                   root_id, source_path, target_path, target_folder_id,
-                  attempt_count, journal_phase, source_identity, error_code, error
+                  attempt_count, journal_phase, source_identity,
+                  target_parent_identity, staging_identity, recycle_phase,
+                  error_code, error
            FROM file_operations
            WHERE status = 'pending' AND operation_group_id IS NOT NULL
            ORDER BY id"#,
@@ -1766,6 +2170,9 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                 row.get::<_, Option<String>>(11)?,
                 row.get::<_, Option<String>>(12)?,
                 row.get::<_, Option<String>>(13)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1785,6 +2192,9 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                 attempt_count,
                 journal_phase,
                 source_identity,
+                target_parent_identity,
+                staging_identity,
+                recycle_phase,
                 error_code,
                 error_detail,
             )| {
@@ -1806,6 +2216,9 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                     attempt_count,
                     phase: JournalPhase::parse(&journal_phase)?,
                     source_identity,
+                    target_parent_identity,
+                    staging_identity,
+                    recycle_phase: RecyclePhase::parse(&recycle_phase)?,
                     pending_error_code: error_code,
                     pending_error_detail: error_detail,
                 })
@@ -1920,6 +2333,8 @@ fn prepare_rename(
                         target_folder_id: None,
                         delete_root_path: None,
                         source_identity: None,
+                        target_parent_identity: None,
+                        staging_identity: None,
                         preflight_error: error,
                     })
                 }
@@ -1970,6 +2385,8 @@ fn prepare_rename(
                         target_folder_id: None,
                         delete_root_path: None,
                         source_identity: None,
+                        target_parent_identity: None,
+                        staging_identity: None,
                         preflight_error: error,
                     })
                 }
@@ -2010,6 +2427,7 @@ fn prepare_rename(
     })()?;
     apply_source_identity_preflight(&mut prepared);
     apply_target_path_preflight(&mut prepared, "rename target already exists");
+    apply_target_parent_identity_preflight(&mut prepared);
     Ok(prepared)
 }
 
@@ -2052,6 +2470,7 @@ fn prepare_move(
     for intent in &mut prepared {
         apply_source_identity_preflight(intent);
         apply_target_path_preflight(intent, "move target already exists");
+        apply_target_parent_identity_preflight(intent);
     }
     Ok(prepared)
 }
@@ -2112,6 +2531,8 @@ fn prepare_move_file(
         target_folder_id: target.map(|target| target.folder_id),
         delete_root_path: None,
         source_identity: None,
+        target_parent_identity: None,
+        staging_identity: None,
         preflight_error: error,
     })
 }
@@ -2194,6 +2615,8 @@ fn prepare_move_folder(
         target_folder_id: target.map(|target| target.folder_id),
         delete_root_path: None,
         source_identity: None,
+        target_parent_identity: None,
+        staging_identity: None,
         preflight_error: error,
     })
 }
@@ -2228,6 +2651,8 @@ fn prepare_delete(
                         target_folder_id: None,
                         delete_root_path,
                         source_identity: None,
+                        target_parent_identity: None,
+                        staging_identity: None,
                         preflight_error,
                     }
                 }
@@ -2275,6 +2700,8 @@ fn prepare_delete(
                         target_folder_id: None,
                         delete_root_path: root_path,
                         source_identity: None,
+                        target_parent_identity: None,
+                        staging_identity: None,
                         preflight_error: error,
                     }
                 }
@@ -2297,6 +2724,10 @@ fn prepare_delete(
             apply_delete_filesystem_preflight(intent);
         } else {
             apply_source_identity_preflight(intent);
+            apply_target_parent_identity_preflight(intent);
+            if intent.preflight_error.is_none() {
+                intent.staging_identity = intent.source_identity.clone();
+            }
         }
     }
     Ok(prepared)
@@ -2486,6 +2917,36 @@ fn apply_source_identity_preflight(intent: &mut PreparedIntent) {
     }
 }
 
+fn apply_target_parent_identity_preflight(intent: &mut PreparedIntent) {
+    if intent.preflight_error.is_some() {
+        return;
+    }
+    let Some(target_parent) = intent
+        .target_path
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::parent)
+    else {
+        intent.preflight_error = Some(FsOpsError::new(
+            FsOpsErrorCode::InvalidRequest,
+            "file-operation target has no parent directory",
+        ));
+        return;
+    };
+    match super::platform::VerifiedTargetParent::open(target_parent) {
+        Ok(parent) => intent.target_parent_identity = Some(parent.identity().to_owned()),
+        Err(error) => {
+            intent.preflight_error = Some(FsOpsError::new(
+                FsOpsErrorCode::FsError,
+                format!(
+                    "cannot open protected target parent '{}': {error}",
+                    target_parent.display()
+                ),
+            ));
+        }
+    }
+}
+
 fn recycle_staging_path(source_path: &Path) -> PathBuf {
     let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
     parent.join(format!(".megle-recycle-{}", Uuid::now_v7()))
@@ -2508,6 +2969,8 @@ fn missing_intent(
         target_folder_id: None,
         delete_root_path: None,
         source_identity: None,
+        target_parent_identity: None,
+        staging_identity: None,
         preflight_error: Some(error),
     }
 }
@@ -2527,6 +2990,8 @@ fn request_error_intent(
         target_folder_id: None,
         delete_root_path: None,
         source_identity: None,
+        target_parent_identity: None,
+        staging_identity: None,
         preflight_error: Some(error),
     }
 }

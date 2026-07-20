@@ -2,7 +2,7 @@ use tokio::sync::{mpsc, Semaphore};
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::db::{
     Database, DbWriter, TaskScanProgress, ThumbBlobRecord, ThumbnailStateUpsert, PURGE_BATCH_SIZE,
@@ -230,7 +230,19 @@ pub fn start_worker_with_ffmpeg(
             %error,
             "startup file-operation journal recovery failed; scheduling bounded in-process repair"
         );
-        crate::fsops::schedule_pending_file_operation_repair(&worker_database);
+        match worker_database.reopen() {
+            Ok(Some(repair_database)) => crate::fsops::schedule_pending_file_operation_repair(
+                Arc::new(Mutex::new(repair_database)),
+                writer.clone(),
+            ),
+            Ok(None) => {
+                tracing::warn!("cannot schedule file-operation repair for an in-memory database")
+            }
+            Err(reopen_error) => tracing::error!(
+                %reopen_error,
+                "cannot reopen the shared-notify read connection for file-operation repair"
+            ),
+        }
     }
     if let Err(error) = worker_database.recover_interrupted_notification_operations() {
         tracing::error!(

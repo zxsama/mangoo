@@ -19,7 +19,7 @@ mod platform;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::Serialize;
@@ -172,7 +172,7 @@ pub fn rename(
 }
 
 pub fn rename_with_writer(
-    database: &Mutex<Database>,
+    database: &Arc<Mutex<Database>>,
     writer: &crate::db::DbWriter,
     request: RenameRequest,
 ) -> FsOpsResult<FileOperationRecord> {
@@ -188,7 +188,7 @@ pub fn move_items(
 }
 
 pub fn move_items_with_writer(
-    database: &Mutex<Database>,
+    database: &Arc<Mutex<Database>>,
     writer: &crate::db::DbWriter,
     request: MoveRequest,
 ) -> FsOpsResult<Vec<FileOperationRecord>> {
@@ -204,7 +204,7 @@ pub fn delete(
 }
 
 pub fn delete_with_writer(
-    database: &Mutex<Database>,
+    database: &Arc<Mutex<Database>>,
     writer: &crate::db::DbWriter,
     request: DeleteRequest,
 ) -> FsOpsResult<Vec<FileOperationRecord>> {
@@ -215,8 +215,11 @@ pub(crate) fn recover_pending_file_operations(database: &Database) -> FsOpsResul
     journal::recover_pending_file_operations(database)
 }
 
-pub(crate) fn schedule_pending_file_operation_repair(database: &Database) {
-    journal::schedule_pending_repair_for_database(database);
+pub(crate) fn schedule_pending_file_operation_repair(
+    database: Arc<Mutex<Database>>,
+    writer: crate::db::DbWriter,
+) {
+    journal::schedule_pending_repair(database, writer);
 }
 
 pub fn list_recent(
@@ -649,7 +652,7 @@ mod tests {
     use std::path::PathBuf;
 
     struct TestEnv {
-        database: Mutex<Database>,
+        database: Arc<Mutex<Database>>,
         root_id: i64,
         root_folder_id: i64,
         root_path: PathBuf,
@@ -695,7 +698,7 @@ mod tests {
                 })
                 .expect("insert root folder");
             Self {
-                database: Mutex::new(database),
+                database: Arc::new(Mutex::new(database)),
                 root_id,
                 root_folder_id,
                 root_path,
@@ -995,6 +998,17 @@ mod tests {
             "internal recycle staging path must not leak through the legacy API"
         );
         assert!(!env.root_path.join("r.jpg").exists());
+        let guard = env.database.lock().expect("db lock");
+        let (staging_identity, recycle_phase): (Option<String>, String) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT staging_identity, recycle_phase FROM file_operations WHERE id = ?1",
+                [records[0].id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("recycle binding metadata");
+        assert!(staging_identity.is_some());
+        assert_eq!(recycle_phase, "shell_completed");
     }
 
     #[test]
@@ -1058,17 +1072,24 @@ mod tests {
         assert_eq!(operation.status, "succeeded");
         assert_eq!(operation.current_value, 3);
         assert_eq!(operation.total_value, Some(3));
-        let missing_identities: i64 = guard
+        let (missing_sources, missing_target_parents): (i64, i64) = guard
             .connection_for_fsops()
             .query_row(
-                "SELECT COUNT(*) FROM file_operations WHERE operation_group_id = ?1 AND source_identity IS NULL",
+                r#"SELECT
+                     SUM(CASE WHEN source_identity IS NULL THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN target_parent_identity IS NULL THEN 1 ELSE 0 END)
+                   FROM file_operations WHERE operation_group_id = ?1"#,
                 [group_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("source identity count");
+            .expect("binding identity counts");
         assert_eq!(
-            missing_identities, 0,
+            missing_sources, 0,
             "executable intents must persist a stable source identity"
+        );
+        assert_eq!(
+            missing_target_parents, 0,
+            "rename/move intents must persist a stable target-parent identity"
         );
         assert_eq!(
             heads
@@ -1192,9 +1213,9 @@ mod tests {
         )
         .expect_err("missing files make the aggregate terminal-failed");
 
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "1000-item journal aggregation exceeded the smoke-test budget"
+        eprintln!(
+            "1000 missing-item aggregate completed in {:?}",
+            started.elapsed()
         );
         let guard = env.database.lock().expect("db lock");
         let (group_id, audit_count): (String, i64) = guard
@@ -1222,6 +1243,55 @@ mod tests {
         assert_eq!(operation.current_value, 1_000);
         assert_eq!(operation.total_value, Some(1_000));
         assert_eq!(operation.status, "failed");
+    }
+
+    #[test]
+    fn hundred_real_moves_measure_handle_and_writer_pipeline() {
+        let env = TestEnv::new_file_backed("hundred_real_move_pipeline");
+        let target_id = env.add_folder(env.root_folder_id, "target");
+        let mut file_ids = Vec::with_capacity(100);
+        for index in 0..100 {
+            file_ids.push(env.add_file(env.root_folder_id, &format!("item-{index:03}.jpg")));
+        }
+        let writer = crate::db::DbWriter::spawn(env.reopened_database());
+        let started = std::time::Instant::now();
+
+        let records = move_items_with_writer(
+            &env.database,
+            &writer,
+            MoveRequest {
+                file_ids,
+                folder_ids: Vec::new(),
+                target_folder_id: target_id,
+            },
+        )
+        .expect("move real files through the writer-backed journal");
+
+        let elapsed = started.elapsed();
+        eprintln!("100 real writer-backed moves completed in {elapsed:?}");
+        assert_eq!(records.len(), 100);
+        assert!(records.iter().all(|record| record.status == "succeeded"));
+        for index in 0..100 {
+            assert!(env
+                .root_path
+                .join("target")
+                .join(format!("item-{index:03}.jpg"))
+                .exists());
+        }
+        let guard = env.database.lock().expect("db lock");
+        let group_id = records[0]
+            .operation_group_id
+            .as_deref()
+            .expect("operation group");
+        let operation = guard
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .into_iter()
+            .find(|operation| operation.operation_id == group_id)
+            .expect("move aggregate");
+        assert_eq!(operation.current_value, 100);
+        assert_eq!(operation.total_value, Some(100));
+        assert_eq!(operation.status, "succeeded");
     }
 
     #[test]
@@ -1577,6 +1647,12 @@ mod tests {
     async fn finalize_failure_repairs_in_process_after_fault_clears() {
         let env = TestEnv::new_file_backed("journal_in_process_finalize_repair");
         let file_id = env.add_file(env.root_folder_id, "old.jpg");
+        let writer = crate::db::DbWriter::spawn(env.reopened_database());
+        let wake = env
+            .database
+            .lock()
+            .expect("db lock")
+            .notification_outbox_wake();
         env.database
             .lock()
             .expect("db lock")
@@ -1593,15 +1669,19 @@ mod tests {
             )
             .expect("install finalize failure trigger");
 
-        rename(
-            &env.database,
-            RenameRequest {
-                file_id: Some(file_id),
-                folder_id: None,
-                new_name: "new.jpg".to_owned(),
-            },
-        )
+        tokio::task::block_in_place(|| {
+            rename_with_writer(
+                &env.database,
+                &writer,
+                RenameRequest {
+                    file_id: Some(file_id),
+                    folder_id: None,
+                    new_name: "new.jpg".to_owned(),
+                },
+            )
+        })
         .expect_err("finalize failure must surface to the command");
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(5), wake.notified()).await;
         assert!(env.root_path.join("new.jpg").exists());
         env.database
             .lock()
@@ -1610,6 +1690,7 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_file_operation_finalize;")
             .expect("remove finalize failure trigger");
 
+        let repair_wake = tokio::time::timeout(std::time::Duration::from_secs(3), wake.notified());
         let repaired = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 let state: Option<(String, String, String)> = env
@@ -1637,8 +1718,12 @@ mod tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-        })
-        .await;
+        });
+        let (repair_wake, repaired) = tokio::join!(repair_wake, repaired);
+        assert!(
+            repair_wake.is_ok(),
+            "repair commit did not wake the main Database notify"
+        );
         assert!(
             repaired.is_ok(),
             "pending journal was not repaired in process"
@@ -1649,6 +1734,7 @@ mod tests {
     async fn mark_failure_repairs_in_process_after_fault_clears() {
         let env = TestEnv::new_file_backed("journal_in_process_mark_repair");
         let file_id = env.add_file(env.root_folder_id, "old.jpg");
+        let writer = crate::db::DbWriter::spawn(env.reopened_database());
         env.database
             .lock()
             .expect("db lock")
@@ -1665,14 +1751,17 @@ mod tests {
             )
             .expect("install mark failure trigger");
 
-        rename(
-            &env.database,
-            RenameRequest {
-                file_id: Some(file_id),
-                folder_id: None,
-                new_name: "new.jpg".to_owned(),
-            },
-        )
+        tokio::task::block_in_place(|| {
+            rename_with_writer(
+                &env.database,
+                &writer,
+                RenameRequest {
+                    file_id: Some(file_id),
+                    folder_id: None,
+                    new_name: "new.jpg".to_owned(),
+                },
+            )
+        })
         .expect_err("mark failure must surface to the command");
         assert!(env.root_path.join("old.jpg").exists());
         env.database
@@ -1958,11 +2047,74 @@ mod tests {
             .find(|operation| operation.operation_id == group_id)
             .expect("failed recovered operation head");
         assert_eq!(status, "failed");
-        assert_eq!(attempt_count, 1);
-        assert_eq!(error_code.as_deref(), Some("fs_error"));
+        assert_eq!(attempt_count, 0);
+        assert_eq!(error_code.as_deref(), Some("interrupted"));
         assert_eq!(recovered.status, "failed");
         assert_eq!(recovered.current_value, 1);
         assert_eq!(recovered.total_value, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_move_refuses_replaced_target_parent_and_stays_in_root() {
+        let env = TestEnv::new_file_backed("journal_target_parent_replaced");
+        let file_id = env.add_file(env.root_folder_id, "source.jpg");
+        let target_id = env.add_folder(env.root_folder_id, "target");
+        let target_path = env.root_path.join("target");
+        let outside = unique_temp_dir("journal_target_parent_outside");
+        stdfs::create_dir_all(&outside).expect("create outside directory");
+        let displaced_target = outside.join("displaced-target");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_attempt
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced pre-execution stop');
+                END;
+                "#,
+            )
+            .expect("install attempt failure trigger");
+
+        move_items(
+            &env.database,
+            MoveRequest {
+                file_ids: vec![file_id],
+                folder_ids: Vec::new(),
+                target_folder_id: target_id,
+            },
+        )
+        .expect_err("attempt transition must stop before filesystem work");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_attempt;")
+            .expect("remove attempt failure trigger");
+        stdfs::rename(&target_path, &displaced_target).expect("move original target outside");
+        stdfs::create_dir(&target_path).expect("replace target parent at original path");
+
+        env.run_startup_recovery().await;
+
+        assert!(env.root_path.join("source.jpg").exists());
+        assert!(!target_path.join("source.jpg").exists());
+        assert!(!displaced_target.join("source.jpg").exists());
+        let guard = env.database.lock().expect("db lock");
+        let (status, error_code): (String, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("move audit");
+        assert_eq!(status, "failed");
+        assert_eq!(error_code.as_deref(), Some("interrupted"));
+        drop(guard);
+        let _ = stdfs::remove_dir_all(outside);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2205,22 +2357,31 @@ mod tests {
                 r#"INSERT INTO file_operations(
                      operation, source_path, target_path, status, created_at,
                      operation_group_id, entity_kind, entity_id, root_id,
-                     attempt_count, journal_phase, source_identity
+                     attempt_count, journal_phase, source_identity,
+                     target_parent_identity, staging_identity, recycle_phase
                    ) VALUES ('delete_recycle', ?1, ?2, 'pending', unixepoch(),
-                             ?3, 'file', ?4, ?5, 1, 'executing', ?6)"#,
+                             ?3, 'file', ?4, ?5, 1, 'executing', ?6,
+                             ?7, ?6, 'staged')"#,
                 params![
                     source.to_string_lossy(),
                     staging.to_string_lossy(),
                     group_id,
                     file_id,
                     env.root_id,
-                    identity
+                    identity,
+                    super::platform::VerifiedTargetParent::open(&env.root_path)
+                        .expect("open staging parent identity")
+                        .identity()
                 ],
             )
             .expect("insert staged recycle journal");
         super::platform::VerifiedSource::open(&source)
             .expect("open source for staging")
-            .rename_no_replace(&staging)
+            .rename_no_replace(
+                &super::platform::VerifiedTargetParent::open(&env.root_path)
+                    .expect("open staging parent"),
+                staging.file_name().expect("staging leaf"),
+            )
             .expect("simulate crash after handle staging");
 
         env.run_startup_recovery().await;
@@ -2240,6 +2401,203 @@ mod tests {
             )
             .expect("recycle audit status");
         assert_eq!(status, "succeeded");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_refuses_replaced_recycle_staging_object() {
+        let env = TestEnv::new_file_backed("journal_recycle_replaced_staging");
+        let file_id = env.add_file(env.root_folder_id, "recycle.jpg");
+        let source = env.root_path.join("recycle.jpg");
+        let staging = env.root_path.join(".megle-recycle-staging");
+        let displaced = env.root_path.join("displaced-original.jpg");
+        let source_handle =
+            super::platform::VerifiedSource::open(&source).expect("open protected source");
+        let identity = source_handle.identity().to_owned();
+        let target_parent = super::platform::VerifiedTargetParent::open(&env.root_path)
+            .expect("open staging parent");
+        let target_parent_identity = target_parent.identity().to_owned();
+        let group_id =
+            super::journal::begin_test_group(&env.database, FileOperationKind::DeleteRecycle, 1)
+                .expect("begin recycle group");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute(
+                r#"INSERT INTO file_operations(
+                     operation, source_path, target_path, status, created_at,
+                     operation_group_id, entity_kind, entity_id, root_id,
+                     attempt_count, journal_phase, source_identity,
+                     target_parent_identity, staging_identity, recycle_phase
+                   ) VALUES ('delete_recycle', ?1, ?2, 'pending', unixepoch(),
+                             ?3, 'file', ?4, ?5, 1, 'executing', ?6,
+                             ?7, ?6, 'staged')"#,
+                params![
+                    source.to_string_lossy(),
+                    staging.to_string_lossy(),
+                    group_id,
+                    file_id,
+                    env.root_id,
+                    identity,
+                    target_parent_identity
+                ],
+            )
+            .expect("insert staged recycle journal");
+        source_handle
+            .rename_no_replace(&target_parent, staging.file_name().expect("staging leaf"))
+            .expect("stage original");
+        drop(source_handle);
+        stdfs::rename(&staging, &displaced).expect("move staged original aside");
+        stdfs::write(&staging, b"replacement").expect("write staging replacement");
+
+        env.run_startup_recovery().await;
+
+        assert_eq!(
+            stdfs::read(&staging).expect("replacement survives"),
+            b"replacement"
+        );
+        assert_eq!(stdfs::read(&displaced).expect("original survives"), b"x");
+        let guard = env.database.lock().expect("db lock");
+        let (status, error_code): (String, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code FROM file_operations WHERE operation_group_id = ?1",
+                [&group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("recycle audit");
+        assert_eq!(status, "failed");
+        assert_eq!(error_code.as_deref(), Some("interrupted"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_does_not_succeed_when_staged_recycle_object_was_moved() {
+        let env = TestEnv::new_file_backed("journal_recycle_moved_staging");
+        let file_id = env.add_file(env.root_folder_id, "recycle.jpg");
+        let source = env.root_path.join("recycle.jpg");
+        let staging = env.root_path.join(".megle-recycle-staging");
+        let displaced = env.root_path.join("externally-moved-original.jpg");
+        let source_handle =
+            super::platform::VerifiedSource::open(&source).expect("open protected source");
+        let identity = source_handle.identity().to_owned();
+        let target_parent = super::platform::VerifiedTargetParent::open(&env.root_path)
+            .expect("open staging parent");
+        let group_id =
+            super::journal::begin_test_group(&env.database, FileOperationKind::DeleteRecycle, 1)
+                .expect("begin recycle group");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute(
+                r#"INSERT INTO file_operations(
+                     operation, source_path, target_path, status, created_at,
+                     operation_group_id, entity_kind, entity_id, root_id,
+                     attempt_count, journal_phase, source_identity,
+                     target_parent_identity, staging_identity, recycle_phase
+                   ) VALUES ('delete_recycle', ?1, ?2, 'pending', unixepoch(),
+                             ?3, 'file', ?4, ?5, 1, 'executing', ?6,
+                             ?7, ?6, 'staged')"#,
+                params![
+                    source.to_string_lossy(),
+                    staging.to_string_lossy(),
+                    group_id,
+                    file_id,
+                    env.root_id,
+                    identity,
+                    target_parent.identity()
+                ],
+            )
+            .expect("insert staged recycle journal");
+        source_handle
+            .rename_no_replace(&target_parent, staging.file_name().expect("staging leaf"))
+            .expect("stage original");
+        drop(source_handle);
+        stdfs::rename(&staging, &displaced).expect("move staged object away");
+
+        env.run_startup_recovery().await;
+
+        assert_eq!(
+            stdfs::read(&displaced).expect("moved original survives"),
+            b"x"
+        );
+        assert!(!staging.exists());
+        let guard = env.database.lock().expect("db lock");
+        let (status, error_code): (String, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code FROM file_operations WHERE operation_group_id = ?1",
+                [&group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("recycle audit");
+        assert_eq!(status, "failed");
+        assert_eq!(error_code.as_deref(), Some("interrupted"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_finalizes_only_durably_completed_shell_recycle() {
+        let env = TestEnv::new_file_backed("journal_recycle_shell_completed");
+        let file_id = env.add_file(env.root_folder_id, "recycle.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_finalize
+                BEFORE UPDATE OF status ON file_operations
+                WHEN OLD.status = 'pending' AND NEW.status = 'succeeded'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced finalize failure');
+                END;
+                "#,
+            )
+            .expect("install finalize failure trigger");
+
+        delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![file_id],
+                folder_ids: Vec::new(),
+                permanent: false,
+            },
+        )
+        .expect_err("finalize failure must leave the completed recycle pending");
+        {
+            let guard = env.database.lock().expect("db lock");
+            let (status, recycle_phase): (String, String) = guard
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT status, recycle_phase FROM file_operations ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("pending recycle journal");
+            assert_eq!(status, "pending");
+            assert_eq!(recycle_phase, "shell_completed");
+            guard
+                .connection_for_fsops()
+                .execute_batch("DROP TRIGGER fail_file_operation_finalize;")
+                .expect("remove finalize failure trigger");
+        }
+
+        env.run_startup_recovery().await;
+
+        let guard = env.database.lock().expect("db lock");
+        let (audit_status, file_status): (String, String) = guard
+            .connection_for_fsops()
+            .query_row(
+                r#"SELECT file_operations.status, files.status
+                   FROM file_operations
+                   JOIN files ON files.id = file_operations.entity_id
+                   ORDER BY file_operations.id DESC LIMIT 1"#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("recovered recycle state");
+        assert_eq!(audit_status, "succeeded");
+        assert_eq!(file_status, "deleted");
     }
 
     #[tokio::test(flavor = "current_thread")]

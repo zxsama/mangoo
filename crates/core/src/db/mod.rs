@@ -976,6 +976,10 @@ impl Database {
             self.connection
                 .execute_batch(migrations::FILE_OPERATION_RECOVERY_METADATA_MIGRATION)?;
         }
+        if !self.migration_applied(24)? {
+            self.connection
+                .execute_batch(migrations::FILE_OPERATION_OBJECT_BINDING_MIGRATION)?;
+        }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
         Ok(())
@@ -18318,6 +18322,17 @@ mod tests {
         database
     }
 
+    fn database_migrated_through_23() -> Database {
+        let database = database_migrated_through_22();
+        database
+            .connection
+            .execute_batch(migrations::FILE_OPERATION_RECOVERY_METADATA_MIGRATION)
+            .expect("apply migration 23");
+        assert!(database.migration_applied(23).unwrap());
+        assert!(!database.migration_applied(24).unwrap());
+        database
+    }
+
     fn index_key_columns(database: &Database, index_name: &str) -> Vec<(String, bool)> {
         let mut statement = database
             .connection
@@ -18945,6 +18960,79 @@ mod tests {
         assert!(database
             .table_has_column("file_operations", "journal_phase")
             .unwrap());
+    }
+
+    #[test]
+    fn migration_0024_adds_object_binding_metadata_without_losing_pending_intents() {
+        let database = database_migrated_through_23();
+        database
+            .connection
+            .execute(
+                r#"INSERT INTO file_operations(
+                     id, operation, source_path, target_path, status, created_at,
+                     operation_group_id, entity_kind, entity_id, root_id,
+                     attempt_count, journal_phase, source_identity
+                   ) VALUES (84, 'move', 'source', 'target', 'pending', 1,
+                             'v23-binding', 'file', 9, 3, 1, 'executing',
+                             'windows:1:2')"#,
+                [],
+            )
+            .expect("seed version-23 pending intent");
+
+        database.apply_migrations().expect("upgrade v23 to v24");
+
+        let row: (String, Option<String>, Option<String>, String) = database
+            .connection
+            .query_row(
+                r#"SELECT source_identity, target_parent_identity,
+                          staging_identity, recycle_phase
+                   FROM file_operations WHERE id = 84"#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read upgraded pending intent");
+        assert_eq!(row.0, "windows:1:2");
+        assert_eq!(row.1, None);
+        assert_eq!(row.2, None);
+        assert_eq!(row.3, "none");
+        assert!(database.migration_applied(24).unwrap());
+
+        let invalid_phase = database.connection.execute(
+            r#"INSERT INTO file_operations(
+                 operation, source_path, status, created_at, recycle_phase
+               ) VALUES ('delete_recycle', 'source', 'pending', 1, 'unknown')"#,
+            [],
+        );
+        assert!(invalid_phase.is_err(), "unsupported recycle phase");
+    }
+
+    #[test]
+    fn migration_0024_rolls_back_all_binding_columns() {
+        let database = database_migrated_through_23();
+        let (before_commit, _) = migrations::FILE_OPERATION_OBJECT_BINDING_MIGRATION
+            .rsplit_once("COMMIT;")
+            .expect("migration 24 must end with an explicit commit");
+        let failing = format!("{before_commit}\nSELECT * FROM migration_0024_deliberate_failure;");
+
+        assert!(database.connection.execute_batch(&failing).is_err());
+        database
+            .connection
+            .execute_batch("ROLLBACK;")
+            .expect("roll back failed migration 24");
+
+        assert!(!database.migration_applied(24).unwrap());
+        for column in [
+            "target_parent_identity",
+            "staging_identity",
+            "recycle_phase",
+        ] {
+            assert!(!database
+                .table_has_column("file_operations", column)
+                .unwrap());
+        }
+
+        database.apply_migrations().expect("rerun migration 24");
+        assert!(database.migration_applied(24).unwrap());
     }
 
     #[test]

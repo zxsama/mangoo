@@ -28,6 +28,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0021_notification_outbox.sql",
     ROOT / "crates" / "core" / "migrations" / "0022_file_operation_journal.sql",
     ROOT / "crates" / "core" / "migrations" / "0023_file_operation_recovery_metadata.sql",
+    ROOT / "crates" / "core" / "migrations" / "0024_file_operation_object_binding.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -366,6 +367,11 @@ def main() -> None:
             ).fetchone()
             if version is None:
                 fail("migration version 23 was not recorded")
+            version = conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 24"
+            ).fetchone()
+            if version is None:
+                fail("migration version 24 was not recorded")
 
             media_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(media)").fetchall()
@@ -488,6 +494,9 @@ def main() -> None:
                 "attempt_count",
                 "journal_phase",
                 "source_identity",
+                "target_parent_identity",
+                "staging_identity",
+                "recycle_phase",
                 "error_code",
             }
             missing_file_operation_columns = (
@@ -652,7 +661,8 @@ def main() -> None:
             legacy_defaults = conn.execute(
                 """SELECT operation_group_id, entity_kind, entity_id, root_id,
                           target_folder_id, attempt_count, journal_phase,
-                          source_identity, error_code
+                          source_identity, target_parent_identity,
+                          staging_identity, recycle_phase, error_code
                    FROM file_operations WHERE id = last_insert_rowid()"""
             ).fetchone()
             if legacy_defaults != (
@@ -664,6 +674,9 @@ def main() -> None:
                 0,
                 "legacy",
                 None,
+                None,
+                None,
+                "none",
                 None,
             ):
                 fail(
@@ -681,6 +694,17 @@ def main() -> None:
                 pass
             else:
                 fail("file_operations.journal_phase must reject unknown values")
+            try:
+                conn.execute(
+                    """INSERT INTO file_operations(
+                         operation, source_path, status, created_at, recycle_phase
+                       ) VALUES ('delete_recycle', 'source', 'pending', 1,
+                                 'unknown')"""
+                )
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                fail("file_operations.recycle_phase must reject unknown values")
 
             conn.execute(
                 """
