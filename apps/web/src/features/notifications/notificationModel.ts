@@ -101,15 +101,14 @@ export function buildCompactNotificationModel(
     .sort(compareTerminalOperations)
     .slice(0, 3)
     .map(operationViewModel);
-  const retryableFailure = results.some(
-    (operation) => operation.status === "failed" && operation.retryable
-  );
-
   return {
     active,
     thumbnail: buildThumbnailAggregate(snapshot.thumbnailSummaries),
     results,
-    indicator: notificationIndicator({ active: active.length > 0, retryableFailure }),
+    indicator: notificationIndicator({
+      active: active.length > 0,
+      retryableFailure: snapshot.hasRetryableFailure
+    }),
     degraded: snapshot.syncHealth.state === "degraded",
     healthDetail: snapshot.syncHealth.detail
   };

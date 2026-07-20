@@ -6,6 +6,7 @@ import type {
   DesktopNotificationHistoryPage,
   DesktopNotificationOperation,
   DesktopNotificationsBridge,
+  DesktopProcessLogBatch,
   DesktopThumbnailCacheSummary
 } from "@megle/notification-contract";
 import {
@@ -97,6 +98,7 @@ function compact(
     active: [],
     thumbnailSummaries: [],
     latestImportantResults: [],
+    hasRetryableFailure: false,
     syncHealth: {
       state: "healthy",
       libraryId: "library-a",
@@ -196,12 +198,28 @@ describe("notification selectors", () => {
     const model = buildCompactNotificationModel(
       compact({
         active: [operation("scan")],
+        hasRetryableFailure: true,
         latestImportantResults: [
-          terminal("failed", 300, { status: "failed", retryable: true, origin: "background" })
+          terminal("newer-success", 300),
+          terminal("newest-success", 400)
         ]
       })
     );
     assert.equal(model.indicator, "failure");
+
+    const resolved = buildCompactNotificationModel(
+      compact({
+        hasRetryableFailure: false,
+        latestImportantResults: [
+          terminal("old-failure", 300, {
+            status: "failed",
+            retryable: true,
+            origin: "background"
+          })
+        ]
+      })
+    );
+    assert.equal(resolved.indicator, "idle");
   });
 
   it("builds determinate and indeterminate progress without false percentages", () => {
@@ -492,6 +510,34 @@ describe("notification external store", () => {
     await Promise.all([one, two]);
   });
 
+  it("reuses one in-flight first-page promise for the same normalized query", async () => {
+    const page = deferred<DesktopNotificationHistoryPage>();
+    let calls = 0;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          listHistory: () => {
+            calls += 1;
+            return page.promise;
+          }
+        })
+    });
+    const query = { search: " same ", statuses: ["failed" as const], limit: 20, offset: 0 };
+
+    const first = store.loadHistory(query);
+    const strictModeReplay = store.loadHistory({
+      search: "same",
+      statuses: ["failed"],
+      limit: 20,
+      offset: 0
+    });
+
+    assert.equal(first, strictModeReplay);
+    assert.equal(calls, 1);
+    page.resolve({ items: [], total: 0, nextOffset: null });
+    await first;
+  });
+
   it("returns typed action failures without mutating a newer compact revision", async () => {
     const action = deferred<{ ok: boolean; message: string | null }>();
     let changed: ((snapshot: DesktopNotificationCompactSnapshot) => void) | null = null;
@@ -529,5 +575,117 @@ describe("notification external store", () => {
       ok: false,
       message: "IPC unavailable"
     });
+  });
+
+  it("does not subscribe to logs until explicitly requested", () => {
+    let subscriptions = 0;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          snapshotAndSubscribeLogs: () => {
+            subscriptions += 1;
+            return {
+              ready: Promise.resolve({ snapshot: [], afterSequence: 0 }),
+              unsubscribe: () => undefined
+            };
+          }
+        })
+    });
+
+    const off = store.subscribe(() => undefined);
+    assert.equal(subscriptions, 0);
+    off();
+  });
+
+  it("owns one generated log subscription and preserves gap batches", async () => {
+    const callbacks: Array<(batch: DesktopProcessLogBatch) => void> = [];
+    let unsubscribes = 0;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          snapshotAndSubscribeLogs: (_query, callback) => {
+            callbacks.push(callback);
+            return {
+              ready: Promise.resolve({ snapshot: [], afterSequence: callbacks.length * 10 }),
+              unsubscribe: () => {
+                unsubscribes += 1;
+              }
+            };
+          }
+        })
+    });
+    const batches: DesktopProcessLogBatch[] = [];
+
+    const first = store.snapshotAndSubscribeLogs({}, (batch) => batches.push(batch));
+    assert.deepEqual(await first.ready, {
+      ok: true,
+      value: { snapshot: [], afterSequence: 10 }
+    });
+    const second = store.snapshotAndSubscribeLogs({ sources: ["core"] }, (batch) =>
+      batches.push(batch)
+    );
+    assert.equal(unsubscribes, 1);
+    callbacks[0]?.({ lines: [], afterSequence: 11, droppedBeforeSequence: 4 });
+    callbacks[1]?.({ lines: [], afterSequence: 21, droppedBeforeSequence: 9 });
+    assert.deepEqual(batches, [
+      { lines: [], afterSequence: 21, droppedBeforeSequence: 9 }
+    ]);
+
+    store.dispose();
+    assert.equal(unsubscribes, 2);
+    assert.deepEqual(await second.ready, {
+      ok: false,
+      error: "日志订阅已关闭"
+    });
+  });
+
+  it("wraps log page and clear errors without throwing", async () => {
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          getLogs: async (query) => {
+            if (query.search === "fail") throw new Error("page unavailable");
+            return { lines: [], hasMore: true, nextBeforeSequence: 12 };
+          },
+          clearLogs: async () => {
+            throw new Error("clear unavailable");
+          }
+        })
+    });
+
+    assert.deepEqual(await store.getLogPage({}), {
+      ok: true,
+      value: { lines: [], hasMore: true, nextBeforeSequence: 12 }
+    });
+    assert.deepEqual(await store.getLogPage({ search: "fail" }), {
+      ok: false,
+      error: "page unavailable"
+    });
+    assert.deepEqual(await store.clearLogs(), {
+      ok: false,
+      error: "clear unavailable"
+    });
+  });
+
+  it("turns log subscription startup errors into typed failures and cleans up", async () => {
+    let unsubscribes = 0;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          snapshotAndSubscribeLogs: () => ({
+            ready: Promise.reject(new Error("subscription unavailable")),
+            unsubscribe: () => {
+              unsubscribes += 1;
+            }
+          })
+        })
+    });
+
+    const subscription = store.snapshotAndSubscribeLogs({}, () => undefined);
+    assert.deepEqual(await subscription.ready, {
+      ok: false,
+      error: "subscription unavailable"
+    });
+    assert.equal(unsubscribes, 1);
   });
 });

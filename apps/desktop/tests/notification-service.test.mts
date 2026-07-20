@@ -122,7 +122,12 @@ function rendererErrorOperationIdForTest(report: RendererErrorReport): string {
 }
 
 function emptySnapshot(): NotificationStoredSnapshot {
-  return { active: [], thumbnailSummaries: [], latestImportantResults: [] };
+  return {
+    active: [],
+    thumbnailSummaries: [],
+    latestImportantResults: [],
+    hasRetryableFailure: false
+  };
 }
 
 class FakeStore implements NotificationServiceStore {
@@ -202,7 +207,14 @@ class FakeStore implements NotificationServiceStore {
             item.presentation === "important"
         )
         .sort((a, b) => (b.completedAt ?? b.updatedAt) - (a.completedAt ?? a.updatedAt))
-        .slice(0, 3)
+        .slice(0, 3),
+      hasRetryableFailure: all.some(
+        (item) =>
+          item.status !== "pending" &&
+          item.status !== "running" &&
+          item.status === "failed" &&
+          item.retryable
+      )
     };
   }
 
@@ -1321,6 +1333,41 @@ describe("notification service", () => {
     const history = await service.history({ limit: 200, offset: 0 });
     assert.equal(history.total, 500);
     assert.equal((await service.compactSnapshot()).syncHealth.state, "degraded");
+    await service.close();
+  });
+
+  it("keeps retryable failure state in degraded fallback beyond latest results", async () => {
+    const service = await createNotificationService({
+      openStore: async () => {
+        throw new Error("worker unavailable");
+      },
+      fetch: async () =>
+        response({
+          items: [
+            event(
+              1,
+              operation("failed:fallback", 1, "failed", {
+                updatedAt: NOW - 100_000,
+                completedAt: NOW - 100_000,
+                retryable: true
+              })
+            ),
+            event(2, operation("success:1", 1, "succeeded", { updatedAt: NOW - 3_000 })),
+            event(3, operation("success:2", 1, "succeeded", { updatedAt: NOW - 2_000 })),
+            event(4, operation("success:3", 1, "succeeded", { updatedAt: NOW - 1_000 }))
+          ],
+          maxSequence: 4
+        }),
+      now: () => NOW
+    });
+
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    const snapshot = await service.compactSnapshot();
+    assert.deepEqual(
+      snapshot.latestImportantResults.map((item) => item.operationId),
+      ["success:3", "success:2", "success:1"]
+    );
+    assert.equal(snapshot.hasRetryableFailure, true);
     await service.close();
   });
 

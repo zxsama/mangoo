@@ -547,10 +547,29 @@ class NotificationStoreDatabase {
          ORDER BY library_name COLLATE NOCASE ASC, library_id ASC`
       )
       .all() as unknown as Array<{ payload_json: string }>;
+    const retryableFailureRow = this.database
+      .prepare(
+        `SELECT EXISTS(
+           SELECT 1
+           FROM operations
+           LEFT JOIN action_errors
+             ON action_errors.library_id = operations.library_id
+            AND action_errors.operation_id = operations.operation_id
+            AND action_errors.operation_revision = operations.revision
+           WHERE operations.status NOT IN ('pending', 'running')
+             AND (
+               (operations.status = 'failed'
+                 AND json_extract(operations.payload_json, '$.retryable') = 1)
+               OR action_errors.detail IS NOT NULL
+             )
+         ) AS has_retryable_failure`
+      )
+      .get() as { has_retryable_failure: number };
     return {
       active: active.map(rowToOperation),
       thumbnailSummaries: thumbnailRows.map((row) => JSON.parse(row.payload_json) as ThumbnailCacheSummary),
-      latestImportantResults: latestImportantResults.map(rowToOperation)
+      latestImportantResults: latestImportantResults.map(rowToOperation),
+      hasRetryableFailure: retryableFailureRow.has_retryable_failure === 1
     };
   }
 

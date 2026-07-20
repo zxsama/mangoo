@@ -16,5 +16,8 @@ if (!source.includes('"trace" | "debug" | "info" | "warn" | "error"')) {
 if (source.includes("onLogs")) {
   throw new Error("notification contract must expose only the tokenized log subscription API");
 }
+if (!/interface NotificationStoredSnapshot[\s\S]*hasRetryableFailure: boolean;/.test(source)) {
+  throw new Error("notification compact snapshot must expose authoritative retryable failure state");
+}
 
 console.log("PASS: shared notification contract boundary");

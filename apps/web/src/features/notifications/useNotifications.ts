@@ -2,7 +2,12 @@ import { startTransition, useSyncExternalStore } from "react";
 import type {
   DesktopNotificationCompactSnapshot,
   DesktopNotificationHistoryQuery,
-  DesktopNotificationsBridge
+  DesktopNotificationsBridge,
+  DesktopProcessLogBatch,
+  DesktopProcessLogFilter,
+  DesktopProcessLogPage,
+  ProcessLogSubscriptionHandle as DesktopProcessLogSubscriptionHandle,
+  ProcessLogSubscriptionInitialSnapshot
 } from "@megle/notification-contract";
 import { getDesktopBridge } from "../../core/desktop.ts";
 import {
@@ -33,10 +38,20 @@ export interface LoadNotificationHistoryOptions {
   append?: boolean;
 }
 
+export type NotificationRequestResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string };
+
+export interface NotificationLogSubscriptionHandle {
+  ready: Promise<NotificationRequestResult<ProcessLogSubscriptionInitialSnapshot>>;
+  unsubscribe(): void;
+}
+
 const EMPTY_COMPACT_SNAPSHOT: DesktopNotificationCompactSnapshot = {
   active: [],
   thumbnailSummaries: [],
   latestImportantResults: [],
+  hasRetryableFailure: false,
   syncHealth: {
     state: "degraded",
     libraryId: null,
@@ -74,6 +89,8 @@ export class NotificationExternalStore {
   private historyStartOffset = 0;
   private historyPages = new Map<number, NotificationHistoryPageSlice>();
   private historyRequests = new Map<string, Promise<NotificationHistoryState>>();
+  private logGeneration = 0;
+  private activeLogSubscription: { generation: number; unsubscribe: () => void } | null = null;
 
   constructor(options: NotificationStoreOptions = {}) {
     this.bridgeProvider = options.getBridge ?? defaultBridge;
@@ -101,26 +118,29 @@ export class NotificationExternalStore {
     return this.compactLoad ?? Promise.resolve();
   }
 
-  async loadHistory(
+  loadHistory(
     query: DesktopNotificationHistoryQuery,
     options: LoadNotificationHistoryOptions = {}
   ): Promise<NotificationHistoryState> {
     const bridge = this.currentBridge();
     if (!bridge) {
-      return this.setHistoryError("通知历史仅在桌面模式可用");
+      return Promise.resolve(this.setHistoryError("通知历史仅在桌面模式可用"));
     }
 
     const append = options.append === true;
     const baseQuery = withoutOffset(query);
     const identity = historyQueryIdentity(baseQuery);
+    const requestedStartOffset = append ? this.historyStartOffset : query.offset ?? 0;
     const currentIdentity = this.snapshot.history.query
       ? historyQueryIdentity(withoutOffset(this.snapshot.history.query))
       : null;
-    if (!append || identity !== currentIdentity) {
+    const queryChanged =
+      identity !== currentIdentity || requestedStartOffset !== this.historyStartOffset;
+    if (queryChanged) {
       this.historyGeneration += 1;
       this.historyPages.clear();
       this.historyRequests.clear();
-      this.historyStartOffset = query.offset ?? 0;
+      this.historyStartOffset = requestedStartOffset;
       this.updateHistory({
         items: [],
         total: 0,
@@ -134,8 +154,8 @@ export class NotificationExternalStore {
     const generation = this.historyGeneration;
     const offset = append
       ? this.snapshot.history.nextOffset
-      : query.offset ?? this.historyStartOffset;
-    if (offset === null) return this.snapshot.history;
+      : requestedStartOffset;
+    if (offset === null) return Promise.resolve(this.snapshot.history);
     const requestKey = `${generation}:${offset}`;
     const existing = this.historyRequests.get(requestKey);
     if (existing) return existing;
@@ -168,6 +188,97 @@ export class NotificationExternalStore {
 
   retry(libraryId: string, operationId: string) {
     return this.performAction("retry", libraryId, operationId);
+  }
+
+  async getLogPage(
+    query: DesktopProcessLogFilter
+  ): Promise<NotificationRequestResult<DesktopProcessLogPage>> {
+    const bridge = this.currentBridge();
+    if (!bridge) return { ok: false, error: "进程日志仅在桌面模式可用" };
+    try {
+      return { ok: true, value: await bridge.getLogs(query) };
+    } catch (error) {
+      return { ok: false, error: errorMessage(error) };
+    }
+  }
+
+  snapshotAndSubscribeLogs(
+    query: DesktopProcessLogFilter,
+    listener: (batch: DesktopProcessLogBatch) => void
+  ): NotificationLogSubscriptionHandle {
+    const generation = ++this.logGeneration;
+    this.activeLogSubscription?.unsubscribe();
+    this.activeLogSubscription = null;
+    const bridge = this.currentBridge();
+    if (!bridge) return failedLogSubscription("进程日志仅在桌面模式可用");
+
+    let active = true;
+    let bridgeHandle: DesktopProcessLogSubscriptionHandle;
+    try {
+      bridgeHandle = bridge.snapshotAndSubscribeLogs(query, (batch) => {
+        if (active && generation === this.logGeneration) listener(batch);
+      });
+    } catch (error) {
+      return failedLogSubscription(errorMessage(error));
+    }
+
+    const unsubscribe = () => {
+      if (!active) return;
+      active = false;
+      bridgeHandle.unsubscribe();
+      if (this.activeLogSubscription?.generation === generation) {
+        this.activeLogSubscription = null;
+      }
+      if (this.logGeneration === generation) this.logGeneration += 1;
+    };
+    this.activeLogSubscription = { generation, unsubscribe };
+
+    return {
+      ready: bridgeHandle.ready.then(
+        (value) =>
+          active && generation === this.logGeneration
+            ? { ok: true as const, value }
+            : { ok: false as const, error: "日志订阅已关闭" },
+        (error) => {
+          if (active) unsubscribe();
+          return { ok: false as const, error: errorMessage(error) };
+        }
+      ),
+      unsubscribe
+    };
+  }
+
+  async clearLogs(): Promise<NotificationRequestResult<boolean>> {
+    const bridge = this.currentBridge();
+    if (!bridge) return { ok: false, error: "进程日志仅在桌面模式可用" };
+    try {
+      const cleared = await bridge.clearLogs();
+      return cleared
+        ? { ok: true, value: true }
+        : { ok: false, error: "进程日志未能清空" };
+    } catch (error) {
+      return { ok: false, error: errorMessage(error) };
+    }
+  }
+
+  dispose(): void {
+    this.disconnectGeneration += 1;
+    this.disconnectBridge?.();
+    this.disconnectBridge = null;
+    this.bridge = null;
+    this.compactConnectionGeneration += 1;
+    this.compactLoad = null;
+    this.historyGeneration += 1;
+    this.historyRequests.clear();
+    if (this.snapshot.history.loading) {
+      this.snapshot = {
+        ...this.snapshot,
+        history: { ...this.snapshot.history, loading: false }
+      };
+    }
+    this.activeLogSubscription?.unsubscribe();
+    this.activeLogSubscription = null;
+    this.logGeneration += 1;
   }
 
   private connect(): void {
@@ -259,6 +370,7 @@ export class NotificationExternalStore {
       active: [],
       thumbnailSummaries: [],
       latestImportantResults: [],
+      hasRetryableFailure: false,
       syncHealth: {
         state: "degraded",
         libraryId: null,
@@ -352,6 +464,13 @@ const loadHistory = notificationStore.loadHistory.bind(notificationStore);
 const loadMoreHistory = notificationStore.loadMoreHistory.bind(notificationStore);
 const cancel = notificationStore.cancel.bind(notificationStore);
 const retry = notificationStore.retry.bind(notificationStore);
+const getLogPage = notificationStore.getLogPage.bind(notificationStore);
+const snapshotAndSubscribeLogs = notificationStore.snapshotAndSubscribeLogs.bind(notificationStore);
+const clearLogs = notificationStore.clearLogs.bind(notificationStore);
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", () => notificationStore.dispose());
+}
 
 function subscribeWithTransition(listener: () => void): () => void {
   return notificationStore.subscribe(() => startTransition(listener));
@@ -368,7 +487,10 @@ export function useNotifications() {
     loadHistory,
     loadMoreHistory,
     cancel,
-    retry
+    retry,
+    getLogPage,
+    snapshotAndSubscribeLogs,
+    clearLogs
   };
 }
 
@@ -394,4 +516,11 @@ function historyQueryIdentity(query: DesktopNotificationHistoryQuery): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function failedLogSubscription(error: string): NotificationLogSubscriptionHandle {
+  return {
+    ready: Promise.resolve({ ok: false, error }),
+    unsubscribe: () => undefined
+  };
 }

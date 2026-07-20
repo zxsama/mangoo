@@ -53,6 +53,7 @@ export interface NotificationStoredSnapshot {
   active: DesktopNotificationOperation[];
   thumbnailSummaries: ThumbnailCacheSummary[];
   latestImportantResults: DesktopNotificationOperation[];
+  hasRetryableFailure: boolean;
 }
 
 export interface NotificationSyncHealth {

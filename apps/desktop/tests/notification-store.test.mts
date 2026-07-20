@@ -299,6 +299,66 @@ describe("notification store", () => {
     }
   });
 
+  it("keeps retryable failure state independent from the latest-three result window", async () => {
+    const store = await createTestStore();
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        operation("failed:durable", 1, "failed", {
+          updatedAt: NOW - 100_000,
+          completedAt: NOW - 100_000,
+          retryable: true
+        }),
+        operation("success:1", 1, "succeeded", { updatedAt: NOW - 3_000 }),
+        operation("success:2", 1, "succeeded", { updatedAt: NOW - 2_000 }),
+        operation("success:3", 1, "succeeded", { updatedAt: NOW - 1_000 })
+      ]);
+
+      let compact = await store.compactSnapshot();
+      assert.deepEqual(
+        compact.latestImportantResults.map((item) => item.operationId),
+        ["success:3", "success:2", "success:1"]
+      );
+      assert.equal(compact.hasRetryableFailure, true);
+
+      await store.upsertOperations(LIBRARY_A, [
+        operation("failed:durable", 2, "succeeded", {
+          updatedAt: NOW + 1,
+          completedAt: NOW + 1,
+          retryable: false
+        })
+      ]);
+      compact = await store.compactSnapshot();
+      assert.equal(compact.hasRetryableFailure, false);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("treats a current terminal action error as an authoritative failure", async () => {
+    const store = await createTestStore();
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        operation("failed:action", 1, "failed", { retryable: false })
+      ]);
+      assert.equal((await store.compactSnapshot()).hasRetryableFailure, false);
+
+      await store.setOperationActionError(
+        LIBRARY_A.id,
+        "failed:action",
+        1,
+        "retry request failed"
+      );
+      assert.equal((await store.compactSnapshot()).hasRetryableFailure, true);
+
+      await store.upsertOperations(LIBRARY_A, [
+        operation("failed:action", 2, "succeeded", { retryable: false })
+      ]);
+      assert.equal((await store.compactSnapshot()).hasRetryableFailure, false);
+    } finally {
+      await store.close();
+    }
+  });
+
   it("upserts thumbnail summaries independently for each library", async () => {
     const store = await createTestStore();
     try {

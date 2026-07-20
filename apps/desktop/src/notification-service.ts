@@ -171,7 +171,12 @@ function errorMessage(error: unknown): string {
 }
 
 function emptyStoredSnapshot(): NotificationStoredSnapshot {
-  return { active: [], thumbnailSummaries: [], latestImportantResults: [] };
+  return {
+    active: [],
+    thumbnailSummaries: [],
+    latestImportantResults: [],
+    hasRetryableFailure: false
+  };
 }
 
 function assertSafeSequence(value: unknown, name: string): asserts value is number {
@@ -324,6 +329,7 @@ function cloneCompactSnapshot(snapshot: NotificationCompactSnapshot): Notificati
     active: snapshot.active.map((item) => ({ ...item })),
     thumbnailSummaries: snapshot.thumbnailSummaries.map((item) => ({ ...item })),
     latestImportantResults: snapshot.latestImportantResults.map((item) => ({ ...item })),
+    hasRetryableFailure: snapshot.hasRetryableFailure,
     syncHealth: { ...snapshot.syncHealth }
   };
 }
@@ -1431,6 +1437,17 @@ export class NotificationService {
             right.updatedAt - left.updatedAt
         )
         .slice(0, 3),
+      hasRetryableFailure:
+        this.storedSnapshot.hasRetryableFailure ||
+        operations.some((item) => {
+          if (item.status === "pending" || item.status === "running") return false;
+          const key = libraryKey(item.libraryId, item.operationId);
+          return (
+            (item.status === "failed" && item.retryable) ||
+            this.pendingActionErrors.get(key)?.detail != null ||
+            this.fallbackActionBaseDetails.has(key)
+          );
+        }),
       syncHealth: this.health
     };
   }
