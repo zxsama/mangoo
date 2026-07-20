@@ -8,10 +8,12 @@ import { Worker } from "node:worker_threads";
 
 import {
   createNotificationStore,
-  notificationDatabasePath
+  notificationDatabasePath,
+  NotificationStore
 } from "../src/notification-store.ts";
 import type {
   NotificationLibraryIdentity,
+  NotificationLocalRecoveryBatch,
   NotificationOperationInput,
   RendererErrorReport,
   NotificationStoreEvent,
@@ -295,10 +297,70 @@ describe("notification store", () => {
     const store = await createTestStore();
     try {
       assert.equal(await store.hasLegacyImport(LIBRARY_A.id), false);
-      await store.markLegacyImported(LIBRARY_A.id, NOW);
-      await store.markLegacyImported(LIBRARY_A.id, NOW + 1_000);
+      assert.equal(await store.importLegacyOperations(LIBRARY_A, [], NOW), true);
+      assert.equal(await store.importLegacyOperations(LIBRARY_A, [], NOW + 1_000), false);
       assert.equal(await store.hasLegacyImport(LIBRARY_A.id), true);
       assert.equal(await store.hasLegacyImport(LIBRARY_B.id), false);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("atomically imports legacy operations with their marker and retries changed payloads", async () => {
+    const databasePath = testDatabasePath();
+    const initialized = await createTestStore(databasePath);
+    await initialized.close();
+    const inspection = new DatabaseSync(databasePath);
+    inspection.exec(`
+      CREATE TRIGGER fail_legacy_marker
+      BEFORE INSERT ON legacy_imports
+      BEGIN
+        SELECT RAISE(ABORT, 'legacy marker failed');
+      END;
+    `);
+    inspection.close();
+
+    let store = await createTestStore(databasePath);
+    const first = operation("legacy-import:library-a", 0, "succeeded", {
+      kind: "legacy_file_operations",
+      category: "file_operation",
+      taskId: null,
+      currentValue: 2,
+      totalValue: 2
+    });
+    await assert.rejects(
+      store.importLegacyOperations(LIBRARY_A, [first], NOW),
+      /legacy marker failed/i
+    );
+    assert.equal(await store.getOperation(LIBRARY_A.id, first.operationId), null);
+    assert.equal(await store.hasLegacyImport(LIBRARY_A.id), false);
+    await store.close();
+
+    const repair = new DatabaseSync(databasePath);
+    repair.exec("DROP TRIGGER fail_legacy_marker;");
+    repair.close();
+    store = await createTestStore(databasePath);
+    try {
+      const changedAfterCutoff = {
+        ...first,
+        currentValue: 1,
+        totalValue: 1,
+        summary: "cutoff changed"
+      };
+      assert.equal(
+        await store.importLegacyOperations(LIBRARY_A, [changedAfterCutoff], NOW + 1),
+        true
+      );
+      assert.equal(await store.hasLegacyImport(LIBRARY_A.id), true);
+      assert.equal(
+        (await store.getOperation(LIBRARY_A.id, first.operationId))?.summary,
+        "cutoff changed"
+      );
+      assert.equal(
+        await store.importLegacyOperations(LIBRARY_A, [first], NOW + 2),
+        false,
+        "the marker must make repeated imports a no-op without revision conflicts"
+      );
     } finally {
       await store.close();
     }
@@ -342,6 +404,59 @@ describe("notification store", () => {
         )?.occurrenceCount,
         4
       );
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("applies local recovery batches atomically and idempotently", async () => {
+    const store = await createTestStore();
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "recovery",
+      code: "load-failed",
+      target: "folder:4",
+      title: "Folder load failed",
+      message: "Could not load folder",
+      detail: "database busy"
+    };
+    const task = operation("task:recovery", 2, "running", { errorDetail: null });
+    const batch: NotificationLocalRecoveryBatch = {
+      batchId: "recovery-batch-1",
+      rendererErrors: [
+        { library: LIBRARY_A, report, occurredAt: NOW, occurrenceIncrement: 2 }
+      ],
+      thumbnails: [thumbnailSummary(LIBRARY_A, 70)],
+      actionErrors: [
+        {
+          libraryId: LIBRARY_A.id,
+          operationId: task.operationId,
+          expectedRevision: task.revision,
+          detail: "action failed",
+          updatedAt: NOW
+        }
+      ],
+      createdAt: NOW
+    };
+    try {
+      await store.upsertOperations(LIBRARY_A, [task]);
+      assert.equal(await store.applyLocalRecoveryBatch(batch, NOW), true);
+      assert.equal(await store.applyLocalRecoveryBatch(batch, NOW + 1), false);
+      assert.equal(
+        (
+          await store.getOperation(
+            LIBRARY_A.id,
+            `renderer-error:${LIBRARY_A.id}:${report.source}:${report.code}:${report.target}`
+          )
+        )?.occurrenceCount,
+        2
+      );
+      assert.equal(
+        (await store.getOperation(LIBRARY_A.id, task.operationId))?.errorDetail,
+        "action failed"
+      );
+      assert.equal((await store.compactSnapshot()).thumbnailSummaries[0]?.cachedCount, 70);
     } finally {
       await store.close();
     }
@@ -449,7 +564,7 @@ describe("notification store", () => {
     const inspection = new DatabaseSync(databasePath, { readOnly: true });
     try {
       assert.equal(inspection.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
-      assert.equal(inspection.prepare("PRAGMA user_version").get()?.user_version, 3);
+      assert.equal(inspection.prepare("PRAGMA user_version").get()?.user_version, 4);
       const tables = inspection
         .prepare(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
@@ -459,6 +574,7 @@ describe("notification store", () => {
       assert.deepEqual(tables, [
         "action_errors",
         "legacy_imports",
+        "local_recovery_batches",
         "operations",
         "sync_cursors",
         "thumbnail_summaries"
@@ -496,7 +612,7 @@ describe("notification store", () => {
 
     const upgraded = new DatabaseSync(databasePath, { readOnly: true });
     try {
-      assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 3);
+      assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 4);
       const indexSql = upgraded
         .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_operations_history'")
         .get()?.sql as string;
@@ -583,6 +699,52 @@ describe("notification store", () => {
       createNotificationStore({ databasePath: missingParent, workerUrl: TEST_WORKER_URL }),
       /open|database|sqlite/i
     );
+  });
+
+  it("bounds startup when a worker never reports ready", async () => {
+    const workerUrl = dataWorkerUrl(`
+      setInterval(() => {}, 1_000);
+    `);
+    const startedAt = Date.now();
+    await assert.rejects(
+      createNotificationStore({
+        databasePath: testDatabasePath(),
+        workerUrl,
+        startupTimeoutMs: 30
+      }),
+      /startup.*timed out/i
+    );
+    assert.ok(Date.now() - startedAt < 500, "startup timeout must terminate the worker promptly");
+  });
+
+  it("aborts startup and terminates a worker that never reports ready", async () => {
+    const workerUrl = dataWorkerUrl(`
+      setInterval(() => {}, 1_000);
+    `);
+    const controller = new AbortController();
+    const opening = createNotificationStore({
+      databasePath: testDatabasePath(),
+      workerUrl,
+      startupTimeoutMs: 5_000,
+      signal: controller.signal
+    });
+    controller.abort(new DOMException("Library switched", "AbortError"));
+    await assert.rejects(opening, /Library switched|AbortError/i);
+  });
+
+  it("close rejects ready and terminates a never-ready worker", async () => {
+    const workerUrl = dataWorkerUrl(`
+      setInterval(() => {}, 1_000);
+    `);
+    const store = new NotificationStore({
+      databasePath: testDatabasePath(),
+      workerUrl,
+      startupTimeoutMs: 5_000
+    });
+    const ready = store.ready();
+    const readyRejected = assert.rejects(ready, /closing|closed/i);
+    await store.close();
+    await readyRejected;
   });
 
   it("guards malformed worker messages without undefined responses or worker crashes", async () => {

@@ -5,6 +5,7 @@ import type {
   DesktopNotificationOperation,
   NotificationHistoryPage,
   NotificationHistoryQuery,
+  NotificationLocalRecoveryBatch,
   NotificationLibraryIdentity,
   NotificationOperationInput,
   NotificationRetentionResult,
@@ -17,7 +18,7 @@ import type {
   ThumbnailCacheSummary
 } from "./notification-types.js";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const COMPLETED_RETENTION_LIMIT = 2_000;
 const COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const OPERATION_STATUSES = new Set(["pending", "running", "succeeded", "failed", "cancelled"]);
@@ -212,6 +213,10 @@ function openDatabase(databasePath: string): DatabaseSync {
           library_id TEXT PRIMARY KEY,
           imported_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS local_recovery_batches (
+          batch_id TEXT PRIMARY KEY,
+          applied_at INTEGER NOT NULL
+        );
         PRAGMA user_version = ${SCHEMA_VERSION};
       `);
       database.exec("COMMIT;");
@@ -252,6 +257,14 @@ function openDatabase(databasePath: string): DatabaseSync {
             PRIMARY KEY(library_id, operation_id),
             FOREIGN KEY(library_id, operation_id)
               REFERENCES operations(library_id, operation_id) ON DELETE CASCADE
+          );
+        `);
+      }
+      if (lockedVersion < 4) {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS local_recovery_batches (
+            batch_id TEXT PRIMARY KEY,
+            applied_at INTEGER NOT NULL
           );
         `);
       }
@@ -584,7 +597,7 @@ class NotificationStoreDatabase {
     assertNullableString(detail, "action error detail");
     assertSafeInteger(updatedAt, "action error updatedAt");
 
-    this.database.exec("BEGIN IMMEDIATE;");
+    this.database.exec("SAVEPOINT set_operation_action_error;");
     try {
       const row = this.database
         .prepare(
@@ -593,7 +606,7 @@ class NotificationStoreDatabase {
         )
         .get(libraryId, operationId) as { revision: number } | undefined;
       if (!row || row.revision !== expectedRevision) {
-        this.database.exec("COMMIT;");
+        this.database.exec("RELEASE set_operation_action_error;");
         return null;
       }
       if (detail === null) {
@@ -613,9 +626,11 @@ class NotificationStoreDatabase {
           )
           .run(libraryId, operationId, expectedRevision, detail, updatedAt);
       }
-      this.database.exec("COMMIT;");
+      this.database.exec("RELEASE set_operation_action_error;");
     } catch (error) {
-      this.database.exec("ROLLBACK;");
+      this.database.exec(
+        "ROLLBACK TO set_operation_action_error; RELEASE set_operation_action_error;"
+      );
       throw error;
     }
     return this.getOperation(libraryId, operationId);
@@ -643,7 +658,7 @@ class NotificationStoreDatabase {
     assertSafeInteger(occurrenceIncrement, "renderer error occurrenceIncrement", 1);
 
     const operationId = `renderer-error:${library.id}:${report.source}:${report.code}:${report.target}`;
-    this.database.exec("BEGIN IMMEDIATE;");
+    this.database.exec("SAVEPOINT record_renderer_error;");
     try {
       const existing = this.getOperation(library.id, operationId);
       const revision = (existing?.revision ?? 0) + 1;
@@ -679,10 +694,10 @@ class NotificationStoreDatabase {
         completedAt: occurredAt
       };
       this.upsertOperationRows(library, [operation]);
-      this.database.exec("COMMIT;");
+      this.database.exec("RELEASE record_renderer_error;");
       return { ...operation, libraryId: library.id, libraryName: library.name };
     } catch (error) {
-      this.database.exec("ROLLBACK;");
+      this.database.exec("ROLLBACK TO record_renderer_error; RELEASE record_renderer_error;");
       throw error;
     }
   }
@@ -703,6 +718,59 @@ class NotificationStoreDatabase {
       .run(summary.libraryId, summary.libraryName, summary.observedAt, payloadJson);
   }
 
+  applyLocalRecoveryBatch(batch: NotificationLocalRecoveryBatch, appliedAt: number): boolean {
+    assertObject(batch, "local recovery batch");
+    assertString(batch.batchId, "local recovery batchId");
+    assertSafeInteger(batch.createdAt, "local recovery createdAt");
+    assertSafeInteger(appliedAt, "local recovery appliedAt");
+    if (
+      !Array.isArray(batch.rendererErrors) ||
+      !Array.isArray(batch.thumbnails) ||
+      !Array.isArray(batch.actionErrors)
+    ) {
+      throw new TypeError("local recovery batch entries must be arrays");
+    }
+
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const applied = this.database
+        .prepare("SELECT 1 FROM local_recovery_batches WHERE batch_id = ?")
+        .get(batch.batchId);
+      if (applied) {
+        this.database.exec("COMMIT;");
+        return false;
+      }
+      for (const pending of batch.rendererErrors) {
+        assertObject(pending, "pending renderer error");
+        this.recordRendererError(
+          pending.library,
+          pending.report,
+          pending.occurredAt,
+          pending.occurrenceIncrement
+        );
+      }
+      for (const summary of batch.thumbnails) this.publishThumbnailSummary(summary);
+      for (const pending of batch.actionErrors) {
+        assertObject(pending, "pending action error");
+        this.setOperationActionError(
+          pending.libraryId,
+          pending.operationId,
+          pending.expectedRevision,
+          pending.detail,
+          pending.updatedAt
+        );
+      }
+      this.database
+        .prepare("INSERT INTO local_recovery_batches(batch_id, applied_at) VALUES (?, ?)")
+        .run(batch.batchId, appliedAt);
+      this.database.exec("COMMIT;");
+      return true;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
   hasLegacyImport(libraryId: string): boolean {
     assertString(libraryId, "libraryId");
     return Boolean(
@@ -710,15 +778,38 @@ class NotificationStoreDatabase {
     );
   }
 
-  markLegacyImported(libraryId: string, importedAt: number): void {
-    assertString(libraryId, "libraryId");
+  importLegacyOperations(
+    library: NotificationLibraryIdentity,
+    operations: NotificationOperationInput[],
+    importedAt: number
+  ): boolean {
+    validateLibrary(library);
+    if (!Array.isArray(operations)) throw new TypeError("operations must be an array");
+    for (const operation of operations) validateOperation(operation);
     assertSafeInteger(importedAt, "importedAt");
-    this.database
-      .prepare(
-        `INSERT INTO legacy_imports (library_id, imported_at) VALUES (?, ?)
-         ON CONFLICT(library_id) DO NOTHING`
-      )
-      .run(libraryId, importedAt);
+
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      if (this.hasLegacyImport(library.id)) {
+        this.database.exec("COMMIT;");
+        return false;
+      }
+      const existing = this.database.prepare(
+        "SELECT 1 FROM operations WHERE library_id = ? AND operation_id = ?"
+      );
+      this.upsertOperationRows(
+        library,
+        operations.filter((operation) => !existing.get(library.id, operation.operationId))
+      );
+      this.database
+        .prepare("INSERT INTO legacy_imports (library_id, imported_at) VALUES (?, ?)")
+        .run(library.id, importedAt);
+      this.database.exec("COMMIT;");
+      return true;
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
   }
 
   cleanupRetention(now: number): NotificationRetentionResult {
@@ -745,6 +836,9 @@ class NotificationStoreDatabase {
            )`
         )
         .run();
+      this.database
+        .prepare("DELETE FROM local_recovery_batches WHERE applied_at < ?")
+        .run(cutoff);
       this.database.exec("COMMIT;");
       return {
         deletedExpired: Number(expired.changes),
@@ -814,11 +908,16 @@ function executeRequest(store: NotificationStoreDatabase, request: NotificationS
     case "publishThumbnailSummary":
       store.publishThumbnailSummary(request.params.summary);
       return null;
+    case "applyLocalRecoveryBatch":
+      return store.applyLocalRecoveryBatch(request.params.batch, request.params.appliedAt);
     case "hasLegacyImport":
       return store.hasLegacyImport(request.params.libraryId);
-    case "markLegacyImported":
-      store.markLegacyImported(request.params.libraryId, request.params.importedAt);
-      return null;
+    case "importLegacyOperations":
+      return store.importLegacyOperations(
+        request.params.library,
+        request.params.operations,
+        request.params.importedAt
+      );
     case "cleanupRetention":
       return store.cleanupRetention(request.params.now);
     case "close":
@@ -838,8 +937,9 @@ const REQUEST_METHODS = new Set<NotificationStoreRequest["method"]>([
   "setOperationActionError",
   "recordRendererError",
   "publishThumbnailSummary",
+  "applyLocalRecoveryBatch",
   "hasLegacyImport",
-  "markLegacyImported",
+  "importLegacyOperations",
   "cleanupRetention",
   "close"
 ]);

@@ -22,6 +22,7 @@ import type {
   NotificationHistoryPage,
   NotificationHistoryQuery,
   NotificationLibraryIdentity,
+  NotificationLocalRecoveryBatch,
   NotificationOperationInput,
   NotificationStoreEvent,
   NotificationStoredSnapshot,
@@ -115,6 +116,10 @@ function ackResponse(body: NotificationOutboxAckResponse): Response {
   return response(body);
 }
 
+function rendererErrorOperationIdForTest(report: RendererErrorReport): string {
+  return `renderer-error:${report.libraryId}:${report.source}:${report.code}:${report.target}`;
+}
+
 function emptySnapshot(): NotificationStoredSnapshot {
   return { active: [], thumbnailSummaries: [], latestImportantResults: [] };
 }
@@ -125,11 +130,13 @@ class FakeStore implements NotificationServiceStore {
   readonly acknowledgements = new Map<string, number>();
   readonly summaries = new Map<string, ThumbnailCacheSummary>();
   readonly imported = new Set<string>();
+  readonly recoveryBatches = new Set<string>();
   readonly calls: string[] = [];
   readonly getOperationCalls: string[] = [];
   cleanupCalls = 0;
   failApply = false;
   failActionError = false;
+  failLegacyImport = false;
   failSnapshot = false;
 
   async applyOutboxBatch(
@@ -239,7 +246,35 @@ class FakeStore implements NotificationServiceStore {
   }
 
   async publishThumbnailSummary(summary: ThumbnailCacheSummary): Promise<void> {
-    this.summaries.set(summary.libraryId, summary);
+    const existing = this.summaries.get(summary.libraryId);
+    if (!existing || summary.observedAt >= existing.observedAt) {
+      this.summaries.set(summary.libraryId, summary);
+    }
+  }
+
+  async applyLocalRecoveryBatch(
+    batch: NotificationLocalRecoveryBatch
+  ): Promise<boolean> {
+    if (this.recoveryBatches.has(batch.batchId)) return false;
+    for (const pending of batch.rendererErrors) {
+      await this.recordRendererError(
+        pending.library,
+        pending.report,
+        pending.occurredAt,
+        pending.occurrenceIncrement
+      );
+    }
+    for (const summary of batch.thumbnails) await this.publishThumbnailSummary(summary);
+    for (const pending of batch.actionErrors) {
+      await this.setOperationActionError(
+        pending.libraryId,
+        pending.operationId,
+        pending.expectedRevision,
+        pending.detail
+      );
+    }
+    this.recoveryBatches.add(batch.batchId);
+    return true;
   }
 
   async recordRendererError(
@@ -277,8 +312,18 @@ class FakeStore implements NotificationServiceStore {
     return this.imported.has(libraryId);
   }
 
-  async markLegacyImported(libraryId: string): Promise<void> {
-    this.imported.add(libraryId);
+  async importLegacyOperations(
+    library: NotificationLibraryIdentity,
+    operations: NotificationOperationInput[]
+  ): Promise<boolean> {
+    if (this.imported.has(library.id)) return false;
+    if (this.failLegacyImport) throw new Error("legacy marker failed");
+    const fresh = operations.filter(
+      (value) => !this.operations.has(`${library.id}/${value.operationId}`)
+    );
+    await this.upsertOperations(library, fresh);
+    this.imported.add(library.id);
+    return true;
   }
 
   async cleanupRetention(): Promise<{ deletedExpired: number; deletedOverflow: number }> {
@@ -766,6 +811,44 @@ describe("notification service", () => {
     await service.close();
   });
 
+  it("rolls back a failed legacy marker and retries safely after the cutoff changes", async () => {
+    const store = new FakeStore();
+    store.failLegacyImport = true;
+    let now = NOW;
+    const cutoffEdge = NOW - 30 * 24 * 60 * 60 * 1_000 + 1;
+    const service = await createNotificationService({
+      store,
+      fetch: async () =>
+        response({
+          items: [
+            fileOperationRecord({
+              id: 1,
+              operation: "move",
+              createdAt: cutoffEdge,
+              finishedAt: cutoffEdge,
+              error: null
+            })
+          ],
+          nextCursor: null
+        }),
+      now: () => now
+    });
+
+    await assert.rejects(
+      service.runLegacyImportForTest(LIBRARY_A, SESSION_A),
+      /legacy marker failed/i
+    );
+    assert.equal(store.operations.size, 0);
+    assert.equal(store.imported.has(LIBRARY_A.id), false);
+
+    store.failLegacyImport = false;
+    now += 2;
+    await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
+    assert.equal(store.operations.size, 0, "the now-expired row must not conflict with the retry");
+    assert.equal(store.imported.has(LIBRARY_A.id), true);
+    await service.close();
+  });
+
   it("proxies task actions only for the active library", async () => {
     const store = new FakeStore();
     store.imported.add(LIBRARY_A.id);
@@ -793,6 +876,60 @@ describe("notification service", () => {
     assert.equal((await service.cancelOperation(LIBRARY_A.id, "task:7")).ok, true);
     assert.equal((await service.retryOperation(LIBRARY_A.id, "task:7")).ok, true);
     assert.deepEqual(actionPaths, ["/api/tasks/7/cancel", "/api/tasks/7/retry"]);
+    await service.close();
+  });
+
+  it("does not POST a task action when the library switches after operation lookup starts", async () => {
+    const store = new FakeStore();
+    store.imported.add(LIBRARY_A.id);
+    store.imported.add(LIBRARY_B.id);
+    await store.upsertOperations(LIBRARY_A, [
+      operation("task:library-race", 1, "running", { taskId: 7, cancellable: true })
+    ]);
+    let lookupStarted!: () => void;
+    const lookupReached = new Promise<void>((resolve) => {
+      lookupStarted = resolve;
+    });
+    let releaseLookup!: () => void;
+    const lookupBarrier = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    const originalGetOperation = store.getOperation.bind(store);
+    store.getOperation = async (...args) => {
+      lookupStarted();
+      await lookupBarrier;
+      return originalGetOperation(...args);
+    };
+    let actionPosts = 0;
+    const service = await createNotificationService({
+      store,
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.includes("/notifications/outbox?")) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(init.signal?.reason ?? new DOMException("Aborted", "AbortError")),
+              { once: true }
+            );
+          });
+        }
+        actionPosts += 1;
+        return response({ taskId: 7 });
+      },
+      now: () => NOW
+    });
+    await service.attachLibrary(LIBRARY_A, SESSION_A);
+
+    const action = service.cancelOperation(LIBRARY_A.id, "task:library-race");
+    await lookupReached;
+    const switched = service.attachLibrary(LIBRARY_B, SESSION_B);
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseLookup();
+    await switched;
+
+    assert.equal((await action).ok, false);
+    assert.equal(actionPosts, 0, "a stale action must not reach either Core session");
     await service.close();
   });
 
@@ -900,6 +1037,158 @@ describe("notification service", () => {
     }
   });
 
+  it("serializes reports and action overlays injected while local recovery is flushing", async () => {
+    const failedStore = new FakeStore();
+    failedStore.imported.add(LIBRARY_A.id);
+    failedStore.failActionError = true;
+    const task = operation("task:recovery-barrier", 2, "running", {
+      taskId: 7,
+      cancellable: true,
+      errorDetail: null
+    });
+    await failedStore.upsertOperations(LIBRARY_A, [task]);
+    const recoveredStore = new FakeStore();
+    recoveredStore.imported.add(LIBRARY_A.id);
+    await recoveredStore.upsertOperations(LIBRARY_A, [task]);
+    let flushStarted!: () => void;
+    const flushReached = new Promise<void>((resolve) => {
+      flushStarted = resolve;
+    });
+    let releaseFlush!: () => void;
+    const flushBarrier = new Promise<void>((resolve) => {
+      releaseFlush = resolve;
+    });
+    const originalApplyRecovery = recoveredStore.applyLocalRecoveryBatch.bind(recoveredStore);
+    let recoveryCalls = 0;
+    recoveredStore.applyLocalRecoveryBatch = async (batch) => {
+      recoveryCalls += 1;
+      if (recoveryCalls === 1) {
+        flushStarted();
+        await flushBarrier;
+      }
+      return originalApplyRecovery(batch);
+    };
+    const initialError: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "recovery",
+      code: "initial",
+      target: "folder:1",
+      title: "Initial error",
+      message: "initial",
+      detail: null
+    };
+    const injectedError = { ...initialError, code: "injected", title: "Injected error" };
+    const service = await createNotificationService({
+      store: failedStore,
+      openStore: async () => recoveredStore,
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.includes("/notifications/outbox?")) {
+          if (init?.signal) {
+            return new Promise<Response>((resolve, reject) => {
+              const timeoutId = setTimeout(
+                () => resolve(response({ items: [], maxSequence: 0 })),
+                5
+              );
+              init.signal?.addEventListener(
+                "abort",
+                () => {
+                  clearTimeout(timeoutId);
+                  reject(init.signal?.reason ?? new DOMException("Aborted", "AbortError"));
+                },
+                { once: true }
+              );
+            });
+          }
+          return response({ items: [], maxSequence: 0 });
+        }
+        return response({ error: "Core refused cancellation" }, 409);
+      },
+      now: () => NOW
+    });
+    await service.attachLibrary(LIBRARY_A, SESSION_A);
+    assert.equal((await service.cancelOperation(LIBRARY_A.id, task.operationId)).ok, false);
+    await service.reportRendererError(initialError);
+    await service.publishThumbnailSummary({ ...thumbnailSummary(), observedAt: 100 });
+
+    const recovering = service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    await flushReached;
+    const injectedReports = Promise.all([
+      service.reportRendererError(injectedError),
+      service.publishThumbnailSummary({ ...thumbnailSummary(), observedAt: 200 }),
+      service.cancelOperation(LIBRARY_A.id, task.operationId)
+    ]);
+    releaseFlush();
+    await recovering;
+    await injectedReports;
+
+    assert.ok(
+      await recoveredStore.getOperation(
+        LIBRARY_A.id,
+        `renderer-error:${LIBRARY_A.id}:recovery:initial:folder:1`
+      )
+    );
+    assert.ok(
+      await recoveredStore.getOperation(
+        LIBRARY_A.id,
+        `renderer-error:${LIBRARY_A.id}:recovery:injected:folder:1`
+      )
+    );
+    assert.equal(recoveredStore.summaries.get(LIBRARY_A.id)?.observedAt, 200);
+    assert.match(
+      (await recoveredStore.getOperation(LIBRARY_A.id, task.operationId))?.errorDetail ?? "",
+      /409/
+    );
+    await service.close();
+  });
+
+  it("retains an idempotent local recovery batch when snapshot activation fails", async () => {
+    const recoveredStore = new FakeStore();
+    recoveredStore.failSnapshot = true;
+    let opens = 0;
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "recovery",
+      code: "snapshot-failed",
+      target: "folder:9",
+      title: "Snapshot failed",
+      message: "snapshot failed",
+      detail: null
+    };
+    const service = await createNotificationService({
+      openStore: async () => {
+        opens += 1;
+        if (opens === 1) throw new Error("initial worker unavailable");
+        return recoveredStore;
+      },
+      fetch: async () => response({ items: [], maxSequence: 0 }),
+      now: () => NOW
+    });
+    await service.reportRendererError(report);
+    await service.reportRendererError(report);
+    await service.publishThumbnailSummary(thumbnailSummary());
+
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    const degraded = await service.compactSnapshot();
+    assert.equal(degraded.syncHealth.state, "degraded");
+    assert.equal(degraded.latestImportantResults[0]?.occurrenceCount, 2);
+    assert.equal(degraded.thumbnailSummaries.length, 1);
+
+    recoveredStore.failSnapshot = false;
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    const operationId = rendererErrorOperationIdForTest(report);
+    assert.equal(
+      (await recoveredStore.getOperation(LIBRARY_A.id, operationId))?.occurrenceCount,
+      2,
+      "replaying a committed recovery batch must not double-count reports"
+    );
+    assert.equal(recoveredStore.recoveryBatches.size, 1);
+    assert.equal((await service.compactSnapshot()).syncHealth.state, "healthy");
+    await service.close();
+  });
+
   it("deduplicates renderer errors, publishes thumbnail summaries, and broadcasts snapshots", async () => {
     const store = new FakeStore();
     const service = await createNotificationService({ store, now: () => NOW });
@@ -955,6 +1244,27 @@ describe("notification service", () => {
     await service.close();
   });
 
+  it("keeps thumbnail fallback and recovery monotonic when an older summary arrives", async () => {
+    const recoveredStore = new FakeStore();
+    let opens = 0;
+    const service = await createNotificationService({
+      openStore: async () => {
+        opens += 1;
+        if (opens === 1) throw new Error("worker unavailable");
+        return recoveredStore;
+      },
+      fetch: async () => response({ items: [], maxSequence: 0 }),
+      now: () => NOW
+    });
+    await service.publishThumbnailSummary({ ...thumbnailSummary(), observedAt: 200 });
+    await service.publishThumbnailSummary({ ...thumbnailSummary(), observedAt: 100 });
+    assert.equal((await service.compactSnapshot()).thumbnailSummaries[0]?.observedAt, 200);
+
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    assert.equal(recoveredStore.summaries.get(LIBRARY_A.id)?.observedAt, 200);
+    await service.close();
+  });
+
   it("keeps a bounded 500-operation fallback and reports degraded health", async () => {
     const service = await createNotificationService({
       openStore: async () => {
@@ -978,6 +1288,63 @@ describe("notification service", () => {
     const history = await service.history({ limit: 200, offset: 0 });
     assert.equal(history.total, 500);
     assert.equal((await service.compactSnapshot()).syncHealth.state, "degraded");
+    await service.close();
+  });
+
+  it("caps fallback and pending records globally across many libraries and releases them after recovery", async () => {
+    const recoveredStore = new FakeStore();
+    let opens = 0;
+    const service = await createNotificationService({
+      openStore: async () => {
+        opens += 1;
+        if (opens === 1) throw new Error("worker unavailable");
+        return recoveredStore;
+      },
+      fetch: async () => response({ items: [], maxSequence: 0 }),
+      now: () => NOW
+    });
+    for (let index = 0; index < 260; index += 1) {
+      const library = { id: `library-${index}`, name: `Library ${index}` };
+      await service.reportRendererError({
+        libraryId: library.id,
+        libraryName: library.name,
+        source: "cap",
+        code: `error-${index}`,
+        target: "library",
+        title: `Error ${index}`,
+        message: "failed",
+        detail: null
+      });
+      await service.publishThumbnailSummary({ ...thumbnailSummary(library), observedAt: index });
+    }
+
+    const degradedHistory = await service.history({ limit: 200, offset: 0 });
+    const degradedSnapshot = await service.compactSnapshot();
+    assert.ok(
+      degradedHistory.total + degradedSnapshot.thumbnailSummaries.length <= 500,
+      "all fallback record kinds must share one logical cap"
+    );
+
+    recoveredStore.failSnapshot = true;
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    assert.equal((await service.compactSnapshot()).syncHealth.state, "degraded");
+    await service.reportRendererError({
+      libraryId: "library-overflow",
+      libraryName: "Library Overflow",
+      source: "cap",
+      code: "overflow",
+      target: "library",
+      title: "Overflow",
+      message: "overflow",
+      detail: null
+    });
+    recoveredStore.failSnapshot = false;
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    assert.ok(
+      recoveredStore.operations.size + recoveredStore.summaries.size <= 500,
+      "the bounded pending state must be all that migrates into the recovered store"
+    );
+    assert.equal((await service.compactSnapshot()).syncHealth.state, "healthy");
     await service.close();
   });
 
@@ -1153,6 +1520,49 @@ describe("notification service", () => {
     }
   });
 
+  it("cancels a never-ready recovery worker on library switch and close", async () => {
+    const workerUrl = new URL(
+      "data:text/javascript,setInterval%28%28%29%3D%3E%7B%7D%2C1000%29",
+      import.meta.url
+    );
+    let opens = 0;
+    let recoveryStarted!: () => void;
+    const recoveryReached = new Promise<void>((resolve) => {
+      recoveryStarted = resolve;
+    });
+    const service = await createNotificationService({
+      openStore: async (signal) => {
+        opens += 1;
+        if (opens === 1) throw new Error("initial worker unavailable");
+        recoveryStarted();
+        return createNotificationStore({
+          databasePath: testDatabasePath(),
+          workerUrl,
+          startupTimeoutMs: 5_000,
+          signal
+        });
+      },
+      fetch: async () => response({ items: [], maxSequence: 0 }),
+      now: () => NOW
+    });
+    await service.attachLibrary(LIBRARY_A, SESSION_A);
+    await recoveryReached;
+
+    await Promise.race([
+      service.attachLibrary(LIBRARY_B, SESSION_B),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("library switch waited for never-ready worker")), 500)
+      )
+    ]);
+    await Promise.race([
+      service.close(),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("close waited for never-ready worker")), 500)
+      )
+    ]);
+    assert.ok(opens >= 3, "the switched library should own a fresh recovery attempt");
+  });
+
   it("runs retention at startup and throttles cleanup after durable writes", async () => {
     const store = new FakeStore();
     let now = NOW;
@@ -1196,6 +1606,24 @@ describe("notification service", () => {
     now += 24 * 60 * 60 * 1_000;
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     assert.equal(store.cleanupCalls, 3, "the first durable Outbox batch after cadence cleans up");
+    await service.close();
+  });
+
+  it("runs throttled retention after empty long polls while the service is idle", async () => {
+    const store = new FakeStore();
+    let now = NOW;
+    const service = await createNotificationService({
+      store,
+      fetch: async () => response({ items: [], maxSequence: 0 }),
+      now: () => now
+    });
+    assert.equal(store.cleanupCalls, 1);
+
+    now += 5 * 60 * 1_000 + 1;
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    assert.equal(store.cleanupCalls, 2, "an empty poll must still enforce retention cadence");
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    assert.equal(store.cleanupCalls, 2, "empty polls inside the cadence must stay throttled");
     await service.close();
   });
 

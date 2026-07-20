@@ -6,6 +6,7 @@ import type {
   DesktopNotificationOperation,
   NotificationHistoryPage,
   NotificationHistoryQuery,
+  NotificationLocalRecoveryBatch,
   NotificationLibraryIdentity,
   NotificationOperationInput,
   NotificationRetentionResult,
@@ -22,9 +23,12 @@ import type {
 export interface NotificationStoreOptions {
   databasePath: string;
   workerUrl?: URL;
+  startupTimeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 const WORKER_CLOSE_TIMEOUT_MS = 1_000;
+const WORKER_STARTUP_TIMEOUT_MS = 5_000;
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -48,8 +52,12 @@ export class NotificationStore {
   private readonly worker: Worker;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly readyPromise: Promise<void>;
+  private readonly startupTimeoutMs: number;
+  private readonly startupSignal: AbortSignal | undefined;
   private readyResolve!: () => void;
   private readyReject!: (reason?: unknown) => void;
+  private readySettled = false;
+  private readySucceeded = false;
   private requestCounter = 0;
   private closed = false;
   private closing = false;
@@ -57,10 +65,16 @@ export class NotificationStore {
   private failure: Error | null = null;
 
   constructor(options: NotificationStoreOptions) {
+    this.startupTimeoutMs = options.startupTimeoutMs ?? WORKER_STARTUP_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.startupTimeoutMs) || this.startupTimeoutMs < 1) {
+      throw new RangeError("notification store startupTimeoutMs must be a positive safe integer");
+    }
+    this.startupSignal = options.signal;
     this.readyPromise = new Promise<void>((resolve, reject) => {
       this.readyResolve = resolve;
       this.readyReject = reject;
     });
+    void this.readyPromise.catch(() => undefined);
     this.worker = new Worker(
       options.workerUrl ?? new URL("./notification-store-worker.js", import.meta.url),
       { workerData: { databasePath: options.databasePath } }
@@ -83,7 +97,7 @@ export class NotificationStore {
   static async open(options: NotificationStoreOptions): Promise<NotificationStore> {
     const store = new NotificationStore(options);
     try {
-      await store.ready();
+      await store.ready(options.signal);
       return store;
     } catch (error) {
       await store.close().catch(() => undefined);
@@ -91,8 +105,27 @@ export class NotificationStore {
     }
   }
 
-  async ready(): Promise<void> {
-    await this.readyPromise;
+  async ready(signal = this.startupSignal): Promise<void> {
+    if (signal?.aborted) throw signal.reason;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error("notification store worker startup timed out")),
+        this.startupTimeoutMs
+      );
+    });
+    const aborted = new Promise<never>((_resolve, reject) => {
+      if (!signal) return;
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([this.readyPromise, timeout, aborted]);
+    } finally {
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+    }
   }
 
   async applyOutboxBatch(
@@ -204,6 +237,17 @@ export class NotificationStore {
     });
   }
 
+  async applyLocalRecoveryBatch(
+    batch: NotificationLocalRecoveryBatch,
+    appliedAt: number
+  ): Promise<boolean> {
+    return this.request<boolean>({
+      requestId: this.nextRequestId(),
+      method: "applyLocalRecoveryBatch",
+      params: { batch, appliedAt }
+    });
+  }
+
   async hasLegacyImport(libraryId: string): Promise<boolean> {
     return this.request<boolean>({
       requestId: this.nextRequestId(),
@@ -212,11 +256,15 @@ export class NotificationStore {
     });
   }
 
-  async markLegacyImported(libraryId: string, importedAt: number): Promise<void> {
-    await this.request<void>({
+  async importLegacyOperations(
+    library: NotificationLibraryIdentity,
+    operations: NotificationOperationInput[],
+    importedAt: number
+  ): Promise<boolean> {
+    return this.request<boolean>({
       requestId: this.nextRequestId(),
-      method: "markLegacyImported",
-      params: { libraryId, importedAt }
+      method: "importLegacyOperations",
+      params: { library, operations, importedAt }
     });
   }
 
@@ -241,9 +289,13 @@ export class NotificationStore {
 
   private async closeWorker(): Promise<void> {
     this.closing = true;
+    if (!this.readySettled) {
+      this.readySettled = true;
+      this.readyReject(new Error("notification store is closing"));
+    }
     this.rejectPending(new Error("notification store is closing"));
     try {
-      if (!this.failure) {
+      if (!this.failure && this.readySucceeded) {
         const closeRequest = this.request<void>({
           requestId: this.nextRequestId(),
           method: "close",
@@ -302,6 +354,9 @@ export class NotificationStore {
 
   private handleMessage(message: NotificationStoreWorkerMessage): void {
     if (message.type === "ready") {
+      if (this.readySettled) return;
+      this.readySettled = true;
+      this.readySucceeded = true;
       this.readyResolve();
       return;
     }
@@ -326,6 +381,7 @@ export class NotificationStore {
       return;
     }
     this.failure = error instanceof Error ? error : new Error(String(error));
+    this.readySettled = true;
     this.readyReject(this.failure);
     this.rejectPending(this.failure);
   }

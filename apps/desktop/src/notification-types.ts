@@ -134,6 +134,29 @@ export interface NotificationRetentionResult {
   deletedOverflow: number;
 }
 
+export interface NotificationPendingRendererError {
+  library: NotificationLibraryIdentity;
+  report: RendererErrorReport;
+  occurredAt: number;
+  occurrenceIncrement: number;
+}
+
+export interface NotificationPendingActionError {
+  libraryId: string;
+  operationId: string;
+  expectedRevision: number;
+  detail: string | null;
+  updatedAt: number;
+}
+
+export interface NotificationLocalRecoveryBatch {
+  batchId: string;
+  rendererErrors: NotificationPendingRendererError[];
+  thumbnails: ThumbnailCacheSummary[];
+  actionErrors: NotificationPendingActionError[];
+  createdAt: number;
+}
+
 export type NotificationStoreRequest =
   | {
       requestId: string;
@@ -192,11 +215,20 @@ export type NotificationStoreRequest =
       method: "publishThumbnailSummary";
       params: { summary: ThumbnailCacheSummary };
     }
+  | {
+      requestId: string;
+      method: "applyLocalRecoveryBatch";
+      params: { batch: NotificationLocalRecoveryBatch; appliedAt: number };
+    }
   | { requestId: string; method: "hasLegacyImport"; params: { libraryId: string } }
   | {
       requestId: string;
-      method: "markLegacyImported";
-      params: { libraryId: string; importedAt: number };
+      method: "importLegacyOperations";
+      params: {
+        library: NotificationLibraryIdentity;
+        operations: NotificationOperationInput[];
+        importedAt: number;
+      };
     }
   | { requestId: string; method: "cleanupRetention"; params: { now: number } }
   | { requestId: string; method: "close"; params: Record<string, never> };

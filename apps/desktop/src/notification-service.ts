@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type {
   FileOperationKind,
   FileOperationRecord,
@@ -13,6 +15,7 @@ import type {
   NotificationHistoryPage,
   NotificationHistoryQuery,
   NotificationLibraryIdentity,
+  NotificationLocalRecoveryBatch,
   NotificationOperationInput,
   NotificationRetentionResult,
   NotificationStoreEvent,
@@ -29,7 +32,7 @@ const LEGACY_PAGE_LIMIT = 200;
 const LEGACY_LOGICAL_LIMIT = 2_000;
 const LEGACY_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const RETENTION_CADENCE_MS = 5 * 60 * 1_000;
-const FALLBACK_OPERATION_LIMIT = 500;
+const FALLBACK_RECORD_LIMIT = 500;
 const MIN_RETRY_MS = 250;
 const MAX_RETRY_MS = 5_000;
 const OPERATION_CATEGORIES = new Set(["task", "file_operation", "error", "thumbnail_cache"]);
@@ -78,6 +81,10 @@ export interface NotificationServiceStore {
     updatedAt?: number
   ): Promise<DesktopNotificationOperation | null>;
   publishThumbnailSummary(summary: ThumbnailCacheSummary): Promise<void>;
+  applyLocalRecoveryBatch(
+    batch: NotificationLocalRecoveryBatch,
+    appliedAt: number
+  ): Promise<boolean>;
   recordRendererError(
     library: NotificationLibraryIdentity,
     report: RendererErrorReport,
@@ -85,14 +92,18 @@ export interface NotificationServiceStore {
     occurrenceIncrement?: number
   ): Promise<DesktopNotificationOperation>;
   hasLegacyImport(libraryId: string): Promise<boolean>;
-  markLegacyImported(libraryId: string, importedAt: number): Promise<void>;
+  importLegacyOperations(
+    library: NotificationLibraryIdentity,
+    operations: NotificationOperationInput[],
+    importedAt: number
+  ): Promise<boolean>;
   cleanupRetention(now: number): Promise<NotificationRetentionResult>;
   close?(): Promise<void>;
 }
 
 export interface NotificationServiceOptions {
   store?: NotificationServiceStore;
-  openStore?: () => Promise<NotificationServiceStore>;
+  openStore?: (signal: AbortSignal) => Promise<NotificationServiceStore>;
   fetch?: typeof fetch;
   now?: () => number;
   retryDelay?: (delayMs: number, signal: AbortSignal) => Promise<void>;
@@ -102,6 +113,7 @@ interface ActiveLibrary {
   library: NotificationLibraryIdentity;
   session: NotificationCoreSession;
   controller: AbortController;
+  generation: number;
   loop: Promise<void>;
 }
 
@@ -293,6 +305,18 @@ function libraryKey(libraryId: string, operationId: string): string {
   return `${libraryId}\u0000${operationId}`;
 }
 
+function fallbackOperationKey(libraryId: string, operationId: string): string {
+  return `operation\u0000${libraryId}\u0000${operationId}`;
+}
+
+function fallbackThumbnailKey(libraryId: string): string {
+  return `thumbnail\u0000${libraryId}`;
+}
+
+function rendererErrorOperationId(libraryId: string, report: RendererErrorReport): string {
+  return `renderer-error:${libraryId}:${report.source}:${report.code}:${report.target}`;
+}
+
 function cloneCompactSnapshot(snapshot: NotificationCompactSnapshot): NotificationCompactSnapshot {
   return {
     active: snapshot.active.map((item) => ({ ...item })),
@@ -304,11 +328,12 @@ function cloneCompactSnapshot(snapshot: NotificationCompactSnapshot): Notificati
 
 export class NotificationService {
   private store: NotificationServiceStore | null;
-  private readonly openStore: (() => Promise<NotificationServiceStore>) | null;
+  private readonly openStore: ((signal: AbortSignal) => Promise<NotificationServiceStore>) | null;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private readonly retryDelay: (delayMs: number, signal: AbortSignal) => Promise<void>;
   private active: ActiveLibrary | null = null;
+  private activeGeneration = 0;
   private closed = false;
   private storedSnapshot = emptyStoredSnapshot();
   private health: NotificationSyncHealth;
@@ -316,15 +341,19 @@ export class NotificationService {
   private readonly pendingOutbox = new Map<string, PendingOutboxBatch>();
   private readonly fallbackOperations = new Map<string, DesktopNotificationOperation>();
   private readonly fallbackThumbnails = new Map<string, ThumbnailCacheSummary>();
-  private readonly fallbackLibraries = new Map<string, NotificationLibraryIdentity>();
+  private readonly fallbackRecordOrder = new Map<string, true>();
   private readonly pendingRendererErrors = new Map<string, PendingRendererError>();
   private readonly pendingLocalThumbnails = new Map<string, ThumbnailCacheSummary>();
   private readonly pendingActionErrors = new Map<string, PendingActionError>();
+  private readonly pendingRecoveryBatches: NotificationLocalRecoveryBatch[] = [];
+  private readonly protectedRecoveryBatchIds = new Set<string>();
   private readonly legacyImports = new Map<string, Promise<void>>();
   private readonly fallbackActionBaseDetails = new Map<string, string | null>();
   private lastRetentionAt: number | null = null;
   private retentionPromise: Promise<void> | null = null;
   private lifecycleTail: Promise<void> = Promise.resolve();
+  private storeMutationTail: Promise<void> = Promise.resolve();
+  private readonly closeController = new AbortController();
 
   constructor(options: NotificationServiceOptions) {
     this.store = options.store ?? null;
@@ -342,11 +371,8 @@ export class NotificationService {
 
   async initialize(): Promise<void> {
     if (!this.store && this.openStore) {
-      try {
-        this.store = await this.openStore();
-      } catch (error) {
-        this.setHealth("degraded", null, errorMessage(error), false);
-      }
+      await this.tryRecoverStore(this.closeController.signal);
+      return;
     }
     if (!this.store) return;
     try {
@@ -385,6 +411,7 @@ export class NotificationService {
       library,
       session,
       controller,
+      generation: ++this.activeGeneration,
       loop: Promise.resolve()
     };
     this.active = active;
@@ -408,7 +435,9 @@ export class NotificationService {
     return this.enqueueLifecycle(async () => {
       if (this.closed) return;
       this.closed = true;
+      this.closeController.abort(new DOMException("Notification service closed", "AbortError"));
       await this.stopActiveLoop();
+      await this.storeMutationTail.catch(() => undefined);
       const store = this.store;
       this.store = null;
       await store?.close?.().catch(() => undefined);
@@ -453,8 +482,11 @@ export class NotificationService {
   }
 
   async reportRendererError(report: RendererErrorReport): Promise<void> {
+    return this.enqueueStoreMutation(() => this.reportRendererErrorNow(report));
+  }
+
+  private async reportRendererErrorNow(report: RendererErrorReport): Promise<void> {
     const library = { id: report.libraryId, name: report.libraryName };
-    this.fallbackLibraries.set(library.id, library);
     if (this.store) {
       const store = this.store;
       let committed: DesktopNotificationOperation | null = null;
@@ -479,6 +511,7 @@ export class NotificationService {
     }
     const value = this.recordFallbackRendererError(library, report);
     const key = libraryKey(library.id, value.operationId);
+    if (!this.fallbackOperations.has(key)) return;
     const pending = this.pendingRendererErrors.get(key);
     this.pendingRendererErrors.set(key, {
       library,
@@ -490,8 +523,11 @@ export class NotificationService {
   }
 
   async publishThumbnailSummary(summary: ThumbnailCacheSummary): Promise<void> {
+    return this.enqueueStoreMutation(() => this.publishThumbnailSummaryNow(summary));
+  }
+
+  private async publishThumbnailSummaryNow(summary: ThumbnailCacheSummary): Promise<void> {
     const library = { id: summary.libraryId, name: summary.libraryName };
-    this.fallbackLibraries.set(library.id, library);
     if (this.store) {
       const store = this.store;
       let committed = false;
@@ -510,13 +546,16 @@ export class NotificationService {
           }
         }
         if (this.store === store && (await this.refreshStoredSnapshot())) return;
-        this.fallbackThumbnails.set(summary.libraryId, summary);
+        this.upsertFallbackThumbnail(summary);
         this.emitSnapshot();
         return;
       }
     }
-    this.fallbackThumbnails.set(summary.libraryId, summary);
-    this.pendingLocalThumbnails.set(summary.libraryId, summary);
+    if (!this.upsertFallbackThumbnail(summary)) return;
+    const pending = this.pendingLocalThumbnails.get(summary.libraryId);
+    if (!pending || summary.observedAt >= pending.observedAt) {
+      this.pendingLocalThumbnails.set(summary.libraryId, summary);
+    }
     this.emitSnapshot();
   }
 
@@ -565,10 +604,9 @@ export class NotificationService {
     session: NotificationCoreSession,
     signal: AbortSignal
   ): Promise<void> {
-    this.fallbackLibraries.set(library.id, library);
 
     const pending = this.pendingOutbox.get(library.id);
-    if (!this.store && (await this.tryRecoverStore())) {
+    if (!this.store && (await this.tryRecoverStore(signal))) {
       void this.ensureLegacyImport(library, session, signal);
     }
     if (!this.store && pending) {
@@ -610,6 +648,28 @@ export class NotificationService {
     }
 
     const page = await this.listOutbox(session, cursor, signal, this.store ? OUTBOX_WAIT_MS : 0);
+    if (this.store) {
+      const store = this.store;
+      try {
+        if (signal.aborted) throw signal.reason;
+        await this.cleanupRetentionIfDue(store);
+        if (signal.aborted) throw signal.reason;
+      } catch (error) {
+        if (isAbort(error, signal)) throw error;
+        await this.markStoreUnavailable(error);
+        if (page.events.length > 0) {
+          const batch: PendingOutboxBatch = {
+            library,
+            events: page.events,
+            maxSequence: page.maxSequence
+          };
+          this.rememberPendingOutbox(batch);
+          this.mergeFallbackEvents(library, page.events);
+          this.emitSnapshot();
+        }
+        return;
+      }
+    }
     if (page.events.length === 0) {
       if (this.store) this.setHealth("healthy", library.id, null);
       return;
@@ -637,14 +697,6 @@ export class NotificationService {
       return;
     }
 
-    try {
-      await this.cleanupRetentionIfDue(this.store);
-    } catch (error) {
-      await this.markStoreUnavailable(error);
-      this.mergeFallbackEvents(library, page.events);
-      this.emitSnapshot();
-      return;
-    }
     const refreshed = await this.refreshStoredSnapshot();
     if (!refreshed || !this.store) {
       this.mergeFallbackEvents(library, page.events);
@@ -849,10 +901,7 @@ export class NotificationService {
     if (ungroupedSummary.total > 0) {
       operations.push(this.legacyImportSummaryOperation(library.id, ungroupedSummary));
     }
-    for (let index = 0; index < operations.length; index += LEGACY_PAGE_LIMIT) {
-      await store.upsertOperations(library, operations.slice(index, index + LEGACY_PAGE_LIMIT));
-    }
-    await store.markLegacyImported(library.id, this.now());
+    await store.importLegacyOperations(library, operations, this.now());
     await this.cleanupRetentionIfDue(store);
     if (this.store === store) await this.refreshStoredSnapshot();
   }
@@ -981,7 +1030,18 @@ export class NotificationService {
     if (!active || active.library.id !== libraryId) {
       return { ok: false, message: "This operation belongs to an inactive library." };
     }
+    const activeLibraryId = active.library.id;
+    const generation = active.generation;
+    const signal = active.controller.signal;
     const operation = await this.findOperation(libraryId, operationId);
+    if (
+      signal.aborted ||
+      this.active !== active ||
+      this.active.generation !== generation ||
+      this.active.library.id !== activeLibraryId
+    ) {
+      return { ok: false, message: "This operation belongs to an inactive library." };
+    }
     if (!operation || operation.taskId === null) {
       return { ok: false, message: "The task is no longer available." };
     }
@@ -995,11 +1055,14 @@ export class NotificationService {
       await this.requestJson(
         `${active.session.baseUrl}/tasks/${operation.taskId}/${action}`,
         active.session,
-        { method: "POST" }
+        { method: "POST", signal }
       );
       await this.persistActionError(operation, null);
       return { ok: true, message: null };
     } catch (error) {
+      if (isAbort(error, signal) || this.active !== active) {
+        return { ok: false, message: "This operation belongs to an inactive library." };
+      }
       const message = errorMessage(error);
       await this.persistActionError(operation, message);
       return { ok: false, message };
@@ -1007,6 +1070,13 @@ export class NotificationService {
   }
 
   private async persistActionError(
+    operation: DesktopNotificationOperation,
+    detail: string | null
+  ): Promise<void> {
+    return this.enqueueStoreMutation(() => this.persistActionErrorNow(operation, detail));
+  }
+
+  private async persistActionErrorNow(
     operation: DesktopNotificationOperation,
     detail: string | null
   ): Promise<void> {
@@ -1050,9 +1120,13 @@ export class NotificationService {
         : operation.errorDetail;
       this.fallbackActionBaseDetails.delete(key);
       this.upsertFallbackOperation({ ...operation, errorDetail: detail });
-      this.fallbackActionBaseDetails.set(key, baseDetail);
+      if (this.fallbackOperations.has(key)) {
+        this.fallbackActionBaseDetails.set(key, baseDetail);
+      }
     }
-    this.pendingActionErrors.set(key, { operation, detail, updatedAt });
+    if (this.fallbackOperations.has(key)) {
+      this.pendingActionErrors.set(key, { operation, detail, updatedAt });
+    }
     this.emitSnapshot();
   }
 
@@ -1070,94 +1144,65 @@ export class NotificationService {
     return this.fallbackOperations.get(libraryKey(libraryId, operationId)) ?? null;
   }
 
-  private async tryRecoverStore(): Promise<boolean> {
+  private async tryRecoverStore(signal: AbortSignal): Promise<boolean> {
+    return this.enqueueStoreMutation(() => this.tryRecoverStoreNow(signal));
+  }
+
+  private async tryRecoverStoreNow(signal: AbortSignal): Promise<boolean> {
     if (this.store) return true;
     if (!this.openStore) return false;
     let store: NotificationServiceStore | null = null;
     try {
-      store = await this.openStore();
+      store = await this.openStoreWithSignal(signal);
+      if (signal.aborted) throw signal.reason;
       await this.flushPendingOutboxState(store);
       await this.flushPendingLocalState(store);
       await this.cleanupRetentionIfDue(store, true);
+      const snapshot = await store.compactSnapshot();
+      if (signal.aborted) throw signal.reason;
       this.store = store;
-      this.storedSnapshot = await store.compactSnapshot();
+      this.storedSnapshot = snapshot;
     } catch (error) {
-      if (this.store === store) this.store = null;
       void store?.close?.().catch(() => undefined);
+      if (isAbort(error, signal)) throw error;
       this.setHealth("degraded", this.active?.library.id ?? null, errorMessage(error));
       return false;
     }
+    this.pendingOutbox.clear();
+    this.pendingRecoveryBatches.length = 0;
+    this.protectedRecoveryBatchIds.clear();
     this.clearFallbackFromDurableState();
     this.setHealth("healthy", this.active?.library.id ?? null, null);
     return true;
   }
 
   private async flushPendingLocalState(store: NotificationServiceStore): Promise<void> {
-    while (this.pendingRendererErrors.size > 0) {
-      const entry = this.pendingRendererErrors.entries().next().value as
-        | [string, PendingRendererError]
-        | undefined;
-      if (!entry) break;
-      const [key, pending] = entry;
-      this.pendingRendererErrors.delete(key);
-      try {
-        await store.recordRendererError(
-          pending.library,
-          pending.report,
-          pending.occurredAt,
-          pending.occurrenceIncrement
-        );
-      } catch (error) {
-        const newer = this.pendingRendererErrors.get(key);
-        this.pendingRendererErrors.set(key, {
-          ...pending,
-          report: newer?.report ?? pending.report,
-          occurredAt: Math.max(pending.occurredAt, newer?.occurredAt ?? pending.occurredAt),
-          occurrenceIncrement:
-            pending.occurrenceIncrement + (newer?.occurrenceIncrement ?? 0)
-        });
-        throw error;
-      }
+    if (
+      this.pendingRendererErrors.size > 0 ||
+      this.pendingLocalThumbnails.size > 0 ||
+      this.pendingActionErrors.size > 0
+    ) {
+      this.pendingRecoveryBatches.push({
+        batchId: randomUUID(),
+        rendererErrors: [...this.pendingRendererErrors.values()],
+        thumbnails: [...this.pendingLocalThumbnails.values()],
+        actionErrors: [...this.pendingActionErrors.values()].map((pending) => ({
+          libraryId: pending.operation.libraryId,
+          operationId: pending.operation.operationId,
+          expectedRevision: pending.operation.revision,
+          detail: pending.detail,
+          updatedAt: pending.updatedAt
+        })),
+        createdAt: this.now()
+      });
+      this.pendingRendererErrors.clear();
+      this.pendingLocalThumbnails.clear();
+      this.pendingActionErrors.clear();
     }
-    while (this.pendingLocalThumbnails.size > 0) {
-      const entry = this.pendingLocalThumbnails.entries().next().value as
-        | [string, ThumbnailCacheSummary]
-        | undefined;
-      if (!entry) break;
-      const [key, summary] = entry;
-      this.pendingLocalThumbnails.delete(key);
-      try {
-        await store.publishThumbnailSummary(summary);
-      } catch (error) {
-        const newer = this.pendingLocalThumbnails.get(key);
-        if (!newer || summary.observedAt > newer.observedAt) {
-          this.pendingLocalThumbnails.set(key, summary);
-        }
-        throw error;
-      }
-    }
-    while (this.pendingActionErrors.size > 0) {
-      const entry = this.pendingActionErrors.entries().next().value as
-        | [string, PendingActionError]
-        | undefined;
-      if (!entry) break;
-      const [key, pending] = entry;
-      this.pendingActionErrors.delete(key);
-      try {
-        await store.setOperationActionError(
-          pending.operation.libraryId,
-          pending.operation.operationId,
-          pending.operation.revision,
-          pending.detail,
-          pending.updatedAt
-        );
-      } catch (error) {
-        const newer = this.pendingActionErrors.get(key);
-        if (!newer || pending.updatedAt > newer.updatedAt) {
-          this.pendingActionErrors.set(key, pending);
-        }
-        throw error;
-      }
+    for (const batch of this.pendingRecoveryBatches) {
+      // Once transmission starts, keep the payload stable even if the commit response is lost.
+      this.protectedRecoveryBatchIds.add(batch.batchId);
+      await store.applyLocalRecoveryBatch(batch, this.now());
     }
   }
 
@@ -1165,9 +1210,6 @@ export class NotificationService {
     const pending = [...this.pendingOutbox.values()];
     for (const batch of pending) {
       await store.applyOutboxBatch(batch.library, batch.events, batch.maxSequence);
-    }
-    for (const batch of pending) {
-      this.pendingOutbox.delete(batch.library.id);
     }
   }
 
@@ -1227,11 +1269,7 @@ export class NotificationService {
       this.upsertFallbackOperation(operation);
     }
     for (const summary of this.storedSnapshot.thumbnailSummaries) {
-      this.fallbackThumbnails.set(summary.libraryId, summary);
-      this.fallbackLibraries.set(summary.libraryId, {
-        id: summary.libraryId,
-        name: summary.libraryName
-      });
+      this.upsertFallbackThumbnail(summary);
     }
   }
 
@@ -1255,7 +1293,7 @@ export class NotificationService {
       (total, item) => total + item.events.length,
       0
     );
-    while (eventCount > FALLBACK_OPERATION_LIMIT) {
+    while (eventCount > FALLBACK_RECORD_LIMIT) {
       const oldest = this.pendingOutbox.entries().next().value as
         | [string, PendingOutboxBatch]
         | undefined;
@@ -1269,7 +1307,7 @@ export class NotificationService {
     library: NotificationLibraryIdentity,
     report: RendererErrorReport
   ): DesktopNotificationOperation {
-    const operationId = `renderer-error:${library.id}:${report.source}:${report.code}:${report.target}`;
+    const operationId = rendererErrorOperationId(library.id, report);
     const key = libraryKey(library.id, operationId);
     const existing = this.fallbackOperations.get(key);
     const occurredAt = this.now();
@@ -1320,17 +1358,7 @@ export class NotificationService {
     }
     this.fallbackOperations.delete(key);
     this.fallbackOperations.set(key, operation);
-    while (this.fallbackOperations.size > FALLBACK_OPERATION_LIMIT) {
-      const oldestCompleted = [...this.fallbackOperations.entries()].find(
-        ([, item]) => item.status !== "pending" && item.status !== "running"
-      );
-      const keyToDelete = oldestCompleted?.[0] ?? this.fallbackOperations.keys().next().value;
-      if (typeof keyToDelete !== "string") break;
-      this.fallbackOperations.delete(keyToDelete);
-      this.pendingRendererErrors.delete(keyToDelete);
-      this.pendingActionErrors.delete(keyToDelete);
-      this.fallbackActionBaseDetails.delete(keyToDelete);
-    }
+    this.touchFallbackRecord(fallbackOperationKey(operation.libraryId, operation.operationId));
   }
 
   private fallbackHistory(query: NotificationHistoryQuery): NotificationHistoryPage {
@@ -1392,6 +1420,104 @@ export class NotificationService {
     this.fallbackOperations.clear();
     this.fallbackThumbnails.clear();
     this.fallbackActionBaseDetails.clear();
+    this.fallbackRecordOrder.clear();
+  }
+
+  private upsertFallbackThumbnail(summary: ThumbnailCacheSummary): boolean {
+    const existing = this.fallbackThumbnails.get(summary.libraryId);
+    if (existing && summary.observedAt < existing.observedAt) return false;
+    this.fallbackThumbnails.delete(summary.libraryId);
+    this.fallbackThumbnails.set(summary.libraryId, summary);
+    this.touchFallbackRecord(fallbackThumbnailKey(summary.libraryId));
+    return this.fallbackThumbnails.has(summary.libraryId);
+  }
+
+  private touchFallbackRecord(recordKey: string): void {
+    this.fallbackRecordOrder.delete(recordKey);
+    this.fallbackRecordOrder.set(recordKey, true);
+    while (this.fallbackRecordOrder.size > FALLBACK_RECORD_LIMIT) {
+      const oldest = [...this.fallbackRecordOrder.keys()].find(
+        (key) => !this.isAppliedRecoveryRecord(key)
+      );
+      if (typeof oldest !== "string") break;
+      this.evictFallbackRecord(oldest);
+    }
+  }
+
+  private isAppliedRecoveryRecord(recordKey: string): boolean {
+    const [kind, libraryId, ...rest] = recordKey.split("\u0000");
+    const operationId = rest.join("\u0000");
+    return this.pendingRecoveryBatches.some((batch) => {
+      if (!this.protectedRecoveryBatchIds.has(batch.batchId)) return false;
+      if (kind === "thumbnail") {
+        return batch.thumbnails.some((summary) => summary.libraryId === libraryId);
+      }
+      if (kind !== "operation") return false;
+      return (
+        batch.rendererErrors.some(
+          (pending) =>
+            pending.library.id === libraryId &&
+            rendererErrorOperationId(pending.library.id, pending.report) === operationId
+        ) ||
+        batch.actionErrors.some(
+          (pending) => pending.libraryId === libraryId && pending.operationId === operationId
+        )
+      );
+    });
+  }
+
+  private evictFallbackRecord(recordKey: string): void {
+    this.fallbackRecordOrder.delete(recordKey);
+    const [kind, libraryId, ...rest] = recordKey.split("\u0000");
+    if (kind === "thumbnail") {
+      this.fallbackThumbnails.delete(libraryId);
+      this.pendingLocalThumbnails.delete(libraryId);
+      for (let index = this.pendingRecoveryBatches.length - 1; index >= 0; index -= 1) {
+        const batch = this.pendingRecoveryBatches[index]!;
+        batch.thumbnails = batch.thumbnails.filter((item) => item.libraryId !== libraryId);
+        if (
+          batch.rendererErrors.length === 0 &&
+          batch.thumbnails.length === 0 &&
+          batch.actionErrors.length === 0
+        ) {
+          this.pendingRecoveryBatches.splice(index, 1);
+        }
+      }
+      return;
+    }
+    if (kind !== "operation") return;
+    const operationId = rest.join("\u0000");
+    const key = libraryKey(libraryId, operationId);
+    this.fallbackOperations.delete(key);
+    this.pendingRendererErrors.delete(key);
+    this.pendingActionErrors.delete(key);
+    this.fallbackActionBaseDetails.delete(key);
+    for (const [pendingLibraryId, batch] of this.pendingOutbox) {
+      if (
+        batch.library.id === libraryId &&
+        batch.events.some((event) => event.operation.operationId === operationId)
+      ) {
+        this.pendingOutbox.delete(pendingLibraryId);
+      }
+    }
+    for (let index = this.pendingRecoveryBatches.length - 1; index >= 0; index -= 1) {
+      const batch = this.pendingRecoveryBatches[index]!;
+      batch.rendererErrors = batch.rendererErrors.filter(
+        (pending) =>
+          pending.library.id !== libraryId ||
+          rendererErrorOperationId(pending.library.id, pending.report) !== operationId
+      );
+      batch.actionErrors = batch.actionErrors.filter(
+        (pending) => pending.libraryId !== libraryId || pending.operationId !== operationId
+      );
+      if (
+        batch.rendererErrors.length === 0 &&
+        batch.thumbnails.length === 0 &&
+        batch.actionErrors.length === 0
+      ) {
+        this.pendingRecoveryBatches.splice(index, 1);
+      }
+    }
   }
 
   private setHealth(
@@ -1427,6 +1553,39 @@ export class NotificationService {
     this.active = null;
     active.controller.abort(new DOMException("Library detached", "AbortError"));
     await active.loop.catch(() => undefined);
+  }
+
+  private async openStoreWithSignal(signal: AbortSignal): Promise<NotificationServiceStore> {
+    if (!this.openStore) throw new Error("notification history store opener is unavailable");
+    if (signal.aborted) throw signal.reason;
+    const opening = Promise.resolve().then(() => this.openStore!(signal));
+    let onAbort!: () => void;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([opening, aborted]);
+    } catch (error) {
+      if (signal.aborted) {
+        void opening.then(
+          (store) => store.close?.().catch(() => undefined),
+          () => undefined
+        );
+      }
+      throw error;
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  private enqueueStoreMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.storeMutationTail.then(operation, operation);
+    this.storeMutationTail = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
   }
 
   private enqueueLifecycle(operation: () => Promise<void>): Promise<void> {
