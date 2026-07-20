@@ -3,7 +3,6 @@ import { DatabaseSync } from "node:sqlite";
 
 import type {
   DesktopNotificationOperation,
-  NotificationCompactSnapshot,
   NotificationHistoryPage,
   NotificationHistoryQuery,
   NotificationLibraryIdentity,
@@ -11,14 +10,15 @@ import type {
   NotificationRetentionResult,
   NotificationStoreRequest,
   NotificationStoreSerializedError,
+  NotificationStoredSnapshot,
   NotificationStoreWorkerMessage,
+  RendererErrorReport,
   ThumbnailCacheSummary
 } from "./notification-types.js";
 
 const SCHEMA_VERSION = 2;
 const COMPLETED_RETENTION_LIMIT = 2_000;
 const COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
-const ACTIVE_STATUSES = new Set(["pending", "running"]);
 const OPERATION_STATUSES = new Set(["pending", "running", "succeeded", "failed", "cancelled"]);
 const CATEGORIES = new Set(["task", "file_operation", "error", "thumbnail_cache"]);
 const ORIGINS = new Set(["user", "background", "recovery", "system"]);
@@ -260,6 +260,49 @@ class NotificationStoreDatabase {
       validateOperation(item.operation);
     }
 
+    const cursorStatement = this.database.prepare(`
+      INSERT INTO sync_cursors (library_id, sequence) VALUES (?, ?)
+      ON CONFLICT(library_id) DO UPDATE SET sequence = MAX(sync_cursors.sequence, excluded.sequence)
+    `);
+
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.upsertOperationRows(
+        library,
+        events.map((item) => item.operation)
+      );
+      cursorStatement.run(library.id, maxSequence);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  upsertOperations(
+    library: NotificationLibraryIdentity,
+    operations: NotificationOperationInput[]
+  ): void {
+    validateLibrary(library);
+    if (!Array.isArray(operations)) {
+      throw new TypeError("operations must be an array");
+    }
+    for (const operation of operations) validateOperation(operation);
+
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      this.upsertOperationRows(library, operations);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  private upsertOperationRows(
+    library: NotificationLibraryIdentity,
+    operations: NotificationOperationInput[]
+  ): void {
     const existingStatement = this.database.prepare(
       "SELECT revision, payload_json FROM operations WHERE library_id = ? AND operation_id = ?"
     );
@@ -279,47 +322,32 @@ class NotificationStoreDatabase {
         payload_json = excluded.payload_json
       WHERE excluded.revision > operations.revision
     `);
-    const cursorStatement = this.database.prepare(`
-      INSERT INTO sync_cursors (library_id, sequence) VALUES (?, ?)
-      ON CONFLICT(library_id) DO UPDATE SET sequence = MAX(sync_cursors.sequence, excluded.sequence)
-    `);
-
-    this.database.exec("BEGIN IMMEDIATE;");
-    try {
-      for (const item of events) {
-        const payloadJson = JSON.stringify(item.operation);
-        const existing = existingStatement.get(library.id, item.operation.operationId) as
-          | { revision: number; payload_json: string }
-          | undefined;
-        if (existing && item.operation.revision < existing.revision) {
-          continue;
+    for (const operation of operations) {
+      const payloadJson = JSON.stringify(operation);
+      const existing = existingStatement.get(library.id, operation.operationId) as
+        | { revision: number; payload_json: string }
+        | undefined;
+      if (existing && operation.revision < existing.revision) continue;
+      if (existing && operation.revision === existing.revision) {
+        if (existing.payload_json !== payloadJson) {
+          throw new Error(
+            `Conflicting payload for ${library.id}/${operation.operationId} revision ${operation.revision}`
+          );
         }
-        if (existing && item.operation.revision === existing.revision) {
-          if (existing.payload_json !== payloadJson) {
-            throw new Error(
-              `Conflicting payload for ${library.id}/${item.operation.operationId} revision ${item.operation.revision}`
-            );
-          }
-          continue;
-        }
-        insertStatement.run(
-          library.id,
-          item.operation.operationId,
-          library.name,
-          item.operation.revision,
-          item.operation.status,
-          item.operation.category,
-          item.operation.presentation,
-          item.operation.updatedAt,
-          item.operation.completedAt,
-          payloadJson
-        );
+        continue;
       }
-      cursorStatement.run(library.id, maxSequence);
-      this.database.exec("COMMIT;");
-    } catch (error) {
-      this.database.exec("ROLLBACK;");
-      throw error;
+      insertStatement.run(
+        library.id,
+        operation.operationId,
+        library.name,
+        operation.revision,
+        operation.status,
+        operation.category,
+        operation.presentation,
+        operation.updatedAt,
+        operation.completedAt,
+        payloadJson
+      );
     }
   }
 
@@ -331,7 +359,7 @@ class NotificationStoreDatabase {
     return row?.sequence ?? 0;
   }
 
-  compactSnapshot(): NotificationCompactSnapshot {
+  compactSnapshot(): NotificationStoredSnapshot {
     const active = this.database
       .prepare(
         `SELECT library_id, library_name, payload_json
@@ -432,6 +460,84 @@ class NotificationStoreDatabase {
     return { items: rows.map(rowToOperation), total: totalRow.total, nextOffset };
   }
 
+  getOperation(libraryId: string, operationId: string): DesktopNotificationOperation | null {
+    assertString(libraryId, "libraryId");
+    assertString(operationId, "operationId");
+    const row = this.database
+      .prepare(
+        `SELECT library_id, library_name, payload_json FROM operations
+         WHERE library_id = ? AND operation_id = ?`
+      )
+      .get(libraryId, operationId) as OperationRow | undefined;
+    return row ? rowToOperation(row) : null;
+  }
+
+  recordRendererError(
+    library: NotificationLibraryIdentity,
+    report: RendererErrorReport,
+    occurredAt: number,
+    occurrenceIncrement: number
+  ): DesktopNotificationOperation {
+    validateLibrary(library);
+    assertObject(report, "renderer error report");
+    for (const [name, value] of [
+      ["source", report.source],
+      ["code", report.code],
+      ["target", report.target],
+      ["title", report.title],
+      ["message", report.message]
+    ] as const) {
+      assertString(value, `renderer error ${name}`);
+    }
+    assertNullableString(report.detail, "renderer error detail");
+    assertSafeInteger(occurredAt, "renderer error occurredAt");
+    assertSafeInteger(occurrenceIncrement, "renderer error occurrenceIncrement", 1);
+
+    const operationId = `renderer-error:${library.id}:${report.source}:${report.code}:${report.target}`;
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const existing = this.getOperation(library.id, operationId);
+      const revision = (existing?.revision ?? 0) + 1;
+      const occurrenceCount = (existing?.occurrenceCount ?? 0) + occurrenceIncrement;
+      assertSafeInteger(revision, "renderer error revision", 1);
+      assertSafeInteger(occurrenceCount, "renderer error occurrenceCount", 1);
+      const operation: NotificationOperationInput = {
+        operationId,
+        revision,
+        kind: "renderer_error",
+        category: "error",
+        origin: "system",
+        presentation: "important",
+        status: "failed",
+        phase: "reported",
+        title: report.title,
+        summary: report.message,
+        taskId: null,
+        rootId: null,
+        folderId: null,
+        fileId: null,
+        currentValue: occurrenceCount,
+        totalValue: null,
+        unit: "occurrences",
+        errorCode: report.code,
+        errorDetail: report.detail,
+        cancellable: false,
+        retryable: false,
+        attempt: 1,
+        occurrenceCount,
+        startedAt: existing?.startedAt ?? occurredAt,
+        updatedAt: occurredAt,
+        completedAt: occurredAt
+      };
+      this.upsertOperationRows(library, [operation]);
+      this.database.exec("COMMIT;");
+      return { ...operation, libraryId: library.id, libraryName: library.name };
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
   publishThumbnailSummary(summary: ThumbnailCacheSummary): void {
     validateThumbnailSummary(summary);
     const payloadJson = JSON.stringify(summary);
@@ -523,12 +629,24 @@ function executeRequest(store: NotificationStoreDatabase, request: NotificationS
         request.params.maxSequence
       );
       return null;
+    case "upsertOperations":
+      store.upsertOperations(request.params.library, request.params.operations);
+      return null;
     case "cursor":
       return store.cursor(request.params.libraryId);
     case "compactSnapshot":
       return store.compactSnapshot();
     case "history":
       return store.history(request.params.query);
+    case "getOperation":
+      return store.getOperation(request.params.libraryId, request.params.operationId);
+    case "recordRendererError":
+      return store.recordRendererError(
+        request.params.library,
+        request.params.report,
+        request.params.occurredAt,
+        request.params.occurrenceIncrement
+      );
     case "publishThumbnailSummary":
       store.publishThumbnailSummary(request.params.summary);
       return null;
@@ -546,9 +664,12 @@ function executeRequest(store: NotificationStoreDatabase, request: NotificationS
 
 const REQUEST_METHODS = new Set<NotificationStoreRequest["method"]>([
   "applyOutboxBatch",
+  "upsertOperations",
   "cursor",
   "compactSnapshot",
   "history",
+  "getOperation",
+  "recordRendererError",
   "publishThumbnailSummary",
   "hasLegacyImport",
   "markLegacyImported",

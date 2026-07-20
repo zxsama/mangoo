@@ -68,10 +68,14 @@ export interface ThumbnailCacheSummary {
   completionPercent: number | null;
 }
 
-export interface NotificationCompactSnapshot {
+export interface NotificationStoredSnapshot {
   active: DesktopNotificationOperation[];
   thumbnailSummaries: ThumbnailCacheSummary[];
   latestImportantResults: DesktopNotificationOperation[];
+}
+
+export interface NotificationCompactSnapshot extends NotificationStoredSnapshot {
+  syncHealth: NotificationSyncHealth;
 }
 
 export interface NotificationHistoryQuery {
@@ -94,6 +98,22 @@ export interface NotificationSyncHealth {
   libraryId: string | null;
   detail: string | null;
   updatedAt: number;
+}
+
+export interface RendererErrorReport {
+  libraryId: string;
+  libraryName: string;
+  source: string;
+  code: string;
+  target: string;
+  title: string;
+  message: string;
+  detail: string | null;
+}
+
+export interface NotificationActionResult {
+  ok: boolean;
+  message: string | null;
 }
 
 export interface ProcessLogEntry {
@@ -119,9 +139,32 @@ export type NotificationStoreRequest =
         maxSequence: number;
       };
     }
+  | {
+      requestId: string;
+      method: "upsertOperations";
+      params: {
+        library: NotificationLibraryIdentity;
+        operations: NotificationOperationInput[];
+      };
+    }
   | { requestId: string; method: "cursor"; params: { libraryId: string } }
   | { requestId: string; method: "compactSnapshot"; params: Record<string, never> }
   | { requestId: string; method: "history"; params: { query: NotificationHistoryQuery } }
+  | {
+      requestId: string;
+      method: "getOperation";
+      params: { libraryId: string; operationId: string };
+    }
+  | {
+      requestId: string;
+      method: "recordRendererError";
+      params: {
+        library: NotificationLibraryIdentity;
+        report: RendererErrorReport;
+        occurredAt: number;
+        occurrenceIncrement: number;
+      };
+    }
   | {
       requestId: string;
       method: "publishThumbnailSummary";

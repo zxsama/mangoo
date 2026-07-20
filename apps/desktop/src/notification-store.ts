@@ -3,15 +3,18 @@ import path from "node:path";
 import { Worker } from "node:worker_threads";
 
 import type {
-  NotificationCompactSnapshot,
+  DesktopNotificationOperation,
   NotificationHistoryPage,
   NotificationHistoryQuery,
   NotificationLibraryIdentity,
+  NotificationOperationInput,
   NotificationRetentionResult,
   NotificationStoreEvent,
   NotificationStoreRequest,
   NotificationStoreSerializedError,
+  NotificationStoredSnapshot,
   NotificationStoreWorkerMessage,
+  RendererErrorReport,
   ThumbnailCacheSummary
 } from "./notification-types.js";
 
@@ -111,8 +114,19 @@ export class NotificationStore {
     });
   }
 
-  async compactSnapshot(): Promise<NotificationCompactSnapshot> {
-    return this.request<NotificationCompactSnapshot>({
+  async upsertOperations(
+    library: NotificationLibraryIdentity,
+    operations: NotificationOperationInput[]
+  ): Promise<void> {
+    await this.request<void>({
+      requestId: this.nextRequestId(),
+      method: "upsertOperations",
+      params: { library, operations }
+    });
+  }
+
+  async compactSnapshot(): Promise<NotificationStoredSnapshot> {
+    return this.request<NotificationStoredSnapshot>({
       requestId: this.nextRequestId(),
       method: "compactSnapshot",
       params: {}
@@ -124,6 +138,30 @@ export class NotificationStore {
       requestId: this.nextRequestId(),
       method: "history",
       params: { query }
+    });
+  }
+
+  async getOperation(
+    libraryId: string,
+    operationId: string
+  ): Promise<DesktopNotificationOperation | null> {
+    return this.request<DesktopNotificationOperation | null>({
+      requestId: this.nextRequestId(),
+      method: "getOperation",
+      params: { libraryId, operationId }
+    });
+  }
+
+  async recordRendererError(
+    library: NotificationLibraryIdentity,
+    report: RendererErrorReport,
+    occurredAt: number,
+    occurrenceIncrement = 1
+  ): Promise<DesktopNotificationOperation> {
+    return this.request<DesktopNotificationOperation>({
+      requestId: this.nextRequestId(),
+      method: "recordRendererError",
+      params: { library, report, occurredAt, occurrenceIncrement }
     });
   }
 

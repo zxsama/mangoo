@@ -13,6 +13,7 @@ import {
 import type {
   NotificationLibraryIdentity,
   NotificationOperationInput,
+  RendererErrorReport,
   NotificationStoreEvent,
   NotificationStoreWorkerMessage,
   ThumbnailCacheSummary
@@ -285,6 +286,49 @@ describe("notification store", () => {
       await store.markLegacyImported(LIBRARY_A.id, NOW + 1_000);
       assert.equal(await store.hasLegacyImport(LIBRARY_A.id), true);
       assert.equal(await store.hasLegacyImport(LIBRARY_B.id), false);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("upserts local operations and atomically aggregates renderer error occurrences", async () => {
+    const store = await createTestStore();
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "library-data",
+      code: "load-failed",
+      target: "folder:4",
+      title: "Folder load failed",
+      message: "Could not load folder",
+      detail: "database busy"
+    };
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        operation("legacy-file-op:9", 1, "succeeded", {
+          kind: "move",
+          category: "file_operation",
+          taskId: null
+        })
+      ]);
+      assert.equal(
+        (await store.getOperation(LIBRARY_A.id, "legacy-file-op:9"))?.kind,
+        "move"
+      );
+
+      await store.recordRendererError(LIBRARY_A, report, NOW, 1);
+      const aggregated = await store.recordRendererError(LIBRARY_A, report, NOW + 1, 3);
+      assert.equal(aggregated.revision, 2);
+      assert.equal(aggregated.occurrenceCount, 4);
+      assert.equal(
+        (
+          await store.getOperation(
+            LIBRARY_A.id,
+            `renderer-error:${LIBRARY_A.id}:${report.source}:${report.code}:${report.target}`
+          )
+        )?.occurrenceCount,
+        4
+      );
     } finally {
       await store.close();
     }
