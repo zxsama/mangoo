@@ -4,13 +4,43 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CoreSession } from "./core-session.js";
+import type { ProcessLogLevel } from "./process-log-buffer.js";
 
 export interface CoreProcessHandle {
   process: ChildProcess | null;
   stop: () => void;
 }
 
-export function startCoreProcess(session: CoreSession): CoreProcessHandle {
+export type CoreProcessLogHandler = (
+  source: "core",
+  level: Extract<ProcessLogLevel, "info" | "warn" | "error">,
+  message: string
+) => void;
+
+export function createCoreOutputLineSplitter(onLine: (line: string) => void): {
+  push: (chunk: string) => void;
+  flush: () => void;
+} {
+  let pending = "";
+  return {
+    push(chunk) {
+      pending += chunk;
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? "";
+      for (const line of lines) onLine(line);
+    },
+    flush() {
+      if (pending.length === 0) return;
+      onLine(pending);
+      pending = "";
+    }
+  };
+}
+
+export function startCoreProcess(
+  session: CoreSession,
+  onLog: CoreProcessLogHandler = defaultCoreProcessLogHandler
+): CoreProcessHandle {
   if (process.env.MEGLE_CORE_EXTERNAL === "1") {
     return {
       process: null,
@@ -38,15 +68,27 @@ export function startCoreProcess(session: CoreSession): CoreProcessHandle {
     windowsHide: true
   });
 
+  const stdoutSplitter = createCoreOutputLineSplitter((line) => emitCoreLog(onLog, "info", line));
+  const stderrSplitter = createCoreOutputLineSplitter((line) => emitCoreLog(onLog, "warn", line));
   child.stdout?.on("data", (chunk: Buffer) => {
-    process.stdout.write(`[core] ${chunk.toString()}`);
+    const text = chunk.toString();
+    process.stdout.write(`[core stdout] ${text}`);
+    stdoutSplitter.push(text);
   });
   child.stderr?.on("data", (chunk: Buffer) => {
-    process.stderr.write(`[core] ${chunk.toString()}`);
+    const text = chunk.toString();
+    process.stderr.write(`[core stderr] ${text}`);
+    stderrSplitter.push(text);
   });
   child.on("exit", (code, signal) => {
+    stdoutSplitter.flush();
+    stderrSplitter.flush();
     if (code !== 0 && signal !== "SIGTERM") {
-      console.error(`[core] exited with code=${code} signal=${signal ?? "none"}`);
+      emitCoreLog(
+        onLog,
+        "error",
+        `Core exited with code=${code} signal=${signal ?? "none"}`
+      );
     }
   });
 
@@ -56,6 +98,28 @@ export function startCoreProcess(session: CoreSession): CoreProcessHandle {
       stopCoreProcessTree(child);
     }
   };
+}
+
+function defaultCoreProcessLogHandler(
+  _source: "core",
+  level: Extract<ProcessLogLevel, "info" | "warn" | "error">,
+  message: string
+): void {
+  const method = level === "info" ? "log" : level;
+  const sink = console[method] ?? console.log;
+  sink(`[core ${level}] ${message}`);
+}
+
+function emitCoreLog(
+  onLog: CoreProcessLogHandler,
+  level: Extract<ProcessLogLevel, "info" | "warn" | "error">,
+  message: string
+): void {
+  try {
+    onLog("core", level, message);
+  } catch {
+    // A log sink must not affect Core process lifecycle.
+  }
 }
 
 export async function waitForCoreHealth(

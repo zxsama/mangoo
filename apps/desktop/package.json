@@ -6,7 +6,7 @@
   "main": "dist/main.js",
   "scripts": {
     "dev": "npm --prefix ../.. run dev",
-    "test": "node --no-warnings --import ./tests/filter-sqlite-experimental-warning.mjs --experimental-strip-types --test tests/*.test.mts",
+    "test": "node --no-warnings --import ./tests/filter-sqlite-experimental-warning.mjs --import ./tests/register-source-imports.mjs --experimental-strip-types --test tests/*.test.mts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('src/preload.cjs', 'dist/preload.cjs')\""
   },

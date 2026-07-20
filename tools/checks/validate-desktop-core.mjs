@@ -518,7 +518,7 @@ const startupFailureBody = functionBody(main, "function handleDesktopStartupFail
 if (!startupFailureBody) {
   fail("desktop main must centralize startup failure handling");
 } else {
-  if (!startupFailureBody.includes("console.error")) {
+  if (!startupFailureBody.includes("console.error") && !startupFailureBody.includes("desktopLogger.error")) {
     fail("desktop startup failure handler must log the failure clearly");
   }
   if (!startupFailureBody.includes("app.exit(1)")) {

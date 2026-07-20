@@ -17,6 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startCoreProcess, waitForCoreHealth, type CoreProcessHandle } from "./core-process.js";
 import { createCoreSession, type CoreSession } from "./core-session.js";
+import { desktopLogger } from "./desktop-logger.js";
 import * as libraryRegistry from "./library-registry.js";
 import { sessionForDbPath } from "./core-session.js";
 import {
@@ -570,10 +571,15 @@ async function createWindow(): Promise<void> {
     "did-fail-load",
     (_event, errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
       if (!isMainFrame) return;
+      desktopLogger.error("renderer", "Main renderer failed to load", { errorCode });
       void revealMainWindowForLaunchFailure(window, `did-fail-load:${errorCode}`);
     }
   );
   window.webContents.on("render-process-gone", (_event, details) => {
+    desktopLogger.error("renderer", "Main renderer process gone", {
+      reason: details.reason,
+      exitCode: details.exitCode
+    });
     void revealMainWindowForLaunchFailure(window, `render-process-gone:${details.reason}`);
   });
 
@@ -614,7 +620,7 @@ async function createWindow(): Promise<void> {
     armShellReadyFailureFallback(window);
   } catch (error) {
     await revealMainWindowForLaunchFailure(window, "loadURL-rejected");
-    console.warn("[megle] desktop renderer loadURL rejected:", error);
+    desktopLogger.warn("main", "[megle] desktop renderer loadURL rejected:", error);
   }
 }
 
@@ -691,8 +697,10 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
   });
   window.webContents.on(
     "did-fail-load",
-    (_event, _errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
-      if (isMainFrame) forceSecondaryWindowReveal(role, window);
+    (_event, errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
+      if (!isMainFrame) return;
+      desktopLogger.error("renderer", `${role} renderer failed to load`, { errorCode });
+      forceSecondaryWindowReveal(role, window);
     }
   );
   window.on("blur", () => {
@@ -725,7 +733,7 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
   try {
     await window.loadURL(`${devServer}${config.route}`);
   } catch (error) {
-    console.warn(`[megle] ${role} window loadURL rejected:`, error);
+    desktopLogger.warn("main", `[megle] ${role} window loadURL rejected:`, error);
     forceSecondaryWindowReveal(role, window);
   }
 }
@@ -806,7 +814,7 @@ function revealSecondaryWindowWhenReady(
   if (warmupToken === null) return;
   void warmSecondaryWindowNativeHost(role, window, readiness, warmupToken)
     .catch((error) => {
-      console.warn(`[megle] ${role} native window warm-up failed:`, error);
+      desktopLogger.warn("main", `[megle] ${role} native window warm-up failed:`, error);
       forceSecondaryWindowReveal(role, window);
     })
     .finally(() => {
@@ -911,14 +919,16 @@ async function startCoreSession(): Promise<CoreSession> {
 
     try {
       const session = await createColdStartSession();
-      pendingProcess = startCoreProcess(session);
+      pendingProcess = startCoreProcess(session, (source, level, message) => {
+        desktopLogger.log(source, level, message);
+      });
       pendingCoreProcess = pendingProcess;
       await waitForCoreHealth(session.baseUrl, session.sessionToken);
       coreProcess = pendingProcess;
       pendingCoreProcess = null;
       coreSession = session;
       if (attempt > 1) {
-        console.log(`[megle] Core startup recovered on attempt ${attempt}/${maxAttempts}`);
+        desktopLogger.info("main", `[megle] Core startup recovered on attempt ${attempt}/${maxAttempts}`);
       }
       return session;
     } catch (error) {
@@ -928,7 +938,8 @@ async function startCoreSession(): Promise<CoreSession> {
       coreSession = null;
 
       if (attempt < maxAttempts) {
-        console.warn(
+        desktopLogger.warn(
+          "main",
           `[megle] Core startup attempt ${attempt}/${maxAttempts} failed; retrying with a fresh session/port:`,
           error
         );
@@ -936,7 +947,11 @@ async function startCoreSession(): Promise<CoreSession> {
       }
 
       coreReadyPromise = null;
-      console.error(`[megle] Core startup attempt ${attempt}/${maxAttempts} failed; no retries remain:`, error);
+      desktopLogger.error(
+        "main",
+        `[megle] Core startup attempt ${attempt}/${maxAttempts} failed; no retries remain:`,
+        error
+      );
       throw error;
     }
   }
@@ -977,7 +992,9 @@ async function restartCoreForLibrary(dbPath: string): Promise<void> {
   await waitForPortFree(base.bindAddress);
 
   const session = sessionForDbPath(base, dbPath);
-  const handle = startCoreProcess(session);
+  const handle = startCoreProcess(session, (source, level, message) => {
+    desktopLogger.log(source, level, message);
+  });
   pendingCoreProcess = handle;
   try {
     pushLibraryPhase("opening-library");
@@ -1108,7 +1125,7 @@ async function revealMainWindowForLaunchFailure(
   }
   const didReveal = await revealMainWindow(window);
   if (didReveal) {
-    console.warn(`[megle] revealing window after renderer startup failure: ${reason}`);
+    desktopLogger.warn("main", `[megle] revealing window after renderer startup failure: ${reason}`);
   }
   return didReveal;
 }
@@ -1430,7 +1447,7 @@ app
   .catch(handleDesktopStartupFailure);
 
 function handleDesktopStartupFailure(error: unknown): void {
-  console.error("[megle] desktop startup failed:", error);
+  desktopLogger.error("main", "[megle] desktop startup failed:", error);
   pendingCoreProcess?.stop();
   pendingCoreProcess = null;
   coreProcess?.stop();
@@ -1454,12 +1471,12 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
     });
     if (!response.ok) {
       const text = await response.text();
-      console.warn(`[megle] MEGLE_AUTO_ADD_ROOT addRoot failed (${response.status}): ${text}`);
+      desktopLogger.warn("main", `[megle] MEGLE_AUTO_ADD_ROOT addRoot failed (${response.status}): ${text}`);
     } else {
-      console.log(`[megle] auto-added root ${target}`);
+      desktopLogger.info("main", `[megle] auto-added root ${target}`);
     }
   } catch (error) {
-    console.warn("[megle] MEGLE_AUTO_ADD_ROOT request failed:", error);
+    desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT request failed:", error);
   }
 }
 
@@ -1491,6 +1508,7 @@ app.on("before-quit", (event) => {
       try {
         await persistWindowState();
       } finally {
+        await desktopLogger.close();
         pendingCoreProcess?.stop();
         pendingCoreProcess = null;
         coreProcess?.stop();
