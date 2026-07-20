@@ -49,20 +49,6 @@ export interface DesktopThumbnailCacheSummary {
 
 export type ThumbnailCacheSummary = DesktopThumbnailCacheSummary;
 
-export interface NotificationRetryableFailureReference {
-  libraryId: string;
-  operationId: string;
-  revision: number;
-}
-
-export interface NotificationStoredSnapshot {
-  active: DesktopNotificationOperation[];
-  thumbnailSummaries: ThumbnailCacheSummary[];
-  latestImportantResults: DesktopNotificationOperation[];
-  retryableFailures: NotificationRetryableFailureReference[];
-  hasRetryableFailure: boolean;
-}
-
 export interface NotificationSyncHealth {
   state: "healthy" | "syncing" | "degraded";
   libraryId: string | null;
@@ -70,7 +56,11 @@ export interface NotificationSyncHealth {
   updatedAt: number;
 }
 
-export interface NotificationCompactSnapshot extends NotificationStoredSnapshot {
+export interface NotificationCompactSnapshot {
+  active: DesktopNotificationOperation[];
+  thumbnailSummaries: ThumbnailCacheSummary[];
+  latestImportantResults: DesktopNotificationOperation[];
+  hasRetryableFailure: boolean;
   syncHealth: NotificationSyncHealth;
 }
 

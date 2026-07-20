@@ -126,8 +126,7 @@ function emptySnapshot(): NotificationStoredSnapshot {
     active: [],
     thumbnailSummaries: [],
     latestImportantResults: [],
-    retryableFailures: [],
-    hasRetryableFailure: false
+    retryableFailures: []
   };
 }
 
@@ -227,7 +226,6 @@ class FakeStore implements NotificationServiceStore {
         .sort((a, b) => (b.completedAt ?? b.updatedAt) - (a.completedAt ?? a.updatedAt))
         .slice(0, 3),
       retryableFailures,
-      hasRetryableFailure: retryableFailures.length > 0
     };
   }
 
@@ -1384,6 +1382,26 @@ describe("notification service", () => {
     await service.close();
   });
 
+  it("projects 2000 internal failure references into one bounded renderer boolean", async () => {
+    const store = new FakeStore();
+    await store.upsertOperations(
+      LIBRARY_A,
+      Array.from({ length: 2_000 }, (_, index) =>
+        operation(`failed:compact:${index}`, 1, "failed", { retryable: true })
+      )
+    );
+    const service = await createNotificationService({ store, now: () => NOW });
+
+    const snapshot = await service.compactSnapshot();
+    assert.equal(snapshot.hasRetryableFailure, true);
+    assert.equal("retryableFailures" in snapshot, false);
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(snapshot), "utf8") < 16_384,
+      "renderer compact payload must stay independent from internal failure count"
+    );
+    await service.close();
+  });
+
   it("clears a stored failure when fallback receives a newer success and keeps it clear after recovery", async () => {
     const store = new FakeStore();
     await store.upsertOperations(LIBRARY_A, [
@@ -1414,14 +1432,12 @@ describe("notification service", () => {
 
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     let snapshot = await service.compactSnapshot();
-    assert.deepEqual(snapshot.retryableFailures, []);
     assert.equal(snapshot.hasRetryableFailure, false);
 
     store.failApply = false;
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     snapshot = await service.compactSnapshot();
     assert.equal(store.operations.get(`${LIBRARY_A.id}/failed:durable`)?.revision, 2);
-    assert.deepEqual(snapshot.retryableFailures, []);
     assert.equal(snapshot.hasRetryableFailure, false);
     await service.close();
   });
@@ -1453,7 +1469,6 @@ describe("notification service", () => {
         })
       )
     ]);
-    assert.deepEqual(running.retryableFailures, []);
     assert.equal(running.hasRetryableFailure, false);
 
     const failedAgain = await createDegradedSnapshot([
@@ -1465,13 +1480,6 @@ describe("notification service", () => {
         })
       ),
       event(2, operation("failed:retry", 3, "failed", { retryable: true }))
-    ]);
-    assert.deepEqual(failedAgain.retryableFailures, [
-      {
-        libraryId: LIBRARY_A.id,
-        operationId: "failed:retry",
-        revision: 3
-      }
     ]);
     assert.equal(failedAgain.hasRetryableFailure, true);
   });
@@ -1508,13 +1516,7 @@ describe("notification service", () => {
         retryable: false
       }
     ]);
-    assert.deepEqual(conflict.compact.retryableFailures, [
-      {
-        libraryId: LIBRARY_A.id,
-        operationId: "failed:conflict",
-        revision: 1
-      }
-    ]);
+    assert.equal(conflict.compact.hasRetryableFailure, true);
     assert.equal(conflict.compact.latestImportantResults[0]?.status, "failed");
     assert.equal(conflict.compact.latestImportantResults[0]?.currentValue, 4);
     assert.equal(conflict.compact.latestImportantResults[0]?.errorDetail, "original failure");
@@ -1522,11 +1524,12 @@ describe("notification service", () => {
     assert.equal(conflict.history.items[0]?.status, "failed");
     assert.equal(conflict.history.items[0]?.currentValue, 4);
     assert.equal(conflict.history.items[0]?.errorDetail, "original failure");
+    assert.match(conflict.compact.syncHealth.detail ?? "", /conflict.*revision 1/i);
 
     const identical = await runFallback([failed, { ...failed }]);
     assert.equal(identical.history.total, 1);
     assert.equal(identical.history.items[0]?.status, "failed");
-    assert.equal(identical.compact.retryableFailures[0]?.revision, 1);
+    assert.equal(identical.compact.hasRetryableFailure, true);
 
     const succeeded = await runFallback([
       failed,
@@ -1536,7 +1539,7 @@ describe("notification service", () => {
         retryable: false
       })
     ]);
-    assert.deepEqual(succeeded.compact.retryableFailures, []);
+    assert.equal(succeeded.compact.hasRetryableFailure, false);
     assert.equal(succeeded.compact.latestImportantResults[0]?.status, "succeeded");
     assert.equal(succeeded.history.items[0]?.revision, 2);
     assert.equal(succeeded.history.items[0]?.status, "succeeded");
@@ -1569,13 +1572,6 @@ describe("notification service", () => {
 
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     const snapshot = await service.compactSnapshot();
-    assert.deepEqual(snapshot.retryableFailures, [
-      {
-        libraryId: LIBRARY_A.id,
-        operationId: "failed:durable",
-        revision: 1
-      }
-    ]);
     assert.equal(snapshot.hasRetryableFailure, true);
     await service.close();
   });
@@ -1604,24 +1600,26 @@ describe("notification service", () => {
 
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     const snapshot = await service.compactSnapshot();
-    assert.deepEqual(snapshot.retryableFailures, [
-      {
-        libraryId: LIBRARY_A.id,
-        operationId: "failed:second",
-        revision: 1
-      }
-    ]);
     assert.equal(snapshot.hasRetryableFailure, true);
     await service.close();
   });
 
   it("caps fallback-origin retryable references with the 500 logical-record limit", async () => {
-    const events = Array.from({ length: 510 }, (_, index) =>
+    const failures = Array.from({ length: 510 }, (_, index) =>
       event(
         index + 1,
         operation(`failed:fallback:${index}`, 1, "failed", { retryable: true })
       )
     );
+    const resolutions = Array.from({ length: 500 }, (_, index) =>
+      event(
+        index + 511,
+        operation(`failed:fallback:${index + 10}`, 2, "succeeded", {
+          retryable: false
+        })
+      )
+    );
+    const events = [...failures, ...resolutions];
     const service = await createNotificationService({
       openStore: async () => {
         throw new Error("worker unavailable");
@@ -1634,11 +1632,7 @@ describe("notification service", () => {
     const snapshot = await service.compactSnapshot();
     const history = await service.history({ limit: 200, offset: 0 });
     assert.equal(history.total, 500);
-    assert.equal(snapshot.retryableFailures.length, 500);
-    assert.deepEqual(
-      new Set(snapshot.retryableFailures.map((item) => item.operationId)),
-      new Set(Array.from({ length: 500 }, (_, index) => `failed:fallback:${index + 10}`))
-    );
+    assert.equal(snapshot.hasRetryableFailure, false);
     await service.close();
   });
 
@@ -1653,16 +1647,25 @@ describe("notification service", () => {
     await recoveredStore.upsertOperations(LIBRARY_B, [
       operation("failed:recovered", 4, "failed", { retryable: true })
     ]);
-    const events: NotificationStoreEvent[] = [
+    const failureEvents: NotificationStoreEvent[] = [
       event(1, operation("failed:reused", 1, "failed", { retryable: true })),
       ...Array.from({ length: 500 }, (_, index) =>
         event(
           index + 2,
           operation(`failed:unique:${index}`, 1, "failed", { retryable: true })
         )
-      ),
-      event(502, operation("failed:reused", 2, "failed", { retryable: true }))
+      )
     ];
+    const resolutionEvents: NotificationStoreEvent[] = [
+      event(502, operation("failed:reused", 2, "succeeded", { retryable: false })),
+      ...Array.from({ length: 499 }, (_, index) =>
+        event(
+          index + 503,
+          operation(`failed:unique:${index + 1}`, 2, "succeeded", { retryable: false })
+        )
+      )
+    ];
+    const events = [...failureEvents, ...resolutionEvents];
     let listCalls = 0;
     const service = await createNotificationService({
       store: failedStore,
@@ -1684,32 +1687,21 @@ describe("notification service", () => {
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     let snapshot = await service.compactSnapshot();
     assert.equal((await service.history({ limit: 200, offset: 0 })).total, 500);
-    assert.equal(snapshot.retryableFailures.length, 501);
-    assert.deepEqual(
-      snapshot.retryableFailures.filter((item) => item.operationId === "failed:reused"),
-      [
-        {
-          libraryId: LIBRARY_A.id,
-          operationId: "failed:reused",
-          revision: 2
-        }
-      ]
-    );
+    assert.equal(snapshot.hasRetryableFailure, true);
     assert.ok(
-      snapshot.retryableFailures.some((item) => item.operationId === "failed:durable"),
-      "an unoverridden durable baseline must survive fallback eviction"
+      (await service.history({ limit: 200, offset: 0 })).items.every(
+        (item) => item.status === "succeeded"
+      ),
+      "only the unoverridden durable baseline should keep the failure boolean set"
     );
 
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     snapshot = await service.compactSnapshot();
-    assert.deepEqual(snapshot.retryableFailures, [
-      {
-        libraryId: LIBRARY_B.id,
-        operationId: "failed:recovered",
-        revision: 4
-      }
-    ]);
     assert.equal(snapshot.hasRetryableFailure, true);
+    assert.deepEqual(
+      (await service.history({ limit: 20, offset: 0 })).items.map((item) => item.operationId),
+      ["failed:recovered"]
+    );
     await service.close();
   });
 

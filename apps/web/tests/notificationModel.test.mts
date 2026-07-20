@@ -98,7 +98,6 @@ function compact(
     active: [],
     thumbnailSummaries: [],
     latestImportantResults: [],
-    retryableFailures: [],
     hasRetryableFailure: false,
     syncHealth: {
       state: "healthy",
@@ -309,6 +308,46 @@ describe("notification history model", () => {
   it("keeps the next offset at the first missing contiguous page", () => {
     const page = { items: [terminal("late", 100)], total: 3, nextOffset: null };
     assert.equal(mergeNotificationHistoryPages([{ offset: 2, page }]).nextOffset, 0);
+  });
+
+  it("keeps the first same-revision payload and reports conflicting history", () => {
+    const first = terminal("conflict", 100, {
+      revision: 3,
+      summary: "first payload",
+      currentValue: 10
+    });
+    const conflict = {
+      ...first,
+      summary: "conflicting payload",
+      currentValue: 90,
+      updatedAt: first.updatedAt + 1_000
+    };
+    const merged = mergeNotificationHistoryPages([
+      {
+        offset: 0,
+        page: { items: [first], total: 1, nextOffset: 1 }
+      },
+      {
+        offset: 1,
+        page: { items: [conflict], total: 1, nextOffset: null }
+      }
+    ]);
+
+    assert.equal(merged.items[0]?.summary, "first payload");
+    assert.equal(merged.items[0]?.currentValue, 10);
+    assert.match(merged.conflictError ?? "", /conflict.*revision 3/i);
+
+    const replay = mergeNotificationHistoryPages([
+      {
+        offset: 0,
+        page: { items: [first], total: 1, nextOffset: 1 }
+      },
+      {
+        offset: 1,
+        page: { items: [{ ...first }], total: 1, nextOffset: null }
+      }
+    ]);
+    assert.equal(replay.conflictError, null);
   });
 });
 
@@ -539,6 +578,106 @@ describe("notification external store", () => {
     await first;
   });
 
+  it("refreshes a completed query after page two and clears prior pages", async () => {
+    const refresh = deferred<DesktopNotificationHistoryPage>();
+    let calls = 0;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          listHistory: async (query) => {
+            calls += 1;
+            if (calls === 1) {
+              return { items: [terminal("page-1", 300)], total: 2, nextOffset: 1 };
+            }
+            if (calls === 2) {
+              assert.equal(query.offset, 1);
+              return { items: [terminal("page-2", 200)], total: 2, nextOffset: null };
+            }
+            return refresh.promise;
+          }
+        })
+    });
+    const query = { search: "same", limit: 20, offset: 0 };
+
+    await store.loadHistory(query);
+    await store.loadMoreHistory();
+    assert.deepEqual(
+      store.getSnapshot().history.items.map((item) => item.operationId),
+      ["page-1", "page-2"]
+    );
+
+    const refreshing = store.loadHistory(query);
+    assert.equal(calls, 3);
+    assert.deepEqual(store.getSnapshot().history.items, []);
+    assert.equal(store.getSnapshot().history.total, 0);
+    refresh.resolve({ items: [terminal("refreshed", 400)], total: 1, nextOffset: null });
+    await refreshing;
+    assert.deepEqual(
+      store.getSnapshot().history.items.map((item) => item.operationId),
+      ["refreshed"]
+    );
+  });
+
+  it("ignores an old append that resolves after an explicit refresh", async () => {
+    const append = deferred<DesktopNotificationHistoryPage>();
+    const refresh = deferred<DesktopNotificationHistoryPage>();
+    let calls = 0;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          listHistory: async () => {
+            calls += 1;
+            if (calls === 1) {
+              return { items: [terminal("initial", 300)], total: 2, nextOffset: 1 };
+            }
+            return calls === 2 ? append.promise : refresh.promise;
+          }
+        })
+    });
+    const query = { limit: 20, offset: 0 };
+
+    await store.loadHistory(query);
+    const oldAppend = store.loadMoreHistory();
+    const refreshing = store.loadHistory(query);
+    assert.equal(calls, 3);
+
+    append.resolve({ items: [terminal("stale-append", 500)], total: 2, nextOffset: null });
+    await oldAppend;
+    assert.deepEqual(store.getSnapshot().history.items, []);
+
+    refresh.resolve({ items: [terminal("fresh", 600)], total: 1, nextOffset: null });
+    await refreshing;
+    assert.deepEqual(
+      store.getSnapshot().history.items.map((item) => item.operationId),
+      ["fresh"]
+    );
+  });
+
+  it("surfaces same-revision page conflicts through history error", async () => {
+    const first = terminal("conflict", 100, { revision: 2, summary: "first" });
+    let calls = 0;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          listHistory: async () => {
+            calls += 1;
+            return calls === 1
+              ? { items: [first], total: 1, nextOffset: 1 }
+              : {
+                  items: [{ ...first, summary: "second", updatedAt: first.updatedAt + 1 }],
+                  total: 1,
+                  nextOffset: null
+                };
+          }
+        })
+    });
+
+    await store.loadHistory({ limit: 20 });
+    await store.loadMoreHistory();
+    assert.equal(store.getSnapshot().history.items[0]?.summary, "first");
+    assert.match(store.getSnapshot().history.error ?? "", /conflict.*revision 2/i);
+  });
+
   it("returns typed action failures without mutating a newer compact revision", async () => {
     const action = deferred<{ ok: boolean; message: string | null }>();
     let changed: ((snapshot: DesktopNotificationCompactSnapshot) => void) | null = null;
@@ -598,16 +737,22 @@ describe("notification external store", () => {
     off();
   });
 
-  it("owns one generated log subscription and preserves gap batches", async () => {
+  it("opens logs atomically and delivers buffered gap batches after the initial snapshot", async () => {
     const callbacks: Array<(batch: DesktopProcessLogBatch) => void> = [];
+    const firstReady = deferred<{ snapshot: []; afterSequence: number }>();
+    const deferredDeliveries: Array<() => void> = [];
     let unsubscribes = 0;
     const store = createNotificationStore({
+      deferLogDelivery: (callback) => deferredDeliveries.push(callback),
       getBridge: () =>
         bridge({
           snapshotAndSubscribeLogs: (_query, callback) => {
             callbacks.push(callback);
             return {
-              ready: Promise.resolve({ snapshot: [], afterSequence: callbacks.length * 10 }),
+              ready:
+                callbacks.length === 1
+                  ? firstReady.promise
+                  : Promise.resolve({ snapshot: [], afterSequence: callbacks.length * 10 }),
               unsubscribe: () => {
                 unsubscribes += 1;
               }
@@ -617,27 +762,39 @@ describe("notification external store", () => {
     });
     const batches: DesktopProcessLogBatch[] = [];
 
-    const first = store.snapshotAndSubscribeLogs({}, (batch) => batches.push(batch));
-    assert.deepEqual(await first.ready, {
-      ok: true,
-      value: { snapshot: [], afterSequence: 10 }
+    const openingFirst = store.openLogSubscription({}, (batch) => batches.push(batch));
+    callbacks[0]?.({ lines: [], afterSequence: 11, droppedBeforeSequence: 4 });
+    assert.deepEqual(batches, []);
+    firstReady.resolve({ snapshot: [], afterSequence: 10 });
+    const first = await openingFirst;
+    assert.deepEqual(first.ok && first.value.snapshot, {
+      snapshot: [],
+      afterSequence: 10
     });
-    const second = store.snapshotAndSubscribeLogs({ sources: ["core"] }, (batch) =>
+    assert.deepEqual(batches, [], "the caller must apply the initial snapshot before batches");
+    deferredDeliveries.splice(0).forEach((callback) => callback());
+    assert.deepEqual(batches, [
+      { lines: [], afterSequence: 11, droppedBeforeSequence: 4 }
+    ]);
+
+    const openingSecond = store.openLogSubscription({ sources: ["core"] }, (batch) =>
       batches.push(batch)
     );
     assert.equal(unsubscribes, 1);
     callbacks[0]?.({ lines: [], afterSequence: 11, droppedBeforeSequence: 4 });
     callbacks[1]?.({ lines: [], afterSequence: 21, droppedBeforeSequence: 9 });
+    const second = await openingSecond;
+    assert.equal(second.ok, true);
+    assert.equal(batches.length, 1);
+    if (!second.ok) assert.fail(second.error);
+    second.value.unsubscribe();
+    deferredDeliveries.splice(0).forEach((callback) => callback());
     assert.deepEqual(batches, [
-      { lines: [], afterSequence: 21, droppedBeforeSequence: 9 }
+      { lines: [], afterSequence: 11, droppedBeforeSequence: 4 }
     ]);
 
     store.dispose();
     assert.equal(unsubscribes, 2);
-    assert.deepEqual(await second.ready, {
-      ok: false,
-      error: "日志订阅已关闭"
-    });
   });
 
   it("wraps log page and clear errors without throwing", async () => {
@@ -682,8 +839,7 @@ describe("notification external store", () => {
         })
     });
 
-    const subscription = store.snapshotAndSubscribeLogs({}, () => undefined);
-    assert.deepEqual(await subscription.ready, {
+    assert.deepEqual(await store.openLogSubscription({}, () => undefined), {
       ok: false,
       error: "subscription unavailable"
     });

@@ -176,8 +176,7 @@ function emptyStoredSnapshot(): NotificationStoredSnapshot {
     active: [],
     thumbnailSummaries: [],
     latestImportantResults: [],
-    retryableFailures: [],
-    hasRetryableFailure: false
+    retryableFailures: []
   };
 }
 
@@ -340,7 +339,6 @@ function cloneCompactSnapshot(snapshot: NotificationCompactSnapshot): Notificati
     active: snapshot.active.map((item) => ({ ...item })),
     thumbnailSummaries: snapshot.thumbnailSummaries.map((item) => ({ ...item })),
     latestImportantResults: snapshot.latestImportantResults.map((item) => ({ ...item })),
-    retryableFailures: snapshot.retryableFailures.map((item) => ({ ...item })),
     hasRetryableFailure: snapshot.hasRetryableFailure,
     syncHealth: { ...snapshot.syncHealth }
   };
@@ -1406,6 +1404,7 @@ export class NotificationService {
           }
         : existing;
       if (sameNotificationOperationPayload(comparableExisting, operation)) return;
+      this.recordFallbackRevisionConflict(operation);
       return;
     }
     if (existing && operation.revision > existing.revision) {
@@ -1426,6 +1425,15 @@ export class NotificationService {
     if (existing && operation.revision <= existing.revision) return;
     this.fallbackOperations.set(key, operation);
     this.touchFallbackRecord(fallbackOperationKey(operation.libraryId, operation.operationId));
+  }
+
+  private recordFallbackRevisionConflict(operation: DesktopNotificationOperation): void {
+    this.health = {
+      state: "degraded",
+      libraryId: operation.libraryId,
+      detail: `Notification fallback conflict for ${operation.libraryId}/${operation.operationId} revision ${operation.revision}`,
+      updatedAt: this.now()
+    };
   }
 
   private applyFallbackActionOverlay(
@@ -1538,20 +1546,16 @@ export class NotificationService {
   }
 
   private currentCompactSnapshot(): NotificationCompactSnapshot {
-    if (this.store) return { ...this.storedSnapshot, syncHealth: this.health };
-    const operations = [...this.fallbackOperations.values()];
-    const retryableFailureMap = new Map(this.durableRetryableFailures);
-    for (const [key, failure] of this.fallbackRetryableFailures) {
-      const existing = retryableFailureMap.get(key);
-      if (!existing || failure.revision > existing.revision) {
-        retryableFailureMap.set(key, failure);
-      }
+    if (this.store) {
+      return {
+        active: this.storedSnapshot.active,
+        thumbnailSummaries: this.storedSnapshot.thumbnailSummaries,
+        latestImportantResults: this.storedSnapshot.latestImportantResults,
+        hasRetryableFailure: this.storedSnapshot.retryableFailures.length > 0,
+        syncHealth: this.health
+      };
     }
-    const retryableFailures = [...retryableFailureMap.values()].sort(
-      (left, right) =>
-        left.libraryId.localeCompare(right.libraryId) ||
-        left.operationId.localeCompare(right.operationId)
-    );
+    const operations = [...this.fallbackOperations.values()];
     return {
       active: operations
         .filter((item) => item.status === "pending" || item.status === "running")
@@ -1572,8 +1576,8 @@ export class NotificationService {
             right.updatedAt - left.updatedAt
         )
         .slice(0, 3),
-      retryableFailures,
-      hasRetryableFailure: retryableFailures.length > 0,
+      hasRetryableFailure:
+        this.durableRetryableFailures.size > 0 || this.fallbackRetryableFailures.size > 0,
       syncHealth: this.health
     };
   }

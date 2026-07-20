@@ -32,6 +32,7 @@ export interface NotificationStoreSnapshot {
 export interface NotificationStoreOptions {
   getBridge?: () => DesktopNotificationsBridge | null;
   deferDisconnect?: (callback: () => void) => void;
+  deferLogDelivery?: (callback: () => void) => void;
 }
 
 export interface LoadNotificationHistoryOptions {
@@ -42,8 +43,8 @@ export type NotificationRequestResult<T> =
   | { ok: true; value: T }
   | { ok: false; error: string };
 
-export interface NotificationLogSubscriptionHandle {
-  ready: Promise<NotificationRequestResult<ProcessLogSubscriptionInitialSnapshot>>;
+export interface OpenNotificationLogSubscription {
+  snapshot: ProcessLogSubscriptionInitialSnapshot;
   unsubscribe(): void;
 }
 
@@ -51,7 +52,6 @@ const EMPTY_COMPACT_SNAPSHOT: DesktopNotificationCompactSnapshot = {
   active: [],
   thumbnailSummaries: [],
   latestImportantResults: [],
-  retryableFailures: [],
   hasRetryableFailure: false,
   syncHealth: {
     state: "degraded",
@@ -65,6 +65,7 @@ const EMPTY_HISTORY: NotificationHistoryState = {
   items: [],
   total: 0,
   nextOffset: null,
+  conflictError: null,
   query: null,
   loading: false,
   error: null
@@ -78,6 +79,7 @@ const EMPTY_STORE_SNAPSHOT: NotificationStoreSnapshot = {
 export class NotificationExternalStore {
   private readonly bridgeProvider: () => DesktopNotificationsBridge | null;
   private readonly deferDisconnect: (callback: () => void) => void;
+  private readonly deferLogDelivery: (callback: () => void) => void;
   private readonly listeners = new Set<() => void>();
   private snapshot = EMPTY_STORE_SNAPSHOT;
   private bridge: DesktopNotificationsBridge | null = null;
@@ -96,6 +98,7 @@ export class NotificationExternalStore {
   constructor(options: NotificationStoreOptions = {}) {
     this.bridgeProvider = options.getBridge ?? defaultBridge;
     this.deferDisconnect = options.deferDisconnect ?? queueMicrotask;
+    this.deferLogDelivery = options.deferLogDelivery ?? ((callback) => setTimeout(callback, 0));
   }
 
   readonly getSnapshot = (): NotificationStoreSnapshot => this.snapshot;
@@ -137,7 +140,13 @@ export class NotificationExternalStore {
       : null;
     const queryChanged =
       identity !== currentIdentity || requestedStartOffset !== this.historyStartOffset;
-    if (queryChanged) {
+    if (!append && !queryChanged) {
+      const existing = this.historyRequests.get(
+        `${this.historyGeneration}:${requestedStartOffset}`
+      );
+      if (existing) return existing;
+    }
+    if (queryChanged || !append) {
       this.historyGeneration += 1;
       this.historyPages.clear();
       this.historyRequests.clear();
@@ -146,6 +155,7 @@ export class NotificationExternalStore {
         items: [],
         total: 0,
         nextOffset: this.historyStartOffset,
+        conflictError: null,
         query: baseQuery,
         loading: true,
         error: null
@@ -203,30 +213,43 @@ export class NotificationExternalStore {
     }
   }
 
-  snapshotAndSubscribeLogs(
+  async openLogSubscription(
     query: DesktopProcessLogFilter,
     listener: (batch: DesktopProcessLogBatch) => void
-  ): NotificationLogSubscriptionHandle {
+  ): Promise<NotificationRequestResult<OpenNotificationLogSubscription>> {
     const generation = ++this.logGeneration;
     this.activeLogSubscription?.unsubscribe();
     this.activeLogSubscription = null;
     const bridge = this.currentBridge();
-    if (!bridge) return failedLogSubscription("进程日志仅在桌面模式可用");
+    if (!bridge) return { ok: false, error: "进程日志仅在桌面模式可用" };
 
     let active = true;
+    let delivering = false;
+    const bufferedBatches: DesktopProcessLogBatch[] = [];
     let bridgeHandle: DesktopProcessLogSubscriptionHandle;
     try {
       bridgeHandle = bridge.snapshotAndSubscribeLogs(query, (batch) => {
-        if (active && generation === this.logGeneration) listener(batch);
+        if (!active || generation !== this.logGeneration) return;
+        if (!delivering) {
+          bufferedBatches.push(batch);
+          return;
+        }
+        listener(batch);
       });
     } catch (error) {
-      return failedLogSubscription(errorMessage(error));
+      return { ok: false, error: errorMessage(error) };
     }
 
+    let resolveClosed!: () => void;
+    const closed = new Promise<null>((resolve) => {
+      resolveClosed = () => resolve(null);
+    });
     const unsubscribe = () => {
       if (!active) return;
       active = false;
+      bufferedBatches.length = 0;
       bridgeHandle.unsubscribe();
+      resolveClosed();
       if (this.activeLogSubscription?.generation === generation) {
         this.activeLogSubscription = null;
       }
@@ -234,19 +257,25 @@ export class NotificationExternalStore {
     };
     this.activeLogSubscription = { generation, unsubscribe };
 
-    return {
-      ready: bridgeHandle.ready.then(
-        (value) =>
-          active && generation === this.logGeneration
-            ? { ok: true as const, value }
-            : { ok: false as const, error: "日志订阅已关闭" },
-        (error) => {
-          if (active) unsubscribe();
-          return { ok: false as const, error: errorMessage(error) };
-        }
-      ),
-      unsubscribe
-    };
+    let snapshot: ProcessLogSubscriptionInitialSnapshot | null;
+    try {
+      snapshot = await Promise.race([bridgeHandle.ready, closed]);
+    } catch (error) {
+      unsubscribe();
+      return { ok: false, error: errorMessage(error) };
+    }
+    if (!snapshot || !active || generation !== this.logGeneration) {
+      unsubscribe();
+      return { ok: false, error: "日志订阅已关闭" };
+    }
+
+    this.deferLogDelivery(() => {
+      if (!active || generation !== this.logGeneration) return;
+      delivering = true;
+      const pending = bufferedBatches.splice(0);
+      for (const batch of pending) listener(batch);
+    });
+    return { ok: true, value: { snapshot, unsubscribe } };
   }
 
   async clearLogs(): Promise<NotificationRequestResult<boolean>> {
@@ -371,7 +400,6 @@ export class NotificationExternalStore {
       active: [],
       thumbnailSummaries: [],
       latestImportantResults: [],
-      retryableFailures: [],
       hasRetryableFailure: false,
       syncHealth: {
         state: "degraded",
@@ -401,7 +429,7 @@ export class NotificationExternalStore {
         ...merged,
         query: baseQuery,
         loading: this.hasOtherHistoryRequest(requestKey, generation),
-        error: null
+        error: merged.conflictError
       });
       return this.snapshot.history;
     } catch (error) {
@@ -467,7 +495,7 @@ const loadMoreHistory = notificationStore.loadMoreHistory.bind(notificationStore
 const cancel = notificationStore.cancel.bind(notificationStore);
 const retry = notificationStore.retry.bind(notificationStore);
 const getLogPage = notificationStore.getLogPage.bind(notificationStore);
-const snapshotAndSubscribeLogs = notificationStore.snapshotAndSubscribeLogs.bind(notificationStore);
+const openLogSubscription = notificationStore.openLogSubscription.bind(notificationStore);
 const clearLogs = notificationStore.clearLogs.bind(notificationStore);
 
 if (typeof window !== "undefined") {
@@ -491,7 +519,7 @@ export function useNotifications() {
     cancel,
     retry,
     getLogPage,
-    snapshotAndSubscribeLogs,
+    openLogSubscription,
     clearLogs
   };
 }
@@ -518,11 +546,4 @@ function historyQueryIdentity(query: DesktopNotificationHistoryQuery): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function failedLogSubscription(error: string): NotificationLogSubscriptionHandle {
-  return {
-    ready: Promise.resolve({ ok: false, error }),
-    unsubscribe: () => undefined
-  };
 }

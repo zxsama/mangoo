@@ -8,8 +8,6 @@ import type {
   NotificationLibraryIdentity,
   NotificationOperationInput,
   NotificationOperationStatus,
-  NotificationRetryableFailureReference,
-  NotificationStoredSnapshot,
   NotificationStoreEvent,
   NotificationSyncHealth,
   ProcessLogEntry,
@@ -27,14 +25,25 @@ export type {
   NotificationLibraryIdentity,
   NotificationOperationInput,
   NotificationOperationStatus,
-  NotificationRetryableFailureReference,
-  NotificationStoredSnapshot,
   NotificationStoreEvent,
   NotificationSyncHealth,
   ProcessLogEntry,
   RendererErrorReport,
   ThumbnailCacheSummary
 } from "@megle/notification-contract";
+
+export interface NotificationRetryableFailureReference {
+  libraryId: string;
+  operationId: string;
+  revision: number;
+}
+
+export interface NotificationStoredSnapshot {
+  active: DesktopNotificationOperation[];
+  thumbnailSummaries: ThumbnailCacheSummary[];
+  latestImportantResults: DesktopNotificationOperation[];
+  retryableFailures: NotificationRetryableFailureReference[];
+}
 
 export interface NotificationSyncState {
   persistedSequence: number;

@@ -581,8 +581,7 @@ class NotificationStoreDatabase {
       active: active.map(rowToOperation),
       thumbnailSummaries: thumbnailRows.map((row) => JSON.parse(row.payload_json) as ThumbnailCacheSummary),
       latestImportantResults: latestImportantResults.map(rowToOperation),
-      retryableFailures,
-      hasRetryableFailure: retryableFailures.length > 0
+      retryableFailures
     };
   }
 

@@ -51,6 +51,7 @@ export interface NotificationHistoryCollection {
   items: DesktopNotificationOperation[];
   total: number;
   nextOffset: number | null;
+  conflictError: string | null;
 }
 
 const ACTIVE_STATUSES = new Set<DesktopNotificationOperation["status"]>([
@@ -124,11 +125,12 @@ export function mergeNotificationHistoryPages(
     pages.set(slice.offset, slice.page);
   }
 
-  const items = deduplicateOperations(
+  const deduplicated = deduplicateOperationsWithConflicts(
     [...pages.entries()]
       .sort(([left], [right]) => left - right)
       .flatMap(([, page]) => page.items)
-  ).sort(compareTerminalOperations);
+  );
+  const items = deduplicated.items.sort(compareTerminalOperations);
   const total = Math.max(0, ...[...pages.values()].map((page) => page.total));
 
   let nextOffset: number | null = startOffset;
@@ -140,7 +142,15 @@ export function mergeNotificationHistoryPages(
     nextOffset = page.nextOffset;
   }
 
-  return { items, total, nextOffset };
+  return {
+    items,
+    total,
+    nextOffset,
+    conflictError:
+      deduplicated.conflicts.length > 0
+        ? `Notification history conflict for ${deduplicated.conflicts[0]}`
+        : null
+  };
 }
 
 function operationViewModel(
@@ -201,19 +211,40 @@ function buildThumbnailAggregate(
 function deduplicateOperations(
   input: readonly DesktopNotificationOperation[]
 ): DesktopNotificationOperation[] {
+  return deduplicateOperationsWithConflicts(input).items;
+}
+
+function deduplicateOperationsWithConflicts(
+  input: readonly DesktopNotificationOperation[]
+): { items: DesktopNotificationOperation[]; conflicts: string[] } {
   const operations = new Map<string, DesktopNotificationOperation>();
+  const conflicts = new Set<string>();
   for (const operation of input) {
     const key = `${operation.libraryId}\u0000${operation.operationId}`;
     const current = operations.get(key);
-    if (
-      !current ||
-      operation.revision > current.revision ||
-      (operation.revision === current.revision && operation.updatedAt > current.updatedAt)
-    ) {
+    if (!current || operation.revision > current.revision) {
       operations.set(key, operation);
+      continue;
+    }
+    if (
+      operation.revision === current.revision &&
+      !sameNotificationOperationPayload(current, operation)
+    ) {
+      conflicts.add(
+        `${operation.libraryId}/${operation.operationId} revision ${operation.revision}`
+      );
     }
   }
-  return [...operations.values()];
+  return { items: [...operations.values()], conflicts: [...conflicts] };
+}
+
+function sameNotificationOperationPayload(
+  left: DesktopNotificationOperation,
+  right: DesktopNotificationOperation
+): boolean {
+  const { libraryId: _leftLibraryId, libraryName: _leftLibraryName, ...leftPayload } = left;
+  const { libraryId: _rightLibraryId, libraryName: _rightLibraryName, ...rightPayload } = right;
+  return JSON.stringify(leftPayload) === JSON.stringify(rightPayload);
 }
 
 function compareActiveOperations(

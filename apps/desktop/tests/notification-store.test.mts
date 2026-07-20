@@ -325,7 +325,6 @@ describe("notification store", () => {
           revision: 1
         }
       ]);
-      assert.equal(compact.hasRetryableFailure, true);
 
       await store.upsertOperations(LIBRARY_A, [
         operation("failed:durable", 2, "succeeded", {
@@ -336,7 +335,6 @@ describe("notification store", () => {
       ]);
       compact = await store.compactSnapshot();
       assert.deepEqual(compact.retryableFailures, []);
-      assert.equal(compact.hasRetryableFailure, false);
     } finally {
       await store.close();
     }
@@ -348,7 +346,7 @@ describe("notification store", () => {
       await store.upsertOperations(LIBRARY_A, [
         operation("failed:action", 1, "failed", { retryable: false })
       ]);
-      assert.equal((await store.compactSnapshot()).hasRetryableFailure, false);
+      assert.deepEqual((await store.compactSnapshot()).retryableFailures, []);
 
       await store.setOperationActionError(
         LIBRARY_A.id,
@@ -364,14 +362,12 @@ describe("notification store", () => {
           revision: 1
         }
       ]);
-      assert.equal(compact.hasRetryableFailure, true);
 
       await store.upsertOperations(LIBRARY_A, [
         operation("failed:action", 2, "succeeded", { retryable: false })
       ]);
       compact = await store.compactSnapshot();
       assert.deepEqual(compact.retryableFailures, []);
-      assert.equal(compact.hasRetryableFailure, false);
     } finally {
       await store.close();
     }
