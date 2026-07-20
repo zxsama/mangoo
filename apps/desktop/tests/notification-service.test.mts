@@ -1426,7 +1426,57 @@ describe("notification service", () => {
     await service.close();
   });
 
-  it("does not clear a stored failure with an older fallback success", async () => {
+  it("reconciles retryable failures through a newer running revision and later failure", async () => {
+    const createDegradedSnapshot = async (events: NotificationStoreEvent[]) => {
+      const store = new FakeStore();
+      await store.upsertOperations(LIBRARY_A, [
+        operation("failed:retry", 1, "failed", { retryable: true })
+      ]);
+      store.failApply = true;
+      const service = await createNotificationService({
+        store,
+        fetch: async () => response({ items: events, maxSequence: events.at(-1)?.sequence ?? 0 }),
+        now: () => NOW
+      });
+      await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+      const snapshot = await service.compactSnapshot();
+      await service.close();
+      return snapshot;
+    };
+
+    const running = await createDegradedSnapshot([
+      event(
+        1,
+        operation("failed:retry", 2, "running", {
+          completedAt: null,
+          retryable: false
+        })
+      )
+    ]);
+    assert.deepEqual(running.retryableFailures, []);
+    assert.equal(running.hasRetryableFailure, false);
+
+    const failedAgain = await createDegradedSnapshot([
+      event(
+        1,
+        operation("failed:retry", 2, "running", {
+          completedAt: null,
+          retryable: false
+        })
+      ),
+      event(2, operation("failed:retry", 3, "failed", { retryable: true }))
+    ]);
+    assert.deepEqual(failedAgain.retryableFailures, [
+      {
+        libraryId: LIBRARY_A.id,
+        operationId: "failed:retry",
+        revision: 3
+      }
+    ]);
+    assert.equal(failedAgain.hasRetryableFailure, true);
+  });
+
+  it("does not clear a stored failure with an older or same-revision fallback success", async () => {
     const store = new FakeStore();
     await store.upsertOperations(LIBRARY_A, [
       operation("failed:durable", 1, "failed", { retryable: true })
@@ -1440,9 +1490,13 @@ describe("notification service", () => {
             event(
               1,
               operation("failed:durable", 0, "succeeded", { retryable: false })
+            ),
+            event(
+              2,
+              operation("failed:durable", 1, "succeeded", { retryable: false })
             )
           ],
-          maxSequence: 1
+          maxSequence: 2
         }),
       now: () => NOW
     });
@@ -1489,6 +1543,104 @@ describe("notification service", () => {
         libraryId: LIBRARY_A.id,
         operationId: "failed:second",
         revision: 1
+      }
+    ]);
+    assert.equal(snapshot.hasRetryableFailure, true);
+    await service.close();
+  });
+
+  it("caps fallback-origin retryable references with the 500 logical-record limit", async () => {
+    const events = Array.from({ length: 510 }, (_, index) =>
+      event(
+        index + 1,
+        operation(`failed:fallback:${index}`, 1, "failed", { retryable: true })
+      )
+    );
+    const service = await createNotificationService({
+      openStore: async () => {
+        throw new Error("worker unavailable");
+      },
+      fetch: async () => response({ items: events, maxSequence: events.length }),
+      now: () => NOW
+    });
+
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    const snapshot = await service.compactSnapshot();
+    const history = await service.history({ limit: 200, offset: 0 });
+    assert.equal(history.total, 500);
+    assert.equal(snapshot.retryableFailures.length, 500);
+    assert.deepEqual(
+      new Set(snapshot.retryableFailures.map((item) => item.operationId)),
+      new Set(Array.from({ length: 500 }, (_, index) => `failed:fallback:${index + 10}`))
+    );
+    await service.close();
+  });
+
+  it("evicts only fallback-origin failure references and adopts durable state on recovery", async () => {
+    const failedStore = new FakeStore();
+    await failedStore.upsertOperations(LIBRARY_A, [
+      operation("failed:durable", 1, "failed", { retryable: true })
+    ]);
+    failedStore.failApply = true;
+
+    const recoveredStore = new FakeStore();
+    await recoveredStore.upsertOperations(LIBRARY_B, [
+      operation("failed:recovered", 4, "failed", { retryable: true })
+    ]);
+    const events: NotificationStoreEvent[] = [
+      event(1, operation("failed:reused", 1, "failed", { retryable: true })),
+      ...Array.from({ length: 500 }, (_, index) =>
+        event(
+          index + 2,
+          operation(`failed:unique:${index}`, 1, "failed", { retryable: true })
+        )
+      ),
+      event(502, operation("failed:reused", 2, "failed", { retryable: true }))
+    ];
+    let listCalls = 0;
+    const service = await createNotificationService({
+      store: failedStore,
+      openStore: async () => recoveredStore,
+      fetch: async (input) => {
+        if (String(input).endsWith("/notifications/outbox/ack")) {
+          return ackResponse({ acknowledged: true });
+        }
+        listCalls += 1;
+        return response(
+          listCalls === 1
+            ? { items: events, maxSequence: events.length }
+            : { items: [], maxSequence: 0 }
+        );
+      },
+      now: () => NOW
+    });
+
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    let snapshot = await service.compactSnapshot();
+    assert.equal((await service.history({ limit: 200, offset: 0 })).total, 500);
+    assert.equal(snapshot.retryableFailures.length, 501);
+    assert.deepEqual(
+      snapshot.retryableFailures.filter((item) => item.operationId === "failed:reused"),
+      [
+        {
+          libraryId: LIBRARY_A.id,
+          operationId: "failed:reused",
+          revision: 2
+        }
+      ]
+    );
+    assert.ok(
+      snapshot.retryableFailures.some((item) => item.operationId === "failed:durable"),
+      "an unoverridden durable baseline must survive fallback eviction"
+    );
+
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    snapshot = await service.compactSnapshot();
+    assert.deepEqual(snapshot.retryableFailures, [
+      {
+        libraryId: LIBRARY_B.id,
+        operationId: "failed:recovered",
+        revision: 4
       }
     ]);
     assert.equal(snapshot.hasRetryableFailure, true);

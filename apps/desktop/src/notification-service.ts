@@ -352,6 +352,10 @@ export class NotificationService {
   private readonly listeners = new Set<(snapshot: NotificationCompactSnapshot) => void>();
   private readonly pendingOutbox = new Map<string, PendingOutboxBatch>();
   private readonly fallbackOperations = new Map<string, DesktopNotificationOperation>();
+  private readonly durableRetryableFailures = new Map<
+    string,
+    NotificationRetryableFailureReference
+  >();
   private readonly fallbackRetryableFailures = new Map<
     string,
     NotificationRetryableFailureReference
@@ -1296,7 +1300,15 @@ export class NotificationService {
   }
 
   private seedFallbackFromStoredSnapshot(): void {
+    this.durableRetryableFailures.clear();
     this.fallbackRetryableFailures.clear();
+    for (const failure of this.storedSnapshot.retryableFailures) {
+      const key = libraryKey(failure.libraryId, failure.operationId);
+      const existing = this.durableRetryableFailures.get(key);
+      if (!existing || failure.revision > existing.revision) {
+        this.durableRetryableFailures.set(key, { ...failure });
+      }
+    }
     for (const operation of [
       ...this.storedSnapshot.active,
       ...this.storedSnapshot.latestImportantResults
@@ -1305,13 +1317,6 @@ export class NotificationService {
     }
     for (const summary of this.storedSnapshot.thumbnailSummaries) {
       this.upsertFallbackThumbnail(summary);
-    }
-    for (const failure of this.storedSnapshot.retryableFailures) {
-      const key = libraryKey(failure.libraryId, failure.operationId);
-      const existing = this.fallbackRetryableFailures.get(key);
-      if (!existing || failure.revision > existing.revision) {
-        this.fallbackRetryableFailures.set(key, { ...failure });
-      }
     }
   }
 
@@ -1391,9 +1396,14 @@ export class NotificationService {
   private upsertFallbackOperation(operation: DesktopNotificationOperation): void {
     const key = libraryKey(operation.libraryId, operation.operationId);
     const existing = this.fallbackOperations.get(key);
-    const existingFailure = this.fallbackRetryableFailures.get(key);
-    if (existingFailure && operation.revision < existingFailure.revision) return;
-    if (existing && operation.revision < existing.revision) return;
+    const durableFailure = this.durableRetryableFailures.get(key);
+    const fallbackFailure = this.fallbackRetryableFailures.get(key);
+    const knownRevision = Math.max(
+      existing?.revision ?? -1,
+      durableFailure?.revision ?? -1,
+      fallbackFailure?.revision ?? -1
+    );
+    if (operation.revision < knownRevision) return;
     if (existing && operation.revision > existing.revision) {
       this.fallbackActionBaseDetails.delete(key);
       this.pendingActionErrors.delete(key);
@@ -1402,32 +1412,66 @@ export class NotificationService {
     }
     this.fallbackOperations.delete(key);
     this.fallbackOperations.set(key, operation);
-    this.reconcileFallbackRetryableFailure(operation);
+    this.reconcileFallbackRetryableFailure(operation, undefined, knownRevision);
     this.touchFallbackRecord(fallbackOperationKey(operation.libraryId, operation.operationId));
   }
 
   private reconcileFallbackRetryableFailure(
     operation: DesktopNotificationOperation,
-    actionFailure?: boolean
+    actionFailure?: boolean,
+    previousRevision?: number
   ): void {
-    if (operation.status === "pending" || operation.status === "running") return;
     const key = libraryKey(operation.libraryId, operation.operationId);
-    const existing = this.fallbackRetryableFailures.get(key);
-    if (existing && operation.revision < existing.revision) return;
+    const durableFailure = this.durableRetryableFailures.get(key);
+    const fallbackFailure = this.fallbackRetryableFailures.get(key);
+    const knownRevision =
+      previousRevision ??
+      Math.max(
+        this.fallbackOperations.get(key)?.revision ?? -1,
+        durableFailure?.revision ?? -1,
+        fallbackFailure?.revision ?? -1
+      );
+    if (operation.revision < knownRevision) return;
 
-    const remainsRetryable =
-      actionFailure === true || (operation.status === "failed" && operation.retryable);
-    if (remainsRetryable) {
+    const terminal = operation.status !== "pending" && operation.status !== "running";
+    if (actionFailure !== undefined) {
+      if (!terminal) return;
+      if (actionFailure) {
+        this.durableRetryableFailures.delete(key);
+        this.fallbackRetryableFailures.set(key, {
+          libraryId: operation.libraryId,
+          operationId: operation.operationId,
+          revision: operation.revision
+        });
+        return;
+      }
+
+      this.fallbackRetryableFailures.delete(key);
+      if (operation.status === "failed" && operation.retryable) {
+        if (durableFailure?.revision === operation.revision) return;
+        this.durableRetryableFailures.delete(key);
+        this.fallbackRetryableFailures.set(key, {
+          libraryId: operation.libraryId,
+          operationId: operation.operationId,
+          revision: operation.revision
+        });
+      } else {
+        this.durableRetryableFailures.delete(key);
+      }
+      return;
+    }
+
+    if (operation.revision <= knownRevision) return;
+
+    this.durableRetryableFailures.delete(key);
+    this.fallbackRetryableFailures.delete(key);
+
+    if (terminal && operation.status === "failed" && operation.retryable) {
       this.fallbackRetryableFailures.set(key, {
         libraryId: operation.libraryId,
         operationId: operation.operationId,
         revision: operation.revision
       });
-      return;
-    }
-
-    if (actionFailure === false || !existing || operation.revision > existing.revision) {
-      this.fallbackRetryableFailures.delete(key);
     }
   }
 
@@ -1462,7 +1506,14 @@ export class NotificationService {
   private currentCompactSnapshot(): NotificationCompactSnapshot {
     if (this.store) return { ...this.storedSnapshot, syncHealth: this.health };
     const operations = [...this.fallbackOperations.values()];
-    const retryableFailures = [...this.fallbackRetryableFailures.values()].sort(
+    const retryableFailureMap = new Map(this.durableRetryableFailures);
+    for (const [key, failure] of this.fallbackRetryableFailures) {
+      const existing = retryableFailureMap.get(key);
+      if (!existing || failure.revision > existing.revision) {
+        retryableFailureMap.set(key, failure);
+      }
+    }
+    const retryableFailures = [...retryableFailureMap.values()].sort(
       (left, right) =>
         left.libraryId.localeCompare(right.libraryId) ||
         left.operationId.localeCompare(right.operationId)
@@ -1495,6 +1546,7 @@ export class NotificationService {
 
   private clearFallbackFromDurableState(): void {
     this.fallbackOperations.clear();
+    this.durableRetryableFailures.clear();
     this.fallbackRetryableFailures.clear();
     this.fallbackThumbnails.clear();
     this.fallbackActionBaseDetails.clear();
@@ -1567,6 +1619,7 @@ export class NotificationService {
     const operationId = rest.join("\u0000");
     const key = libraryKey(libraryId, operationId);
     this.fallbackOperations.delete(key);
+    this.fallbackRetryableFailures.delete(key);
     this.pendingRendererErrors.delete(key);
     this.pendingActionErrors.delete(key);
     this.fallbackActionBaseDetails.delete(key);
