@@ -40,3 +40,5 @@ pub const NOTIFICATION_OUTBOX_MIGRATION: &str =
     include_str!("../../migrations/0021_notification_outbox.sql");
 pub const FILE_OPERATION_JOURNAL_MIGRATION: &str =
     include_str!("../../migrations/0022_file_operation_journal.sql");
+pub const FILE_OPERATION_RECOVERY_METADATA_MIGRATION: &str =
+    include_str!("../../migrations/0023_file_operation_recovery_metadata.sql");

@@ -972,6 +972,10 @@ impl Database {
             self.connection
                 .execute_batch(migrations::FILE_OPERATION_JOURNAL_MIGRATION)?;
         }
+        if !self.migration_applied(23)? {
+            self.connection
+                .execute_batch(migrations::FILE_OPERATION_RECOVERY_METADATA_MIGRATION)?;
+        }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
         Ok(())
@@ -18299,6 +18303,21 @@ mod tests {
         database
     }
 
+    fn database_migrated_through_22() -> Database {
+        let database = database_migrated_through_20();
+        database
+            .connection
+            .execute_batch(migrations::NOTIFICATION_OUTBOX_MIGRATION)
+            .expect("apply migration 21");
+        database
+            .connection
+            .execute_batch(migrations::FILE_OPERATION_JOURNAL_MIGRATION)
+            .expect("apply migration 22");
+        assert!(database.migration_applied(22).unwrap());
+        assert!(!database.migration_applied(23).unwrap());
+        database
+    }
+
     fn index_key_columns(database: &Database, index_name: &str) -> Vec<(String, bool)> {
         let mut statement = database
             .connection
@@ -18593,8 +18612,8 @@ mod tests {
     }
 
     #[test]
-    fn migration_0022_adds_recoverable_file_operation_journal() {
-        let database = migrated_database();
+    fn migration_0022_adds_base_file_operation_journal() {
+        let database = database_migrated_through_22();
         let columns = database
             .connection
             .prepare("PRAGMA table_info(file_operations)")
@@ -18607,16 +18626,19 @@ mod tests {
             "operation_group_id",
             "entity_kind",
             "entity_id",
-            "root_id",
             "target_folder_id",
             "attempt_count",
-            "journal_phase",
-            "source_identity",
             "error_code",
         ] {
             assert!(
                 columns.iter().any(|actual| actual == column),
                 "missing {column}"
+            );
+        }
+        for column in ["root_id", "journal_phase", "source_identity"] {
+            assert!(
+                !columns.iter().any(|actual| actual == column),
+                "migration 22 must not contain later recovery column {column}"
             );
         }
         assert!(database.migration_applied(22).unwrap());
@@ -18630,11 +18652,11 @@ mod tests {
             .optional()
             .expect("query pending journal index");
         assert!(
-            pending_index.as_deref().is_some_and(|sql| {
-                sql.contains("WHERE status = 'pending'")
-                    && sql.contains("operation_group_id IS NOT NULL")
-            }),
-            "pending journal index must scan only grouped pending intents"
+            pending_index
+                .as_deref()
+                .is_some_and(|sql| sql.contains("WHERE status = 'pending'")
+                    && !sql.contains("operation_group_id IS NOT NULL")),
+            "migration 22 must retain its published pending index"
         );
 
         database
@@ -18642,12 +18664,10 @@ mod tests {
             .execute(
                 r#"INSERT INTO file_operations(
                      operation, source_path, target_path, status, created_at,
-                     operation_group_id, entity_kind, entity_id, root_id,
-                     target_folder_id, attempt_count, journal_phase,
-                     source_identity, error_code
+                     operation_group_id, entity_kind, entity_id,
+                     target_folder_id, attempt_count, error_code
                    ) VALUES ('move', 'old', 'new', 'pending', 1,
-                             'group', 'file', 7, 3, 9, 0, 'prepared',
-                             'windows:1:7', NULL)"#,
+                             'group', 'file', 7, 9, 0, NULL)"#,
                 [],
             )
             .expect("valid pending journal intent");
@@ -18659,6 +18679,34 @@ mod tests {
             [],
         );
         assert!(invalid_kind.is_err(), "unsupported journal entity kind");
+    }
+
+    #[test]
+    fn migration_0023_adds_recovery_metadata_on_fresh_database() {
+        let database = database_migrated_through_22();
+        database
+            .apply_migrations()
+            .expect("upgrade fresh version-22 database to version 23");
+        for column in ["root_id", "journal_phase", "source_identity"] {
+            assert!(
+                database
+                    .table_has_column("file_operations", column)
+                    .unwrap(),
+                "missing recovery metadata column {column}"
+            );
+        }
+        assert!(database.migration_applied(22).unwrap());
+        assert!(database.migration_applied(23).unwrap());
+        let pending_index: String = database
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_file_operations_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query version-23 pending index");
+        assert!(pending_index.contains("WHERE status = 'pending'"));
+        assert!(pending_index.contains("operation_group_id IS NOT NULL"));
         let invalid_phase = database.connection.execute(
             r#"INSERT INTO file_operations(
                  operation, source_path, status, created_at, operation_group_id,
@@ -18668,6 +18716,88 @@ mod tests {
             [],
         );
         assert!(invalid_phase.is_err(), "unsupported journal phase");
+    }
+
+    #[test]
+    fn migration_0023_upgrades_populated_v22_pending_journal_without_loss() {
+        let database = database_migrated_through_22();
+        database
+            .connection
+            .execute(
+                r#"INSERT INTO file_operations(
+                     id, operation, source_path, target_path, status, created_at,
+                     operation_group_id, entity_kind, entity_id, target_folder_id,
+                     attempt_count, error_code, error
+                   ) VALUES (72, 'move', 'old-path', 'new-path', 'pending', 11,
+                             'v22-group', 'file', 17, 23, 2, 'fs_error',
+                             'persisted v22 error')"#,
+                [],
+            )
+            .expect("seed populated version-22 pending journal");
+
+        database
+            .apply_migrations()
+            .expect("upgrade v22 database to v23");
+
+        let row: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<String>,
+        ) = database
+            .connection
+            .query_row(
+                r#"SELECT operation, source_path, target_path, status,
+                          operation_group_id, entity_kind, entity_id,
+                          target_folder_id, attempt_count, error_code, error,
+                          journal_phase, root_id, source_identity
+                   FROM file_operations WHERE id = 72"#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                    ))
+                },
+            )
+            .expect("read upgraded v22 pending journal");
+        assert_eq!(row.0, "move");
+        assert_eq!(row.1, "old-path");
+        assert_eq!(row.2, "new-path");
+        assert_eq!(row.3, "pending");
+        assert_eq!(row.4, "v22-group");
+        assert_eq!(row.5.as_deref(), Some("file"));
+        assert_eq!(row.6, Some(17));
+        assert_eq!(row.7, Some(23));
+        assert_eq!(row.8, 2);
+        assert_eq!(row.9.as_deref(), Some("fs_error"));
+        assert_eq!(row.10.as_deref(), Some("persisted v22 error"));
+        assert_eq!(row.11, "legacy");
+        assert_eq!(row.12, None);
+        assert_eq!(row.13, None);
+        assert!(database.migration_applied(23).unwrap());
     }
 
     #[test]
@@ -18769,6 +18899,51 @@ mod tests {
         assert!(database.migration_applied(22).unwrap());
         assert!(database
             .table_has_column("file_operations", "entity_kind")
+            .unwrap());
+    }
+
+    #[test]
+    fn migration_0023_rolls_back_recovery_metadata_and_index_replacement() {
+        let database = database_migrated_through_22();
+        let original_index_sql: String = database
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_file_operations_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read version-22 pending index");
+        let (before_commit, _) = migrations::FILE_OPERATION_RECOVERY_METADATA_MIGRATION
+            .rsplit_once("COMMIT;")
+            .expect("migration 23 must end with an explicit commit");
+        let failing = format!("{before_commit}\nSELECT * FROM migration_0023_deliberate_failure;");
+
+        assert!(database.connection.execute_batch(&failing).is_err());
+        database
+            .connection
+            .execute_batch("ROLLBACK;")
+            .expect("roll back failed migration 23");
+
+        assert!(!database.migration_applied(23).unwrap());
+        for column in ["root_id", "journal_phase", "source_identity"] {
+            assert!(!database
+                .table_has_column("file_operations", column)
+                .unwrap());
+        }
+        let rolled_back_index_sql: String = database
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_file_operations_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rolled-back pending index");
+        assert_eq!(rolled_back_index_sql, original_index_sql);
+
+        database.apply_migrations().expect("rerun migration 23");
+        assert!(database.migration_applied(23).unwrap());
+        assert!(database
+            .table_has_column("file_operations", "journal_phase")
             .unwrap());
     }
 

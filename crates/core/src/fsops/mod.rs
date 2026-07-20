@@ -2052,6 +2052,123 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn prepared_permanent_delete_without_persisted_identity_is_interrupted() {
+        let env = TestEnv::new_file_backed("journal_delete_missing_identity");
+        let file_id = env.add_file(env.root_folder_id, "keep.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_attempt
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced pre-execution stop');
+                END;
+                "#,
+            )
+            .expect("install attempt failure trigger");
+        delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![file_id],
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .expect_err("attempt transition must stop before filesystem work");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                "DROP TRIGGER fail_file_operation_attempt; UPDATE file_operations SET source_identity = NULL;",
+            )
+            .expect("simulate prepared journal without stable identity");
+
+        env.run_startup_recovery().await;
+
+        assert!(env.root_path.join("keep.jpg").exists());
+        let guard = env.database.lock().expect("db lock");
+        let audit: (String, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("missing-identity audit");
+        assert_eq!(audit.0, "failed");
+        assert_eq!(audit.1.as_deref(), Some("interrupted"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_permanent_delete_refuses_regular_same_path_replacement() {
+        let env = TestEnv::new_file_backed("journal_delete_regular_replacement");
+        let file_id = env.add_file(env.root_folder_id, "keep.jpg");
+        let source = env.root_path.join("keep.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_attempt
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced pre-execution stop');
+                END;
+                "#,
+            )
+            .expect("install attempt failure trigger");
+        delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![file_id],
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .expect_err("attempt transition must stop before filesystem work");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_attempt;")
+            .expect("remove attempt failure trigger");
+        stdfs::remove_file(&source).expect("remove original object");
+        stdfs::write(&source, b"replacement").expect("write same-path replacement");
+
+        env.run_startup_recovery().await;
+
+        assert_eq!(
+            stdfs::read(&source).expect("read replacement after recovery"),
+            b"replacement"
+        );
+        let guard = env.database.lock().expect("db lock");
+        let file_status: String = guard
+            .connection_for_fsops()
+            .query_row("SELECT status FROM files WHERE id = ?1", [file_id], |row| {
+                row.get(0)
+            })
+            .expect("replacement index status");
+        let audit: (String, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("replacement audit");
+        assert_eq!(file_status, "active");
+        assert_eq!(audit.0, "failed");
+        assert_eq!(audit.1.as_deref(), Some("interrupted"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn probe_error_during_delete_recovery_is_interrupted_not_succeeded() {
         let env = TestEnv::new_file_backed("journal_delete_probe_error");
         let file_id = env.add_file(env.root_folder_id, "keep.jpg");

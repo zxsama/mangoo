@@ -583,6 +583,9 @@ fn validate_permanent_delete_replay(
     intent: &JournalIntent,
     metadata: &fs::Metadata,
 ) -> FsOpsResult<()> {
+    let expected_identity = intent.source_identity.as_deref().ok_or_else(|| {
+        interrupted_error("permanent-delete replay requires a persisted stable source identity")
+    })?;
     verify_entity_snapshot(database, intent)?;
     let root_id = intent
         .root_id
@@ -592,7 +595,7 @@ fn validate_permanent_delete_replay(
         &intent.source_path,
         &root_path,
         metadata,
-        intent.source_identity.as_deref(),
+        Some(expected_identity),
     )?;
     Ok(())
 }

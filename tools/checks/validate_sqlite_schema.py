@@ -27,6 +27,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0020_root_purge_task_kind.sql",
     ROOT / "crates" / "core" / "migrations" / "0021_notification_outbox.sql",
     ROOT / "crates" / "core" / "migrations" / "0022_file_operation_journal.sql",
+    ROOT / "crates" / "core" / "migrations" / "0023_file_operation_recovery_metadata.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -360,6 +361,11 @@ def main() -> None:
             ).fetchone()
             if version is None:
                 fail("migration version 22 was not recorded")
+            version = conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 23"
+            ).fetchone()
+            if version is None:
+                fail("migration version 23 was not recorded")
 
             media_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(media)").fetchall()
