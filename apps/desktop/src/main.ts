@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import {
   startCoreProcess,
   stopCoreProcesses,
+  stopCoreProcessesAndCloseLogger,
   waitForCoreHealth,
   type CoreProcessHandle
 } from "./core-process.js";
@@ -1454,13 +1455,18 @@ app
 function handleDesktopStartupFailure(error: unknown): void {
   desktopLogger.error("main", "[megle] desktop startup failed:", error);
   void (async () => {
-    await stopCoreProcesses([pendingCoreProcess, coreProcess]);
-    pendingCoreProcess = null;
-    coreProcess = null;
-    coreReadyPromise = null;
-    coreSession = null;
-    await desktopLogger.close();
-    app.exit(1);
+    try {
+      await stopCoreProcessesAndCloseLogger(
+        [pendingCoreProcess, coreProcess],
+        () => desktopLogger.close()
+      );
+    } finally {
+      pendingCoreProcess = null;
+      coreProcess = null;
+      coreReadyPromise = null;
+      coreSession = null;
+      app.exit(1);
+    }
   })();
 }
 
@@ -1515,11 +1521,14 @@ app.on("before-quit", (event) => {
       try {
         await persistWindowState();
       } finally {
-        await stopCoreProcesses([pendingCoreProcess, coreProcess]);
+        const handles = [pendingCoreProcess, coreProcess] as const;
         pendingCoreProcess = null;
         coreProcess = null;
-        await desktopLogger.close();
-        app.exit(0);
+        try {
+          await stopCoreProcessesAndCloseLogger(handles, () => desktopLogger.close());
+        } finally {
+          app.exit(0);
+        }
       }
     })();
     return;

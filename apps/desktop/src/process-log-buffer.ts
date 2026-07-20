@@ -36,15 +36,41 @@ export interface ProcessLogPage {
   readonly nextBeforeSequence: number | null;
 }
 
+export interface ProcessLogBatch {
+  readonly lines: readonly ProcessLogLine[];
+  /** Cursor to use for the next batch, including filtered-out retained lines. */
+  readonly afterSequence: number;
+  /** First retained sequence when older entries were evicted before this batch. */
+  readonly droppedBeforeSequence: number | null;
+}
+
+export interface ProcessLogSubscribeOptions {
+  readonly afterSequence?: number;
+  readonly filter?: ProcessLogFilter;
+}
+
+export interface ProcessLogSnapshotSubscription {
+  readonly snapshot: readonly ProcessLogLine[];
+  readonly afterSequence: number;
+  readonly unsubscribe: () => void;
+}
+
 export interface ProcessLogBufferOptions {
   readonly maxEntries?: number;
   readonly maxBytes?: number;
   readonly now?: () => number;
 }
 
-type StoredLine = ProcessLogLine & { readonly bytes: number };
-type ProcessLogSubscriber = (line: ProcessLogLine) => void;
-type QueuedNotification = { readonly generation: number; readonly line: ProcessLogLine };
+type StoredLine = { readonly line: ProcessLogLine; readonly bytes: number };
+type ProcessLogSubscriber = (batch: ProcessLogBatch) => void | Promise<void>;
+type SubscriberState = {
+  readonly subscriber: ProcessLogSubscriber;
+  readonly filter: ProcessLogFilter;
+  afterSequence: number;
+  generation: number;
+  delivering: boolean;
+  active: boolean;
+};
 type SanitizeContext = { readonly seen: WeakSet<object>; keys: number };
 
 const MAX_MESSAGE_BYTES = 16 * 1024;
@@ -54,28 +80,62 @@ const MAX_METADATA_ARRAY_ITEMS = 128;
 const MAX_METADATA_STRING_LENGTH = 4 * 1024;
 const REDACTED = "[redacted]";
 const UNREADABLE = "[unreadable]";
+const ACCESSOR = "[accessor]";
 
-const SENSITIVE_KEY_SOURCE = String.raw`(?:megle[-_]?session[-_]?token|megle[-_]?session|x[-_]?megle[-_]?session(?:[-_]?token)?|x[-_]?session[-_]?token|session[-_]?token|sessiontoken|access[-_]?token|refresh[-_]?token|token|auth|authorization|proxy[-_]?authorization|bearer|secret|password|cookie|set[-_]?cookie|api[-_]?key|x[-_]?api[-_]?key)`;
-const SECRET_TEXT_PATTERN = new RegExp(
-  `((?:${SENSITIVE_KEY_SOURCE})\\s*[:=]\\s*)([^\\r\\n,;]+)`,
+const SENSITIVE_TEXT_KEY_SOURCE = String.raw`(?:megle[-_ ]?session(?:[-_ ]?token)?|x[-_ ]?megle[-_ ]?session(?:[-_ ]?token)?|x[-_ ]?session[-_ ]?token|session[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token|auth[-_ ]?token|id[-_ ]?token|csrf[-_ ]?token|client[-_ ]?secret|token|auth|authorization|proxy[-_ ]?authorization|bearer|secret|password|cookie|set[-_ ]?cookie|api[-_ ]?key|x[-_ ]?api[-_ ]?key)`;
+const SECRET_JSON_DOUBLE_PATTERN = new RegExp(
+  `("(?:${SENSITIVE_TEXT_KEY_SOURCE})"\\s*:\\s*")([^"]*)(")`,
   "gi"
 );
-const SECRET_JSON_PATTERN = new RegExp(
-  `((?:["']?(?:${SENSITIVE_KEY_SOURCE})["']?)\\s*:\\s*["'])([^"']*)(["'])`,
+const SECRET_JSON_SINGLE_PATTERN = new RegExp(
+  `('(?:${SENSITIVE_TEXT_KEY_SOURCE})'\\s*:\\s*')([^']*)(')`,
   "gi"
 );
-const SENSITIVE_HEADER_NAME_PATTERN = new RegExp(`^${SENSITIVE_KEY_SOURCE}$`, "i");
+const SECRET_HEADER_PATTERN = new RegExp(
+  `(^|\\r?\\n)(\\s*(?:${SENSITIVE_TEXT_KEY_SOURCE})\\s*:\\s*)([^\\r\\n]*)`,
+  "gim"
+);
+const SECRET_ASSIGNMENT_PATTERN = new RegExp(
+  `((?:${SENSITIVE_TEXT_KEY_SOURCE})\\s*=\\s*)([^\\s,;]+)`,
+  "gi"
+);
+const BEARER_TOKEN_PATTERN = /\b(Bearer\s+)([^\s,;]+)/gi;
 const WINDOWS_PATH_PATTERN = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+/g;
 const UNIX_SENSITIVE_PATH_PATTERN = /(?:\/Users\/|\/home\/|\/private\/var\/|\/tmp\/)[^\s"'`<>]+/gi;
-const SENSITIVE_METADATA_KEY_PATTERN = new RegExp(
-  `^(?:${SENSITIVE_KEY_SOURCE}|path|file[-_]?path|directory|root[-_]?path)$`,
-  "i"
-);
+const SENSITIVE_NORMALIZED_KEYS = new Set([
+  "meglesession",
+  "meglesessiontoken",
+  "xmeglesession",
+  "xmeglesessiontoken",
+  "xsessiontoken",
+  "sessiontoken",
+  "accesstoken",
+  "refreshtoken",
+  "authtoken",
+  "idtoken",
+  "csrftoken",
+  "clientsecret",
+  "token",
+  "auth",
+  "authorization",
+  "proxyauthorization",
+  "bearer",
+  "secret",
+  "password",
+  "cookie",
+  "setcookie",
+  "apikey",
+  "xapikey"
+]);
+const SENSITIVE_PATH_KEYS = new Set(["path", "filepath", "directory", "rootpath"]);
 
 export function sanitizeProcessLogMessage(value: string): string {
   let message = value;
-  message = message.replace(SECRET_TEXT_PATTERN, `$1${REDACTED}`);
-  message = message.replace(SECRET_JSON_PATTERN, `$1${REDACTED}$3`);
+  message = message.replace(SECRET_JSON_DOUBLE_PATTERN, `$1${REDACTED}$3`);
+  message = message.replace(SECRET_JSON_SINGLE_PATTERN, `$1${REDACTED}$3`);
+  message = message.replace(SECRET_HEADER_PATTERN, `$1$2${REDACTED}`);
+  message = message.replace(BEARER_TOKEN_PATTERN, `$1${REDACTED}`);
+  message = message.replace(SECRET_ASSIGNMENT_PATTERN, `$1${REDACTED}`);
   message = message.replace(WINDOWS_PATH_PATTERN, REDACTED);
   message = message.replace(UNIX_SENSITIVE_PATH_PATTERN, REDACTED);
   message = message.replace(/\r\n?/g, "\\n");
@@ -121,19 +181,21 @@ export class ProcessLogBuffer {
   private readonly maxEntries: number;
   private readonly maxBytes: number;
   private readonly now: () => number;
-  private readonly lines: StoredLine[] = [];
-  private readonly subscribers = new Set<ProcessLogSubscriber>();
+  private readonly ring: Array<StoredLine | undefined>;
+  private readonly subscribers = new Set<SubscriberState>();
   private readonly flushWaiters = new Set<() => void>();
-  private pendingNotifications: QueuedNotification[] = [];
-  private notificationScheduled = false;
-  private notificationGeneration = 0;
+  private head = 0;
+  private count = 0;
   private totalBytes = 0;
   private nextSequence = 1;
+  private notificationScheduled = false;
+  private notificationGeneration = 0;
 
   constructor(options: ProcessLogBufferOptions = {}) {
     this.maxEntries = positiveInteger(options.maxEntries, DEFAULT_PROCESS_LOG_MAX_ENTRIES);
     this.maxBytes = positiveInteger(options.maxBytes, DEFAULT_PROCESS_LOG_MAX_BYTES);
     this.now = options.now ?? Date.now;
+    this.ring = new Array<StoredLine | undefined>(this.maxEntries);
   }
 
   append(
@@ -143,6 +205,7 @@ export class ProcessLogBuffer {
     metadata?: unknown,
     timestamp = this.now()
   ): ProcessLogLine | null {
+    if (!Number.isSafeInteger(this.nextSequence)) return null;
     const sequence = this.nextSequence++;
     let candidate: StoredLine | null;
     try {
@@ -159,55 +222,86 @@ export class ProcessLogBuffer {
     }
     if (!candidate) return null;
 
-    const stored = freezeStoredLine(candidate);
-    this.lines.push(stored);
-    this.totalBytes += stored.bytes;
-    while (this.lines.length > this.maxEntries || this.totalBytes > this.maxBytes) {
-      const removed = this.lines.shift();
-      if (!removed) break;
-      this.totalBytes -= removed.bytes;
-    }
-    this.pendingNotifications.push({
-      generation: this.notificationGeneration,
-      line: stripBytes(stored)
-    });
-    this.scheduleNotificationFlush();
-    return stripBytes(stored);
+    this.push(candidate);
+    if (this.subscribers.size > 0) this.scheduleNotificationFlush();
+    return candidate.line;
   }
 
   snapshot(filter: ProcessLogFilter = {}): ProcessLogLine[] {
-    const lines = this.lines.filter((line) => matchesFilter(line, filter));
-    if (filter.limit === undefined) return lines.map(stripBytes);
-    const limit = positiveInteger(filter.limit, 1);
-    return lines.slice(-limit).map(stripBytes);
+    const matching: ProcessLogLine[] = [];
+    this.forEachStored((stored) => {
+      if (matchesFilter(stored.line, filter)) matching.push(stored.line);
+    });
+    const selected = filter.limit === undefined
+      ? matching
+      : matching.slice(-positiveInteger(filter.limit, 1));
+    return selected.map(cloneProcessLogLine);
   }
 
   page(filter: ProcessLogFilter & { readonly limit?: number } = {}): ProcessLogPage {
     const limit = positiveInteger(filter.limit, 100);
-    const matching = this.lines.filter((line) => matchesFilter(line, filter));
-    const lines = matching.slice(-limit).map(stripBytes);
-    const hasMore = matching.length > lines.length;
+    const matching: ProcessLogLine[] = [];
+    this.forEachStored((stored) => {
+      if (matchesFilter(stored.line, filter)) matching.push(stored.line);
+    });
+    const selected = matching.slice(-limit);
     return {
-      lines,
-      hasMore,
-      nextBeforeSequence: hasMore ? (lines[0]?.sequence ?? null) : null
+      lines: selected.map(cloneProcessLogLine),
+      hasMore: matching.length > selected.length,
+      nextBeforeSequence: matching.length > selected.length ? (selected[0]?.sequence ?? null) : null
     };
   }
 
-  subscribe(subscriber: ProcessLogSubscriber): () => void {
-    this.subscribers.add(subscriber);
-    return () => this.subscribers.delete(subscriber);
+  subscribe(subscriber: ProcessLogSubscriber, options: ProcessLogSubscribeOptions = {}): () => void {
+    const requestedAfter = options.afterSequence;
+    const afterSequence = Number.isSafeInteger(requestedAfter) && requestedAfter !== undefined && requestedAfter >= 0
+      ? requestedAfter
+      : this.latestSequence;
+    const state: SubscriberState = {
+      subscriber,
+      filter: cloneProcessLogFilter(options.filter),
+      afterSequence,
+      generation: this.notificationGeneration,
+      delivering: false,
+      active: true
+    };
+    this.subscribers.add(state);
+    if (this.latestSequence > state.afterSequence) this.scheduleNotificationFlush();
+    return () => {
+      state.active = false;
+      this.subscribers.delete(state);
+    };
+  }
+
+  snapshotAndSubscribe(
+    subscriber: ProcessLogSubscriber,
+    filter: ProcessLogFilter = {}
+  ): ProcessLogSnapshotSubscription {
+    // JavaScript execution is single-threaded here, so no append can interleave
+    // between capturing this cursor and registering the subscriber.
+    const afterSequence = this.latestSequence;
+    const snapshot = this.snapshot(filter);
+    const unsubscribe = this.subscribe(subscriber, { afterSequence, filter });
+    return { snapshot, afterSequence, unsubscribe };
   }
 
   clear(): void {
-    this.lines.length = 0;
+    for (let index = 0; index < this.count; index += 1) {
+      this.ring[(this.head + index) % this.maxEntries] = undefined;
+    }
+    this.head = 0;
+    this.count = 0;
     this.totalBytes = 0;
     this.notificationGeneration += 1;
-    this.pendingNotifications = [];
+    const afterSequence = this.latestSequence;
+    for (const state of this.subscribers) {
+      state.generation = this.notificationGeneration;
+      state.afterSequence = afterSequence;
+    }
   }
 
   get size(): number {
-    return this.lines.length;
+    return this.count;
   }
 
   get bytes(): number {
@@ -215,29 +309,28 @@ export class ProcessLogBuffer {
   }
 
   async flush(): Promise<void> {
-    if (!this.notificationScheduled && this.pendingNotifications.length === 0) return;
+    if (!this.notificationScheduled) return;
     await new Promise<void>((resolve) => {
       this.flushWaiters.add(resolve);
-      this.scheduleNotificationFlush();
     });
   }
 
   async shutdown(): Promise<void> {
     await this.flush();
+    for (const state of this.subscribers) state.active = false;
     this.subscribers.clear();
-    this.pendingNotifications.length = 0;
     for (const resolve of this.flushWaiters) resolve();
     this.flushWaiters.clear();
   }
 
   private fitLine(line: ProcessLogLine): StoredLine | null {
-    let candidate: ProcessLogLine = line;
+    let candidate = line;
     let bytes = estimateLineBytes(candidate);
-    if (bytes <= this.maxBytes) return { ...candidate, bytes };
+    if (bytes <= this.maxBytes) return freezeStoredLine(candidate, bytes);
 
     candidate = { ...candidate, metadata: undefined };
     bytes = estimateLineBytes(candidate);
-    if (bytes <= this.maxBytes) return { ...candidate, bytes };
+    if (bytes <= this.maxBytes) return freezeStoredLine(candidate, bytes);
 
     let low = 0;
     let high = candidate.message.length;
@@ -245,8 +338,7 @@ export class ProcessLogBuffer {
     while (low <= high) {
       const middle = Math.floor((low + high) / 2);
       const shortened = { ...candidate, message: candidate.message.slice(0, middle) };
-      const shortenedBytes = estimateLineBytes(shortened);
-      if (shortenedBytes <= this.maxBytes) {
+      if (estimateLineBytes(shortened) <= this.maxBytes) {
         best = shortened;
         low = middle + 1;
       } else {
@@ -254,35 +346,106 @@ export class ProcessLogBuffer {
       }
     }
     if (!best) return null;
-    return { ...best, bytes: estimateLineBytes(best) };
+    return freezeStoredLine(best, estimateLineBytes(best));
+  }
+
+  private push(stored: StoredLine): void {
+    while (this.count >= this.maxEntries || (this.count > 0 && this.totalBytes + stored.bytes > this.maxBytes)) {
+      this.evictOldest();
+    }
+    const index = (this.head + this.count) % this.maxEntries;
+    this.ring[index] = stored;
+    this.count += 1;
+    this.totalBytes += stored.bytes;
+  }
+
+  private evictOldest(): void {
+    if (this.count === 0) return;
+    const removed = this.ring[this.head];
+    this.ring[this.head] = undefined;
+    this.head = (this.head + 1) % this.maxEntries;
+    this.count -= 1;
+    if (removed) this.totalBytes -= removed.bytes;
+  }
+
+  private forEachStored(visitor: (stored: StoredLine) => void): void {
+    for (let index = 0; index < this.count; index += 1) {
+      const stored = this.ring[(this.head + index) % this.maxEntries];
+      if (stored) visitor(stored);
+    }
+  }
+
+  private get latestSequence(): number {
+    return this.nextSequence - 1;
   }
 
   private scheduleNotificationFlush(): void {
-    if (this.notificationScheduled) return;
+    if (this.notificationScheduled || this.subscribers.size === 0) return;
     this.notificationScheduled = true;
     queueMicrotask(() => this.flushNotifications());
   }
 
   private flushNotifications(): void {
     this.notificationScheduled = false;
-    const pending = this.pendingNotifications;
-    this.pendingNotifications = [];
-    for (const queued of pending) {
-      if (queued.generation !== this.notificationGeneration) continue;
-      for (const subscriber of this.subscribers) {
-        try {
-          subscriber(queued.line);
-        } catch {
-          // A log consumer must never interrupt the producer or another consumer.
+    for (const state of this.subscribers) {
+      if (!state.active || state.delivering) continue;
+      const batch = this.createBatch(state);
+      if (!batch) continue;
+      if (batch.lines.length === 0 && batch.droppedBeforeSequence === null) {
+        state.afterSequence = batch.afterSequence;
+        continue;
+      }
+      state.delivering = true;
+      const generation = state.generation;
+      try {
+        const result = state.subscriber(batch);
+        if (result && typeof result.then === "function") {
+          void Promise.resolve(result).then(
+            () => this.completeDelivery(state, generation, batch.afterSequence),
+            () => this.completeDelivery(state, generation, batch.afterSequence)
+          );
+        } else {
+          this.completeDelivery(state, generation, batch.afterSequence);
         }
+      } catch {
+        this.completeDelivery(state, generation, batch.afterSequence);
       }
     }
-    if (this.pendingNotifications.length > 0) {
-      this.scheduleNotificationFlush();
-      return;
+
+    if (this.hasReadySubscriber()) this.scheduleNotificationFlush();
+    if (!this.notificationScheduled) {
+      for (const resolve of this.flushWaiters) resolve();
+      this.flushWaiters.clear();
     }
-    for (const resolve of this.flushWaiters) resolve();
-    this.flushWaiters.clear();
+  }
+
+  private createBatch(state: SubscriberState): ProcessLogBatch | null {
+    const afterSequence = this.latestSequence;
+    if (afterSequence <= state.afterSequence) return null;
+    if (this.count === 0) return { lines: [], afterSequence, droppedBeforeSequence: null };
+
+    const oldest = this.ring[this.head]?.line.sequence ?? afterSequence;
+    const droppedBeforeSequence = state.afterSequence + 1 < oldest ? oldest : null;
+    const lines: ProcessLogLine[] = [];
+    this.forEachStored((stored) => {
+      if (stored.line.sequence <= state.afterSequence) return;
+      if (matchesFilter(stored.line, state.filter)) lines.push(cloneProcessLogLine(stored.line));
+    });
+    return { lines, afterSequence, droppedBeforeSequence };
+  }
+
+  private completeDelivery(state: SubscriberState, generation: number, afterSequence: number): void {
+    if (!state.active) return;
+    state.delivering = false;
+    if (state.generation === generation) state.afterSequence = Math.max(state.afterSequence, afterSequence);
+    if (this.latestSequence > state.afterSequence) this.scheduleNotificationFlush();
+  }
+
+  private hasReadySubscriber(): boolean {
+    for (const state of this.subscribers) {
+      if (state.active && !state.delivering && this.latestSequence > state.afterSequence) return true;
+    }
+    return false;
   }
 }
 
@@ -290,31 +453,48 @@ function positiveInteger(value: number | undefined, fallback: number): number {
   return Number.isInteger(value) && value !== undefined && value > 0 ? value : fallback;
 }
 
-function freezeStoredLine(line: StoredLine): StoredLine {
-  const metadata = line.metadata ? deepFreeze(sanitizeProcessLogMetadata(line.metadata)) : undefined;
-  return Object.freeze({ ...line, metadata });
+function freezeStoredLine(line: ProcessLogLine, bytes: number): StoredLine {
+  const metadata = line.metadata ? deepFreeze(line.metadata) : undefined;
+  const frozenLine = Object.freeze({ ...line, metadata });
+  return Object.freeze({ line: frozenLine, bytes });
 }
 
-function stripBytes(line: StoredLine): ProcessLogLine {
-  const metadata = line.metadata ? sanitizeProcessLogMetadata(line.metadata) : undefined;
-  const { bytes: _bytes, ...publicLine } = line;
-  return { ...publicLine, metadata };
+function cloneProcessLogLine(line: ProcessLogLine): ProcessLogLine {
+  const metadata = line.metadata
+    ? cloneSanitizedValue(line.metadata) as ProcessLogMetadata
+    : undefined;
+  return { ...line, metadata };
+}
+
+function cloneProcessLogFilter(filter: ProcessLogFilter | undefined): ProcessLogFilter {
+  if (!filter) return {};
+  return {
+    ...filter,
+    sources: filter.sources ? [...filter.sources] : undefined,
+    levels: filter.levels ? [...filter.levels] : undefined
+  };
+}
+
+function cloneSanitizedValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(cloneSanitizedValue);
+  if (!isRecord(value)) return value;
+  const output: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) output[key] = cloneSanitizedValue(value[key]);
+  return output;
 }
 
 function estimateLineBytes(line: ProcessLogLine): number {
   return Buffer.byteLength(JSON.stringify(line), "utf8");
 }
 
-function matchesFilter(line: StoredLine, filter: ProcessLogFilter): boolean {
+function matchesFilter(line: ProcessLogLine, filter: ProcessLogFilter): boolean {
   if (filter.source && line.source !== filter.source) return false;
   if (filter.sources && !filter.sources.includes(line.source)) return false;
   if (filter.level && line.level !== filter.level) return false;
   if (filter.levels && !filter.levels.includes(line.level)) return false;
   if (filter.afterSequence !== undefined && line.sequence <= filter.afterSequence) return false;
   if (filter.beforeSequence !== undefined && line.sequence >= filter.beforeSequence) return false;
-  if (filter.search && !line.message.toLocaleLowerCase().includes(filter.search.toLocaleLowerCase())) {
-    return false;
-  }
+  if (filter.search && !line.message.toLocaleLowerCase().includes(filter.search.toLocaleLowerCase())) return false;
   return true;
 }
 
@@ -327,8 +507,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function normalizeKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_NORMALIZED_KEYS.has(normalizeKey(key));
+}
+
+function isSensitiveMetadataKey(key: string): boolean {
+  const normalized = normalizeKey(key);
+  return SENSITIVE_NORMALIZED_KEYS.has(normalized) || SENSITIVE_PATH_KEYS.has(normalized);
+}
+
 function sanitizeMetadataValue(value: unknown, key: string, context: SanitizeContext, depth: number): unknown {
-  if (SENSITIVE_METADATA_KEY_PATTERN.test(key)) return REDACTED;
+  if (isSensitiveMetadataKey(key)) return REDACTED;
   if (value === null || typeof value === "boolean" || typeof value === "number") return value;
   if (typeof value === "string") return truncateUtf8(sanitizeProcessLogMessage(value), MAX_METADATA_STRING_LENGTH);
   if (typeof value === "bigint") return `${value.toString()}n`;
@@ -338,66 +531,40 @@ function sanitizeMetadataValue(value: unknown, key: string, context: SanitizeCon
   if (context.seen.has(value)) return "[circular]";
   context.seen.add(value);
 
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return UNREADABLE;
+  }
+
   try {
     if (value instanceof Error) {
       return {
-        name: safeProperty(value, "name"),
-        message: safeProperty(value, "message"),
-        stack: safeProperty(value, "stack")
+        name: sanitizeErrorProperty(descriptors.name, "Error"),
+        message: sanitizeErrorProperty(descriptors.message),
+        stack: sanitizeErrorProperty(descriptors.stack)
       };
     }
     if (value instanceof Date) {
-      const time = value.getTime();
-      return Number.isFinite(time) ? value.toISOString() : "[invalid date]";
+      const time = Date.prototype.getTime.call(value);
+      return Number.isFinite(time) ? new Date(time).toISOString() : "[invalid date]";
     }
-    if (Array.isArray(value)) {
-      const output: unknown[] = [];
-      const length = Math.min(value.length, MAX_METADATA_ARRAY_ITEMS);
-      let firstItem: unknown;
-      try {
-        firstItem = value[0];
-      } catch {
-        firstItem = UNREADABLE;
-      }
-      if (length === 2 && typeof firstItem === "string" && SENSITIVE_HEADER_NAME_PATTERN.test(firstItem)) {
-        return [sanitizeMetadataValue(firstItem, "value", context, depth + 1), REDACTED];
-      }
-      for (let index = 0; index < length; index += 1) {
-        let item: unknown;
-        try {
-          item = value[index];
-        } catch {
-          item = UNREADABLE;
-        }
-        output.push(sanitizeMetadataValue(item, "value", context, depth + 1));
-      }
-      if (value.length > length) output.push("[truncated]");
-      return output;
-    }
+    if (Array.isArray(value)) return sanitizeArray(descriptors, context, depth);
 
     const output: Record<string, unknown> = {};
-    let keys: string[];
-    try {
-      keys = Object.keys(value);
-    } catch {
-      return UNREADABLE;
-    }
-    for (const childKey of keys) {
+    for (const [childKey, descriptor] of Object.entries(descriptors)) {
+      if (!descriptor.enumerable) continue;
       if (context.keys++ >= MAX_METADATA_KEYS) {
         output.__truncated__ = true;
         break;
       }
-      let childValue: unknown;
-      try {
-        childValue = (value as Record<string, unknown>)[childKey];
-      } catch {
-        childValue = UNREADABLE;
-      }
-      try {
-        const normalized = sanitizeMetadataValue(childValue, childKey, context, depth + 1);
-        if (normalized !== undefined) output[childKey] = normalized;
-      } catch {
-        output[childKey] = UNREADABLE;
+      if (isSensitiveMetadataKey(childKey)) {
+        output[childKey] = REDACTED;
+      } else if (!("value" in descriptor)) {
+        output[childKey] = ACCESSOR;
+      } else {
+        output[childKey] = sanitizeMetadataValue(descriptor.value, childKey, context, depth + 1);
       }
     }
     return output;
@@ -406,13 +573,40 @@ function sanitizeMetadataValue(value: unknown, key: string, context: SanitizeCon
   }
 }
 
-function safeProperty(value: object, key: string): string | undefined {
-  try {
-    const property = (value as Record<string, unknown>)[key];
-    return property === undefined ? undefined : sanitizeProcessLogMessage(String(property));
-  } catch {
-    return UNREADABLE;
+function sanitizeArray(descriptors: PropertyDescriptorMap, context: SanitizeContext, depth: number): unknown[] {
+  const rawLength = descriptors.length && "value" in descriptors.length ? descriptors.length.value : 0;
+  const actualLength = typeof rawLength === "number" && Number.isSafeInteger(rawLength) && rawLength >= 0
+    ? rawLength
+    : 0;
+  const length = Math.min(actualLength, MAX_METADATA_ARRAY_ITEMS);
+  const firstDescriptor = descriptors["0"];
+  const firstItem = firstDescriptor && "value" in firstDescriptor ? firstDescriptor.value : undefined;
+  if (length === 2 && typeof firstItem === "string" && isSensitiveKey(firstItem)) {
+    return [sanitizeMetadataValue(firstItem, "value", context, depth + 1), REDACTED];
   }
+
+  const output: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor) {
+      output.push(undefined);
+    } else if (!("value" in descriptor)) {
+      output.push(ACCESSOR);
+    } else {
+      output.push(sanitizeMetadataValue(descriptor.value, "value", context, depth + 1));
+    }
+  }
+  if (actualLength > length) output.push("[truncated]");
+  return output;
+}
+
+function sanitizeErrorProperty(descriptor: PropertyDescriptor | undefined, fallback?: string): string | undefined {
+  if (!descriptor) return fallback;
+  if (!("value" in descriptor)) return ACCESSOR;
+  const value = descriptor.value;
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") return UNREADABLE;
+  return sanitizeProcessLogMessage(String(value));
 }
 
 function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {

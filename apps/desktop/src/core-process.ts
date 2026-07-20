@@ -24,6 +24,13 @@ export interface CoreProcessLifecycle {
   readonly stop: () => Promise<void>;
 }
 
+export interface CoreProcessLifecycleOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly gracefulTimeoutMs?: number;
+  readonly forceTimeoutMs?: number;
+  readonly requestWindowsStop?: (child: ChildProcess) => void;
+}
+
 export function createCoreOutputLineSplitter(onLine: (line: string) => void): {
   push: (chunk: string | Uint8Array) => void;
   flush: () => void;
@@ -101,30 +108,37 @@ export function startCoreProcess(
 
 export function attachCoreProcessLifecycle(
   child: ChildProcess,
-  onLog: CoreProcessLogHandler = defaultCoreProcessLogHandler
+  onLog: CoreProcessLogHandler = defaultCoreProcessLogHandler,
+  options: CoreProcessLifecycleOptions = {}
 ): CoreProcessLifecycle {
   const stdoutSplitter = createCoreOutputLineSplitter((line) => emitCoreLog(onLog, "info", line));
   const stderrSplitter = createCoreOutputLineSplitter((line) => emitCoreLog(onLog, "warn", line));
+  const platform = options.platform ?? process.platform;
+  const gracefulTimeoutMs = options.gracefulTimeoutMs ?? CORE_GRACEFUL_STOP_TIMEOUT_MS;
+  const forceTimeoutMs = options.forceTimeoutMs ?? CORE_FORCE_STOP_TIMEOUT_MS;
+  const requestWindowsStop = options.requestWindowsStop ?? stopCoreProcessTree;
   let settled = false;
   let exitObserved = false;
-  let stopState: "running" | "stopping" | "stopped" = "running";
+  let stopRequested = false;
   let stopPromise: Promise<void> | null = null;
   let resolveExit!: () => void;
+  let resolveTermination!: () => void;
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
   let processError: unknown;
   const waitForExit = new Promise<void>((resolve) => {
     resolveExit = resolve;
   });
+  const waitForTermination = new Promise<void>((resolve) => {
+    resolveTermination = resolve;
+  });
 
   const settle = (code: number | null, signal: NodeJS.Signals | null, error?: unknown): void => {
     if (settled) return;
     settled = true;
-    const intentionalStop = stopState === "stopping";
-    stopState = "stopped";
     stdoutSplitter.flush();
     stderrSplitter.flush();
-    if (intentionalStop) {
+    if (stopRequested) {
       emitCoreLog(
         onLog,
         "info",
@@ -135,6 +149,7 @@ export function attachCoreProcessLifecycle(
     } else if (code !== 0 || signal !== null) {
       emitCoreLog(onLog, "error", `Core exited with code=${code} signal=${signal ?? "none"}`);
     }
+    resolveTermination();
     resolveExit();
   };
 
@@ -144,6 +159,7 @@ export function attachCoreProcessLifecycle(
     exitObserved = true;
     exitCode = code;
     exitSignal = signal;
+    resolveTermination();
   });
   child.once("error", (error) => {
     processError = error;
@@ -157,27 +173,42 @@ export function attachCoreProcessLifecycle(
       await waitForExit;
       return;
     }
-    if (exitObserved || processError !== undefined) {
-      await waitForExit;
-      return;
-    }
-    if (!stopPromise) {
-      stopState = "stopping";
-      stopPromise = (async () => {
-        try {
-          stopCoreProcessTree(child);
-        } catch (error) {
-          emitCoreLog(onLog, "error", `Core stop request failed: ${formatCoreError(error)}`);
+    if (stopPromise) return stopPromise;
+
+    const attempt = (async () => {
+      if (!exitObserved && processError === undefined) {
+        stopRequested = true;
+        if (platform === "win32") {
+          try {
+            requestWindowsStop(child);
+          } catch (error) {
+            emitCoreLog(onLog, "error", `Core taskkill request failed: ${formatCoreError(error)}`);
+            requestCoreSignal(child, "SIGKILL", onLog);
+          }
+        } else {
+          requestCoreSignal(child, "SIGTERM", onLog);
+          const terminated = await waitForCoreEvent(waitForTermination, gracefulTimeoutMs);
+          if (!terminated) requestCoreSignal(child, "SIGKILL", onLog);
         }
-        const didExit = await waitForCoreExit(waitForExit, CORE_STOP_TIMEOUT_MS);
-        if (!didExit) {
-          stdoutSplitter.flush();
-          stderrSplitter.flush();
-          emitCoreLog(onLog, "error", `Core stop timed out after ${CORE_STOP_TIMEOUT_MS}ms`);
-        }
-      })();
+      }
+
+      const didClose = await waitForCoreEvent(waitForExit, forceTimeoutMs);
+      if (didClose) return;
+      stdoutSplitter.flush();
+      stderrSplitter.flush();
+      const totalTimeoutMs = platform === "win32"
+        ? forceTimeoutMs
+        : gracefulTimeoutMs + forceTimeoutMs;
+      const error = new Error(`Core stop timed out after ${totalTimeoutMs}ms without close`);
+      emitCoreLog(onLog, "error", error.message);
+      throw error;
+    })();
+    stopPromise = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (!settled && stopPromise === attempt) stopPromise = null;
     }
-    await stopPromise;
   };
 
   return { waitForExit, stop };
@@ -187,14 +218,35 @@ export async function stopCoreProcesses(
   handles: readonly (CoreProcessHandle | null)[]
 ): Promise<void> {
   const stopped = new Set<CoreProcessHandle>();
+  let firstError: unknown;
   for (const handle of handles) {
     if (!handle || stopped.has(handle)) continue;
     stopped.add(handle);
-    await handle.stop();
+    try {
+      await handle.stop();
+    } catch (error) {
+      firstError ??= error;
+    }
   }
+  if (firstError !== undefined) throw firstError;
 }
 
-const CORE_STOP_TIMEOUT_MS = 5_000;
+export async function stopCoreProcessesAndCloseLogger(
+  handles: readonly (CoreProcessHandle | null)[],
+  closeLogger: () => Promise<void>
+): Promise<void> {
+  let stopError: unknown;
+  try {
+    await stopCoreProcesses(handles);
+  } catch (error) {
+    stopError = error;
+  }
+  await closeLogger();
+  if (stopError !== undefined) throw stopError;
+}
+
+const CORE_GRACEFUL_STOP_TIMEOUT_MS = 2_000;
+const CORE_FORCE_STOP_TIMEOUT_MS = 5_000;
 
 function formatCoreError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
@@ -205,12 +257,12 @@ function formatCoreError(error: unknown): string {
   }
 }
 
-async function waitForCoreExit(waitForExit: Promise<void>, timeoutMs: number): Promise<boolean> {
+async function waitForCoreEvent(event: Promise<void>, timeoutMs: number): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined;
   const timedOut = new Promise<boolean>((resolve) => {
     timer = setTimeout(() => resolve(false), timeoutMs);
   });
-  const didExit = await Promise.race([waitForExit.then(() => true), timedOut]);
+  const didExit = await Promise.race([event.then(() => true), timedOut]);
   if (timer) clearTimeout(timer);
   return didExit;
 }
@@ -289,32 +341,39 @@ function delay(ms: number): Promise<void> {
 
 function stopCoreProcessTree(child: ChildProcess): void {
   if (child.pid === undefined) {
-    child.kill();
+    child.kill("SIGKILL");
     return;
   }
 
-  if (process.platform === "win32") {
-    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-      stdio: "ignore",
-      windowsHide: true
-    });
-    killer.on("error", () => {
-      child.kill();
-    });
-    killer.on("exit", (code) => {
-      if (code !== 0 && !child.killed) {
-        child.kill();
-      }
-    });
-    return;
-  }
+  const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+    stdio: "ignore",
+    windowsHide: true
+  });
+  killer.once("error", () => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // The lifecycle timeout reports failure if the child still does not close.
+    }
+  });
+  killer.once("exit", (code) => {
+    if (code === 0) return;
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // The lifecycle timeout reports failure if the child still does not close.
+    }
+  });
+}
 
-  if (!child.killed) {
-    child.kill("SIGTERM");
-    setTimeout(() => {
-      if (!child.killed) {
-        child.kill("SIGKILL");
-      }
-    }, 2_000).unref();
+function requestCoreSignal(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  onLog: CoreProcessLogHandler
+): void {
+  try {
+    child.kill(signal);
+  } catch (error) {
+    emitCoreLog(onLog, "error", `Core ${signal} request failed: ${formatCoreError(error)}`);
   }
 }

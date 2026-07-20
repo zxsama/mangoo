@@ -25,32 +25,39 @@ export interface DesktopLoggerOptions {
 
 export class DesktopLogger {
   readonly buffer: ProcessLogBuffer;
-  private readonly console: ConsoleSink;
-  private pending: NormalizedLog[] = [];
-  private scheduled = false;
+  private readonly consoleMethods: Partial<Record<ProcessLogLevel, ConsoleMethod>>;
   private closed = false;
-  private readonly flushWaiters = new Set<() => void>();
+  private logging = false;
 
   constructor(options: DesktopLoggerOptions = {}) {
     this.buffer = options.buffer ?? new ProcessLogBuffer();
-    this.console = options.console ?? console;
+    this.consoleMethods = bindConsoleMethods(options.console ?? console);
   }
 
   log(source: ProcessLogSource, level: ProcessLogLevel, ...args: unknown[]): void {
-    this.writeConsole(level, args);
-    if (this.closed) return;
-    let normalized: NormalizedLog;
+    if (this.logging) return;
+    this.logging = true;
     try {
-      normalized = normalizeLog(source, level, args);
-    } catch {
-      normalized = {
-        source,
-        level,
-        message: "[log serialization failed]"
-      };
+      this.writeConsole(level, args);
+      if (this.closed) return;
+      let normalized: NormalizedLog;
+      try {
+        normalized = normalizeLog(source, level, args);
+      } catch {
+        normalized = {
+          source,
+          level,
+          message: "[log serialization failed]"
+        };
+      }
+      try {
+        this.buffer.append(normalized.source, normalized.level, normalized.message, normalized.metadata);
+      } catch {
+        // Logging must be best-effort and never break the application.
+      }
+    } finally {
+      this.logging = false;
     }
-    this.pending.push(normalized);
-    this.scheduleDrain();
   }
 
   trace(source: ProcessLogSource, ...args: unknown[]): void {
@@ -74,30 +81,16 @@ export class DesktopLogger {
   }
 
   async flush(): Promise<void> {
-    if (!this.scheduled && this.pending.length === 0) {
-      await this.buffer.flush();
-      return;
-    }
-    await new Promise<void>((resolve) => {
-      this.flushWaiters.add(resolve);
-      this.scheduleDrain();
-    });
     await this.buffer.flush();
   }
 
   async close(): Promise<void> {
-    await this.flush();
     this.closed = true;
     await this.buffer.flush();
   }
 
   private writeConsole(level: ProcessLogLevel, args: unknown[]): void {
-    let method: ConsoleMethod | undefined;
-    try {
-      method = this.console[level] ?? this.console.log;
-    } catch {
-      return;
-    }
+    const method = this.consoleMethods[level];
     if (!method) return;
     try {
       method(...args);
@@ -106,30 +99,20 @@ export class DesktopLogger {
     }
   }
 
-  private scheduleDrain(): void {
-    if (this.scheduled || this.closed) return;
-    this.scheduled = true;
-    queueMicrotask(() => this.drain());
-  }
+}
 
-  private drain(): void {
-    this.scheduled = false;
-    const pending = this.pending;
-    this.pending = [];
-    for (const line of pending) {
-      try {
-        this.buffer.append(line.source, line.level, line.message, line.metadata);
-      } catch {
-        // Logging must be best-effort and never break the application.
-      }
+function bindConsoleMethods(sink: ConsoleSink): Partial<Record<ProcessLogLevel, ConsoleMethod>> {
+  const methods: Partial<Record<ProcessLogLevel, ConsoleMethod>> = {};
+  const levels: readonly ProcessLogLevel[] = ["trace", "debug", "info", "warn", "error"];
+  for (const level of levels) {
+    try {
+      const method = sink[level] ?? sink.log;
+      if (typeof method === "function") methods[level] = method.bind(sink);
+    } catch {
+      // A hostile console object must not prevent logger construction.
     }
-    if (this.pending.length > 0) {
-      this.scheduleDrain();
-      return;
-    }
-    for (const resolve of this.flushWaiters) resolve();
-    this.flushWaiters.clear();
   }
+  return methods;
 }
 
 function normalizeLog(source: ProcessLogSource, level: ProcessLogLevel, args: unknown[]): NormalizedLog {

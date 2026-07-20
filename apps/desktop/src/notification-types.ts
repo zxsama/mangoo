@@ -1,3 +1,5 @@
+import type { ProcessLogLine } from "./process-log-buffer.js";
+
 export type NotificationOrigin = "user" | "background" | "recovery" | "system";
 export type NotificationPresentation = "important" | "history_only" | "status_only";
 export type NotificationOperationStatus =
@@ -125,13 +127,7 @@ export interface NotificationActionResult {
   message: string | null;
 }
 
-export interface ProcessLogEntry {
-  sequence: number;
-  timestamp: number;
-  source: "main" | "core" | "renderer";
-  level: "debug" | "info" | "warn" | "error";
-  message: string;
-}
+export type ProcessLogEntry = ProcessLogLine;
 
 export interface NotificationRetentionResult {
   deletedExpired: number;
