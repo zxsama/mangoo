@@ -64,9 +64,11 @@ impl NotificationOperation {
 }
 
 impl Database {
-    /// Publish one logical operation using its own immediate transaction.
-    /// The wake is sent only after the transaction has committed successfully.
-    pub fn publish_notification_operation(
+    /// Test-only convenience for publishing through an owned transaction.
+    /// Production producers must publish inside their existing writer-owned
+    /// transaction and notify only after that transaction commits.
+    #[cfg(test)]
+    pub(crate) fn publish_notification_operation(
         &self,
         operation: &mut NotificationOperation,
         mode: PublishMode,
@@ -661,18 +663,16 @@ mod tests {
         db.apply_migrations().expect("apply migrations");
         let reopened = db.reopen().expect("reopen").expect("file database");
         let wake = db.notification_outbox_wake();
-        let waiter = tokio::spawn(async move {
-            wake.notified().await;
-        });
-        tokio::task::yield_now().await;
+        let waiter = wake.notified();
+        tokio::pin!(waiter);
+        waiter.as_mut().enable();
         let mut operation = fixture_operation("task:wake", "root_scan", "running", 10);
         assert!(reopened
             .publish_notification_operation(&mut operation, PublishMode::Phase)
             .unwrap());
-        tokio::time::timeout(Duration::from_secs(1), waiter)
+        tokio::time::timeout(Duration::from_secs(1), waiter.as_mut())
             .await
-            .expect("wake after commit")
-            .expect("waiter task");
+            .expect("wake after commit");
         drop(reopened);
         drop(db);
         let _ = std::fs::remove_file(path);

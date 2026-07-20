@@ -32,6 +32,10 @@ use crate::scan::ScanSummary;
 use crate::thumbnails::{is_pending_status, normalize_profile};
 
 const THUMBNAIL_TASK_WAKE_DEDUPE_WINDOW: Duration = Duration::from_millis(750);
+const INVALID_NOTIFICATION_OUTBOX_QUERY: &str = "invalid notification outbox query";
+const INVALID_NOTIFICATION_OUTBOX_ACKNOWLEDGEMENT: &str =
+    "invalid notification outbox acknowledgement";
+const MAX_SAFE_NOTIFICATION_SEQUENCE: i64 = 9_007_199_254_740_991;
 static RECENT_THUMBNAIL_TASK_WAKEUPS: LazyLock<Mutex<HashMap<(usize, i64, i64), Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1454,9 +1458,8 @@ async fn list_notification_outbox(
     State(state): State<AppState>,
     query: Result<Query<ListNotificationOutboxQuery>, QueryRejection>,
 ) -> ApiResult<Json<NotificationOutboxResponse>> {
-    let Query(query) = query.map_err(|rejection| {
-        invalid_notification_request("invalid notification outbox query", rejection.body_text())
-    })?;
+    let Query(query) =
+        query.map_err(|_| invalid_notification_request(INVALID_NOTIFICATION_OUTBOX_QUERY))?;
     let after_sequence = query.after_sequence.unwrap_or(0);
     let limit = query.limit.unwrap_or(100);
     let wait_ms = query.wait_ms.unwrap_or(0);
@@ -1464,6 +1467,11 @@ async fn list_notification_outbox(
         return Err(CoreError::bad_request(
             "afterSequence must be greater than or equal to 0".to_string(),
         ));
+    }
+    if after_sequence > MAX_SAFE_NOTIFICATION_SEQUENCE {
+        return Err(CoreError::bad_request(format!(
+            "afterSequence must be less than or equal to {MAX_SAFE_NOTIFICATION_SEQUENCE}"
+        )));
     }
     if !(1..=200).contains(&limit) {
         return Err(CoreError::bad_request(
@@ -1478,7 +1486,7 @@ async fn list_notification_outbox(
 
     let items = read_notification_outbox(&state, after_sequence, limit).await?;
     if !items.is_empty() || wait_ms == 0 {
-        return Ok(Json(notification_outbox_response(items, after_sequence)));
+        return Ok(Json(notification_outbox_response(items, after_sequence)?));
     }
 
     // `notify_waiters` does not retain a permit. Register first, then repeat the
@@ -1489,12 +1497,19 @@ async fn list_notification_outbox(
     notified.as_mut().enable();
     let items = read_notification_outbox(&state, after_sequence, limit).await?;
     if !items.is_empty() {
-        return Ok(Json(notification_outbox_response(items, after_sequence)));
+        return Ok(Json(notification_outbox_response(items, after_sequence)?));
     }
 
+    #[cfg(test)]
+    let waiter_activity = state
+        .notification_outbox_test_probe
+        .as_ref()
+        .map(|probe| probe.begin_waiter());
     let _ = tokio::time::timeout(Duration::from_millis(wait_ms as u64), notified.as_mut()).await;
+    #[cfg(test)]
+    drop(waiter_activity);
     let items = read_notification_outbox(&state, after_sequence, limit).await?;
-    Ok(Json(notification_outbox_response(items, after_sequence)))
+    Ok(Json(notification_outbox_response(items, after_sequence)?))
 }
 
 async fn read_notification_outbox(
@@ -1502,7 +1517,26 @@ async fn read_notification_outbox(
     after_sequence: i64,
     limit: i64,
 ) -> ApiResult<Vec<NotificationOutboxEvent>> {
+    let read_permit = Arc::clone(&state.notification_outbox_read_gate)
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            CoreError::from(anyhow::anyhow!(
+                "notification outbox read gate is unavailable"
+            ))
+        })?;
+    #[cfg(test)]
+    let read_activity = if let Some(probe) = &state.notification_outbox_test_probe {
+        let activity = probe.begin_read();
+        probe.wait_for_read_release().await;
+        Some(activity)
+    } else {
+        None
+    };
     run_read_database(state.clone(), move |database| {
+        let _read_permit = read_permit;
+        #[cfg(test)]
+        let _read_activity = read_activity;
         Ok(database.list_notification_outbox(after_sequence, limit)?)
     })
     .await
@@ -1511,31 +1545,40 @@ async fn read_notification_outbox(
 fn notification_outbox_response(
     items: Vec<NotificationOutboxEvent>,
     after_sequence: i64,
-) -> NotificationOutboxResponse {
+) -> ApiResult<NotificationOutboxResponse> {
+    if items
+        .iter()
+        .any(|event| !(0..=MAX_SAFE_NOTIFICATION_SEQUENCE).contains(&event.sequence))
+    {
+        return Err(CoreError::bad_request(format!(
+            "notification outbox sequence must be between 0 and {MAX_SAFE_NOTIFICATION_SEQUENCE}"
+        )));
+    }
     let max_sequence = items
         .last()
         .map(|event| event.sequence)
         .unwrap_or(after_sequence);
-    NotificationOutboxResponse {
+    Ok(NotificationOutboxResponse {
         items,
         max_sequence,
-    }
+    })
 }
 
 async fn acknowledge_notification_outbox(
     State(state): State<AppState>,
     body: Result<Json<NotificationOutboxAckRequest>, JsonRejection>,
 ) -> ApiResult<Json<NotificationOutboxAckResponse>> {
-    let Json(body) = body.map_err(|rejection| {
-        invalid_notification_request(
-            "invalid notification outbox acknowledgement",
-            rejection.body_text(),
-        )
-    })?;
+    let Json(body) = body
+        .map_err(|_| invalid_notification_request(INVALID_NOTIFICATION_OUTBOX_ACKNOWLEDGEMENT))?;
     if body.max_sequence < 0 {
         return Err(CoreError::bad_request(
             "maxSequence must be greater than or equal to 0".to_string(),
         ));
+    }
+    if body.max_sequence > MAX_SAFE_NOTIFICATION_SEQUENCE {
+        return Err(CoreError::bad_request(format!(
+            "maxSequence must be less than or equal to {MAX_SAFE_NOTIFICATION_SEQUENCE}"
+        )));
     }
     let max_sequence = body.max_sequence;
     run_shared_database(state, move |database| {
@@ -1546,14 +1589,12 @@ async fn acknowledge_notification_outbox(
     Ok(Json(NotificationOutboxAckResponse { acknowledged: true }))
 }
 
-fn invalid_notification_request(context: &str, detail: String) -> CoreError {
-    let detail = detail.trim();
-    let message = if detail.is_empty() {
-        context.to_string()
-    } else {
-        format!("{context}: {detail}")
-    };
-    CoreError::coded(StatusCode::BAD_REQUEST, "invalid_request", message)
+fn invalid_notification_request(message: &'static str) -> CoreError {
+    CoreError::coded(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        message.to_string(),
+    )
 }
 
 async fn list_plugins(State(state): State<AppState>) -> ApiResult<Json<PluginListResponse>> {
@@ -2323,9 +2364,14 @@ mod tests {
     use base64::Engine as _;
     use tower::ServiceExt;
 
-    use super::{fallback_display_name, router, ErrorResponse};
-    use crate::api::{router_with_config, ApiConfig, AppState, BasicAuthCredentials};
-    use crate::db::notification_outbox::{NotificationOperation, PublishMode};
+    use super::{fallback_display_name, notification_outbox_response, router, ErrorResponse};
+    use crate::api::{
+        router_with_config, ApiConfig, AppState, BasicAuthCredentials, NotificationOutboxTestProbe,
+        NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+    };
+    use crate::db::notification_outbox::{
+        NotificationOperation, NotificationOutboxEvent, PublishMode,
+    };
     use crate::db::{Database, NewRoot, ThumbnailTaskPriority};
 
     #[test]
@@ -2599,6 +2645,10 @@ mod tests {
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -2743,6 +2793,10 @@ mod tests {
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -2818,6 +2872,10 @@ mod tests {
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -3800,6 +3858,10 @@ mod tests {
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -3920,6 +3982,10 @@ mod tests {
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -4332,6 +4398,10 @@ mod tests {
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -4422,6 +4492,10 @@ mod tests {
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -4669,6 +4743,10 @@ mod tests {
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: _sender,
             plugins_dir: None,
@@ -4724,6 +4802,10 @@ mod tests {
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -6417,19 +6499,24 @@ mod tests {
         assert_eq!(body["items"][0]["operation"]["currentValue"], 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn notification_outbox_route_wakes_all_waiters_after_one_committed_batch() {
-        let state = AppState::new(test_database());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn notification_outbox_route_bounds_one_hundred_waiters_and_wakes_every_page() {
+        const WAITER_COUNT: usize = 100;
+        let mut state = AppState::new(test_database());
         let writer = state.writer.clone();
+        let read_gate = Arc::clone(&state.notification_outbox_read_gate);
+        let (probe, mut read_started, mut waiter_registered) =
+            NotificationOutboxTestProbe::new(true);
+        state.notification_outbox_test_probe = Some(Arc::clone(&probe));
         let app = router(state);
         let mut requests = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..WAITER_COUNT {
             let app = app.clone();
             requests.push(tokio::spawn(async move {
                 app.oneshot(
                     Request::builder()
                         .method(Method::GET)
-                        .uri("/api/notifications/outbox?afterSequence=0&limit=100&waitMs=1000")
+                        .uri("/api/notifications/outbox?afterSequence=0&limit=1&waitMs=5000")
                         .body(Body::empty())
                         .expect("build concurrent outbox request"),
                 )
@@ -6437,21 +6524,55 @@ mod tests {
                 .expect("request concurrent outbox")
             }));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        for _ in 0..NOTIFICATION_OUTBOX_READ_CONCURRENCY {
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_started.recv())
+                .await
+                .expect("bounded read must start")
+                .expect("read probe remains open");
+        }
+        assert!(
+            matches!(
+                read_started.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "no read beyond the shared gate may start while all permits are held"
+        );
+        assert_eq!(probe.active_reads(), NOTIFICATION_OUTBOX_READ_CONCURRENCY);
+        assert_eq!(
+            probe.max_active_reads(),
+            NOTIFICATION_OUTBOX_READ_CONCURRENCY
+        );
+        probe.release_reads(WAITER_COUNT * 3);
+        for _ in 0..WAITER_COUNT {
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiter_registered.recv())
+                .await
+                .expect("every request must register after an empty second query")
+                .expect("waiter probe remains open");
+        }
         publish_test_notification(writer, "route:broadcast", 2_000).await;
 
         for request in requests {
-            let response = tokio::time::timeout(std::time::Duration::from_millis(500), request)
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
                 .await
                 .expect("all long-poll waiters must wake for the same commit")
                 .expect("join concurrent outbox request");
             assert_eq!(response.status(), StatusCode::OK);
             let body = response_json(response).await;
+            assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
             assert_eq!(
                 body["items"][0]["operation"]["operationId"],
                 "route:broadcast"
             );
+            assert_eq!(body["maxSequence"], body["items"][0]["sequence"]);
         }
+        assert!(probe.max_active_reads() <= NOTIFICATION_OUTBOX_READ_CONCURRENCY);
+        assert_eq!(probe.active_reads(), 0);
+        assert_eq!(probe.active_waiters(), 0);
+        assert_eq!(
+            read_gate.available_permits(),
+            NOTIFICATION_OUTBOX_READ_CONCURRENCY
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6465,7 +6586,10 @@ mod tests {
             .reopen()
             .expect("reopen notification producer")
             .expect("file database can reopen");
-        let app = router(AppState::new(database));
+        let mut state = AppState::new(database);
+        let (probe, _read_started, mut waiter_registered) = NotificationOutboxTestProbe::new(false);
+        state.notification_outbox_test_probe = Some(probe);
+        let app = router(state);
         let request = tokio::spawn(async move {
             app.oneshot(
                 Request::builder()
@@ -6477,7 +6601,10 @@ mod tests {
             .await
             .expect("request reopened wake outbox")
         });
-        tokio::task::yield_now().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter_registered.recv())
+            .await
+            .expect("request must register after an empty second query")
+            .expect("waiter probe remains open");
         let mut operation = test_notification_operation("route:reopened", 3_000);
         producer
             .publish_notification_operation(&mut operation, PublishMode::Phase)
@@ -6494,8 +6621,87 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn notification_outbox_route_cancellation_releases_read_gate_permit() {
+        let mut state = AppState::new(test_database());
+        let read_gate = Arc::clone(&state.notification_outbox_read_gate);
+        let (probe, mut read_started, _waiter_registered) = NotificationOutboxTestProbe::new(true);
+        state.notification_outbox_test_probe = Some(Arc::clone(&probe));
+        let app = router(state);
+        let request = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/notifications/outbox?afterSequence=0&limit=1&waitMs=5000")
+                    .body(Body::empty())
+                    .expect("build cancellable read request"),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), read_started.recv())
+            .await
+            .expect("read must acquire one gate permit")
+            .expect("read probe remains open");
+        assert_eq!(
+            read_gate.available_permits(),
+            NOTIFICATION_OUTBOX_READ_CONCURRENCY - 1
+        );
+
+        request.abort();
+        assert!(request
+            .await
+            .expect_err("request must be cancelled")
+            .is_cancelled());
+        assert_eq!(probe.active_reads(), 0);
+        assert_eq!(
+            read_gate.available_permits(),
+            NOTIFICATION_OUTBOX_READ_CONCURRENCY
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn notification_outbox_route_cancellation_unregisters_waiter_without_holding_read_gate() {
+        let mut state = AppState::new(test_database());
+        let read_gate = Arc::clone(&state.notification_outbox_read_gate);
+        let (probe, _read_started, mut waiter_registered) = NotificationOutboxTestProbe::new(false);
+        state.notification_outbox_test_probe = Some(Arc::clone(&probe));
+        let app = router(state);
+        let request = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/notifications/outbox?afterSequence=0&limit=1&waitMs=30000")
+                    .body(Body::empty())
+                    .expect("build cancellable waiter request"),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter_registered.recv())
+            .await
+            .expect("request must register its waiter")
+            .expect("waiter probe remains open");
+        assert_eq!(probe.active_waiters(), 1);
+        assert_eq!(
+            read_gate.available_permits(),
+            NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            "waiting must not retain a read permit"
+        );
+
+        request.abort();
+        assert!(request
+            .await
+            .expect_err("request must be cancelled")
+            .is_cancelled());
+        assert_eq!(probe.active_waiters(), 0);
+        assert_eq!(
+            read_gate.available_permits(),
+            NOTIFICATION_OUTBOX_READ_CONCURRENCY
+        );
+    }
+
     #[tokio::test]
     async fn notification_outbox_route_validates_query_and_ack_bounds() {
+        const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
         let database = test_database();
         for index in 0..3 {
             let mut operation =
@@ -6526,8 +6732,27 @@ mod tests {
                 .map(Vec::len),
             Some(2)
         );
+        let max_safe = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/notifications/outbox?afterSequence={MAX_SAFE_INTEGER}&waitMs=0"
+                    ))
+                    .body(Body::empty())
+                    .expect("build max-safe outbox request"),
+            )
+            .await
+            .expect("request max-safe outbox page");
+        assert_eq!(max_safe.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(max_safe).await["maxSequence"],
+            MAX_SAFE_INTEGER
+        );
         for uri in [
             "/api/notifications/outbox?afterSequence=-1",
+            "/api/notifications/outbox?afterSequence=9007199254740992",
             "/api/notifications/outbox?limit=0",
             "/api/notifications/outbox?limit=201",
             "/api/notifications/outbox?waitMs=-1",
@@ -6547,7 +6772,24 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "uri {uri}");
         }
 
+        let max_safe_ack = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/notifications/outbox/ack")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"maxSequence":{MAX_SAFE_INTEGER}}}"#
+                    )))
+                    .expect("build max-safe ack request"),
+            )
+            .await
+            .expect("request max-safe outbox ack");
+        assert_eq!(max_safe_ack.status(), StatusCode::OK);
+
         let invalid_ack = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -6559,9 +6801,42 @@ mod tests {
             .await
             .expect("request invalid outbox ack");
         assert_eq!(invalid_ack.status(), StatusCode::BAD_REQUEST);
+
+        let unsafe_ack = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/notifications/outbox/ack")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"maxSequence":9007199254740992}"#))
+                    .expect("build unsafe ack request"),
+            )
+            .await
+            .expect("request unsafe outbox ack");
+        assert_eq!(unsafe_ack.status(), StatusCode::BAD_REQUEST);
     }
 
-    async fn assert_notification_request_error(response: axum::response::Response, case: &str) {
+    #[test]
+    fn notification_outbox_response_rejects_sequence_above_javascript_safe_integer() {
+        let result = notification_outbox_response(
+            vec![NotificationOutboxEvent {
+                sequence: 9_007_199_254_740_992,
+                operation: test_notification_operation("route:unsafe-sequence", 5_000),
+            }],
+            0,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            result.expect_err("unsafe sequence must fail").status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    async fn assert_notification_request_error(
+        response: axum::response::Response,
+        case: &str,
+        expected_message: &str,
+    ) {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "case {case}");
         let content_type = response
             .headers()
@@ -6587,6 +6862,13 @@ mod tests {
             !body.error.trim().is_empty(),
             "case {case} returned empty error message: {body:?}"
         );
+        assert_eq!(body.error, expected_message, "case {case}");
+        for parser_detail in ["expected i64", "line", "column", "deserialize"] {
+            assert!(
+                !body.error.to_ascii_lowercase().contains(parser_detail),
+                "case {case} leaked parser detail {parser_detail:?}: {body:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6613,31 +6895,45 @@ mod tests {
                 )
                 .await
                 .expect("request malformed notification query");
-            assert_notification_request_error(response, case).await;
+            assert_notification_request_error(response, case, "invalid notification outbox query")
+                .await;
         }
     }
 
     #[tokio::test]
     async fn notification_outbox_route_maps_json_rejections_to_json_error_response() {
         let app = router(AppState::new(test_database()));
-        for (case, body) in [
-            ("missing maxSequence", r#"{}"#),
-            ("maxSequence has the wrong type", r#"{"maxSequence":"bad"}"#),
-            ("invalid JSON", r#"{"maxSequence":0"#),
+        for (case, body, content_type) in [
+            ("missing maxSequence", r#"{}"#, true),
+            (
+                "maxSequence has the wrong type",
+                r#"{"maxSequence":"bad"}"#,
+                true,
+            ),
+            ("invalid JSON", r#"{"maxSequence":0"#, true),
+            ("missing Content-Type", r#"{"maxSequence":0}"#, false),
         ] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/notifications/outbox/ack");
+            if content_type {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+            }
             let response = app
                 .clone()
                 .oneshot(
-                    Request::builder()
-                        .method(Method::POST)
-                        .uri("/api/notifications/outbox/ack")
-                        .header(header::CONTENT_TYPE, "application/json")
+                    request
                         .body(Body::from(body))
                         .expect("build malformed notification acknowledgement"),
                 )
                 .await
                 .expect("request malformed notification acknowledgement");
-            assert_notification_request_error(response, case).await;
+            assert_notification_request_error(
+                response,
+                case,
+                "invalid notification outbox acknowledgement",
+            )
+            .await;
         }
     }
 

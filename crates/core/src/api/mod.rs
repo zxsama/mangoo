@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::Request;
@@ -23,11 +25,125 @@ pub mod routes;
 #[allow(dead_code)]
 pub const API_PREFIX: &str = "/api";
 pub const SESSION_HEADER: &str = "X-Megle-Session";
+pub(crate) const NOTIFICATION_OUTBOX_READ_CONCURRENCY: usize = 4;
+
+#[cfg(test)]
+pub(crate) struct NotificationOutboxTestProbe {
+    read_started: tokio::sync::mpsc::UnboundedSender<()>,
+    waiter_registered: tokio::sync::mpsc::UnboundedSender<()>,
+    read_release: Option<Arc<tokio::sync::Semaphore>>,
+    active_reads: AtomicUsize,
+    max_active_reads: AtomicUsize,
+    active_waiters: AtomicUsize,
+}
+
+#[cfg(test)]
+enum NotificationOutboxTestActivityKind {
+    Read,
+    Waiter,
+}
+
+#[cfg(test)]
+pub(crate) struct NotificationOutboxTestActivity {
+    probe: Arc<NotificationOutboxTestProbe>,
+    kind: NotificationOutboxTestActivityKind,
+}
+
+#[cfg(test)]
+impl NotificationOutboxTestProbe {
+    pub(crate) fn new(
+        block_reads: bool,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let (read_started, read_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (waiter_registered, waiter_registered_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Arc::new(Self {
+                read_started,
+                waiter_registered,
+                read_release: block_reads.then(|| Arc::new(tokio::sync::Semaphore::new(0))),
+                active_reads: AtomicUsize::new(0),
+                max_active_reads: AtomicUsize::new(0),
+                active_waiters: AtomicUsize::new(0),
+            }),
+            read_started_rx,
+            waiter_registered_rx,
+        )
+    }
+
+    pub(crate) fn begin_read(self: &Arc<Self>) -> NotificationOutboxTestActivity {
+        let active = self.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active_reads.fetch_max(active, Ordering::SeqCst);
+        let _ = self.read_started.send(());
+        NotificationOutboxTestActivity {
+            probe: Arc::clone(self),
+            kind: NotificationOutboxTestActivityKind::Read,
+        }
+    }
+
+    pub(crate) async fn wait_for_read_release(&self) {
+        if let Some(release) = &self.read_release {
+            if let Ok(permit) = release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+
+    pub(crate) fn release_reads(&self, count: usize) {
+        if let Some(release) = &self.read_release {
+            release.add_permits(count);
+        }
+    }
+
+    pub(crate) fn begin_waiter(self: &Arc<Self>) -> NotificationOutboxTestActivity {
+        self.active_waiters.fetch_add(1, Ordering::SeqCst);
+        let _ = self.waiter_registered.send(());
+        NotificationOutboxTestActivity {
+            probe: Arc::clone(self),
+            kind: NotificationOutboxTestActivityKind::Waiter,
+        }
+    }
+
+    pub(crate) fn active_reads(&self) -> usize {
+        self.active_reads.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn max_active_reads(&self) -> usize {
+        self.max_active_reads.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn active_waiters(&self) -> usize {
+        self.active_waiters.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Drop for NotificationOutboxTestActivity {
+    fn drop(&mut self) {
+        match self.kind {
+            NotificationOutboxTestActivityKind::Read => {
+                self.probe.active_reads.fetch_sub(1, Ordering::SeqCst);
+            }
+            NotificationOutboxTestActivityKind::Waiter => {
+                self.probe.active_waiters.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub writer: DbWriter,
     pub(crate) notification_outbox_wake: Arc<tokio::sync::Notify>,
+    /// Bounds only the short SQLite reads around long polling. Requests release
+    /// their permit before awaiting `notification_outbox_wake`, so the desktop
+    /// drain loop is never pinned behind idle waiters.
+    pub(crate) notification_outbox_read_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(crate) notification_outbox_test_probe: Option<Arc<NotificationOutboxTestProbe>>,
     /// A reopened connection used for file-operation preflight reads and plugin
     /// discovery. File-operation journal writes are submitted as short jobs to
     /// `writer`; filesystem syscalls run outside both connections on Tokio's
@@ -70,6 +186,11 @@ impl AppState {
         Self {
             writer: DbWriter::spawn(database),
             notification_outbox_wake,
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            #[cfg(test)]
+            notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue,
             read_database_path: None,
@@ -107,6 +228,11 @@ impl AppState {
         Self {
             writer,
             notification_outbox_wake,
+            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
+                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            #[cfg(test)]
+            notification_outbox_test_probe: None,
             fsops_database,
             task_queue,
             read_database_path,

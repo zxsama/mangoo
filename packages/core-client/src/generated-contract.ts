@@ -159,16 +159,19 @@ export interface NotificationOperationSnapshot {
 }
 
 export interface NotificationOutboxEvent {
+  /** Integer in the inclusive range 0..Number.MAX_SAFE_INTEGER. */
   sequence: number;
   operation: NotificationOperationSnapshot;
 }
 
 export interface NotificationOutboxResponse {
   items: NotificationOutboxEvent[];
+  /** Integer in the inclusive range 0..Number.MAX_SAFE_INTEGER. */
   maxSequence: number;
 }
 
 export interface NotificationOutboxAckRequest {
+  /** Integer in the inclusive range 0..Number.MAX_SAFE_INTEGER. */
   maxSequence: number;
 }
 
@@ -177,6 +180,7 @@ export interface NotificationOutboxAckResponse {
 }
 
 export interface ListNotificationOutboxParams {
+  /** Integer in the inclusive range 0..Number.MAX_SAFE_INTEGER. */
   afterSequence?: number;
   limit?: number;
   waitMs?: number;

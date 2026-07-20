@@ -594,6 +594,7 @@ paths:
           schema:
             type: integer
             minimum: 0
+            maximum: 9007199254740991
         - name: limit
           in: query
           schema:
@@ -1367,6 +1368,8 @@ components:
       properties:
         sequence:
           type: integer
+          minimum: 0
+          maximum: 9007199254740991
         operation:
           $ref: "#/components/schemas/NotificationOperationSnapshot"
     NotificationOutboxResponse:
@@ -1379,6 +1382,8 @@ components:
             $ref: "#/components/schemas/NotificationOutboxEvent"
         maxSequence:
           type: integer
+          minimum: 0
+          maximum: 9007199254740991
     NotificationOutboxAckRequest:
       type: object
       required: [maxSequence]
@@ -1386,6 +1391,7 @@ components:
         maxSequence:
           type: integer
           minimum: 0
+          maximum: 9007199254740991
     NotificationOutboxAckResponse:
       type: object
       required: [acknowledged]

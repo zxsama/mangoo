@@ -554,6 +554,25 @@ describe("createCoreClient", () => {
     assert.equal(undefinedUrl.searchParams.has("waitMs"), false);
   });
 
+  test("notification sequences remain numeric at the JavaScript safe-integer boundary", async () => {
+    mockFetch({ items: [], maxSequence: Number.MAX_SAFE_INTEGER });
+    await client().listNotificationOutbox({
+      afterSequence: Number.MAX_SAFE_INTEGER,
+      limit: 200,
+      waitMs: 0
+    });
+    await client().ackNotificationOutbox({ maxSequence: Number.MAX_SAFE_INTEGER });
+
+    const listUrl = new URL(recorded[0].url);
+    assert.equal(
+      listUrl.searchParams.get("afterSequence"),
+      String(Number.MAX_SAFE_INTEGER)
+    );
+    assert.deepEqual(JSON.parse(recorded[1].body!), {
+      maxSequence: Number.MAX_SAFE_INTEGER
+    });
+  });
+
   test("plugin endpoints encode the id", async () => {
     mockFetch({ deleted: true });
     await client().deletePlugin("org.example/risky");

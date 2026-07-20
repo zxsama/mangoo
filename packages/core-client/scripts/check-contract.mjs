@@ -194,6 +194,19 @@ function assertIntegerParameterBounds(operationId, name, minimum, maximum) {
   }
 }
 
+function assertIntegerSchemaPropertyBounds(schemaName, propertyName, minimum, maximum) {
+  const propertySchema = dereference(schema(schemaName)?.properties?.[propertyName]);
+  if (propertySchema?.type !== "integer") {
+    fail(`OpenAPI ${schemaName}.${propertyName} must be an integer`);
+  }
+  if (propertySchema?.minimum !== minimum) {
+    fail(`OpenAPI ${schemaName}.${propertyName} must have minimum ${minimum}`);
+  }
+  if (propertySchema?.maximum !== maximum) {
+    fail(`OpenAPI ${schemaName}.${propertyName} must have maximum ${maximum}`);
+  }
+}
+
 function assertParamLine(interfaceName, parameterName, line) {
   const parameter = operationParameter(
     interfaceName === "ListMediaParams" ? "listMedia" : "listFolderChildren",
@@ -353,8 +366,22 @@ assertOperationParameters("searchMedia", ["rootId", "folderId", "limit", "offset
 assertOperationRoute("listNotificationOutbox", "get", "/notifications/outbox");
 assertOperationRoute("ackNotificationOutbox", "post", "/notifications/outbox/ack");
 assertExactOperationParameters("listNotificationOutbox", ["afterSequence", "limit", "waitMs"]);
+assertIntegerParameterBounds("listNotificationOutbox", "afterSequence", 0, 9007199254740991);
 assertIntegerParameterBounds("listNotificationOutbox", "limit", 1, 200);
 assertIntegerParameterBounds("listNotificationOutbox", "waitMs", 0, 30000);
+assertIntegerSchemaPropertyBounds("NotificationOutboxEvent", "sequence", 0, 9007199254740991);
+assertIntegerSchemaPropertyBounds(
+  "NotificationOutboxResponse",
+  "maxSequence",
+  0,
+  9007199254740991
+);
+assertIntegerSchemaPropertyBounds(
+  "NotificationOutboxAckRequest",
+  "maxSequence",
+  0,
+  9007199254740991
+);
 
 const listNotificationOutboxBody = interfaceBody("ListNotificationOutboxParams");
 for (const line of [
