@@ -46,6 +46,7 @@ import {
   parseThumbnailCacheSummary,
   type NotificationIpcWindowRole
 } from "./notification-ipc.js";
+import { runNotificationSafeCoreTransition } from "./notification-core-transition.js";
 import { NotificationRuntime } from "./notification-runtime.js";
 import { createNotificationService, type NotificationService } from "./notification-service.js";
 import { createNotificationStore, notificationDatabasePath } from "./notification-store.js";
@@ -274,34 +275,47 @@ async function ensureNotificationService(): Promise<NotificationService> {
   return service;
 }
 
-async function attachNotificationServiceForSession(session: CoreSession): Promise<void> {
+async function detachNotificationServiceForCoreReplacement(): Promise<void> {
   const service = await ensureNotificationService();
-  if (coreSession !== session) return;
+  await service.detachLibrary();
+}
+
+async function attachNotificationServiceForSession(
+  session: CoreSession,
+  generation: number,
+  signal: AbortSignal
+): Promise<void> {
+  assertCurrentCoreGeneration(generation, signal);
+  const service = await ensureNotificationService();
+  assertCurrentCoreGeneration(generation, signal);
+  if (coreSession !== session) {
+    throw new LifecycleCancelledError("Core session changed before notification attach");
+  }
   const registry = getRegistry();
   const active = registry.libraries.find((library) => library.id === registry.activeLibraryId);
   if (!active || path.resolve(active.dbPath) !== path.resolve(session.dbPath)) {
-    await service.detachLibrary();
-    return;
+    throw new LifecycleCancelledError("Active library changed before notification attach");
   }
-  await ensureNotificationRuntime().attachLibrary(
+  assertCurrentCoreGeneration(generation, signal);
+  await service.attachLibrary(
     { id: active.id, name: active.name },
     { baseUrl: session.baseUrl, sessionToken: session.sessionToken }
   );
-}
-
-function scheduleNotificationServiceAttach(session: CoreSession): void {
-  void attachNotificationServiceForSession(session).catch((error) => {
-    desktopLogger.warn("main", "[megle] notification service library attach failed:", error);
-  });
+  assertCurrentCoreGeneration(generation, signal);
 }
 
 async function closeNotificationRuntime(): Promise<void> {
+  const runtime = notificationRuntime;
+  notificationRuntime = null;
+  try {
+    await runtime?.detachLibrary();
+  } catch (error) {
+    desktopLogger.warn("main", "[megle] notification detach failed during shutdown; closing runtime:", error);
+  }
   notificationChangeSubscription?.();
   notificationChangeSubscription = null;
   notificationBroadcastQueue.close();
   processLogSubscriptions.clear();
-  const runtime = notificationRuntime;
-  notificationRuntime = null;
   await runtime?.close();
 }
 
@@ -677,10 +691,9 @@ ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
       const target = reg.libraries.find((l) => l.id === libraryId);
       if (!target) return { ok: false, error: "library not found" };
       if (!fsSync.existsSync(target.dbPath)) return { ok: false, error: "library file missing" };
-      await restartCoreForLibrary(target.dbPath, signal, generation);
-      assertCurrentCoreGeneration(generation, signal);
-      persistRegistry(libraryRegistry.setActive(reg, libraryId, Date.now()));
-      if (coreSession) scheduleNotificationServiceAttach(coreSession);
+      await restartCoreForLibrary(target.dbPath, signal, generation, () => {
+        persistRegistry(libraryRegistry.setActive(reg, libraryId, Date.now()));
+      });
       pushLibraryPhase("loading-media"); // renderer takes over from here
       return { ok: true };
     });
@@ -707,10 +720,9 @@ ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath:
       // Keep the candidate discoverable while its Core is starting, but do
       // not change activeLibraryId until health succeeds.
       persistRegistry(added.registry);
-      await restartCoreForLibrary(added.entry.dbPath, signal, generation);
-      assertCurrentCoreGeneration(generation, signal);
-      persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
-      if (coreSession) scheduleNotificationServiceAttach(coreSession);
+      await restartCoreForLibrary(added.entry.dbPath, signal, generation, () => {
+        persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
+      });
       pushLibraryPhase("loading-media");
       const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
       return { ok: true, library: summary };
@@ -733,10 +745,9 @@ ipcMain.handle("megle:open-library", async (_e, dbPath: string) => {
       // Keep the candidate discoverable while its Core is starting, but do
       // not change activeLibraryId until health succeeds.
       persistRegistry(added.registry);
-      await restartCoreForLibrary(added.entry.dbPath, signal, generation);
-      assertCurrentCoreGeneration(generation, signal);
-      persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
-      if (coreSession) scheduleNotificationServiceAttach(coreSession);
+      await restartCoreForLibrary(added.entry.dbPath, signal, generation, () => {
+        persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
+      });
       pushLibraryPhase("loading-media");
       const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
       return { ok: true, library: summary };
@@ -1196,9 +1207,15 @@ async function ensureCoreReady(): Promise<CoreSession> {
     if (reusable) return reusable;
 
     const generation = coreLifecycleQueue.beginGeneration();
-    await stopDesktopCoreProcesses();
-    assertCurrentCoreGeneration(generation, signal);
-    return startCoreSession(signal, generation);
+    return runNotificationSafeCoreTransition({
+      assertCurrent: () => assertCurrentCoreGeneration(generation, signal),
+      detachNotifications: detachNotificationServiceForCoreReplacement,
+      stopOldCore: stopDesktopCoreProcesses,
+      startHealthyCore: () => startCoreSession(signal, generation),
+      commitActiveLibrary: () => undefined,
+      attachNotifications: (session) =>
+        attachNotificationServiceForSession(session, generation, signal)
+    });
   });
   coreReadyPromise = startup;
   const clearReadyPromise = () => {
@@ -1282,7 +1299,6 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
       coreProcess = pendingProcess;
       pendingCoreProcess = null;
       coreSession = session;
-      scheduleNotificationServiceAttach(session);
       if (attempt > 1) {
         desktopLogger.info("main", `[megle] Core startup recovered on attempt ${attempt}/${maxAttempts}`);
       }
@@ -1378,8 +1394,9 @@ async function stopDesktopCoreProcesses(): Promise<void> {
 async function restartCoreForLibrary(
   dbPath: string,
   signal: AbortSignal,
-  generation: number
-): Promise<void> {
+  generation: number,
+  commitActiveLibrary: (session: CoreSession) => void | Promise<void>
+): Promise<CoreSession> {
   assertCurrentCoreGeneration(generation, signal);
   pushLibraryPhase("starting-core");
   const base = coreSession ?? pendingCoreSession ?? (await createCoreSession());
@@ -1389,41 +1406,63 @@ async function restartCoreForLibrary(
   // the replacement Core is healthy. The renderer keeps using baseUrl/token
   // throughout this transaction, while the candidate is reusable on retry.
   pendingCoreSession = session;
-  // Stop a failed pending Core before the active Core and wait for the port to free up.
-  await stopDesktopCoreProcesses();
-  assertCurrentCoreGeneration(generation, signal);
-  await waitForPortFree(base.bindAddress, signal);
-  assertCurrentCoreGeneration(generation, signal);
-  if (coreProcess) {
-    throw new LifecycleCancelledError("Tracked Core changed before library restart");
-  }
-
-  const handle = startCoreProcess(session, (source, level, message) => {
-    desktopLogger.log(source, level, message);
-  });
-  pendingCoreProcess = handle;
+  let handle: CoreProcessHandle | null = null;
   try {
-    pushLibraryPhase("opening-library");
-    await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
-    assertCurrentCoreGeneration(generation, signal);
-    if (coreProcess && coreProcess !== handle) {
-      throw new LifecycleCancelledError("A newer Core process was committed before library restart completed");
-    }
+    return await runNotificationSafeCoreTransition({
+      assertCurrent: () => assertCurrentCoreGeneration(generation, signal),
+      detachNotifications: detachNotificationServiceForCoreReplacement,
+      stopOldCore: async () => {
+        // Stop a failed pending Core before the active Core and wait for the port to free up.
+        await stopDesktopCoreProcesses();
+        assertCurrentCoreGeneration(generation, signal);
+        await waitForPortFree(base.bindAddress, signal);
+        assertCurrentCoreGeneration(generation, signal);
+        if (coreProcess) {
+          throw new LifecycleCancelledError("Tracked Core changed before library restart");
+        }
+      },
+      startHealthyCore: async () => {
+        handle = startCoreProcess(session, (source, level, message) => {
+          desktopLogger.log(source, level, message);
+        });
+        pendingCoreProcess = handle;
+        pushLibraryPhase("opening-library");
+        await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
+        assertCurrentCoreGeneration(generation, signal);
+        if (coreProcess && coreProcess !== handle) {
+          throw new LifecycleCancelledError(
+            "A newer Core process was committed before library restart completed"
+          );
+        }
+        return session;
+      },
+      commitActiveLibrary: async (healthySession) => {
+        await commitActiveLibrary(healthySession);
+        assertCurrentCoreGeneration(generation, signal);
+        if (!handle || pendingCoreProcess !== handle) {
+          throw new LifecycleCancelledError("Candidate Core changed before library commit");
+        }
+        coreProcess = handle;
+        pendingCoreProcess = null;
+        coreSession = healthySession;
+        pendingCoreSession = null;
+      },
+      attachNotifications: (healthySession) =>
+        attachNotificationServiceForSession(healthySession, generation, signal)
+    });
   } catch (error) {
-    try {
-      await stopPendingCoreProcess();
-    } catch (stopError) {
-      desktopLogger.warn("main", "[megle] pending Core cleanup failed after library switch; retaining process:", stopError);
+    if (handle && pendingCoreProcess === handle) {
+      try {
+        await stopPendingCoreProcess();
+      } catch (stopError) {
+        desktopLogger.warn("main", "[megle] pending Core cleanup failed after library switch; retaining process:", stopError);
+      }
     }
     if (!signal.aborted) {
       desktopLogger.error("main", "[megle] library Core replacement failed; retaining session metadata for retry:", error);
     }
     throw error;
   }
-  coreProcess = handle;
-  pendingCoreProcess = null;
-  coreSession = session;
-  pendingCoreSession = null;
 }
 
 // Poll until the host:port can be bound again (Core's listener has closed),

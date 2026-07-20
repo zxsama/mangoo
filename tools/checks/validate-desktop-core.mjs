@@ -52,6 +52,7 @@ const lifecycleQueue = read("apps/desktop/src/core-lifecycle-queue.ts");
 const preload = read("apps/desktop/src/preload.cjs");
 const notificationIpc = readOptional("apps/desktop/src/notification-ipc.ts");
 const notificationRuntime = readOptional("apps/desktop/src/notification-runtime.ts");
+const notificationCoreTransition = readOptional("apps/desktop/src/notification-core-transition.ts");
 const notificationChannels = readOptional("apps/desktop/src/notification-ipc-channels.cjs");
 const notificationStore = readOptional("apps/desktop/src/notification-store.ts");
 const webDesktopBridge = read("apps/web/src/core/desktop.ts");
@@ -274,6 +275,24 @@ for (const value of ["class NotificationRuntime", "start()", "attachLibrary", "d
   if (!notificationRuntime.includes(value)) {
     fail(`notification runtime missing ${value}`);
   }
+}
+for (const value of [
+  "runNotificationSafeCoreTransition",
+  "await options.detachNotifications()",
+  "await options.stopOldCore()",
+  "await options.startHealthyCore()",
+  "await options.commitActiveLibrary(session)",
+  "await options.attachNotifications(session)"
+]) {
+  if (!notificationCoreTransition.includes(value)) {
+    fail(`notification-safe Core transition missing ${value}`);
+  }
+}
+if (main.includes("scheduleNotificationServiceAttach")) {
+  fail("notification attachment must stay inside the serialized Core lifecycle transaction");
+}
+if (!main.includes("runNotificationSafeCoreTransition")) {
+  fail("desktop Core replacement must use the notification-safe transition boundary");
 }
 
 for (const value of [

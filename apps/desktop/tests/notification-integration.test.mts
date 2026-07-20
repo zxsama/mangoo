@@ -8,10 +8,18 @@ import vm from "node:vm";
 
 const ipcModuleUrl = new URL("../src/notification-ipc.ts", import.meta.url);
 const runtimeModuleUrl = new URL("../src/notification-runtime.ts", import.meta.url);
+const transitionModuleUrl = new URL("../src/notification-core-transition.ts", import.meta.url);
+const lifecycleModuleUrl = new URL("../src/core-lifecycle-queue.ts", import.meta.url);
 const channelsUrl = new URL("../src/notification-ipc-channels.cjs", import.meta.url);
 const ipcModule = existsSync(fileURLToPath(ipcModuleUrl)) ? await import(ipcModuleUrl.href) : null;
 const runtimeModule = existsSync(fileURLToPath(runtimeModuleUrl))
   ? await import(runtimeModuleUrl.href)
+  : null;
+const transitionModule = existsSync(fileURLToPath(transitionModuleUrl))
+  ? await import(transitionModuleUrl.href)
+  : null;
+const lifecycleModule = existsSync(fileURLToPath(lifecycleModuleUrl))
+  ? await import(lifecycleModuleUrl.href)
   : null;
 const channels = existsSync(fileURLToPath(channelsUrl))
   ? createRequire(import.meta.url)(fileURLToPath(channelsUrl))
@@ -195,6 +203,170 @@ test("notification runtime starts once, switches libraries in order and closes o
   await assert.rejects(() => runtime.start(), /closed/i);
 });
 
+function deferredBarrier(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+test("Core replacement waits for a hanging notification long-poll to abort before stop and start", async () => {
+  assert.ok(transitionModule, "notification-safe Core transition must exist");
+  const detachStarted = deferredBarrier();
+  const detachFinished = deferredBarrier();
+  const events: string[] = [];
+
+  const transition = transitionModule.runNotificationSafeCoreTransition({
+    assertCurrent: () => undefined,
+    detachNotifications: async () => {
+      events.push("detach:start");
+      detachStarted.resolve();
+      await detachFinished.promise;
+      events.push("detach:done");
+    },
+    stopOldCore: async () => {
+      events.push("stop");
+    },
+    startHealthyCore: async () => {
+      events.push("start");
+      return "new-session";
+    },
+    commitActiveLibrary: async () => {
+      events.push("commit");
+    },
+    attachNotifications: async () => {
+      events.push("attach:new");
+    }
+  });
+
+  await detachStarted.promise;
+  assert.deepEqual(events, ["detach:start"]);
+  detachFinished.resolve();
+
+  assert.equal(await transition, "new-session");
+  assert.deepEqual(events, [
+    "detach:start",
+    "detach:done",
+    "stop",
+    "start",
+    "commit",
+    "attach:new"
+  ]);
+});
+
+test("same-URL replacement events cannot reach the detached old library store or ACK", async () => {
+  assert.ok(transitionModule);
+  const detachStarted = deferredBarrier();
+  const oldPollAborted = deferredBarrier();
+  let oldLoopAttached = true;
+  let oldLibraryWrites = 0;
+  let oldLibraryAcks = 0;
+  let newLibraryAttached = false;
+  const sharedUrl = "http://127.0.0.1:48101/api";
+
+  const transition = transitionModule.runNotificationSafeCoreTransition({
+    assertCurrent: () => undefined,
+    detachNotifications: async () => {
+      oldLoopAttached = false;
+      detachStarted.resolve();
+      await oldPollAborted.promise;
+    },
+    stopOldCore: async () => undefined,
+    startHealthyCore: async () => {
+      assert.equal(oldLoopAttached, false, "old consumer must be gone before the URL is reused");
+      const eventFromReplacementCore = { baseUrl: sharedUrl, sequence: 1 };
+      if (oldLoopAttached && eventFromReplacementCore.baseUrl === sharedUrl) {
+        oldLibraryWrites += 1;
+        oldLibraryAcks += 1;
+      }
+      return { baseUrl: sharedUrl };
+    },
+    commitActiveLibrary: async () => undefined,
+    attachNotifications: async () => {
+      newLibraryAttached = true;
+    }
+  });
+
+  await detachStarted.promise;
+  oldPollAborted.resolve();
+  await transition;
+
+  assert.equal(oldLibraryWrites, 0);
+  assert.equal(oldLibraryAcks, 0);
+  assert.equal(newLibraryAttached, true);
+});
+
+test("a generation change immediately before attach leaves notifications detached", async () => {
+  assert.ok(transitionModule);
+  let currentGeneration = 7;
+  let detachCount = 0;
+  let attachCount = 0;
+
+  await assert.rejects(
+    transitionModule.runNotificationSafeCoreTransition({
+      assertCurrent: () => {
+        if (currentGeneration !== 7) throw new Error("stale generation");
+      },
+      detachNotifications: async () => {
+        detachCount += 1;
+      },
+      stopOldCore: async () => undefined,
+      startHealthyCore: async () => "candidate",
+      commitActiveLibrary: async () => {
+        currentGeneration = 8;
+      },
+      attachNotifications: async () => {
+        attachCount += 1;
+      }
+    }),
+    /stale generation/
+  );
+
+  assert.equal(attachCount, 0);
+  assert.equal(detachCount, 2, "failed transitions must re-establish the detached state");
+});
+
+test("consecutive notification-safe switches leave only the final library loop active", async () => {
+  assert.ok(transitionModule);
+  assert.ok(lifecycleModule);
+  const queue = new lifecycleModule.CoreLifecycleQueue();
+  let activeLibrary: string | null = "old";
+  let activeLoops = 1;
+  let maxActiveLoops = 1;
+  const attached: string[] = [];
+  const transitionTo = (libraryId: string) => queue.enqueue(async () => {
+    const generation = queue.beginGeneration();
+    return transitionModule.runNotificationSafeCoreTransition({
+      assertCurrent: () => {
+        if (!queue.isCurrentGeneration(generation)) throw new Error("stale generation");
+      },
+      detachNotifications: async () => {
+        activeLibrary = null;
+        activeLoops = 0;
+      },
+      stopOldCore: async () => undefined,
+      startHealthyCore: async () => libraryId,
+      commitActiveLibrary: async () => undefined,
+      attachNotifications: async (session: string) => {
+        activeLibrary = session;
+        activeLoops += 1;
+        maxActiveLoops = Math.max(maxActiveLoops, activeLoops);
+        attached.push(session);
+      }
+    });
+  });
+
+  const first = transitionTo("library-a");
+  const second = transitionTo("library-b");
+  await Promise.all([first, second]);
+
+  assert.deepEqual(attached, ["library-a", "library-b"]);
+  assert.equal(activeLibrary, "library-b");
+  assert.equal(activeLoops, 1);
+  assert.equal(maxActiveLoops, 1);
+});
+
 test("Task 10 source contract exposes one notifications window and typed preload bridge", () => {
   const root = fileURLToPath(new URL("../../..", import.meta.url));
   const read = (relativePath: string) => readFileSync(`${root}/${relativePath}`, "utf8");
@@ -213,6 +385,9 @@ test("Task 10 source contract exposes one notifications window and typed preload
   assert.match(main, /rememberSecondaryWindowPosition\(role, window\)/);
   assert.match(main, /\["settings", "plugins", "notifications"\] as const/);
   assert.match(main, /notificationDatabasePath\(userDataDir\(\)\)/);
+  assert.match(main, /runNotificationSafeCoreTransition/);
+  assert.doesNotMatch(main, /scheduleNotificationServiceAttach/);
+  assert.match(main, /await runtime\?\.detachLibrary\(\)[\s\S]*await runtime\?\.close\(\)/);
   assert.match(main, /await closeNotificationRuntime\(\)[\s\S]*await stopDesktopCoreProcesses\(\)/);
   assert.match(preload, /notifications:\s*{/);
   assert.match(preload, /return \(\) => ipcRenderer\.removeListener/);
