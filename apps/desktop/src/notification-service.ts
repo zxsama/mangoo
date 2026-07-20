@@ -1,6 +1,8 @@
 import type {
   FileOperationKind,
-  FileOperationRecord
+  FileOperationRecord,
+  NotificationOutboxAckRequest,
+  NotificationOutboxAckResponse
 } from "@megle/core-client/generated-contract";
 
 import type { CoreSession } from "./core-session.js";
@@ -162,6 +164,17 @@ function assertSafeSequence(value: unknown, name: string): asserts value is numb
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new TypeError(`${name} must be a non-negative safe integer`);
   }
+}
+
+function parseNotificationOutboxAckResponse(value: unknown): NotificationOutboxAckResponse {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("invalid notification outbox acknowledgement response");
+  }
+  const acknowledged = (value as { acknowledged?: unknown }).acknowledged;
+  if (typeof acknowledged !== "boolean") {
+    throw new TypeError("invalid notification outbox acknowledgement response");
+  }
+  return { acknowledged };
 }
 
 function validateOutboxOperation(value: unknown): NotificationOperationInput {
@@ -694,19 +707,16 @@ export class NotificationService {
     maxSequence: number,
     signal: AbortSignal
   ): Promise<void> {
+    const request: NotificationOutboxAckRequest = { maxSequence };
     const body = await this.requestJson(`${session.baseUrl}/notifications/outbox/ack`, session, {
       method: "POST",
       signal,
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ maxSequence })
+      body: JSON.stringify(request)
     });
-    const acknowledgedThrough =
-      body && typeof body === "object"
-        ? (body as { acknowledgedThrough?: unknown }).acknowledgedThrough
-        : undefined;
-    assertSafeSequence(acknowledgedThrough, "acknowledged notification sequence");
-    if (acknowledgedThrough < maxSequence) {
-      throw new RangeError("Core acknowledged below the requested notification sequence");
+    const acknowledgement = parseNotificationOutboxAckResponse(body);
+    if (!acknowledgement.acknowledged) {
+      throw new Error("Core did not acknowledge the notification outbox sequence");
     }
   }
 

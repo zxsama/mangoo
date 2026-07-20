@@ -3,7 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import type { FileOperationRecord } from "@megle/core-client/generated-contract";
+import type {
+  FileOperationRecord,
+  NotificationOutboxAckResponse
+} from "@megle/core-client/generated-contract";
 
 import {
   createNotificationService,
@@ -106,6 +109,10 @@ function response(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" }
   });
+}
+
+function ackResponse(body: NotificationOutboxAckResponse): Response {
+  return response(body);
 }
 
 function emptySnapshot(): NotificationStoredSnapshot {
@@ -298,9 +305,10 @@ function thumbnailSummary(library = LIBRARY_A): ThumbnailCacheSummary {
 }
 
 describe("notification service", () => {
-  it("acks only after the durable batch commits", async () => {
+  it("advances ackedSequence only after true ACK and continues with the next GET", async () => {
     const calls: string[] = [];
     const store = new FakeStore();
+    let listCalls = 0;
     const originalApply = store.applyOutboxBatch.bind(store);
     store.applyOutboxBatch = async (...args) => {
       await originalApply(...args);
@@ -313,15 +321,28 @@ describe("notification service", () => {
         if (url.endsWith("/notifications/outbox/ack")) {
           calls.push("ack");
           assert.equal(init?.headers && new Headers(init.headers).get("x-megle-session"), "token-a");
-          return response({ acknowledgedThrough: 1 });
+          return ackResponse({ acknowledged: true });
         }
-        return response({ items: [event(1)], maxSequence: 1 });
+        listCalls += 1;
+        return response(
+          listCalls === 1 ? { items: [event(1)], maxSequence: 1 } : { items: [], maxSequence: 1 }
+        );
       },
       now: () => NOW
     });
 
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     assert.deepEqual(calls, ["store", "ack"]);
+    assert.deepEqual(await store.syncState(LIBRARY_A.id), {
+      persistedSequence: 1,
+      ackedSequence: 1
+    });
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    assert.equal(listCalls, 2, "a successful ACK must leave the local cursor ready for the next GET");
+    assert.deepEqual(await store.syncState(LIBRARY_A.id), {
+      persistedSequence: 1,
+      ackedSequence: 1
+    });
     await service.close();
   });
 
@@ -334,7 +355,7 @@ describe("notification service", () => {
       fetch: async (input) => {
         if (String(input).endsWith("/notifications/outbox/ack")) {
           ackCalls += 1;
-          return ackCalls === 1 ? response({ error: "offline" }, 503) : response({ acknowledgedThrough: 1 });
+          return ackCalls === 1 ? response({ error: "offline" }, 503) : ackResponse({ acknowledged: true });
         }
         listCalls += 1;
         return response(
@@ -348,6 +369,52 @@ describe("notification service", () => {
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     assert.equal(store.calls.filter((call) => call === "apply").length, 1);
     assert.equal(ackCalls, 2);
+    await service.close();
+  });
+
+  it("does not advance ackedSequence for false or malformed ACK responses", async () => {
+    const store = new FakeStore();
+    let ackCalls = 0;
+    let listCalls = 0;
+    const service = await createNotificationService({
+      store,
+      fetch: async (input) => {
+        if (String(input).endsWith("/notifications/outbox/ack")) {
+          ackCalls += 1;
+          if (ackCalls === 1) return ackResponse({ acknowledged: false });
+          if (ackCalls === 2) return response({ acknowledged: "yes" });
+          return ackResponse({ acknowledged: true });
+        }
+        listCalls += 1;
+        return response(
+          listCalls === 1 ? { items: [event(1)], maxSequence: 1 } : { items: [], maxSequence: 1 }
+        );
+      },
+      now: () => NOW
+    });
+
+    await assert.rejects(
+      service.runOneDrainForTest(LIBRARY_A, SESSION_A),
+      /did not acknowledge/i
+    );
+    assert.deepEqual(await store.syncState(LIBRARY_A.id), {
+      persistedSequence: 1,
+      ackedSequence: 0
+    });
+    await assert.rejects(
+      service.runOneDrainForTest(LIBRARY_A, SESSION_A),
+      /invalid notification outbox acknowledgement/i
+    );
+    assert.deepEqual(await store.syncState(LIBRARY_A.id), {
+      persistedSequence: 1,
+      ackedSequence: 0
+    });
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    assert.equal(listCalls, 2, "a true retry must proceed to GET after the ACK is accepted");
+    assert.deepEqual(await store.syncState(LIBRARY_A.id), {
+      persistedSequence: 1,
+      ackedSequence: 1
+    });
     await service.close();
   });
 
@@ -389,7 +456,7 @@ describe("notification service", () => {
         fetch: async (input) => {
           if (String(input).endsWith("/notifications/outbox/ack")) {
             calls.push("ack");
-            return response({ acknowledgedThrough: 1 });
+            return ackResponse({ acknowledged: true });
           }
           calls.push("get");
           return response({ items: [], maxSequence: 1 });
@@ -412,6 +479,65 @@ describe("notification service", () => {
     }
   });
 
+  it("replays a true ACK after restart when Core already removed the Outbox row", async () => {
+    const databasePath = testDatabasePath();
+    const firstStore = await createNotificationStore({
+      databasePath,
+      workerUrl: TEST_WORKER_URL
+    });
+    const firstService = await createNotificationService({
+      store: firstStore,
+      fetch: async (input) =>
+        String(input).endsWith("/notifications/outbox/ack")
+          ? ackResponse({ acknowledged: true })
+          : response({ items: [event(1)], maxSequence: 1 }),
+      now: () => NOW
+    });
+    const originalMarkAcknowledged = firstStore.markAcknowledged.bind(firstStore);
+    firstStore.markAcknowledged = async () => {
+      throw new Error("simulated crash after Core ACK");
+    };
+    try {
+      await assert.rejects(
+        firstService.runOneDrainForTest(LIBRARY_A, SESSION_A),
+        /simulated crash after Core ACK/i
+      );
+    } finally {
+      firstStore.markAcknowledged = originalMarkAcknowledged;
+      await firstService.close();
+    }
+
+    const secondStore = await createNotificationStore({
+      databasePath,
+      workerUrl: TEST_WORKER_URL
+    });
+    const calls: string[] = [];
+    const secondService = await createNotificationService({
+      store: secondStore,
+      fetch: async (input) => {
+        if (String(input).endsWith("/notifications/outbox/ack")) {
+          calls.push("ack");
+          return ackResponse({ acknowledged: true });
+        }
+        calls.push("get");
+        return response({ items: [], maxSequence: 1 });
+      },
+      now: () => NOW
+    });
+    try {
+      await secondService.runOneDrainForTest(LIBRARY_A, SESSION_A);
+      assert.deepEqual(calls, ["ack", "get"]);
+      assert.deepEqual(await secondStore.syncState(LIBRARY_A.id), {
+        persistedSequence: 1,
+        ackedSequence: 1
+      });
+      await secondService.runOneDrainForTest(LIBRARY_A, SESSION_A);
+      assert.deepEqual(calls, ["ack", "get", "get"], "repeat after idempotent ACK must not ACK again");
+    } finally {
+      await secondService.close();
+    }
+  });
+
   it("does not acknowledge when the durable store rejects a batch", async () => {
     const store = new FakeStore();
     store.failApply = true;
@@ -421,7 +547,7 @@ describe("notification service", () => {
       fetch: async (input) => {
         if (String(input).endsWith("/notifications/outbox/ack")) {
           ackCalls += 1;
-          return response({ acknowledgedThrough: 1 });
+          return ackResponse({ acknowledged: true });
         }
         return response({ items: [event(1)], maxSequence: 1 });
       },
@@ -463,7 +589,7 @@ describe("notification service", () => {
             );
           });
         }
-        return response({ acknowledgedThrough: 0 });
+        return ackResponse({ acknowledged: true });
       },
       retryDelay: async (_delay, signal) => {
         if (signal.aborted) throw signal.reason;
@@ -871,7 +997,7 @@ describe("notification service", () => {
       fetch: async (input) => {
         if (String(input).endsWith("/notifications/outbox/ack")) {
           acknowledgements += 1;
-          return response({ acknowledgedThrough: 1 });
+          return ackResponse({ acknowledged: true });
         }
         return response(
           acknowledgements > 0
@@ -1034,7 +1160,7 @@ describe("notification service", () => {
       store,
       fetch: async (input) =>
         String(input).endsWith("/notifications/outbox/ack")
-          ? response({ acknowledgedThrough: 1 })
+          ? ackResponse({ acknowledged: true })
           : response({ items: [event(1)], maxSequence: 1 }),
       now: () => now
     });
@@ -1104,7 +1230,7 @@ describe("notification service", () => {
       fetch: async (input) => {
         if (String(input).endsWith("/notifications/outbox/ack")) {
           acknowledgements += 1;
-          return response({ acknowledgedThrough: 1 });
+          return ackResponse({ acknowledged: true });
         }
         return response({ items: [event(1)], maxSequence: 1 });
       },
@@ -1170,7 +1296,7 @@ describe("notification service", () => {
         const url = String(input);
         if (url.endsWith("/notifications/outbox/ack")) {
           if (url.includes("48101")) aAcks += 1;
-          return response({ acknowledgedThrough: 1 });
+          return ackResponse({ acknowledged: true });
         }
         if (url.includes("48101")) {
           aLists += 1;
