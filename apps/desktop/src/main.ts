@@ -121,6 +121,7 @@ const PERSIST_DEBOUNCE_MS = 500;
 const SHELL_READY_FAILURE_TIMEOUT_MS = 4000;
 const SECONDARY_WINDOW_READY_TIMEOUT_MS = 4000;
 const AUTO_CORE_STARTUP_MAX_ATTEMPTS = 3;
+const CORE_REUSE_HEALTH_TIMEOUT_MS = 1_000;
 const WINDOW_COMPOSITION_REFRESH_DELAYS_MS = [34, 140, 420] as const;
 const CHROMIUM_OVERLAY_SCROLLBAR_FEATURES = [
   "OverlayScrollbar",
@@ -424,11 +425,13 @@ ipcMain.handle("megle:get-active-library-id", () => getRegistry().activeLibraryI
 ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
   try {
     return await coreLifecycleQueue.enqueue(async (signal) => {
+      const generation = coreLifecycleQueue.beginGeneration();
       const reg = getRegistry();
       const target = reg.libraries.find((l) => l.id === libraryId);
       if (!target) return { ok: false, error: "library not found" };
       if (!fsSync.existsSync(target.dbPath)) return { ok: false, error: "library file missing" };
-      await restartCoreForLibrary(target.dbPath, signal);
+      await restartCoreForLibrary(target.dbPath, signal, generation);
+      assertCurrentCoreGeneration(generation, signal);
       persistRegistry(libraryRegistry.setActive(reg, libraryId, Date.now()));
       pushLibraryPhase("loading-media"); // renderer takes over from here
       return { ok: true };
@@ -442,6 +445,7 @@ ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
 ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath: string }) => {
   try {
     return await coreLifecycleQueue.enqueue(async (signal) => {
+      const generation = coreLifecycleQueue.beginGeneration();
       throwIfLifecycleAborted(signal);
       const reg = getRegistry();
       // A brand-new empty file: Core builds the schema on first open. Never
@@ -455,7 +459,8 @@ ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath:
       // Keep the candidate discoverable while its Core is starting, but do
       // not change activeLibraryId until health succeeds.
       persistRegistry(added.registry);
-      await restartCoreForLibrary(added.entry.dbPath, signal);
+      await restartCoreForLibrary(added.entry.dbPath, signal, generation);
+      assertCurrentCoreGeneration(generation, signal);
       persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
       pushLibraryPhase("loading-media");
       const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
@@ -470,6 +475,7 @@ ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath:
 ipcMain.handle("megle:open-library", async (_e, dbPath: string) => {
   try {
     return await coreLifecycleQueue.enqueue(async (signal) => {
+      const generation = coreLifecycleQueue.beginGeneration();
       throwIfLifecycleAborted(signal);
       const reg = getRegistry();
       if (!fsSync.existsSync(dbPath)) return { ok: false, error: "file not found" };
@@ -478,7 +484,8 @@ ipcMain.handle("megle:open-library", async (_e, dbPath: string) => {
       // Keep the candidate discoverable while its Core is starting, but do
       // not change activeLibraryId until health succeeds.
       persistRegistry(added.registry);
-      await restartCoreForLibrary(added.entry.dbPath, signal);
+      await restartCoreForLibrary(added.entry.dbPath, signal, generation);
+      assertCurrentCoreGeneration(generation, signal);
       persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
       pushLibraryPhase("loading-media");
       const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
@@ -929,28 +936,71 @@ function closeAllSecondaryWindows(): void {
 }
 
 async function ensureCoreReady(): Promise<CoreSession> {
-  if (coreSession && coreProcess) {
-    return coreSession;
-  }
   if (coreReadyPromise) {
     return coreReadyPromise;
   }
 
-  const startup = coreLifecycleQueue.enqueue((signal) => startCoreSession(signal));
-  coreReadyPromise = startup;
-  void startup.catch(() => {
-    if (coreReadyPromise === startup) coreReadyPromise = null;
+  const startup = coreLifecycleQueue.enqueue(async (signal) => {
+    throwIfLifecycleAborted(signal);
+    const reusable = await currentHealthyCoreSession(signal);
+    if (reusable) return reusable;
+
+    const generation = coreLifecycleQueue.beginGeneration();
+    await stopDesktopCoreProcesses();
+    assertCurrentCoreGeneration(generation, signal);
+    return startCoreSession(signal, generation);
   });
+  coreReadyPromise = startup;
+  const clearReadyPromise = () => {
+    if (coreReadyPromise === startup) coreReadyPromise = null;
+  };
+  void startup.then(clearReadyPromise, clearReadyPromise);
   return startup;
 }
 
-async function startCoreSession(signal: AbortSignal): Promise<CoreSession> {
+async function currentHealthyCoreSession(signal: AbortSignal): Promise<CoreSession | null> {
+  throwIfLifecycleAborted(signal);
+  const handle = coreProcess;
+  const session = coreSession;
+  if (!handle || !session) return null;
+  const generation = coreLifecycleQueue.currentGeneration;
+  try {
+    await waitForCoreHealth(
+      session.baseUrl,
+      session.sessionToken,
+      CORE_REUSE_HEALTH_TIMEOUT_MS,
+      signal
+    );
+  } catch (error) {
+    throwIfLifecycleAborted(signal);
+    desktopLogger.warn("main", "[megle] current Core health recheck failed; restarting tracked process:", error);
+    return null;
+  }
+  throwIfLifecycleAborted(signal);
+  if (
+    !coreLifecycleQueue.isCurrentGeneration(generation) ||
+    coreProcess !== handle ||
+    coreSession !== session
+  ) {
+    return null;
+  }
+  return session;
+}
+
+function assertCurrentCoreGeneration(generation: number, signal: AbortSignal): void {
+  throwIfLifecycleAborted(signal);
+  if (!coreLifecycleQueue.isCurrentGeneration(generation)) {
+    throw new LifecycleCancelledError("Stale Core lifecycle generation");
+  }
+}
+
+async function startCoreSession(signal: AbortSignal, generation: number): Promise<CoreSession> {
   const maxAttempts = shouldRetryAutoCoreStartup() ? AUTO_CORE_STARTUP_MAX_ATTEMPTS : 1;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let pendingProcess: CoreProcessHandle | null = null;
 
-    throwIfLifecycleAborted(signal);
+    assertCurrentCoreGeneration(generation, signal);
     try {
       await stopPendingCoreProcess();
     } catch (error) {
@@ -962,14 +1012,23 @@ async function startCoreSession(signal: AbortSignal): Promise<CoreSession> {
     }
 
     try {
-      throwIfLifecycleAborted(signal);
+      assertCurrentCoreGeneration(generation, signal);
       const session = coreSession ?? (await createColdStartSession());
+      assertCurrentCoreGeneration(generation, signal);
+      if (coreProcess) {
+        const reusable = await currentHealthyCoreSession(signal);
+        if (reusable) return reusable;
+        throw new LifecycleCancelledError("Tracked Core changed before startup");
+      }
       pendingProcess = startCoreProcess(session, (source, level, message) => {
         desktopLogger.log(source, level, message);
       });
       pendingCoreProcess = pendingProcess;
       await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
-      throwIfLifecycleAborted(signal);
+      assertCurrentCoreGeneration(generation, signal);
+      if (coreProcess && coreProcess !== pendingProcess) {
+        throw new LifecycleCancelledError("A newer Core process was committed before startup completed");
+      }
       coreProcess = pendingProcess;
       pendingCoreProcess = null;
       coreSession = session;
@@ -987,7 +1046,7 @@ async function startCoreSession(signal: AbortSignal): Promise<CoreSession> {
           desktopLogger.warn("main", "[megle] pending Core cleanup failed; retaining process for retry:", stopError);
         }
       }
-      coreProcess = null;
+      if (coreProcess === pendingProcess) coreProcess = null;
 
       // Do not start another child while an unhealthy pending child may still
       // own the bind port. The next library switch or shutdown retries it.
@@ -995,7 +1054,7 @@ async function startCoreSession(signal: AbortSignal): Promise<CoreSession> {
         coreReadyPromise = null;
         throw error;
       }
-      throwIfLifecycleAborted(signal);
+      assertCurrentCoreGeneration(generation, signal);
 
       if (attempt < maxAttempts) {
         desktopLogger.warn(
@@ -1065,10 +1124,15 @@ async function stopDesktopCoreProcesses(): Promise<void> {
   );
 }
 
-async function restartCoreForLibrary(dbPath: string, signal: AbortSignal): Promise<void> {
-  throwIfLifecycleAborted(signal);
+async function restartCoreForLibrary(
+  dbPath: string,
+  signal: AbortSignal,
+  generation: number
+): Promise<void> {
+  assertCurrentCoreGeneration(generation, signal);
   pushLibraryPhase("starting-core");
   const base = coreSession ?? pendingCoreSession ?? (await createCoreSession());
+  assertCurrentCoreGeneration(generation, signal);
   const session = sessionForDbPath(base, dbPath, pendingCoreSession);
   // Keep both the last-known renderer session and the candidate session until
   // the replacement Core is healthy. The renderer keeps using baseUrl/token
@@ -1076,13 +1140,12 @@ async function restartCoreForLibrary(dbPath: string, signal: AbortSignal): Promi
   pendingCoreSession = session;
   // Stop a failed pending Core before the active Core and wait for the port to free up.
   await stopDesktopCoreProcesses();
-  // The resolved startup promise describes the old process. Keep its session
-  // metadata above, but never let a later ensureCoreReady call reuse that
-  // settled promise after the process has been replaced or stopped.
-  coreReadyPromise = null;
-  throwIfLifecycleAborted(signal);
+  assertCurrentCoreGeneration(generation, signal);
   await waitForPortFree(base.bindAddress, signal);
-  throwIfLifecycleAborted(signal);
+  assertCurrentCoreGeneration(generation, signal);
+  if (coreProcess) {
+    throw new LifecycleCancelledError("Tracked Core changed before library restart");
+  }
 
   const handle = startCoreProcess(session, (source, level, message) => {
     desktopLogger.log(source, level, message);
@@ -1091,7 +1154,10 @@ async function restartCoreForLibrary(dbPath: string, signal: AbortSignal): Promi
   try {
     pushLibraryPhase("opening-library");
     await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
-    throwIfLifecycleAborted(signal);
+    assertCurrentCoreGeneration(generation, signal);
+    if (coreProcess && coreProcess !== handle) {
+      throw new LifecycleCancelledError("A newer Core process was committed before library restart completed");
+    }
   } catch (error) {
     try {
       await stopPendingCoreProcess();

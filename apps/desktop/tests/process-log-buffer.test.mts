@@ -599,6 +599,51 @@ test("splits Core stdout and stderr chunks without losing partial lines", () => 
   assert.deepEqual(stderr, ["警告"]);
 });
 
+test("routes each complete Core line through the bound console exactly once", async () => {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = Object.assign(new EventEmitter(), {
+    stdout,
+    stderr,
+    kill: () => true
+  });
+  const consoleLines: Array<{ level: string; message: string }> = [];
+  const logger = new DesktopLogger({
+    console: {
+      info: (message) => consoleLines.push({ level: "info", message: String(message) }),
+      warn: (message) => consoleLines.push({ level: "warn", message: String(message) })
+    }
+  });
+  const lifecycle = attachCoreProcessLifecycle(
+    child as unknown as ChildProcess,
+    (source, level, message) => logger.log(source, level, message)
+  );
+
+  stdout.write("first\npar");
+  stdout.write("tial\n");
+  stderr.write("warning\n");
+  stdout.end();
+  stderr.end();
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+  await lifecycle.waitForExit;
+  await logger.flush();
+
+  assert.deepEqual(consoleLines, [
+    { level: "info", message: "first" },
+    { level: "info", message: "partial" },
+    { level: "warn", message: "warning" }
+  ]);
+  assert.deepEqual(
+    logger.buffer.snapshot({}).map(({ source, level, message }) => ({ source, level, message })),
+    [
+      { source: "core", level: "info", message: "first" },
+      { source: "core", level: "info", message: "partial" },
+      { source: "core", level: "warn", message: "warning" }
+    ]
+  );
+});
+
 test("Core stop escalates from ignored SIGTERM to SIGKILL and waits for close", async () => {
   const stdout = new PassThrough();
   const stderr = new PassThrough();

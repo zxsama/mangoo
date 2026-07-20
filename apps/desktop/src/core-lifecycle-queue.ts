@@ -27,6 +27,7 @@ export class CoreLifecycleQueue {
   private shutdownRequested = false;
   private closed = false;
   private shutdownAttempt: Promise<unknown> | null = null;
+  private generation = 0;
 
   enqueue<T>(task: CoreLifecycleTask<T>): Promise<T> {
     if (this.shutdownRequested || this.closed) {
@@ -43,6 +44,7 @@ export class CoreLifecycleQueue {
       return this.shutdownAttempt as Promise<T>;
     }
 
+    this.generation += 1;
     this.shutdownRequested = true;
     for (const item of this.pending.splice(0)) {
       item.controller.abort();
@@ -61,6 +63,22 @@ export class CoreLifecycleQueue {
       if (this.shutdownAttempt === attempt) this.shutdownAttempt = null;
     });
     return attempt;
+  }
+
+  beginGeneration(): number {
+    if (this.shutdownRequested || this.closed) {
+      throw new LifecycleClosedError();
+    }
+    this.generation += 1;
+    return this.generation;
+  }
+
+  get currentGeneration(): number {
+    return this.generation;
+  }
+
+  isCurrentGeneration(generation: number): boolean {
+    return !this.shutdownRequested && !this.closed && generation === this.generation;
   }
 
   private enqueueInternal<T>(task: CoreLifecycleTask<T>): Promise<T> {

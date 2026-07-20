@@ -49,6 +49,96 @@ test("serializes concurrent Core child/session operations", async () => {
   assert.equal(maxActiveChildren, 1);
 });
 
+test("queued secondary open rechecks a completed switch and reuses its only child", async () => {
+  const queue = new CoreLifecycleQueue();
+  const switchStarted = deferred();
+  const switchHealthy = deferred();
+  let childStarts = 0;
+  let childStops = 0;
+  let currentChild: { readonly stop: () => Promise<void> } | null = null;
+  let currentSession: string | null = null;
+
+  const switching = queue.enqueue(async () => {
+    const generation = queue.beginGeneration();
+    childStarts += 1;
+    const child = {
+      stop: async () => {
+        childStops += 1;
+      }
+    };
+    switchStarted.resolve();
+    await switchHealthy.promise;
+    if (!queue.isCurrentGeneration(generation)) {
+      await child.stop();
+      throw new LifecycleCancelledError("stale switch result");
+    }
+    currentChild = child;
+    currentSession = "switched-session";
+    return currentSession;
+  });
+  await switchStarted.promise;
+
+  const secondaryOpen = queue.enqueue(async () => {
+    const observedGeneration = queue.currentGeneration;
+    if (
+      currentChild &&
+      currentSession &&
+      queue.isCurrentGeneration(observedGeneration)
+    ) {
+      return currentSession;
+    }
+    const generation = queue.beginGeneration();
+    childStarts += 1;
+    if (!queue.isCurrentGeneration(generation)) throw new LifecycleCancelledError();
+    currentSession = "secondary-started-session";
+    return currentSession;
+  });
+
+  switchHealthy.resolve();
+  assert.equal(await switching, "switched-session");
+  assert.equal(await secondaryOpen, "switched-session");
+  assert.equal(childStarts, 1);
+
+  await queue.shutdown(async () => {
+    await currentChild?.stop();
+    currentChild = null;
+  });
+  assert.equal(childStops, 1);
+});
+
+test("shutdown generation invalidates an in-flight start before handle commit", async () => {
+  const queue = new CoreLifecycleQueue();
+  const startCreated = deferred();
+  const healthGate = deferred();
+  let committedChild = false;
+  let childStops = 0;
+
+  const starting = queue.enqueue(async () => {
+    const generation = queue.beginGeneration();
+    const child = {
+      stop: async () => {
+        childStops += 1;
+      }
+    };
+    startCreated.resolve();
+    await healthGate.promise;
+    if (!queue.isCurrentGeneration(generation)) {
+      await child.stop();
+      throw new LifecycleCancelledError("stale start result");
+    }
+    committedChild = true;
+  });
+  await startCreated.promise;
+
+  const shutdown = queue.shutdown(async () => undefined);
+  healthGate.resolve();
+
+  await assert.rejects(starting, LifecycleCancelledError);
+  await shutdown;
+  assert.equal(committedChild, false);
+  assert.equal(childStops, 1);
+});
+
 test("shutdown cancels queued/active library work and prevents later starts", async () => {
   const queue = new CoreLifecycleQueue();
   const activeStarted = deferred();

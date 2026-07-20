@@ -91,14 +91,6 @@ export function startCoreProcess(
   });
 
   const lifecycle = attachCoreProcessLifecycle(child, onLog);
-  child.stdout?.on("data", (chunk: Buffer) => {
-    process.stdout.write("[core stdout] ");
-    process.stdout.write(chunk);
-  });
-  child.stderr?.on("data", (chunk: Buffer) => {
-    process.stderr.write("[core stderr] ");
-    process.stderr.write(chunk);
-  });
 
   return {
     process: child,

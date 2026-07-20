@@ -377,13 +377,16 @@ if (startCoreCalls !== 2) {
     `desktop main must start Core from exactly two call sites (startCoreSession + restartCoreForLibrary); found ${startCoreCalls} calls`
   );
 }
+if (processFile.includes('process.stdout.write("[core stdout] ")') || processFile.includes('process.stderr.write("[core stderr] ")')) {
+  fail("Core output must use the line-based desktop logger path without duplicate raw chunk console writes");
+}
 const lifecycleEnqueueCalls = [...main.matchAll(/coreLifecycleQueue\.enqueue\(/g)].length;
 if (lifecycleEnqueueCalls < 4) {
   fail("desktop library/startup lifecycle operations must all enter the shared Core lifecycle queue");
 }
 const restartCoreForLibraryBody = functionBody(
   main,
-  "async function restartCoreForLibrary(dbPath: string, signal: AbortSignal): Promise<void>"
+  "async function restartCoreForLibrary("
 );
 if (!restartCoreForLibraryBody) {
   fail("desktop main must expose restartCoreForLibrary to restart Core for a library switch");
@@ -397,13 +400,21 @@ if (!restartCoreForLibraryBody) {
   if (!restartCoreForLibraryBody.includes("sessionForDbPath(")) {
     fail("desktop main restartCoreForLibrary must reuse the existing bind address/session token via sessionForDbPath");
   }
-  for (const value of ["pendingCoreSession", "throwIfLifecycleAborted(signal)", "pendingCoreSession = null"]) {
+  for (const value of ["pendingCoreSession", "assertCurrentCoreGeneration(generation, signal)", "pendingCoreSession = null"]) {
     if (!restartCoreForLibraryBody.includes(value)) {
       fail(`desktop main restartCoreForLibrary must preserve candidate session lifecycle state: ${value}`);
     }
   }
   if (restartCoreForLibraryBody.includes("coreSession = null")) {
     fail("desktop main must retain the last-known coreSession while a library candidate is unhealthy");
+  }
+  const processCommitIndex = restartCoreForLibraryBody.indexOf("coreProcess = handle");
+  const generationFenceIndex = restartCoreForLibraryBody.lastIndexOf(
+    "assertCurrentCoreGeneration(generation, signal)",
+    processCommitIndex
+  );
+  if (processCommitIndex === -1 || generationFenceIndex === -1) {
+    fail("desktop library restart must compare lifecycle generation before committing its Core handle");
   }
 }
 if (!main.includes("ensureCoreReady")) {
@@ -424,13 +435,46 @@ if (!lifecycleQueue.includes("this.active?.controller.abort()") || !lifecycleQue
 if (!lifecycleQueue.includes("this.shutdownRequested || this.closed")) {
   fail("Core lifecycle queue must reject work after shutdown begins");
 }
+for (const value of ["beginGeneration()", "isCurrentGeneration(", "this.generation += 1"]) {
+  if (!lifecycleQueue.includes(value)) {
+    fail(`Core lifecycle queue must expose generation fencing: ${value}`);
+  }
+}
 const ensureCoreReadyBody = functionBody(main, "async function ensureCoreReady(): Promise<CoreSession>");
-const startCoreSessionBody = functionBody(main, "async function startCoreSession(signal: AbortSignal): Promise<CoreSession>");
+const currentHealthyCoreSessionBody = functionBody(
+  main,
+  "async function currentHealthyCoreSession(signal: AbortSignal): Promise<CoreSession | null>"
+);
+const startCoreSessionBody = functionBody(
+  main,
+  "async function startCoreSession(signal: AbortSignal, generation: number): Promise<CoreSession>"
+);
 if (!ensureCoreReadyBody) {
   fail("desktop main must keep ensureCoreReady as an async CoreSession function");
 } else {
   if (!ensureCoreReadyBody.includes("return coreReadyPromise")) {
     fail("desktop main must return shared Core startup promise to concurrent callers");
+  }
+  for (const value of ["currentHealthyCoreSession(signal)", "coreLifecycleQueue.beginGeneration()", "clearReadyPromise"]) {
+    if (!ensureCoreReadyBody.includes(value)) {
+      fail(`desktop ensureCoreReady must recheck queued Core state before starting: ${value}`);
+    }
+  }
+}
+if (!currentHealthyCoreSessionBody) {
+  fail("desktop main must recheck queued Core handles and health before starting");
+} else {
+  for (const value of [
+    "const handle = coreProcess",
+    "const session = coreSession",
+    "coreLifecycleQueue.currentGeneration",
+    "await waitForCoreHealth(",
+    "coreProcess !== handle",
+    "coreSession !== session"
+  ]) {
+    if (!currentHealthyCoreSessionBody.includes(value)) {
+      fail(`desktop queued Core reuse must recheck state at execution time: ${value}`);
+    }
   }
 }
 if (!startCoreSessionBody) {
@@ -457,6 +501,13 @@ if (!startCoreSessionBody) {
   if (healthIndex === -1 || processPublishIndex === -1 || processPublishIndex < healthIndex) {
     fail("desktop main must publish coreProcess only after Core health succeeds");
   }
+  const generationFenceIndex = startCoreSessionBody.lastIndexOf(
+    "assertCurrentCoreGeneration(generation, signal)",
+    processPublishIndex
+  );
+  if (generationFenceIndex === -1 || generationFenceIndex > processPublishIndex) {
+    fail("desktop main must compare lifecycle generation immediately before publishing a started Core");
+  }
   if (!startCoreSessionBody.includes("catch") || !startCoreSessionBody.includes("coreReadyPromise = null")) {
     fail("desktop main must clear pending Core startup state on failure");
   }
@@ -468,6 +519,9 @@ if (!startCoreSessionBody) {
   }
   if (!startCoreSessionBody.includes("pendingCoreProcess = null")) {
     fail("desktop main must clear pending Core process after startup settles");
+  }
+  if (!startCoreSessionBody.includes("assertCurrentCoreGeneration(generation, signal)")) {
+    fail("desktop main must fence Core startup commits by lifecycle generation");
   }
   if (!startCoreSessionBody.includes("cleanupFailed") || !startCoreSessionBody.includes("retaining process for retry")) {
     fail("desktop main must retain a pending Core process when cleanup fails before retrying startup");
