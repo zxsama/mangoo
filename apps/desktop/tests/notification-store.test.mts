@@ -409,6 +409,24 @@ describe("notification store", () => {
     }
   });
 
+  it("allows concurrent first opens of the same empty v0 database", async () => {
+    const databasePath = testDatabasePath();
+    const [first, second] = await Promise.all([
+      createTestStore(databasePath),
+      createTestStore(databasePath)
+    ]);
+    try {
+      await first.applyOutboxBatch(
+        LIBRARY_A,
+        [event(1, operation("concurrent-init", 1, "running"))],
+        1
+      );
+      assert.equal(await second.cursor(LIBRARY_A.id), 1);
+    } finally {
+      await Promise.all([first.close(), second.close()]);
+    }
+  });
+
   it("serializes concurrent requests and closes without leaking pending calls", async () => {
     const store = await createTestStore();
     await Promise.all(
@@ -553,5 +571,33 @@ describe("notification store", () => {
     assert.ok(Date.now() - startedAt < 50, "pending requests should reject when close starts");
     await Promise.all([firstClose, secondClose]);
     await assert.rejects(store.cursor(LIBRARY_A.id), /closed/i);
+  });
+
+  it("does not send a cursor request when close races it in the same tick", async () => {
+    const workerUrl = dataWorkerUrl(`
+      import { parentPort } from "node:worker_threads";
+      parentPort.postMessage({ type: "ready" });
+      parentPort.on("message", (message) => {
+        if (message.method === "cursor") {
+          throw new Error("cursor request was sent after close began");
+        }
+        if (message.method === "close") {
+          parentPort.postMessage({
+            type: "response", requestId: message.requestId, ok: true, result: null
+          });
+        }
+      });
+    `);
+    const store = await createNotificationStore({
+      databasePath: testDatabasePath(),
+      workerUrl
+    });
+    const startedAt = Date.now();
+    const cursorPromise = store.cursor(LIBRARY_A.id);
+    const firstClose = store.close();
+    const secondClose = store.close();
+    await assert.rejects(cursorPromise, /closed/i);
+    await Promise.all([firstClose, secondClose]);
+    assert.ok(Date.now() - startedAt < 500, "same-tick close race should not hit the close timeout");
   });
 });

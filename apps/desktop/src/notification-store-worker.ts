@@ -24,7 +24,7 @@ const CATEGORIES = new Set(["task", "file_operation", "error", "thumbnail_cache"
 const ORIGINS = new Set(["user", "background", "recovery", "system"]);
 const PRESENTATIONS = new Set(["important", "history_only", "status_only"]);
 const HISTORY_INDEX_SQL = `
-  CREATE INDEX idx_operations_history
+  CREATE INDEX IF NOT EXISTS idx_operations_history
     ON operations(COALESCE(completed_at, updated_at) DESC, updated_at DESC)
     WHERE status NOT IN ('pending', 'running');
 `;
@@ -168,7 +168,7 @@ function openDatabase(databasePath: string): DatabaseSync {
     database.exec("BEGIN IMMEDIATE;");
     try {
       database.exec(`
-        CREATE TABLE operations (
+        CREATE TABLE IF NOT EXISTS operations (
           library_id TEXT NOT NULL,
           operation_id TEXT NOT NULL,
           library_name TEXT NOT NULL,
@@ -182,19 +182,19 @@ function openDatabase(databasePath: string): DatabaseSync {
           PRIMARY KEY(library_id, operation_id)
         );
         ${HISTORY_INDEX_SQL}
-        CREATE INDEX idx_operations_status
+        CREATE INDEX IF NOT EXISTS idx_operations_status
           ON operations(status, updated_at DESC);
-        CREATE TABLE sync_cursors (
+        CREATE TABLE IF NOT EXISTS sync_cursors (
           library_id TEXT PRIMARY KEY,
           sequence INTEGER NOT NULL
         );
-        CREATE TABLE thumbnail_summaries (
+        CREATE TABLE IF NOT EXISTS thumbnail_summaries (
           library_id TEXT PRIMARY KEY,
           library_name TEXT NOT NULL,
           observed_at INTEGER NOT NULL,
           payload_json TEXT NOT NULL
         );
-        CREATE TABLE legacy_imports (
+        CREATE TABLE IF NOT EXISTS legacy_imports (
           library_id TEXT PRIMARY KEY,
           imported_at INTEGER NOT NULL
         );

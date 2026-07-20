@@ -214,6 +214,9 @@ export class NotificationStore {
     if (this.failure) {
       throw this.failure;
     }
+    if (this.closed || (this.closing && request.method !== "close")) {
+      throw new Error("notification store is closed");
+    }
     return new Promise<T>((resolve, reject) => {
       this.pending.set(request.requestId, {
         resolve: resolve as (value: unknown) => void,
