@@ -312,12 +312,15 @@ export async function waitForCoreHealth(
 
   while (Date.now() < deadline) {
     if (signal) throwIfLifecycleAborted(signal);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    const requestAbort = createHealthRequestAbort(remainingMs, signal);
     try {
       const response = await fetch(new URL("health", ensureTrailingSlash(baseUrl)), {
         headers: {
           "x-megle-session": sessionToken
         },
-        signal
+        signal: requestAbort.signal
       });
       if (response.ok) {
         return;
@@ -325,12 +328,68 @@ export async function waitForCoreHealth(
       lastError = new Error(`health returned ${response.status}`);
     } catch (error) {
       if (signal?.aborted) throw new LifecycleCancelledError();
+      if (requestAbort.timedOut()) {
+        throw coreHealthTimeoutError(timeoutMs, error);
+      }
       lastError = error;
+    } finally {
+      requestAbort.dispose();
     }
-    await delay(250, signal);
+    const delayMs = Math.min(250, deadline - Date.now());
+    if (delayMs > 0) await delay(delayMs, signal);
   }
 
-  throw new Error(`Core did not become healthy: ${String(lastError)}`);
+  throw coreHealthTimeoutError(timeoutMs, lastError);
+}
+
+interface HealthRequestAbort {
+  readonly signal: AbortSignal;
+  readonly timedOut: () => boolean;
+  readonly dispose: () => void;
+}
+
+function createHealthRequestAbort(
+  remainingMs: number,
+  lifecycleSignal?: AbortSignal
+): HealthRequestAbort {
+  const controller = new AbortController();
+  let timeoutReached = false;
+  let lifecycleListenerAttached = false;
+  const onLifecycleAbort = () => {
+    controller.abort(lifecycleSignal?.reason);
+  };
+
+  if (lifecycleSignal) {
+    if (lifecycleSignal.aborted) {
+      onLifecycleAbort();
+    } else {
+      lifecycleSignal.addEventListener("abort", onLifecycleAbort, { once: true });
+      lifecycleListenerAttached = true;
+    }
+  }
+
+  const timeoutId = setTimeout(() => {
+    timeoutReached = true;
+    controller.abort(new DOMException("Core health request timed out", "TimeoutError"));
+  }, remainingMs);
+
+  return {
+    signal: controller.signal,
+    timedOut: () => timeoutReached,
+    dispose: () => {
+      clearTimeout(timeoutId);
+      if (lifecycleSignal && lifecycleListenerAttached) {
+        lifecycleSignal.removeEventListener("abort", onLifecycleAbort);
+        lifecycleListenerAttached = false;
+      }
+    }
+  };
+}
+
+function coreHealthTimeoutError(timeoutMs: number, lastError: unknown): Error {
+  return new Error(
+    `Core did not become healthy within ${timeoutMs}ms: ${String(lastError ?? "health request timed out")}`
+  );
 }
 
 function repoRoot(): string {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import {
@@ -18,6 +19,20 @@ function deferred<T = void>(): {
     resolve = nextResolve;
   });
   return { promise, resolve };
+}
+
+async function listenOnLoopback(server: ReturnType<typeof createServer>): Promise<string> {
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  return `http://127.0.0.1:${address.port}/api`;
+}
+
+async function closeHttpServer(server: ReturnType<typeof createServer>): Promise<void> {
+  server.closeAllConnections();
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
 }
 
 test("serializes concurrent Core child/session operations", async () => {
@@ -192,25 +207,124 @@ test("failed shutdown can retry without reopening library work", async () => {
   await assert.rejects(queue.enqueue(async () => "unreachable"), LifecycleClosedError);
 });
 
+test("health timeout aborts a connected request that never returns headers", async () => {
+  const accepted = deferred();
+  const sockets: Array<{ destroyed: boolean }> = [];
+  const server = createServer(() => accepted.resolve());
+  server.on("connection", (socket) => sockets.push(socket));
+  const baseUrl = await listenOnLoopback(server);
+  const controller = new AbortController();
+  const baselineAbortListeners = getEventListeners(controller.signal, "abort").length;
+  const safetyAbort = setTimeout(
+    () => controller.abort(new Error("test safety abort")),
+    750
+  );
+  const startedAt = performance.now();
+  try {
+    const rejection = assert.rejects(
+      waitForCoreHealth(baseUrl, "session-token", 50, controller.signal),
+      /Core did not become healthy|timed out/i
+    );
+    await accepted.promise;
+    await rejection;
+    const elapsedMs = performance.now() - startedAt;
+    assert.ok(elapsedMs >= 25, `health timeout fired too early after ${elapsedMs}ms`);
+    assert.ok(elapsedMs < 500, `health timeout remained pending for ${elapsedMs}ms`);
+    assert.equal(getEventListeners(controller.signal, "abort").length, baselineAbortListeners);
+  } finally {
+    clearTimeout(safetyAbort);
+    await closeHttpServer(server);
+  }
+  assert.ok(sockets.length > 0, "health request must establish a real server connection");
+  assert.ok(sockets.every((socket) => socket.destroyed), "server sockets must close after timeout");
+});
+
+test("one-second health recheck releases the lifecycle queue after its deadline", async () => {
+  const accepted = deferred();
+  const server = createServer(() => accepted.resolve());
+  const baseUrl = await listenOnLoopback(server);
+  const queue = new CoreLifecycleQueue();
+  const health = queue.enqueue((signal) =>
+    waitForCoreHealth(baseUrl, "session-token", 1_000, signal)
+  );
+  const following = queue.enqueue(async () => "queue-released");
+  const followingOutcome = following.then(
+    (value) => ({ status: "fulfilled" as const, value }),
+    (error: unknown) => ({ status: "rejected" as const, error })
+  );
+  const safetyShutdown = setTimeout(() => {
+    void queue.shutdown(async () => undefined).catch(() => undefined);
+  }, 3_000);
+  try {
+    const rejection = assert.rejects(health, /Core did not become healthy|timed out/i);
+    await accepted.promise;
+    await rejection;
+    assert.deepEqual(await followingOutcome, {
+      status: "fulfilled",
+      value: "queue-released"
+    });
+  } finally {
+    clearTimeout(safetyShutdown);
+    await closeHttpServer(server);
+  }
+});
+
+test("external lifecycle abort wins over the health deadline", async () => {
+  const accepted = deferred();
+  const server = createServer(() => accepted.resolve());
+  const baseUrl = await listenOnLoopback(server);
+  const controller = new AbortController();
+  const baselineAbortListeners = getEventListeners(controller.signal, "abort").length;
+  try {
+    const rejection = assert.rejects(
+      waitForCoreHealth(baseUrl, "session-token", 5_000, controller.signal),
+      LifecycleCancelledError
+    );
+    await accepted.promise;
+    controller.abort(new DOMException("Library switched", "AbortError"));
+    await rejection;
+    assert.equal(getEventListeners(controller.signal, "abort").length, baselineAbortListeners);
+  } finally {
+    await closeHttpServer(server);
+  }
+});
+
+test("healthy Core response completes without retaining lifecycle listeners", async () => {
+  let observedPath = "";
+  let observedSession = "";
+  const server = createServer((request, response) => {
+    observedPath = request.url ?? "";
+    observedSession = String(request.headers["x-megle-session"] ?? "");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end('{"status":"ok"}');
+  });
+  const baseUrl = await listenOnLoopback(server);
+  const controller = new AbortController();
+  const baselineAbortListeners = getEventListeners(controller.signal, "abort").length;
+  try {
+    await waitForCoreHealth(baseUrl, "session-token", 1_000, controller.signal);
+    assert.equal(observedPath, "/api/health");
+    assert.equal(observedSession, "session-token");
+    assert.equal(getEventListeners(controller.signal, "abort").length, baselineAbortListeners);
+  } finally {
+    await closeHttpServer(server);
+  }
+});
+
 test("health polling aborts promptly when shutdown cancels the active lifecycle", async () => {
   const server = createServer(() => {
     // Leave the response pending so the AbortSignal is the only completion.
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
+  const baseUrl = await listenOnLoopback(server);
   const controller = new AbortController();
-  const health = waitForCoreHealth(
-    `http://127.0.0.1:${address.port}/api`,
-    "session-token",
-    5_000,
-    controller.signal
-  );
+  const health = waitForCoreHealth(baseUrl, "session-token", 5_000, controller.signal);
 
   setTimeout(() => controller.abort(), 10);
-  await assert.rejects(health, LifecycleCancelledError);
-  server.closeAllConnections();
-  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  try {
+    await assert.rejects(health, LifecycleCancelledError);
+  } finally {
+    await closeHttpServer(server);
+  }
 });
 
 test("candidate library session retries with the same URL, port, and token", () => {
