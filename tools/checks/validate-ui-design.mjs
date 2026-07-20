@@ -62,6 +62,7 @@ const libraryCenterPane = readOptional("apps/web/src/features/library/LibraryCen
 const libraryInspectorPane = readOptional("apps/web/src/features/library/LibraryInspectorPane.tsx") ?? "";
 const pluginsView = read("apps/web/src/features/plugins/PluginsView.tsx");
 const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
+const notificationWindow = read("apps/web/src/features/notifications/NotificationWindow.tsx");
 const filterMenu = readOptional("apps/web/src/features/library/FilterMenu.tsx");
 const mediaGrid = read("apps/web/src/features/media-grid/MediaGrid.tsx");
 const mediaResources = read("apps/web/src/core/mediaResources.ts");
@@ -1650,7 +1651,8 @@ if (
 }
 for (const [label, source] of [
   ["SettingsWindow", settingsWindow],
-  ["PluginsWindow", pluginsWindow]
+  ["PluginsWindow", pluginsWindow],
+  ["NotificationWindow", notificationWindow]
 ]) {
   if (!source.includes("SecondaryWindowFrame")) {
     fail(`${label} must share the frameless secondary-window titlebar/material frame`);
@@ -1713,6 +1715,9 @@ for (const value of ["applyInterfaceStyleVariables(readInterfaceStyle())", "prel
 }
 if (!webMain.includes('windowRole === "plugins"') || !webMain.includes('import("./features/plugins/PluginsWindow")')) {
   fail("web entry must render PluginsWindow as a standalone renderer mode");
+}
+if (!webMain.includes('windowRole === "notifications"') || !webMain.includes('import("./features/notifications/NotificationWindow")')) {
+  fail("web entry must render NotificationWindow as a standalone renderer mode");
 }
 
 if (!shortcutBindings) {

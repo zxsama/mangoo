@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -11,6 +11,11 @@ function fail(message) {
 
 function read(relativePath) {
   return readFileSync(path.join(root, relativePath), "utf8");
+}
+
+function readOptional(relativePath) {
+  const absolutePath = path.join(root, relativePath);
+  return existsSync(absolutePath) ? readFileSync(absolutePath, "utf8") : "";
 }
 
 function functionBody(source, signature) {
@@ -45,6 +50,12 @@ const session = read("apps/desktop/src/core-session.ts");
 const processFile = read("apps/desktop/src/core-process.ts");
 const lifecycleQueue = read("apps/desktop/src/core-lifecycle-queue.ts");
 const preload = read("apps/desktop/src/preload.cjs");
+const notificationIpc = readOptional("apps/desktop/src/notification-ipc.ts");
+const notificationRuntime = readOptional("apps/desktop/src/notification-runtime.ts");
+const notificationChannels = readOptional("apps/desktop/src/notification-ipc-channels.cjs");
+const notificationStore = readOptional("apps/desktop/src/notification-store.ts");
+const webDesktopBridge = read("apps/web/src/core/desktop.ts");
+const webMain = read("apps/web/src/main.tsx");
 const secondaryReveal = read("apps/desktop/src/secondary-window-reveal.ts");
 const desktopPackage = read("apps/desktop/package.json");
 const rootPackage = read("package.json");
@@ -150,15 +161,18 @@ for (const value of [
 }
 
 for (const value of [
-  'type SecondaryWindowRole = "settings" | "plugins"',
+  'type SecondaryWindowRole = "settings" | "plugins" | "notifications"',
   "SECONDARY_WINDOW_CONFIGS",
   "secondaryWindows",
   "secondaryWindowReadiness",
   "SECONDARY_WINDOW_READY_TIMEOUT_MS",
   'route: "#/settings"',
   'route: "#/plugins"',
+  'route: "#/notifications"',
   'ipcMain.handle("megle:open-plugins-window"',
   'ipcMain.handle("megle:close-plugins-window"',
+  'ipcMain.handle(NOTIFICATION_IPC_CHANNELS.openWindow',
+  'ipcMain.handle(NOTIFICATION_IPC_CHANNELS.closeWindow',
   'ipcMain.handle("megle:secondary-window-ready"',
   "openSecondaryWindow",
   "closeSecondaryWindow",
@@ -174,7 +188,7 @@ const openSecondaryWindowBody = functionBody(
   "async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void>"
 );
 if (!openSecondaryWindowBody) {
-  fail("desktop must centralize Settings/Plugins creation in openSecondaryWindow");
+  fail("desktop must centralize Settings/Plugins/Notifications creation in openSecondaryWindow");
 } else {
   for (const value of [
     "existing.isMinimized()",
@@ -201,6 +215,103 @@ if (!openSecondaryWindowBody) {
       fail(`shared secondary window must preserve the Settings lifecycle/material contract: ${value}`);
     }
   }
+}
+
+for (const value of [
+  "notificationDatabasePath(userDataDir())",
+  "createNotificationStore",
+  "createNotificationService",
+  "NotificationRuntime",
+  "attachNotificationServiceForSession",
+  "closeNotificationRuntime",
+  "await closeNotificationRuntime()"
+]) {
+  if (!main.includes(value)) {
+    fail(`desktop notification lifecycle missing ${value}`);
+  }
+}
+if (!notificationStore.includes('"notifications.sqlite"')) {
+  fail("desktop notification store must use the global notifications.sqlite path");
+}
+
+for (const value of [
+  "compact",
+  "history",
+  "cancel",
+  "retry",
+  "reportError",
+  "thumbnailSummary",
+  "logsPage",
+  "logsSubscribe",
+  "logsUnsubscribe",
+  "logsClear",
+  "rendererLogs",
+  "changed",
+  "logsChanged"
+]) {
+  if (!notificationChannels.includes(value)) {
+    fail(`central notification IPC channel table missing ${value}`);
+  }
+}
+
+for (const value of [
+  "canAccessNotificationIpc",
+  "parseNotificationHistoryQuery",
+  "parseNotificationAction",
+  "parseRendererErrorReport",
+  "parseThumbnailCacheSummary",
+  "parseProcessLogFilter",
+  "parseRendererLogEntries",
+  "LatestValueBroadcastQueue",
+  "ProcessLogIpcSubscriptions"
+]) {
+  if (!notificationIpc.includes(value)) {
+    fail(`notification IPC boundary missing ${value}`);
+  }
+}
+
+for (const value of ["class NotificationRuntime", "start()", "attachLibrary", "detachLibrary", "close()"] ) {
+  if (!notificationRuntime.includes(value)) {
+    fail(`notification runtime missing ${value}`);
+  }
+}
+
+for (const value of [
+  "getCompactSnapshot",
+  "listHistory",
+  "cancel",
+  "retry",
+  "reportError",
+  "publishThumbnailSummary",
+  "onChanged",
+  "getLogs",
+  "snapshotAndSubscribeLogs",
+  "clearLogs",
+  "emitRendererLogs"
+]) {
+  if (!preload.includes(value)) {
+    fail(`preload notification bridge missing ${value}`);
+  }
+  if (!webDesktopBridge.includes(value)) {
+    fail(`typed Web notification bridge missing ${value}`);
+  }
+}
+if (!preload.includes("notifications: {") ||
+    !webDesktopBridge.includes("notifications?: DesktopNotificationsBridge")) {
+  fail("preload and Web bridge must expose one nested notifications surface");
+}
+if (preload.includes('require("./notification-ipc-channels.cjs")') ||
+    !desktopPackage.includes("channels+'\\\\n'+preload")) {
+  fail("sandboxed preload must bundle the centralized notification channels without a local require");
+}
+
+if (!webMain.includes('windowRole === "notifications"') ||
+    !webMain.includes('import("./features/notifications/NotificationWindow")')) {
+  fail("web entry must lazily route the standalone NotificationWindow");
+}
+
+if (/from\s+["']node:fs["']|require\(["']node:fs["']\)/.test(webDesktopBridge)) {
+  fail("Web notification bridge must not import node:fs");
 }
 
 if (main.includes('window.once("ready-to-show", () => window.show())')) {

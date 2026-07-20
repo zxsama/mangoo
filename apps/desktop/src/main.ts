@@ -6,8 +6,10 @@ import {
   ipcMain,
   screen,
   shell,
+  type IpcMainEvent,
   type IpcMainInvokeEvent,
-  type OpenDialogOptions
+  type OpenDialogOptions,
+  type WebContents
 } from "electron";
 import { spawn } from "node:child_process";
 import { promises as fsp } from "node:fs";
@@ -23,7 +25,7 @@ import {
   type CoreProcessHandle
 } from "./core-process.js";
 import { createCoreSession, type CoreSession } from "./core-session.js";
-import { desktopLogger } from "./desktop-logger.js";
+import { desktopLogger, processLogBuffer } from "./desktop-logger.js";
 import {
   CoreLifecycleQueue,
   LifecycleCancelledError,
@@ -31,6 +33,23 @@ import {
 } from "./core-lifecycle-queue.js";
 import * as libraryRegistry from "./library-registry.js";
 import { sessionForDbPath } from "./core-session.js";
+import {
+  LatestValueBroadcastQueue,
+  NOTIFICATION_IPC_CHANNELS,
+  ProcessLogIpcSubscriptions,
+  assertNotificationIpcAccess,
+  parseNotificationAction,
+  parseNotificationHistoryQuery,
+  parseProcessLogFilter,
+  parseRendererErrorReport,
+  parseRendererLogEntries,
+  parseThumbnailCacheSummary,
+  type NotificationIpcWindowRole
+} from "./notification-ipc.js";
+import { NotificationRuntime } from "./notification-runtime.js";
+import { createNotificationService, type NotificationService } from "./notification-service.js";
+import { createNotificationStore, notificationDatabasePath } from "./notification-store.js";
+import type { NotificationCompactSnapshot } from "./notification-types.js";
 import {
   NATIVE_WINDOW_WARMUP_MS,
   createSecondaryWindowRevealState,
@@ -40,7 +59,7 @@ import {
 } from "./secondary-window-reveal.js";
 
 let mainWindow: BrowserWindow | null = null;
-type SecondaryWindowRole = "settings" | "plugins";
+type SecondaryWindowRole = "settings" | "plugins" | "notifications";
 type SecondaryWindowConfig = {
   title: string;
   route: string;
@@ -52,7 +71,8 @@ type SecondaryWindowConfig = {
 type SecondaryWindowPosition = { x: number; y: number };
 const secondaryWindows: Record<SecondaryWindowRole, BrowserWindow | null> = {
   settings: null,
-  plugins: null
+  plugins: null,
+  notifications: null
 };
 type SecondaryWindowReadiness = {
   windowId: number;
@@ -68,11 +88,13 @@ type SecondaryWindowRevealResult = {
 };
 const secondaryWindowReadiness: Record<SecondaryWindowRole, SecondaryWindowReadiness | null> = {
   settings: null,
-  plugins: null
+  plugins: null,
+  notifications: null
 };
 const secondaryWindowPositions: Record<SecondaryWindowRole, SecondaryWindowPosition | null> = {
   settings: null,
-  plugins: null
+  plugins: null,
+  notifications: null
 };
 const SECONDARY_WINDOW_CONFIGS: Record<SecondaryWindowRole, SecondaryWindowConfig> = {
   settings: {
@@ -90,6 +112,14 @@ const SECONDARY_WINDOW_CONFIGS: Record<SecondaryWindowRole, SecondaryWindowConfi
     height: 720,
     minWidth: 720,
     minHeight: 500
+  },
+  notifications: {
+    title: "Megle 通知中心",
+    route: "#/notifications",
+    width: 1040,
+    height: 720,
+    minWidth: 820,
+    minHeight: 560
   }
 };
 let coreProcess: CoreProcessHandle | null = null;
@@ -103,6 +133,15 @@ let persisted = false;
 let shutdownFinalized = false;
 let shutdownPromise: Promise<void> | null = null;
 const coreLifecycleQueue = new CoreLifecycleQueue();
+let notificationRuntime: NotificationRuntime<NotificationService> | null = null;
+let notificationChangeSubscription: (() => void) | null = null;
+const notificationBroadcastQueue = new LatestValueBroadcastQueue<NotificationCompactSnapshot>(
+  broadcastNotificationSnapshot
+);
+const processLogSubscriptions = new ProcessLogIpcSubscriptions(
+  processLogBuffer,
+  NOTIFICATION_IPC_CHANNELS.logsChanged
+);
 let persistDebounceTimer: NodeJS.Timeout | null = null;
 let mainWindowReadyToShow: Promise<void> | null = null;
 let shellReadyRevealPromise: Promise<boolean> | null = null;
@@ -173,9 +212,103 @@ function pushLibraryPhase(phase: unknown): void {
   }
 }
 
-function windowForIpcEvent(event: IpcMainInvokeEvent): BrowserWindow | null {
+function windowForIpcEvent(event: IpcMainInvokeEvent | IpcMainEvent): BrowserWindow | null {
   const window = BrowserWindow.fromWebContents(event.sender);
   return window && !window.isDestroyed() ? window : null;
+}
+
+function roleForWebContents(sender: WebContents): NotificationIpcWindowRole | null {
+  const window = BrowserWindow.fromWebContents(sender);
+  if (!window || window.isDestroyed()) return null;
+  if (window === mainWindow) return "main";
+  for (const role of Object.keys(secondaryWindows) as SecondaryWindowRole[]) {
+    if (secondaryWindows[role] === window) return role;
+  }
+  return null;
+}
+
+function requireNotificationIpcAccess(
+  event: IpcMainInvokeEvent | IpcMainEvent,
+  channel: string
+): NotificationIpcWindowRole {
+  const role = roleForWebContents(event.sender);
+  assertNotificationIpcAccess(role, channel);
+  return role;
+}
+
+function broadcastNotificationSnapshot(snapshot: NotificationCompactSnapshot): void {
+  const targets = [mainWindow, secondaryWindows.notifications];
+  for (const window of targets) {
+    if (window && !window.isDestroyed()) {
+      window.webContents.send(NOTIFICATION_IPC_CHANNELS.changed, snapshot);
+    }
+  }
+}
+
+function ensureNotificationRuntime(): NotificationRuntime<NotificationService> {
+  if (notificationRuntime) return notificationRuntime;
+  notificationRuntime = new NotificationRuntime<NotificationService>(async (runtimeSignal) => {
+    const service = await createNotificationService({
+      openStore: (serviceSignal) =>
+        createNotificationStore({
+          databasePath: notificationDatabasePath(userDataDir()),
+          signal: AbortSignal.any([runtimeSignal, serviceSignal])
+        })
+    });
+    if (runtimeSignal.aborted) {
+      await service.close();
+      throw new DOMException("Notification runtime closed during startup", "AbortError");
+    }
+    return service;
+  });
+  return notificationRuntime;
+}
+
+async function ensureNotificationService(): Promise<NotificationService> {
+  const service = await ensureNotificationRuntime().start();
+  if (!notificationChangeSubscription) {
+    notificationChangeSubscription = service.subscribe((snapshot) => {
+      notificationBroadcastQueue.publish(snapshot);
+    });
+  }
+  return service;
+}
+
+async function attachNotificationServiceForSession(session: CoreSession): Promise<void> {
+  const service = await ensureNotificationService();
+  if (coreSession !== session) return;
+  const registry = getRegistry();
+  const active = registry.libraries.find((library) => library.id === registry.activeLibraryId);
+  if (!active || path.resolve(active.dbPath) !== path.resolve(session.dbPath)) {
+    await service.detachLibrary();
+    return;
+  }
+  await ensureNotificationRuntime().attachLibrary(
+    { id: active.id, name: active.name },
+    { baseUrl: session.baseUrl, sessionToken: session.sessionToken }
+  );
+}
+
+function scheduleNotificationServiceAttach(session: CoreSession): void {
+  void attachNotificationServiceForSession(session).catch((error) => {
+    desktopLogger.warn("main", "[megle] notification service library attach failed:", error);
+  });
+}
+
+async function closeNotificationRuntime(): Promise<void> {
+  notificationChangeSubscription?.();
+  notificationChangeSubscription = null;
+  notificationBroadcastQueue.close();
+  processLogSubscriptions.clear();
+  const runtime = notificationRuntime;
+  notificationRuntime = null;
+  await runtime?.close();
+}
+
+function registeredNotificationLibrary(libraryId: string): { id: string; name: string } {
+  const library = getRegistry().libraries.find((candidate) => candidate.id === libraryId);
+  if (!library) throw new Error("notification library not found");
+  return { id: library.id, name: library.name };
 }
 function toSummaries(reg: libraryRegistry.LibraryRegistry): Array<{
   id: string; name: string; dbPath: string; available: boolean; active: boolean; icon?: string; color?: string;
@@ -383,6 +516,120 @@ ipcMain.handle("megle:close-plugins-window", () => {
   return true;
 });
 
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.openWindow, async (event) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.openWindow);
+  await openSecondaryWindow("notifications");
+  return true;
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.closeWindow, (event) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.closeWindow);
+  closeSecondaryWindow("notifications");
+  return true;
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.compact, async (event) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.compact);
+  return (await ensureNotificationService()).compactSnapshot();
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.history, async (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.history);
+  return (await ensureNotificationService()).history(parseNotificationHistoryQuery(input));
+});
+
+ipcMain.handle(
+  NOTIFICATION_IPC_CHANNELS.cancel,
+  async (event, libraryId: unknown, operationId: unknown) => {
+    requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.cancel);
+    const action = parseNotificationAction(libraryId, operationId);
+    return (await ensureNotificationService()).cancelOperation(
+      action.libraryId,
+      action.operationId
+    );
+  }
+);
+
+ipcMain.handle(
+  NOTIFICATION_IPC_CHANNELS.retry,
+  async (event, libraryId: unknown, operationId: unknown) => {
+    requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.retry);
+    const action = parseNotificationAction(libraryId, operationId);
+    return (await ensureNotificationService()).retryOperation(
+      action.libraryId,
+      action.operationId
+    );
+  }
+);
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.reportError, async (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.reportError);
+  const report = parseRendererErrorReport(input);
+  const library = registeredNotificationLibrary(report.libraryId);
+  await (await ensureNotificationService()).reportRendererError({
+    ...report,
+    libraryName: library.name
+  });
+  return true;
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.thumbnailSummary, async (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.thumbnailSummary);
+  const summary = parseThumbnailCacheSummary(input);
+  const library = registeredNotificationLibrary(summary.libraryId);
+  if (getRegistry().activeLibraryId !== library.id) {
+    throw new Error("thumbnail summary must belong to the active library");
+  }
+  await (await ensureNotificationService()).publishThumbnailSummary({
+    ...summary,
+    libraryName: library.name
+  });
+  return true;
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.logsPage, (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.logsPage);
+  return processLogBuffer.page(parseProcessLogFilter(input));
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.logsSubscribe, (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.logsSubscribe);
+  return processLogSubscriptions.snapshotAndSubscribe(
+    event.sender,
+    parseProcessLogFilter(input)
+  );
+});
+
+ipcMain.on(NOTIFICATION_IPC_CHANNELS.logsUnsubscribe, (event) => {
+  try {
+    requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.logsUnsubscribe);
+    processLogSubscriptions.unsubscribe(event.sender.id);
+  } catch {
+    // Fire-and-forget unsubscribe is intentionally silent for stale windows.
+  }
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.logsClear, (event) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.logsClear);
+  processLogBuffer.clear();
+  return true;
+});
+
+ipcMain.on(NOTIFICATION_IPC_CHANNELS.rendererLogs, (event, input: unknown) => {
+  try {
+    requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.rendererLogs);
+    for (const entry of parseRendererLogEntries(input)) {
+      if (entry.metadata) {
+        desktopLogger.log("renderer", entry.level, entry.message, entry.metadata);
+      } else {
+        desktopLogger.log("renderer", entry.level, entry.message);
+      }
+    }
+  } catch (error) {
+    desktopLogger.warn("main", "[megle] rejected renderer log batch:", error);
+  }
+});
+
 ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown) => {
   if (!isSecondaryWindowRole(role)) return false;
   const window = windowForIpcEvent(event);
@@ -433,6 +680,7 @@ ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
       await restartCoreForLibrary(target.dbPath, signal, generation);
       assertCurrentCoreGeneration(generation, signal);
       persistRegistry(libraryRegistry.setActive(reg, libraryId, Date.now()));
+      if (coreSession) scheduleNotificationServiceAttach(coreSession);
       pushLibraryPhase("loading-media"); // renderer takes over from here
       return { ok: true };
     });
@@ -462,6 +710,7 @@ ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath:
       await restartCoreForLibrary(added.entry.dbPath, signal, generation);
       assertCurrentCoreGeneration(generation, signal);
       persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
+      if (coreSession) scheduleNotificationServiceAttach(coreSession);
       pushLibraryPhase("loading-media");
       const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
       return { ok: true, library: summary };
@@ -487,6 +736,7 @@ ipcMain.handle("megle:open-library", async (_e, dbPath: string) => {
       await restartCoreForLibrary(added.entry.dbPath, signal, generation);
       assertCurrentCoreGeneration(generation, signal);
       persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
+      if (coreSession) scheduleNotificationServiceAttach(coreSession);
       pushLibraryPhase("loading-media");
       const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
       return { ok: true, library: summary };
@@ -660,7 +910,7 @@ async function createWindow(): Promise<void> {
   }
 }
 
-// Settings and Plugins use the same controlled secondary-window lifecycle:
+// Settings, Plugins, and Notifications use the same controlled secondary-window lifecycle:
 // non-modal child windows, shared preload/Core session, frameless acrylic, and
 // one live instance per role. Re-opening restores and focuses the existing one.
 async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
@@ -775,7 +1025,7 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
 }
 
 function isSecondaryWindowRole(value: unknown): value is SecondaryWindowRole {
-  return value === "settings" || value === "plugins";
+  return value === "settings" || value === "plugins" || value === "notifications";
 }
 
 function restoreSecondaryWindowPositions(
@@ -1032,6 +1282,7 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
       coreProcess = pendingProcess;
       pendingCoreProcess = null;
       coreSession = session;
+      scheduleNotificationServiceAttach(session);
       if (attempt > 1) {
         desktopLogger.info("main", `[megle] Core startup recovered on attempt ${attempt}/${maxAttempts}`);
       }
@@ -1349,7 +1600,7 @@ function readSecondaryWindowPositions(value: unknown):
   if (!value || typeof value !== "object") return undefined;
   const source = value as Record<string, unknown>;
   const positions: Partial<Record<SecondaryWindowRole, SecondaryWindowPosition>> = {};
-  for (const role of ["settings", "plugins"] as const) {
+  for (const role of ["settings", "plugins", "notifications"] as const) {
     const candidate = source[role];
     if (!candidate || typeof candidate !== "object") continue;
     const position = candidate as { x?: unknown; y?: unknown };
@@ -1632,6 +1883,9 @@ function resolvePluginsDir(dbPath: string): string {
 app
   .whenReady()
   .then(async () => {
+    void ensureNotificationService().catch((error) => {
+      desktopLogger.warn("main", "[megle] notification service startup degraded:", error);
+    });
     const session = await ensureCoreReady();
     await maybeAutoAddRoot(session);
     await createWindow();
@@ -1646,6 +1900,7 @@ function handleDesktopStartupFailure(error: unknown): void {
 function requestDesktopShutdown(exitCode: number): void {
   if (shutdownFinalized || shutdownPromise) return;
   const shutdown = coreLifecycleQueue.shutdown(async () => {
+    await closeNotificationRuntime();
     await stopDesktopCoreProcesses();
     await desktopLogger.close();
     pendingCoreProcess = null;

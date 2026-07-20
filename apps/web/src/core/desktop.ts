@@ -1,6 +1,6 @@
 import type { LibrarySummary, LibraryLoadPhase } from "./libraryTypes";
 
-export type DesktopSecondaryWindowRole = "settings" | "plugins";
+export type DesktopSecondaryWindowRole = "settings" | "plugins" | "notifications";
 export interface DesktopSecondaryWindowRevealResult {
   nativeWarmupStartedAt: number;
   nativeWindowRevealedAt: number;
@@ -11,6 +11,161 @@ export interface DesktopDiagnostics {
   ffmpegAvailable: boolean;
   dbPath: string | null;
   pluginsDir: string | null;
+}
+
+export type DesktopNotificationStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+export type DesktopNotificationCategory = "task" | "file_operation" | "error" | "thumbnail_cache";
+
+export interface DesktopNotificationOperation {
+  libraryId: string;
+  libraryName: string;
+  operationId: string;
+  revision: number;
+  kind: string;
+  category: DesktopNotificationCategory;
+  origin: "user" | "background" | "recovery" | "system";
+  presentation: "important" | "history_only" | "status_only";
+  status: DesktopNotificationStatus;
+  phase: string | null;
+  title: string;
+  summary: string | null;
+  taskId: number | null;
+  rootId: number | null;
+  folderId: number | null;
+  fileId: number | null;
+  currentValue: number;
+  totalValue: number | null;
+  unit: string | null;
+  errorCode: string | null;
+  errorDetail: string | null;
+  cancellable: boolean;
+  retryable: boolean;
+  attempt: number;
+  occurrenceCount: number;
+  startedAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+}
+
+export interface DesktopThumbnailCacheSummary {
+  libraryId: string;
+  libraryName: string;
+  observedAt: number;
+  cachedCount: number;
+  totalCandidateCount: number;
+  missingCount: number;
+  staleCount: number;
+  failedCount: number;
+  pendingCount: number;
+  activeBulkTaskCount: number;
+  totalCacheBytes: number | null;
+  completionPercent: number | null;
+}
+
+export interface DesktopNotificationCompactSnapshot {
+  active: DesktopNotificationOperation[];
+  thumbnailSummaries: DesktopThumbnailCacheSummary[];
+  latestImportantResults: DesktopNotificationOperation[];
+  syncHealth: {
+    state: "healthy" | "syncing" | "degraded";
+    libraryId: string | null;
+    detail: string | null;
+    updatedAt: number;
+  };
+}
+
+export interface DesktopNotificationHistoryQuery {
+  libraryId?: string;
+  statuses?: DesktopNotificationStatus[];
+  categories?: DesktopNotificationCategory[];
+  search?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface DesktopNotificationHistoryPage {
+  items: DesktopNotificationOperation[];
+  total: number;
+  nextOffset: number | null;
+}
+
+export interface DesktopRendererErrorReport {
+  libraryId: string;
+  libraryName: string;
+  source: string;
+  code: string;
+  target: string;
+  title: string;
+  message: string;
+  detail: string | null;
+}
+
+export type DesktopProcessLogSource = "main" | "core" | "renderer";
+export type DesktopProcessLogLevel = "trace" | "debug" | "info" | "warn" | "error";
+
+export interface DesktopProcessLogLine {
+  sequence: number;
+  timestamp: number;
+  source: DesktopProcessLogSource;
+  level: DesktopProcessLogLevel;
+  message: string;
+  metadata?: Readonly<Record<string, unknown>>;
+}
+
+export interface DesktopProcessLogFilter {
+  source?: DesktopProcessLogSource;
+  sources?: DesktopProcessLogSource[];
+  level?: DesktopProcessLogLevel;
+  levels?: DesktopProcessLogLevel[];
+  search?: string;
+  afterSequence?: number;
+  beforeSequence?: number;
+  limit?: number;
+}
+
+export interface DesktopProcessLogPage {
+  lines: DesktopProcessLogLine[];
+  hasMore: boolean;
+  nextBeforeSequence: number | null;
+}
+
+export interface DesktopProcessLogBatch {
+  lines: DesktopProcessLogLine[];
+  afterSequence: number;
+  droppedBeforeSequence: number | null;
+}
+
+export interface DesktopNotificationsBridge {
+  getCompactSnapshot: () => Promise<DesktopNotificationCompactSnapshot>;
+  listHistory: (query: DesktopNotificationHistoryQuery) => Promise<DesktopNotificationHistoryPage>;
+  cancel: (libraryId: string, operationId: string) => Promise<{ ok: boolean; message: string | null }>;
+  retry: (libraryId: string, operationId: string) => Promise<{ ok: boolean; message: string | null }>;
+  reportError: (input: DesktopRendererErrorReport) => Promise<boolean>;
+  publishThumbnailSummary: (input: DesktopThumbnailCacheSummary) => Promise<boolean>;
+  onChanged: (cb: (snapshot: DesktopNotificationCompactSnapshot) => void) => () => void;
+  getLogs: (query: DesktopProcessLogFilter) => Promise<DesktopProcessLogPage>;
+  onLogs: (cb: (batch: DesktopProcessLogBatch) => void) => () => void;
+  snapshotAndSubscribeLogs: (
+    query: DesktopProcessLogFilter,
+    cb: (batch: DesktopProcessLogBatch) => void
+  ) => Promise<{
+    snapshot: DesktopProcessLogLine[];
+    afterSequence: number;
+    unsubscribe: () => void;
+  }>;
+  clearLogs: () => Promise<boolean>;
+  emitRendererLogs: (
+    entries: Array<{
+      level: DesktopProcessLogLevel;
+      message: string;
+      metadata?: Readonly<Record<string, unknown>>;
+    }>
+  ) => void;
 }
 
 export interface DesktopWindowControls {
@@ -57,6 +212,9 @@ export interface MegleDesktopBridge {
   closeSettingsWindow?: () => Promise<boolean>;
   openPluginsWindow?: () => Promise<boolean>;
   closePluginsWindow?: () => Promise<boolean>;
+  openNotificationsWindow?: () => Promise<boolean>;
+  closeNotificationsWindow?: () => Promise<boolean>;
+  notifications?: DesktopNotificationsBridge;
   windowControls?: DesktopWindowControls;
   shell?: DesktopShellActions;
   listLibraries?: () => Promise<LibrarySummary[]>;
@@ -116,6 +274,21 @@ export async function openPluginsWindow(): Promise<boolean> {
   const opened = window.open(
     pluginsUrl,
     "megle-plugins",
+    "popup=yes,width=1040,height=720"
+  );
+  opened?.focus();
+  return opened !== null;
+}
+
+export async function openNotificationsWindow(): Promise<boolean> {
+  const desktopOpen = getDesktopBridge()?.openNotificationsWindow;
+  if (desktopOpen) return desktopOpen();
+
+  const notificationsUrl = new URL(window.location.href);
+  notificationsUrl.hash = "/notifications";
+  const opened = window.open(
+    notificationsUrl,
+    "megle-notifications",
     "popup=yes,width=1040,height=720"
   );
   opened?.focus();

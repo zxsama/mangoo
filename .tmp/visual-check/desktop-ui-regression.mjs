@@ -7,7 +7,7 @@ import process from "node:process";
 import WebSocket from "ws";
 import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-browser-window-options.mjs";
 
-const root = "D:\\Megle";
+const root = path.resolve(process.cwd());
 const visualRoot = path.join(root, ".tmp", "visual-check");
 const mediaDir = path.join(visualRoot, "media");
 const screenshotDir = path.join(visualRoot, "screenshots");
@@ -1383,6 +1383,149 @@ async function pluginsSecondaryWindowEvidence(client) {
   }
 }
 
+async function notificationsSecondaryWindowEvidence(client) {
+  const open = () =>
+    evaluate(
+      client,
+      `(async () => (await window.megleDesktop?.openNotificationsWindow?.()) ?? false)()`
+    );
+  await open();
+  const firstTarget = await waitForTarget((page) => page.url.includes("#/notifications"), 10000);
+  const notificationsClient = new CdpClient(firstTarget.webSocketDebuggerUrl);
+  await notificationsClient.ready;
+  await Promise.all([
+    notificationsClient.send("Page.enable"),
+    notificationsClient.send("Runtime.enable")
+  ]);
+
+  let reopenedClient;
+  try {
+    await waitFor(
+      notificationsClient,
+      `Boolean(document.querySelector(".notification-window"))`,
+      10000,
+      "Notification secondary window"
+    );
+    await waitFor(
+      notificationsClient,
+      `document.querySelector(".secondary-window")?.getAttribute("data-secondary-content-visible") === "true"`,
+      10000,
+      "Notification native-window reveal"
+    );
+    const screenshotPath = await screenshot(
+      notificationsClient,
+      "ui-notifications-secondary-window.png"
+    );
+    const firstTargets = await waitForTargetCount(
+      (page) => page.url.includes("#/notifications"),
+      1
+    );
+
+    await open();
+    const repeatedTargets = await waitForTargetCount(
+      (page) => page.url.includes("#/notifications"),
+      1
+    );
+    await waitFor(notificationsClient, `document.hasFocus()`, 5000, "existing Notification window focus");
+
+    const initialBounds = await evaluate(
+      notificationsClient,
+      `(async () => (await window.megleDesktop?.windowControls?.getBounds?.()) ?? null)()`
+    );
+    const requestedPosition = initialBounds
+      ? { x: initialBounds.x + 18, y: initialBounds.y + 18 }
+      : null;
+    if (requestedPosition) {
+      await evaluate(
+        notificationsClient,
+        `(async () => (await window.megleDesktop?.windowControls?.setPosition?.(${requestedPosition.x}, ${requestedPosition.y})) ?? false)()`
+      );
+      await delay(250);
+    }
+    const movedBounds = await evaluate(
+      notificationsClient,
+      `(async () => (await window.megleDesktop?.windowControls?.getBounds?.()) ?? null)()`
+    );
+    const windowEvidence = await evaluate(
+      notificationsClient,
+      `(() => {
+        const owner = document.querySelector(".secondary-window");
+        const backdrop = owner?.querySelector(":scope > .liquid-glass-backdrop");
+        const root = getComputedStyle(document.documentElement);
+        return {
+          role: window.megleDesktop?.windowRole,
+          title: document.querySelector(".secondary-window-title")?.textContent?.trim(),
+          closePresent: Boolean(document.querySelector(".secondary-window-close")),
+          rendererReady: owner?.getAttribute("data-secondary-renderer-ready"),
+          windowVisible: owner?.getAttribute("data-secondary-window-visible"),
+          contentVisible: owner?.getAttribute("data-secondary-content-visible"),
+          nativeWarmupStartedAt: owner?.getAttribute("data-secondary-native-warmup-started-at"),
+          nativeWindowRevealedAt: owner?.getAttribute("data-secondary-native-window-revealed-at"),
+          contentVisibleAt: owner?.getAttribute("data-secondary-content-visible-at"),
+          revealFallback: owner?.getAttribute("data-secondary-reveal-fallback"),
+          material: {
+            background: backdrop ? getComputedStyle(backdrop).backgroundColor : null,
+            backdropFilter: backdrop ? getComputedStyle(backdrop).backdropFilter : null,
+            sideBlur: root.getPropertyValue("--glass-side-blur").trim(),
+            sideFill: root.getPropertyValue("--glass-side-fill").trim(),
+            sideSaturation: root.getPropertyValue("--glass-side-saturation").trim(),
+            sideStroke: root.getPropertyValue("--glass-side-stroke").trim()
+          }
+        };
+      })()`
+    );
+
+    fireRendererCommand(
+      notificationsClient,
+      `void window.megleDesktop?.closeNotificationsWindow?.()`
+    );
+    await waitForTargetCount((page) => page.url.includes("#/notifications"), 0, 10000);
+    notificationsClient.close();
+
+    await open();
+    const reopenedTarget = await waitForTarget(
+      (page) => page.url.includes("#/notifications"),
+      10000
+    );
+    reopenedClient = new CdpClient(reopenedTarget.webSocketDebuggerUrl);
+    await reopenedClient.ready;
+    await reopenedClient.send("Runtime.enable");
+    await waitFor(
+      reopenedClient,
+      `document.querySelector(".secondary-window")?.getAttribute("data-secondary-content-visible") === "true"`,
+      10000,
+      "reopened Notification native-window reveal"
+    );
+    const restoredBounds = await evaluate(
+      reopenedClient,
+      `(async () => (await window.megleDesktop?.windowControls?.getBounds?.()) ?? null)()`
+    );
+    fireRendererCommand(
+      reopenedClient,
+      `void window.megleDesktop?.closeNotificationsWindow?.()`
+    );
+    await waitForTargetCount((page) => page.url.includes("#/notifications"), 0, 10000);
+
+    return {
+      screenshotPath,
+      firstTargetId: firstTargets[0]?.id ?? null,
+      repeatedTargetId: repeatedTargets[0]?.id ?? null,
+      initialBounds,
+      requestedPosition,
+      movedBounds,
+      restoredBounds,
+      window: windowEvidence
+    };
+  } finally {
+    fireRendererCommand(
+      reopenedClient ?? notificationsClient,
+      `void window.megleDesktop?.closeNotificationsWindow?.()`
+    );
+    reopenedClient?.close();
+    notificationsClient.close();
+  }
+}
+
 async function imagePointRatioAt(client, point) {
   return evaluate(
     client,
@@ -2139,6 +2282,7 @@ try {
   const searchNoDrag = await searchNoDragEvidence(client);
   const settingsInterfaceStyle = await settingsInterfaceStyleEvidence(client);
   const pluginsSecondaryWindow = await pluginsSecondaryWindowEvidence(client);
+  const notificationsSecondaryWindow = await notificationsSecondaryWindowEvidence(client);
   const compactPopovers = await compactPopoverDismissalEvidence(client);
 
   await selectMediaByName(client, "portrait-sample");
@@ -2220,6 +2364,7 @@ try {
       integratedTitlebarMain,
       settingsInterfaceStyle: settingsInterfaceStyle.screenshotPath,
       pluginsSecondaryWindow: pluginsSecondaryWindow.screenshotPath,
+      notificationsSecondaryWindow: notificationsSecondaryWindow.screenshotPath,
       selectedPortraitRightPreview,
       centralLandscapeFit,
       centralLandscapeActual,
@@ -2244,6 +2389,7 @@ try {
       searchNoDrag,
       settingsInterfaceStyle: settingsInterfaceStyle.evidence,
       pluginsSecondaryWindow,
+      notificationsSecondaryWindow,
       compactPopovers,
       inspectorPortrait,
       inspectorPreviewApiResponsesBeforeCentralOpen,
@@ -2547,6 +2693,30 @@ try {
       JSON.stringify(pluginsWindowEvidence.settingsWindow?.material)
   ) {
     hardFailures.push("Plugins window single-instance/coexistence/renderer-role contract failed");
+  }
+  const notificationsWindowEvidence = summary.evidence.notificationsSecondaryWindow;
+  const notificationPositionPersisted =
+    notificationsWindowEvidence.movedBounds &&
+    notificationsWindowEvidence.restoredBounds &&
+    Math.abs(
+      notificationsWindowEvidence.movedBounds.x - notificationsWindowEvidence.restoredBounds.x
+    ) <= 2 &&
+    Math.abs(
+      notificationsWindowEvidence.movedBounds.y - notificationsWindowEvidence.restoredBounds.y
+    ) <= 2;
+  if (
+    notificationsWindowEvidence.firstTargetId !== notificationsWindowEvidence.repeatedTargetId ||
+    notificationsWindowEvidence.window?.role !== "notifications" ||
+    notificationsWindowEvidence.window?.title !== "通知中心" ||
+    !notificationsWindowEvidence.window?.closePresent ||
+    notificationsWindowEvidence.window?.rendererReady !== "true" ||
+    notificationsWindowEvidence.window?.windowVisible !== "true" ||
+    !stagedSecondaryReveal(notificationsWindowEvidence.window) ||
+    JSON.stringify(notificationsWindowEvidence.window?.material) !==
+      JSON.stringify(pluginsWindowEvidence.pluginWindow?.material) ||
+    !notificationPositionPersisted
+  ) {
+    hardFailures.push("Notification window single-instance/position/material/reveal contract failed");
   }
   if (
     !summary.evidence.settingsInterfaceStyle.present ||

@@ -10,6 +10,46 @@ function readArg(prefix) {
   return arg ? arg.slice(prefix.length) : undefined;
 }
 
+function subscribe(channel, cb) {
+  const listener = (_event, value) => cb(value);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
+async function snapshotAndSubscribeLogs(query, cb) {
+  const queued = [];
+  let ready = false;
+  let active = true;
+  const listener = (_event, batch) => {
+    if (!active) return;
+    if (!ready) {
+      queued.push(batch);
+      return;
+    }
+    cb(batch);
+  };
+  ipcRenderer.on(NOTIFICATION_IPC_CHANNELS.logsChanged, listener);
+  try {
+    const initial = await ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsSubscribe, query);
+    ready = true;
+    for (const batch of queued.splice(0)) cb(batch);
+    return {
+      ...initial,
+      unsubscribe: () => {
+        if (!active) return;
+        active = false;
+        ipcRenderer.removeListener(NOTIFICATION_IPC_CHANNELS.logsChanged, listener);
+        ipcRenderer.send(NOTIFICATION_IPC_CHANNELS.logsUnsubscribe);
+      }
+    };
+  } catch (error) {
+    active = false;
+    ipcRenderer.removeListener(NOTIFICATION_IPC_CHANNELS.logsChanged, listener);
+    ipcRenderer.send(NOTIFICATION_IPC_CHANNELS.logsUnsubscribe);
+    throw error;
+  }
+}
+
 const visualHarnessEnabled = readArg("--megle-visual-harness=") === "1";
 
 contextBridge.exposeInMainWorld("megleDesktop", {
@@ -25,6 +65,8 @@ contextBridge.exposeInMainWorld("megleDesktop", {
   closeSettingsWindow: () => ipcRenderer.invoke("megle:close-settings-window"),
   openPluginsWindow: () => ipcRenderer.invoke("megle:open-plugins-window"),
   closePluginsWindow: () => ipcRenderer.invoke("megle:close-plugins-window"),
+  openNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.openWindow),
+  closeNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.closeWindow),
   notifySecondaryWindowReady: (role) =>
     ipcRenderer.invoke("megle:secondary-window-ready", role),
   windowControls: {
@@ -58,6 +100,23 @@ contextBridge.exposeInMainWorld("megleDesktop", {
     const listener = (_event, phase) => cb(phase);
     ipcRenderer.on("megle:library-load-phase", listener);
     return () => ipcRenderer.removeListener("megle:library-load-phase", listener);
+  },
+  notifications: {
+    getCompactSnapshot: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.compact),
+    listHistory: (query) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.history, query),
+    cancel: (libraryId, operationId) =>
+      ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.cancel, libraryId, operationId),
+    retry: (libraryId, operationId) =>
+      ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.retry, libraryId, operationId),
+    reportError: (input) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.reportError, input),
+    publishThumbnailSummary: (input) =>
+      ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.thumbnailSummary, input),
+    onChanged: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.changed, cb),
+    getLogs: (query) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsPage, query),
+    onLogs: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.logsChanged, cb),
+    snapshotAndSubscribeLogs,
+    clearLogs: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsClear),
+    emitRendererLogs: (entries) => ipcRenderer.send(NOTIFICATION_IPC_CHANNELS.rendererLogs, entries)
   },
   ...(visualHarnessEnabled
     ? {

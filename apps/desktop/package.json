@@ -8,7 +8,7 @@
     "dev": "npm --prefix ../.. run dev",
     "test": "node --no-warnings --import ./tests/filter-sqlite-experimental-warning.mjs --import ./tests/register-source-imports.mjs --experimental-strip-types --test tests/*.test.mts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "build": "tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('src/preload.cjs', 'dist/preload.cjs')\""
+    "build": "tsc -p tsconfig.json && node -e \"const fs=require('fs'); const channels=fs.readFileSync('src/notification-ipc-channels.cjs','utf8'); const preload=fs.readFileSync('src/preload.cjs','utf8'); fs.writeFileSync('dist/preload.cjs', channels+'\\n'+preload); fs.copyFileSync('src/notification-ipc-channels.cjs','dist/notification-ipc-channels.cjs')\""
   },
   "dependencies": {
     "@megle/core-client": "*",

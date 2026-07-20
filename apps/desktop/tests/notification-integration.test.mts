@@ -1,0 +1,307 @@
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import vm from "node:vm";
+
+const ipcModuleUrl = new URL("../src/notification-ipc.ts", import.meta.url);
+const runtimeModuleUrl = new URL("../src/notification-runtime.ts", import.meta.url);
+const channelsUrl = new URL("../src/notification-ipc-channels.cjs", import.meta.url);
+const ipcModule = existsSync(fileURLToPath(ipcModuleUrl)) ? await import(ipcModuleUrl.href) : null;
+const runtimeModule = existsSync(fileURLToPath(runtimeModuleUrl))
+  ? await import(runtimeModuleUrl.href)
+  : null;
+const channels = existsSync(fileURLToPath(channelsUrl))
+  ? createRequire(import.meta.url)(fileURLToPath(channelsUrl))
+  : null;
+
+test("notification IPC permissions isolate privileged history, action and log access", () => {
+  assert.ok(ipcModule, "notification IPC boundary module must exist");
+  assert.ok(channels, "notification IPC channels must be centralized");
+  const canAccess = ipcModule.canAccessNotificationIpc;
+
+  assert.equal(canAccess("main", channels.compact), true);
+  assert.equal(canAccess("notifications", channels.compact), true);
+  assert.equal(canAccess("settings", channels.compact), false);
+  assert.equal(canAccess("notifications", channels.history), true);
+  assert.equal(canAccess("main", channels.history), false);
+  assert.equal(canAccess("notifications", channels.cancel), true);
+  assert.equal(canAccess("plugins", channels.cancel), false);
+  assert.equal(canAccess("notifications", channels.logsPage), true);
+  assert.equal(canAccess("main", channels.logsPage), false);
+  assert.equal(canAccess("main", channels.thumbnailSummary), true);
+  assert.equal(canAccess("notifications", channels.thumbnailSummary), false);
+  assert.equal(canAccess("plugins", channels.rendererLogs), true);
+  assert.equal(canAccess(null, channels.rendererLogs), false);
+});
+
+test("notification IPC validators reject malformed or unbounded renderer payloads", () => {
+  assert.ok(ipcModule);
+
+  assert.throws(() => ipcModule.parseNotificationHistoryQuery({ limit: 201 }), /limit/i);
+  assert.throws(() => ipcModule.parseNotificationHistoryQuery({ search: "x".repeat(501) }), /search/i);
+  assert.throws(() => ipcModule.parseNotificationAction("", "task:1"), /library/i);
+  assert.throws(() => ipcModule.parseNotificationAction("library", "x".repeat(257)), /operation/i);
+  assert.throws(
+    () =>
+      ipcModule.parseRendererErrorReport({
+        libraryId: "library",
+        libraryName: "Library",
+        source: "view",
+        code: "E_VIEW",
+        target: "grid",
+        title: "Failure",
+        message: "x".repeat(4_001),
+        detail: null
+      }),
+    /message/i
+  );
+  assert.throws(
+    () =>
+      ipcModule.parseThumbnailCacheSummary({
+        libraryId: "library",
+        libraryName: "Library",
+        observedAt: 1,
+        cachedCount: -1,
+        totalCandidateCount: 0,
+        missingCount: 0,
+        staleCount: 0,
+        failedCount: 0,
+        pendingCount: 0,
+        activeBulkTaskCount: 0,
+        totalCacheBytes: null,
+        completionPercent: null
+      }),
+    /cachedCount/i
+  );
+  assert.throws(() => ipcModule.parseProcessLogFilter({ limit: 0 }), /limit/i);
+  assert.throws(() => ipcModule.parseRendererLogEntries(new Array(101).fill({ level: "info", message: "x" })), /100/);
+
+  assert.deepEqual(ipcModule.parseNotificationHistoryQuery({ limit: 25, offset: 5 }), {
+    limit: 25,
+    offset: 5
+  });
+  assert.deepEqual(ipcModule.parseNotificationAction("library", "task:1"), {
+    libraryId: "library",
+    operationId: "task:1"
+  });
+});
+
+test("notification snapshot broadcasts coalesce to the newest bounded update", () => {
+  assert.ok(ipcModule);
+  const scheduled: Array<() => void> = [];
+  const delivered: number[] = [];
+  const queue = new ipcModule.LatestValueBroadcastQueue<number>(
+    (value: number) => delivered.push(value),
+    (flush: () => void) => scheduled.push(flush)
+  );
+
+  queue.publish(1);
+  queue.publish(2);
+  queue.publish(3);
+  assert.equal(scheduled.length, 1);
+  scheduled.shift()?.();
+  assert.deepEqual(delivered, [3]);
+
+  queue.close();
+  queue.publish(4);
+  assert.equal(scheduled.length, 0);
+});
+
+test("process log subscriptions replace duplicates, preserve gap batches and clean up on destroy", () => {
+  assert.ok(ipcModule);
+  let subscriber: ((batch: unknown) => void) | null = null;
+  let unsubscribeCount = 0;
+  const buffer = {
+    snapshotAndSubscribe(next: (batch: unknown) => void) {
+      subscriber = next;
+      return {
+        snapshot: [{ sequence: 4 }],
+        afterSequence: 4,
+        unsubscribe: () => {
+          unsubscribeCount += 1;
+        }
+      };
+    }
+  };
+  class Target extends EventEmitter {
+    readonly id = 17;
+    destroyed = false;
+    sent: Array<[string, unknown]> = [];
+    isDestroyed() {
+      return this.destroyed;
+    }
+    send(channel: string, payload: unknown) {
+      this.sent.push([channel, payload]);
+    }
+  }
+  const target = new Target();
+  const registry = new ipcModule.ProcessLogIpcSubscriptions(buffer, "logs-changed");
+
+  assert.deepEqual(registry.snapshotAndSubscribe(target, {}), {
+    snapshot: [{ sequence: 4 }],
+    afterSequence: 4
+  });
+  registry.snapshotAndSubscribe(target, {});
+  assert.equal(unsubscribeCount, 1, "a sender may own only one live log subscription");
+
+  subscriber?.({ lines: [], afterSequence: 9, droppedBeforeSequence: 6 });
+  assert.deepEqual(target.sent, [
+    ["logs-changed", { lines: [], afterSequence: 9, droppedBeforeSequence: 6 }]
+  ]);
+
+  target.destroyed = true;
+  target.emit("destroyed");
+  assert.equal(unsubscribeCount, 2);
+  assert.equal(registry.size, 0);
+});
+
+test("notification runtime starts once, switches libraries in order and closes once", async () => {
+  assert.ok(runtimeModule, "notification lifecycle coordinator must exist");
+  let starts = 0;
+  let closes = 0;
+  const attached: string[] = [];
+  const service = {
+    async attachLibrary(library: { id: string }) {
+      attached.push(library.id);
+    },
+    async detachLibrary() {
+      attached.push("detached");
+    },
+    async close() {
+      closes += 1;
+    }
+  };
+  const runtime = new runtimeModule.NotificationRuntime(async () => {
+    starts += 1;
+    await Promise.resolve();
+    return service;
+  });
+
+  const [first, second] = await Promise.all([runtime.start(), runtime.start()]);
+  assert.equal(first, service);
+  assert.equal(second, service);
+  assert.equal(starts, 1);
+
+  await runtime.attachLibrary({ id: "a", name: "A" }, { baseUrl: "http://a", sessionToken: "t" });
+  await runtime.attachLibrary({ id: "b", name: "B" }, { baseUrl: "http://b", sessionToken: "t" });
+  await runtime.detachLibrary();
+  assert.deepEqual(attached, ["a", "b", "detached"]);
+
+  await Promise.all([runtime.close(), runtime.close()]);
+  assert.equal(closes, 1);
+  await assert.rejects(() => runtime.start(), /closed/i);
+});
+
+test("Task 10 source contract exposes one notifications window and typed preload bridge", () => {
+  const root = fileURLToPath(new URL("../../..", import.meta.url));
+  const read = (relativePath: string) => readFileSync(`${root}/${relativePath}`, "utf8");
+  const main = read("apps/desktop/src/main.ts");
+  const preload = read("apps/desktop/src/preload.cjs");
+  const desktop = read("apps/web/src/core/desktop.ts");
+  const webMain = read("apps/web/src/main.tsx");
+  const windowPath = `${root}/apps/web/src/features/notifications/NotificationWindow.tsx`;
+
+  assert.match(main, /type SecondaryWindowRole = "settings" \| "plugins" \| "notifications"/);
+  assert.match(main, /route: "#\/notifications"/);
+  assert.match(main, /notifications:\s*{[\s\S]*width: 1040,[\s\S]*height: 720,[\s\S]*minWidth: 820,[\s\S]*minHeight: 560/);
+  assert.match(main, /backgroundMaterial: "acrylic"/);
+  assert.match(main, /resolveSecondaryWindowPosition\(role, parent, config\)/);
+  assert.match(main, /const existing = secondaryWindows\[role\][\s\S]*existing\.focus\(\)[\s\S]*return/);
+  assert.match(main, /rememberSecondaryWindowPosition\(role, window\)/);
+  assert.match(main, /\["settings", "plugins", "notifications"\] as const/);
+  assert.match(main, /notificationDatabasePath\(userDataDir\(\)\)/);
+  assert.match(main, /await closeNotificationRuntime\(\)[\s\S]*await stopDesktopCoreProcesses\(\)/);
+  assert.match(preload, /notifications:\s*{/);
+  assert.match(preload, /return \(\) => ipcRenderer\.removeListener/);
+  assert.match(desktop, /interface DesktopNotificationsBridge/);
+  assert.match(desktop, /windowRole\?: "main" \| DesktopSecondaryWindowRole/);
+  assert.match(webMain, /windowRole === "notifications"/);
+  assert.match(webMain, /import\("\.\/features\/notifications\/NotificationWindow"\)/);
+  assert.equal(existsSync(windowPath), true);
+});
+
+test("preload bridge removes exact listeners and buffers log batches until snapshot readiness", async () => {
+  assert.ok(channels);
+  const preloadPath = fileURLToPath(new URL("../src/preload.cjs", import.meta.url));
+  const source = `${readFileSync(fileURLToPath(channelsUrl), "utf8")}\n${readFileSync(preloadPath, "utf8")}`;
+  const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
+  const removed: Array<[string, (...args: unknown[]) => void]> = [];
+  const sent: Array<[string, ...unknown[]]> = [];
+  let exposed: Record<string, unknown> | null = null;
+  let resolveLogSnapshot: ((value: unknown) => void) | null = null;
+  const ipcRenderer = {
+    invoke(channel: string) {
+      if (channel === channels.logsSubscribe) {
+        return new Promise((resolve) => {
+          resolveLogSnapshot = resolve;
+        });
+      }
+      return Promise.resolve(true);
+    },
+    on(channel: string, listener: (...args: unknown[]) => void) {
+      const bucket = listeners.get(channel) ?? new Set();
+      bucket.add(listener);
+      listeners.set(channel, bucket);
+    },
+    removeListener(channel: string, listener: (...args: unknown[]) => void) {
+      removed.push([channel, listener]);
+      listeners.get(channel)?.delete(listener);
+    },
+    send(channel: string, ...args: unknown[]) {
+      sent.push([channel, ...args]);
+    }
+  };
+  vm.runInNewContext(source, {
+    module: { exports: {} },
+    process: { argv: [] },
+    require(id: string) {
+      if (id === "electron") {
+        return {
+          contextBridge: {
+            exposeInMainWorld(_name: string, value: Record<string, unknown>) {
+              exposed = value;
+            }
+          },
+          ipcRenderer
+        };
+      }
+      throw new Error(`unexpected preload require: ${id}`);
+    }
+  });
+
+  assert.ok(exposed);
+  const bridge = exposed.notifications as {
+    onChanged(cb: (value: unknown) => void): () => void;
+    snapshotAndSubscribeLogs(
+      query: unknown,
+      cb: (value: unknown) => void
+    ): Promise<{ snapshot: unknown[]; afterSequence: number; unsubscribe: () => void }>;
+  };
+  assert.equal(typeof bridge.onChanged, "function");
+  assert.equal(typeof bridge.snapshotAndSubscribeLogs, "function");
+
+  const changed = () => undefined;
+  const stopChanged = bridge.onChanged(changed);
+  const changedListener = [...(listeners.get(channels.changed) ?? [])][0];
+  assert.ok(changedListener);
+  stopChanged();
+  assert.deepEqual(removed.at(-1), [channels.changed, changedListener]);
+
+  const delivered: unknown[] = [];
+  const pending = bridge.snapshotAndSubscribeLogs({}, (batch) => delivered.push(batch));
+  const logListener = [...(listeners.get(channels.logsChanged) ?? [])][0];
+  assert.ok(logListener);
+  const earlyBatch = { lines: [], afterSequence: 7, droppedBeforeSequence: 4 };
+  logListener({}, earlyBatch);
+  assert.deepEqual(delivered, []);
+  resolveLogSnapshot?.({ snapshot: [{ sequence: 6 }], afterSequence: 6 });
+  const subscription = await pending;
+  assert.deepEqual(delivered, [earlyBatch]);
+  assert.deepEqual(subscription.snapshot, [{ sequence: 6 }]);
+  subscription.unsubscribe();
+  assert.deepEqual(removed.at(-1), [channels.logsChanged, logListener]);
+  assert.equal(sent.at(-1)?.[0], channels.logsUnsubscribe);
+});

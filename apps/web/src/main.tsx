@@ -16,8 +16,18 @@ const isSettingsWindow =
   window.location.hash.startsWith("#/settings") || windowRole === "settings";
 const isPluginsWindow =
   window.location.hash.startsWith("#/plugins") || windowRole === "plugins";
+const isNotificationsWindow =
+  window.location.hash.startsWith("#/notifications") || windowRole === "notifications";
 
-if (isPluginsWindow) {
+if (isNotificationsWindow) {
+  void import("./features/notifications/NotificationWindow").then(({ NotificationWindow }) => {
+    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+      <React.StrictMode>
+        <NotificationWindow />
+      </React.StrictMode>
+    );
+  });
+} else if (isPluginsWindow) {
   void import("./features/plugins/PluginsWindow").then(({ PluginsWindow }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>
@@ -49,6 +59,7 @@ function preloadSecondaryWindowRenderers() {
   const preload = () => {
     void import("./features/plugins/PluginsWindow");
     void import("./features/settings/SettingsWindow");
+    void import("./features/notifications/NotificationWindow");
   };
   if (typeof window.requestIdleCallback === "function") {
     window.requestIdleCallback(preload, { timeout: 1200 });
