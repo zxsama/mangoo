@@ -1,8 +1,6 @@
-import { LiquidGlassSurface } from "../design/liquid-glass";
 import { ContextMenu, type ContextMenuItem } from "../features/file-ops/ContextMenu";
 import { DeleteConfirm } from "../features/file-ops/DeleteConfirm";
 import { MoveDialog } from "../features/file-ops/MoveDialog";
-import { RecentOpsPanel } from "../features/file-ops/RecentOpsPanel";
 import { RenameDialog } from "../features/file-ops/RenameDialog";
 import {
   collectFileIds,
@@ -11,9 +9,8 @@ import {
   targetSampleName,
   type FileOpsController
 } from "../features/file-ops/useFileOps";
-import { TaskOverlay } from "../features/tasks/TaskOverlay";
-import { TaskPanel } from "../features/tasks/TaskPanel";
-import { TaskCenter } from "../features/tasks/TaskCenter";
+import { NotificationPopover } from "../features/notifications/NotificationPopover";
+import type { CompactNotificationModel } from "../features/notifications/notificationModel";
 import type { LibraryState } from "../core/useLibraryData";
 
 export interface ShellContextMenuState {
@@ -26,30 +23,20 @@ interface ShellOverlayHostProps {
   contextMenu: ShellContextMenuState | null;
   fileOps: FileOpsController;
   library: LibraryState;
-  recentOpsOpen: boolean;
-  taskPaletteOpen: boolean;
-  taskCenterOpen: boolean;
+  notificationModel: CompactNotificationModel;
+  notificationsOpen: boolean;
   onCloseContextMenu: () => void;
-  onCloseRecentOps: () => void;
-  onCloseTaskPalette: () => void;
-  onCloseTaskCenter: () => void;
-  onOpenTaskCenter: () => void;
-  onRefreshRecentOps: () => void;
+  onOpenNotificationCenter: () => void;
 }
 
 export function ShellOverlayHost({
   contextMenu,
   fileOps,
   library,
-  recentOpsOpen,
-  taskPaletteOpen,
-  taskCenterOpen,
+  notificationModel,
+  notificationsOpen,
   onCloseContextMenu,
-  onCloseRecentOps,
-  onCloseTaskPalette,
-  onCloseTaskCenter,
-  onOpenTaskCenter,
-  onRefreshRecentOps
+  onOpenNotificationCenter
 }: ShellOverlayHostProps) {
   const renameTarget = fileOps.rename.target;
   const moveTarget = fileOps.move.target;
@@ -57,44 +44,11 @@ export function ShellOverlayHost({
 
   return (
     <>
-      <TaskOverlay mode="compact" onClose={onCloseTaskPalette} open={taskPaletteOpen}>
-        <TaskPanel
-          onClose={onCloseTaskPalette}
-          onOpenTaskCenter={onOpenTaskCenter}
-          scanActive={library.scanActive}
-          tasks={library.tasks}
+      {notificationsOpen ? (
+        <NotificationPopover
+          model={notificationModel}
+          onOpenCenter={onOpenNotificationCenter}
         />
-      </TaskOverlay>
-
-      <TaskOverlay mode="center" onClose={onCloseTaskCenter} open={taskCenterOpen}>
-        <TaskCenter
-          busyTaskIds={library.busyTaskIds}
-          onCancel={library.cancelTask}
-          onClose={onCloseTaskCenter}
-          onRefresh={() => void library.refreshTasks()}
-          onRetry={library.retryTask}
-          scanActive={library.scanActive}
-          tasks={library.tasks}
-        />
-      </TaskOverlay>
-
-      {recentOpsOpen ? (
-        <LiquidGlassSurface
-          as="div"
-          className="floating-popover recent-ops-drawer popup-surface"
-          data-compact-popover="recent"
-          data-compact-popover-root="recent"
-          interactive
-          scrollable
-          tone="elevated"
-        >
-          <RecentOpsPanel
-            loading={library.recentOpsLoading}
-            onDismiss={onCloseRecentOps}
-            onRefresh={onRefreshRecentOps}
-            ops={library.recentOps}
-          />
-        </LiquidGlassSurface>
       ) : null}
 
       {contextMenu ? (

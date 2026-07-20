@@ -1060,14 +1060,42 @@ async function compactPopoverDismissalEvidence(client) {
   await pressKey(client, "Escape", "Escape", 27);
   await waitForCompactPopoverState(client, null).catch(() => undefined);
 
-  for (const name of ["tasks", "recent", "filter", "sort"]) {
+  for (const name of ["notifications", "filter", "sort"]) {
     await clickSelector(client, `[data-compact-popover-trigger="${name}"]`);
     await waitForCompactPopoverState(client, name);
+    const screenshotPath =
+      name === "notifications"
+        ? await screenshot(client, "ui-notification-compact-popover.png")
+        : null;
     steps.push({
       action: `open-${name}`,
       expected: name,
+      screenshotPath,
       evidence: await evaluate(client, compactPopoverEvidenceExpression())
     });
+    if (name === "notifications") {
+      await clickSelector(client, ".notification-open-center");
+      await waitForCompactPopoverState(client, null);
+      await waitForTargetCount((page) => page.url.includes("#/notifications"), 1, 10000);
+      steps.push({
+        action: "open-full-center-closes-notifications",
+        expected: null,
+        evidence: await evaluate(client, compactPopoverEvidenceExpression())
+      });
+      const notificationTarget = await waitForTarget(
+        (page) => page.url.includes("#/notifications"),
+        10000
+      );
+      const notificationClient = new CdpClient(notificationTarget.webSocketDebuggerUrl);
+      await notificationClient.ready;
+      await notificationClient.send("Runtime.enable");
+      await evaluate(
+        notificationClient,
+        `(async () => (await window.megleDesktop?.closeNotificationsWindow?.()) ?? false)()`
+      );
+      notificationClient.close();
+      await waitForTargetCount((page) => page.url.includes("#/notifications"), 0, 10000);
+    }
   }
 
   await pressKey(client, "Escape", "Escape", 27);
@@ -1078,18 +1106,18 @@ async function compactPopoverDismissalEvidence(client) {
     evidence: await evaluate(client, compactPopoverEvidenceExpression())
   });
 
-  await clickSelector(client, `[data-compact-popover-trigger="tasks"]`);
-  await waitForCompactPopoverState(client, "tasks");
+  await clickSelector(client, `[data-compact-popover-trigger="notifications"]`);
+  await waitForCompactPopoverState(client, "notifications");
   steps.push({
-    action: "open-tasks-before-workspace-click",
-    expected: "tasks",
+    action: "open-notifications-before-workspace-click",
+    expected: "notifications",
     evidence: await evaluate(client, compactPopoverEvidenceExpression())
   });
 
   await clickSelector(client, ".grid-surface", 0.5, 0.5);
   await waitForCompactPopoverState(client, null);
   steps.push({
-    action: "workspace-click-closes-tasks",
+    action: "workspace-click-closes-notifications",
     expected: null,
     evidence: await evaluate(client, compactPopoverEvidenceExpression())
   });
@@ -1100,8 +1128,8 @@ async function compactPopoverDismissalEvidence(client) {
 async function glassMaterialEvidence(client) {
   await pressKey(client, "Escape", "Escape", 27);
   await waitForCompactPopoverState(client, null).catch(() => undefined);
-  await clickSelector(client, `[data-compact-popover-trigger="tasks"]`);
-  await waitForCompactPopoverState(client, "tasks");
+  await clickSelector(client, `[data-compact-popover-trigger="notifications"]`);
+  await waitForCompactPopoverState(client, "notifications");
   const evidence = await evaluate(client, glassMaterialEvidenceExpression());
   await pressKey(client, "Escape", "Escape", 27);
   await waitForCompactPopoverState(client, null);
@@ -1990,11 +2018,20 @@ function titlebarAllButtonsEvidenceExpression() {
 
 function compactPopoverEvidenceExpression() {
   return `(() => {
+    const notificationButtons = [...document.querySelectorAll('[data-titlebar-control="notifications"]')];
+    const legacyButtons = [...document.querySelectorAll('[data-titlebar-control="tasks-palette"], [data-titlebar-control="recent-operations"]')];
     const roots = [...document.querySelectorAll("[data-compact-popover-root]")].map((element) => {
       const style = getComputedStyle(element);
       const backdrop = element.querySelector(".liquid-glass-backdrop");
       const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
       const rect = element.getBoundingClientRect();
+      const activeRows = [...element.querySelectorAll("[data-notification-active-operation]")];
+      const contentSections = [
+        ["active", element.querySelector(".notification-active-list")],
+        ["thumbnail", element.querySelector(".notification-thumbnail-summary")],
+        ["results", element.querySelector(".notification-result-list")],
+        ["center", element.querySelector(".notification-open-center")]
+      ].filter(([, node]) => Boolean(node));
       return {
         name: element.getAttribute("data-compact-popover-root"),
         className: element.className?.toString?.() ?? null,
@@ -2006,14 +2043,32 @@ function compactPopoverEvidenceExpression() {
         webkitBackdropFilter: backdropStyle?.webkitBackdropFilter ?? null,
         boxShadow: style.boxShadow,
         border: style.border,
-        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, top: rect.top, right: rect.right, bottom: rect.bottom, left: rect.left }
+        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, top: rect.top, right: rect.right, bottom: rect.bottom, left: rect.left },
+        notification: element.getAttribute("data-compact-popover-root") === "notifications"
+          ? {
+              activeCount: activeRows.length,
+              activeProgressCount: activeRows.filter((row) => row.querySelector(".notification-progress-track")).length,
+              thumbnailCount: element.querySelectorAll(".notification-thumbnail-summary").length,
+              resultCount: element.querySelectorAll("[data-notification-result]").length,
+              actionCount: element.querySelectorAll("[data-notification-action], .task-action, [data-action='cancel'], [data-action='retry']").length,
+              fullCenterCount: element.querySelectorAll(".notification-open-center").length,
+              contentOrder: contentSections.map(([name, node]) => ({ name, top: node.getBoundingClientRect().top })),
+              degraded: Boolean(element.querySelector(".notification-popover-degraded")),
+              empty: Boolean(element.querySelector(".notification-popover-empty"))
+            }
+          : null
       };
     });
     return {
       count: roots.length,
       names: roots.map((root) => root.name),
       roots,
-      taskCenterOpen: Boolean(document.querySelector(".task-center-overlay"))
+      titlebar: {
+        notificationButtonCount: notificationButtons.length,
+        legacyButtonCount: legacyButtons.length,
+        visibleText: notificationButtons.map((button) => button.textContent?.trim() ?? "")
+      },
+      viewport: { width: window.innerWidth, height: window.innerHeight }
     };
   })()`;
 }
@@ -2827,6 +2882,44 @@ try {
       if (!root.floating || !effectiveBlurFilter(root.backdropFilter)) {
         hardFailures.push(`${root.name} compact popover is not floating glass material`);
       }
+      if (root.notification) {
+        if (root.notification.activeProgressCount !== root.notification.activeCount) {
+          hardFailures.push("notification compact active rows are missing progress tracks");
+        }
+        if (root.notification.thumbnailCount > 1) {
+          hardFailures.push("notification compact rendered more than one thumbnail aggregate");
+        }
+        if (root.notification.resultCount > 3) {
+          hardFailures.push("notification compact rendered more than three important results");
+        }
+        if (root.notification.actionCount !== 0) {
+          hardFailures.push("notification compact exposed cancel/retry actions");
+        }
+        if (root.notification.fullCenterCount !== 1) {
+          hardFailures.push("notification compact is missing the full-center action");
+        }
+        const tops = root.notification.contentOrder.map((item) => item.top);
+        if (tops.some((top, index) => index > 0 && top < tops[index - 1])) {
+          hardFailures.push("notification compact content sections are out of order");
+        }
+        if (
+          root.rect.left < 0 ||
+          root.rect.top < 0 ||
+          root.rect.right > step.evidence.viewport.width ||
+          root.rect.bottom > step.evidence.viewport.height
+        ) {
+          hardFailures.push("notification compact popover overflows the visual harness viewport");
+        }
+      }
+    }
+    if (step.evidence.titlebar.notificationButtonCount !== 1) {
+      hardFailures.push("titlebar does not expose exactly one notification button");
+    }
+    if (step.evidence.titlebar.legacyButtonCount !== 0) {
+      hardFailures.push("legacy Tasks/Recent titlebar buttons are still present");
+    }
+    if (step.evidence.titlebar.visibleText.some((text) => /\d/.test(text))) {
+      hardFailures.push("notification titlebar button exposes a numeric badge");
     }
   }
   if (inspectorPortrait.centralOpen) hardFailures.push("central preview open during right preview capture");

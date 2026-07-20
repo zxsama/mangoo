@@ -29,6 +29,7 @@ import {
   getDesktopShellActions,
   listLibraries,
   notifyDesktopShellReady,
+  openNotificationsWindow,
   openPluginsWindow,
   openPath,
   revealPath,
@@ -68,6 +69,7 @@ import {
   type LibraryGridPreferences
 } from "../features/media-grid/gridPreferences";
 import { OnboardingHero } from "../features/onboarding/OnboardingHero";
+import { useNotifications } from "../features/notifications/useNotifications";
 import {
   readStoredPreviewPreferences,
   storePreviewPreferences,
@@ -77,7 +79,7 @@ import { subscribePreference } from "../core/preferenceSync";
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
 
-type CompactPopover = "tasks" | "recent" | "filter" | "sort" | null;
+type CompactPopover = "notifications" | "filter" | "sort" | null;
 type PreviewViewState = { mode: "fit-long-edge" | "actual"; scale: number };
 type PreviewViewCommands = { reset: () => void; toggleActualSize: () => void };
 
@@ -95,7 +97,8 @@ export function App() {
   const [menu, setMenu] = useState<ShellContextMenuState | null>(null);
   const [activeCompactPopover, setActiveCompactPopover] =
     useState<CompactPopover>(null);
-  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
+  const notifications = useNotifications();
+  const notificationModel = notifications.compact;
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewDisplayedMediaId, setPreviewDisplayedMediaId] = useState<number | null>(null);
   const previewNavigationLockedRef = useRef(false);
@@ -316,45 +319,38 @@ export function App() {
       setActiveCompactPopover(null);
     }
 
+    function handleWindowInactive() {
+      setActiveCompactPopover(null);
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState !== "visible") handleWindowInactive();
+    }
+
     document.addEventListener("keydown", handleKeyDown);
     document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", handleWindowInactive);
+    window.addEventListener("pagehide", handleWindowInactive);
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
       document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", handleWindowInactive);
+      window.removeEventListener("pagehide", handleWindowInactive);
     };
   }, [activeCompactPopover]);
 
-  const setCompactPopover = useCallback(
-    (next: CompactPopover) => {
-      if (next === "recent") void library.loadRecentOps();
-      setActiveCompactPopover(next);
-    },
-    [library]
-  );
+  const setCompactPopover = useCallback((next: CompactPopover) => {
+    setActiveCompactPopover(next);
+  }, []);
 
   const toggleCompactPopover = useCallback(
     (next: Exclude<CompactPopover, null>) => {
-      setActiveCompactPopover((current) => {
-        const nextPopover = current === next ? null : next;
-        if (nextPopover === "recent") void library.loadRecentOps();
-        return nextPopover;
-      });
+      setActiveCompactPopover((current) => (current === next ? null : next));
     },
-    [library]
+    []
   );
-
-  const openTaskPalette = useCallback(() => {
-    setTaskCenterOpen(false);
-    setCompactPopover("tasks");
-  }, [setCompactPopover]);
-
-  const closeTaskPalette = useCallback(() => {
-    setCompactPopover(null);
-  }, [setCompactPopover]);
-
-  const closeRecentOps = useCallback(() => {
-    setCompactPopover(null);
-  }, [setCompactPopover]);
 
   const setFilterOpen = useCallback(
     (open: boolean) => {
@@ -370,34 +366,26 @@ export function App() {
     [setCompactPopover]
   );
 
-  const recentOpsOpen = activeCompactPopover === "recent";
-  const taskDrawerOpen = activeCompactPopover === "tasks";
+  const notificationsOpen = activeCompactPopover === "notifications";
   const filterMenuOpen = activeCompactPopover === "filter";
   const sortMenuOpen = activeCompactPopover === "sort";
 
-  const onToggleRecent = useCallback(() => {
-    toggleCompactPopover("recent");
+  const onToggleNotifications = useCallback(() => {
+    toggleCompactPopover("notifications");
   }, [toggleCompactPopover]);
+
+  const handleOpenNotificationCenter = useCallback(() => {
+    setActiveCompactPopover(null);
+    void openNotificationsWindow();
+  }, []);
 
   const shellRightActions = (
     <ShellRightActions
-      recentOpsOpen={recentOpsOpen}
-      scanActive={library.scanActive}
-      taskPaletteOpen={taskDrawerOpen}
-      onCloseTasks={closeTaskPalette}
-      onOpenTasks={openTaskPalette}
-      onToggleRecent={onToggleRecent}
+      notificationIndicator={notificationModel.indicator}
+      notificationsOpen={notificationsOpen}
+      onToggleNotifications={onToggleNotifications}
     />
   );
-
-  const openTaskCenter = useCallback(() => {
-    setCompactPopover(null);
-    setTaskCenterOpen(true);
-  }, [setCompactPopover]);
-
-  const closeTaskCenter = useCallback(() => {
-    setTaskCenterOpen(false);
-  }, []);
 
   const handleOpenPreview = useCallback(
     (mediaId: number) => {
@@ -681,15 +669,10 @@ export function App() {
           contextMenu={menu}
           fileOps={fileOps}
           library={library}
+          notificationModel={notificationModel}
+          notificationsOpen={notificationsOpen}
           onCloseContextMenu={closeMenu}
-          onCloseRecentOps={closeRecentOps}
-          onCloseTaskPalette={closeTaskPalette}
-          onCloseTaskCenter={closeTaskCenter}
-          onOpenTaskCenter={openTaskCenter}
-          onRefreshRecentOps={() => void library.loadRecentOps()}
-          recentOpsOpen={recentOpsOpen}
-          taskCenterOpen={taskCenterOpen}
-          taskPaletteOpen={taskDrawerOpen}
+          onOpenNotificationCenter={handleOpenNotificationCenter}
         />
         <LibrarySwitcher
           open={switcherOpen}

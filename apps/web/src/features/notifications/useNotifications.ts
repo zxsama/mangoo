@@ -97,7 +97,8 @@ export class NotificationExternalStore {
 
   constructor(options: NotificationStoreOptions = {}) {
     this.bridgeProvider = options.getBridge ?? defaultBridge;
-    this.deferDisconnect = options.deferDisconnect ?? queueMicrotask;
+    this.deferDisconnect =
+      options.deferDisconnect ?? ((callback) => globalThis.queueMicrotask(callback));
     this.deferLogDelivery = options.deferLogDelivery ?? ((callback) => setTimeout(callback, 0));
   }
 

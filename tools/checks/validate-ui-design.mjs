@@ -63,6 +63,7 @@ const libraryInspectorPane = readOptional("apps/web/src/features/library/Library
 const pluginsView = read("apps/web/src/features/plugins/PluginsView.tsx");
 const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
 const notificationWindow = read("apps/web/src/features/notifications/NotificationWindow.tsx");
+const notificationPopover = read("apps/web/src/features/notifications/NotificationPopover.tsx");
 const filterMenu = readOptional("apps/web/src/features/library/FilterMenu.tsx");
 const mediaGrid = read("apps/web/src/features/media-grid/MediaGrid.tsx");
 const mediaResources = read("apps/web/src/core/mediaResources.ts");
@@ -419,8 +420,7 @@ for (const value of [
 // titlebar pointer plane. These pins assert the controls still exist and stay
 // no-drag; the glow itself is the shared affordance system.
 for (const [source, value, message] of [
-  [shellTitlebar, "tasks-palette", "titlebar tasks control must exist"],
-  [shellTitlebar, "recent-operations", "titlebar recent-operations control must exist"],
+  [shellTitlebar, "notifications", "unified titlebar notification control must exist"],
   [filterMenu ?? "", "library-filter", "library filter trigger must exist"],
   [sortMenu, "library-sort", "library sort trigger must exist"],
   [searchBar, "library-search", "search field must exist"],
@@ -462,14 +462,13 @@ for (const [source, value, message] of [
 }
 
 for (const value of [
-  "taskDrawerOpen",
-  "task-drawer-toggle",
-  "task-drawer-panel",
-  "Open tasks palette",
-  "Close tasks palette"
+  "notificationsOpen",
+  "notification-toggle",
+  "notification-popover",
+  'aria-label="通知"'
 ]) {
-  if (!app.includes(value) && !taskPanel.includes(value) && !shellTitlebar.includes(value)) {
-    fail(`tasks must be a floating accessible drawer/palette, missing ${value}`);
+  if (!app.includes(value) && !notificationPopover.includes(value) && !shellTitlebar.includes(value)) {
+    fail(`notifications must use one accessible compact titlebar popover, missing ${value}`);
   }
 }
 
@@ -1036,9 +1035,8 @@ for (const value of [
   'data-titlebar-control="open-settings"',
   'aria-label="Open plugins"',
   'aria-label="Open settings"',
-  "task-drawer-toggle",
-  "Open tasks palette",
-  "Close tasks palette",
+  "notification-toggle",
+  'aria-label="通知"',
   "WindowChrome"
 ]) {
   if (!shellTitlebar.includes(value)) {
@@ -1104,8 +1102,8 @@ if (!app.includes("ShellOverlayHost")) {
 
 if (!shellOverlayHost) {
   fail("global shell/overlay contract missing ShellOverlayHost file");
-} else if (!shellOverlayHost.includes("TaskOverlay")) {
-  fail("global shell/overlay contract missing TaskOverlay reference in ShellOverlayHost");
+} else if (!shellOverlayHost.includes("NotificationPopover")) {
+  fail("global shell/overlay contract missing NotificationPopover reference in ShellOverlayHost");
 }
 
 for (const value of ["onPreviewPrevious", "onPreviewNext"]) {
@@ -1353,7 +1351,10 @@ for (const button of titlebarToolButtons) {
   if (!/\btitle=/.test(button)) {
     fail("middle titlebar tool buttons must expose tooltip text with title");
   }
-  if (/<span\b/.test(button) || /top-action-label/.test(button)) {
+  const visibleSpans = [...button.matchAll(/<span\b([^>]*)>/g)].filter(
+    ([, attributes]) => !attributes.includes("notification-status-dot")
+  );
+  if (visibleSpans.length > 0 || /top-action-label/.test(button)) {
     fail("middle titlebar tool buttons must stay icon-only with no visible text label inside the button");
   }
 }
@@ -1453,7 +1454,7 @@ if (!filterMenu) {
 }
 
 for (const value of [
-  'type CompactPopover = "tasks" | "recent" | "filter" | "sort" | null',
+  'type CompactPopover = "notifications" | "filter" | "sort" | null',
   "activeCompactPopover",
   "Escape",
   "pointerdown",
@@ -1478,20 +1479,73 @@ for (const [label, source, values] of [
     ["data-compact-popover-root", "sort-menu-popover", "floating-popover", "LiquidGlassSurface", 'tone="elevated"']
   ],
   [
-    "task drawer",
-    taskOverlay ?? "",
-    ["data-compact-popover-root", "floating-popover"]
-  ],
-  [
-    "recent operations drawer",
-    shellOverlayHost ?? "",
-    ["data-compact-popover-root", "floating-popover"]
+    "notification popover",
+    notificationPopover,
+    [
+      'data-compact-popover-root="notifications"',
+      "notification-popover",
+      "popup-surface",
+      "floating-popover",
+      "LiquidGlassSurface",
+      'tone="elevated"'
+    ]
   ]
 ]) {
   for (const value of values) {
     if (!source.includes(value)) {
       fail(`${label} compact popover contract missing ${value}`);
     }
+  }
+}
+
+const shellRightActionsBlock =
+  shellTitlebar.match(/export function ShellRightActions[\s\S]*?\n}\n/)?.[0] ?? "";
+for (const value of [
+  'data-titlebar-control="notifications"',
+  'data-compact-popover-trigger="notifications"',
+  "titlebar-icon-button",
+  "notification-status-dot",
+  "Bell"
+]) {
+  if (!shellRightActionsBlock.includes(value)) {
+    fail(`notification titlebar control missing ${value}`);
+  }
+}
+for (const retiredValue of ["tasks-palette", "recent-operations", "top-action-label"]) {
+  if (shellRightActionsBlock.includes(retiredValue)) {
+    fail(`notification titlebar replacement must remove ${retiredValue}`);
+  }
+}
+if ((shellRightActionsBlock.match(/data-titlebar-control="notifications"/g) ?? []).length !== 1) {
+  fail("titlebar must render exactly one notification control");
+}
+for (const value of [
+  "notification-active-list",
+  "notification-progress-track",
+  "notification-progress-fill",
+  "notification-progress-indeterminate",
+  "notification-thumbnail-summary",
+  "notification-result-list",
+  "notification-popover-empty",
+  "notification-popover-degraded",
+  "notification-open-center"
+]) {
+  if (!notificationPopover.includes(value)) {
+    fail(`notification popover visual contract missing ${value}`);
+  }
+}
+if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopover)) {
+  fail("compact notification UI must not contain task actions");
+}
+for (const selector of [
+  ".notification-popover",
+  ".notification-status-dot",
+  ".notification-progress-track",
+  ".notification-progress-fill",
+  ".notification-progress-indeterminate"
+]) {
+  if (cssBlocksForExactSelector(stylesForChecks, selector).length === 0) {
+    fail(`notification compact UI style missing ${selector}`);
   }
 }
 

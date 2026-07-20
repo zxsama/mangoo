@@ -1,10 +1,9 @@
 import {
   ArrowLeft,
+  Bell,
   ChevronsUpDown,
   ChevronLeft,
   ChevronRight,
-  History,
-  ListChecks,
   Maximize2,
   Minimize2,
   PanelLeftClose,
@@ -78,12 +77,9 @@ interface PreviewTitlebarToolbarProps {
 }
 
 interface ShellRightActionsProps {
-  recentOpsOpen: boolean;
-  scanActive: boolean;
-  taskPaletteOpen: boolean;
-  onCloseTasks: () => void;
-  onOpenTasks: () => void;
-  onToggleRecent: () => void;
+  notificationIndicator: "idle" | "active" | "failure";
+  notificationsOpen: boolean;
+  onToggleNotifications: () => void;
 }
 
 export function ShellSidebarToggle({
@@ -408,51 +404,31 @@ export function PreviewTitlebarToolbar({
 }
 
 export function ShellRightActions({
-  recentOpsOpen,
-  scanActive,
-  taskPaletteOpen,
-  onCloseTasks,
-  onOpenTasks,
-  onToggleRecent
+  notificationIndicator,
+  notificationsOpen,
+  onToggleNotifications
 }: ShellRightActionsProps) {
   return (
     <div className="shell-right-actions no-drag">
       <LiquidGlassButton
-        active={taskPaletteOpen || scanActive}
-        aria-label={taskPaletteOpen ? "Close tasks palette" : "Open tasks palette"}
-        aria-pressed={taskPaletteOpen}
-        className={
-          taskPaletteOpen || scanActive
-            ? "top-action task-drawer-toggle active no-drag"
-            : "top-action task-drawer-toggle no-drag"
-        }
-        data-compact-popover="tasks"
-        data-compact-popover-trigger="tasks"
-        data-titlebar-control="tasks-palette"
-        onClick={taskPaletteOpen ? onCloseTasks : onOpenTasks}
-        title={taskPaletteOpen ? "Close tasks palette" : "Open tasks palette"}
+        active={notificationsOpen}
+        aria-label="通知"
+        aria-pressed={notificationsOpen}
+        className="titlebar-icon-button notification-toggle no-drag"
+        data-compact-popover-trigger="notifications"
+        data-titlebar-control="notifications"
+        onClick={onToggleNotifications}
+        title="通知"
         tone="control"
         type="button"
       >
-        <ListChecks size={16} />
-        <span className="top-action-label">Tasks</span>
-        {scanActive ? <span className="task-drawer-status" aria-hidden="true" /> : null}
-      </LiquidGlassButton>
-      <LiquidGlassButton
-        active={recentOpsOpen}
-        aria-label="Toggle recent file operations"
-        aria-pressed={recentOpsOpen}
-        className={`top-action recent-ops-toggle no-drag${recentOpsOpen ? " active" : ""}`}
-        data-compact-popover="recent"
-        data-compact-popover-trigger="recent"
-        data-titlebar-control="recent-operations"
-        onClick={onToggleRecent}
-        title="Recent file operations"
-        tone="control"
-        type="button"
-      >
-        <History size={16} />
-        <span className="top-action-label">Recent</span>
+        <Bell aria-hidden="true" size={15} />
+        {notificationIndicator !== "idle" ? (
+          <span
+            aria-hidden="true"
+            className={`notification-status-dot ${notificationIndicator}`}
+          />
+        ) : null}
       </LiquidGlassButton>
       <WindowChrome />
     </div>

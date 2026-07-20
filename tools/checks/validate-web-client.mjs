@@ -87,6 +87,12 @@ const mediaGridLayoutGeometry = read("apps/web/src/features/media-grid/layoutGeo
 const main = read("apps/web/src/main.tsx");
 const app = read("apps/web/src/app/App.tsx");
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
+const shellOverlayHost = read("apps/web/src/app-shell/ShellOverlayHost.tsx");
+const notificationPopoverPath =
+  "apps/web/src/features/notifications/NotificationPopover.tsx";
+const notificationPopover = existsSync(path.join(root, notificationPopoverPath))
+  ? read(notificationPopoverPath)
+  : "";
 const secondaryWindowFrame = read("apps/web/src/app-shell/SecondaryWindowFrame.tsx");
 const secondaryWindowInterfaceStyle = read("apps/web/src/app-shell/useSecondaryWindowInterfaceStyle.ts");
 const settingsWindow = read("apps/web/src/features/settings/SettingsWindow.tsx");
@@ -1673,6 +1679,79 @@ if (!shortcutBindings.includes("toggleSidebars") || !shortcutBindings.includes('
 }
 if (!useShortcuts.includes("onToggleSidebars") || !useShortcuts.includes('"toggleSidebars"')) {
   fail("global shortcut handler must invoke onToggleSidebars from the editable shortcut binding");
+}
+
+const shellRightActionsBlock = sourceMatch(
+  shellTitlebar,
+  /export function ShellRightActions[\s\S]*?\n}\n/
+);
+for (const value of [
+  'data-titlebar-control="notifications"',
+  'data-compact-popover-trigger="notifications"',
+  "titlebar-icon-button",
+  "Bell",
+  "notification-status-dot"
+]) {
+  if (!shellRightActionsBlock.includes(value)) {
+    fail(`unified notification titlebar control missing ${value}`);
+  }
+}
+for (const retiredValue of [
+  'data-titlebar-control="tasks-palette"',
+  'data-titlebar-control="recent-operations"',
+  "top-action-label"
+]) {
+  if (shellRightActionsBlock.includes(retiredValue)) {
+    fail(`ShellRightActions must retire ${retiredValue}`);
+  }
+}
+if ((shellRightActionsBlock.match(/data-titlebar-control="notifications"/g) ?? []).length !== 1) {
+  fail("ShellRightActions must expose exactly one notification titlebar control");
+}
+if (/notification-(?:badge|count)|notification-status-dot[^\n]*\{[^}]*\d+\s*\}/.test(shellRightActionsBlock)) {
+  fail("notification titlebar control must not render a numeric badge");
+}
+
+for (const value of [
+  'data-compact-popover-root="notifications"',
+  "notification-active-list",
+  "notification-progress-track",
+  "notification-progress-fill",
+  "notification-progress-indeterminate",
+  "notification-thumbnail-summary",
+  "notification-result-list",
+  "notification-popover-empty",
+  "notification-popover-degraded",
+  "notification-open-center"
+]) {
+  if (!notificationPopover.includes(value)) {
+    fail(`compact notification popover contract missing ${value}`);
+  }
+}
+const popoverOrder = [
+  "notification-active-list",
+  "notification-thumbnail-summary",
+  "notification-result-list",
+  "notification-open-center"
+].map((value) => notificationPopover.indexOf(value));
+if (popoverOrder.some((index) => index < 0) || popoverOrder.some((index, i) => i > 0 && index <= popoverOrder[i - 1])) {
+  fail("compact notification popover must render active, thumbnail, results, then full-center action");
+}
+if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopover)) {
+  fail("compact notification popover must stay read-only without cancel/retry actions");
+}
+if (!app.includes('type CompactPopover = "notifications" | "filter" | "sort" | null')) {
+  fail("App must coordinate notifications with the shared compact-popover state");
+}
+for (const retiredState of ["taskCenterOpen", '=== "tasks"', '=== "recent"']) {
+  if (app.includes(retiredState)) {
+    fail(`App must retire legacy Tasks/Recent overlay state: ${retiredState}`);
+  }
+}
+for (const value of ["NotificationPopover", "useNotifications", "openNotificationsWindow"]) {
+  if (!app.includes(value) && !shellOverlayHost.includes(value)) {
+    fail(`compact notification integration missing ${value}`);
+  }
 }
 if (/selectPreviewNeighbor/.test(useShortcuts) || /library\.media\.findIndex/.test(useShortcuts)) {
   fail("useShortcuts must not implement its own preview ordering because App owns locked preview navigation");

@@ -352,6 +352,24 @@ describe("notification history model", () => {
 });
 
 describe("notification external store", () => {
+  it("invokes the default microtask scheduler with its browser receiver", () => {
+    const originalQueueMicrotask = globalThis.queueMicrotask;
+    globalThis.queueMicrotask = function queueMicrotaskWithReceiver(
+      this: typeof globalThis,
+      callback: VoidFunction
+    ) {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      callback();
+    };
+    try {
+      const store = createNotificationStore({ getBridge: () => bridge() });
+      const off = store.subscribe(() => undefined);
+      assert.doesNotThrow(off);
+    } finally {
+      globalThis.queueMicrotask = originalQueueMicrotask;
+    }
+  });
+
   it("shares one bridge subscription across consumers and survives StrictMode resubscribe", async () => {
     let subscribeCalls = 0;
     let unsubscribeCalls = 0;
