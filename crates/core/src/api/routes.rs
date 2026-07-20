@@ -13,6 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::api::AppState;
+use crate::db::notification_outbox::NotificationOutboxEvent;
 use crate::db::{
     Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot,
     NotificationOrigin, PluginRecord, RootRecord, SearchQuery, TagError, TagRecord, TaskRecord,
@@ -401,6 +402,32 @@ struct ListFileOperationsQuery {
     cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListNotificationOutboxQuery {
+    after_sequence: Option<i64>,
+    limit: Option<i64>,
+    wait_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationOutboxResponse {
+    items: Vec<NotificationOutboxEvent>,
+    max_sequence: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationOutboxAckRequest {
+    max_sequence: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct NotificationOutboxAckResponse {
+    acknowledged: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
@@ -541,6 +568,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/file-ops/move", post(move_files))
         .route("/api/file-ops/delete", post(delete_files))
         .route("/api/file-ops", get(list_file_operations))
+        .route("/api/notifications/outbox", get(list_notification_outbox))
+        .route(
+            "/api/notifications/outbox/ack",
+            post(acknowledge_notification_outbox),
+        )
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/discover", post(discover_plugins))
         .route(
@@ -1432,6 +1464,93 @@ async fn list_file_operations(
     }))
 }
 
+async fn list_notification_outbox(
+    State(state): State<AppState>,
+    Query(query): Query<ListNotificationOutboxQuery>,
+) -> ApiResult<Json<NotificationOutboxResponse>> {
+    let after_sequence = query.after_sequence.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100);
+    let wait_ms = query.wait_ms.unwrap_or(0);
+    if after_sequence < 0 {
+        return Err(CoreError::bad_request(
+            "afterSequence must be greater than or equal to 0".to_string(),
+        ));
+    }
+    if !(1..=200).contains(&limit) {
+        return Err(CoreError::bad_request(
+            "limit must be between 1 and 200".to_string(),
+        ));
+    }
+    if !(0..=30_000).contains(&wait_ms) {
+        return Err(CoreError::bad_request(
+            "waitMs must be between 0 and 30000".to_string(),
+        ));
+    }
+
+    let items = read_notification_outbox(&state, after_sequence, limit).await?;
+    if !items.is_empty() || wait_ms == 0 {
+        return Ok(Json(notification_outbox_response(items, after_sequence)));
+    }
+
+    // `notify_waiters` does not retain a permit. Register first, then repeat the
+    // read to close the commit window between the initial empty query and this
+    // waiter becoming visible to producers.
+    let notified = state.notification_outbox_wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let items = read_notification_outbox(&state, after_sequence, limit).await?;
+    if !items.is_empty() {
+        return Ok(Json(notification_outbox_response(items, after_sequence)));
+    }
+
+    let _ = tokio::time::timeout(Duration::from_millis(wait_ms as u64), notified.as_mut()).await;
+    let items = read_notification_outbox(&state, after_sequence, limit).await?;
+    Ok(Json(notification_outbox_response(items, after_sequence)))
+}
+
+async fn read_notification_outbox(
+    state: &AppState,
+    after_sequence: i64,
+    limit: i64,
+) -> ApiResult<Vec<NotificationOutboxEvent>> {
+    run_read_database(state.clone(), move |database| {
+        Ok(database.list_notification_outbox(after_sequence, limit)?)
+    })
+    .await
+}
+
+fn notification_outbox_response(
+    items: Vec<NotificationOutboxEvent>,
+    after_sequence: i64,
+) -> NotificationOutboxResponse {
+    let max_sequence = items
+        .last()
+        .map(|event| event.sequence)
+        .unwrap_or(after_sequence);
+    NotificationOutboxResponse {
+        items,
+        max_sequence,
+    }
+}
+
+async fn acknowledge_notification_outbox(
+    State(state): State<AppState>,
+    Json(body): Json<NotificationOutboxAckRequest>,
+) -> ApiResult<Json<NotificationOutboxAckResponse>> {
+    if body.max_sequence < 0 {
+        return Err(CoreError::bad_request(
+            "maxSequence must be greater than or equal to 0".to_string(),
+        ));
+    }
+    let max_sequence = body.max_sequence;
+    run_shared_database(state, move |database| {
+        database.acknowledge_notification_outbox(max_sequence)?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(NotificationOutboxAckResponse { acknowledged: true }))
+}
+
 async fn list_plugins(State(state): State<AppState>) -> ApiResult<Json<PluginListResponse>> {
     // Read on the dedicated WAL read connection so it never blocks behind a
     // scan-time write holding the shared mutex (see get_user_metadata).
@@ -2201,6 +2320,7 @@ mod tests {
 
     use super::{fallback_display_name, router};
     use crate::api::{router_with_config, ApiConfig, AppState, BasicAuthCredentials};
+    use crate::db::notification_outbox::{NotificationOperation, PublishMode};
     use crate::db::{Database, NewRoot, ThumbnailTaskPriority};
 
     #[test]
@@ -2473,6 +2593,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
+            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -2616,6 +2737,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
+            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -2690,6 +2812,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
+            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -3671,6 +3794,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
+            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -3790,6 +3914,7 @@ mod tests {
         sender.try_send(-1).expect("fill worker queue");
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
+            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -4201,6 +4326,7 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
+            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -4290,6 +4416,7 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
+            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -4536,6 +4663,7 @@ mod tests {
         drop(receiver);
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
+            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             fsops_database: None,
             task_queue: _sender,
             plugins_dir: None,
@@ -4590,6 +4718,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         let state = AppState {
             writer: crate::db::DbWriter::spawn(database),
+            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             fsops_database: None,
             task_queue: sender,
             plugins_dir: None,
@@ -6084,6 +6213,386 @@ mod tests {
                 .as_nanos(),
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+
+    fn test_notification_operation(operation_id: &str, updated_at: i64) -> NotificationOperation {
+        NotificationOperation {
+            operation_id: operation_id.to_string(),
+            revision: 0,
+            kind: "route_test".to_string(),
+            category: "error".to_string(),
+            origin: "system".to_string(),
+            presentation: "important".to_string(),
+            status: "running".to_string(),
+            phase: Some("testing".to_string()),
+            title: "Route test notification".to_string(),
+            summary: None,
+            task_id: None,
+            root_id: None,
+            folder_id: None,
+            file_id: None,
+            current_value: 0,
+            total_value: None,
+            unit: None,
+            error_code: None,
+            error_detail: None,
+            cancellable: false,
+            retryable: false,
+            attempt: 1,
+            occurrence_count: 1,
+            started_at: updated_at,
+            updated_at,
+            completed_at: None,
+        }
+    }
+
+    async fn publish_test_notification(
+        writer: crate::db::DbWriter,
+        operation_id: &'static str,
+        updated_at: i64,
+    ) {
+        writer
+            .write(move |database| {
+                let mut operation = test_notification_operation(operation_id, updated_at);
+                database.publish_notification_operation(&mut operation, PublishMode::Phase)?;
+                Ok(())
+            })
+            .await
+            .expect("publish route test notification");
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_route_returns_immediately_replays_and_acknowledges_idempotently() {
+        let database = test_database();
+        let mut operation = test_notification_operation("route:immediate", 1_000);
+        operation.status = "succeeded".to_string();
+        operation.phase = None;
+        operation.completed_at = Some(operation.updated_at);
+        database
+            .publish_notification_operation(&mut operation, PublishMode::Terminal)
+            .expect("publish immediate notification");
+        let app = router(AppState::new(database));
+
+        let started = std::time::Instant::now();
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/notifications/outbox?afterSequence=0&limit=1&waitMs=1000")
+                    .body(Body::empty())
+                    .expect("build immediate outbox request"),
+            )
+            .await
+            .expect("request immediate outbox");
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        let first_body = response_json(first).await;
+        assert_eq!(first_body["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            first_body["items"][0]["operation"]["operationId"],
+            "route:immediate"
+        );
+        let sequence = first_body["items"][0]["sequence"]
+            .as_i64()
+            .expect("outbox sequence");
+        assert_eq!(first_body["maxSequence"], sequence);
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/notifications/outbox?afterSequence=0&limit=1&waitMs=0")
+                    .body(Body::empty())
+                    .expect("build replay request"),
+            )
+            .await
+            .expect("request replay");
+        let replay_body = response_json(replay).await;
+        assert_eq!(replay_body["items"][0]["sequence"], sequence);
+
+        for _ in 0..2 {
+            let ack = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/notifications/outbox/ack")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!(r#"{{"maxSequence":{sequence}}}"#)))
+                        .expect("build acknowledgement request"),
+                )
+                .await
+                .expect("acknowledge outbox");
+            assert_eq!(ack.status(), StatusCode::OK);
+            assert_eq!(response_json(ack).await["acknowledged"], true);
+        }
+
+        let empty = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/notifications/outbox?afterSequence={sequence}&limit=200&waitMs=0"
+                    ))
+                    .body(Body::empty())
+                    .expect("build empty outbox request"),
+            )
+            .await
+            .expect("request acknowledged outbox");
+        let empty_body = response_json(empty).await;
+        assert!(empty_body["items"].as_array().expect("items").is_empty());
+        assert_eq!(empty_body["maxSequence"], sequence);
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_route_waits_once_then_returns_empty_without_polling() {
+        let app = router(AppState::new(test_database()));
+        let started = std::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/notifications/outbox?afterSequence=17&limit=100&waitMs=60")
+                    .body(Body::empty())
+                    .expect("build timeout outbox request"),
+            )
+            .await
+            .expect("request timeout outbox");
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(45),
+            "elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "elapsed {elapsed:?}"
+        );
+        let body = response_json(response).await;
+        assert!(body["items"].as_array().expect("items").is_empty());
+        assert_eq!(body["maxSequence"], 17);
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_route_flushes_dirty_head_before_serving_requests() {
+        let database = test_database();
+        let mut operation = test_notification_operation("route:dirty", 1_000);
+        operation.category = "task".to_string();
+        database
+            .publish_notification_operation(&mut operation, PublishMode::Phase)
+            .expect("publish initial dirty fixture phase");
+        let first_sequence = database
+            .list_notification_outbox(0, 100)
+            .expect("read initial dirty fixture event")[0]
+            .sequence;
+        operation.current_value = 1;
+        operation.updated_at = 1_500;
+        assert!(!database
+            .publish_notification_operation(&mut operation, PublishMode::Progress)
+            .expect("persist coalesced dirty progress"));
+
+        let app = router(AppState::new(database));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/notifications/outbox?afterSequence={first_sequence}&limit=100&waitMs=0"
+                    ))
+                    .body(Body::empty())
+                    .expect("build dirty flush request"),
+            )
+            .await
+            .expect("request flushed dirty event");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["items"][0]["operation"]["currentValue"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn notification_outbox_route_wakes_all_waiters_after_one_committed_batch() {
+        let state = AppState::new(test_database());
+        let writer = state.writer.clone();
+        let app = router(state);
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let app = app.clone();
+            requests.push(tokio::spawn(async move {
+                app.oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/notifications/outbox?afterSequence=0&limit=100&waitMs=1000")
+                        .body(Body::empty())
+                        .expect("build concurrent outbox request"),
+                )
+                .await
+                .expect("request concurrent outbox")
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        publish_test_notification(writer, "route:broadcast", 2_000).await;
+
+        for request in requests {
+            let response = tokio::time::timeout(std::time::Duration::from_millis(500), request)
+                .await
+                .expect("all long-poll waiters must wake for the same commit")
+                .expect("join concurrent outbox request");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(
+                body["items"][0]["operation"]["operationId"],
+                "route:broadcast"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn notification_outbox_route_reopened_database_wake_closes_registration_race() {
+        let directory = unique_temp_dir();
+        fs::create_dir_all(&directory).expect("create outbox route directory");
+        let database =
+            Database::open(directory.join("notifications.sqlite")).expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let producer = database
+            .reopen()
+            .expect("reopen notification producer")
+            .expect("file database can reopen");
+        let app = router(AppState::new(database));
+        let request = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/notifications/outbox?afterSequence=0&limit=100&waitMs=1000")
+                    .body(Body::empty())
+                    .expect("build reopened wake request"),
+            )
+            .await
+            .expect("request reopened wake outbox")
+        });
+        tokio::task::yield_now().await;
+        let mut operation = test_notification_operation("route:reopened", 3_000);
+        producer
+            .publish_notification_operation(&mut operation, PublishMode::Phase)
+            .expect("publish through reopened database");
+
+        let response = tokio::time::timeout(std::time::Duration::from_millis(500), request)
+            .await
+            .expect("reopened shared wake must release route")
+            .expect("join reopened wake request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["items"][0]["operation"]["operationId"],
+            "route:reopened"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_route_validates_query_and_ack_bounds() {
+        let database = test_database();
+        for index in 0..3 {
+            let mut operation =
+                test_notification_operation(&format!("route:limit:{index}"), 4_000 + index);
+            operation.status = "succeeded".to_string();
+            operation.phase = None;
+            operation.completed_at = Some(operation.updated_at);
+            database
+                .publish_notification_operation(&mut operation, PublishMode::Terminal)
+                .expect("publish limit fixture");
+        }
+        let app = router(AppState::new(database));
+        let limited = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/notifications/outbox?afterSequence=0&limit=2&waitMs=0")
+                    .body(Body::empty())
+                    .expect("build limited outbox request"),
+            )
+            .await
+            .expect("request limited outbox page");
+        assert_eq!(limited.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(limited).await["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        for uri in [
+            "/api/notifications/outbox?afterSequence=-1",
+            "/api/notifications/outbox?limit=0",
+            "/api/notifications/outbox?limit=201",
+            "/api/notifications/outbox?waitMs=-1",
+            "/api/notifications/outbox?waitMs=30001",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("build invalid outbox request"),
+                )
+                .await
+                .expect("request invalid outbox query");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "uri {uri}");
+        }
+
+        let invalid_ack = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/notifications/outbox/ack")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"maxSequence":-1}"#))
+                    .expect("build invalid ack request"),
+            )
+            .await
+            .expect("request invalid outbox ack");
+        assert_eq!(invalid_ack.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_route_acknowledgement_requires_session_authentication() {
+        let app = router_with_config(
+            test_database(),
+            ApiConfig {
+                session_token: Some("notification-session".to_string()),
+                ..ApiConfig::default()
+            },
+        );
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/notifications/outbox/ack")
+                .header(header::CONTENT_TYPE, "application/json")
+        };
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                request()
+                    .body(Body::from(r#"{"maxSequence":0}"#))
+                    .expect("build unauthenticated ack"),
+            )
+            .await
+            .expect("request unauthenticated ack");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                request()
+                    .header("x-megle-session", "notification-session")
+                    .body(Body::from(r#"{"maxSequence":0}"#))
+                    .expect("build authenticated ack"),
+            )
+            .await
+            .expect("request authenticated ack");
+        assert_eq!(authorized.status(), StatusCode::OK);
+        assert_eq!(response_json(authorized).await["acknowledged"], true);
     }
 
     #[tokio::test]

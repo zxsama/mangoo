@@ -27,6 +27,7 @@ pub const SESSION_HEADER: &str = "X-Megle-Session";
 #[derive(Clone)]
 pub struct AppState {
     pub writer: DbWriter,
+    pub(crate) notification_outbox_wake: Arc<tokio::sync::Notify>,
     /// A reopened connection used for file-operation preflight reads and plugin
     /// discovery. File-operation journal writes are submitted as short jobs to
     /// `writer`; filesystem syscalls run outside both connections on Tokio's
@@ -56,10 +57,19 @@ impl AppState {
 
         // In-memory/test DB: no reopen possible, so the writer owns the sole
         // connection and reads fall back to it (no read_database_path).
+        flush_notification_outbox_at_startup(&database);
+        if let Err(error) = database.recover_interrupted_notification_operations() {
+            tracing::error!(
+                %error,
+                "startup notification recovery failed; Core will continue with observable pending state"
+            );
+        }
+        let notification_outbox_wake = database.notification_outbox_wake();
         let (task_queue, receiver) = tokio::sync::mpsc::channel(1);
         drop(receiver);
         Self {
             writer: DbWriter::spawn(database),
+            notification_outbox_wake,
             fsops_database: None,
             task_queue,
             read_database_path: None,
@@ -70,6 +80,8 @@ impl AppState {
     }
 
     pub fn new_with_worker(database: Database, worker_database: Database) -> Self {
+        flush_notification_outbox_at_startup(&database);
+        let notification_outbox_wake = database.notification_outbox_wake();
         let read_database_path = database.path().map(Path::to_path_buf);
         let watcher_database = database.reopen().expect("reopen watcher database");
         // Reopened before `database` is moved into the writer. File operations
@@ -94,6 +106,7 @@ impl AppState {
         });
         Self {
             writer,
+            notification_outbox_wake,
             fsops_database,
             task_queue,
             read_database_path,
@@ -115,6 +128,15 @@ impl AppState {
     /// handlers fall back to the shared connection.
     pub fn has_read_database(&self) -> bool {
         self.read_database_path.is_some()
+    }
+}
+
+fn flush_notification_outbox_at_startup(database: &Database) {
+    if let Err(error) = database.flush_dirty_notification_heads() {
+        tracing::error!(
+            %error,
+            "startup notification dirty-head flush failed; Core will continue with persisted head state"
+        );
     }
 }
 

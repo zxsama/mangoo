@@ -807,7 +807,7 @@ impl Database {
 
     fn publish_task_notification_after_commit(&self, appended: bool) {
         if appended {
-            self.notification_outbox_wake.notify_one();
+            self.notification_outbox_wake.notify_waiters();
         }
     }
 

@@ -19,6 +19,7 @@ const openApi = read("contracts/core-api/openapi.yaml");
 const routesRs = read("crates/core/src/api/routes.rs");
 const apiModRs = read("crates/core/src/api/mod.rs");
 const dbModRs = read("crates/core/src/db/mod.rs");
+const notificationOutboxRs = read("crates/core/src/db/notification_outbox.rs");
 const tasksRs = read("crates/core/src/tasks.rs");
 const dbMigrationsRs = read("crates/core/src/db/migrations.rs");
 const mainRs = read("crates/core/src/main.rs");
@@ -32,6 +33,9 @@ const previewServedByMigrationSql = read("crates/core/migrations/0013_preview_se
 const thumbnailsRs = read("crates/core/src/thumbnails/mod.rs");
 const pluginsRs = read("crates/core/src/plugins/mod.rs");
 const fsopsRs = read("crates/core/src/fsops/mod.rs");
+const fsopsJournalRs = read("crates/core/src/fsops/journal.rs");
+const fsopsPlatformRs = read("crates/core/src/fsops/platform.rs");
+const fsopsImplementationRs = `${fsopsRs}\n${fsopsJournalRs}\n${fsopsPlatformRs}`;
 const coreCargo = read("crates/core/Cargo.toml");
 const pluginManifest = read("contracts/plugins/manifest.schema.json");
 
@@ -86,6 +90,8 @@ const expectedAxumRoutes = [
   "/api/file-ops/rename",
   "/api/file-ops/move",
   "/api/file-ops/delete",
+  "/api/notifications/outbox",
+  "/api/notifications/outbox/ack",
   "/api/plugins",
   "/api/plugins/discover",
   "/api/plugins/:plugin_id",
@@ -746,8 +752,7 @@ for (const value of [
   "WHERE id = ?3 AND status IN ('pending', 'running')",
   "WHERE id = ?2 AND status IN ('pending', 'running')",
   "WHERE id = ?2 AND status IN ('failed', 'cancelled')",
-  "ensure_one_task_attempt_updated",
-  "ensure_one_task_updated"
+  "ensure_one_task_attempt_updated"
 ]) {
   if (!dbModRs.includes(value)) {
     fail(`DB task status transition guard missing ${value}`);
@@ -917,7 +922,7 @@ for (const value of [
 }
 
 for (const value of [
-  "BEGIN IMMEDIATE",
+  "Transaction::new_unchecked",
   "TransactionBehavior::Immediate",
   "FileOperationRecord",
   "FsOpsError",
@@ -933,9 +938,39 @@ for (const value of [
   "move_items(",
   "delete("
 ]) {
-  if (!fsopsRs.includes(value)) {
-    fail(`fsops/mod.rs must include ${value}`);
+  if (!fsopsImplementationRs.includes(value)) {
+    fail(`fsops implementation must include ${value}`);
   }
+}
+
+for (const value of [
+  '"/api/notifications/outbox"',
+  '"/api/notifications/outbox/ack"',
+  "list_notification_outbox",
+  "acknowledge_notification_outbox",
+  "notification_outbox_wake.notified()",
+  "notified.as_mut().enable()",
+  "tokio::time::timeout"
+]) {
+  if (!routesRs.includes(value)) {
+    fail(`notification Outbox routes must include ${value}`);
+  }
+}
+for (const value of [
+  "notification_outbox_wake: Arc<tokio::sync::Notify>",
+  "database.notification_outbox_wake()",
+  "flush_dirty_notification_heads"
+]) {
+  if (!apiModRs.includes(value)) {
+    fail(`AppState notification Outbox integration must include ${value}`);
+  }
+}
+const notificationProducerRs = `${dbModRs}\n${notificationOutboxRs}\n${fsopsJournalRs}`;
+if (/notification_outbox_wake(?:\(\))?\.notify_one\(\)/.test(notificationProducerRs)) {
+  fail("notification Outbox producers must broadcast committed batches instead of waking only one long-poll client");
+}
+if (!notificationProducerRs.includes("notify_waiters()")) {
+  fail("notification Outbox producers must broadcast committed batches with notify_waiters()");
 }
 
 if (!coreCargo.includes("trash =")) {

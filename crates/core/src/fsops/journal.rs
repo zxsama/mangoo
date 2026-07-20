@@ -445,7 +445,7 @@ pub(super) fn begin_test_group(
     )?;
     transaction.commit()?;
     if appended {
-        guard.notification_outbox_wake().notify_one();
+        guard.notification_outbox_wake().notify_waiters();
     }
     Ok(group_id)
 }
@@ -1759,7 +1759,7 @@ fn persist_intents(
     };
     transaction.commit()?;
     if phase_appended || state_appended {
-        database.notification_outbox_wake().notify_one();
+        database.notification_outbox_wake().notify_waiters();
     }
     Ok(PersistedBatch {
         intents,
@@ -1855,7 +1855,7 @@ fn finalize_intent(
     let record = operation_record_in_transaction(&transaction, intent.id)?;
     transaction.commit()?;
     if appended {
-        database.notification_outbox_wake().notify_one();
+        database.notification_outbox_wake().notify_waiters();
     }
     Ok(record)
 }

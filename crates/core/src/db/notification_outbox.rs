@@ -77,7 +77,7 @@ impl Database {
             self.publish_notification_operation_in_transaction(&transaction, operation, mode)?;
         transaction.commit()?;
         if appended {
-            self.notification_outbox_wake.notify_one();
+            self.notification_outbox_wake.notify_waiters();
         }
         Ok(appended)
     }
@@ -217,7 +217,7 @@ impl Database {
         }
         transaction.commit()?;
         if appended > 0 {
-            self.notification_outbox_wake.notify_one();
+            self.notification_outbox_wake.notify_waiters();
         }
         Ok(appended)
     }
@@ -251,7 +251,7 @@ impl Database {
         }
         transaction.commit()?;
         if recovered > 0 {
-            self.notification_outbox_wake.notify_one();
+            self.notification_outbox_wake.notify_waiters();
         }
         Ok(recovered)
     }
@@ -664,6 +664,7 @@ mod tests {
         let waiter = tokio::spawn(async move {
             wake.notified().await;
         });
+        tokio::task::yield_now().await;
         let mut operation = fixture_operation("task:wake", "root_scan", "running", 10);
         assert!(reopened
             .publish_notification_operation(&mut operation, PublishMode::Phase)
@@ -683,6 +684,8 @@ mod tests {
         let wake = db.notification_outbox_wake();
 
         let failed_notification = wake.notified();
+        tokio::pin!(failed_notification);
+        failed_notification.as_mut().enable();
         let mut invalid = fixture_operation("task:rollback", "root_scan", "running", 1_000);
         invalid.status = "invalid-status".to_string();
         assert!(db
@@ -690,17 +693,19 @@ mod tests {
             .is_err());
         assert!(db.list_notification_outbox(0, 100).unwrap().is_empty());
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), failed_notification)
+            tokio::time::timeout(Duration::from_millis(50), failed_notification.as_mut())
                 .await
                 .is_err()
         );
 
         let committed_notification = wake.notified();
+        tokio::pin!(committed_notification);
+        committed_notification.as_mut().enable();
         let mut valid = fixture_operation("task:commit", "root_scan", "running", 1_000);
         assert!(db
             .publish_notification_operation(&mut valid, PublishMode::Phase)
             .unwrap());
-        tokio::time::timeout(Duration::from_secs(1), committed_notification)
+        tokio::time::timeout(Duration::from_secs(1), committed_notification.as_mut())
             .await
             .expect("successful commit should wake");
     }
