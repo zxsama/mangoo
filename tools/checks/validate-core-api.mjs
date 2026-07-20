@@ -948,6 +948,10 @@ for (const value of [
   '"/api/notifications/outbox/ack"',
   "list_notification_outbox",
   "acknowledge_notification_outbox",
+  "QueryRejection",
+  "JsonRejection",
+  "invalid_notification_request",
+  '"invalid_request"',
   "notification_outbox_wake.notified()",
   "notified.as_mut().enable()",
   "tokio::time::timeout"

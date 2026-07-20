@@ -1,3 +1,4 @@
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -428,16 +429,11 @@ struct NotificationOutboxAckResponse {
     acknowledged: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ErrorResponse {
     error: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CodedErrorResponse {
-    error: String,
-    code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -483,24 +479,14 @@ impl From<anyhow::Error> for CoreError {
 
 impl IntoResponse for CoreError {
     fn into_response(self) -> Response {
-        if let Some(code) = self.code {
-            (
-                self.status,
-                Json(CodedErrorResponse {
-                    error: self.message,
-                    code,
-                }),
-            )
-                .into_response()
-        } else {
-            (
-                self.status,
-                Json(ErrorResponse {
-                    error: self.message,
-                }),
-            )
-                .into_response()
-        }
+        (
+            self.status,
+            Json(ErrorResponse {
+                error: self.message,
+                code: self.code,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -1466,8 +1452,11 @@ async fn list_file_operations(
 
 async fn list_notification_outbox(
     State(state): State<AppState>,
-    Query(query): Query<ListNotificationOutboxQuery>,
+    query: Result<Query<ListNotificationOutboxQuery>, QueryRejection>,
 ) -> ApiResult<Json<NotificationOutboxResponse>> {
+    let Query(query) = query.map_err(|rejection| {
+        invalid_notification_request("invalid notification outbox query", rejection.body_text())
+    })?;
     let after_sequence = query.after_sequence.unwrap_or(0);
     let limit = query.limit.unwrap_or(100);
     let wait_ms = query.wait_ms.unwrap_or(0);
@@ -1535,8 +1524,14 @@ fn notification_outbox_response(
 
 async fn acknowledge_notification_outbox(
     State(state): State<AppState>,
-    Json(body): Json<NotificationOutboxAckRequest>,
+    body: Result<Json<NotificationOutboxAckRequest>, JsonRejection>,
 ) -> ApiResult<Json<NotificationOutboxAckResponse>> {
+    let Json(body) = body.map_err(|rejection| {
+        invalid_notification_request(
+            "invalid notification outbox acknowledgement",
+            rejection.body_text(),
+        )
+    })?;
     if body.max_sequence < 0 {
         return Err(CoreError::bad_request(
             "maxSequence must be greater than or equal to 0".to_string(),
@@ -1549,6 +1544,16 @@ async fn acknowledge_notification_outbox(
     })
     .await?;
     Ok(Json(NotificationOutboxAckResponse { acknowledged: true }))
+}
+
+fn invalid_notification_request(context: &str, detail: String) -> CoreError {
+    let detail = detail.trim();
+    let message = if detail.is_empty() {
+        context.to_string()
+    } else {
+        format!("{context}: {detail}")
+    };
+    CoreError::coded(StatusCode::BAD_REQUEST, "invalid_request", message)
 }
 
 async fn list_plugins(State(state): State<AppState>) -> ApiResult<Json<PluginListResponse>> {
@@ -2318,7 +2323,7 @@ mod tests {
     use base64::Engine as _;
     use tower::ServiceExt;
 
-    use super::{fallback_display_name, router};
+    use super::{fallback_display_name, router, ErrorResponse};
     use crate::api::{router_with_config, ApiConfig, AppState, BasicAuthCredentials};
     use crate::db::notification_outbox::{NotificationOperation, PublishMode};
     use crate::db::{Database, NewRoot, ThumbnailTaskPriority};
@@ -6554,6 +6559,86 @@ mod tests {
             .await
             .expect("request invalid outbox ack");
         assert_eq!(invalid_ack.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn assert_notification_request_error(response: axum::response::Response, case: &str) {
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "case {case}");
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("application/json"),
+            "case {case} returned content type {content_type:?}"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read notification request error body");
+        let body: ErrorResponse = serde_json::from_slice(&bytes)
+            .expect("notification request error must deserialize as ErrorResponse");
+        assert!(
+            body.code
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+            "case {case} returned empty error code: {body:?}"
+        );
+        assert!(
+            !body.error.trim().is_empty(),
+            "case {case} returned empty error message: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_route_maps_query_rejections_to_json_error_response() {
+        let app = router(AppState::new(test_database()));
+        for (case, uri) in [
+            (
+                "afterSequence is not an integer",
+                "/api/notifications/outbox?afterSequence=abc",
+            ),
+            (
+                "limit is not an integer",
+                "/api/notifications/outbox?limit=many",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("build malformed notification query"),
+                )
+                .await
+                .expect("request malformed notification query");
+            assert_notification_request_error(response, case).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_route_maps_json_rejections_to_json_error_response() {
+        let app = router(AppState::new(test_database()));
+        for (case, body) in [
+            ("missing maxSequence", r#"{}"#),
+            ("maxSequence has the wrong type", r#"{"maxSequence":"bad"}"#),
+            ("invalid JSON", r#"{"maxSequence":0"#),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/notifications/outbox/ack")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .expect("build malformed notification acknowledgement"),
+                )
+                .await
+                .expect("request malformed notification acknowledgement");
+            assert_notification_request_error(response, case).await;
+        }
     }
 
     #[tokio::test]
