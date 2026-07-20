@@ -137,8 +137,8 @@ export interface NotificationRetentionResult {
 export interface NotificationPendingRendererError {
   library: NotificationLibraryIdentity;
   report: RendererErrorReport;
+  reportIds: string[];
   occurredAt: number;
-  occurrenceIncrement: number;
 }
 
 export interface NotificationPendingActionError {
@@ -206,8 +206,8 @@ export type NotificationStoreRequest =
       params: {
         library: NotificationLibraryIdentity;
         report: RendererErrorReport;
+        reportId: string;
         occurredAt: number;
-        occurrenceIncrement: number;
       };
     }
   | {

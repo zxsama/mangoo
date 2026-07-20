@@ -391,10 +391,15 @@ describe("notification store", () => {
         "move"
       );
 
-      await store.recordRendererError(LIBRARY_A, report, NOW, 1);
-      const aggregated = await store.recordRendererError(LIBRARY_A, report, NOW + 1, 3);
+      await store.recordRendererError(LIBRARY_A, report, "aggregate-1", NOW);
+      const aggregated = await store.recordRendererError(
+        LIBRARY_A,
+        report,
+        "aggregate-2",
+        NOW + 1
+      );
       assert.equal(aggregated.revision, 2);
-      assert.equal(aggregated.occurrenceCount, 4);
+      assert.equal(aggregated.occurrenceCount, 2);
       assert.equal(
         (
           await store.getOperation(
@@ -402,8 +407,48 @@ describe("notification store", () => {
             `renderer-error:${LIBRARY_A.id}:${report.source}:${report.code}:${report.target}`
           )
         )?.occurrenceCount,
-        4
+        2
       );
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("counts distinct renderer report ids once across process restarts", async () => {
+    const databasePath = testDatabasePath();
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "renderer",
+      code: "load-failed",
+      target: "folder:4",
+      title: "Folder load failed",
+      message: "Could not load folder",
+      detail: "database busy"
+    };
+    let store = await createTestStore(databasePath);
+    try {
+      await store.recordRendererError(LIBRARY_A, report, "report-a", NOW);
+      const distinct = await store.recordRendererError(
+        LIBRARY_A,
+        report,
+        "report-b",
+        NOW + 1
+      );
+      assert.equal(distinct.occurrenceCount, 2);
+    } finally {
+      await store.close();
+    }
+
+    store = await createTestStore(databasePath);
+    try {
+      const replayed = await store.recordRendererError(
+        LIBRARY_A,
+        report,
+        "report-a",
+        NOW + 2
+      );
+      assert.equal(replayed.occurrenceCount, 2, "the same report id must survive restart");
     } finally {
       await store.close();
     }
@@ -425,7 +470,12 @@ describe("notification store", () => {
     const batch: NotificationLocalRecoveryBatch = {
       batchId: "recovery-batch-1",
       rendererErrors: [
-        { library: LIBRARY_A, report, occurredAt: NOW, occurrenceIncrement: 2 }
+        {
+          library: LIBRARY_A,
+          report,
+          reportIds: ["recovery-report-1", "recovery-report-2"],
+          occurredAt: NOW
+        }
       ],
       thumbnails: [thumbnailSummary(LIBRARY_A, 70)],
       actionErrors: [

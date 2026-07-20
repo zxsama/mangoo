@@ -219,13 +219,13 @@ export class NotificationStore {
   async recordRendererError(
     library: NotificationLibraryIdentity,
     report: RendererErrorReport,
-    occurredAt: number,
-    occurrenceIncrement = 1
+    reportId: string,
+    occurredAt: number
   ): Promise<DesktopNotificationOperation> {
     return this.request<DesktopNotificationOperation>({
       requestId: this.nextRequestId(),
       method: "recordRendererError",
-      params: { library, report, occurredAt, occurrenceIncrement }
+      params: { library, report, reportId, occurredAt }
     });
   }
 

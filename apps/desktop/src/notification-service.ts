@@ -88,8 +88,8 @@ export interface NotificationServiceStore {
   recordRendererError(
     library: NotificationLibraryIdentity,
     report: RendererErrorReport,
-    occurredAt: number,
-    occurrenceIncrement?: number
+    reportId: string,
+    occurredAt: number
   ): Promise<DesktopNotificationOperation>;
   hasLegacyImport(libraryId: string): Promise<boolean>;
   importLegacyOperations(
@@ -107,6 +107,7 @@ export interface NotificationServiceOptions {
   fetch?: typeof fetch;
   now?: () => number;
   retryDelay?: (delayMs: number, signal: AbortSignal) => Promise<void>;
+  createReportId?: () => string;
 }
 
 interface ActiveLibrary {
@@ -126,8 +127,8 @@ interface PendingOutboxBatch {
 interface PendingRendererError {
   library: NotificationLibraryIdentity;
   report: RendererErrorReport;
+  reportIds: string[];
   occurredAt: number;
-  occurrenceIncrement: number;
 }
 
 interface PendingActionError {
@@ -332,6 +333,7 @@ export class NotificationService {
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private readonly retryDelay: (delayMs: number, signal: AbortSignal) => Promise<void>;
+  private readonly createReportId: () => string;
   private active: ActiveLibrary | null = null;
   private activeGeneration = 0;
   private closed = false;
@@ -361,6 +363,7 @@ export class NotificationService {
     this.fetchImpl = options.fetch ?? fetch;
     this.now = options.now ?? Date.now;
     this.retryDelay = options.retryDelay ?? abortableDelay;
+    this.createReportId = options.createReportId ?? randomUUID;
     this.health = {
       state: this.store ? "healthy" : "degraded",
       libraryId: null,
@@ -482,16 +485,27 @@ export class NotificationService {
   }
 
   async reportRendererError(report: RendererErrorReport): Promise<void> {
-    return this.enqueueStoreMutation(() => this.reportRendererErrorNow(report));
+    const reportId = this.createReportId();
+    if (typeof reportId !== "string" || reportId.length === 0) {
+      throw new TypeError("renderer report id must be a non-empty string");
+    }
+    const occurredAt = this.now();
+    return this.enqueueStoreMutation(() =>
+      this.reportRendererErrorNow(report, reportId, occurredAt)
+    );
   }
 
-  private async reportRendererErrorNow(report: RendererErrorReport): Promise<void> {
+  private async reportRendererErrorNow(
+    report: RendererErrorReport,
+    reportId: string,
+    occurredAt: number
+  ): Promise<void> {
     const library = { id: report.libraryId, name: report.libraryName };
     if (this.store) {
       const store = this.store;
       let committed: DesktopNotificationOperation | null = null;
       try {
-        committed = await store.recordRendererError(library, report, this.now());
+        committed = await store.recordRendererError(library, report, reportId, occurredAt);
       } catch (error) {
         await this.markStoreUnavailable(error);
       }
@@ -509,15 +523,17 @@ export class NotificationService {
         return;
       }
     }
-    const value = this.recordFallbackRendererError(library, report);
-    const key = libraryKey(library.id, value.operationId);
-    if (!this.fallbackOperations.has(key)) return;
+    const operationId = rendererErrorOperationId(library.id, report);
+    const key = libraryKey(library.id, operationId);
     const pending = this.pendingRendererErrors.get(key);
+    if (pending?.reportIds.includes(reportId)) return;
+    this.recordFallbackRendererError(library, report, occurredAt);
+    if (!this.fallbackOperations.has(key)) return;
     this.pendingRendererErrors.set(key, {
       library,
       report,
-      occurredAt: this.now(),
-      occurrenceIncrement: (pending?.occurrenceIncrement ?? 0) + 1
+      reportIds: [...(pending?.reportIds ?? []), reportId],
+      occurredAt: Math.max(pending?.occurredAt ?? occurredAt, occurredAt)
     });
     this.emitSnapshot();
   }
@@ -1305,12 +1321,12 @@ export class NotificationService {
 
   private recordFallbackRendererError(
     library: NotificationLibraryIdentity,
-    report: RendererErrorReport
+    report: RendererErrorReport,
+    occurredAt: number
   ): DesktopNotificationOperation {
     const operationId = rendererErrorOperationId(library.id, report);
     const key = libraryKey(library.id, operationId);
     const existing = this.fallbackOperations.get(key);
-    const occurredAt = this.now();
     const occurrenceCount = (existing?.occurrenceCount ?? 0) + 1;
     const value: DesktopNotificationOperation = {
       operationId,

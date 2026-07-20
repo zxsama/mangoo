@@ -72,6 +72,10 @@ function assertNullableString(value: unknown, label: string): void {
   }
 }
 
+function rendererReportMarkerId(reportId: string): string {
+  return `renderer-report:${reportId}`;
+}
+
 function assertSafeInteger(value: unknown, label: string, minimum = 0): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < minimum) {
     throw new RangeError(`${label} must be a safe integer greater than or equal to ${minimum}`);
@@ -639,8 +643,8 @@ class NotificationStoreDatabase {
   recordRendererError(
     library: NotificationLibraryIdentity,
     report: RendererErrorReport,
-    occurredAt: number,
-    occurrenceIncrement: number
+    reportIds: string[],
+    occurredAt: number
   ): DesktopNotificationOperation {
     validateLibrary(library);
     assertObject(report, "renderer error report");
@@ -654,15 +658,39 @@ class NotificationStoreDatabase {
       assertString(value, `renderer error ${name}`);
     }
     assertNullableString(report.detail, "renderer error detail");
+    if (!Array.isArray(reportIds) || reportIds.length === 0) {
+      throw new TypeError("renderer reportIds must be a non-empty array");
+    }
+    const uniqueReportIds = [...new Set(reportIds)];
+    for (const reportId of uniqueReportIds) assertString(reportId, "renderer reportId");
     assertSafeInteger(occurredAt, "renderer error occurredAt");
-    assertSafeInteger(occurrenceIncrement, "renderer error occurrenceIncrement", 1);
 
     const operationId = `renderer-error:${library.id}:${report.source}:${report.code}:${report.target}`;
     this.database.exec("SAVEPOINT record_renderer_error;");
     try {
+      const markerExists = this.database.prepare(
+        "SELECT 1 FROM local_recovery_batches WHERE batch_id = ?"
+      );
+      const insertMarker = this.database.prepare(
+        "INSERT INTO local_recovery_batches(batch_id, applied_at) VALUES (?, ?)"
+      );
+      let newReportCount = 0;
+      for (const reportId of uniqueReportIds) {
+        const markerId = rendererReportMarkerId(reportId);
+        if (markerExists.get(markerId)) continue;
+        insertMarker.run(markerId, occurredAt);
+        newReportCount += 1;
+      }
       const existing = this.getOperation(library.id, operationId);
+      if (newReportCount === 0) {
+        if (!existing) {
+          throw new Error("renderer report marker exists without its operation");
+        }
+        this.database.exec("RELEASE record_renderer_error;");
+        return existing;
+      }
       const revision = (existing?.revision ?? 0) + 1;
-      const occurrenceCount = (existing?.occurrenceCount ?? 0) + occurrenceIncrement;
+      const occurrenceCount = (existing?.occurrenceCount ?? 0) + newReportCount;
       assertSafeInteger(revision, "renderer error revision", 1);
       assertSafeInteger(occurrenceCount, "renderer error occurrenceCount", 1);
       const operation: NotificationOperationInput = {
@@ -745,8 +773,8 @@ class NotificationStoreDatabase {
         this.recordRendererError(
           pending.library,
           pending.report,
-          pending.occurredAt,
-          pending.occurrenceIncrement
+          pending.reportIds,
+          pending.occurredAt
         );
       }
       for (const summary of batch.thumbnails) this.publishThumbnailSummary(summary);
@@ -902,8 +930,8 @@ function executeRequest(store: NotificationStoreDatabase, request: NotificationS
       return store.recordRendererError(
         request.params.library,
         request.params.report,
-        request.params.occurredAt,
-        request.params.occurrenceIncrement
+        [request.params.reportId],
+        request.params.occurredAt
       );
     case "publishThumbnailSummary":
       store.publishThumbnailSummary(request.params.summary);

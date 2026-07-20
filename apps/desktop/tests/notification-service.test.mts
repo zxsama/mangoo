@@ -131,6 +131,7 @@ class FakeStore implements NotificationServiceStore {
   readonly summaries = new Map<string, ThumbnailCacheSummary>();
   readonly imported = new Set<string>();
   readonly recoveryBatches = new Set<string>();
+  readonly rendererReportIds = new Set<string>();
   readonly calls: string[] = [];
   readonly getOperationCalls: string[] = [];
   cleanupCalls = 0;
@@ -257,12 +258,14 @@ class FakeStore implements NotificationServiceStore {
   ): Promise<boolean> {
     if (this.recoveryBatches.has(batch.batchId)) return false;
     for (const pending of batch.rendererErrors) {
-      await this.recordRendererError(
-        pending.library,
-        pending.report,
-        pending.occurredAt,
-        pending.occurrenceIncrement
-      );
+      for (const reportId of pending.reportIds) {
+        await this.recordRendererError(
+          pending.library,
+          pending.report,
+          reportId,
+          pending.occurredAt
+        );
+      }
     }
     for (const summary of batch.thumbnails) await this.publishThumbnailSummary(summary);
     for (const pending of batch.actionErrors) {
@@ -280,12 +283,17 @@ class FakeStore implements NotificationServiceStore {
   async recordRendererError(
     library: NotificationLibraryIdentity,
     report: RendererErrorReport,
-    occurredAt: number,
-    occurrenceIncrement = 1
+    reportId: string,
+    occurredAt: number
   ): Promise<DesktopNotificationOperation> {
     const operationId = `renderer-error:${library.id}:${report.source}:${report.code}:${report.target}`;
     const key = `${library.id}/${operationId}`;
     const existing = this.operations.get(key);
+    if (this.rendererReportIds.has(reportId)) {
+      if (!existing) throw new Error("renderer report marker exists without its operation");
+      return existing;
+    }
+    this.rendererReportIds.add(reportId);
     const value = operation(operationId, (existing?.revision ?? 0) + 1, "failed", {
       kind: "renderer_error",
       category: "error",
@@ -296,7 +304,7 @@ class FakeStore implements NotificationServiceStore {
       summary: report.message,
       errorCode: report.code,
       errorDetail: report.detail,
-      occurrenceCount: (existing?.occurrenceCount ?? 0) + occurrenceIncrement,
+      occurrenceCount: (existing?.occurrenceCount ?? 0) + 1,
       startedAt: existing?.startedAt ?? occurredAt,
       updatedAt: occurredAt,
       completedAt: occurredAt,
@@ -1397,7 +1405,12 @@ describe("notification service", () => {
       detail: "database busy"
     };
     for (let index = 0; index < 5; index += 1) {
-      await recoveredStore.recordRendererError(LIBRARY_A, report, NOW - 100 + index);
+      await recoveredStore.recordRendererError(
+        LIBRARY_A,
+        report,
+        `recovered-report-${index}`,
+        NOW - 100 + index
+      );
     }
     let opens = 0;
     const service = await createNotificationService({
@@ -1419,6 +1432,77 @@ describe("notification service", () => {
     );
     assert.equal(stored?.occurrenceCount, 7);
     await service.close();
+  });
+
+  it("replays a committed renderer report with the same id after its response is lost", async () => {
+    const databasePath = testDatabasePath();
+    const firstStore = await createNotificationStore({
+      databasePath,
+      workerUrl: TEST_WORKER_URL
+    });
+    let closePromise = Promise.resolve();
+    const lossyStore = new Proxy(firstStore, {
+      get(target, property, receiver) {
+        if (property === "recordRendererError") {
+          return async (...args: unknown[]) => {
+            await Reflect.apply(target.recordRendererError, target, args);
+            throw new Error("worker response lost after commit");
+          };
+        }
+        if (property === "close") {
+          return () => {
+            closePromise = target.close();
+            return closePromise;
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    }) as NotificationServiceStore;
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "renderer",
+      code: "response-lost",
+      target: "folder:7",
+      title: "Response lost",
+      message: "The worker response was lost",
+      detail: null
+    };
+    let recoveredStore: Awaited<ReturnType<typeof createNotificationStore>> | null = null;
+    const service = await createNotificationService({
+      store: lossyStore,
+      openStore: async (signal) => {
+        await closePromise;
+        recoveredStore = await createNotificationStore({
+          databasePath,
+          workerUrl: TEST_WORKER_URL,
+          signal
+        });
+        return recoveredStore;
+      },
+      fetch: async () => response({ items: [], maxSequence: 0 }),
+      createReportId: () => "stable-report-id",
+      now: () => NOW
+    });
+    try {
+      await service.reportRendererError(report);
+      await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+
+      assert.ok(recoveredStore);
+      assert.equal(
+        (
+          await recoveredStore.getOperation(
+            LIBRARY_A.id,
+            rendererErrorOperationIdForTest(report)
+          )
+        )?.occurrenceCount,
+        1,
+        "recovery must not count a report whose transaction already committed"
+      );
+    } finally {
+      await service.close();
+    }
   });
 
   it("runs the one-time legacy import after a degraded store recovers", async () => {
