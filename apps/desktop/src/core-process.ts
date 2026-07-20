@@ -231,6 +231,25 @@ export async function stopCoreProcesses(
   if (firstError !== undefined) throw firstError;
 }
 
+export async function stopCoreProcessHandleAndClear(
+  handle: CoreProcessHandle | null,
+  clear: () => void
+): Promise<void> {
+  if (!handle) return;
+  await handle.stop();
+  clear();
+}
+
+export async function stopCoreProcessesBeforeReplacement(
+  pending: CoreProcessHandle | null,
+  current: CoreProcessHandle | null,
+  clearPending: () => void,
+  clearCurrent: () => void
+): Promise<void> {
+  await stopCoreProcessHandleAndClear(pending, clearPending);
+  await stopCoreProcessHandleAndClear(current, clearCurrent);
+}
+
 export async function stopCoreProcessesAndCloseLogger(
   handles: readonly (CoreProcessHandle | null)[],
   closeLogger: () => Promise<void>

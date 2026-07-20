@@ -438,7 +438,7 @@ if (!startCoreSessionBody) {
   if (!startCoreSessionBody.includes("catch") || !startCoreSessionBody.includes("coreReadyPromise = null")) {
     fail("desktop main must clear pending Core startup state on failure");
   }
-  if (!startCoreSessionBody.includes("pendingProcess?.stop()")) {
+  if (!startCoreSessionBody.includes("await stopPendingCoreProcess()")) {
     fail("desktop main must stop spawned Core process on startup failure");
   }
   if (!startCoreSessionBody.includes("pendingCoreProcess = pendingProcess")) {
@@ -446,6 +446,9 @@ if (!startCoreSessionBody) {
   }
   if (!startCoreSessionBody.includes("pendingCoreProcess = null")) {
     fail("desktop main must clear pending Core process after startup settles");
+  }
+  if (!startCoreSessionBody.includes("cleanupFailed") || !startCoreSessionBody.includes("retaining process for retry")) {
+    fail("desktop main must retain a pending Core process when cleanup fails before retrying startup");
   }
 }
 const shouldRetryBody = functionBody(main, "function shouldRetryAutoCoreStartup(): boolean");
@@ -521,14 +524,37 @@ if (!startupFailureBody) {
   if (!startupFailureBody.includes("console.error") && !startupFailureBody.includes("desktopLogger.error")) {
     fail("desktop startup failure handler must log the failure clearly");
   }
-  if (!startupFailureBody.includes("app.exit(1)")) {
+  if (!startupFailureBody.includes("requestDesktopShutdown(1)")) {
     fail("desktop startup failure handler must exit predictably with a non-zero status");
+  }
+}
+const shutdownBody = functionBody(main, "function requestDesktopShutdown(exitCode: number): void");
+if (!shutdownBody) {
+  fail("desktop main must centralize asynchronous Core shutdown and logger close");
+} else {
+  if (!shutdownBody.includes("await stopDesktopCoreProcesses()")) {
+    fail("desktop shutdown must await pending and active Core process termination");
+  }
+  if (!shutdownBody.includes("await desktopLogger.close()")) {
+    fail("desktop shutdown must close the desktop logger after Core termination");
+  }
+  if (!shutdownBody.includes("app.exit(exitCode)")) {
+    fail("desktop shutdown must exit with the requested status after cleanup");
+  }
+}
+for (const [signature, required] of [
+  ["async function stopPendingCoreProcess(): Promise<void>", "stopCoreProcessHandleAndClear"],
+  ["async function stopDesktopCoreProcesses(): Promise<void>", "stopCoreProcessesBeforeReplacement"]
+]) {
+  const body = functionBody(main, signature);
+  if (!body || !body.includes(required)) {
+    fail(`desktop main must use ${required} for retry-safe Core cleanup`);
   }
 }
 const beforeQuitBody = functionBody(main, 'app.on("before-quit", (event) =>');
 if (!beforeQuitBody) {
   fail("desktop main must handle before-quit cleanup");
-} else if (!beforeQuitBody.includes("stopCoreProcesses")) {
+} else if (!beforeQuitBody.includes("requestDesktopShutdown(0)")) {
   fail("desktop main must stop and await Core processes on before-quit");
 }
 

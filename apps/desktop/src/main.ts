@@ -17,8 +17,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   startCoreProcess,
-  stopCoreProcesses,
-  stopCoreProcessesAndCloseLogger,
+  stopCoreProcessHandleAndClear,
+  stopCoreProcessesBeforeReplacement,
   waitForCoreHealth,
   type CoreProcessHandle
 } from "./core-process.js";
@@ -94,6 +94,8 @@ let coreReadyPromise: Promise<CoreSession> | null = null;
 let cachedRegistry: libraryRegistry.LibraryRegistry | null = null;
 let cachedFfmpegAvailable: boolean | null = null;
 let persisted = false;
+let shutdownFinalized = false;
+let shutdownPromise: Promise<void> | null = null;
 let persistDebounceTimer: NodeJS.Timeout | null = null;
 let mainWindowReadyToShow: Promise<void> | null = null;
 let shellReadyRevealPromise: Promise<boolean> | null = null;
@@ -924,6 +926,16 @@ async function startCoreSession(): Promise<CoreSession> {
     let pendingProcess: CoreProcessHandle | null = null;
 
     try {
+      await stopPendingCoreProcess();
+    } catch (error) {
+      // A failed pending child may still own the bind port. Do not launch a
+      // second child while it is retained for the next switch or shutdown.
+      coreReadyPromise = null;
+      desktopLogger.warn("main", "[megle] pending Core cleanup failed before startup; retaining process for retry:", error);
+      throw error;
+    }
+
+    try {
       const session = await createColdStartSession();
       pendingProcess = startCoreProcess(session, (source, level, message) => {
         desktopLogger.log(source, level, message);
@@ -938,10 +950,24 @@ async function startCoreSession(): Promise<CoreSession> {
       }
       return session;
     } catch (error) {
-      await pendingProcess?.stop();
-      pendingCoreProcess = null;
+      let cleanupFailed = false;
+      if (pendingProcess) {
+        try {
+          await stopPendingCoreProcess();
+        } catch (stopError) {
+          cleanupFailed = true;
+          desktopLogger.warn("main", "[megle] pending Core cleanup failed; retaining process for retry:", stopError);
+        }
+      }
       coreProcess = null;
       coreSession = null;
+
+      // Do not start another child while an unhealthy pending child may still
+      // own the bind port. The next library switch or shutdown retries it.
+      if (cleanupFailed) {
+        coreReadyPromise = null;
+        throw error;
+      }
 
       if (attempt < maxAttempts) {
         desktopLogger.warn(
@@ -989,12 +1015,34 @@ async function createColdStartSession(): Promise<CoreSession> {
 // Gracefully restart Core pointed at a new database file, reusing the same
 // bind address + session token so the renderer keeps its injected coreUrl/token
 // (spec Decision 6). Pushes load phases to the renderer as it goes.
+async function stopPendingCoreProcess(): Promise<void> {
+  const handle = pendingCoreProcess;
+  await stopCoreProcessHandleAndClear(handle, () => {
+    if (pendingCoreProcess === handle) pendingCoreProcess = null;
+  });
+}
+
+async function stopDesktopCoreProcesses(): Promise<void> {
+  const pending = pendingCoreProcess;
+  const current = coreProcess;
+  await stopCoreProcessesBeforeReplacement(
+    pending,
+    current,
+    () => {
+      if (pendingCoreProcess === pending) pendingCoreProcess = null;
+    },
+    () => {
+      if (coreProcess === current) coreProcess = null;
+    }
+  );
+}
+
 async function restartCoreForLibrary(dbPath: string): Promise<void> {
   pushLibraryPhase("starting-core");
   const base = coreSession ?? (await createCoreSession());
-  // Stop the current Core and wait for the port to free up.
-  await coreProcess?.stop();
-  coreProcess = null;
+  // Stop a failed pending Core before the active Core and wait for the port to free up.
+  await stopDesktopCoreProcesses();
+  coreSession = null;
   await waitForPortFree(base.bindAddress);
 
   const session = sessionForDbPath(base, dbPath);
@@ -1006,8 +1054,11 @@ async function restartCoreForLibrary(dbPath: string): Promise<void> {
     pushLibraryPhase("opening-library");
     await waitForCoreHealth(session.baseUrl, session.sessionToken);
   } catch (error) {
-    await handle.stop();
-    pendingCoreProcess = null;
+    try {
+      await stopPendingCoreProcess();
+    } catch (stopError) {
+      desktopLogger.warn("main", "[megle] pending Core cleanup failed after library switch; retaining process:", stopError);
+    }
     throw error;
   }
   coreProcess = handle;
@@ -1454,20 +1505,29 @@ app
 
 function handleDesktopStartupFailure(error: unknown): void {
   desktopLogger.error("main", "[megle] desktop startup failed:", error);
-  void (async () => {
+  requestDesktopShutdown(1);
+}
+
+function requestDesktopShutdown(exitCode: number): void {
+  if (shutdownFinalized || shutdownPromise) return;
+  let run!: Promise<void>;
+  run = (async () => {
     try {
-      await stopCoreProcessesAndCloseLogger(
-        [pendingCoreProcess, coreProcess],
-        () => desktopLogger.close()
-      );
-    } finally {
+      await stopDesktopCoreProcesses();
+      await desktopLogger.close();
       pendingCoreProcess = null;
       coreProcess = null;
       coreReadyPromise = null;
       coreSession = null;
-      app.exit(1);
+      shutdownFinalized = true;
+      app.exit(exitCode);
+    } catch (error) {
+      desktopLogger.error("main", "[megle] Core shutdown failed; retaining process for retry:", error);
+    } finally {
+      if (!shutdownFinalized && shutdownPromise === run) shutdownPromise = null;
     }
   })();
+  shutdownPromise = run;
 }
 
 async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
@@ -1520,21 +1580,16 @@ app.on("before-quit", (event) => {
     void (async () => {
       try {
         await persistWindowState();
+      } catch (error) {
+        desktopLogger.warn("main", "[megle] window state persistence failed during shutdown:", error);
       } finally {
-        const handles = [pendingCoreProcess, coreProcess] as const;
-        pendingCoreProcess = null;
-        coreProcess = null;
-        try {
-          await stopCoreProcessesAndCloseLogger(handles, () => desktopLogger.close());
-        } finally {
-          app.exit(0);
-        }
+        requestDesktopShutdown(0);
       }
     })();
     return;
   }
 
-  void stopCoreProcesses([pendingCoreProcess, coreProcess]);
-  pendingCoreProcess = null;
-  coreProcess = null;
+  if (shutdownFinalized) return;
+  event.preventDefault();
+  requestDesktopShutdown(0);
 });

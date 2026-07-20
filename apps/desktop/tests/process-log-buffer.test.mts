@@ -14,7 +14,9 @@ import {
 import { DesktopLogger } from "../src/desktop-logger.ts";
 import {
   attachCoreProcessLifecycle,
-  createCoreOutputLineSplitter
+  createCoreOutputLineSplitter,
+  stopCoreProcessesBeforeReplacement,
+  type CoreProcessHandle
 } from "../src/core-process.ts";
 import type { ProcessLogEntry } from "../src/notification-types.ts";
 
@@ -276,6 +278,46 @@ test("redacts normalized credential keys, paired JSON values, and raw bearer tok
     buffer.snapshot({})[1]?.message,
     'json={"authToken":"[redacted]"} tail Bearer [redacted]'
   );
+});
+
+test("scans escaped quoted values and global authorization headers without leaking fragments", () => {
+  const fragments = [
+    "abc",
+    "def",
+    "basic-secret",
+    "cookie-secret",
+    "cookie-refresh-secret",
+    "api-secret",
+    "private-secret",
+    "jwt-secret",
+    "session-secret"
+  ];
+  const message = [
+    `prefix Authorization: Basic ${fragments[2]}`,
+    `middle Cookie: sid=${fragments[3]}; refresh=${fragments[4]}; theme=dark`,
+    `middle X-Api-Key: ${fragments[5]}`,
+    `payload={"authToken":"${fragments[0]}\\"${fragments[1]}","privateKey":"${fragments[6]}","jwt":"${fragments[7]}","sessionId":"${fragments[8]}"}`
+  ].join(" | ");
+  const sanitized = sanitizeProcessLogMessage(message);
+
+  for (const fragment of fragments) assert.equal(sanitized.includes(fragment), false);
+  assert.equal(sanitized.includes('"authToken":"[redacted]"'), true);
+  assert.equal(sanitized.includes('"privateKey":"[redacted]"'), true);
+  assert.equal(sanitized.includes('"jwt":"[redacted]"'), true);
+  assert.equal(sanitized.includes('"sessionId":"[redacted]"'), true);
+  assert.equal(sanitized.includes("prefix Authorization: [redacted]"), true);
+  assert.equal(sanitized.includes("middle Cookie: [redacted]"), true);
+  assert.equal(sanitized.includes("middle X-Api-Key: [redacted]"), true);
+
+  const buffer = new ProcessLogBuffer();
+  const line = buffer.append("renderer", "warn", message, {
+    privateKey: fragments[6],
+    jwt: fragments[7],
+    session_id: fragments[8]
+  });
+  assert.ok(line);
+  const serialized = JSON.stringify(line);
+  for (const fragment of fragments) assert.equal(serialized.includes(fragment), false);
 });
 
 test("ProcessLogEntry shares the trace-capable buffer contract", () => {
@@ -618,6 +660,53 @@ test("Core stop timeout rejects and clears stopPromise for a later retry", async
   child.closeOnSignal = true;
   await lifecycle.stop();
   await lifecycle.waitForExit;
+});
+
+test("library replacement retains pending Core after timeout and clears it before the retry start", async () => {
+  let attempts = 0;
+  let pending: CoreProcessHandle | null = {
+    process: null,
+    waitForExit: Promise.resolve(),
+    stop: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("stop timeout");
+    }
+  };
+  let currentStopCalls = 0;
+  const current: CoreProcessHandle = {
+    process: null,
+    waitForExit: Promise.resolve(),
+    stop: async () => {
+      currentStopCalls += 1;
+    }
+  };
+  let clearCount = 0;
+  let currentCleared = false;
+  const stopForLibraryReplacement = async (): Promise<void> => {
+    const pendingAtStart = pending;
+    await stopCoreProcessesBeforeReplacement(
+      pendingAtStart,
+      current,
+      () => {
+        if (pending === pendingAtStart) pending = null;
+        clearCount += 1;
+      },
+      () => {
+        currentCleared = true;
+      }
+    );
+  };
+
+  await assert.rejects(stopForLibraryReplacement(), /stop timeout/);
+  assert.notEqual(pending, null);
+  assert.equal(clearCount, 0);
+  assert.equal(currentStopCalls, 0);
+
+  await stopForLibraryReplacement();
+  assert.equal(pending, null);
+  assert.equal(clearCount, 1);
+  assert.equal(currentStopCalls, 1);
+  assert.equal(currentCleared, true);
 });
 
 test("Windows Core stop requests taskkill and resolves only after child close", async () => {

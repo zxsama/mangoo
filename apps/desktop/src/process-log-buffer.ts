@@ -82,24 +82,6 @@ const REDACTED = "[redacted]";
 const UNREADABLE = "[unreadable]";
 const ACCESSOR = "[accessor]";
 
-const SENSITIVE_TEXT_KEY_SOURCE = String.raw`(?:megle[-_ ]?session(?:[-_ ]?token)?|x[-_ ]?megle[-_ ]?session(?:[-_ ]?token)?|x[-_ ]?session[-_ ]?token|session[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token|auth[-_ ]?token|id[-_ ]?token|csrf[-_ ]?token|client[-_ ]?secret|token|auth|authorization|proxy[-_ ]?authorization|bearer|secret|password|cookie|set[-_ ]?cookie|api[-_ ]?key|x[-_ ]?api[-_ ]?key)`;
-const SECRET_JSON_DOUBLE_PATTERN = new RegExp(
-  `("(?:${SENSITIVE_TEXT_KEY_SOURCE})"\\s*:\\s*")([^"]*)(")`,
-  "gi"
-);
-const SECRET_JSON_SINGLE_PATTERN = new RegExp(
-  `('(?:${SENSITIVE_TEXT_KEY_SOURCE})'\\s*:\\s*')([^']*)(')`,
-  "gi"
-);
-const SECRET_HEADER_PATTERN = new RegExp(
-  `(^|\\r?\\n)(\\s*(?:${SENSITIVE_TEXT_KEY_SOURCE})\\s*:\\s*)([^\\r\\n]*)`,
-  "gim"
-);
-const SECRET_ASSIGNMENT_PATTERN = new RegExp(
-  `((?:${SENSITIVE_TEXT_KEY_SOURCE})\\s*=\\s*)([^\\s,;]+)`,
-  "gi"
-);
-const BEARER_TOKEN_PATTERN = /\b(Bearer\s+)([^\s,;]+)/gi;
 const WINDOWS_PATH_PATTERN = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+/g;
 const UNIX_SENSITIVE_PATH_PATTERN = /(?:\/Users\/|\/home\/|\/private\/var\/|\/tmp\/)[^\s"'`<>]+/gi;
 const SENSITIVE_NORMALIZED_KEYS = new Set([
@@ -115,6 +97,11 @@ const SENSITIVE_NORMALIZED_KEYS = new Set([
   "idtoken",
   "csrftoken",
   "clientsecret",
+  "credential",
+  "credentials",
+  "privatekey",
+  "jwt",
+  "sessionid",
   "token",
   "auth",
   "authorization",
@@ -128,18 +115,170 @@ const SENSITIVE_NORMALIZED_KEYS = new Set([
   "xapikey"
 ]);
 const SENSITIVE_PATH_KEYS = new Set(["path", "filepath", "directory", "rootpath"]);
+const SENSITIVE_HEADER_KEYS = new Set([
+  "authorization",
+  "proxyauthorization",
+  "cookie",
+  "setcookie",
+  "xapikey",
+  "apikey",
+  "meglesession",
+  "meglesessiontoken",
+  "xmeglesession",
+  "xmeglesessiontoken",
+  "xsessiontoken"
+]);
 
 export function sanitizeProcessLogMessage(value: string): string {
   let message = value;
-  message = message.replace(SECRET_JSON_DOUBLE_PATTERN, `$1${REDACTED}$3`);
-  message = message.replace(SECRET_JSON_SINGLE_PATTERN, `$1${REDACTED}$3`);
-  message = message.replace(SECRET_HEADER_PATTERN, `$1$2${REDACTED}`);
-  message = message.replace(BEARER_TOKEN_PATTERN, `$1${REDACTED}`);
-  message = message.replace(SECRET_ASSIGNMENT_PATTERN, `$1${REDACTED}`);
+  message = scanSensitiveKeyValues(message);
+  message = redactAuthorizationSchemes(message);
   message = message.replace(WINDOWS_PATH_PATTERN, REDACTED);
   message = message.replace(UNIX_SENSITIVE_PATH_PATTERN, REDACTED);
   message = message.replace(/\r\n?/g, "\\n");
   return truncateUtf8(message, MAX_MESSAGE_BYTES);
+}
+
+type SensitiveValueMatch = {
+  readonly valueStart: number;
+  readonly valueEnd: number;
+  readonly quote: "'" | '"' | null;
+  readonly closedQuote: boolean;
+};
+
+function scanSensitiveKeyValues(input: string): string {
+  let output = "";
+  let cursor = 0;
+  let index = 0;
+  while (index < input.length) {
+    const match = parseSensitiveValueAt(input, index);
+    if (!match) {
+      index += 1;
+      continue;
+    }
+    output += input.slice(cursor, match.valueStart);
+    if (match.quote) {
+      output += match.quote;
+      output += REDACTED;
+      if (match.closedQuote) output += match.quote;
+    } else {
+      output += REDACTED;
+    }
+    cursor = match.valueEnd;
+    index = match.valueEnd;
+  }
+  return output + input.slice(cursor);
+}
+
+function parseSensitiveValueAt(input: string, start: number): SensitiveValueMatch | null {
+  const first = input[start];
+  let keyEnd = start;
+  let key: string;
+  if (first === '"' || first === "'") {
+    const closing = findQuotedEnd(input, start + 1, first);
+    if (closing < 0) return null;
+    key = input.slice(start + 1, closing);
+    keyEnd = closing + 1;
+  } else {
+    if (!isKeyStart(first) || (start > 0 && isKeyCharacter(input[start - 1]))) return null;
+    keyEnd = start + 1;
+    while (keyEnd < input.length && isKeyCharacter(input[keyEnd])) keyEnd += 1;
+    key = input.slice(start, keyEnd);
+  }
+
+  let separator = keyEnd;
+  while (separator < input.length && isWhitespace(input[separator])) separator += 1;
+  if (input[separator] !== ":" && input[separator] !== "=") return null;
+  if (!isSensitiveKey(key)) return null;
+
+  let valueStart = separator + 1;
+  while (valueStart < input.length && isWhitespace(input[valueStart])) valueStart += 1;
+  const quoteCandidate = input[valueStart];
+  const valueQuote: '"' | "'" | null = quoteCandidate === '"' || quoteCandidate === "'"
+    ? quoteCandidate
+    : null;
+  if (valueQuote) {
+    const closing = findQuotedEnd(input, valueStart + 1, valueQuote);
+    return {
+      valueStart,
+      valueEnd: closing < 0 ? input.length : closing + 1,
+      quote: valueQuote,
+      closedQuote: closing >= 0
+    };
+  }
+
+  const valueEnd = SENSITIVE_HEADER_KEYS.has(normalizeKey(key))
+    ? findHeaderValueEnd(input, valueStart)
+    : findBareValueEnd(input, valueStart);
+  return { valueStart, valueEnd, quote: null, closedQuote: false };
+}
+
+function redactAuthorizationSchemes(input: string): string {
+  const schemePattern = /\b(Bearer|Basic)(\s+)/gi;
+  let output = "";
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = schemePattern.exec(input)) !== null) {
+    const tokenStart = match.index + match[0].length;
+    const tokenEnd = findAuthTokenEnd(input, tokenStart);
+    if (tokenEnd <= tokenStart) continue;
+    output += input.slice(cursor, tokenStart);
+    output += REDACTED;
+    cursor = tokenEnd;
+    schemePattern.lastIndex = tokenEnd;
+  }
+  return output + input.slice(cursor);
+}
+
+function findQuotedEnd(input: string, start: number, quote: string): number {
+  let escaped = false;
+  for (let index = start; index < input.length; index += 1) {
+    const character = input[index];
+    if (escaped) {
+      escaped = false;
+    } else if (character === "\\") {
+      escaped = true;
+    } else if (character === quote) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function findBareValueEnd(input: string, start: number): number {
+  let index = start;
+  while (index < input.length && !isWhitespace(input[index]) && !",;}".includes(input[index])) index += 1;
+  return index;
+}
+
+function findHeaderValueEnd(input: string, start: number): number {
+  let index = start;
+  // A Cookie value may contain several semicolon-separated pairs. Keep the
+  // whole header value covered instead of exposing a later credential pair.
+  while (index < input.length && !"|}\r\n".includes(input[index])) index += 1;
+  return index;
+}
+
+function findAuthTokenEnd(input: string, start: number): number {
+  if (input[start] === '"' || input[start] === "'") {
+    const closing = findQuotedEnd(input, start + 1, input[start]);
+    return closing < 0 ? input.length : closing + 1;
+  }
+  let index = start;
+  while (index < input.length && !isWhitespace(input[index]) && !",;}|".includes(input[index])) index += 1;
+  return index;
+}
+
+function isWhitespace(value: string | undefined): boolean {
+  return value !== undefined && /\s/.test(value);
+}
+
+function isKeyStart(value: string | undefined): boolean {
+  return value !== undefined && /[A-Za-z]/.test(value);
+}
+
+function isKeyCharacter(value: string | undefined): boolean {
+  return value !== undefined && /[A-Za-z0-9_-]/.test(value);
 }
 
 export function sanitizeProcessLogValue(value: unknown): unknown {
