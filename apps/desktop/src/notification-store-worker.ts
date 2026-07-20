@@ -11,12 +11,13 @@ import type {
   NotificationStoreRequest,
   NotificationStoreSerializedError,
   NotificationStoredSnapshot,
+  NotificationSyncState,
   NotificationStoreWorkerMessage,
   RendererErrorReport,
   ThumbnailCacheSummary
 } from "./notification-types.js";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const COMPLETED_RETENTION_LIMIT = 2_000;
 const COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const OPERATION_STATUSES = new Set(["pending", "running", "succeeded", "failed", "cancelled"]);
@@ -37,6 +38,7 @@ interface OperationRow {
   library_id: string;
   library_name: string;
   payload_json: string;
+  action_error_detail?: string | null;
 }
 
 function serializeError(error: unknown): NotificationStoreSerializedError {
@@ -186,7 +188,19 @@ function openDatabase(databasePath: string): DatabaseSync {
           ON operations(status, updated_at DESC);
         CREATE TABLE IF NOT EXISTS sync_cursors (
           library_id TEXT PRIMARY KEY,
-          sequence INTEGER NOT NULL
+          persisted_sequence INTEGER NOT NULL,
+          acked_sequence INTEGER NOT NULL DEFAULT 0,
+          CHECK(acked_sequence <= persisted_sequence)
+        );
+        CREATE TABLE IF NOT EXISTS action_errors (
+          library_id TEXT NOT NULL,
+          operation_id TEXT NOT NULL,
+          operation_revision INTEGER NOT NULL,
+          detail TEXT NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY(library_id, operation_id),
+          FOREIGN KEY(library_id, operation_id)
+            REFERENCES operations(library_id, operation_id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS thumbnail_summaries (
           library_id TEXT PRIMARY KEY,
@@ -207,11 +221,40 @@ function openDatabase(databasePath: string): DatabaseSync {
       throw error;
     }
   }
-  if (version === 1) {
+  if (version > 0 && version < SCHEMA_VERSION) {
     database.exec("BEGIN IMMEDIATE;");
     try {
-      database.exec("DROP INDEX IF EXISTS idx_operations_history;");
-      database.exec(HISTORY_INDEX_SQL);
+      const lockedVersion = Number(
+        (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version
+      );
+      if (lockedVersion === 1) {
+        database.exec("DROP INDEX IF EXISTS idx_operations_history;");
+        database.exec(HISTORY_INDEX_SQL);
+      }
+      if (lockedVersion < 3) {
+        database.exec(`
+          ALTER TABLE sync_cursors RENAME TO sync_cursors_legacy;
+          CREATE TABLE sync_cursors (
+            library_id TEXT PRIMARY KEY,
+            persisted_sequence INTEGER NOT NULL,
+            acked_sequence INTEGER NOT NULL DEFAULT 0,
+            CHECK(acked_sequence <= persisted_sequence)
+          );
+          INSERT INTO sync_cursors(library_id, persisted_sequence, acked_sequence)
+            SELECT library_id, sequence, 0 FROM sync_cursors_legacy;
+          DROP TABLE sync_cursors_legacy;
+          CREATE TABLE IF NOT EXISTS action_errors (
+            library_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            operation_revision INTEGER NOT NULL,
+            detail TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(library_id, operation_id),
+            FOREIGN KEY(library_id, operation_id)
+              REFERENCES operations(library_id, operation_id) ON DELETE CASCADE
+          );
+        `);
+      }
       database.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       database.exec("COMMIT;");
     } catch (error) {
@@ -220,6 +263,7 @@ function openDatabase(databasePath: string): DatabaseSync {
       throw error;
     }
   }
+  database.exec("PRAGMA foreign_keys = ON;");
   return database;
 }
 
@@ -261,8 +305,9 @@ class NotificationStoreDatabase {
     }
 
     const cursorStatement = this.database.prepare(`
-      INSERT INTO sync_cursors (library_id, sequence) VALUES (?, ?)
-      ON CONFLICT(library_id) DO UPDATE SET sequence = MAX(sync_cursors.sequence, excluded.sequence)
+      INSERT INTO sync_cursors (library_id, persisted_sequence, acked_sequence) VALUES (?, ?, 0)
+      ON CONFLICT(library_id) DO UPDATE SET
+        persisted_sequence = MAX(sync_cursors.persisted_sequence, excluded.persisted_sequence)
     `);
 
     this.database.exec("BEGIN IMMEDIATE;");
@@ -322,6 +367,10 @@ class NotificationStoreDatabase {
         payload_json = excluded.payload_json
       WHERE excluded.revision > operations.revision
     `);
+    const clearStaleActionError = this.database.prepare(`
+      DELETE FROM action_errors
+      WHERE library_id = ? AND operation_id = ? AND operation_revision < ?
+    `);
     for (const operation of operations) {
       const payloadJson = JSON.stringify(operation);
       const existing = existingStatement.get(library.id, operation.operationId) as
@@ -348,33 +397,76 @@ class NotificationStoreDatabase {
         operation.completedAt,
         payloadJson
       );
+      clearStaleActionError.run(library.id, operation.operationId, operation.revision);
     }
   }
 
   cursor(libraryId: string): number {
+    return this.syncState(libraryId).persistedSequence;
+  }
+
+  syncState(libraryId: string): NotificationSyncState {
     assertString(libraryId, "libraryId");
     const row = this.database
-      .prepare("SELECT sequence FROM sync_cursors WHERE library_id = ?")
-      .get(libraryId) as { sequence: number } | undefined;
-    return row?.sequence ?? 0;
+      .prepare(
+        `SELECT persisted_sequence, acked_sequence
+         FROM sync_cursors WHERE library_id = ?`
+      )
+      .get(libraryId) as
+      | { persisted_sequence: number; acked_sequence: number }
+      | undefined;
+    return {
+      persistedSequence: row?.persisted_sequence ?? 0,
+      ackedSequence: row?.acked_sequence ?? 0
+    };
+  }
+
+  markAcknowledged(libraryId: string, sequence: number): void {
+    assertString(libraryId, "libraryId");
+    assertSafeInteger(sequence, "acknowledged sequence");
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const state = this.syncState(libraryId);
+      if (sequence > state.persistedSequence) {
+        throw new RangeError("acknowledged sequence cannot exceed persisted sequence");
+      }
+      this.database
+        .prepare(
+          `UPDATE sync_cursors
+           SET acked_sequence = MAX(acked_sequence, ?)
+           WHERE library_id = ?`
+        )
+        .run(sequence, libraryId);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
   }
 
   compactSnapshot(): NotificationStoredSnapshot {
     const active = this.database
       .prepare(
-        `SELECT library_id, library_name, payload_json
+        `SELECT operations.library_id, operations.library_name, operations.payload_json,
+                action_errors.detail AS action_error_detail
          FROM operations
-         WHERE status IN ('pending', 'running')
-         ORDER BY updated_at DESC, library_id ASC, operation_id ASC`
+         LEFT JOIN action_errors USING(library_id, operation_id)
+         WHERE operations.status IN ('pending', 'running')
+         ORDER BY operations.updated_at DESC, operations.library_id ASC,
+                  operations.operation_id ASC`
       )
       .all() as unknown as OperationRow[];
     const latestImportantResults = this.database
       .prepare(
-        `SELECT library_id, library_name, payload_json
+        `SELECT operations.library_id, operations.library_name, operations.payload_json,
+                action_errors.detail AS action_error_detail
          FROM operations
-         WHERE status NOT IN ('pending', 'running') AND presentation = 'important'
-         ORDER BY COALESCE(completed_at, updated_at) DESC, updated_at DESC,
-                  library_id ASC, operation_id ASC
+         LEFT JOIN action_errors USING(library_id, operation_id)
+         WHERE operations.status NOT IN ('pending', 'running')
+           AND operations.presentation = 'important'
+         ORDER BY COALESCE(operations.completed_at, operations.updated_at) DESC,
+                  operations.updated_at DESC, operations.library_id ASC,
+                  operations.operation_id ASC
          LIMIT 3`
       )
       .all() as unknown as OperationRow[];
@@ -401,11 +493,11 @@ class NotificationStoreDatabase {
       throw new RangeError("history limit cannot exceed 200");
     }
 
-    const clauses = ["status NOT IN ('pending', 'running')"];
+    const clauses = ["operations.status NOT IN ('pending', 'running')"];
     const bindings: Array<string | number> = [];
     if (query.libraryId !== undefined) {
       assertString(query.libraryId, "history libraryId");
-      clauses.push("library_id = ?");
+      clauses.push("operations.library_id = ?");
       bindings.push(query.libraryId);
     }
     if (query.statuses !== undefined) {
@@ -417,7 +509,7 @@ class NotificationStoreDatabase {
           throw new TypeError("history status is invalid");
         }
       }
-      clauses.push(`status IN (${query.statuses.map(() => "?").join(", ")})`);
+      clauses.push(`operations.status IN (${query.statuses.map(() => "?").join(", ")})`);
       bindings.push(...query.statuses);
     }
     if (query.categories !== undefined) {
@@ -429,7 +521,7 @@ class NotificationStoreDatabase {
           throw new TypeError("history category is invalid");
         }
       }
-      clauses.push(`category IN (${query.categories.map(() => "?").join(", ")})`);
+      clauses.push(`operations.category IN (${query.categories.map(() => "?").join(", ")})`);
       bindings.push(...query.categories);
     }
     if (query.search !== undefined) {
@@ -438,7 +530,7 @@ class NotificationStoreDatabase {
       }
       const search = query.search.trim();
       if (search.length > 0) {
-        clauses.push("(json_extract(payload_json, '$.title') LIKE ? OR json_extract(payload_json, '$.summary') LIKE ?)");
+        clauses.push("(json_extract(operations.payload_json, '$.title') LIKE ? OR json_extract(operations.payload_json, '$.summary') LIKE ?)");
         bindings.push(`%${search}%`, `%${search}%`);
       }
     }
@@ -449,10 +541,14 @@ class NotificationStoreDatabase {
       .get(...bindings) as { total: number };
     const rows = this.database
       .prepare(
-        `SELECT library_id, library_name, payload_json
-         FROM operations WHERE ${where}
-         ORDER BY COALESCE(completed_at, updated_at) DESC, updated_at DESC,
-                  library_id ASC, operation_id ASC
+        `SELECT operations.library_id, operations.library_name, operations.payload_json,
+                action_errors.detail AS action_error_detail
+         FROM operations
+         LEFT JOIN action_errors USING(library_id, operation_id)
+         WHERE ${where}
+         ORDER BY COALESCE(operations.completed_at, operations.updated_at) DESC,
+                  operations.updated_at DESC, operations.library_id ASC,
+                  operations.operation_id ASC
          LIMIT ? OFFSET ?`
       )
       .all(...bindings, limit, offset) as unknown as OperationRow[];
@@ -465,11 +561,64 @@ class NotificationStoreDatabase {
     assertString(operationId, "operationId");
     const row = this.database
       .prepare(
-        `SELECT library_id, library_name, payload_json FROM operations
-         WHERE library_id = ? AND operation_id = ?`
+        `SELECT operations.library_id, operations.library_name, operations.payload_json,
+                action_errors.detail AS action_error_detail
+         FROM operations
+         LEFT JOIN action_errors USING(library_id, operation_id)
+         WHERE operations.library_id = ? AND operations.operation_id = ?`
       )
       .get(libraryId, operationId) as OperationRow | undefined;
     return row ? rowToOperation(row) : null;
+  }
+
+  setOperationActionError(
+    libraryId: string,
+    operationId: string,
+    expectedRevision: number,
+    detail: string | null,
+    updatedAt: number
+  ): DesktopNotificationOperation | null {
+    assertString(libraryId, "libraryId");
+    assertString(operationId, "operationId");
+    assertSafeInteger(expectedRevision, "expectedRevision");
+    assertNullableString(detail, "action error detail");
+    assertSafeInteger(updatedAt, "action error updatedAt");
+
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      const row = this.database
+        .prepare(
+          `SELECT revision FROM operations
+           WHERE library_id = ? AND operation_id = ?`
+        )
+        .get(libraryId, operationId) as { revision: number } | undefined;
+      if (!row || row.revision !== expectedRevision) {
+        this.database.exec("COMMIT;");
+        return null;
+      }
+      if (detail === null) {
+        this.database
+          .prepare("DELETE FROM action_errors WHERE library_id = ? AND operation_id = ?")
+          .run(libraryId, operationId);
+      } else {
+        this.database
+          .prepare(
+            `INSERT INTO action_errors(
+               library_id, operation_id, operation_revision, detail, updated_at
+             ) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(library_id, operation_id) DO UPDATE SET
+               operation_revision = excluded.operation_revision,
+               detail = excluded.detail,
+               updated_at = excluded.updated_at`
+          )
+          .run(libraryId, operationId, expectedRevision, detail, updatedAt);
+      }
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.database.exec("ROLLBACK;");
+      throw error;
+    }
+    return this.getOperation(libraryId, operationId);
   }
 
   recordRendererError(
@@ -613,8 +762,10 @@ class NotificationStoreDatabase {
 }
 
 function rowToOperation(row: OperationRow): DesktopNotificationOperation {
+  const operation = JSON.parse(row.payload_json) as NotificationOperationInput;
   return {
-    ...(JSON.parse(row.payload_json) as NotificationOperationInput),
+    ...operation,
+    errorDetail: row.action_error_detail ?? operation.errorDetail,
     libraryId: row.library_id,
     libraryName: row.library_name
   };
@@ -634,12 +785,25 @@ function executeRequest(store: NotificationStoreDatabase, request: NotificationS
       return null;
     case "cursor":
       return store.cursor(request.params.libraryId);
+    case "syncState":
+      return store.syncState(request.params.libraryId);
+    case "markAcknowledged":
+      store.markAcknowledged(request.params.libraryId, request.params.sequence);
+      return null;
     case "compactSnapshot":
       return store.compactSnapshot();
     case "history":
       return store.history(request.params.query);
     case "getOperation":
       return store.getOperation(request.params.libraryId, request.params.operationId);
+    case "setOperationActionError":
+      return store.setOperationActionError(
+        request.params.libraryId,
+        request.params.operationId,
+        request.params.expectedRevision,
+        request.params.detail,
+        request.params.updatedAt
+      );
     case "recordRendererError":
       return store.recordRendererError(
         request.params.library,
@@ -666,9 +830,12 @@ const REQUEST_METHODS = new Set<NotificationStoreRequest["method"]>([
   "applyOutboxBatch",
   "upsertOperations",
   "cursor",
+  "syncState",
+  "markAcknowledged",
   "compactSnapshot",
   "history",
   "getOperation",
+  "setOperationActionError",
   "recordRendererError",
   "publishThumbnailSummary",
   "hasLegacyImport",

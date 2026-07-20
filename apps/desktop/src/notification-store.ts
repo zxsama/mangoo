@@ -13,6 +13,7 @@ import type {
   NotificationStoreRequest,
   NotificationStoreSerializedError,
   NotificationStoredSnapshot,
+  NotificationSyncState,
   NotificationStoreWorkerMessage,
   RendererErrorReport,
   ThumbnailCacheSummary
@@ -114,6 +115,22 @@ export class NotificationStore {
     });
   }
 
+  async syncState(libraryId: string): Promise<NotificationSyncState> {
+    return this.request<NotificationSyncState>({
+      requestId: this.nextRequestId(),
+      method: "syncState",
+      params: { libraryId }
+    });
+  }
+
+  async markAcknowledged(libraryId: string, sequence: number): Promise<void> {
+    await this.request<void>({
+      requestId: this.nextRequestId(),
+      method: "markAcknowledged",
+      params: { libraryId, sequence }
+    });
+  }
+
   async upsertOperations(
     library: NotificationLibraryIdentity,
     operations: NotificationOperationInput[]
@@ -149,6 +166,20 @@ export class NotificationStore {
       requestId: this.nextRequestId(),
       method: "getOperation",
       params: { libraryId, operationId }
+    });
+  }
+
+  async setOperationActionError(
+    libraryId: string,
+    operationId: string,
+    expectedRevision: number,
+    detail: string | null,
+    updatedAt = Date.now()
+  ): Promise<DesktopNotificationOperation | null> {
+    return this.request<DesktopNotificationOperation | null>({
+      requestId: this.nextRequestId(),
+      method: "setOperationActionError",
+      params: { libraryId, operationId, expectedRevision, detail, updatedAt }
     });
   }
 

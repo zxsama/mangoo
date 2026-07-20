@@ -7,9 +7,11 @@ import type {
   NotificationHistoryQuery,
   NotificationLibraryIdentity,
   NotificationOperationInput,
+  NotificationRetentionResult,
   NotificationStoreEvent,
   NotificationStoredSnapshot,
   NotificationSyncHealth,
+  NotificationSyncState,
   RendererErrorReport,
   ThumbnailCacheSummary
 } from "./notification-types.js";
@@ -17,7 +19,9 @@ import type {
 const OUTBOX_LIMIT = 200;
 const OUTBOX_WAIT_MS = 30_000;
 const LEGACY_PAGE_LIMIT = 200;
+const LEGACY_LOGICAL_LIMIT = 2_000;
 const LEGACY_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const RETENTION_CADENCE_MS = 5 * 60 * 1_000;
 const FALLBACK_OPERATION_LIMIT = 500;
 const MIN_RETRY_MS = 250;
 const MAX_RETRY_MS = 5_000;
@@ -39,11 +43,20 @@ export interface NotificationServiceStore {
     operations: NotificationOperationInput[]
   ): Promise<void>;
   cursor(libraryId: string): Promise<number>;
+  syncState(libraryId: string): Promise<NotificationSyncState>;
+  markAcknowledged(libraryId: string, sequence: number): Promise<void>;
   compactSnapshot(): Promise<NotificationStoredSnapshot>;
   history(query: NotificationHistoryQuery): Promise<NotificationHistoryPage>;
   getOperation(
     libraryId: string,
     operationId: string
+  ): Promise<DesktopNotificationOperation | null>;
+  setOperationActionError(
+    libraryId: string,
+    operationId: string,
+    expectedRevision: number,
+    detail: string | null,
+    updatedAt?: number
   ): Promise<DesktopNotificationOperation | null>;
   publishThumbnailSummary(summary: ThumbnailCacheSummary): Promise<void>;
   recordRendererError(
@@ -54,6 +67,7 @@ export interface NotificationServiceStore {
   ): Promise<DesktopNotificationOperation>;
   hasLegacyImport(libraryId: string): Promise<boolean>;
   markLegacyImported(libraryId: string, importedAt: number): Promise<void>;
+  cleanupRetention(now: number): Promise<NotificationRetentionResult>;
   close?(): Promise<void>;
 }
 
@@ -94,6 +108,13 @@ interface LegacyFileOperation {
   createdAt: number;
   finishedAt: number | null;
   error: string | null;
+  operationGroupId?: string | null;
+}
+
+interface PendingActionError {
+  operation: DesktopNotificationOperation;
+  detail: string | null;
+  updatedAt: number;
 }
 
 interface LegacyFileOperationPage {
@@ -195,6 +216,17 @@ function validateOutboxOperation(value: unknown): NotificationOperationInput {
   return operation as NotificationOperationInput;
 }
 
+interface LegacyOperationAggregate {
+  operationId: string;
+  operation: LegacyFileOperation["operation"];
+  total: number;
+  succeeded: number;
+  failed: number;
+  startedAt: number;
+  completedAt: number;
+  firstError: string | null;
+}
+
 function validateHistoryQuery(query: NotificationHistoryQuery): void {
   if (!query || typeof query !== "object") throw new TypeError("history query must be an object");
   const limit = query.limit ?? 50;
@@ -250,15 +282,17 @@ export class NotificationService {
   private storedSnapshot = emptyStoredSnapshot();
   private health: NotificationSyncHealth;
   private readonly listeners = new Set<(snapshot: NotificationCompactSnapshot) => void>();
-  private readonly lastKnownCursors = new Map<string, number>();
-  private readonly pendingAcknowledgements = new Map<string, number>();
   private readonly pendingOutbox = new Map<string, PendingOutboxBatch>();
   private readonly fallbackOperations = new Map<string, DesktopNotificationOperation>();
   private readonly fallbackThumbnails = new Map<string, ThumbnailCacheSummary>();
   private readonly fallbackLibraries = new Map<string, NotificationLibraryIdentity>();
   private readonly pendingRendererErrors = new Map<string, PendingRendererError>();
   private readonly pendingLocalThumbnails = new Map<string, ThumbnailCacheSummary>();
+  private readonly pendingActionErrors = new Map<string, PendingActionError>();
   private readonly legacyImports = new Map<string, Promise<void>>();
+  private readonly fallbackActionBaseDetails = new Map<string, string | null>();
+  private lastRetentionAt: number | null = null;
+  private retentionPromise: Promise<void> | null = null;
   private lifecycleTail: Promise<void> = Promise.resolve();
 
   constructor(options: NotificationServiceOptions) {
@@ -285,6 +319,7 @@ export class NotificationService {
     }
     if (!this.store) return;
     try {
+      await this.cleanupRetentionIfDue(this.store, true);
       this.storedSnapshot = await this.store.compactSnapshot();
       this.setHealth("healthy", null, null, false);
     } catch (error) {
@@ -390,12 +425,25 @@ export class NotificationService {
     const library = { id: report.libraryId, name: report.libraryName };
     this.fallbackLibraries.set(library.id, library);
     if (this.store) {
+      const store = this.store;
+      let committed: DesktopNotificationOperation | null = null;
       try {
-        await this.store.recordRendererError(library, report, this.now());
-        await this.refreshStoredSnapshot();
-        return;
+        committed = await store.recordRendererError(library, report, this.now());
       } catch (error) {
         await this.markStoreUnavailable(error);
+      }
+      if (committed) {
+        if (this.store === store) {
+          try {
+            await this.cleanupRetentionIfDue(store);
+          } catch (error) {
+            await this.markStoreUnavailable(error);
+          }
+        }
+        if (this.store === store && (await this.refreshStoredSnapshot())) return;
+        this.upsertFallbackOperation(committed);
+        this.emitSnapshot();
+        return;
       }
     }
     const value = this.recordFallbackRendererError(library, report);
@@ -414,12 +462,26 @@ export class NotificationService {
     const library = { id: summary.libraryId, name: summary.libraryName };
     this.fallbackLibraries.set(library.id, library);
     if (this.store) {
+      const store = this.store;
+      let committed = false;
       try {
-        await this.store.publishThumbnailSummary(summary);
-        await this.refreshStoredSnapshot();
-        return;
+        await store.publishThumbnailSummary(summary);
+        committed = true;
       } catch (error) {
         await this.markStoreUnavailable(error);
+      }
+      if (committed) {
+        if (this.store === store) {
+          try {
+            await this.cleanupRetentionIfDue(store);
+          } catch (error) {
+            await this.markStoreUnavailable(error);
+          }
+        }
+        if (this.store === store && (await this.refreshStoredSnapshot())) return;
+        this.fallbackThumbnails.set(summary.libraryId, summary);
+        this.emitSnapshot();
+        return;
       }
     }
     this.fallbackThumbnails.set(summary.libraryId, summary);
@@ -448,7 +510,12 @@ export class NotificationService {
     while (!active.controller.signal.aborted && this.active === active) {
       try {
         await this.runOneDrain(active.library, active.session, active.controller.signal);
-        delayMs = MIN_RETRY_MS;
+        if (this.store) {
+          delayMs = MIN_RETRY_MS;
+        } else {
+          await this.retryDelay(delayMs, active.controller.signal);
+          delayMs = Math.min(delayMs * 2, MAX_RETRY_MS);
+        }
       } catch (error) {
         if (isAbort(error, active.controller.signal)) return;
         this.setHealth(
@@ -470,43 +537,48 @@ export class NotificationService {
     this.fallbackLibraries.set(library.id, library);
 
     const pending = this.pendingOutbox.get(library.id);
-    if (!this.store && pending) {
-      const recovered = await this.tryRecoverStore();
-      if (!recovered) throw new Error("Notification history store is unavailable");
-      void this.ensureLegacyImport(library, session, signal);
-      const recoveredAck = this.pendingAcknowledgements.get(library.id);
-      if (recoveredAck !== undefined && recoveredAck > 0) {
-        await this.acknowledge(session, recoveredAck, signal);
-        this.pendingAcknowledgements.delete(library.id);
-      }
-      return;
-    }
-
     if (!this.store && (await this.tryRecoverStore())) {
       void this.ensureLegacyImport(library, session, signal);
     }
-    const pendingAck = this.pendingAcknowledgements.get(library.id);
-    if (pendingAck !== undefined && pendingAck > 0) {
-      await this.acknowledge(session, pendingAck, signal);
-      this.pendingAcknowledgements.delete(library.id);
-      const acknowledgedBatch = this.pendingOutbox.get(library.id);
-      if (acknowledgedBatch && acknowledgedBatch.maxSequence <= pendingAck) {
-        this.pendingOutbox.delete(library.id);
-      }
+    if (!this.store && pending) {
+      return;
     }
 
-    let cursor = this.lastKnownCursors.get(library.id) ?? 0;
+    let cursor = 0;
     if (this.store) {
+      const store = this.store;
+      let syncState: NotificationSyncState;
       try {
-        cursor = await this.store.cursor(library.id);
-        assertSafeSequence(cursor, "notification cursor");
-        this.lastKnownCursors.set(library.id, cursor);
+        syncState = await store.syncState(library.id);
+        assertSafeSequence(syncState.persistedSequence, "persisted notification cursor");
+        assertSafeSequence(syncState.ackedSequence, "acknowledged notification cursor");
+        if (syncState.ackedSequence > syncState.persistedSequence) {
+          throw new RangeError("acknowledged notification cursor exceeds persisted cursor");
+        }
       } catch (error) {
         await this.markStoreUnavailable(error);
+        throw error;
       }
+      if (syncState.persistedSequence > syncState.ackedSequence) {
+        await this.acknowledge(session, syncState.persistedSequence, signal);
+        try {
+          await store.markAcknowledged(library.id, syncState.persistedSequence);
+          const acknowledgedBatch = this.pendingOutbox.get(library.id);
+          if (
+            acknowledgedBatch &&
+            acknowledgedBatch.maxSequence <= syncState.persistedSequence
+          ) {
+            this.pendingOutbox.delete(library.id);
+          }
+        } catch (error) {
+          await this.markStoreUnavailable(error);
+          throw error;
+        }
+      }
+      cursor = syncState.persistedSequence;
     }
 
-    const page = await this.listOutbox(session, cursor, signal);
+    const page = await this.listOutbox(session, cursor, signal, this.store ? OUTBOX_WAIT_MS : 0);
     if (page.events.length === 0) {
       if (this.store) this.setHealth("healthy", library.id, null);
       return;
@@ -534,28 +606,41 @@ export class NotificationService {
       return;
     }
 
-    this.lastKnownCursors.set(library.id, page.maxSequence);
-    this.pendingAcknowledgements.set(library.id, page.maxSequence);
-    await this.refreshStoredSnapshot();
-    if (!this.store) this.mergeFallbackEvents(library, page.events);
-    await this.acknowledge(session, page.maxSequence, signal);
-    this.pendingAcknowledgements.delete(library.id);
-    if (this.store) {
-      this.setHealth("healthy", library.id, null);
-    } else {
+    try {
+      await this.cleanupRetentionIfDue(this.store);
+    } catch (error) {
+      await this.markStoreUnavailable(error);
+      this.mergeFallbackEvents(library, page.events);
       this.emitSnapshot();
+      return;
     }
+    const refreshed = await this.refreshStoredSnapshot();
+    if (!refreshed || !this.store) {
+      this.mergeFallbackEvents(library, page.events);
+      this.emitSnapshot();
+      return;
+    }
+    await this.acknowledge(session, page.maxSequence, signal);
+    try {
+      await this.store.markAcknowledged(library.id, page.maxSequence);
+    } catch (error) {
+      await this.markStoreUnavailable(error);
+      throw error;
+    }
+    this.pendingOutbox.delete(library.id);
+    this.setHealth("healthy", library.id, null);
   }
 
   private async listOutbox(
     session: NotificationCoreSession,
     afterSequence: number,
-    signal: AbortSignal
+    signal: AbortSignal,
+    waitMs = OUTBOX_WAIT_MS
   ): Promise<{ events: NotificationStoreEvent[]; maxSequence: number }> {
     const query = new URLSearchParams({
       afterSequence: String(afterSequence),
       limit: String(OUTBOX_LIMIT),
-      waitMs: String(OUTBOX_WAIT_MS)
+      waitMs: String(waitMs)
     });
     const body = await this.requestJson(
       `${session.baseUrl}/notifications/outbox?${query}`,
@@ -591,12 +676,20 @@ export class NotificationService {
     maxSequence: number,
     signal: AbortSignal
   ): Promise<void> {
-    await this.requestJson(`${session.baseUrl}/notifications/outbox/ack`, session, {
+    const body = await this.requestJson(`${session.baseUrl}/notifications/outbox/ack`, session, {
       method: "POST",
       signal,
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ maxSequence })
     });
+    const acknowledgedThrough =
+      body && typeof body === "object"
+        ? (body as { acknowledgedThrough?: unknown }).acknowledgedThrough
+        : undefined;
+    assertSafeSequence(acknowledgedThrough, "acknowledged notification sequence");
+    if (acknowledgedThrough < maxSequence) {
+      throw new RangeError("Core acknowledged below the requested notification sequence");
+    }
   }
 
   private async requestJson(
@@ -643,29 +736,62 @@ export class NotificationService {
     signal: AbortSignal
   ): Promise<void> {
     if (!this.store) return;
-    if (await this.store.hasLegacyImport(library.id)) return;
+    const store = this.store;
+    if (await store.hasLegacyImport(library.id)) return;
 
     const cutoff = this.now() - LEGACY_RETENTION_MS;
+    const aggregates = new Map<string, LegacyOperationAggregate>();
     let cursor: string | null = null;
+    let reachedLogicalLimit = false;
     while (!signal.aborted) {
       const query = new URLSearchParams({ limit: String(LEGACY_PAGE_LIMIT) });
       if (cursor) query.set("cursor", cursor);
       const body = await this.requestJson(`${session.baseUrl}/file-ops?${query}`, session, { signal });
       const page = this.parseLegacyPage(body);
       const eligible = page.items.filter((item) => item.createdAt >= cutoff);
-      if (eligible.length > 0) {
-        await this.store.upsertOperations(
-          library,
-          eligible.map((item) => this.legacyOperation(item))
-        );
+      for (const item of eligible) {
+        const aggregateKey = item.operationGroupId
+          ? `group:${item.operationGroupId}`
+          : `batch:${item.operation}`;
+        const existing = aggregates.get(aggregateKey);
+        if (!existing && item.operationGroupId && aggregates.size >= LEGACY_LOGICAL_LIMIT) {
+          reachedLogicalLimit = true;
+          break;
+        }
+        const completedAt = item.finishedAt ?? item.createdAt;
+        aggregates.set(aggregateKey, {
+          operationId:
+            item.operationGroupId ?? `legacy-import:${library.id}:${item.operation}`,
+          operation: existing?.operation ?? item.operation,
+          total: (existing?.total ?? 0) + 1,
+          succeeded: (existing?.succeeded ?? 0) + (item.status === "succeeded" ? 1 : 0),
+          failed: (existing?.failed ?? 0) + (item.status === "failed" ? 1 : 0),
+          startedAt: Math.min(existing?.startedAt ?? item.createdAt, item.createdAt),
+          completedAt: Math.max(existing?.completedAt ?? completedAt, completedAt),
+          firstError: existing?.firstError ?? item.error
+        });
       }
       const reachedCutoff = page.items.some((item) => item.createdAt < cutoff);
-      if (reachedCutoff || !page.nextCursor || page.items.length === 0) break;
+      if (
+        reachedLogicalLimit ||
+        reachedCutoff ||
+        !page.nextCursor ||
+        page.items.length === 0
+      ) {
+        break;
+      }
       cursor = page.nextCursor;
     }
     if (signal.aborted) throw signal.reason;
-    await this.store.markLegacyImported(library.id, this.now());
-    await this.refreshStoredSnapshot();
+    const operations = [...aggregates.values()].map((aggregate) =>
+      this.legacyOperation(aggregate)
+    );
+    for (let index = 0; index < operations.length; index += LEGACY_PAGE_LIMIT) {
+      await store.upsertOperations(library, operations.slice(index, index + LEGACY_PAGE_LIMIT));
+    }
+    await store.markLegacyImported(library.id, this.now());
+    await this.cleanupRetentionIfDue(store);
+    if (this.store === store) await this.refreshStoredSnapshot();
   }
 
   private parseLegacyPage(body: unknown): LegacyFileOperationPage {
@@ -695,46 +821,53 @@ export class NotificationService {
       if (item.error !== null && typeof item.error !== "string") {
         throw new TypeError("invalid legacy file operation error");
       }
+      if (
+        item.operationGroupId !== null &&
+        item.operationGroupId !== undefined &&
+        (typeof item.operationGroupId !== "string" || item.operationGroupId.length === 0)
+      ) {
+        throw new TypeError("invalid legacy operationGroupId");
+      }
       return item as LegacyFileOperation;
     });
     return { items, nextCursor: nextCursor ?? null };
   }
 
-  private legacyOperation(item: LegacyFileOperation): NotificationOperationInput {
-    const completedAt = item.finishedAt ?? item.createdAt;
+  private legacyOperation(aggregate: LegacyOperationAggregate): NotificationOperationInput {
     const labels: Record<LegacyFileOperation["operation"], string> = {
       rename: "Rename",
       move: "Move",
       delete_recycle: "Move to recycle bin",
       delete_permanent: "Delete permanently"
     };
+    const status = aggregate.failed > 0 ? "failed" : "succeeded";
     return {
-      operationId: `legacy-file-op:${item.id}`,
-      revision: 1,
-      kind: item.operation,
+      operationId: aggregate.operationId,
+      revision: 0,
+      kind: aggregate.operation,
       category: "file_operation",
       origin: "user",
-      presentation: "important",
-      status: item.status,
+      presentation: "history_only",
+      status,
       phase: "completed",
-      title: labels[item.operation],
-      summary: item.targetPath ? `${item.sourcePath} -> ${item.targetPath}` : item.sourcePath,
+      title: labels[aggregate.operation],
+      summary: `${aggregate.succeeded} succeeded, ${aggregate.failed} failed (${aggregate.total} total)`,
       taskId: null,
       rootId: null,
       folderId: null,
       fileId: null,
-      currentValue: 1,
-      totalValue: 1,
+      currentValue: aggregate.total,
+      totalValue: aggregate.total,
       unit: "items",
-      errorCode: item.status === "failed" ? "legacy_file_operation_failed" : null,
-      errorDetail: item.error,
+      errorCode: status === "failed" ? "legacy_file_operation_failed" : null,
+      errorDetail: aggregate.firstError,
       cancellable: false,
       retryable: false,
       attempt: 1,
       occurrenceCount: 1,
-      startedAt: item.createdAt,
-      updatedAt: completedAt,
-      completedAt
+      startedAt: aggregate.startedAt,
+      updatedAt: aggregate.completedAt,
+      completedAt: aggregate.completedAt
     };
   }
 
@@ -763,10 +896,63 @@ export class NotificationService {
         active.session,
         { method: "POST" }
       );
+      await this.persistActionError(operation, null);
       return { ok: true, message: null };
     } catch (error) {
-      return { ok: false, message: errorMessage(error) };
+      const message = errorMessage(error);
+      await this.persistActionError(operation, message);
+      return { ok: false, message };
     }
+  }
+
+  private async persistActionError(
+    operation: DesktopNotificationOperation,
+    detail: string | null
+  ): Promise<void> {
+    const key = libraryKey(operation.libraryId, operation.operationId);
+    const updatedAt = this.now();
+    if (this.store) {
+      const store = this.store;
+      try {
+        const updated = await store.setOperationActionError(
+          operation.libraryId,
+          operation.operationId,
+          operation.revision,
+          detail,
+          updatedAt
+        );
+        if (updated) {
+          try {
+            await this.cleanupRetentionIfDue(store);
+          } catch (error) {
+            await this.markStoreUnavailable(error);
+          }
+          if (this.store === store && (await this.refreshStoredSnapshot())) return;
+          this.fallbackActionBaseDetails.delete(key);
+          this.upsertFallbackOperation(updated);
+          this.emitSnapshot();
+        }
+        return;
+      } catch (error) {
+        await this.markStoreUnavailable(error);
+      }
+    }
+    if (detail === null) {
+      const baseDetail = this.fallbackActionBaseDetails.has(key)
+        ? this.fallbackActionBaseDetails.get(key) ?? null
+        : operation.errorDetail;
+      this.fallbackActionBaseDetails.delete(key);
+      this.upsertFallbackOperation({ ...operation, errorDetail: baseDetail });
+    } else {
+      const baseDetail = this.fallbackActionBaseDetails.has(key)
+        ? this.fallbackActionBaseDetails.get(key) ?? null
+        : operation.errorDetail;
+      this.fallbackActionBaseDetails.delete(key);
+      this.upsertFallbackOperation({ ...operation, errorDetail: detail });
+      this.fallbackActionBaseDetails.set(key, baseDetail);
+    }
+    this.pendingActionErrors.set(key, { operation, detail, updatedAt });
+    this.emitSnapshot();
   }
 
   private async findOperation(
@@ -789,8 +975,9 @@ export class NotificationService {
     let store: NotificationServiceStore | null = null;
     try {
       store = await this.openStore();
-      await this.flushPendingLocalState(store);
       await this.flushPendingOutboxState(store);
+      await this.flushPendingLocalState(store);
+      await this.cleanupRetentionIfDue(store, true);
       this.store = store;
       this.storedSnapshot = await store.compactSnapshot();
     } catch (error) {
@@ -848,6 +1035,29 @@ export class NotificationService {
         throw error;
       }
     }
+    while (this.pendingActionErrors.size > 0) {
+      const entry = this.pendingActionErrors.entries().next().value as
+        | [string, PendingActionError]
+        | undefined;
+      if (!entry) break;
+      const [key, pending] = entry;
+      this.pendingActionErrors.delete(key);
+      try {
+        await store.setOperationActionError(
+          pending.operation.libraryId,
+          pending.operation.operationId,
+          pending.operation.revision,
+          pending.detail,
+          pending.updatedAt
+        );
+      } catch (error) {
+        const newer = this.pendingActionErrors.get(key);
+        if (!newer || pending.updatedAt > newer.updatedAt) {
+          this.pendingActionErrors.set(key, pending);
+        }
+        throw error;
+      }
+    }
   }
 
   private async flushPendingOutboxState(store: NotificationServiceStore): Promise<void> {
@@ -856,19 +1066,47 @@ export class NotificationService {
       await store.applyOutboxBatch(batch.library, batch.events, batch.maxSequence);
     }
     for (const batch of pending) {
-      this.lastKnownCursors.set(batch.library.id, batch.maxSequence);
-      this.pendingAcknowledgements.set(batch.library.id, batch.maxSequence);
       this.pendingOutbox.delete(batch.library.id);
     }
   }
 
-  private async refreshStoredSnapshot(): Promise<void> {
-    if (!this.store) return;
+  private async refreshStoredSnapshot(): Promise<boolean> {
+    if (!this.store) return false;
     try {
       this.storedSnapshot = await this.store.compactSnapshot();
       this.emitSnapshot();
+      return true;
     } catch (error) {
       await this.markStoreUnavailable(error);
+      return false;
+    }
+  }
+
+  private async cleanupRetentionIfDue(
+    store: NotificationServiceStore,
+    force = false
+  ): Promise<void> {
+    const now = this.now();
+    if (
+      !force &&
+      this.lastRetentionAt !== null &&
+      now - this.lastRetentionAt < RETENTION_CADENCE_MS
+    ) {
+      return;
+    }
+    if (this.retentionPromise) {
+      await this.retentionPromise;
+      return;
+    }
+    const cleanup = (async () => {
+      await store.cleanupRetention(now);
+      this.lastRetentionAt = now;
+    })();
+    this.retentionPromise = cleanup;
+    try {
+      await cleanup;
+    } finally {
+      if (this.retentionPromise === cleanup) this.retentionPromise = null;
     }
   }
 
@@ -973,6 +1211,12 @@ export class NotificationService {
     const key = libraryKey(operation.libraryId, operation.operationId);
     const existing = this.fallbackOperations.get(key);
     if (existing && operation.revision < existing.revision) return;
+    if (existing && operation.revision > existing.revision) {
+      this.fallbackActionBaseDetails.delete(key);
+      this.pendingActionErrors.delete(key);
+    } else if (existing && this.fallbackActionBaseDetails.has(key)) {
+      operation = { ...operation, errorDetail: existing.errorDetail };
+    }
     this.fallbackOperations.delete(key);
     this.fallbackOperations.set(key, operation);
     while (this.fallbackOperations.size > FALLBACK_OPERATION_LIMIT) {
@@ -983,6 +1227,8 @@ export class NotificationService {
       if (typeof keyToDelete !== "string") break;
       this.fallbackOperations.delete(keyToDelete);
       this.pendingRendererErrors.delete(keyToDelete);
+      this.pendingActionErrors.delete(keyToDelete);
+      this.fallbackActionBaseDetails.delete(keyToDelete);
     }
   }
 
@@ -1044,6 +1290,7 @@ export class NotificationService {
   private clearFallbackFromDurableState(): void {
     this.fallbackOperations.clear();
     this.fallbackThumbnails.clear();
+    this.fallbackActionBaseDetails.clear();
   }
 
   private setHealth(

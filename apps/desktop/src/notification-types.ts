@@ -53,6 +53,11 @@ export interface NotificationStoreEvent {
   operation: NotificationOperationInput;
 }
 
+export interface NotificationSyncState {
+  persistedSequence: number;
+  ackedSequence: number;
+}
+
 export interface ThumbnailCacheSummary {
   libraryId: string;
   libraryName: string;
@@ -148,12 +153,29 @@ export type NotificationStoreRequest =
       };
     }
   | { requestId: string; method: "cursor"; params: { libraryId: string } }
+  | { requestId: string; method: "syncState"; params: { libraryId: string } }
+  | {
+      requestId: string;
+      method: "markAcknowledged";
+      params: { libraryId: string; sequence: number };
+    }
   | { requestId: string; method: "compactSnapshot"; params: Record<string, never> }
   | { requestId: string; method: "history"; params: { query: NotificationHistoryQuery } }
   | {
       requestId: string;
       method: "getOperation";
       params: { libraryId: string; operationId: string };
+    }
+  | {
+      requestId: string;
+      method: "setOperationActionError";
+      params: {
+        libraryId: string;
+        operationId: string;
+        expectedRevision: number;
+        detail: string | null;
+        updatedAt: number;
+      };
     }
   | {
       requestId: string;

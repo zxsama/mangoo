@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, it } from "node:test";
 
 import {
   createNotificationService,
   type NotificationServiceStore
 } from "../src/notification-service.ts";
+import {
+  createNotificationStore,
+  notificationDatabasePath
+} from "../src/notification-store.ts";
 import type {
   DesktopNotificationOperation,
   NotificationCompactSnapshot,
@@ -29,6 +36,11 @@ const SESSION_B = {
   baseUrl: "http://127.0.0.1:48102/api",
   sessionToken: "token-b"
 };
+const TEST_WORKER_URL = new URL("../src/notification-store-worker.ts", import.meta.url);
+
+function testDatabasePath(): string {
+  return notificationDatabasePath(fs.mkdtempSync(path.join(os.tmpdir(), "megle-service-")));
+}
 
 function operation(
   operationId: string,
@@ -86,10 +98,13 @@ function emptySnapshot(): NotificationStoredSnapshot {
 class FakeStore implements NotificationServiceStore {
   readonly operations = new Map<string, DesktopNotificationOperation>();
   readonly cursors = new Map<string, number>();
+  readonly acknowledgements = new Map<string, number>();
   readonly summaries = new Map<string, ThumbnailCacheSummary>();
   readonly imported = new Set<string>();
   readonly calls: string[] = [];
+  cleanupCalls = 0;
   failApply = false;
+  failActionError = false;
   failSnapshot = false;
 
   async applyOutboxBatch(
@@ -121,6 +136,20 @@ class FakeStore implements NotificationServiceStore {
 
   async cursor(libraryId: string): Promise<number> {
     return this.cursors.get(libraryId) ?? 0;
+  }
+
+  async syncState(libraryId: string): Promise<{ persistedSequence: number; ackedSequence: number }> {
+    return {
+      persistedSequence: this.cursors.get(libraryId) ?? 0,
+      ackedSequence: this.acknowledgements.get(libraryId) ?? 0
+    };
+  }
+
+  async markAcknowledged(libraryId: string, sequence: number): Promise<void> {
+    this.acknowledgements.set(
+      libraryId,
+      Math.max(this.acknowledgements.get(libraryId) ?? 0, sequence)
+    );
   }
 
   async compactSnapshot(): Promise<NotificationStoredSnapshot> {
@@ -168,6 +197,21 @@ class FakeStore implements NotificationServiceStore {
     return this.operations.get(`${libraryId}/${operationId}`) ?? null;
   }
 
+  async setOperationActionError(
+    libraryId: string,
+    operationId: string,
+    expectedRevision: number,
+    detail: string | null
+  ): Promise<DesktopNotificationOperation | null> {
+    if (this.failActionError) throw new Error("action store offline");
+    const key = `${libraryId}/${operationId}`;
+    const existing = this.operations.get(key);
+    if (!existing || existing.revision !== expectedRevision) return null;
+    const updated = { ...existing, errorDetail: detail };
+    this.operations.set(key, updated);
+    return updated;
+  }
+
   async publishThumbnailSummary(summary: ThumbnailCacheSummary): Promise<void> {
     this.summaries.set(summary.libraryId, summary);
   }
@@ -209,6 +253,11 @@ class FakeStore implements NotificationServiceStore {
 
   async markLegacyImported(libraryId: string): Promise<void> {
     this.imported.add(libraryId);
+  }
+
+  async cleanupRetention(): Promise<{ deletedExpired: number; deletedOverflow: number }> {
+    this.cleanupCalls += 1;
+    return { deletedExpired: 0, deletedOverflow: 0 };
   }
 }
 
@@ -283,6 +332,67 @@ describe("notification service", () => {
     await service.close();
   });
 
+  it("persists an acknowledgement intent across a real store restart", async () => {
+    const databasePath = testDatabasePath();
+    const firstStore = await createNotificationStore({
+      databasePath,
+      workerUrl: TEST_WORKER_URL
+    });
+    let firstAckCalls = 0;
+    const firstService = await createNotificationService({
+      store: firstStore,
+      fetch: async (input) => {
+        if (String(input).endsWith("/notifications/outbox/ack")) {
+          firstAckCalls += 1;
+          return response({ error: "offline" }, 503);
+        }
+        return response({ items: [event(1)], maxSequence: 1 });
+      },
+      now: () => NOW
+    });
+    let secondService: Awaited<ReturnType<typeof createNotificationService>> | null = null;
+    try {
+      await assert.rejects(firstService.runOneDrainForTest(LIBRARY_A, SESSION_A), /503/);
+      assert.deepEqual(await firstStore.syncState(LIBRARY_A.id), {
+        persistedSequence: 1,
+        ackedSequence: 0
+      });
+      assert.equal(firstAckCalls, 1);
+      await firstService.close();
+
+      const secondStore = await createNotificationStore({
+        databasePath,
+        workerUrl: TEST_WORKER_URL
+      });
+      const calls: string[] = [];
+      secondService = await createNotificationService({
+        store: secondStore,
+        fetch: async (input) => {
+          if (String(input).endsWith("/notifications/outbox/ack")) {
+            calls.push("ack");
+            return response({ acknowledgedThrough: 1 });
+          }
+          calls.push("get");
+          return response({ items: [], maxSequence: 1 });
+        },
+        now: () => NOW
+      });
+
+      await secondService.runOneDrainForTest(LIBRARY_A, SESSION_A);
+      assert.deepEqual(calls, ["ack", "get"], "restart must finish the durable ACK before GET");
+      assert.deepEqual(await secondStore.syncState(LIBRARY_A.id), {
+        persistedSequence: 1,
+        ackedSequence: 1
+      });
+      await secondService.runOneDrainForTest(LIBRARY_A, SESSION_A);
+      assert.deepEqual(calls, ["ack", "get", "get"], "an acknowledged cursor must not be replayed");
+      assert.equal((await secondStore.compactSnapshot()).active.length, 1);
+    } finally {
+      await firstService.close();
+      await secondService?.close();
+    }
+  });
+
   it("does not acknowledge when the durable store rejects a batch", async () => {
     const store = new FakeStore();
     store.failApply = true;
@@ -354,11 +464,21 @@ describe("notification service", () => {
     await service.close();
   });
 
-  it("imports eligible legacy rows once in bounded pages with deterministic IDs", async () => {
+  it("aggregates legacy rows into bounded logical history operations", async () => {
     const store = new FakeStore();
     const requested: string[] = [];
     const recent = NOW - 1_000;
     const old = NOW - 31 * 24 * 60 * 60 * 1_000;
+    const ungrouped = Array.from({ length: 1_000 }, (_, index) => ({
+      id: 2_000 - index,
+      operation: "move",
+      sourcePath: `source-${index}`,
+      targetPath: `target-${index}`,
+      status: index === 999 ? "failed" : "succeeded",
+      createdAt: recent - index,
+      finishedAt: recent - index,
+      error: index === 999 ? "busy" : null
+    }));
     const service = await createNotificationService({
       store,
       fetch: async (input) => {
@@ -367,8 +487,9 @@ describe("notification service", () => {
         if (!url.searchParams.has("cursor")) {
           return response({
             items: [
-              { id: 9, operation: "move", sourcePath: "a", targetPath: "b", status: "succeeded", createdAt: recent, finishedAt: recent, error: null },
-              { id: 8, operation: "delete_recycle", sourcePath: "c", targetPath: null, status: "failed", createdAt: recent - 1, finishedAt: recent, error: "busy" }
+              ...ungrouped,
+              { id: 9, operationGroupId: "file-group:9", operation: "delete_recycle", sourcePath: "a", targetPath: null, status: "succeeded", createdAt: recent, finishedAt: recent, error: null },
+              { id: 8, operationGroupId: "file-group:9", operation: "delete_recycle", sourcePath: "b", targetPath: null, status: "failed", createdAt: recent - 1, finishedAt: recent, error: "locked" }
             ],
             nextCursor: "8"
           });
@@ -387,10 +508,51 @@ describe("notification service", () => {
     await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
     assert.deepEqual(requested, ["first", "8"]);
     assert.equal(store.imported.has(LIBRARY_A.id), true);
-    assert.deepEqual(
-      [...store.operations.values()].map((item) => item.operationId).sort(),
-      ["legacy-file-op:8", "legacy-file-op:9"]
-    );
+    assert.equal(store.operations.size, 2, "1,002 rows must not become 1,002 notifications");
+    const move = [...store.operations.values()].find((item) => item.kind === "move");
+    assert.equal(move?.presentation, "history_only");
+    assert.equal(move?.totalValue, 1_000);
+    assert.equal(move?.status, "failed");
+    assert.match(move?.summary ?? "", /999 succeeded.*1 failed/i);
+    const grouped = store.operations.get(`${LIBRARY_A.id}/file-group:9`);
+    assert.equal(grouped?.totalValue, 2);
+    assert.equal(grouped?.revision, 0, "legacy group snapshots must yield to Core revisions");
+    await service.close();
+  });
+
+  it("does not duplicate a legacy group already represented by an Outbox operation", async () => {
+    const store = new FakeStore();
+    await store.upsertOperations(LIBRARY_A, [
+      operation("file-group:existing", 3, "succeeded", {
+        kind: "move",
+        category: "file_operation"
+      })
+    ]);
+    const service = await createNotificationService({
+      store,
+      fetch: async () =>
+        response({
+          items: [
+            {
+              id: 1,
+              operationGroupId: "file-group:existing",
+              operation: "move",
+              sourcePath: "a",
+              targetPath: "b",
+              status: "succeeded",
+              createdAt: NOW - 100,
+              finishedAt: NOW - 50,
+              error: null
+            }
+          ],
+          nextCursor: null
+        }),
+      now: () => NOW
+    });
+
+    await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
+    assert.equal(store.operations.size, 1);
+    assert.equal(store.operations.get(`${LIBRARY_A.id}/file-group:existing`)?.revision, 3);
     await service.close();
   });
 
@@ -424,6 +586,110 @@ describe("notification service", () => {
     await service.close();
   });
 
+  it("records action failures on the existing operation and clears them after success", async () => {
+    const store = new FakeStore();
+    store.imported.add(LIBRARY_A.id);
+    await store.upsertOperations(LIBRARY_A, [
+      operation("task:action", 2, "running", {
+        taskId: 7,
+        cancellable: true,
+        retryable: false,
+        errorDetail: null
+      })
+    ]);
+    let actionCalls = 0;
+    const service = await createNotificationService({
+      store,
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.includes("/notifications/outbox?")) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true }
+            );
+          });
+        }
+        actionCalls += 1;
+        return actionCalls === 1
+          ? response({ error: "Core refused cancellation" }, 409)
+          : response({ taskId: 7 });
+      },
+      now: () => NOW
+    });
+    await service.attachLibrary(LIBRARY_A, SESSION_A);
+
+    const failed = await service.cancelOperation(LIBRARY_A.id, "task:action");
+    assert.equal(failed.ok, false);
+    assert.match((await service.compactSnapshot()).active[0]?.errorDetail ?? "", /409/);
+
+    const succeeded = await service.cancelOperation(LIBRARY_A.id, "task:action");
+    assert.equal(succeeded.ok, true);
+    assert.equal((await service.compactSnapshot()).active[0]?.errorDetail, null);
+
+    await store.setOperationActionError(LIBRARY_A.id, "task:action", 2, "stale action error");
+    await store.upsertOperations(LIBRARY_A, [operation("task:action", 3, "running")]);
+    assert.equal((await store.getOperation(LIBRARY_A.id, "task:action"))?.errorDetail, null);
+    await service.close();
+  });
+
+  it("replays a degraded action error into the recovered store without a new operation", async () => {
+    const failedStore = new FakeStore();
+    failedStore.imported.add(LIBRARY_A.id);
+    failedStore.failActionError = true;
+    const recoveredStore = new FakeStore();
+    recoveredStore.imported.add(LIBRARY_A.id);
+    const input = operation("task:recover-action", 2, "running", {
+      taskId: 7,
+      cancellable: true,
+      errorDetail: null
+    });
+    await failedStore.upsertOperations(LIBRARY_A, [input]);
+    await recoveredStore.upsertOperations(LIBRARY_A, [input]);
+    let listCalls = 0;
+    const service = await createNotificationService({
+      store: failedStore,
+      openStore: async () => recoveredStore,
+      fetch: async (inputUrl, init) => {
+        const url = String(inputUrl);
+        if (url.includes("/notifications/outbox?")) {
+          listCalls += 1;
+          if (listCalls === 1) {
+            return new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener(
+                "abort",
+                () => reject(new DOMException("Aborted", "AbortError")),
+                { once: true }
+              );
+            });
+          }
+          return response({ items: [], maxSequence: 0 });
+        }
+        return response({ error: "Core refused cancellation" }, 409);
+      },
+      now: () => NOW
+    });
+    try {
+      await service.attachLibrary(LIBRARY_A, SESSION_A);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(listCalls, 1);
+      const failed = await service.cancelOperation(LIBRARY_A.id, "task:recover-action");
+      assert.equal(failed.ok, false);
+      assert.match((await service.compactSnapshot()).active[0]?.errorDetail ?? "", /409/);
+
+      await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+      const recovered = await recoveredStore.getOperation(
+        LIBRARY_A.id,
+        "task:recover-action"
+      );
+      assert.match(recovered?.errorDetail ?? "", /409/);
+      assert.equal(recoveredStore.operations.size, 1);
+    } finally {
+      await service.close();
+    }
+  });
+
   it("deduplicates renderer errors, publishes thumbnail summaries, and broadcasts snapshots", async () => {
     const store = new FakeStore();
     const service = await createNotificationService({ store, now: () => NOW });
@@ -450,6 +716,32 @@ describe("notification service", () => {
     assert.equal((await service.compactSnapshot()).thumbnailSummaries.length, 1);
     assert.ok(reports.length >= 3);
     unsubscribe();
+    await service.close();
+  });
+
+  it("keeps committed local reports visible when snapshot refresh fails", async () => {
+    const store = new FakeStore();
+    const service = await createNotificationService({ store, now: () => NOW });
+    store.failSnapshot = true;
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "library-data",
+      code: "load-failed",
+      target: "folder:4",
+      title: "Folder load failed",
+      message: "Could not load folder",
+      detail: "database busy"
+    };
+
+    await service.reportRendererError(report);
+    let snapshot = await service.compactSnapshot();
+    assert.equal(snapshot.syncHealth.state, "degraded");
+    assert.equal(snapshot.latestImportantResults[0]?.operationId.includes("renderer-error"), true);
+
+    await service.publishThumbnailSummary(thumbnailSummary());
+    snapshot = await service.compactSnapshot();
+    assert.equal(snapshot.thumbnailSummaries[0]?.libraryId, LIBRARY_A.id);
     await service.close();
   });
 
@@ -497,7 +789,11 @@ describe("notification service", () => {
           acknowledgements += 1;
           return response({ acknowledgedThrough: 1 });
         }
-        return response({ items: [event(1)], maxSequence: 1 });
+        return response(
+          acknowledgements > 0
+            ? { items: [], maxSequence: 1 }
+            : { items: [event(1)], maxSequence: 1 }
+        );
       },
       now: () => NOW
     });
@@ -605,6 +901,94 @@ describe("notification service", () => {
     await service.close();
   });
 
+  it("retries a degraded store on bounded backoff even when the Outbox is empty", async () => {
+    let opens = 0;
+    let listCalls = 0;
+    let delayStarted!: () => void;
+    const delayed = new Promise<void>((resolve) => {
+      delayStarted = resolve;
+    });
+    const service = await createNotificationService({
+      openStore: async () => {
+        opens += 1;
+        throw new Error("worker unavailable");
+      },
+      fetch: async () => {
+        listCalls += 1;
+        await new Promise((resolve) => setImmediate(resolve));
+        return response({ items: [], maxSequence: 0 });
+      },
+      retryDelay: async (delay, signal) => {
+        assert.equal(delay, 250);
+        delayStarted();
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+      now: () => NOW
+    });
+
+    try {
+      await service.attachLibrary(LIBRARY_A, SESSION_A);
+      await Promise.race([
+        delayed,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("degraded retry did not enter backoff")), 250)
+        )
+      ]);
+      assert.ok(opens >= 2, "the service must retry opening the store");
+      assert.equal(listCalls, 1, "an empty degraded GET must not busy-loop");
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("runs retention at startup and throttles cleanup after durable writes", async () => {
+    const store = new FakeStore();
+    let now = NOW;
+    const service = await createNotificationService({
+      store,
+      fetch: async (input) =>
+        String(input).endsWith("/notifications/outbox/ack")
+          ? response({ acknowledgedThrough: 1 })
+          : response({ items: [event(1)], maxSequence: 1 }),
+      now: () => now
+    });
+    assert.equal(store.cleanupCalls, 1);
+
+    await service.publishThumbnailSummary(thumbnailSummary());
+    await service.reportRendererError({
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "retention",
+      code: "first",
+      target: "test",
+      title: "test",
+      message: "test",
+      detail: null
+    });
+    assert.equal(store.cleanupCalls, 1, "same-cadence writes must not rescan retention");
+
+    now += 24 * 60 * 60 * 1_000;
+    await service.publishThumbnailSummary({ ...thumbnailSummary(), observedAt: now });
+    await service.reportRendererError({
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "retention",
+      code: "second",
+      target: "test",
+      title: "test",
+      message: "test",
+      detail: null
+    });
+    assert.equal(store.cleanupCalls, 2, "only the first write after the cadence runs cleanup");
+
+    now += 24 * 60 * 60 * 1_000;
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    assert.equal(store.cleanupCalls, 3, "the first durable Outbox batch after cadence cleans up");
+    await service.close();
+  });
+
   it("rejects unsafe operation revisions before they enter the fallback", async () => {
     const service = await createNotificationService({
       openStore: async () => {
@@ -645,7 +1029,7 @@ describe("notification service", () => {
 
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     const snapshot = await service.compactSnapshot();
-    assert.equal(acknowledgements, 1, "a confirmed durable commit remains safe to acknowledge");
+    assert.equal(acknowledgements, 0, "fallback mode must never acknowledge Core");
     assert.equal(snapshot.syncHealth.state, "degraded");
     assert.equal(snapshot.active[0]?.operationId, "task:1");
     await service.close();

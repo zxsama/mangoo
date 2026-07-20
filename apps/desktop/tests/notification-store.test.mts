@@ -152,6 +152,10 @@ describe("notification store", () => {
       assert.equal(snapshot.active[0]?.revision, 1);
       assert.equal(snapshot.active[0]?.status, "running");
       assert.equal(await store.cursor(LIBRARY_A.id), 2);
+      assert.deepEqual(await store.syncState(LIBRARY_A.id), {
+        persistedSequence: 2,
+        ackedSequence: 0
+      });
 
       await assert.rejects(
         store.applyOutboxBatch(
@@ -176,6 +180,15 @@ describe("notification store", () => {
       assert.equal(snapshot.active.length, 0);
       assert.equal(snapshot.latestImportantResults[0]?.revision, 2);
       assert.equal(await store.cursor(LIBRARY_A.id), 3);
+
+      await store.markAcknowledged(LIBRARY_A.id, 3);
+      assert.deepEqual(await store.syncState(LIBRARY_A.id), {
+        persistedSequence: 3,
+        ackedSequence: 3
+      });
+      await store.markAcknowledged(LIBRARY_A.id, 2);
+      await assert.rejects(store.markAcknowledged(LIBRARY_A.id, 4), /exceed persisted/i);
+      assert.equal((await store.syncState(LIBRARY_A.id)).ackedSequence, 3);
 
       await store.applyOutboxBatch(LIBRARY_A, [], 1);
       assert.equal(await store.cursor(LIBRARY_A.id), 3, "cursor must never move backwards");
@@ -334,6 +347,47 @@ describe("notification store", () => {
     }
   });
 
+  it("atomically overlays action errors without competing with Core revisions", async () => {
+    const store = await createTestStore();
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        operation("task:action", 2, "running", { errorDetail: "core detail" })
+      ]);
+      const failed = await store.setOperationActionError(
+        LIBRARY_A.id,
+        "task:action",
+        2,
+        "cancel failed"
+      );
+      assert.equal(failed?.errorDetail, "cancel failed");
+      assert.equal(
+        await store.setOperationActionError(LIBRARY_A.id, "task:action", 1, "stale"),
+        null
+      );
+      assert.equal(
+        (await store.getOperation(LIBRARY_A.id, "task:action"))?.errorDetail,
+        "cancel failed"
+      );
+
+      await store.setOperationActionError(LIBRARY_A.id, "task:action", 2, null);
+      assert.equal(
+        (await store.getOperation(LIBRARY_A.id, "task:action"))?.errorDetail,
+        "core detail"
+      );
+
+      await store.setOperationActionError(LIBRARY_A.id, "task:action", 2, "retry failed");
+      await store.upsertOperations(LIBRARY_A, [
+        operation("task:action", 3, "running", { errorDetail: "new core detail" })
+      ]);
+      assert.equal(
+        (await store.getOperation(LIBRARY_A.id, "task:action"))?.errorDetail,
+        "new core detail"
+      );
+    } finally {
+      await store.close();
+    }
+  });
+
   it("retains active operations, removes completed records older than 30 days, and caps completed history at 2000", async () => {
     const store = await createTestStore();
     try {
@@ -395,7 +449,7 @@ describe("notification store", () => {
     const inspection = new DatabaseSync(databasePath, { readOnly: true });
     try {
       assert.equal(inspection.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
-      assert.equal(inspection.prepare("PRAGMA user_version").get()?.user_version, 2);
+      assert.equal(inspection.prepare("PRAGMA user_version").get()?.user_version, 3);
       const tables = inspection
         .prepare(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
@@ -403,6 +457,7 @@ describe("notification store", () => {
         .all()
         .map((row) => row.name);
       assert.deepEqual(tables, [
+        "action_errors",
         "legacy_imports",
         "operations",
         "sync_cursors",
@@ -412,25 +467,36 @@ describe("notification store", () => {
       inspection.close();
     }
 
-    const v1Database = new DatabaseSync(databasePath);
-    v1Database.exec(`
-      DROP INDEX idx_operations_history;
-      CREATE INDEX idx_operations_history ON operations(completed_at DESC, updated_at DESC);
-      PRAGMA user_version = 1;
+    const v2Database = new DatabaseSync(databasePath);
+    v2Database.exec(`
+      DROP TABLE action_errors;
+      ALTER TABLE sync_cursors RENAME TO sync_cursors_v3;
+      CREATE TABLE sync_cursors (
+        library_id TEXT PRIMARY KEY,
+        sequence INTEGER NOT NULL
+      );
+      INSERT INTO sync_cursors(library_id, sequence)
+        SELECT library_id, persisted_sequence FROM sync_cursors_v3;
+      DROP TABLE sync_cursors_v3;
+      PRAGMA user_version = 2;
     `);
-    v1Database.close();
+    v2Database.close();
 
     store = await createTestStore(databasePath);
     try {
       assert.equal((await store.history({ limit: 10, offset: 0 })).items[0]?.operationId, "persisted");
       assert.equal(await store.cursor(LIBRARY_A.id), 1);
+      assert.deepEqual(await store.syncState(LIBRARY_A.id), {
+        persistedSequence: 1,
+        ackedSequence: 0
+      });
     } finally {
       await store.close();
     }
 
     const upgraded = new DatabaseSync(databasePath, { readOnly: true });
     try {
-      assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 2);
+      assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 3);
       const indexSql = upgraded
         .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_operations_history'")
         .get()?.sql as string;
