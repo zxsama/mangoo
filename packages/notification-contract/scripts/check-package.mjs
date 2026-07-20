@@ -16,8 +16,11 @@ if (!source.includes('"trace" | "debug" | "info" | "warn" | "error"')) {
 if (source.includes("onLogs")) {
   throw new Error("notification contract must expose only the tokenized log subscription API");
 }
-if (!/interface NotificationStoredSnapshot[\s\S]*hasRetryableFailure: boolean;/.test(source)) {
-  throw new Error("notification compact snapshot must expose authoritative retryable failure state");
+if (!/interface NotificationRetryableFailureReference[\s\S]*libraryId: string;[\s\S]*operationId: string;[\s\S]*revision: number;/.test(source)) {
+  throw new Error("notification contract must expose retryable failure identity and revision");
+}
+if (!/interface NotificationStoredSnapshot[\s\S]*retryableFailures: NotificationRetryableFailureReference\[\];[\s\S]*hasRetryableFailure: boolean;/.test(source)) {
+  throw new Error("notification compact snapshot must expose authoritative retryable failure references");
 }
 
 console.log("PASS: shared notification contract boundary");

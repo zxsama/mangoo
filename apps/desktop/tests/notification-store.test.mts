@@ -318,6 +318,13 @@ describe("notification store", () => {
         compact.latestImportantResults.map((item) => item.operationId),
         ["success:3", "success:2", "success:1"]
       );
+      assert.deepEqual(compact.retryableFailures, [
+        {
+          libraryId: LIBRARY_A.id,
+          operationId: "failed:durable",
+          revision: 1
+        }
+      ]);
       assert.equal(compact.hasRetryableFailure, true);
 
       await store.upsertOperations(LIBRARY_A, [
@@ -328,6 +335,7 @@ describe("notification store", () => {
         })
       ]);
       compact = await store.compactSnapshot();
+      assert.deepEqual(compact.retryableFailures, []);
       assert.equal(compact.hasRetryableFailure, false);
     } finally {
       await store.close();
@@ -348,12 +356,22 @@ describe("notification store", () => {
         1,
         "retry request failed"
       );
-      assert.equal((await store.compactSnapshot()).hasRetryableFailure, true);
+      let compact = await store.compactSnapshot();
+      assert.deepEqual(compact.retryableFailures, [
+        {
+          libraryId: LIBRARY_A.id,
+          operationId: "failed:action",
+          revision: 1
+        }
+      ]);
+      assert.equal(compact.hasRetryableFailure, true);
 
       await store.upsertOperations(LIBRARY_A, [
         operation("failed:action", 2, "succeeded", { retryable: false })
       ]);
-      assert.equal((await store.compactSnapshot()).hasRetryableFailure, false);
+      compact = await store.compactSnapshot();
+      assert.deepEqual(compact.retryableFailures, []);
+      assert.equal(compact.hasRetryableFailure, false);
     } finally {
       await store.close();
     }
@@ -775,9 +793,10 @@ describe("notification store", () => {
         events.push(
           event(
             index + 3,
-            operation(`completed:${index}`, 1, "succeeded", {
+            operation(`completed:${index}`, 1, "failed", {
               updatedAt: timestamp,
-              completedAt: timestamp
+              completedAt: timestamp,
+              retryable: true
             })
           )
         );
@@ -789,6 +808,7 @@ describe("notification store", () => {
       assert.equal(result.deletedOverflow, 5);
       const compact = await store.compactSnapshot();
       assert.deepEqual(compact.active.map((item) => item.operationId), ["active:old"]);
+      assert.equal(compact.retryableFailures.length, 2_000);
       const history = await store.history({ limit: 100, offset: 0 });
       assert.equal(history.total, 2_000);
       assert.equal(history.items[0]?.operationId, "completed:2004");

@@ -10,6 +10,7 @@ import type {
   NotificationOperationInput,
   NotificationRendererErrorRecordResult,
   NotificationRetentionResult,
+  NotificationRetryableFailureReference,
   NotificationStoreRequest,
   NotificationStoreSerializedError,
   NotificationStoredSnapshot,
@@ -547,29 +548,41 @@ class NotificationStoreDatabase {
          ORDER BY library_name COLLATE NOCASE ASC, library_id ASC`
       )
       .all() as unknown as Array<{ payload_json: string }>;
-    const retryableFailureRow = this.database
+    const retryableFailures = this.database
       .prepare(
-        `SELECT EXISTS(
-           SELECT 1
-           FROM operations
-           LEFT JOIN action_errors
-             ON action_errors.library_id = operations.library_id
-            AND action_errors.operation_id = operations.operation_id
-            AND action_errors.operation_revision = operations.revision
-           WHERE operations.status NOT IN ('pending', 'running')
-             AND (
-               (operations.status = 'failed'
-                 AND json_extract(operations.payload_json, '$.retryable') = 1)
-               OR action_errors.detail IS NOT NULL
-             )
-         ) AS has_retryable_failure`
+        `SELECT operations.library_id, operations.operation_id, operations.revision
+         FROM operations
+         LEFT JOIN action_errors
+           ON action_errors.library_id = operations.library_id
+          AND action_errors.operation_id = operations.operation_id
+          AND action_errors.operation_revision = operations.revision
+         WHERE operations.status NOT IN ('pending', 'running')
+           AND (
+             (operations.status = 'failed'
+               AND json_extract(operations.payload_json, '$.retryable') = 1)
+             OR action_errors.detail IS NOT NULL
+           )
+         ORDER BY operations.library_id ASC, operations.operation_id ASC`
       )
-      .get() as { has_retryable_failure: number };
+      .all()
+      .map((row) => {
+        const value = row as {
+          library_id: string;
+          operation_id: string;
+          revision: number;
+        };
+        return {
+          libraryId: value.library_id,
+          operationId: value.operation_id,
+          revision: value.revision
+        } satisfies NotificationRetryableFailureReference;
+      });
     return {
       active: active.map(rowToOperation),
       thumbnailSummaries: thumbnailRows.map((row) => JSON.parse(row.payload_json) as ThumbnailCacheSummary),
       latestImportantResults: latestImportantResults.map(rowToOperation),
-      hasRetryableFailure: retryableFailureRow.has_retryable_failure === 1
+      retryableFailures,
+      hasRetryableFailure: retryableFailures.length > 0
     };
   }
 

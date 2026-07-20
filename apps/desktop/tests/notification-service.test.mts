@@ -126,6 +126,7 @@ function emptySnapshot(): NotificationStoredSnapshot {
     active: [],
     thumbnailSummaries: [],
     latestImportantResults: [],
+    retryableFailures: [],
     hasRetryableFailure: false
   };
 }
@@ -194,6 +195,23 @@ class FakeStore implements NotificationServiceStore {
   async compactSnapshot(): Promise<NotificationStoredSnapshot> {
     if (this.failSnapshot) throw new Error("snapshot offline");
     const all = [...this.operations.values()];
+    const retryableFailures = all
+      .filter(
+        (item) =>
+          item.status !== "pending" &&
+          item.status !== "running" &&
+          item.status === "failed" &&
+          item.retryable
+      )
+      .map((item) => ({
+        libraryId: item.libraryId,
+        operationId: item.operationId,
+        revision: item.revision
+      }))
+      .sort((left, right) =>
+        left.libraryId.localeCompare(right.libraryId) ||
+        left.operationId.localeCompare(right.operationId)
+      );
     return {
       active: all
         .filter((item) => item.status === "pending" || item.status === "running")
@@ -208,13 +226,8 @@ class FakeStore implements NotificationServiceStore {
         )
         .sort((a, b) => (b.completedAt ?? b.updatedAt) - (a.completedAt ?? a.updatedAt))
         .slice(0, 3),
-      hasRetryableFailure: all.some(
-        (item) =>
-          item.status !== "pending" &&
-          item.status !== "running" &&
-          item.status === "failed" &&
-          item.retryable
-      )
+      retryableFailures,
+      hasRetryableFailure: retryableFailures.length > 0
     };
   }
 
@@ -1367,6 +1380,117 @@ describe("notification service", () => {
       snapshot.latestImportantResults.map((item) => item.operationId),
       ["success:3", "success:2", "success:1"]
     );
+    assert.equal(snapshot.hasRetryableFailure, true);
+    await service.close();
+  });
+
+  it("clears a stored failure when fallback receives a newer success and keeps it clear after recovery", async () => {
+    const store = new FakeStore();
+    await store.upsertOperations(LIBRARY_A, [
+      operation("failed:durable", 1, "failed", { retryable: true })
+    ]);
+    store.failApply = true;
+    let acknowledged = false;
+    const success = event(
+      1,
+      operation("failed:durable", 2, "succeeded", { retryable: false })
+    );
+    const service = await createNotificationService({
+      store,
+      openStore: async () => store,
+      fetch: async (input) => {
+        if (String(input).endsWith("/notifications/outbox/ack")) {
+          acknowledged = true;
+          return ackResponse({ acknowledged: true });
+        }
+        return response(
+          acknowledged
+            ? { items: [], maxSequence: 1 }
+            : { items: [success], maxSequence: 1 }
+        );
+      },
+      now: () => NOW
+    });
+
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    let snapshot = await service.compactSnapshot();
+    assert.deepEqual(snapshot.retryableFailures, []);
+    assert.equal(snapshot.hasRetryableFailure, false);
+
+    store.failApply = false;
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    snapshot = await service.compactSnapshot();
+    assert.equal(store.operations.get(`${LIBRARY_A.id}/failed:durable`)?.revision, 2);
+    assert.deepEqual(snapshot.retryableFailures, []);
+    assert.equal(snapshot.hasRetryableFailure, false);
+    await service.close();
+  });
+
+  it("does not clear a stored failure with an older fallback success", async () => {
+    const store = new FakeStore();
+    await store.upsertOperations(LIBRARY_A, [
+      operation("failed:durable", 1, "failed", { retryable: true })
+    ]);
+    store.failApply = true;
+    const service = await createNotificationService({
+      store,
+      fetch: async () =>
+        response({
+          items: [
+            event(
+              1,
+              operation("failed:durable", 0, "succeeded", { retryable: false })
+            )
+          ],
+          maxSequence: 1
+        }),
+      now: () => NOW
+    });
+
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    const snapshot = await service.compactSnapshot();
+    assert.deepEqual(snapshot.retryableFailures, [
+      {
+        libraryId: LIBRARY_A.id,
+        operationId: "failed:durable",
+        revision: 1
+      }
+    ]);
+    assert.equal(snapshot.hasRetryableFailure, true);
+    await service.close();
+  });
+
+  it("keeps another stored failure when fallback makes only one operation non-retryable", async () => {
+    const store = new FakeStore();
+    await store.upsertOperations(LIBRARY_A, [
+      operation("failed:first", 1, "failed", { retryable: true }),
+      operation("failed:second", 1, "failed", { retryable: true })
+    ]);
+    store.failApply = true;
+    const service = await createNotificationService({
+      store,
+      fetch: async () =>
+        response({
+          items: [
+            event(
+              1,
+              operation("failed:first", 2, "failed", { retryable: false })
+            )
+          ],
+          maxSequence: 1
+        }),
+      now: () => NOW
+    });
+
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    const snapshot = await service.compactSnapshot();
+    assert.deepEqual(snapshot.retryableFailures, [
+      {
+        libraryId: LIBRARY_A.id,
+        operationId: "failed:second",
+        revision: 1
+      }
+    ]);
     assert.equal(snapshot.hasRetryableFailure, true);
     await service.close();
   });

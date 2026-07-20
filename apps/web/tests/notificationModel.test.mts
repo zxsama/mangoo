@@ -98,6 +98,7 @@ function compact(
     active: [],
     thumbnailSummaries: [],
     latestImportantResults: [],
+    retryableFailures: [],
     hasRetryableFailure: false,
     syncHealth: {
       state: "healthy",

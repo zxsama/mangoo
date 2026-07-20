@@ -49,10 +49,17 @@ export interface DesktopThumbnailCacheSummary {
 
 export type ThumbnailCacheSummary = DesktopThumbnailCacheSummary;
 
+export interface NotificationRetryableFailureReference {
+  libraryId: string;
+  operationId: string;
+  revision: number;
+}
+
 export interface NotificationStoredSnapshot {
   active: DesktopNotificationOperation[];
   thumbnailSummaries: ThumbnailCacheSummary[];
   latestImportantResults: DesktopNotificationOperation[];
+  retryableFailures: NotificationRetryableFailureReference[];
   hasRetryableFailure: boolean;
 }
 

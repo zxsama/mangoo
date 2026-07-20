@@ -51,6 +51,7 @@ const EMPTY_COMPACT_SNAPSHOT: DesktopNotificationCompactSnapshot = {
   active: [],
   thumbnailSummaries: [],
   latestImportantResults: [],
+  retryableFailures: [],
   hasRetryableFailure: false,
   syncHealth: {
     state: "degraded",
@@ -370,6 +371,7 @@ export class NotificationExternalStore {
       active: [],
       thumbnailSummaries: [],
       latestImportantResults: [],
+      retryableFailures: [],
       hasRetryableFailure: false,
       syncHealth: {
         state: "degraded",
