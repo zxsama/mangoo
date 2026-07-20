@@ -1,48 +1,26 @@
 import { Buffer } from "node:buffer";
+import type {
+  ProcessLogBatch,
+  ProcessLogFilter,
+  ProcessLogLevel,
+  ProcessLogLine,
+  ProcessLogMetadata,
+  ProcessLogPage,
+  ProcessLogSource
+} from "@megle/notification-contract";
+
+export type {
+  ProcessLogBatch,
+  ProcessLogFilter,
+  ProcessLogLevel,
+  ProcessLogLine,
+  ProcessLogMetadata,
+  ProcessLogPage,
+  ProcessLogSource
+} from "@megle/notification-contract";
 
 export const DEFAULT_PROCESS_LOG_MAX_ENTRIES = 5_000;
 export const DEFAULT_PROCESS_LOG_MAX_BYTES = 5 * 1024 * 1024;
-
-export type ProcessLogSource = "main" | "core" | "renderer";
-export type ProcessLogLevel = "trace" | "debug" | "info" | "warn" | "error";
-
-export interface ProcessLogMetadata {
-  readonly [key: string]: unknown;
-}
-
-export interface ProcessLogLine {
-  readonly sequence: number;
-  readonly timestamp: number;
-  readonly source: ProcessLogSource;
-  readonly level: ProcessLogLevel;
-  readonly message: string;
-  readonly metadata?: ProcessLogMetadata;
-}
-
-export interface ProcessLogFilter {
-  readonly source?: ProcessLogSource;
-  readonly sources?: readonly ProcessLogSource[];
-  readonly level?: ProcessLogLevel;
-  readonly levels?: readonly ProcessLogLevel[];
-  readonly search?: string;
-  readonly afterSequence?: number;
-  readonly beforeSequence?: number;
-  readonly limit?: number;
-}
-
-export interface ProcessLogPage {
-  readonly lines: readonly ProcessLogLine[];
-  readonly hasMore: boolean;
-  readonly nextBeforeSequence: number | null;
-}
-
-export interface ProcessLogBatch {
-  readonly lines: readonly ProcessLogLine[];
-  /** Cursor to use for the next batch, including filtered-out retained lines. */
-  readonly afterSequence: number;
-  /** First retained sequence when older entries were evicted before this batch. */
-  readonly droppedBeforeSequence: number | null;
-}
 
 export interface ProcessLogSubscribeOptions {
   readonly afterSequence?: number;

@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@megle/core-client": "*",
+    "@megle/notification-contract": "*",
     "@tanstack/react-query": "^5.60.0",
     "@tanstack/react-virtual": "^3.10.0",
     "lucide-react": "^0.468.0",

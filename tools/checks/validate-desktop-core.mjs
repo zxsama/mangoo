@@ -53,8 +53,12 @@ const preload = read("apps/desktop/src/preload.cjs");
 const notificationIpc = readOptional("apps/desktop/src/notification-ipc.ts");
 const notificationRuntime = readOptional("apps/desktop/src/notification-runtime.ts");
 const notificationCoreTransition = readOptional("apps/desktop/src/notification-core-transition.ts");
+const notificationShutdown = readOptional("apps/desktop/src/notification-shutdown.ts");
 const notificationChannels = readOptional("apps/desktop/src/notification-ipc-channels.cjs");
 const notificationStore = readOptional("apps/desktop/src/notification-store.ts");
+const desktopIpcPermissions = readOptional("apps/desktop/src/desktop-ipc-permissions.ts");
+const secondaryWindowOpening = readOptional("apps/desktop/src/secondary-window-opening.ts");
+const notificationContract = readOptional("packages/notification-contract/src/index.ts");
 const webDesktopBridge = read("apps/web/src/core/desktop.ts");
 const webMain = read("apps/web/src/main.tsx");
 const secondaryReveal = read("apps/desktop/src/secondary-window-reveal.ts");
@@ -184,19 +188,29 @@ for (const value of [
   }
 }
 
-const openSecondaryWindowBody = functionBody(
-  main,
-  "async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void>"
-);
-if (!openSecondaryWindowBody) {
+const openSecondaryWindowBody = functionBody(main, "function openSecondaryWindow(role: SecondaryWindowRole): Promise<void>");
+const createSecondaryWindowBody = functionBody(main, "async function createSecondaryWindow(");
+const focusSecondaryWindowBody = functionBody(main, "function focusExistingSecondaryWindow(role: SecondaryWindowRole): boolean");
+if (!openSecondaryWindowBody || !createSecondaryWindowBody || !focusSecondaryWindowBody) {
   fail("desktop must centralize Settings/Plugins/Notifications creation in openSecondaryWindow");
 } else {
+  for (const value of ["secondaryWindowOpenings.run", "await ensureCoreReady()", "focusExistingSecondaryWindow(role)", "createSecondaryWindow("]) {
+    if (!openSecondaryWindowBody.includes(value)) {
+      fail(`shared secondary window opening must preserve single-flight and post-Core recheck: ${value}`);
+    }
+  }
   for (const value of [
     "existing.isMinimized()",
     "existing.restore()",
     "readiness?.windowId === existing.id",
     "!readiness.revealState.settled",
-    "existing.focus()",
+    "existing.focus()"
+  ]) {
+    if (!focusSecondaryWindowBody.includes(value)) {
+      fail(`shared secondary window focus must preserve existing-window behavior: ${value}`);
+    }
+  }
+  for (const value of [
     "parent",
     "modal: false",
     'backgroundMaterial: "acrylic"',
@@ -205,15 +219,24 @@ if (!openSecondaryWindowBody) {
     "secondaryWindows[role] = window",
     "revealState: createSecondaryWindowRevealState",
     "readiness.revealState.nativeReady = true",
-    "readiness.revealState.settle(false)",
     "SECONDARY_WINDOW_READY_TIMEOUT_MS",
     'window.once("ready-to-show"',
     "revealSecondaryWindowWhenReady(role, window)",
     "--megle-window=${role}",
     "config.route"
   ]) {
-    if (!openSecondaryWindowBody.includes(value)) {
+    if (!createSecondaryWindowBody.includes(value)) {
       fail(`shared secondary window must preserve the Settings lifecycle/material contract: ${value}`);
+    }
+  }
+  for (const value of ["did-fail-load", "render-process-gone", "destroyFailedSecondaryWindow", "processLogSubscriptions.clearTarget", "readiness.revealState.settle(false)"]) {
+    if (!main.includes(value)) {
+      fail(`failed secondary windows must release role state and subscriptions: ${value}`);
+    }
+  }
+  for (const value of ["class SecondaryWindowOpeningCoordinator", "this.openings", "token", "finally", "clear(role: Role, token: symbol)"]) {
+    if (!secondaryWindowOpening.includes(value)) {
+      fail(`secondary window opening coordinator missing ${value}`);
     }
   }
 }
@@ -224,8 +247,11 @@ for (const value of [
   "createNotificationService",
   "NotificationRuntime",
   "attachNotificationServiceForSession",
+  "quiesceNotificationRuntime",
+  "restoreNotificationsAfterFailedCoreStop",
+  "runRecoverableNotificationShutdown",
   "closeNotificationRuntime",
-  "await closeNotificationRuntime()"
+  "closeNotifications: closeNotificationRuntime"
 ]) {
   if (!main.includes(value)) {
     fail(`desktop notification lifecycle missing ${value}`);
@@ -311,13 +337,66 @@ for (const value of [
   if (!preload.includes(value)) {
     fail(`preload notification bridge missing ${value}`);
   }
-  if (!webDesktopBridge.includes(value)) {
+  if (!notificationContract.includes(value)) {
     fail(`typed Web notification bridge missing ${value}`);
   }
 }
-if (!preload.includes("notifications: {") ||
+if (!preload.includes("notifications: notificationsBridge") ||
     !webDesktopBridge.includes("notifications?: DesktopNotificationsBridge")) {
   fail("preload and Web bridge must expose one nested notifications surface");
+}
+if (!webDesktopBridge.includes('from "@megle/notification-contract"') ||
+    !notificationContract.includes("interface NotificationIpcBridge") ||
+    notificationContract.includes("onLogs")) {
+  fail("Desktop and Web must share the tokenized type-only notification IPC contract");
+}
+for (const value of [
+  "subscriptionId",
+  "ProcessLogSubscriptionStart",
+  "ProcessLogSubscriptionEvent",
+  "parseProcessLogSubscriptionId",
+  "clearTarget"
+]) {
+  if (!notificationIpc.includes(value) && !notificationContract.includes(value)) {
+    fail(`tokenized process log IPC missing ${value}`);
+  }
+}
+if (preload.includes("onLogs:") ||
+    !preload.includes("logsUnsubscribe, id") ||
+    !preload.includes('windowRole === "notifications"')) {
+  fail("preload must use one tokenized log protocol and a role-scoped notifications bridge");
+}
+for (const value of [
+  "canAccessDesktopIpc",
+  "PRIVILEGED_WINDOW_ROLES",
+  '"megle:switch-library"',
+  '"megle:shell-open-path"'
+]) {
+  if (!desktopIpcPermissions.includes(value)) {
+    fail(`desktop sender-role allowlist missing ${value}`);
+  }
+}
+for (const channel of [
+  "megle:switch-library",
+  "megle:create-library",
+  "megle:remove-library-from-list",
+  "megle:delete-library-file",
+  "megle:shell-reveal-path",
+  "megle:shell-open-path"
+]) {
+  if (!main.includes(`requireDesktopIpcAccess(event, "${channel}")`)) {
+    fail(`desktop Main must authorize the real sender before ${channel}`);
+  }
+}
+for (const value of [
+  "await options.quiesceNotifications()",
+  "await options.stopCore()",
+  "await options.restoreNotifications()",
+  "await options.closeNotifications()"
+]) {
+  if (!notificationShutdown.includes(value)) {
+    fail(`recoverable notification shutdown missing ${value}`);
+  }
 }
 if (preload.includes('require("./notification-ipc-channels.cjs")') ||
     !desktopPackage.includes("channels+'\\\\n'+preload")) {
@@ -683,7 +762,7 @@ if (!createWindowBody) {
   }
 }
 
-const shellReadyHandlerBody = functionBody(main, 'ipcMain.handle("megle:shell-ready", async () =>');
+const shellReadyHandlerBody = functionBody(main, 'ipcMain.handle("megle:shell-ready", async (event) =>');
 if (!shellReadyHandlerBody) {
   fail("desktop main must handle the shell-ready IPC handshake");
 } else {
@@ -738,7 +817,7 @@ const shutdownBody = functionBody(main, "function requestDesktopShutdown(exitCod
 if (!shutdownBody) {
   fail("desktop main must centralize asynchronous Core shutdown and logger close");
 } else {
-  if (!shutdownBody.includes("await stopDesktopCoreProcesses()")) {
+  if (!shutdownBody.includes("stopCore: stopDesktopCoreProcesses")) {
     fail("desktop shutdown must await pending and active Core process termination");
   }
   if (!shutdownBody.includes("await desktopLogger.close()")) {

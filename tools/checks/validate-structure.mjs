@@ -42,6 +42,7 @@ const requiredDirs = [
   "crates/core/migrations",
   "docs/performance-results/raw/2026-05-16",
   "packages/core-client",
+  "packages/notification-contract",
   "tests",
   "tools/bench",
   "tools/checks",
@@ -66,6 +67,8 @@ const requiredFiles = [
   "packages/core-client/src/index.ts",
   "packages/core-client/src/generated-contract.ts",
   "packages/core-client/src/client.ts",
+  "packages/notification-contract/package.json",
+  "packages/notification-contract/src/index.ts",
   "contracts/core-api/openapi.yaml",
   "contracts/plugins/manifest.schema.json",
   "crates/core/Cargo.toml",
@@ -92,9 +95,13 @@ for (const file of requiredFiles) requireFile(file);
 for (const generatedPath of forbiddenGeneratedPaths) forbidPath(generatedPath);
 
 const packageJson = readJson("package.json");
+if (!packageJson.workspaces?.includes("packages/notification-contract")) {
+  fail("root workspaces must include packages/notification-contract");
+}
 for (const scriptName of [
   "check:structure",
   "check:core-api",
+  "check:notification-contract",
   "check:schema",
   "check:rust",
   "test"

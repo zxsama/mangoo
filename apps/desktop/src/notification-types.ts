@@ -1,133 +1,47 @@
-import type { ProcessLogLine } from "./process-log-buffer.js";
+import type {
+  DesktopNotificationOperation,
+  NotificationActionResult,
+  NotificationCategory,
+  NotificationCompactSnapshot,
+  NotificationHistoryPage,
+  NotificationHistoryQuery,
+  NotificationLibraryIdentity,
+  NotificationOperationInput,
+  NotificationOperationStatus,
+  NotificationStoredSnapshot,
+  NotificationStoreEvent,
+  NotificationSyncHealth,
+  ProcessLogEntry,
+  RendererErrorReport,
+  ThumbnailCacheSummary
+} from "@megle/notification-contract";
 
-export type NotificationOrigin = "user" | "background" | "recovery" | "system";
-export type NotificationPresentation = "important" | "history_only" | "status_only";
-export type NotificationOperationStatus =
-  | "pending"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "cancelled";
-export type NotificationCategory = "task" | "file_operation" | "error" | "thumbnail_cache";
-
-export interface NotificationLibraryIdentity {
-  id: string;
-  name: string;
-}
-
-// Desktop owns this DTO so its persistent schema does not depend on renderer or client internals.
-export interface NotificationOperationInput {
-  operationId: string;
-  revision: number;
-  kind: string;
-  category: NotificationCategory;
-  origin: NotificationOrigin;
-  presentation: NotificationPresentation;
-  status: NotificationOperationStatus;
-  phase: string | null;
-  title: string;
-  summary: string | null;
-  taskId: number | null;
-  rootId: number | null;
-  folderId: number | null;
-  fileId: number | null;
-  currentValue: number;
-  totalValue: number | null;
-  unit: string | null;
-  errorCode: string | null;
-  errorDetail: string | null;
-  cancellable: boolean;
-  retryable: boolean;
-  attempt: number;
-  occurrenceCount: number;
-  startedAt: number;
-  updatedAt: number;
-  completedAt: number | null;
-}
-
-export interface DesktopNotificationOperation extends NotificationOperationInput {
-  libraryId: string;
-  libraryName: string;
-}
-
-export interface NotificationStoreEvent {
-  sequence: number;
-  operation: NotificationOperationInput;
-}
+export type {
+  DesktopNotificationOperation,
+  NotificationActionResult,
+  NotificationCategory,
+  NotificationCompactSnapshot,
+  NotificationHistoryPage,
+  NotificationHistoryQuery,
+  NotificationLibraryIdentity,
+  NotificationOperationInput,
+  NotificationOperationStatus,
+  NotificationStoredSnapshot,
+  NotificationStoreEvent,
+  NotificationSyncHealth,
+  ProcessLogEntry,
+  RendererErrorReport,
+  ThumbnailCacheSummary
+} from "@megle/notification-contract";
 
 export interface NotificationSyncState {
   persistedSequence: number;
   ackedSequence: number;
 }
 
-export interface ThumbnailCacheSummary {
-  libraryId: string;
-  libraryName: string;
-  observedAt: number;
-  cachedCount: number;
-  totalCandidateCount: number;
-  missingCount: number;
-  staleCount: number;
-  failedCount: number;
-  pendingCount: number;
-  activeBulkTaskCount: number;
-  totalCacheBytes: number | null;
-  completionPercent: number | null;
-}
-
-export interface NotificationStoredSnapshot {
-  active: DesktopNotificationOperation[];
-  thumbnailSummaries: ThumbnailCacheSummary[];
-  latestImportantResults: DesktopNotificationOperation[];
-}
-
-export interface NotificationCompactSnapshot extends NotificationStoredSnapshot {
-  syncHealth: NotificationSyncHealth;
-}
-
-export interface NotificationHistoryQuery {
-  libraryId?: string;
-  statuses?: NotificationOperationStatus[];
-  categories?: NotificationCategory[];
-  search?: string;
-  limit?: number;
-  offset?: number;
-}
-
-export interface NotificationHistoryPage {
-  items: DesktopNotificationOperation[];
-  total: number;
-  nextOffset: number | null;
-}
-
-export interface NotificationSyncHealth {
-  state: "healthy" | "syncing" | "degraded";
-  libraryId: string | null;
-  detail: string | null;
-  updatedAt: number;
-}
-
-export interface RendererErrorReport {
-  libraryId: string;
-  libraryName: string;
-  source: string;
-  code: string;
-  target: string;
-  title: string;
-  message: string;
-  detail: string | null;
-}
-
 export type NotificationRendererErrorRecordResult =
   | { outcome: "applied"; operation: DesktopNotificationOperation }
   | { outcome: "duplicate"; operation: DesktopNotificationOperation | null };
-
-export interface NotificationActionResult {
-  ok: boolean;
-  message: string | null;
-}
-
-export type ProcessLogEntry = ProcessLogLine;
 
 export interface NotificationRetentionResult {
   deletedExpired: number;

@@ -7,19 +7,21 @@
   "workspaces": [
     "apps/desktop",
     "apps/web",
-    "packages/core-client"
+    "packages/core-client",
+    "packages/notification-contract"
   ],
   "scripts": {
     "dev": "node tools/dev/run-dev.mjs",
     "check:structure": "node tools/checks/validate-structure.mjs",
     "check:core-api": "node tools/checks/validate-core-api.mjs",
     "check:core-client": "npm --workspace @megle/core-client run check && npm --workspace @megle/core-client run typecheck && npm --workspace @megle/core-client run test",
+    "check:notification-contract": "npm --workspace @megle/notification-contract run check && npm --workspace @megle/notification-contract run typecheck && npm --workspace @megle/notification-contract run test",
     "check:desktop": "node tools/checks/validate-desktop-core.mjs && npm --workspace @megle/desktop run typecheck && npm --workspace @megle/desktop run test",
     "check:web": "node tools/checks/validate-web-client.mjs && npm --workspace @megle/web run typecheck && npm --workspace @megle/web run test",
     "check:ui-design": "node tools/checks/validate-ui-design.mjs",
     "check:schema": "python tools/checks/validate_sqlite_schema.py",
     "check:rust": "node tools/checks/verify-rust.mjs",
-    "test": "npm run check:structure && npm run check:core-api && npm run check:core-client && npm run check:desktop && npm run check:web && npm run check:ui-design && npm run check:schema && npm run check:rust"
+    "test": "npm run check:structure && npm run check:core-api && npm run check:core-client && npm run check:notification-contract && npm run check:desktop && npm run check:web && npm run check:ui-design && npm run check:schema && npm run check:rust"
   },
   "engines": {
     "node": ">=22.0.0",

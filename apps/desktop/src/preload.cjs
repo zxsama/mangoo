@@ -16,48 +16,124 @@ function subscribe(channel, cb) {
   return () => ipcRenderer.removeListener(channel, listener);
 }
 
-async function snapshotAndSubscribeLogs(query, cb) {
-  const queued = [];
-  let ready = false;
+const MAX_QUEUED_LOG_LINES = 5000;
+
+function mergeQueuedLogBatch(previous, next) {
+  const lines = [...(previous?.lines ?? []), ...(next?.lines ?? [])];
+  let droppedBeforeSequence = Math.max(
+    previous?.droppedBeforeSequence ?? 0,
+    next?.droppedBeforeSequence ?? 0
+  ) || null;
+  if (lines.length > MAX_QUEUED_LOG_LINES) {
+    lines.splice(0, lines.length - MAX_QUEUED_LOG_LINES);
+    droppedBeforeSequence = lines[0]?.sequence ?? next.afterSequence;
+  }
+  return {
+    lines,
+    afterSequence: next.afterSequence,
+    droppedBeforeSequence
+  };
+}
+
+function snapshotAndSubscribeLogs(query, cb) {
+  const queuedBySubscription = new Map();
   let active = true;
-  const listener = (_event, batch) => {
+  let subscriptionId = null;
+  let unsubscribeSent = false;
+  const sendUnsubscribe = (id) => {
+    if (unsubscribeSent) return;
+    unsubscribeSent = true;
+    ipcRenderer.send(NOTIFICATION_IPC_CHANNELS.logsUnsubscribe, id);
+  };
+  const listener = (_event, payload) => {
     if (!active) return;
-    if (!ready) {
-      queued.push(batch);
+    if (!payload || typeof payload.subscriptionId !== "string") return;
+    if (subscriptionId === null) {
+      queuedBySubscription.set(
+        payload.subscriptionId,
+        mergeQueuedLogBatch(queuedBySubscription.get(payload.subscriptionId), payload.batch)
+      );
+      if (queuedBySubscription.size > 8) {
+        queuedBySubscription.delete(queuedBySubscription.keys().next().value);
+      }
       return;
     }
-    cb(batch);
+    if (payload.subscriptionId === subscriptionId) cb(payload.batch);
   };
   ipcRenderer.on(NOTIFICATION_IPC_CHANNELS.logsChanged, listener);
-  try {
-    const initial = await ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsSubscribe, query);
-    ready = true;
-    for (const batch of queued.splice(0)) cb(batch);
-    return {
-      ...initial,
-      unsubscribe: () => {
-        if (!active) return;
-        active = false;
-        ipcRenderer.removeListener(NOTIFICATION_IPC_CHANNELS.logsChanged, listener);
-        ipcRenderer.send(NOTIFICATION_IPC_CHANNELS.logsUnsubscribe);
+  const ready = ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsSubscribe, query).then(
+    (initial) => {
+      subscriptionId = initial.subscriptionId;
+      if (!active) {
+        sendUnsubscribe(subscriptionId);
+      } else if (queuedBySubscription.has(subscriptionId)) {
+        cb(queuedBySubscription.get(subscriptionId));
       }
-    };
-  } catch (error) {
-    active = false;
-    ipcRenderer.removeListener(NOTIFICATION_IPC_CHANNELS.logsChanged, listener);
-    ipcRenderer.send(NOTIFICATION_IPC_CHANNELS.logsUnsubscribe);
-    throw error;
-  }
+      queuedBySubscription.clear();
+      return { snapshot: initial.snapshot, afterSequence: initial.afterSequence };
+    },
+    (error) => {
+      active = false;
+      queuedBySubscription.clear();
+      ipcRenderer.removeListener(NOTIFICATION_IPC_CHANNELS.logsChanged, listener);
+      throw error;
+    }
+  );
+  return {
+    ready,
+    unsubscribe: () => {
+      if (!active) return;
+      active = false;
+      queuedBySubscription.clear();
+      ipcRenderer.removeListener(NOTIFICATION_IPC_CHANNELS.logsChanged, listener);
+      if (subscriptionId !== null) sendUnsubscribe(subscriptionId);
+    }
+  };
 }
 
 const visualHarnessEnabled = readArg("--megle-visual-harness=") === "1";
-
-contextBridge.exposeInMainWorld("megleDesktop", {
+const requestedWindowRole = readArg("--megle-window=");
+const windowRole = ["main", "settings", "plugins", "notifications"].includes(requestedWindowRole)
+  ? requestedWindowRole
+  : "unknown";
+const windowControls = {
+  minimize: () => ipcRenderer.invoke("megle:window-minimize"),
+  maximize: () => ipcRenderer.invoke("megle:window-maximize"),
+  close: () => ipcRenderer.invoke("megle:window-close"),
+  isMaximized: () => ipcRenderer.invoke("megle:window-is-maximized"),
+  beginDrag: (payload) => ipcRenderer.invoke("megle:window-begin-drag", payload),
+  moveDrag: () => ipcRenderer.invoke("megle:window-drag-move"),
+  endDrag: () => ipcRenderer.invoke("megle:window-end-drag"),
+  getBounds: () => ipcRenderer.invoke("megle:window-get-bounds"),
+  setPosition: (x, y) => ipcRenderer.invoke("megle:window-set-position", x, y)
+};
+/** @type {import("@megle/notification-contract").NotificationIpcBridge} */
+const notificationsBridge = {
+  getCompactSnapshot: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.compact),
+  listHistory: (query) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.history, query),
+  cancel: (libraryId, operationId) =>
+    ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.cancel, libraryId, operationId),
+  retry: (libraryId, operationId) =>
+    ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.retry, libraryId, operationId),
+  reportError: (input) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.reportError, input),
+  publishThumbnailSummary: (input) =>
+    ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.thumbnailSummary, input),
+  onChanged: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.changed, cb),
+  getLogs: (query) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsPage, query),
+  snapshotAndSubscribeLogs,
+  clearLogs: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsClear),
+  emitRendererLogs: (entries) => ipcRenderer.send(NOTIFICATION_IPC_CHANNELS.rendererLogs, entries)
+};
+const commonWindowBridge = {
+  windowRole,
+  notifySecondaryWindowReady: (role) =>
+    ipcRenderer.invoke("megle:secondary-window-ready", role),
+  windowControls
+};
+const fullBridge = {
+  ...commonWindowBridge,
   coreUrl: readArg("--megle-core-url="),
   sessionToken: readArg("--megle-session-token="),
-  // The web entry pairs this role with the matching hash route to select the
-  // main shell or a standalone secondary-window surface.
-  windowRole: readArg("--megle-window=") ?? "main",
   notifyShellReady: () => ipcRenderer.invoke("megle:shell-ready"),
   pickFolder: () => ipcRenderer.invoke("megle:pick-folder"),
   diagnostics: () => ipcRenderer.invoke("megle:diagnostics"),
@@ -67,19 +143,6 @@ contextBridge.exposeInMainWorld("megleDesktop", {
   closePluginsWindow: () => ipcRenderer.invoke("megle:close-plugins-window"),
   openNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.openWindow),
   closeNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.closeWindow),
-  notifySecondaryWindowReady: (role) =>
-    ipcRenderer.invoke("megle:secondary-window-ready", role),
-  windowControls: {
-    minimize: () => ipcRenderer.invoke("megle:window-minimize"),
-    maximize: () => ipcRenderer.invoke("megle:window-maximize"),
-    close: () => ipcRenderer.invoke("megle:window-close"),
-    isMaximized: () => ipcRenderer.invoke("megle:window-is-maximized"),
-    beginDrag: (payload) => ipcRenderer.invoke("megle:window-begin-drag", payload),
-    moveDrag: () => ipcRenderer.invoke("megle:window-drag-move"),
-    endDrag: () => ipcRenderer.invoke("megle:window-end-drag"),
-    getBounds: () => ipcRenderer.invoke("megle:window-get-bounds"),
-    setPosition: (x, y) => ipcRenderer.invoke("megle:window-set-position", x, y)
-  },
   shell: {
     revealPath: (path) => ipcRenderer.invoke("megle:shell-reveal-path", path),
     openPath: (path) => ipcRenderer.invoke("megle:shell-open-path", path),
@@ -101,28 +164,21 @@ contextBridge.exposeInMainWorld("megleDesktop", {
     ipcRenderer.on("megle:library-load-phase", listener);
     return () => ipcRenderer.removeListener("megle:library-load-phase", listener);
   },
-  notifications: {
-    getCompactSnapshot: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.compact),
-    listHistory: (query) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.history, query),
-    cancel: (libraryId, operationId) =>
-      ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.cancel, libraryId, operationId),
-    retry: (libraryId, operationId) =>
-      ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.retry, libraryId, operationId),
-    reportError: (input) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.reportError, input),
-    publishThumbnailSummary: (input) =>
-      ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.thumbnailSummary, input),
-    onChanged: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.changed, cb),
-    getLogs: (query) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsPage, query),
-    onLogs: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.logsChanged, cb),
-    snapshotAndSubscribeLogs,
-    clearLogs: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsClear),
-    emitRendererLogs: (entries) => ipcRenderer.send(NOTIFICATION_IPC_CHANNELS.rendererLogs, entries)
-  },
+  notifications: notificationsBridge
+};
+const notificationWindowBridge = {
+  ...commonWindowBridge,
+  closeNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.closeWindow),
+  notifications: notificationsBridge
+};
+const roleBridge = windowRole === "notifications"
+  ? notificationWindowBridge
+  : ["main", "settings", "plugins"].includes(windowRole)
+    ? fullBridge
+    : { windowRole };
+contextBridge.exposeInMainWorld("megleDesktop", {
+  ...roleBridge,
   ...(visualHarnessEnabled
-    ? {
-        visual: {
-          capturePage: () => ipcRenderer.invoke("megle:visual-capture-page")
-        }
-      }
+    ? { visual: { capturePage: () => ipcRenderer.invoke("megle:visual-capture-page") } }
     : {})
 });

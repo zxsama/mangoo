@@ -15,6 +15,7 @@ crates/
   core/             Rust Core service binary and Phase 1 backend modules.
 packages/
   core-client/      Generated-package boundary for the TypeScript Core API client.
+  notification-contract/ Shared type-only Desktop/Web notification IPC contract.
 docs/               Product, architecture, decisions, benchmark reports.
 tools/
   bench/            Reproducible performance benchmarks and generated-data tools.
@@ -29,6 +30,7 @@ tools/
 - `crates/core` composes API, database, queues, tasks, and service lifecycle. During Phase 1, `api`, `db`, `roots`, `scan`, `thumbnails`, `fsops`, and `plugins` live as modules inside this crate.
 - Future Rust crates should be split out only after the module boundaries are stable and tests show real separation pressure.
 - `packages/core-client` owns the TypeScript Core API client/types boundary as `@megle/core-client`. Phase 1 keeps a hand-maintained generated-output placeholder aligned by a fast contract check until full generator output replaces it.
+- `packages/notification-contract` owns the type-only notification, process-log, and preload bridge DTOs shared by Desktop and Web. It reuses generated Core operation types and has no runtime Node dependency.
 - `tools/bench` is for heavier performance experiments. It may generate large ignored artifacts.
 - `tools/checks` is for quick checks that should run every time the structure changes.
 

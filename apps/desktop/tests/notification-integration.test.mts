@@ -118,7 +118,7 @@ test("notification snapshot broadcasts coalesce to the newest bounded update", (
   assert.equal(scheduled.length, 0);
 });
 
-test("process log subscriptions replace duplicates, preserve gap batches and clean up on destroy", () => {
+test("process log subscriptions replace tokens, preserve gap batches and clean up on destroy", () => {
   assert.ok(ipcModule);
   let subscriber: ((batch: unknown) => void) | null = null;
   let unsubscribeCount = 0;
@@ -146,18 +146,32 @@ test("process log subscriptions replace duplicates, preserve gap batches and cle
     }
   }
   const target = new Target();
-  const registry = new ipcModule.ProcessLogIpcSubscriptions(buffer, "logs-changed");
+  const subscriptionIds = ["first", "second"];
+  const registry = new ipcModule.ProcessLogIpcSubscriptions(
+    buffer,
+    "logs-changed",
+    () => subscriptionIds.shift()
+  );
 
-  assert.deepEqual(registry.snapshotAndSubscribe(target, {}), {
+  const first = registry.snapshotAndSubscribe(target, {});
+  assert.deepEqual(first, {
+    subscriptionId: "first",
     snapshot: [{ sequence: 4 }],
     afterSequence: 4
   });
-  registry.snapshotAndSubscribe(target, {});
+  const second = registry.snapshotAndSubscribe(target, {});
   assert.equal(unsubscribeCount, 1, "a sender may own only one live log subscription");
+  assert.equal(registry.unsubscribe(target.id, first.subscriptionId), false);
 
   subscriber?.({ lines: [], afterSequence: 9, droppedBeforeSequence: 6 });
   assert.deepEqual(target.sent, [
-    ["logs-changed", { lines: [], afterSequence: 9, droppedBeforeSequence: 6 }]
+    [
+      "logs-changed",
+      {
+        subscriptionId: "second",
+        batch: { lines: [], afterSequence: 9, droppedBeforeSequence: 6 }
+      }
+    ]
   ]);
 
   target.destroyed = true;
@@ -387,11 +401,11 @@ test("Task 10 source contract exposes one notifications window and typed preload
   assert.match(main, /notificationDatabasePath\(userDataDir\(\)\)/);
   assert.match(main, /runNotificationSafeCoreTransition/);
   assert.doesNotMatch(main, /scheduleNotificationServiceAttach/);
-  assert.match(main, /await runtime\?\.detachLibrary\(\)[\s\S]*await runtime\?\.close\(\)/);
-  assert.match(main, /await closeNotificationRuntime\(\)[\s\S]*await stopDesktopCoreProcesses\(\)/);
-  assert.match(preload, /notifications:\s*{/);
+  assert.match(main, /runRecoverableNotificationShutdown/);
+  assert.match(main, /quiesceNotifications: quiesceNotificationRuntime[\s\S]*stopCore: stopDesktopCoreProcesses[\s\S]*closeNotifications: closeNotificationRuntime/);
+  assert.match(preload, /notifications:\s*notificationsBridge/);
   assert.match(preload, /return \(\) => ipcRenderer\.removeListener/);
-  assert.match(desktop, /interface DesktopNotificationsBridge/);
+  assert.match(desktop, /DesktopNotificationsBridge[\s\S]*from "@megle\/notification-contract"/);
   assert.match(desktop, /windowRole\?: "main" \| DesktopSecondaryWindowRole/);
   assert.match(webMain, /windowRole === "notifications"/);
   assert.match(webMain, /import\("\.\/features\/notifications\/NotificationWindow"\)/);
@@ -431,7 +445,7 @@ test("preload bridge removes exact listeners and buffers log batches until snaps
   };
   vm.runInNewContext(source, {
     module: { exports: {} },
-    process: { argv: [] },
+    process: { argv: ["--megle-window=notifications"] },
     require(id: string) {
       if (id === "electron") {
         return {
@@ -453,7 +467,10 @@ test("preload bridge removes exact listeners and buffers log batches until snaps
     snapshotAndSubscribeLogs(
       query: unknown,
       cb: (value: unknown) => void
-    ): Promise<{ snapshot: unknown[]; afterSequence: number; unsubscribe: () => void }>;
+    ): {
+      ready: Promise<{ snapshot: unknown[]; afterSequence: number }>;
+      unsubscribe: () => void;
+    };
   };
   assert.equal(typeof bridge.onChanged, "function");
   assert.equal(typeof bridge.snapshotAndSubscribeLogs, "function");
@@ -466,17 +483,17 @@ test("preload bridge removes exact listeners and buffers log batches until snaps
   assert.deepEqual(removed.at(-1), [channels.changed, changedListener]);
 
   const delivered: unknown[] = [];
-  const pending = bridge.snapshotAndSubscribeLogs({}, (batch) => delivered.push(batch));
+  const subscription = bridge.snapshotAndSubscribeLogs({}, (batch) => delivered.push(batch));
   const logListener = [...(listeners.get(channels.logsChanged) ?? [])][0];
   assert.ok(logListener);
   const earlyBatch = { lines: [], afterSequence: 7, droppedBeforeSequence: 4 };
-  logListener({}, earlyBatch);
+  logListener({}, { subscriptionId: "logs-1", batch: earlyBatch });
   assert.deepEqual(delivered, []);
-  resolveLogSnapshot?.({ snapshot: [{ sequence: 6 }], afterSequence: 6 });
-  const subscription = await pending;
-  assert.deepEqual(delivered, [earlyBatch]);
-  assert.deepEqual(subscription.snapshot, [{ sequence: 6 }]);
+  resolveLogSnapshot?.({ subscriptionId: "logs-1", snapshot: [{ sequence: 6 }], afterSequence: 6 });
+  const initial = await subscription.ready;
+  assert.deepEqual(JSON.parse(JSON.stringify(delivered)), [earlyBatch]);
+  assert.deepEqual(JSON.parse(JSON.stringify(initial.snapshot)), [{ sequence: 6 }]);
   subscription.unsubscribe();
   assert.deepEqual(removed.at(-1), [channels.logsChanged, logListener]);
-  assert.equal(sent.at(-1)?.[0], channels.logsUnsubscribe);
+  assert.deepEqual(sent.at(-1), [channels.logsUnsubscribe, "logs-1"]);
 });

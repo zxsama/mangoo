@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@megle/core-client": "*",
+    "@megle/notification-contract": "*",
     "electron": "43.1.0"
   },
   "devDependencies": {

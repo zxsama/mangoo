@@ -1,4 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
+import type {
+  ProcessLogSubscriptionEvent,
+  ProcessLogSubscriptionId,
+  ProcessLogSubscriptionStart,
+  RendererLogEntryInput
+} from "@megle/notification-contract";
 
 import type {
   NotificationHistoryQuery,
@@ -205,12 +212,6 @@ export function parseProcessLogFilter(value: unknown): ProcessLogFilter {
   return filter;
 }
 
-export interface RendererLogEntryInput {
-  readonly level: ProcessLogLevel;
-  readonly message: string;
-  readonly metadata?: Readonly<Record<string, unknown>>;
-}
-
 export function parseRendererLogEntries(value: unknown): RendererLogEntryInput[] {
   if (!Array.isArray(value)) throw new TypeError("renderer logs must be an array");
   if (value.length > 100) throw new RangeError("renderer logs are limited to 100 entries per batch");
@@ -228,6 +229,10 @@ export function parseRendererLogEntries(value: unknown): RendererLogEntryInput[]
     }
     return { level, message, ...(metadata ? { metadata } : {}) };
   });
+}
+
+export function parseProcessLogSubscriptionId(value: unknown): ProcessLogSubscriptionId {
+  return boundedString(value, "process log subscriptionId", 128);
 }
 
 export class LatestValueBroadcastQueue<T> {
@@ -277,7 +282,7 @@ interface ProcessLogSubscriptionBuffer {
 export interface ProcessLogIpcTarget {
   readonly id: number;
   isDestroyed(): boolean;
-  send(channel: string, payload: ProcessLogBatch): void;
+  send(channel: string, payload: ProcessLogSubscriptionEvent): void;
   once(event: "destroyed", listener: () => void): unknown;
   removeListener(event: "destroyed", listener: () => void): unknown;
 }
@@ -285,17 +290,25 @@ export interface ProcessLogIpcTarget {
 export class ProcessLogIpcSubscriptions {
   private readonly buffer: ProcessLogSubscriptionBuffer;
   private readonly changedChannel: string;
+  private readonly createSubscriptionId: () => string;
   private readonly subscriptions = new Map<
     number,
-    { target: ProcessLogIpcTarget; destroyListener: () => void; unsubscribe: () => void }
+    {
+      subscriptionId: ProcessLogSubscriptionId;
+      target: ProcessLogIpcTarget;
+      destroyListener: () => void;
+      unsubscribe: () => void;
+    }
   >();
 
   constructor(
     buffer: ProcessLogSubscriptionBuffer,
-    changedChannel: string
+    changedChannel: string,
+    createSubscriptionId: () => string = randomUUID
   ) {
     this.buffer = buffer;
     this.changedChannel = changedChannel;
+    this.createSubscriptionId = createSubscriptionId;
   }
 
   get size(): number {
@@ -305,35 +318,51 @@ export class ProcessLogIpcSubscriptions {
   snapshotAndSubscribe(
     target: ProcessLogIpcTarget,
     filter: ProcessLogFilter
-  ): { snapshot: ProcessLogSnapshotSubscription["snapshot"]; afterSequence: number } {
-    this.unsubscribe(target.id);
+  ): ProcessLogSubscriptionStart {
+    this.clearTarget(target.id);
+    const subscriptionId = this.createSubscriptionId();
+    if (!subscriptionId) throw new Error("process log subscriptionId must not be empty");
     const subscription = this.buffer.snapshotAndSubscribe((batch) => {
+      if (this.subscriptions.get(target.id)?.subscriptionId !== subscriptionId) return;
       if (target.isDestroyed()) {
-        this.unsubscribe(target.id);
+        this.unsubscribe(target.id, subscriptionId);
         return;
       }
-      target.send(this.changedChannel, batch);
+      target.send(this.changedChannel, { subscriptionId, batch });
     }, filter);
-    const destroyListener = () => this.unsubscribe(target.id);
+    const destroyListener = () => this.unsubscribe(target.id, subscriptionId);
     target.once("destroyed", destroyListener);
     this.subscriptions.set(target.id, {
+      subscriptionId,
       target,
       destroyListener,
       unsubscribe: subscription.unsubscribe
     });
-    return { snapshot: subscription.snapshot, afterSequence: subscription.afterSequence };
+    return {
+      subscriptionId,
+      snapshot: subscription.snapshot,
+      afterSequence: subscription.afterSequence
+    };
   }
 
-  unsubscribe(targetId: number): void {
+  unsubscribe(targetId: number, subscriptionId: ProcessLogSubscriptionId): boolean {
     const current = this.subscriptions.get(targetId);
-    if (!current) return;
+    if (!current || current.subscriptionId !== subscriptionId) return false;
+    this.clearTarget(targetId);
+    return true;
+  }
+
+  clearTarget(targetId: number): boolean {
+    const current = this.subscriptions.get(targetId);
+    if (!current) return false;
     this.subscriptions.delete(targetId);
     current.target.removeListener("destroyed", current.destroyListener);
     current.unsubscribe();
+    return true;
   }
 
   clear(): void {
-    for (const targetId of [...this.subscriptions.keys()]) this.unsubscribe(targetId);
+    for (const targetId of [...this.subscriptions.keys()]) this.clearTarget(targetId);
   }
 }
 

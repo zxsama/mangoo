@@ -25,6 +25,10 @@ import {
   type CoreProcessHandle
 } from "./core-process.js";
 import { createCoreSession, type CoreSession } from "./core-session.js";
+import {
+  assertDesktopIpcAccess,
+  type DesktopIpcWindowRole
+} from "./desktop-ipc-permissions.js";
 import { desktopLogger, processLogBuffer } from "./desktop-logger.js";
 import {
   CoreLifecycleQueue,
@@ -41,6 +45,7 @@ import {
   parseNotificationAction,
   parseNotificationHistoryQuery,
   parseProcessLogFilter,
+  parseProcessLogSubscriptionId,
   parseRendererErrorReport,
   parseRendererLogEntries,
   parseThumbnailCacheSummary,
@@ -49,6 +54,7 @@ import {
 import { runNotificationSafeCoreTransition } from "./notification-core-transition.js";
 import { NotificationRuntime } from "./notification-runtime.js";
 import { createNotificationService, type NotificationService } from "./notification-service.js";
+import { runRecoverableNotificationShutdown } from "./notification-shutdown.js";
 import { createNotificationStore, notificationDatabasePath } from "./notification-store.js";
 import type { NotificationCompactSnapshot } from "./notification-types.js";
 import {
@@ -58,6 +64,7 @@ import {
   waitForSecondaryNativeWindowWarmup,
   type SecondaryWindowRevealState
 } from "./secondary-window-reveal.js";
+import { SecondaryWindowOpeningCoordinator } from "./secondary-window-opening.js";
 
 let mainWindow: BrowserWindow | null = null;
 type SecondaryWindowRole = "settings" | "plugins" | "notifications";
@@ -75,6 +82,7 @@ const secondaryWindows: Record<SecondaryWindowRole, BrowserWindow | null> = {
   plugins: null,
   notifications: null
 };
+const secondaryWindowOpenings = new SecondaryWindowOpeningCoordinator<SecondaryWindowRole>();
 type SecondaryWindowReadiness = {
   windowId: number;
   revealState: SecondaryWindowRevealState<SecondaryWindowRevealResult | false>;
@@ -218,7 +226,7 @@ function windowForIpcEvent(event: IpcMainInvokeEvent | IpcMainEvent): BrowserWin
   return window && !window.isDestroyed() ? window : null;
 }
 
-function roleForWebContents(sender: WebContents): NotificationIpcWindowRole | null {
+function roleForWebContents(sender: WebContents): DesktopIpcWindowRole | null {
   const window = BrowserWindow.fromWebContents(sender);
   if (!window || window.isDestroyed()) return null;
   if (window === mainWindow) return "main";
@@ -226,6 +234,15 @@ function roleForWebContents(sender: WebContents): NotificationIpcWindowRole | nu
     if (secondaryWindows[role] === window) return role;
   }
   return null;
+}
+
+function requireDesktopIpcAccess(
+  event: IpcMainInvokeEvent | IpcMainEvent,
+  channel: string
+): DesktopIpcWindowRole {
+  const role = roleForWebContents(event.sender);
+  assertDesktopIpcAccess(role, channel);
+  return role;
 }
 
 function requireNotificationIpcAccess(
@@ -304,19 +321,53 @@ async function attachNotificationServiceForSession(
   assertCurrentCoreGeneration(generation, signal);
 }
 
+async function quiesceNotificationRuntime(): Promise<void> {
+  const runtime = notificationRuntime;
+  if (runtime) await runtime.detachLibrary();
+}
+
 async function closeNotificationRuntime(): Promise<void> {
   const runtime = notificationRuntime;
   notificationRuntime = null;
-  try {
-    await runtime?.detachLibrary();
-  } catch (error) {
-    desktopLogger.warn("main", "[megle] notification detach failed during shutdown; closing runtime:", error);
-  }
   notificationChangeSubscription?.();
   notificationChangeSubscription = null;
   notificationBroadcastQueue.close();
   processLogSubscriptions.clear();
   await runtime?.close();
+}
+
+async function restoreNotificationsAfterFailedCoreStop(
+  session: CoreSession | null,
+  generation: number
+): Promise<void> {
+  if (
+    !session ||
+    coreLifecycleQueue.currentGeneration !== generation ||
+    coreSession !== session
+  ) {
+    return;
+  }
+  const service = await ensureNotificationService();
+  if (
+    coreLifecycleQueue.currentGeneration !== generation ||
+    coreSession !== session
+  ) {
+    await service.detachLibrary();
+    return;
+  }
+  const registry = getRegistry();
+  const active = registry.libraries.find((library) => library.id === registry.activeLibraryId);
+  if (!active || path.resolve(active.dbPath) !== path.resolve(session.dbPath)) return;
+  await service.attachLibrary(
+    { id: active.id, name: active.name },
+    { baseUrl: session.baseUrl, sessionToken: session.sessionToken }
+  );
+  if (
+    coreLifecycleQueue.currentGeneration !== generation ||
+    coreSession !== session
+  ) {
+    await service.detachLibrary();
+  }
 }
 
 function registeredNotificationLibrary(libraryId: string): { id: string; name: string } {
@@ -338,7 +389,8 @@ function toSummaries(reg: libraryRegistry.LibraryRegistry): Array<{
   }));
 }
 
-ipcMain.handle("megle:pick-folder", async () => {
+ipcMain.handle("megle:pick-folder", async (event) => {
+  requireDesktopIpcAccess(event, "megle:pick-folder");
   const options: OpenDialogOptions = { properties: ["openDirectory"] };
   const result = mainWindow
     ? await dialog.showOpenDialog(mainWindow, options)
@@ -347,7 +399,8 @@ ipcMain.handle("megle:pick-folder", async () => {
   return result.canceled ? null : result.filePaths[0] ?? null;
 });
 
-ipcMain.handle("megle:diagnostics", async () => {
+ipcMain.handle("megle:diagnostics", async (event) => {
+  requireDesktopIpcAccess(event, "megle:diagnostics");
   const session = coreSession;
   return {
     ffmpegAvailable: await detectFfmpeg(),
@@ -357,10 +410,12 @@ ipcMain.handle("megle:diagnostics", async () => {
 });
 
 ipcMain.handle("megle:window-minimize", (event) => {
+  requireDesktopIpcAccess(event, "megle:window-minimize");
   windowForIpcEvent(event)?.minimize();
 });
 
 ipcMain.handle("megle:window-maximize", (event) => {
+  requireDesktopIpcAccess(event, "megle:window-maximize");
   const window = windowForIpcEvent(event);
   if (!window) return false;
   if (window.isMaximized()) {
@@ -372,14 +427,17 @@ ipcMain.handle("megle:window-maximize", (event) => {
 });
 
 ipcMain.handle("megle:window-close", (event) => {
+  requireDesktopIpcAccess(event, "megle:window-close");
   windowForIpcEvent(event)?.close();
 });
 
 ipcMain.handle("megle:window-is-maximized", (event) => {
+  requireDesktopIpcAccess(event, "megle:window-is-maximized");
   return windowForIpcEvent(event)?.isMaximized() ?? false;
 });
 
 ipcMain.handle("megle:window-get-bounds", (event) => {
+  requireDesktopIpcAccess(event, "megle:window-get-bounds");
   const bounds = windowForIpcEvent(event)?.getBounds();
   if (!bounds) {
     return null;
@@ -388,6 +446,7 @@ ipcMain.handle("megle:window-get-bounds", (event) => {
 });
 
 ipcMain.handle("megle:window-set-position", (event, x: number, y: number) => {
+  requireDesktopIpcAccess(event, "megle:window-set-position");
   const window = windowForIpcEvent(event);
   if (!window) return false;
   window.setPosition(Math.round(x), Math.round(y));
@@ -400,6 +459,7 @@ ipcMain.handle(
     event,
     payload: { clientX: number; screenX: number; screenY: number; titlebarOffsetY: number; viewportWidth: number }
   ) => {
+    requireDesktopIpcAccess(event, "megle:window-begin-drag");
     const window = windowForIpcEvent(event);
     if (!window) return null;
 
@@ -445,6 +505,7 @@ ipcMain.handle(
 );
 
 ipcMain.handle("megle:window-drag-move", (event) => {
+  requireDesktopIpcAccess(event, "megle:window-drag-move");
   const window = windowForIpcEvent(event);
   if (!window || !activeWindowDrag || activeWindowDrag.windowId !== window.id) return false;
   const cursor = screen.getCursorScreenPoint();
@@ -456,13 +517,15 @@ ipcMain.handle("megle:window-drag-move", (event) => {
 });
 
 ipcMain.handle("megle:window-end-drag", (event) => {
+  requireDesktopIpcAccess(event, "megle:window-end-drag");
   const window = windowForIpcEvent(event);
   if (!window || activeWindowDrag?.windowId !== window.id) return false;
   activeWindowDrag = null;
   return true;
 });
 
-ipcMain.handle("megle:shell-reveal-path", (_event, targetPath: string) => {
+ipcMain.handle("megle:shell-reveal-path", (event, targetPath: string) => {
+  requireDesktopIpcAccess(event, "megle:shell-reveal-path");
   if (typeof targetPath !== "string" || targetPath.trim().length === 0) {
     return false;
   }
@@ -470,7 +533,8 @@ ipcMain.handle("megle:shell-reveal-path", (_event, targetPath: string) => {
   return true;
 });
 
-ipcMain.handle("megle:shell-open-path", async (_event, targetPath: string) => {
+ipcMain.handle("megle:shell-open-path", async (event, targetPath: string) => {
+  requireDesktopIpcAccess(event, "megle:shell-open-path");
   if (typeof targetPath !== "string" || targetPath.trim().length === 0) {
     return false;
   }
@@ -478,7 +542,8 @@ ipcMain.handle("megle:shell-open-path", async (_event, targetPath: string) => {
   return error.length === 0;
 });
 
-ipcMain.handle("megle:clipboard-write-text", (_event, text: string) => {
+ipcMain.handle("megle:clipboard-write-text", (event, text: string) => {
+  requireDesktopIpcAccess(event, "megle:clipboard-write-text");
   if (typeof text !== "string") {
     return false;
   }
@@ -486,7 +551,8 @@ ipcMain.handle("megle:clipboard-write-text", (_event, text: string) => {
   return true;
 });
 
-ipcMain.handle("megle:shell-ready", async () => {
+ipcMain.handle("megle:shell-ready", async (event) => {
+  requireDesktopIpcAccess(event, "megle:shell-ready");
   const window = mainWindow;
   if (!window || window.isDestroyed()) {
     return false;
@@ -510,22 +576,26 @@ ipcMain.handle("megle:shell-ready", async () => {
   }
 });
 
-ipcMain.handle("megle:open-settings-window", async () => {
+ipcMain.handle("megle:open-settings-window", async (event) => {
+  requireDesktopIpcAccess(event, "megle:open-settings-window");
   await openSecondaryWindow("settings");
   return true;
 });
 
-ipcMain.handle("megle:close-settings-window", () => {
+ipcMain.handle("megle:close-settings-window", (event) => {
+  requireDesktopIpcAccess(event, "megle:close-settings-window");
   closeSecondaryWindow("settings");
   return true;
 });
 
-ipcMain.handle("megle:open-plugins-window", async () => {
+ipcMain.handle("megle:open-plugins-window", async (event) => {
+  requireDesktopIpcAccess(event, "megle:open-plugins-window");
   await openSecondaryWindow("plugins");
   return true;
 });
 
-ipcMain.handle("megle:close-plugins-window", () => {
+ipcMain.handle("megle:close-plugins-window", (event) => {
+  requireDesktopIpcAccess(event, "megle:close-plugins-window");
   closeSecondaryWindow("plugins");
   return true;
 });
@@ -614,10 +684,13 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.logsSubscribe, (event, input: unknown) 
   );
 });
 
-ipcMain.on(NOTIFICATION_IPC_CHANNELS.logsUnsubscribe, (event) => {
+ipcMain.on(NOTIFICATION_IPC_CHANNELS.logsUnsubscribe, (event, subscriptionId: unknown) => {
   try {
     requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.logsUnsubscribe);
-    processLogSubscriptions.unsubscribe(event.sender.id);
+    processLogSubscriptions.unsubscribe(
+      event.sender.id,
+      parseProcessLogSubscriptionId(subscriptionId)
+    );
   } catch {
     // Fire-and-forget unsubscribe is intentionally silent for stale windows.
   }
@@ -680,10 +753,17 @@ ipcMain.handle("megle:visual-capture-page", async (event) => {
   return image.toPNG().toString("base64");
 });
 
-ipcMain.handle("megle:list-libraries", () => toSummaries(getRegistry()));
-ipcMain.handle("megle:get-active-library-id", () => getRegistry().activeLibraryId);
+ipcMain.handle("megle:list-libraries", (event) => {
+  requireDesktopIpcAccess(event, "megle:list-libraries");
+  return toSummaries(getRegistry());
+});
+ipcMain.handle("megle:get-active-library-id", (event) => {
+  requireDesktopIpcAccess(event, "megle:get-active-library-id");
+  return getRegistry().activeLibraryId;
+});
 
-ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
+ipcMain.handle("megle:switch-library", async (event, libraryId: string) => {
+  requireDesktopIpcAccess(event, "megle:switch-library");
   try {
     return await coreLifecycleQueue.enqueue(async (signal) => {
       const generation = coreLifecycleQueue.beginGeneration();
@@ -703,7 +783,8 @@ ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
   }
 });
 
-ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath: string }) => {
+ipcMain.handle("megle:create-library", async (event, input: { name: string; dbPath: string }) => {
+  requireDesktopIpcAccess(event, "megle:create-library");
   try {
     return await coreLifecycleQueue.enqueue(async (signal) => {
       const generation = coreLifecycleQueue.beginGeneration();
@@ -733,7 +814,8 @@ ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath:
   }
 });
 
-ipcMain.handle("megle:open-library", async (_e, dbPath: string) => {
+ipcMain.handle("megle:open-library", async (event, dbPath: string) => {
+  requireDesktopIpcAccess(event, "megle:open-library");
   try {
     return await coreLifecycleQueue.enqueue(async (signal) => {
       const generation = coreLifecycleQueue.beginGeneration();
@@ -758,17 +840,20 @@ ipcMain.handle("megle:open-library", async (_e, dbPath: string) => {
   }
 });
 
-ipcMain.handle("megle:remove-library-from-list", (_e, libraryId: string) => {
+ipcMain.handle("megle:remove-library-from-list", (event, libraryId: string) => {
+  requireDesktopIpcAccess(event, "megle:remove-library-from-list");
   persistRegistry(libraryRegistry.removeLibrary(getRegistry(), libraryId));
   return { ok: true };
 });
 
-ipcMain.handle("megle:rename-library", (_e, libraryId: string, name: string) => {
+ipcMain.handle("megle:rename-library", (event, libraryId: string, name: string) => {
+  requireDesktopIpcAccess(event, "megle:rename-library");
   persistRegistry(libraryRegistry.renameLibrary(getRegistry(), libraryId, name));
   return { ok: true };
 });
 
-ipcMain.handle("megle:set-library-icon", (_e, libraryId: string, icon: string, color: string) => {
+ipcMain.handle("megle:set-library-icon", (event, libraryId: string, icon: string, color: string) => {
+  requireDesktopIpcAccess(event, "megle:set-library-icon");
   persistRegistry(libraryRegistry.setLibraryIcon(getRegistry(), libraryId, icon, color));
   return { ok: true };
 });
@@ -777,7 +862,8 @@ ipcMain.handle("megle:set-library-icon", (_e, libraryId: string, icon: string, c
 // disk AND drop it from the registry. Forbidden on the active library — Core
 // holds that file open (Windows would fail the unlink anyway), and the UI greys
 // the action. The renderer performs its own second confirmation before calling.
-ipcMain.handle("megle:delete-library-file", (_e, libraryId: string) => {
+ipcMain.handle("megle:delete-library-file", (event, libraryId: string) => {
+  requireDesktopIpcAccess(event, "megle:delete-library-file");
   const reg = getRegistry();
   const target = reg.libraries.find((l) => l.id === libraryId);
   if (!target) return { ok: false, error: "library not found" };
@@ -798,14 +884,16 @@ ipcMain.handle("megle:delete-library-file", (_e, libraryId: string) => {
   }
 });
 
-ipcMain.handle("megle:pick-library-file", async () => {
+ipcMain.handle("megle:pick-library-file", async (event) => {
+  requireDesktopIpcAccess(event, "megle:pick-library-file");
   const result = mainWindow
     ? await dialog.showOpenDialog(mainWindow, { properties: ["openFile"], filters: [{ name: "Megle Library", extensions: ["sqlite"] }] })
     : await dialog.showOpenDialog({ properties: ["openFile"], filters: [{ name: "Megle Library", extensions: ["sqlite"] }] });
   return result.canceled ? null : (result.filePaths[0] ?? null);
 });
 
-ipcMain.handle("megle:pick-new-library-path", async (_e, defaultName?: string) => {
+ipcMain.handle("megle:pick-new-library-path", async (event, defaultName?: string) => {
+  requireDesktopIpcAccess(event, "megle:pick-new-library-path");
   const result = mainWindow
     ? await dialog.showSaveDialog(mainWindow, { defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Megle Library", extensions: ["sqlite"] }] })
     : await dialog.showSaveDialog({ defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Megle Library", extensions: ["sqlite"] }] });
@@ -845,6 +933,7 @@ async function createWindow(): Promise<void> {
       additionalArguments: [
         `--megle-core-url=${session.baseUrl}`,
         `--megle-session-token=${session.sessionToken}`,
+        `--megle-window=main`,
         ...(isVisualHarnessEnabled() ? ["--megle-visual-harness=1"] : [])
       ]
     }
@@ -921,28 +1010,38 @@ async function createWindow(): Promise<void> {
   }
 }
 
+function focusExistingSecondaryWindow(role: SecondaryWindowRole): boolean {
+  const existing = secondaryWindows[role];
+  if (!existing || existing.isDestroyed()) return false;
+  if (existing.isMinimized()) existing.restore();
+  const readiness = secondaryWindowReadiness[role];
+  if (readiness?.windowId === existing.id && !readiness.revealState.settled) {
+    void revealSecondaryWindowWhenReady(role, existing);
+    return true;
+  }
+  existing.show();
+  existing.focus();
+  return true;
+}
+
 // Settings, Plugins, and Notifications use the same controlled secondary-window lifecycle:
 // non-modal child windows, shared preload/Core session, frameless acrylic, and
 // one live instance per role. Re-opening restores and focuses the existing one.
-async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
-  const existing = secondaryWindows[role];
-  if (existing && !existing.isDestroyed()) {
-    if (existing.isMinimized()) existing.restore();
-    const readiness = secondaryWindowReadiness[role];
-    if (
-      readiness?.windowId === existing.id &&
-      !readiness.revealState.settled
-    ) {
-      void revealSecondaryWindowWhenReady(role, existing);
-      return;
-    }
-    existing.show();
-    existing.focus();
-    return;
-  }
+function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
+  if (focusExistingSecondaryWindow(role)) return Promise.resolve();
+  return secondaryWindowOpenings.run(role, async (openingToken) => {
+    const session = await ensureCoreReady();
+    if (focusExistingSecondaryWindow(role)) return;
+    await createSecondaryWindow(role, session, openingToken);
+  });
+}
 
+async function createSecondaryWindow(
+  role: SecondaryWindowRole,
+  session: CoreSession,
+  openingToken: symbol
+): Promise<void> {
   const config = SECONDARY_WINDOW_CONFIGS[role];
-  const session = await ensureCoreReady();
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
   const position = resolveSecondaryWindowPosition(role, parent, config);
   const window = new BrowserWindow({
@@ -975,6 +1074,7 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
       ]
     }
   });
+  const webContentsId = window.webContents.id;
   secondaryWindows[role] = window;
   secondaryWindowReadiness[role] = {
     windowId: window.id,
@@ -997,9 +1097,16 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     (_event, errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
       if (!isMainFrame) return;
       desktopLogger.error("renderer", `${role} renderer failed to load`, { errorCode });
-      forceSecondaryWindowReveal(role, window);
+      destroyFailedSecondaryWindow(role, window, webContentsId, openingToken);
     }
   );
+  window.webContents.on("render-process-gone", (_event, details) => {
+    desktopLogger.error("renderer", `${role} renderer process exited`, {
+      reason: details.reason,
+      exitCode: details.exitCode
+    });
+    destroyFailedSecondaryWindow(role, window, webContentsId, openingToken);
+  });
   window.on("blur", () => {
     if (activeWindowDrag?.windowId === window.id) {
       activeWindowDrag = null;
@@ -1010,20 +1117,7 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     schedulePersistWindowState();
   });
   window.on("closed", () => {
-    if (activeWindowDrag?.windowId === window.id) {
-      activeWindowDrag = null;
-    }
-    if (secondaryWindows[role] === window) {
-      secondaryWindows[role] = null;
-    }
-    clearSecondaryWindowReadyFallback(role, window.id);
-    const readiness = secondaryWindowReadiness[role];
-    if (readiness?.windowId === window.id) {
-      readiness.revealState.settle(false);
-    }
-    if (secondaryWindowReadiness[role]?.windowId === window.id) {
-      secondaryWindowReadiness[role] = null;
-    }
+    clearSecondaryWindowState(role, window, webContentsId, openingToken);
   });
 
   const devServer = process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173";
@@ -1031,8 +1125,37 @@ async function openSecondaryWindow(role: SecondaryWindowRole): Promise<void> {
     await window.loadURL(`${devServer}${config.route}`);
   } catch (error) {
     desktopLogger.warn("main", `[megle] ${role} window loadURL rejected:`, error);
-    forceSecondaryWindowReveal(role, window);
+    destroyFailedSecondaryWindow(role, window, webContentsId, openingToken);
+    throw error;
   }
+}
+
+function clearSecondaryWindowState(
+  role: SecondaryWindowRole,
+  window: BrowserWindow,
+  webContentsId: number,
+  openingToken: symbol
+): void {
+  secondaryWindowOpenings.clear(role, openingToken);
+  processLogSubscriptions.clearTarget(webContentsId);
+  if (activeWindowDrag?.windowId === window.id) activeWindowDrag = null;
+  if (secondaryWindows[role] === window) secondaryWindows[role] = null;
+  clearSecondaryWindowReadyFallback(role, window.id);
+  const readiness = secondaryWindowReadiness[role];
+  if (readiness?.windowId === window.id) {
+    readiness.revealState.settle(false);
+    secondaryWindowReadiness[role] = null;
+  }
+}
+
+function destroyFailedSecondaryWindow(
+  role: SecondaryWindowRole,
+  window: BrowserWindow,
+  webContentsId: number,
+  openingToken: symbol
+): void {
+  clearSecondaryWindowState(role, window, webContentsId, openingToken);
+  if (!window.isDestroyed()) window.destroy();
 }
 
 function isSecondaryWindowRole(value: unknown): value is SecondaryWindowRole {
@@ -1939,8 +2062,15 @@ function handleDesktopStartupFailure(error: unknown): void {
 function requestDesktopShutdown(exitCode: number): void {
   if (shutdownFinalized || shutdownPromise) return;
   const shutdown = coreLifecycleQueue.shutdown(async () => {
-    await closeNotificationRuntime();
-    await stopDesktopCoreProcesses();
+    const generation = coreLifecycleQueue.currentGeneration;
+    const session = coreSession;
+    await runRecoverableNotificationShutdown({
+      quiesceNotifications: quiesceNotificationRuntime,
+      stopCore: stopDesktopCoreProcesses,
+      restoreNotifications: () =>
+        restoreNotificationsAfterFailedCoreStop(session, generation),
+      closeNotifications: closeNotificationRuntime
+    });
     await desktopLogger.close();
     pendingCoreProcess = null;
     coreProcess = null;
