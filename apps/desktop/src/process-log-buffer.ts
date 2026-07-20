@@ -64,6 +64,7 @@ const SECRET_JSON_PATTERN = new RegExp(
   `((?:["']?(?:${SENSITIVE_KEY_SOURCE})["']?)\\s*:\\s*["'])([^"']*)(["'])`,
   "gi"
 );
+const SENSITIVE_HEADER_NAME_PATTERN = new RegExp(`^${SENSITIVE_KEY_SOURCE}$`, "i");
 const WINDOWS_PATH_PATTERN = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+/g;
 const UNIX_SENSITIVE_PATH_PATTERN = /(?:\/Users\/|\/home\/|\/private\/var\/|\/tmp\/)[^\s"'`<>]+/gi;
 const SENSITIVE_METADATA_KEY_PATTERN = new RegExp(
@@ -352,6 +353,15 @@ function sanitizeMetadataValue(value: unknown, key: string, context: SanitizeCon
     if (Array.isArray(value)) {
       const output: unknown[] = [];
       const length = Math.min(value.length, MAX_METADATA_ARRAY_ITEMS);
+      let firstItem: unknown;
+      try {
+        firstItem = value[0];
+      } catch {
+        firstItem = UNREADABLE;
+      }
+      if (length === 2 && typeof firstItem === "string" && SENSITIVE_HEADER_NAME_PATTERN.test(firstItem)) {
+        return [sanitizeMetadataValue(firstItem, "value", context, depth + 1), REDACTED];
+      }
       for (let index = 0; index < length; index += 1) {
         let item: unknown;
         try {

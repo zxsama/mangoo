@@ -7,6 +7,7 @@ import { test } from "node:test";
 import {
   DEFAULT_PROCESS_LOG_MAX_BYTES,
   ProcessLogBuffer,
+  safeSerializeProcessLogValue,
   sanitizeProcessLogMessage
 } from "../src/process-log-buffer.ts";
 import { DesktopLogger } from "../src/desktop-logger.ts";
@@ -173,6 +174,64 @@ test("redacts x-megle-session and synonymous headers in nested objects and raw t
     assert.equal(snapshot.some((line) => (JSON.stringify(line.metadata) ?? "").includes(secret)), false);
     assert.equal(serialized.includes(secret), false);
   }
+});
+
+test("redacts sensitive header tuples in nested metadata and JSON messages while preserving ordinary arrays", async () => {
+  const secrets = [
+    "tuple-session-secret",
+    "tuple-auth-secret",
+    "tuple-cookie-secret",
+    "tuple-api-secret",
+    "nested-session-secret",
+    "nested-token-secret"
+  ];
+  const payload = {
+    headers: [
+      ["x-megle-session", secrets[0]],
+      ["Authorization", secrets[1]],
+      ["Cookie", secrets[2]],
+      ["X-Api-Key", secrets[3]],
+      ["content-type", "application/json"]
+    ],
+    nested: {
+      headers: [
+        ["x-session-token", secrets[4]],
+        ["MEGLE_SESSION_TOKEN", secrets[5]],
+        ["accept", "image/png"]
+      ]
+    },
+    ordinary: ["kept", ["name", "value"]]
+  };
+  const buffer = new ProcessLogBuffer();
+  const logger = new DesktopLogger({ buffer, console: { info: () => undefined } });
+
+  logger.info("renderer", payload);
+  await logger.flush();
+
+  const line = buffer.snapshot({})[0];
+  assert.ok(line);
+  const metadata = line.metadata?.argument1 as Record<string, unknown>;
+  const snapshot = JSON.stringify(buffer.snapshot({}));
+  const exported = safeSerializeProcessLogValue(payload);
+  for (const secret of secrets) {
+    assert.equal(line.message.includes(secret), false);
+    assert.equal(JSON.stringify(metadata).includes(secret), false);
+    assert.equal(snapshot.includes(secret), false);
+    assert.equal(exported.includes(secret), false);
+  }
+  assert.deepEqual(metadata.headers, [
+    ["x-megle-session", "[redacted]"],
+    ["Authorization", "[redacted]"],
+    ["Cookie", "[redacted]"],
+    ["X-Api-Key", "[redacted]"],
+    ["content-type", "application/json"]
+  ]);
+  assert.deepEqual((metadata.nested as Record<string, unknown>).headers, [
+    ["x-session-token", "[redacted]"],
+    ["MEGLE_SESSION_TOKEN", "[redacted]"],
+    ["accept", "image/png"]
+  ]);
+  assert.deepEqual(metadata.ordinary, ["kept", ["name", "value"]]);
 });
 
 test("keeps append alive when getters, invalid dates, proxies, or structured clone fail", () => {
