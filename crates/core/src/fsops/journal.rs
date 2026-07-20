@@ -39,11 +39,34 @@ struct PreparedIntent {
     kind: FileOperationKind,
     entity_kind: Option<EntityKind>,
     entity_id: Option<i64>,
+    root_id: Option<i64>,
     source_path: String,
     target_path: Option<String>,
     target_folder_id: Option<i64>,
     delete_root_path: Option<PathBuf>,
+    source_identity: Option<String>,
     preflight_error: Option<FsOpsError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalPhase {
+    Legacy,
+    Prepared,
+    Executing,
+}
+
+impl JournalPhase {
+    fn parse(value: &str) -> FsOpsResult<Self> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "prepared" => Ok(Self::Prepared),
+            "executing" => Ok(Self::Executing),
+            _ => Err(FsOpsError::new(
+                FsOpsErrorCode::FsError,
+                format!("unsupported file-operation journal phase: {value}"),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,12 +76,22 @@ struct JournalIntent {
     kind: FileOperationKind,
     entity_kind: Option<EntityKind>,
     entity_id: Option<i64>,
+    root_id: Option<i64>,
     source_path: PathBuf,
     target_path: Option<PathBuf>,
     target_folder_id: Option<i64>,
     attempt_count: i64,
+    phase: JournalPhase,
+    source_identity: Option<String>,
     pending_error_code: Option<String>,
     pending_error_detail: Option<String>,
+}
+
+#[derive(Debug)]
+enum PathProbe {
+    Exists(fs::Metadata),
+    NotFound,
+    Error(std::io::Error),
 }
 
 pub(super) fn rename(
@@ -79,6 +112,8 @@ pub(super) fn move_items(
     database: &Mutex<Database>,
     request: MoveRequest,
 ) -> FsOpsResult<Vec<FileOperationRecord>> {
+    // An empty item set is an invalid API command, not a logical operation;
+    // reject it before allocating a group id or writing an audit row.
     if request.file_ids.is_empty() && request.folder_ids.is_empty() {
         return Err(FsOpsError::new(
             FsOpsErrorCode::InvalidRequest,
@@ -93,6 +128,7 @@ pub(super) fn delete(
     database: &Mutex<Database>,
     request: DeleteRequest,
 ) -> FsOpsResult<Vec<FileOperationRecord>> {
+    // As with move, an empty item set has no operation to journal.
     if request.file_ids.is_empty() && request.folder_ids.is_empty() {
         return Err(FsOpsError::new(
             FsOpsErrorCode::InvalidRequest,
@@ -244,7 +280,7 @@ fn reconcile_intent(
         return Ok(Err(error));
     }
 
-    match reconcile_filesystem_state(intent) {
+    match reconcile_filesystem_state(database, intent) {
         ReconcileAction::FinalizeSuccess => finalize_intent(database, intent, None).map(Ok),
         ReconcileAction::Retry => execute_intent(database, intent),
         ReconcileAction::Fail(error) => {
@@ -260,15 +296,10 @@ enum ReconcileAction {
     Fail(FsOpsError),
 }
 
-fn reconcile_filesystem_state(intent: &JournalIntent) -> ReconcileAction {
-    let source_exists = path_present(&intent.source_path);
+fn reconcile_filesystem_state(database: &Database, intent: &JournalIntent) -> ReconcileAction {
     match intent.kind {
         FileOperationKind::DeleteRecycle | FileOperationKind::DeletePermanent => {
-            if source_exists {
-                ReconcileAction::Retry
-            } else {
-                ReconcileAction::FinalizeSuccess
-            }
+            reconcile_delete_filesystem_state(database, intent, probe_path(&intent.source_path))
         }
         FileOperationKind::Rename | FileOperationKind::Move => {
             let Some(target_path) = intent.target_path.as_deref() else {
@@ -277,27 +308,141 @@ fn reconcile_filesystem_state(intent: &JournalIntent) -> ReconcileAction {
                     "pending rename/move operation is missing its target path",
                 ));
             };
-            if intent.source_path == target_path {
-                return ReconcileAction::FinalizeSuccess;
+            reconcile_move_filesystem_state(
+                database,
+                intent,
+                target_path,
+                probe_path(&intent.source_path),
+                probe_path(target_path),
+            )
+        }
+    }
+}
+
+fn reconcile_delete_filesystem_state(
+    database: &Database,
+    intent: &JournalIntent,
+    source: PathProbe,
+) -> ReconcileAction {
+    match source {
+        PathProbe::Error(error) => ReconcileAction::Fail(probe_interrupted_error(
+            &intent.source_path,
+            "delete source",
+            error,
+        )),
+        PathProbe::NotFound if intent.phase == JournalPhase::Executing => {
+            match verify_entity_snapshot(database, intent) {
+                Ok(()) => ReconcileAction::FinalizeSuccess,
+                Err(error) => ReconcileAction::Fail(error),
             }
-            match (source_exists, path_present(target_path)) {
-                (false, true) => ReconcileAction::FinalizeSuccess,
-                (true, false) => ReconcileAction::Retry,
-                (true, true) => ReconcileAction::Fail(FsOpsError::new(
-                    FsOpsErrorCode::NameConflict,
-                    "source and target both exist during file-operation recovery",
-                )),
-                (false, false) => ReconcileAction::Fail(FsOpsError::new(
-                    FsOpsErrorCode::NotFound,
-                    "source and target are both missing during file-operation recovery",
-                )),
+        }
+        PathProbe::NotFound => ReconcileAction::Fail(interrupted_error(format!(
+            "delete source '{}' disappeared before filesystem execution was durably started",
+            intent.source_path.display()
+        ))),
+        PathProbe::Exists(_) if intent.phase != JournalPhase::Prepared => {
+            ReconcileAction::Fail(interrupted_error(format!(
+                "delete source '{}' still exists after filesystem execution may have started; refusing destructive replay",
+                intent.source_path.display()
+            )))
+        }
+        PathProbe::Exists(metadata) => {
+            let validation = if intent.kind == FileOperationKind::DeletePermanent {
+                validate_permanent_delete_replay(database, intent, &metadata)
+            } else {
+                validate_prepared_source_replay(database, intent, &metadata)
+            };
+            match validation {
+                Ok(()) => ReconcileAction::Retry,
+                Err(error) => ReconcileAction::Fail(error),
             }
         }
     }
 }
 
-fn path_present(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok()
+fn reconcile_move_filesystem_state(
+    database: &Database,
+    intent: &JournalIntent,
+    target_path: &Path,
+    source: PathProbe,
+    target: PathProbe,
+) -> ReconcileAction {
+    if let PathProbe::Error(error) = source {
+        return ReconcileAction::Fail(probe_interrupted_error(
+            &intent.source_path,
+            "source",
+            error,
+        ));
+    }
+    if let PathProbe::Error(error) = target {
+        return ReconcileAction::Fail(probe_interrupted_error(target_path, "target", error));
+    }
+    if intent.phase == JournalPhase::Legacy {
+        return ReconcileAction::Fail(interrupted_error(
+            "legacy pending file operation has no durable execution phase",
+        ));
+    }
+    if intent.source_path == target_path {
+        return match source {
+            PathProbe::Exists(metadata) => {
+                match validate_prepared_source_replay(database, intent, &metadata) {
+                    Ok(()) => ReconcileAction::FinalizeSuccess,
+                    Err(error) => ReconcileAction::Fail(error),
+                }
+            }
+            PathProbe::NotFound => ReconcileAction::Fail(FsOpsError::new(
+                FsOpsErrorCode::NotFound,
+                "idempotent rename/move source is missing during recovery",
+            )),
+            PathProbe::Error(_) => unreachable!("probe errors returned above"),
+        };
+    }
+    match (source, target, intent.phase) {
+        (PathProbe::NotFound, PathProbe::Exists(target_metadata), JournalPhase::Executing) => {
+            let validation = verify_entity_snapshot(database, intent)
+                .and_then(|()| verify_source_identity(intent, target_path, &target_metadata));
+            match validation {
+                Ok(()) => ReconcileAction::FinalizeSuccess,
+                Err(error) => ReconcileAction::Fail(error),
+            }
+        }
+        (PathProbe::Exists(source_metadata), PathProbe::NotFound, JournalPhase::Prepared) => {
+            match validate_prepared_source_replay(database, intent, &source_metadata) {
+                Ok(()) => ReconcileAction::Retry,
+                Err(error) => ReconcileAction::Fail(error),
+            }
+        }
+        (PathProbe::Exists(_), PathProbe::NotFound, JournalPhase::Executing) => {
+            ReconcileAction::Fail(interrupted_error(
+                "source still exists after rename/move execution may have started; refusing replay",
+            ))
+        }
+        (PathProbe::NotFound, PathProbe::Exists(_), JournalPhase::Prepared) => {
+            ReconcileAction::Fail(interrupted_error(
+                "prepared rename/move source disappeared before execution started",
+            ))
+        }
+        (PathProbe::Exists(_), PathProbe::Exists(_), _) => ReconcileAction::Fail(FsOpsError::new(
+            FsOpsErrorCode::NameConflict,
+            "source and target both exist during file-operation recovery",
+        )),
+        (PathProbe::NotFound, PathProbe::NotFound, _) => ReconcileAction::Fail(FsOpsError::new(
+            FsOpsErrorCode::NotFound,
+            "source and target are both missing during file-operation recovery",
+        )),
+        (PathProbe::Error(_), _, _) | (_, PathProbe::Error(_), _) => {
+            unreachable!("probe errors returned above")
+        }
+        (_, _, JournalPhase::Legacy) => unreachable!("legacy phase returned above"),
+    }
+}
+
+fn probe_path(path: &Path) -> PathProbe {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => PathProbe::Exists(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PathProbe::NotFound,
+        Err(error) => PathProbe::Error(error),
+    }
 }
 
 fn apply_target_path_preflight(intent: &mut PreparedIntent, message: &str) {
@@ -307,9 +452,236 @@ fn apply_target_path_preflight(intent: &mut PreparedIntent, message: &str) {
     let Some(target) = intent.target_path.as_deref().map(Path::new) else {
         return;
     };
-    if Path::new(&intent.source_path) != target && path_present(target) {
-        intent.preflight_error = Some(FsOpsError::new(FsOpsErrorCode::NameConflict, message));
+    if Path::new(&intent.source_path) == target {
+        return;
     }
+    intent.preflight_error = match probe_path(target) {
+        PathProbe::Exists(_) => Some(FsOpsError::new(FsOpsErrorCode::NameConflict, message)),
+        PathProbe::NotFound => None,
+        PathProbe::Error(error) => Some(FsOpsError::new(
+            FsOpsErrorCode::FsError,
+            format!(
+                "cannot inspect file-operation target '{}': {error}",
+                target.display()
+            ),
+        )),
+    };
+}
+
+fn probe_interrupted_error(path: &Path, role: &str, error: std::io::Error) -> FsOpsError {
+    interrupted_error(format!(
+        "cannot determine {role} state for '{}': {error}",
+        path.display()
+    ))
+}
+
+fn interrupted_error(message: impl Into<String>) -> FsOpsError {
+    FsOpsError::new(FsOpsErrorCode::Interrupted, message)
+}
+
+fn verify_entity_snapshot(database: &Database, intent: &JournalIntent) -> FsOpsResult<()> {
+    let entity_kind = intent
+        .entity_kind
+        .ok_or_else(|| interrupted_error("pending file operation is missing its entity kind"))?;
+    let entity_id = intent
+        .entity_id
+        .ok_or_else(|| interrupted_error("pending file operation is missing its entity id"))?;
+    let (root_id, path) =
+        load_journal_entity_snapshot(database.connection_for_fsops(), entity_kind, entity_id)?
+            .ok_or_else(|| {
+                interrupted_error("journal entity is deleted or absent from the index")
+            })?;
+    if intent.root_id != Some(root_id) || intent.source_path != path {
+        return Err(interrupted_error(format!(
+            "journal entity no longer resolves to its recorded source '{}'",
+            intent.source_path.display()
+        )));
+    }
+    if intent.kind == FileOperationKind::Move {
+        let target_folder_id = required_target_folder(intent)?;
+        let target = load_folder_path(database.connection_for_fsops(), target_folder_id)?
+            .ok_or_else(|| interrupted_error("move target folder is no longer active"))?;
+        let expected_parent = intent
+            .target_path
+            .as_deref()
+            .and_then(Path::parent)
+            .ok_or_else(|| interrupted_error("move target path has no parent"))?;
+        if target.root_id != root_id || target.path != expected_parent {
+            return Err(interrupted_error(
+                "move target no longer matches the recorded journal destination",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_journal_entity_snapshot(
+    conn: &rusqlite::Connection,
+    entity_kind: EntityKind,
+    entity_id: i64,
+) -> FsOpsResult<Option<(i64, PathBuf)>> {
+    match entity_kind {
+        EntityKind::File => {
+            let row: Option<(i64, i64, String)> = conn
+                .query_row(
+                    r#"SELECT folder_id, root_id, name
+                       FROM files WHERE id = ?1 AND status <> 'deleted'"#,
+                    [entity_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((folder_id, root_id, name)) = row else {
+                return Ok(None);
+            };
+            Ok(folder_path_for(conn, folder_id)?.map(|parent| (root_id, parent.join(name))))
+        }
+        EntityKind::Folder => {
+            let root_id: Option<i64> = conn
+                .query_row(
+                    "SELECT root_id FROM folders WHERE id = ?1 AND status <> 'deleted'",
+                    [entity_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(root_id) = root_id else {
+                return Ok(None);
+            };
+            Ok(folder_path_for(conn, entity_id)?.map(|path| (root_id, path)))
+        }
+    }
+}
+
+fn validate_prepared_source_replay(
+    database: &Database,
+    intent: &JournalIntent,
+    metadata: &fs::Metadata,
+) -> FsOpsResult<()> {
+    verify_entity_snapshot(database, intent)?;
+    verify_source_identity(intent, &intent.source_path, metadata)
+}
+
+fn verify_source_identity(
+    intent: &JournalIntent,
+    probed_path: &Path,
+    metadata: &fs::Metadata,
+) -> FsOpsResult<()> {
+    let expected = intent.source_identity.as_deref().ok_or_else(|| {
+        interrupted_error("pending file operation has no durable source identity")
+    })?;
+    let actual = filesystem_identity(probed_path, metadata)
+        .ok_or_else(|| interrupted_error("filesystem did not provide a stable source identity"))?;
+    if actual != expected {
+        return Err(interrupted_error(
+            "file-operation source identity changed before recovery",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_permanent_delete_replay(
+    database: &Database,
+    intent: &JournalIntent,
+    metadata: &fs::Metadata,
+) -> FsOpsResult<()> {
+    verify_entity_snapshot(database, intent)?;
+    let root_id = intent
+        .root_id
+        .ok_or_else(|| interrupted_error("permanent-delete intent has no root id"))?;
+    let root_path = enabled_root_path(database.connection_for_fsops(), root_id)?;
+    validate_permanent_delete_path(
+        &intent.source_path,
+        &root_path,
+        metadata,
+        intent.source_identity.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn validate_permanent_delete_path(
+    source_path: &Path,
+    root_path: &Path,
+    metadata: &fs::Metadata,
+    expected_identity: Option<&str>,
+) -> FsOpsResult<Option<String>> {
+    refuse_if_link_or_reparse_point(source_path, metadata)?;
+    let canonical_source = fs::canonicalize(source_path).map_err(|error| {
+        FsOpsError::new(
+            FsOpsErrorCode::FsError,
+            format!(
+                "cannot canonicalize delete source '{}': {error}",
+                source_path.display()
+            ),
+        )
+    })?;
+    let canonical_root = fs::canonicalize(root_path).map_err(|error| {
+        FsOpsError::new(
+            FsOpsErrorCode::FsError,
+            format!(
+                "cannot canonicalize delete root '{}': {error}",
+                root_path.display()
+            ),
+        )
+    })?;
+    if !canonical_source.starts_with(&canonical_root) {
+        return Err(FsOpsError::new(
+            FsOpsErrorCode::OutsideRoot,
+            format!(
+                "permanent delete refused: path is outside root {}",
+                root_path.display()
+            ),
+        ));
+    }
+    let identity = filesystem_identity(source_path, metadata);
+    if let Some(expected) = expected_identity {
+        if identity.as_deref() != Some(expected) {
+            return Err(interrupted_error(
+                "permanent-delete source identity changed before recovery",
+            ));
+        }
+    }
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn filesystem_identity(path: &Path, _metadata: &fs::Metadata) -> Option<String> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information as *mut _) }
+            != 0;
+    if !succeeded {
+        return None;
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Some(format!(
+        "windows:{}:{file_index}",
+        information.dwVolumeSerialNumber
+    ))
+}
+
+#[cfg(unix)]
+fn filesystem_identity(_path: &Path, metadata: &fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn filesystem_identity(_path: &Path, _metadata: &fs::Metadata) -> Option<String> {
+    None
 }
 
 fn perform_filesystem_action(intent: &JournalIntent) -> std::io::Result<()> {
@@ -370,9 +742,11 @@ fn persist_intents(
         transaction.execute(
             r#"INSERT INTO file_operations(
                  operation, source_path, target_path, status, created_at,
-                 operation_group_id, entity_kind, entity_id, target_folder_id,
-                 attempt_count, error_code, error
-               ) VALUES (?1, ?2, ?3, 'pending', unixepoch(), ?4, ?5, ?6, ?7, 0, ?8, ?9)"#,
+                 operation_group_id, entity_kind, entity_id, root_id,
+                 target_folder_id, attempt_count, journal_phase,
+                 source_identity, error_code, error
+               ) VALUES (?1, ?2, ?3, 'pending', unixepoch(), ?4, ?5, ?6, ?7,
+                         ?8, 0, 'prepared', ?9, ?10, ?11)"#,
             params![
                 prepared.kind.as_str(),
                 prepared.source_path,
@@ -380,7 +754,9 @@ fn persist_intents(
                 group_id,
                 prepared.entity_kind.map(EntityKind::as_str),
                 prepared.entity_id,
+                prepared.root_id,
                 prepared.target_folder_id,
+                prepared.source_identity,
                 error_code,
                 error_detail,
             ],
@@ -391,10 +767,13 @@ fn persist_intents(
             kind: prepared.kind,
             entity_kind: prepared.entity_kind,
             entity_id: prepared.entity_id,
+            root_id: prepared.root_id,
             source_path: PathBuf::from(prepared.source_path),
             target_path: prepared.target_path.map(PathBuf::from),
             target_folder_id: prepared.target_folder_id,
             attempt_count: 0,
+            phase: JournalPhase::Prepared,
+            source_identity: prepared.source_identity,
             pending_error_code: error_code.map(str::to_owned),
             pending_error_detail: error_detail.map(str::to_owned),
         });
@@ -419,7 +798,7 @@ fn mark_attempt(database: &Database, intent: &mut JournalIntent) -> FsOpsResult<
         TransactionBehavior::Immediate,
     )?;
     let updated = transaction.execute(
-        "UPDATE file_operations SET attempt_count = attempt_count + 1 WHERE id = ?1 AND status = 'pending'",
+        "UPDATE file_operations SET attempt_count = attempt_count + 1, journal_phase = 'executing' WHERE id = ?1 AND status = 'pending' AND journal_phase = 'prepared'",
         [intent.id],
     )?;
     if updated != 1 {
@@ -430,6 +809,7 @@ fn mark_attempt(database: &Database, intent: &mut JournalIntent) -> FsOpsResult<
     }
     transaction.commit()?;
     intent.attempt_count = intent.attempt_count.saturating_add(1);
+    intent.phase = JournalPhase::Executing;
     Ok(())
 }
 
@@ -492,11 +872,17 @@ fn apply_success_to_index(
             "file-operation intent is missing its entity kind",
         )
     })?;
+    if matches!(
+        intent.kind,
+        FileOperationKind::Rename | FileOperationKind::Move
+    ) {
+        remove_target_index_conflicts(transaction, intent, entity_kind, entity_id)?;
+    }
     match (intent.kind, entity_kind) {
         (FileOperationKind::Rename, EntityKind::File) => {
             let name = target_name(intent)?;
             transaction.execute(
-                "UPDATE files SET name = ?1, ext = ?2 WHERE id = ?3",
+                "UPDATE files SET name = ?1, ext = ?2, status = 'active' WHERE id = ?3",
                 params![name, extension_from_name(&name), entity_id],
             )?;
             crate::db::sync_media_fts_for_file_in_transaction_pub(transaction, entity_id)?;
@@ -504,7 +890,7 @@ fn apply_success_to_index(
         (FileOperationKind::Rename, EntityKind::Folder) => {
             let name = target_name(intent)?;
             transaction.execute(
-                "UPDATE folders SET name = ?1 WHERE id = ?2",
+                "UPDATE folders SET name = ?1, status = 'active' WHERE id = ?2",
                 params![name, entity_id],
             )?;
             sync_descendant_fts(transaction, entity_id)?;
@@ -512,7 +898,7 @@ fn apply_success_to_index(
         (FileOperationKind::Move, EntityKind::File) => {
             let target_folder_id = required_target_folder(intent)?;
             transaction.execute(
-                "UPDATE files SET folder_id = ?1 WHERE id = ?2",
+                "UPDATE files SET folder_id = ?1, status = 'active' WHERE id = ?2",
                 params![target_folder_id, entity_id],
             )?;
             crate::db::sync_media_fts_for_file_in_transaction_pub(transaction, entity_id)?;
@@ -520,7 +906,7 @@ fn apply_success_to_index(
         (FileOperationKind::Move, EntityKind::Folder) => {
             let target_folder_id = required_target_folder(intent)?;
             transaction.execute(
-                "UPDATE folders SET parent_id = ?1 WHERE id = ?2",
+                "UPDATE folders SET parent_id = ?1, status = 'active' WHERE id = ?2",
                 params![target_folder_id, entity_id],
             )?;
             sync_descendant_fts(transaction, entity_id)?;
@@ -564,6 +950,75 @@ fn apply_success_to_index(
                 transaction.execute("DELETE FROM media_fts WHERE rowid = ?1", [file_id])?;
             }
         }
+    }
+    Ok(())
+}
+
+fn remove_target_index_conflicts(
+    transaction: &Transaction<'_>,
+    intent: &JournalIntent,
+    entity_kind: EntityKind,
+    entity_id: i64,
+) -> FsOpsResult<()> {
+    let target_name = target_name(intent)?;
+    let mut removed = false;
+    match entity_kind {
+        EntityKind::File => {
+            let target_folder_id = if intent.kind == FileOperationKind::Move {
+                required_target_folder(intent)?
+            } else {
+                transaction.query_row(
+                    "SELECT folder_id FROM files WHERE id = ?1",
+                    [entity_id],
+                    |row| row.get(0),
+                )?
+            };
+            let duplicate_ids = transaction
+                .prepare("SELECT id FROM files WHERE folder_id = ?1 AND name = ?2 AND id <> ?3")?
+                .query_map(params![target_folder_id, target_name, entity_id], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for duplicate_id in duplicate_ids {
+                transaction.execute("DELETE FROM media_fts WHERE rowid = ?1", [duplicate_id])?;
+                transaction.execute("DELETE FROM files WHERE id = ?1", [duplicate_id])?;
+                removed = true;
+            }
+        }
+        EntityKind::Folder => {
+            let root_id = intent
+                .root_id
+                .ok_or_else(|| interrupted_error("folder operation has no root id"))?;
+            let target_parent_id = if intent.kind == FileOperationKind::Move {
+                Some(required_target_folder(intent)?)
+            } else {
+                transaction.query_row(
+                    "SELECT parent_id FROM folders WHERE id = ?1",
+                    [entity_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?
+            };
+            let duplicate_ids = transaction
+                .prepare(
+                    r#"SELECT id FROM folders
+                       WHERE root_id = ?1 AND parent_id IS ?2 AND name = ?3 AND id <> ?4"#,
+                )?
+                .query_map(
+                    params![root_id, target_parent_id, target_name, entity_id],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for duplicate_id in duplicate_ids {
+                for file_id in collect_descendant_file_ids(transaction, duplicate_id)? {
+                    transaction.execute("DELETE FROM media_fts WHERE rowid = ?1", [file_id])?;
+                }
+                transaction.execute("DELETE FROM folders WHERE id = ?1", [duplicate_id])?;
+                removed = true;
+            }
+        }
+    }
+    if removed {
+        crate::db::cleanup_inactive_thumbnail_artifacts_in_transaction(transaction)?;
     }
     Ok(())
 }
@@ -682,8 +1137,8 @@ fn operation_record_in_transaction(
 fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> {
     let mut statement = database.connection_for_fsops().prepare(
         r#"SELECT id, operation_group_id, operation, entity_kind, entity_id,
-                  source_path, target_path, target_folder_id, attempt_count,
-                  error_code, error
+                  root_id, source_path, target_path, target_folder_id,
+                  attempt_count, journal_phase, source_identity, error_code, error
            FROM file_operations
            WHERE status = 'pending' AND operation_group_id IS NOT NULL
            ORDER BY id"#,
@@ -698,12 +1153,15 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                 operation,
                 entity_kind,
                 row.get::<_, Option<i64>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -716,10 +1174,13 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                 operation,
                 entity_kind,
                 entity_id,
+                root_id,
                 source_path,
                 target_path,
                 target_folder_id,
                 attempt_count,
+                journal_phase,
+                source_identity,
                 error_code,
                 error_detail,
             )| {
@@ -734,10 +1195,13 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                     kind: parse_operation_kind(&operation)?,
                     entity_kind: entity_kind.as_deref().map(EntityKind::parse).transpose()?,
                     entity_id,
+                    root_id,
                     source_path: PathBuf::from(source_path),
                     target_path: target_path.map(PathBuf::from),
                     target_folder_id,
                     attempt_count,
+                    phase: JournalPhase::parse(&journal_phase)?,
+                    source_identity,
                     pending_error_code: error_code,
                     pending_error_detail: error_detail,
                 })
@@ -768,6 +1232,7 @@ fn persisted_error(code: &str, detail: Option<&str>) -> FsOpsError {
         "cross_root" => FsOpsErrorCode::CrossRoot,
         "outside_root" => FsOpsErrorCode::OutsideRoot,
         "symlink_refused" => FsOpsErrorCode::SymlinkRefused,
+        "interrupted" => FsOpsErrorCode::Interrupted,
         _ => FsOpsErrorCode::FsError,
     };
     FsOpsError::new(
@@ -845,10 +1310,12 @@ fn prepare_rename(
                         kind: FileOperationKind::Rename,
                         entity_kind: Some(EntityKind::File),
                         entity_id: Some(file_id),
+                        root_id: Some(info.root_id),
                         source_path: info.path.to_string_lossy().into_owned(),
                         target_path: Some(target.to_string_lossy().into_owned()),
                         target_folder_id: None,
                         delete_root_path: None,
+                        source_identity: None,
                         preflight_error: error,
                     })
                 }
@@ -893,10 +1360,12 @@ fn prepare_rename(
                         kind: FileOperationKind::Rename,
                         entity_kind: Some(EntityKind::Folder),
                         entity_id: Some(folder_id),
+                        root_id: Some(info.root_id),
                         source_path: info.path.to_string_lossy().into_owned(),
                         target_path: Some(target.to_string_lossy().into_owned()),
                         target_folder_id: None,
                         delete_root_path: None,
+                        source_identity: None,
                         preflight_error: error,
                     })
                 }
@@ -935,6 +1404,7 @@ fn prepare_rename(
             )),
         }
     })()?;
+    apply_source_identity_preflight(&mut prepared);
     apply_target_path_preflight(&mut prepared, "rename target already exists");
     Ok(prepared)
 }
@@ -974,6 +1444,7 @@ fn prepare_move(
         prepared
     };
     for intent in &mut prepared {
+        apply_source_identity_preflight(intent);
         apply_target_path_preflight(intent, "move target already exists");
     }
     Ok(prepared)
@@ -1029,10 +1500,12 @@ fn prepare_move_file(
         kind: FileOperationKind::Move,
         entity_kind: Some(EntityKind::File),
         entity_id: Some(file_id),
+        root_id: Some(info.root_id),
         source_path: info.path.to_string_lossy().into_owned(),
         target_path: target_path.map(|path| path.to_string_lossy().into_owned()),
         target_folder_id: target.map(|target| target.folder_id),
         delete_root_path: None,
+        source_identity: None,
         preflight_error: error,
     })
 }
@@ -1109,10 +1582,12 @@ fn prepare_move_folder(
         kind: FileOperationKind::Move,
         entity_kind: Some(EntityKind::Folder),
         entity_id: Some(folder_id),
+        root_id: Some(info.root_id),
         source_path: info.path.to_string_lossy().into_owned(),
         target_path: target_path.map(|path| path.to_string_lossy().into_owned()),
         target_folder_id: target.map(|target| target.folder_id),
         delete_root_path: None,
+        source_identity: None,
         preflight_error: error,
     })
 }
@@ -1137,10 +1612,12 @@ fn prepare_delete(
                         kind,
                         entity_kind: Some(EntityKind::File),
                         entity_id: Some(*file_id),
+                        root_id: Some(info.root_id),
                         source_path: info.path.to_string_lossy().into_owned(),
                         target_path: None,
                         target_folder_id: None,
                         delete_root_path,
+                        source_identity: None,
                         preflight_error,
                     }
                 }
@@ -1180,10 +1657,12 @@ fn prepare_delete(
                         kind,
                         entity_kind: Some(EntityKind::Folder),
                         entity_id: Some(*folder_id),
+                        root_id: Some(info.root_id),
                         source_path: info.path.to_string_lossy().into_owned(),
                         target_path: None,
                         target_folder_id: None,
                         delete_root_path: root_path,
+                        source_identity: None,
                         preflight_error: error,
                     }
                 }
@@ -1201,23 +1680,25 @@ fn prepare_delete(
         }
         prepared
     };
-    if request.permanent {
-        for intent in &mut prepared {
+    for intent in &mut prepared {
+        if request.permanent {
             apply_delete_filesystem_preflight(intent);
+        } else {
+            apply_source_identity_preflight(intent);
         }
     }
     Ok(prepared)
 }
 
 fn enabled_root_path(conn: &rusqlite::Connection, root_id: i64) -> FsOpsResult<PathBuf> {
-    let root: Option<(String, i64)> = conn
+    let root: Option<(String, i64, Option<i64>)> = conn
         .query_row(
-            "SELECT path, enabled FROM roots WHERE id = ?1",
+            "SELECT path, enabled, pending_delete_at FROM roots WHERE id = ?1",
             [root_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((path, enabled)) = root else {
+    let Some((path, enabled, pending_delete_at)) = root else {
         return Err(FsOpsError::new(
             FsOpsErrorCode::OutsideRoot,
             "root not found",
@@ -1227,6 +1708,12 @@ fn enabled_root_path(conn: &rusqlite::Connection, root_id: i64) -> FsOpsResult<P
         return Err(FsOpsError::new(
             FsOpsErrorCode::OutsideRoot,
             "permanent delete is not allowed in disabled roots",
+        ));
+    }
+    if pending_delete_at.is_some() {
+        return Err(FsOpsError::new(
+            FsOpsErrorCode::OutsideRoot,
+            "permanent delete is not allowed while the root is pending deletion",
         ));
     }
     Ok(PathBuf::from(path))
@@ -1250,21 +1737,59 @@ fn apply_delete_filesystem_preflight(intent: &mut PreparedIntent) {
         return;
     };
     let source_path = Path::new(&intent.source_path);
-    let inside_root = match (fs::canonicalize(source_path), fs::canonicalize(root_path)) {
-        (Ok(source), Ok(root)) => source.starts_with(root),
-        _ => source_path.starts_with(root_path),
-    };
-    if !inside_root {
-        intent.preflight_error = Some(FsOpsError::new(
-            FsOpsErrorCode::OutsideRoot,
-            format!(
-                "permanent delete refused: path is outside root {}",
-                root_path.display()
-            ),
-        ));
+    match probe_path(source_path) {
+        PathProbe::Exists(metadata) => {
+            match validate_permanent_delete_path(source_path, root_path, &metadata, None) {
+                Ok(identity) => intent.source_identity = identity,
+                Err(error) => intent.preflight_error = Some(error),
+            }
+        }
+        PathProbe::NotFound => {
+            intent.preflight_error = Some(FsOpsError::new(
+                FsOpsErrorCode::FsError,
+                format!("delete source '{}' does not exist", source_path.display()),
+            ));
+        }
+        PathProbe::Error(error) => {
+            intent.preflight_error = Some(FsOpsError::new(
+                FsOpsErrorCode::FsError,
+                format!(
+                    "cannot inspect delete source '{}': {error}",
+                    source_path.display()
+                ),
+            ));
+        }
+    }
+}
+
+fn apply_source_identity_preflight(intent: &mut PreparedIntent) {
+    if intent.preflight_error.is_some() {
         return;
     }
-    intent.preflight_error = refuse_if_symlink(source_path).err();
+    let source_path = Path::new(&intent.source_path);
+    match probe_path(source_path) {
+        PathProbe::Exists(metadata) => {
+            intent.source_identity = filesystem_identity(source_path, &metadata)
+        }
+        PathProbe::NotFound => {
+            intent.preflight_error = Some(FsOpsError::new(
+                FsOpsErrorCode::NotFound,
+                format!(
+                    "file-operation source '{}' does not exist",
+                    source_path.display()
+                ),
+            ));
+        }
+        PathProbe::Error(error) => {
+            intent.preflight_error = Some(FsOpsError::new(
+                FsOpsErrorCode::FsError,
+                format!(
+                    "cannot inspect file-operation source '{}': {error}",
+                    source_path.display()
+                ),
+            ));
+        }
+    }
 }
 
 fn missing_intent(
@@ -1278,10 +1803,12 @@ fn missing_intent(
         kind,
         entity_kind: Some(entity_kind),
         entity_id: Some(entity_id),
+        root_id: None,
         source_path: format!("{}-id:{entity_id}", entity_kind.as_str()),
         target_path: Some(target.to_owned()),
         target_folder_id: None,
         delete_root_path: None,
+        source_identity: None,
         preflight_error: Some(error),
     }
 }
@@ -1295,10 +1822,12 @@ fn request_error_intent(
         kind,
         entity_kind: None,
         entity_id: None,
+        root_id: None,
         source_path: "invalid-request".to_owned(),
         target_path: Some(target.to_owned()),
         target_folder_id: None,
         delete_root_path: None,
+        source_identity: None,
         preflight_error: Some(error),
     }
 }

@@ -477,8 +477,11 @@ def main() -> None:
                 "operation_group_id",
                 "entity_kind",
                 "entity_id",
+                "root_id",
                 "target_folder_id",
                 "attempt_count",
+                "journal_phase",
+                "source_identity",
                 "error_code",
             }
             missing_file_operation_columns = (
@@ -511,6 +514,16 @@ def main() -> None:
                 ("id", False)
             ]:
                 fail("idx_file_operations_pending must index id")
+            pending_index_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_file_operations_pending'"
+            ).fetchone()[0]
+            if not (
+                "WHERE status = 'pending'" in pending_index_sql
+                and "operation_group_id IS NOT NULL" in pending_index_sql
+            ):
+                fail(
+                    "idx_file_operations_pending must include only grouped pending intents"
+                )
 
             outbox_indexes = conn.execute(
                 "PRAGMA index_list(notification_outbox)"
@@ -631,14 +644,37 @@ def main() -> None:
                 """
             )
             legacy_defaults = conn.execute(
-                """SELECT operation_group_id, entity_kind, entity_id,
-                          target_folder_id, attempt_count, error_code
+                """SELECT operation_group_id, entity_kind, entity_id, root_id,
+                          target_folder_id, attempt_count, journal_phase,
+                          source_identity, error_code
                    FROM file_operations WHERE id = last_insert_rowid()"""
             ).fetchone()
-            if legacy_defaults != (None, None, None, None, 0, None):
+            if legacy_defaults != (
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                "legacy",
+                None,
+                None,
+            ):
                 fail(
                     "existing file_operations inserts must preserve legacy defaults"
                 )
+            try:
+                conn.execute(
+                    """INSERT INTO file_operations(
+                         operation, source_path, status, created_at,
+                         operation_group_id, journal_phase
+                       ) VALUES ('move', 'source', 'pending', 1,
+                                 'invalid-phase', 'unknown')"""
+                )
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                fail("file_operations.journal_phase must reject unknown values")
 
             conn.execute(
                 """

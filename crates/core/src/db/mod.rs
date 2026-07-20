@@ -18607,8 +18607,11 @@ mod tests {
             "operation_group_id",
             "entity_kind",
             "entity_id",
+            "root_id",
             "target_folder_id",
             "attempt_count",
+            "journal_phase",
+            "source_identity",
             "error_code",
         ] {
             assert!(
@@ -18627,10 +18630,11 @@ mod tests {
             .optional()
             .expect("query pending journal index");
         assert!(
-            pending_index
-                .as_deref()
-                .is_some_and(|sql| sql.contains("WHERE status = 'pending'")),
-            "pending journal index must be partial"
+            pending_index.as_deref().is_some_and(|sql| {
+                sql.contains("WHERE status = 'pending'")
+                    && sql.contains("operation_group_id IS NOT NULL")
+            }),
+            "pending journal index must scan only grouped pending intents"
         );
 
         database
@@ -18638,10 +18642,12 @@ mod tests {
             .execute(
                 r#"INSERT INTO file_operations(
                      operation, source_path, target_path, status, created_at,
-                     operation_group_id, entity_kind, entity_id, target_folder_id,
-                     attempt_count, error_code
+                     operation_group_id, entity_kind, entity_id, root_id,
+                     target_folder_id, attempt_count, journal_phase,
+                     source_identity, error_code
                    ) VALUES ('move', 'old', 'new', 'pending', 1,
-                             'group', 'file', 7, 9, 0, NULL)"#,
+                             'group', 'file', 7, 3, 9, 0, 'prepared',
+                             'windows:1:7', NULL)"#,
                 [],
             )
             .expect("valid pending journal intent");
@@ -18653,6 +18659,15 @@ mod tests {
             [],
         );
         assert!(invalid_kind.is_err(), "unsupported journal entity kind");
+        let invalid_phase = database.connection.execute(
+            r#"INSERT INTO file_operations(
+                 operation, source_path, status, created_at, operation_group_id,
+                 entity_kind, entity_id, root_id, journal_phase
+               ) VALUES ('move', 'old', 'pending', 1, 'bad-phase',
+                         'file', 7, 3, 'unknown')"#,
+            [],
+        );
+        assert!(invalid_phase.is_err(), "unsupported journal phase");
     }
 
     #[test]
@@ -18674,15 +18689,47 @@ mod tests {
             .apply_migrations()
             .expect("upgrade through migration 22");
 
-        let preserved: (String, Option<String>, Option<i64>, i64, Option<String>) = database
+        let preserved: (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = database
             .connection
             .query_row(
-                "SELECT status, entity_kind, entity_id, attempt_count, error_code FROM file_operations WHERE id = 71",
+                "SELECT status, entity_kind, entity_id, root_id, attempt_count, journal_phase, source_identity, error_code FROM file_operations WHERE id = 71",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
             )
             .expect("read preserved operation");
-        assert_eq!(preserved, ("succeeded".to_owned(), None, None, 0, None));
+        assert_eq!(
+            preserved,
+            (
+                "succeeded".to_owned(),
+                None,
+                None,
+                None,
+                0,
+                "legacy".to_owned(),
+                None,
+                None,
+            )
+        );
     }
 
     #[test]

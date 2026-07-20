@@ -80,6 +80,7 @@ pub enum FsOpsErrorCode {
     /// later add copy+verify+delete fallback.
     CrossRoot,
     FsError,
+    Interrupted,
     OutsideRoot,
     /// Refused to follow a symlink during a permanent delete.
     SymlinkRefused,
@@ -94,6 +95,7 @@ impl FsOpsErrorCode {
             FsOpsErrorCode::NameConflict => "name_conflict",
             FsOpsErrorCode::CrossRoot => "cross_root",
             FsOpsErrorCode::FsError => "fs_error",
+            FsOpsErrorCode::Interrupted => "interrupted",
             FsOpsErrorCode::OutsideRoot => "outside_root",
             FsOpsErrorCode::SymlinkRefused => "symlink_refused",
         }
@@ -486,33 +488,27 @@ fn collect_descendant_file_ids(
     Ok(ids)
 }
 
-/// Refuse to permanently delete an entry whose `symlink_metadata` reports a
-/// symlink. This is kept separate from the journal's root-boundary check so
-/// neither check holds a SQLite connection during filesystem I/O.
-fn refuse_if_symlink(path: &Path) -> FsOpsResult<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                Err(FsOpsError::new(
-                    FsOpsErrorCode::SymlinkRefused,
-                    format!(
-                        "permanent delete refused: '{}' is a symlink",
-                        path.display()
-                    ),
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // The entry vanished between snapshot and FS work — let the
-            // FS call surface the not-found error in its own time.
-            Ok(())
-        }
-        Err(error) => Err(FsOpsError::new(
-            FsOpsErrorCode::FsError,
-            format!("symlink check failed: {error}"),
-        )),
+/// Refuse symbolic links and Windows reparse points (including junctions)
+/// before permanent deletion. The caller supplies no-follow metadata so a
+/// path probe error can never be collapsed into "not found".
+fn refuse_if_link_or_reparse_point(path: &Path, metadata: &fs::Metadata) -> FsOpsResult<()> {
+    let mut is_link = metadata.file_type().is_symlink();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        is_link |= metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    if is_link {
+        Err(FsOpsError::new(
+            FsOpsErrorCode::SymlinkRefused,
+            format!(
+                "permanent delete refused: '{}' is a link or reparse point",
+                path.display()
+            ),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1420,30 +1416,144 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn recovery_merges_watcher_duplicate_created_after_filesystem_rename() {
+        let env = TestEnv::new_file_backed("journal_watcher_duplicate");
+        let original_id = env.add_file(env.root_folder_id, "before.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_finalize
+                BEFORE UPDATE OF status ON file_operations
+                WHEN OLD.status = 'pending' AND NEW.status <> 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced finalize failure');
+                END;
+                "#,
+            )
+            .expect("install finalize failure trigger");
+        rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(original_id),
+                folder_id: None,
+                new_name: "after.jpg".to_owned(),
+            },
+        )
+        .expect_err("filesystem rename must precede forced finalize failure");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_finalize;")
+            .expect("remove finalize failure trigger");
+        let watcher_duplicate_id = env
+            .database
+            .lock()
+            .expect("db lock")
+            .upsert_file(FileUpsert {
+                root_id: env.root_id,
+                folder_id: env.root_folder_id,
+                name: "after.jpg".to_owned(),
+                ext: ".jpg".to_owned(),
+                size: 1,
+                mtime: 2,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("simulate watcher indexing the completed target");
+        assert_ne!(watcher_duplicate_id, original_id);
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute(
+                "UPDATE files SET status = 'missing' WHERE id = ?1",
+                [original_id],
+            )
+            .expect("simulate watcher marking the old path missing");
+
+        env.run_startup_recovery().await;
+
+        let guard = env.database.lock().expect("db lock");
+        let rows = guard
+            .connection_for_fsops()
+            .prepare("SELECT id, name, status FROM files WHERE folder_id = ?1 ORDER BY id")
+            .expect("prepare file query")
+            .query_map([env.root_folder_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("query files")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect files");
+        assert_eq!(
+            rows,
+            [(original_id, "after.jpg".to_owned(), "active".to_owned())]
+        );
+        let audit_status: String = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("recovered audit");
+        assert_eq!(audit_status, "succeeded");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn restart_retries_pending_intent_when_fs_not_started() {
         let env = TestEnv::new_file_backed("journal_fs_not_started");
         let file_id = env.add_file(env.root_folder_id, "before.jpg");
-        let group_id = journal::begin_test_group(&env.database, FileOperationKind::Rename, 1)
-            .expect("begin operation group");
         let source = env.root_path.join("before.jpg");
         let target = env.root_path.join("after.jpg");
         env.database
             .lock()
             .expect("db lock")
             .connection_for_fsops()
-            .execute(
-                r#"INSERT INTO file_operations(
-                     operation, source_path, target_path, status, created_at,
-                     operation_group_id, entity_kind, entity_id, attempt_count
-                   ) VALUES ('rename', ?1, ?2, 'pending', unixepoch(), ?3, 'file', ?4, 0)"#,
-                params![
-                    source.to_string_lossy(),
-                    target.to_string_lossy(),
-                    group_id,
-                    file_id
-                ],
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_attempt
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced pre-execution stop');
+                END;
+                "#,
             )
-            .expect("persist pending intent before filesystem work");
+            .expect("install attempt failure trigger");
+        rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(file_id),
+                folder_id: None,
+                new_name: "after.jpg".to_owned(),
+            },
+        )
+        .expect_err("attempt transition must stop before filesystem work");
+        let group_id: String = env
+            .database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .query_row(
+                "SELECT operation_group_id FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("prepared rename group");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_attempt;")
+            .expect("remove attempt failure trigger");
 
         env.run_startup_recovery().await;
 
@@ -1481,27 +1591,55 @@ mod tests {
     async fn restart_records_failed_retry_for_unexecutable_pending_intent() {
         let env = TestEnv::new_file_backed("journal_retry_failure");
         let file_id = env.add_file(env.root_folder_id, "before.jpg");
-        let group_id = journal::begin_test_group(&env.database, FileOperationKind::Rename, 1)
-            .expect("begin operation group");
         let source = env.root_path.join("before.jpg");
         let target = env.root_path.join("missing-parent").join("after.jpg");
         env.database
             .lock()
             .expect("db lock")
             .connection_for_fsops()
-            .execute(
-                r#"INSERT INTO file_operations(
-                     operation, source_path, target_path, status, created_at,
-                     operation_group_id, entity_kind, entity_id, attempt_count
-                   ) VALUES ('rename', ?1, ?2, 'pending', unixepoch(), ?3, 'file', ?4, 0)"#,
-                params![
-                    source.to_string_lossy(),
-                    target.to_string_lossy(),
-                    group_id,
-                    file_id
-                ],
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_attempt
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced pre-execution stop');
+                END;
+                "#,
             )
-            .expect("persist pending intent");
+            .expect("install attempt failure trigger");
+        rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(file_id),
+                folder_id: None,
+                new_name: "after.jpg".to_owned(),
+            },
+        )
+        .expect_err("attempt transition must stop before filesystem work");
+        let group_id: String = {
+            let guard = env.database.lock().expect("db lock");
+            let group_id = guard
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT operation_group_id FROM file_operations ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("prepared rename group");
+            guard
+                .connection_for_fsops()
+                .execute(
+                    "UPDATE file_operations SET target_path = ?1 WHERE operation_group_id = ?2",
+                    params![target.to_string_lossy(), group_id],
+                )
+                .expect("redirect prepared target to missing parent");
+            guard
+                .connection_for_fsops()
+                .execute_batch("DROP TRIGGER fail_file_operation_attempt;")
+                .expect("remove attempt failure trigger");
+            group_id
+        };
 
         env.run_startup_recovery().await;
 
@@ -1560,6 +1698,536 @@ mod tests {
             )
             .expect("legacy audit survives startup recovery");
         assert_eq!(row, ("pending".to_owned(), None, None));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_recovers_executed_file_and_prepared_folder_move_in_one_group() {
+        let env = TestEnv::new_file_backed("journal_move_file_folder");
+        let target_id = env.add_folder(env.root_folder_id, "target");
+        let file_id = env.add_file(env.root_folder_id, "loose.jpg");
+        let folder_id = env.add_folder(env.root_folder_id, "album");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_finalize
+                BEFORE UPDATE OF status ON file_operations
+                WHEN OLD.status = 'pending' AND NEW.status <> 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced finalize failure');
+                END;
+                "#,
+            )
+            .expect("install finalize failure trigger");
+
+        move_items(
+            &env.database,
+            MoveRequest {
+                file_ids: vec![file_id],
+                folder_ids: vec![folder_id],
+                target_folder_id: target_id,
+            },
+        )
+        .expect_err("first finalize must fail after the file move");
+        assert!(env.root_path.join("target").join("loose.jpg").exists());
+        assert!(env.root_path.join("album").exists());
+
+        let (group_id, phases): (String, Vec<String>) = {
+            let guard = env.database.lock().expect("db lock");
+            let group_id: String = guard
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT operation_group_id FROM file_operations ORDER BY id LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("move group id");
+            let phases = guard
+                .connection_for_fsops()
+                .prepare(
+                    "SELECT journal_phase FROM file_operations WHERE operation_group_id = ?1 ORDER BY id",
+                )
+                .expect("prepare phase query")
+                .query_map([&group_id], |row| row.get::<_, String>(0))
+                .expect("query journal phases")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect journal phases");
+            (group_id, phases)
+        };
+        assert_eq!(phases, ["executing", "prepared"]);
+
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_finalize;")
+            .expect("remove finalize failure trigger");
+        env.run_startup_recovery().await;
+
+        assert!(env.root_path.join("target").join("loose.jpg").exists());
+        assert!(env.root_path.join("target").join("album").exists());
+        let guard = env.database.lock().expect("db lock");
+        let indexed_file_folder: i64 = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT folder_id FROM files WHERE id = ?1",
+                [file_id],
+                |row| row.get(0),
+            )
+            .expect("moved file index");
+        let indexed_parent: i64 = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1",
+                [folder_id],
+                |row| row.get(0),
+            )
+            .expect("moved folder index");
+        let audit_rows = guard
+            .connection_for_fsops()
+            .prepare(
+                "SELECT status, error_code, error FROM file_operations WHERE operation_group_id = ?1 ORDER BY id",
+            )
+            .expect("prepare status query")
+            .query_map([&group_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .expect("query statuses")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect statuses");
+        let head = guard
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .into_iter()
+            .find(|operation| operation.operation_id == group_id)
+            .expect("move operation head");
+        assert_eq!(
+            indexed_file_folder, target_id,
+            "move recovery audits: {audit_rows:?}"
+        );
+        assert_eq!(
+            indexed_parent, target_id,
+            "move recovery audits: {audit_rows:?}"
+        );
+        assert_eq!(
+            audit_rows
+                .iter()
+                .map(|(status, _, _)| status.as_str())
+                .collect::<Vec<_>>(),
+            ["succeeded", "succeeded"]
+        );
+        assert_eq!(head.status, "succeeded");
+        assert_eq!(head.current_value, 2);
+        assert_eq!(head.total_value, Some(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_finalizes_completed_permanent_delete_without_replaying_it() {
+        let env = TestEnv::new_file_backed("journal_delete_completed");
+        let file_id = env.add_file(env.root_folder_id, "remove.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_finalize
+                BEFORE UPDATE OF status ON file_operations
+                WHEN OLD.status = 'pending' AND NEW.status <> 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced finalize failure');
+                END;
+                "#,
+            )
+            .expect("install finalize failure trigger");
+
+        delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![file_id],
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .expect_err("finalize failure leaves an executing delete intent");
+        assert!(!env.root_path.join("remove.jpg").exists());
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_finalize;")
+            .expect("remove finalize failure trigger");
+
+        env.run_startup_recovery().await;
+
+        let guard = env.database.lock().expect("db lock");
+        let file_status: String = guard
+            .connection_for_fsops()
+            .query_row("SELECT status FROM files WHERE id = ?1", [file_id], |row| {
+                row.get(0)
+            })
+            .expect("deleted file index status");
+        let audit: (String, String) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, journal_phase FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("recovered delete audit");
+        assert_eq!(file_status, "deleted");
+        assert_eq!(audit, ("succeeded".to_owned(), "executing".to_owned()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_permanent_delete_recovery_refuses_disabled_root() {
+        let env = TestEnv::new_file_backed("journal_delete_disabled_root");
+        let file_id = env.add_file(env.root_folder_id, "keep.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_attempt
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced pre-execution stop');
+                END;
+                "#,
+            )
+            .expect("install attempt failure trigger");
+
+        delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![file_id],
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .expect_err("attempt transition must stop before filesystem work");
+        assert!(env.root_path.join("keep.jpg").exists());
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_attempt;")
+            .expect("remove attempt failure trigger");
+        env.database
+            .lock()
+            .expect("db lock")
+            .disable_root(env.root_id)
+            .expect("disable root");
+
+        env.run_startup_recovery().await;
+
+        assert!(env.root_path.join("keep.jpg").exists());
+        let guard = env.database.lock().expect("db lock");
+        let audit: (String, Option<String>, String) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code, journal_phase FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("disabled-root audit");
+        assert_eq!(audit.0, "failed");
+        assert_eq!(audit.1.as_deref(), Some("outside_root"));
+        assert_eq!(audit.2, "prepared");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_permanent_delete_recovery_refuses_pending_delete_root() {
+        let env = TestEnv::new_file_backed("journal_delete_pending_root");
+        let file_id = env.add_file(env.root_folder_id, "keep.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_attempt
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced pre-execution stop');
+                END;
+                "#,
+            )
+            .expect("install attempt failure trigger");
+        delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![file_id],
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .expect_err("attempt transition must stop before filesystem work");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                "DROP TRIGGER fail_file_operation_attempt; UPDATE roots SET pending_delete_at = 1, enabled = 1;",
+            )
+            .expect("mark root pending delete while retaining enabled flag");
+
+        env.run_startup_recovery().await;
+
+        assert!(env.root_path.join("keep.jpg").exists());
+        let guard = env.database.lock().expect("db lock");
+        let audit: (String, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("pending-delete-root audit");
+        assert_eq!(audit.0, "failed");
+        assert_eq!(audit.1.as_deref(), Some("outside_root"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executing_permanent_delete_with_existing_source_is_not_replayed() {
+        let env = TestEnv::new_file_backed("journal_delete_executing_unknown");
+        let file_id = env.add_file(env.root_folder_id, "keep.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_attempt
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced pre-execution stop');
+                END;
+                "#,
+            )
+            .expect("install attempt failure trigger");
+        delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![file_id],
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .expect_err("attempt transition must stop before filesystem work");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                "DROP TRIGGER fail_file_operation_attempt; UPDATE file_operations SET journal_phase = 'executing', attempt_count = 1;",
+            )
+            .expect("simulate crash after executing phase commit and before syscall");
+
+        env.run_startup_recovery().await;
+
+        assert!(env.root_path.join("keep.jpg").exists());
+        let guard = env.database.lock().expect("db lock");
+        let audit: (String, Option<String>, i64) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code, attempt_count FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("executing unknown audit");
+        assert_eq!(audit.0, "failed");
+        assert_eq!(audit.1.as_deref(), Some("interrupted"));
+        assert_eq!(audit.2, 1, "startup must not issue another delete attempt");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_error_during_delete_recovery_is_interrupted_not_succeeded() {
+        let env = TestEnv::new_file_backed("journal_delete_probe_error");
+        let file_id = env.add_file(env.root_folder_id, "keep.jpg");
+        let group_id =
+            journal::begin_test_group(&env.database, FileOperationKind::DeletePermanent, 1)
+                .expect("begin operation group");
+        let invalid_path = String::from("invalid\0delete-path");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute(
+                r#"INSERT INTO file_operations(
+                     operation, source_path, status, created_at, operation_group_id,
+                     entity_kind, entity_id, root_id, attempt_count, journal_phase,
+                     source_identity
+                   ) VALUES ('delete_permanent', ?1, 'pending', unixepoch(), ?2,
+                             'file', ?3, ?4, 1, 'executing', 'invalid-probe-test')"#,
+                params![invalid_path, group_id, file_id, env.root_id],
+            )
+            .expect("persist unknown destructive intent");
+
+        env.run_startup_recovery().await;
+        env.run_startup_recovery().await;
+
+        assert!(env.root_path.join("keep.jpg").exists());
+        let guard = env.database.lock().expect("db lock");
+        let file_status: String = guard
+            .connection_for_fsops()
+            .query_row("SELECT status FROM files WHERE id = ?1", [file_id], |row| {
+                row.get(0)
+            })
+            .expect("file status");
+        let audit: (String, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code FROM file_operations WHERE operation_group_id = ?1",
+                [&group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("probe-error audit");
+        assert_eq!(file_status, "active");
+        assert_eq!(audit.0, "failed");
+        assert_eq!(audit.1.as_deref(), Some("interrupted"));
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_folder_delete_recovery_refuses_link_or_junction_replacement() {
+        let env = TestEnv::new_file_backed("journal_delete_link_replacement");
+        let folder_id = env.add_folder(env.root_folder_id, "replace-me");
+        let source = env.root_path.join("replace-me");
+        let outside = unique_temp_dir("journal_delete_outside");
+        stdfs::create_dir_all(&outside).expect("create outside target");
+        stdfs::write(outside.join("keep.txt"), b"outside").expect("write outside sentinel");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_attempt
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced pre-execution stop');
+                END;
+                "#,
+            )
+            .expect("install attempt failure trigger");
+
+        delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![],
+                folder_ids: vec![folder_id],
+                permanent: true,
+            },
+        )
+        .expect_err("attempt transition must stop before filesystem work");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_attempt;")
+            .expect("remove attempt failure trigger");
+        stdfs::remove_dir(&source).expect("remove original empty folder");
+        create_directory_link(&source, &outside);
+
+        env.run_startup_recovery().await;
+
+        assert!(outside.join("keep.txt").exists());
+        assert!(
+            source.exists(),
+            "recovery must not remove the replacement link"
+        );
+        let guard = env.database.lock().expect("db lock");
+        let audit: (String, Option<String>) = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status, error_code FROM file_operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("replacement audit");
+        assert_eq!(audit.0, "failed");
+        assert_eq!(audit.1.as_deref(), Some("symlink_refused"));
+        drop(guard);
+        remove_directory_link(&source);
+        let _ = stdfs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn empty_item_commands_are_rejected_before_group_or_audit_creation() {
+        let env = TestEnv::new("empty_commands");
+        let move_error = move_items(
+            &env.database,
+            MoveRequest {
+                file_ids: vec![],
+                folder_ids: vec![],
+                target_folder_id: env.root_folder_id,
+            },
+        )
+        .expect_err("empty move is an invalid API command");
+        let delete_error = delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![],
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .expect_err("empty delete is an invalid API command");
+        assert_eq!(move_error.code, FsOpsErrorCode::InvalidRequest);
+        assert_eq!(delete_error.code, FsOpsErrorCode::InvalidRequest);
+        let guard = env.database.lock().expect("db lock");
+        let audit_count: i64 = guard
+            .connection_for_fsops()
+            .query_row("SELECT COUNT(*) FROM file_operations", [], |row| row.get(0))
+            .expect("audit count");
+        assert_eq!(audit_count, 0);
+        assert!(guard
+            .notification_heads_for_test()
+            .expect("notification heads")
+            .is_empty());
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("invoke mklink /J");
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(link: &Path, target: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("create directory symlink");
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(link: &Path) {
+        let _ = stdfs::remove_dir(link);
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(link: &Path) {
+        let _ = stdfs::remove_file(link);
     }
 
     #[test]

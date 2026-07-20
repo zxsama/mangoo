@@ -2022,6 +2022,7 @@ fn map_fsops_error(error: FsOpsError) -> CoreError {
         | FsOpsErrorCode::OutsideRoot
         | FsOpsErrorCode::SymlinkRefused => StatusCode::CONFLICT,
         FsOpsErrorCode::FsError => StatusCode::INTERNAL_SERVER_ERROR,
+        FsOpsErrorCode::Interrupted => StatusCode::INTERNAL_SERVER_ERROR,
     };
     CoreError::coded(status, error.code.as_str(), error.message)
 }
@@ -5293,8 +5294,9 @@ mod tests {
             )
             .await
             .expect("rename");
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "rename response: {body}");
         assert_eq!(body["operation"], "rename");
         assert_eq!(body["status"], "succeeded");
 
@@ -5437,8 +5439,9 @@ mod tests {
             )
             .await
             .expect("move");
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "move response: {body}");
         let ops = body["operations"].as_array().expect("operations");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0]["operation"], "move");
@@ -5582,6 +5585,7 @@ mod tests {
                 mtime: Some(1),
             })
             .expect("upsert folder");
+        let mut file_ids = Vec::new();
         for index in 0..3 {
             let name = format!("f{index}.jpg");
             fs::write(temp_root.join(&name), b"x").expect("write file");
@@ -5597,9 +5601,7 @@ mod tests {
                     file_key: None,
                 })
                 .expect("upsert file");
-            // Trigger a rename to log a row.
-            // Via direct fsops call would require &mut Database, so use the route.
-            let _ = file_id;
+            file_ids.push(file_id);
         }
         // Drive renames through the route for genuine logs.
         let app = router(AppState::new(database));
@@ -5613,7 +5615,7 @@ mod tests {
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(
                             serde_json::json!({
-                                "fileId": index + 1,
+                                "fileId": file_ids[index],
                                 "newName": format!("renamed{index}.jpg")
                             })
                             .to_string(),
@@ -5622,7 +5624,9 @@ mod tests {
                 )
                 .await
                 .expect("rename");
-            assert_eq!(response.status(), StatusCode::OK, "rename {index}");
+            let status = response.status();
+            let body = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "rename {index}: {body}");
         }
 
         let response = app
