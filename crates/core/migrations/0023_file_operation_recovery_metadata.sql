@@ -5,6 +5,8 @@ ALTER TABLE file_operations ADD COLUMN journal_phase TEXT NOT NULL DEFAULT 'lega
   CHECK(journal_phase IN ('legacy','prepared','executing'));
 ALTER TABLE file_operations ADD COLUMN source_identity TEXT;
 
+-- Version 22 shipped a broader pending-status index. Keep 0022 immutable and
+-- replace that index here so already-applied v22 libraries upgrade in place.
 DROP INDEX idx_file_operations_pending;
 CREATE INDEX idx_file_operations_pending
   ON file_operations(id)

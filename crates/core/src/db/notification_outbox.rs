@@ -337,7 +337,15 @@ fn collect_recovery_candidates(
     transaction: &Transaction<'_>,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let mut statement = transaction.prepare(
-        "SELECT operation_id, payload_json FROM notification_operation_heads WHERE status IN ('pending', 'running') ORDER BY updated_at ASC, operation_id ASC",
+        r#"SELECT heads.operation_id, heads.payload_json
+           FROM notification_operation_heads AS heads
+           WHERE heads.status IN ('pending', 'running')
+             AND NOT EXISTS (
+               SELECT 1 FROM file_operations
+               WHERE file_operations.operation_group_id = heads.operation_id
+                 AND file_operations.status = 'pending'
+             )
+           ORDER BY heads.updated_at ASC, heads.operation_id ASC"#,
     )?;
     let rows = statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -608,6 +616,41 @@ mod tests {
                 .all(|event| event.operation.operation_id != "task:1"
                     || event.operation.revision == 1)
         );
+    }
+
+    #[test]
+    fn generic_recovery_leaves_heads_with_pending_file_operation_journals_running() {
+        let db = migrated_database();
+        let mut operation = fixture_operation("file:pending", "move", "running", 1_000);
+        operation.category = "file_operation".to_owned();
+        db.publish_notification_operation(&mut operation, PublishMode::Phase)
+            .expect("publish file-operation head");
+        db.connection
+            .execute(
+                r#"INSERT INTO file_operations(
+                     operation, source_path, target_path, status, created_at,
+                     operation_group_id, entity_kind, entity_id, root_id,
+                     target_folder_id, attempt_count, journal_phase, source_identity
+                   ) VALUES ('move', 'old', 'new', 'pending', 1,
+                             'file:pending', 'file', 7, 3, 9, 1,
+                             'executing', 'windows:1:7')"#,
+                [],
+            )
+            .expect("insert pending journal");
+
+        assert_eq!(db.recover_interrupted_notification_operations().unwrap(), 0);
+        let payload: String = db
+            .connection
+            .query_row(
+                "SELECT payload_json FROM notification_operation_heads WHERE operation_id = 'file:pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read pending head");
+        let operation: NotificationOperation =
+            serde_json::from_str(&payload).expect("deserialize pending head");
+        assert_eq!(operation.status, "running");
+        assert_eq!(operation.completed_at, None);
     }
 
     #[tokio::test(flavor = "current_thread")]

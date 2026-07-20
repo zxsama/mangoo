@@ -1348,14 +1348,21 @@ async fn rename_file(
     State(state): State<AppState>,
     Json(payload): Json<RenameRequestBody>,
 ) -> ApiResult<Json<FileOperationRecord>> {
-    let record = fsops::rename(
-        fsops_database(&state)?,
-        RenameRequest {
-            file_id: payload.file_id,
-            folder_id: payload.folder_id,
-            new_name: payload.new_name,
-        },
-    )
+    let database = fsops_database(&state)?.clone();
+    let writer = state.writer.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        fsops::rename_with_writer(
+            &database,
+            &writer,
+            RenameRequest {
+                file_id: payload.file_id,
+                folder_id: payload.folder_id,
+                new_name: payload.new_name,
+            },
+        )
+    })
+    .await
+    .map_err(|error| CoreError::from(anyhow::anyhow!("file rename worker failed: {error}")))?
     .map_err(map_fsops_error)?;
     Ok(Json(record))
 }
@@ -1364,14 +1371,21 @@ async fn move_files(
     State(state): State<AppState>,
     Json(payload): Json<MoveRequestBody>,
 ) -> ApiResult<Json<FileOperationsResponse>> {
-    let operations = fsops::move_items(
-        fsops_database(&state)?,
-        MoveRequest {
-            file_ids: payload.file_ids.unwrap_or_default(),
-            folder_ids: payload.folder_ids.unwrap_or_default(),
-            target_folder_id: payload.target_folder_id,
-        },
-    )
+    let database = fsops_database(&state)?.clone();
+    let writer = state.writer.clone();
+    let operations = tokio::task::spawn_blocking(move || {
+        fsops::move_items_with_writer(
+            &database,
+            &writer,
+            MoveRequest {
+                file_ids: payload.file_ids.unwrap_or_default(),
+                folder_ids: payload.folder_ids.unwrap_or_default(),
+                target_folder_id: payload.target_folder_id,
+            },
+        )
+    })
+    .await
+    .map_err(|error| CoreError::from(anyhow::anyhow!("file move worker failed: {error}")))?
     .map_err(map_fsops_error)?;
     Ok(Json(FileOperationsResponse { operations }))
 }
@@ -1380,14 +1394,21 @@ async fn delete_files(
     State(state): State<AppState>,
     Json(payload): Json<DeleteRequestBody>,
 ) -> ApiResult<Json<FileOperationsResponse>> {
-    let operations = fsops::delete(
-        fsops_database(&state)?,
-        DeleteRequest {
-            file_ids: payload.file_ids.unwrap_or_default(),
-            folder_ids: payload.folder_ids.unwrap_or_default(),
-            permanent: payload.permanent.unwrap_or(false),
-        },
-    )
+    let database = fsops_database(&state)?.clone();
+    let writer = state.writer.clone();
+    let operations = tokio::task::spawn_blocking(move || {
+        fsops::delete_with_writer(
+            &database,
+            &writer,
+            DeleteRequest {
+                file_ids: payload.file_ids.unwrap_or_default(),
+                folder_ids: payload.folder_ids.unwrap_or_default(),
+                permanent: payload.permanent.unwrap_or(false),
+            },
+        )
+    })
+    .await
+    .map_err(|error| CoreError::from(anyhow::anyhow!("file delete worker failed: {error}")))?
     .map_err(map_fsops_error)?;
     Ok(Json(FileOperationsResponse { operations }))
 }
@@ -5354,6 +5375,103 @@ mod tests {
         drop(app);
         let _ = fs::remove_dir_all(&temp_root);
         let _ = fs::remove_dir_all(&db_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_file_operation_requests_do_not_block_tokio_workers() {
+        let temp_root = unique_temp_dir();
+        fs::create_dir_all(&temp_root).expect("create root dir");
+        fs::write(temp_root.join("source.jpg"), b"source").expect("write source");
+        let db_dir = unique_temp_dir();
+        fs::create_dir_all(&db_dir).expect("create db dir");
+        let database = Database::open(db_dir.join("megle.sqlite")).expect("open db");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: temp_root.to_string_lossy().into_owned(),
+                display_name: "async ops".to_owned(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(crate::db::FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "async-ops-root".to_owned(),
+                mtime: Some(1),
+            })
+            .expect("upsert folder");
+        let file_id = database
+            .upsert_file(crate::db::FileUpsert {
+                root_id,
+                folder_id,
+                name: "source.jpg".to_owned(),
+                ext: ".jpg".to_owned(),
+                size: 6,
+                mtime: 1,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("upsert file");
+        let state = AppState::new(database);
+        let fsops_database = state
+            .fsops_database
+            .as_ref()
+            .expect("file-backed fsops database")
+            .clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let lock_holder = std::thread::spawn(move || {
+            let _guard = fsops_database.lock().expect("hold fsops lock");
+            locked_tx.send(()).expect("announce held lock");
+            release_rx.recv().expect("release held lock");
+        });
+        locked_rx.recv().expect("wait for held lock");
+        let app = router(state);
+        let mut requests = Vec::new();
+        for index in 0..4 {
+            let app = app.clone();
+            requests.push(tokio::spawn(async move {
+                app.oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/file-ops/rename")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "fileId": file_id,
+                                "newName": format!("target-{index}.jpg")
+                            })
+                            .to_string(),
+                        ))
+                        .expect("build blocked request"),
+                )
+                .await
+            }));
+        }
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let _ = release_tx.send(());
+        });
+
+        let heartbeat_started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert!(
+            heartbeat_started.elapsed() < std::time::Duration::from_millis(250),
+            "file-operation handlers blocked every Tokio worker"
+        );
+
+        for request in requests {
+            request
+                .await
+                .expect("request task")
+                .expect("route response");
+        }
+        watchdog.join().expect("watchdog thread");
+        lock_holder.join().expect("lock holder thread");
+        drop(app);
+        let _ = fs::remove_dir_all(temp_root);
+        let _ = fs::remove_dir_all(db_dir);
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@
 //! `contracts/core-api/openapi.yaml`.
 
 mod journal;
+mod platform;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -162,6 +163,7 @@ pub struct DeleteRequest {
 
 // -------------- public entry points -------------------------------------
 
+#[cfg(test)]
 pub fn rename(
     database: &Mutex<Database>,
     request: RenameRequest,
@@ -169,6 +171,15 @@ pub fn rename(
     journal::rename(database, request)
 }
 
+pub fn rename_with_writer(
+    database: &Mutex<Database>,
+    writer: &crate::db::DbWriter,
+    request: RenameRequest,
+) -> FsOpsResult<FileOperationRecord> {
+    journal::rename_with_writer(database, writer, request)
+}
+
+#[cfg(test)]
 pub fn move_items(
     database: &Mutex<Database>,
     request: MoveRequest,
@@ -176,6 +187,15 @@ pub fn move_items(
     journal::move_items(database, request)
 }
 
+pub fn move_items_with_writer(
+    database: &Mutex<Database>,
+    writer: &crate::db::DbWriter,
+    request: MoveRequest,
+) -> FsOpsResult<Vec<FileOperationRecord>> {
+    journal::move_items_with_writer(database, writer, request)
+}
+
+#[cfg(test)]
 pub fn delete(
     database: &Mutex<Database>,
     request: DeleteRequest,
@@ -183,8 +203,20 @@ pub fn delete(
     journal::delete(database, request)
 }
 
+pub fn delete_with_writer(
+    database: &Mutex<Database>,
+    writer: &crate::db::DbWriter,
+    request: DeleteRequest,
+) -> FsOpsResult<Vec<FileOperationRecord>> {
+    journal::delete_with_writer(database, writer, request)
+}
+
 pub(crate) fn recover_pending_file_operations(database: &Database) -> FsOpsResult<usize> {
     journal::recover_pending_file_operations(database)
+}
+
+pub(crate) fn schedule_pending_file_operation_repair(database: &Database) {
+    journal::schedule_pending_repair_for_database(database);
 }
 
 pub fn list_recent(
@@ -204,7 +236,7 @@ pub fn list_recent(
     let guard = database.lock().expect("database mutex poisoned");
     let conn = guard.connection_for_fsops();
     let sql = format!(
-        "SELECT id, operation, source_path, target_path, status, created_at, finished_at, error, operation_group_id \
+        "SELECT id, operation, source_path, CASE WHEN operation LIKE 'delete_%' THEN NULL ELSE target_path END, status, created_at, finished_at, error, operation_group_id \
          FROM file_operations {} ORDER BY id DESC LIMIT {}",
         if cursor_id.is_some() {
             "WHERE status <> 'pending' AND id < ?1"
@@ -510,41 +542,6 @@ fn refuse_if_link_or_reparse_point(path: &Path, metadata: &fs::Metadata) -> FsOp
     } else {
         Ok(())
     }
-}
-
-/// Rename a file or directory with a small TOCTOU defense on Unix.
-///
-/// `std::fs::rename` calls `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`
-/// on Windows, so an existing target raises an error. On Unix, however,
-/// `rename(2)` overwrites silently. Even after the database collision check,
-/// a concurrent writer can race a file into place. To narrow the window we
-/// reserve the destination via `OpenOptions::create_new` first, delete the
-/// placeholder, then perform the actual rename. If the placeholder cannot be
-/// reserved we surface a clear `name_conflict`. The remaining race window is
-/// only the gap between the placeholder removal and the rename, which is far
-/// smaller than the original DB-check + rename window.
-fn atomic_rename(source: &Path, target: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        match OpenOptions::new().write(true).create_new(true).open(target) {
-            Ok(file) => {
-                drop(file);
-                if let Err(error) = fs::remove_file(target) {
-                    // Removing our own placeholder failed — surface as IO.
-                    return Err(error);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!("target already exists: {}", target.display()),
-                ));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    fs::rename(source, target)
 }
 
 fn validate_name(name: &str) -> FsOpsResult<()> {
@@ -993,6 +990,10 @@ mod tests {
         )
         .expect("recycle delete");
         assert_eq!(records[0].operation, "delete_recycle");
+        assert_eq!(
+            records[0].target_path, None,
+            "internal recycle staging path must not leak through the legacy API"
+        );
         assert!(!env.root_path.join("r.jpg").exists());
     }
 
@@ -1057,6 +1058,18 @@ mod tests {
         assert_eq!(operation.status, "succeeded");
         assert_eq!(operation.current_value, 3);
         assert_eq!(operation.total_value, Some(3));
+        let missing_identities: i64 = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT COUNT(*) FROM file_operations WHERE operation_group_id = ?1 AND source_identity IS NULL",
+                [group_id],
+                |row| row.get(0),
+            )
+            .expect("source identity count");
+        assert_eq!(
+            missing_identities, 0,
+            "executable intents must persist a stable source identity"
+        );
         assert_eq!(
             heads
                 .iter()
@@ -1064,6 +1077,151 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn delete_batch_normalization_is_order_independent_and_counts_logical_items() {
+        for reverse in [false, true] {
+            let env = TestEnv::new(if reverse {
+                "delete_normalize_reverse"
+            } else {
+                "delete_normalize_forward"
+            });
+            let parent_id = env.add_folder(env.root_folder_id, "parent");
+            let child_id = env.add_folder(parent_id, "child");
+            let file_id = env.add_file(child_id, "nested.jpg");
+            let folder_ids = if reverse {
+                vec![child_id, parent_id, child_id, parent_id]
+            } else {
+                vec![parent_id, child_id, parent_id, child_id]
+            };
+
+            let records = delete(
+                &env.database,
+                DeleteRequest {
+                    file_ids: vec![file_id, file_id],
+                    folder_ids,
+                    permanent: true,
+                },
+            )
+            .expect("normalized parent delete");
+
+            assert_eq!(records.len(), 1, "only the selected parent is logical work");
+            let group_id = records[0]
+                .operation_group_id
+                .as_deref()
+                .expect("operation group");
+            let guard = env.database.lock().expect("db lock");
+            let audit_count: i64 = guard
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT COUNT(*) FROM file_operations WHERE operation_group_id = ?1",
+                    [group_id],
+                    |row| row.get(0),
+                )
+                .expect("audit count");
+            let payload: String = guard
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT payload_json FROM notification_operation_heads WHERE operation_id = ?1",
+                    [group_id],
+                    |row| row.get(0),
+                )
+                .expect("operation head");
+            let operation: crate::db::notification_outbox::NotificationOperation =
+                serde_json::from_str(&payload).expect("operation payload");
+            assert_eq!(audit_count, 1);
+            assert_eq!(operation.current_value, 1);
+            assert_eq!(operation.total_value, Some(1));
+            assert_eq!(operation.status, "succeeded");
+        }
+    }
+
+    #[test]
+    fn move_batch_normalization_removes_parent_child_overlap_in_either_order() {
+        for reverse in [false, true] {
+            let env = TestEnv::new(if reverse {
+                "move_normalize_reverse"
+            } else {
+                "move_normalize_forward"
+            });
+            let parent_id = env.add_folder(env.root_folder_id, "parent");
+            let child_id = env.add_folder(parent_id, "child");
+            let file_id = env.add_file(child_id, "nested.jpg");
+            let target_id = env.add_folder(env.root_folder_id, "target");
+            let folder_ids = if reverse {
+                vec![child_id, parent_id, child_id]
+            } else {
+                vec![parent_id, child_id, parent_id]
+            };
+
+            let records = move_items(
+                &env.database,
+                MoveRequest {
+                    file_ids: vec![file_id, file_id],
+                    folder_ids,
+                    target_folder_id: target_id,
+                },
+            )
+            .expect("normalized parent move");
+
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].status, "succeeded");
+            assert!(env
+                .root_path
+                .join("target/parent/child/nested.jpg")
+                .exists());
+        }
+    }
+
+    #[test]
+    fn thousand_item_command_keeps_one_aggregate_and_reaches_terminal_progress() {
+        let env = TestEnv::new_file_backed("thousand_item_aggregate");
+        let writer = crate::db::DbWriter::spawn(env.reopened_database());
+        let file_ids: Vec<i64> = (1_000_000..1_001_000).collect();
+        let started = std::time::Instant::now();
+
+        delete_with_writer(
+            &env.database,
+            &writer,
+            DeleteRequest {
+                file_ids,
+                folder_ids: Vec::new(),
+                permanent: true,
+            },
+        )
+        .expect_err("missing files make the aggregate terminal-failed");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "1000-item journal aggregation exceeded the smoke-test budget"
+        );
+        let guard = env.database.lock().expect("db lock");
+        let (group_id, audit_count): (String, i64) = guard
+            .connection_for_fsops()
+            .query_row(
+                r#"SELECT operation_group_id, COUNT(*)
+                   FROM file_operations
+                   GROUP BY operation_group_id
+                   ORDER BY MAX(id) DESC LIMIT 1"#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("aggregate audit group");
+        let payload: String = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT payload_json FROM notification_operation_heads WHERE operation_id = ?1",
+                [&group_id],
+                |row| row.get(0),
+            )
+            .expect("aggregate head");
+        let operation: crate::db::notification_outbox::NotificationOperation =
+            serde_json::from_str(&payload).expect("aggregate payload");
+        assert_eq!(audit_count, 1_000);
+        assert_eq!(operation.current_value, 1_000);
+        assert_eq!(operation.total_value, Some(1_000));
+        assert_eq!(operation.status, "failed");
     }
 
     #[test]
@@ -1413,6 +1571,145 @@ mod tests {
         assert_eq!(terminal_event.operation.status, "succeeded");
         assert_eq!(terminal_event.operation.current_value, 1);
         assert_eq!(terminal_event.operation.total_value, Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_failure_repairs_in_process_after_fault_clears() {
+        let env = TestEnv::new_file_backed("journal_in_process_finalize_repair");
+        let file_id = env.add_file(env.root_folder_id, "old.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_finalize
+                BEFORE UPDATE OF status ON file_operations
+                WHEN OLD.status = 'pending' AND NEW.status = 'succeeded'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced finalize failure');
+                END;
+                "#,
+            )
+            .expect("install finalize failure trigger");
+
+        rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(file_id),
+                folder_id: None,
+                new_name: "new.jpg".to_owned(),
+            },
+        )
+        .expect_err("finalize failure must surface to the command");
+        assert!(env.root_path.join("new.jpg").exists());
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_finalize;")
+            .expect("remove finalize failure trigger");
+
+        let repaired = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let state: Option<(String, String, String)> = env
+                    .database
+                    .lock()
+                    .expect("db lock")
+                    .connection_for_fsops()
+                    .query_row(
+                        r#"SELECT file_operations.status, files.name,
+                                  notification_operation_heads.status
+                           FROM file_operations
+                           JOIN files ON files.id = file_operations.entity_id
+                           JOIN notification_operation_heads
+                             ON notification_operation_heads.operation_id = file_operations.operation_group_id
+                           ORDER BY file_operations.id DESC LIMIT 1"#,
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .expect("read repair state");
+                if state.as_ref().is_some_and(|state| {
+                    state.0 == "succeeded" && state.1 == "new.jpg" && state.2 == "succeeded"
+                }) {
+                    break state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            repaired.is_ok(),
+            "pending journal was not repaired in process"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mark_failure_repairs_in_process_after_fault_clears() {
+        let env = TestEnv::new_file_backed("journal_in_process_mark_repair");
+        let file_id = env.add_file(env.root_folder_id, "old.jpg");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_file_operation_mark
+                BEFORE UPDATE OF attempt_count ON file_operations
+                WHEN OLD.status = 'pending'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced mark failure');
+                END;
+                "#,
+            )
+            .expect("install mark failure trigger");
+
+        rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(file_id),
+                folder_id: None,
+                new_name: "new.jpg".to_owned(),
+            },
+        )
+        .expect_err("mark failure must surface to the command");
+        assert!(env.root_path.join("old.jpg").exists());
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute_batch("DROP TRIGGER fail_file_operation_mark;")
+            .expect("remove mark failure trigger");
+
+        let repaired = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let state: (String, String) = env
+                    .database
+                    .lock()
+                    .expect("db lock")
+                    .connection_for_fsops()
+                    .query_row(
+                        r#"SELECT file_operations.status, files.name
+                           FROM file_operations
+                           JOIN files ON files.id = file_operations.entity_id
+                           ORDER BY file_operations.id DESC LIMIT 1"#,
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .expect("read mark repair state");
+                if state.0 == "succeeded" && state.1 == "new.jpg" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            repaired.is_ok(),
+            "prepared journal was not repaired in process"
+        );
+        assert!(env.root_path.join("new.jpg").exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1883,6 +2180,66 @@ mod tests {
             .expect("recovered delete audit");
         assert_eq!(file_status, "deleted");
         assert_eq!(audit, ("succeeded".to_owned(), "executing".to_owned()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_resumes_handle_staged_recycle_without_leaving_an_orphan() {
+        let env = TestEnv::new_file_backed("journal_recycle_staged");
+        let file_id = env.add_file(env.root_folder_id, "recycle.jpg");
+        let source = env.root_path.join("recycle.jpg");
+        let staging = env
+            .root_path
+            .join(format!(".megle-recycle-{}", uuid::Uuid::now_v7()));
+        let identity = super::platform::VerifiedSource::open(&source)
+            .expect("open source identity")
+            .identity()
+            .to_owned();
+        let group_id =
+            super::journal::begin_test_group(&env.database, FileOperationKind::DeleteRecycle, 1)
+                .expect("begin recycle group");
+        env.database
+            .lock()
+            .expect("db lock")
+            .connection_for_fsops()
+            .execute(
+                r#"INSERT INTO file_operations(
+                     operation, source_path, target_path, status, created_at,
+                     operation_group_id, entity_kind, entity_id, root_id,
+                     attempt_count, journal_phase, source_identity
+                   ) VALUES ('delete_recycle', ?1, ?2, 'pending', unixepoch(),
+                             ?3, 'file', ?4, ?5, 1, 'executing', ?6)"#,
+                params![
+                    source.to_string_lossy(),
+                    staging.to_string_lossy(),
+                    group_id,
+                    file_id,
+                    env.root_id,
+                    identity
+                ],
+            )
+            .expect("insert staged recycle journal");
+        super::platform::VerifiedSource::open(&source)
+            .expect("open source for staging")
+            .rename_no_replace(&staging)
+            .expect("simulate crash after handle staging");
+
+        env.run_startup_recovery().await;
+
+        assert!(!source.exists(), "recycled source returned unexpectedly");
+        assert!(
+            !staging.exists(),
+            "recycle staging orphan survived recovery"
+        );
+        let guard = env.database.lock().expect("db lock");
+        let status: String = guard
+            .connection_for_fsops()
+            .query_row(
+                "SELECT status FROM file_operations WHERE operation_group_id = ?1",
+                [&group_id],
+                |row| row.get(0),
+            )
+            .expect("recycle audit status");
+        assert_eq!(status, "succeeded");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2413,7 +2770,14 @@ mod tests {
         )
         .expect("rename");
         assert_eq!(record.status, "succeeded");
-        assert!(env.root_path.join("image.MP4").exists());
+        assert!(
+            env.root_path.join("image.MP4").exists(),
+            "renamed path missing; directory entries: {:?}",
+            stdfs::read_dir(&env.root_path)
+                .expect("read root entries")
+                .map(|entry| entry.expect("root entry").file_name())
+                .collect::<Vec<_>>()
+        );
 
         // The on-disk name preserves user-typed case but `files.ext` must
         // be lowercased to agree with the rest of the indexer.
@@ -2433,11 +2797,9 @@ mod tests {
 
     #[test]
     fn rename_collision_does_not_clobber_existing_target_on_disk() {
-        // Defense-in-depth regression for the TOCTOU window between the
-        // collision check and `fs::rename`. Even on Windows where the
-        // underlying `MoveFileExW` rejects existing targets, we want a
-        // platform-agnostic test that asserts the existing target is not
-        // overwritten when both files exist on disk.
+        // Defense-in-depth regression for no-clobber execution. The platform
+        // layer must reject an existing target atomically rather than relying
+        // on the earlier database collision check.
         let env = TestEnv::new("rename_clobber_guard");
         let alpha_id = env.add_file(env.root_folder_id, "alpha.jpg");
         let _beta_id = env.add_file(env.root_folder_id, "beta.jpg");

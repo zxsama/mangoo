@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::{collections::BTreeSet, collections::HashSet, sync::OnceLock, thread, time::Duration};
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use uuid::Uuid;
@@ -87,6 +88,11 @@ struct JournalIntent {
     pending_error_detail: Option<String>,
 }
 
+struct PersistedBatch {
+    intents: Vec<JournalIntent>,
+    first_error: Option<FsOpsError>,
+}
+
 #[derive(Debug)]
 enum PathProbe {
     Exists(fs::Metadata),
@@ -94,12 +100,14 @@ enum PathProbe {
     Error(std::io::Error),
 }
 
+#[cfg(test)]
 pub(super) fn rename(
     database: &Mutex<Database>,
     request: RenameRequest,
 ) -> FsOpsResult<FileOperationRecord> {
     let prepared = prepare_rename(database, request)?;
-    let mut records = execute_prepared(database, FileOperationKind::Rename, vec![prepared])?;
+    let store = DirectJournalStore { database };
+    let mut records = execute_prepared(&store, FileOperationKind::Rename, vec![prepared])?;
     records.pop().ok_or_else(|| {
         FsOpsError::new(
             FsOpsErrorCode::FsError,
@@ -108,6 +116,23 @@ pub(super) fn rename(
     })
 }
 
+pub(super) fn rename_with_writer(
+    database: &Mutex<Database>,
+    writer: &crate::db::DbWriter,
+    request: RenameRequest,
+) -> FsOpsResult<FileOperationRecord> {
+    let prepared = prepare_rename(database, request)?;
+    let store = WriterJournalStore { database, writer };
+    let mut records = execute_prepared(&store, FileOperationKind::Rename, vec![prepared])?;
+    records.pop().ok_or_else(|| {
+        FsOpsError::new(
+            FsOpsErrorCode::FsError,
+            "rename completed without an audit row",
+        )
+    })
+}
+
+#[cfg(test)]
 pub(super) fn move_items(
     database: &Mutex<Database>,
     request: MoveRequest,
@@ -121,9 +146,27 @@ pub(super) fn move_items(
         ));
     }
     let prepared = prepare_move(database, &request)?;
-    execute_prepared(database, FileOperationKind::Move, prepared)
+    let store = DirectJournalStore { database };
+    execute_prepared(&store, FileOperationKind::Move, prepared)
 }
 
+pub(super) fn move_items_with_writer(
+    database: &Mutex<Database>,
+    writer: &crate::db::DbWriter,
+    request: MoveRequest,
+) -> FsOpsResult<Vec<FileOperationRecord>> {
+    if request.file_ids.is_empty() && request.folder_ids.is_empty() {
+        return Err(FsOpsError::new(
+            FsOpsErrorCode::InvalidRequest,
+            "at least one fileId or folderId must be provided",
+        ));
+    }
+    let prepared = prepare_move(database, &request)?;
+    let store = WriterJournalStore { database, writer };
+    execute_prepared(&store, FileOperationKind::Move, prepared)
+}
+
+#[cfg(test)]
 pub(super) fn delete(
     database: &Mutex<Database>,
     request: DeleteRequest,
@@ -141,18 +184,156 @@ pub(super) fn delete(
         FileOperationKind::DeleteRecycle
     };
     let prepared = prepare_delete(database, &request, kind)?;
-    execute_prepared(database, kind, prepared)
+    let store = DirectJournalStore { database };
+    execute_prepared(&store, kind, prepared)
+}
+
+pub(super) fn delete_with_writer(
+    database: &Mutex<Database>,
+    writer: &crate::db::DbWriter,
+    request: DeleteRequest,
+) -> FsOpsResult<Vec<FileOperationRecord>> {
+    if request.file_ids.is_empty() && request.folder_ids.is_empty() {
+        return Err(FsOpsError::new(
+            FsOpsErrorCode::InvalidRequest,
+            "at least one fileId or folderId must be provided",
+        ));
+    }
+    let kind = if request.permanent {
+        FileOperationKind::DeletePermanent
+    } else {
+        FileOperationKind::DeleteRecycle
+    };
+    let prepared = prepare_delete(database, &request, kind)?;
+    let store = WriterJournalStore { database, writer };
+    execute_prepared(&store, kind, prepared)
 }
 
 pub(crate) fn recover_pending_file_operations(database: &Database) -> FsOpsResult<usize> {
     let intents = load_pending_intents(database)?;
     let mut recovered = 0usize;
+    let mut first_error = None;
     for mut intent in intents {
-        match reconcile_intent(database, &mut intent)? {
-            Ok(_) | Err(_) => recovered += 1,
+        match reconcile_intent(database, &mut intent) {
+            Ok(Ok(_)) | Ok(Err(_)) => recovered += 1,
+            Err(error) => {
+                tracing::error!(
+                    intent_id = intent.id,
+                    operation_group_id = %intent.group_id,
+                    %error,
+                    "file-operation journal reconcile failed"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
     }
-    Ok(recovered)
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(recovered),
+    }
+}
+
+pub(crate) fn schedule_pending_repair(database: &Mutex<Database>) {
+    let path = database
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .path()
+        .map(Path::to_path_buf);
+    if let Some(path) = path {
+        schedule_pending_repair_for_path(path);
+    } else {
+        tracing::warn!("cannot schedule file-operation repair for an in-memory database");
+    }
+}
+
+pub(crate) fn schedule_pending_repair_for_database(database: &Database) {
+    if let Some(path) = database.path().map(Path::to_path_buf) {
+        schedule_pending_repair_for_path(path);
+    } else {
+        tracing::warn!("cannot schedule file-operation repair for an in-memory database");
+    }
+}
+
+fn schedule_pending_repair_for_path(path: PathBuf) {
+    static ACTIVE_REPAIRS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let active = ACTIVE_REPAIRS.get_or_init(|| Mutex::new(HashSet::new()));
+    if !active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.clone())
+    {
+        return;
+    }
+
+    let repair_path = path.clone();
+    let spawn_result = thread::Builder::new()
+        .name("megle-fsops-repair".to_owned())
+        .spawn(move || {
+            const RETRY_DELAYS: [Duration; 5] = [
+                Duration::from_millis(50),
+                Duration::from_millis(150),
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+                Duration::from_millis(1_600),
+            ];
+            for (attempt, delay) in RETRY_DELAYS.into_iter().enumerate() {
+                thread::sleep(delay);
+                let database = match Database::open(&repair_path) {
+                    Ok(database) => database,
+                    Err(error) => {
+                        tracing::error!(
+                            database_path = %repair_path.display(),
+                            attempt = attempt + 1,
+                            %error,
+                            "cannot open database for file-operation repair"
+                        );
+                        continue;
+                    }
+                };
+                match recover_pending_file_operations(&database) {
+                    Ok(recovered) => {
+                        let pending = pending_intent_count(&database).unwrap_or(i64::MAX);
+                        tracing::info!(
+                            database_path = %repair_path.display(),
+                            attempt = attempt + 1,
+                            recovered,
+                            pending,
+                            "file-operation repair pass completed"
+                        );
+                        if pending == 0 {
+                            break;
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        database_path = %repair_path.display(),
+                        attempt = attempt + 1,
+                        %error,
+                        "file-operation repair pass will retry"
+                    ),
+                }
+            }
+            active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&repair_path);
+        });
+    if let Err(error) = spawn_result {
+        active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
+        tracing::error!(%error, "failed to spawn file-operation repair thread");
+    }
+}
+
+fn pending_intent_count(database: &Database) -> FsOpsResult<i64> {
+    Ok(database.connection_for_fsops().query_row(
+        "SELECT COUNT(*) FROM file_operations WHERE status = 'pending' AND operation_group_id IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 #[cfg(test)]
@@ -179,21 +360,32 @@ pub(super) fn begin_test_group(
 }
 
 fn execute_prepared(
-    database: &Mutex<Database>,
+    store: &impl JournalStore,
     kind: FileOperationKind,
     prepared: Vec<PreparedIntent>,
 ) -> FsOpsResult<Vec<FileOperationRecord>> {
-    let mut intents = persist_intents(database, kind, prepared)?;
+    let batch = match store.persist(kind, prepared) {
+        Ok(batch) => batch,
+        Err(error) => {
+            store.schedule_repair();
+            return Err(error);
+        }
+    };
+    let mut intents = batch.intents;
     let mut records = Vec::with_capacity(intents.len());
-    let mut first_error = None;
+    let mut first_error = batch.first_error;
 
     for intent in &mut intents {
-        match execute_intent_locked(database, intent)? {
-            Ok(record) => records.push(record),
-            Err(error) => {
+        match execute_intent_with_store(store, intent) {
+            Ok(Ok(record)) => records.push(record),
+            Ok(Err(error)) => {
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
+            }
+            Err(error) => {
+                store.schedule_repair();
+                return Err(error);
             }
         }
     }
@@ -205,33 +397,162 @@ fn execute_prepared(
     }
 }
 
-fn execute_intent_locked(
-    database: &Mutex<Database>,
+trait JournalStore {
+    fn persist(
+        &self,
+        kind: FileOperationKind,
+        prepared: Vec<PreparedIntent>,
+    ) -> FsOpsResult<PersistedBatch>;
+    fn validate_and_mark(
+        &self,
+        intent: &mut JournalIntent,
+        source_identity: &str,
+    ) -> FsOpsResult<()>;
+    fn finalize(
+        &self,
+        intent: &JournalIntent,
+        error: Option<&FsOpsError>,
+    ) -> FsOpsResult<FileOperationRecord>;
+    fn schedule_repair(&self);
+}
+
+#[cfg(test)]
+struct DirectJournalStore<'a> {
+    database: &'a Mutex<Database>,
+}
+
+#[cfg(test)]
+impl JournalStore for DirectJournalStore<'_> {
+    fn persist(
+        &self,
+        kind: FileOperationKind,
+        prepared: Vec<PreparedIntent>,
+    ) -> FsOpsResult<PersistedBatch> {
+        let guard = self
+            .database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        persist_intents(&guard, kind, prepared)
+    }
+
+    fn validate_and_mark(
+        &self,
+        intent: &mut JournalIntent,
+        source_identity: &str,
+    ) -> FsOpsResult<()> {
+        let guard = self
+            .database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        validate_execution_source(&guard, intent, source_identity)?;
+        mark_attempt(&guard, intent)
+    }
+
+    fn finalize(
+        &self,
+        intent: &JournalIntent,
+        error: Option<&FsOpsError>,
+    ) -> FsOpsResult<FileOperationRecord> {
+        let guard = self
+            .database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        finalize_intent(&guard, intent, error)
+    }
+
+    fn schedule_repair(&self) {
+        schedule_pending_repair(self.database);
+    }
+}
+
+struct WriterJournalStore<'a> {
+    database: &'a Mutex<Database>,
+    writer: &'a crate::db::DbWriter,
+}
+
+impl JournalStore for WriterJournalStore<'_> {
+    fn persist(
+        &self,
+        kind: FileOperationKind,
+        prepared: Vec<PreparedIntent>,
+    ) -> FsOpsResult<PersistedBatch> {
+        self.writer
+            .write_blocking(move |database| {
+                persist_intents(database, kind, prepared).map_err(anyhow::Error::new)
+            })
+            .map_err(FsOpsError::from)
+    }
+
+    fn validate_and_mark(
+        &self,
+        intent: &mut JournalIntent,
+        source_identity: &str,
+    ) -> FsOpsResult<()> {
+        let mut journal_intent = intent.clone();
+        let source_identity = source_identity.to_owned();
+        let (attempt_count, phase) = self
+            .writer
+            .write_blocking(move |database| {
+                validate_execution_source(database, &journal_intent, &source_identity)
+                    .map_err(anyhow::Error::new)?;
+                mark_attempt(database, &mut journal_intent).map_err(anyhow::Error::new)?;
+                Ok((journal_intent.attempt_count, journal_intent.phase))
+            })
+            .map_err(FsOpsError::from)?;
+        intent.attempt_count = attempt_count;
+        intent.phase = phase;
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        intent: &JournalIntent,
+        error: Option<&FsOpsError>,
+    ) -> FsOpsResult<FileOperationRecord> {
+        let intent = intent.clone();
+        let error = error.cloned();
+        self.writer
+            .write_blocking(move |database| {
+                finalize_intent(database, &intent, error.as_ref()).map_err(anyhow::Error::new)
+            })
+            .map_err(FsOpsError::from)
+    }
+
+    fn schedule_repair(&self) {
+        schedule_pending_repair(self.database);
+    }
+}
+
+fn execute_intent_with_store(
+    store: &impl JournalStore,
     intent: &mut JournalIntent,
 ) -> FsOpsResult<FsOpsResult<FileOperationRecord>> {
     if let Some(code) = intent.pending_error_code.as_deref() {
         let error = persisted_error(code, intent.pending_error_detail.as_deref());
-        let guard = database.lock().expect("database mutex poisoned");
-        finalize_intent(&guard, intent, Some(&error))?;
+        store.finalize(intent, Some(&error))?;
         return Ok(Err(error));
     }
 
     if intent.source_path == intent.target_path.as_deref().unwrap_or(Path::new("")) {
-        let guard = database.lock().expect("database mutex poisoned");
-        return finalize_intent(&guard, intent, None).map(Ok);
+        return store.finalize(intent, None).map(Ok);
     }
 
-    {
-        let guard = database.lock().expect("database mutex poisoned");
-        mark_attempt(&guard, intent)?;
-    }
-    let fs_result = perform_filesystem_action(intent);
-    let guard = database.lock().expect("database mutex poisoned");
+    let source = open_verified_execution_source(intent)?;
+    store.validate_and_mark(intent, source.identity())?;
+    let fs_result = perform_filesystem_action(intent, source);
     match fs_result {
-        Ok(()) => finalize_intent(&guard, intent, None).map(Ok),
+        Ok(()) => store.finalize(intent, None).map(Ok),
         Err(error) => {
             let operation_error = filesystem_operation_error(intent, error);
-            finalize_intent(&guard, intent, Some(&operation_error))?;
+            if intent.kind == FileOperationKind::DeleteRecycle {
+                match reconcile_recycle_action_failure(intent)? {
+                    RecycleFailureState::Completed => {
+                        return store.finalize(intent, None).map(Ok);
+                    }
+                    RecycleFailureState::Restored => {}
+                }
+            }
+            store.finalize(intent, Some(&operation_error))?;
             Ok(Err(operation_error))
         }
     }
@@ -251,11 +572,21 @@ fn execute_intent(
         return finalize_intent(database, intent, None).map(Ok);
     }
 
+    let source = open_verified_execution_source(intent)?;
+    validate_execution_source(database, intent, source.identity())?;
     mark_attempt(database, intent)?;
-    match perform_filesystem_action(intent) {
+    match perform_filesystem_action(intent, source) {
         Ok(()) => finalize_intent(database, intent, None).map(Ok),
         Err(error) => {
             let operation_error = filesystem_operation_error(intent, error);
+            if intent.kind == FileOperationKind::DeleteRecycle {
+                match reconcile_recycle_action_failure(intent)? {
+                    RecycleFailureState::Completed => {
+                        return finalize_intent(database, intent, None).map(Ok);
+                    }
+                    RecycleFailureState::Restored => {}
+                }
+            }
             finalize_intent(database, intent, Some(&operation_error))?;
             Ok(Err(operation_error))
         }
@@ -283,6 +614,7 @@ fn reconcile_intent(
     match reconcile_filesystem_state(database, intent) {
         ReconcileAction::FinalizeSuccess => finalize_intent(database, intent, None).map(Ok),
         ReconcileAction::Retry => execute_intent(database, intent),
+        ReconcileAction::RestoreRecycle => restore_staged_recycle_for_retry(database, intent),
         ReconcileAction::Fail(error) => {
             finalize_intent(database, intent, Some(&error))?;
             Ok(Err(error))
@@ -293,14 +625,30 @@ fn reconcile_intent(
 enum ReconcileAction {
     FinalizeSuccess,
     Retry,
+    RestoreRecycle,
     Fail(FsOpsError),
 }
 
 fn reconcile_filesystem_state(database: &Database, intent: &JournalIntent) -> ReconcileAction {
     match intent.kind {
-        FileOperationKind::DeleteRecycle | FileOperationKind::DeletePermanent => {
+        FileOperationKind::DeletePermanent => {
             reconcile_delete_filesystem_state(database, intent, probe_path(&intent.source_path))
         }
+        FileOperationKind::DeleteRecycle => reconcile_recycle_filesystem_state(
+            database,
+            intent,
+            probe_path(&intent.source_path),
+            intent
+                .target_path
+                .as_deref()
+                .map(probe_path)
+                .unwrap_or_else(|| {
+                    PathProbe::Error(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "recycle intent has no staging path",
+                    ))
+                }),
+        ),
         FileOperationKind::Rename | FileOperationKind::Move => {
             let Some(target_path) = intent.target_path.as_deref() else {
                 return ReconcileAction::Fail(FsOpsError::new(
@@ -316,6 +664,164 @@ fn reconcile_filesystem_state(database: &Database, intent: &JournalIntent) -> Re
                 probe_path(target_path),
             )
         }
+    }
+}
+
+fn reconcile_recycle_filesystem_state(
+    database: &Database,
+    intent: &JournalIntent,
+    source: PathProbe,
+    staging: PathProbe,
+) -> ReconcileAction {
+    if let PathProbe::Error(error) = source {
+        return ReconcileAction::Fail(probe_interrupted_error(
+            &intent.source_path,
+            "recycle source",
+            error,
+        ));
+    }
+    let staging_path = intent.target_path.as_deref().unwrap_or(Path::new(""));
+    if let PathProbe::Error(error) = staging {
+        return ReconcileAction::Fail(probe_interrupted_error(
+            staging_path,
+            "recycle staging path",
+            error,
+        ));
+    }
+    match (source, staging, intent.phase) {
+        (PathProbe::NotFound, PathProbe::NotFound, JournalPhase::Executing) => {
+            ReconcileAction::FinalizeSuccess
+        }
+        (PathProbe::NotFound, PathProbe::Exists(metadata), JournalPhase::Executing) => {
+            match verify_source_identity(intent, staging_path, &metadata) {
+                Ok(()) => ReconcileAction::RestoreRecycle,
+                Err(error) => ReconcileAction::Fail(error),
+            }
+        }
+        (PathProbe::Exists(metadata), PathProbe::NotFound, JournalPhase::Prepared) => {
+            match validate_prepared_source_replay(database, intent, &metadata) {
+                Ok(()) => ReconcileAction::Retry,
+                Err(error) => ReconcileAction::Fail(error),
+            }
+        }
+        (PathProbe::Exists(_), PathProbe::NotFound, JournalPhase::Executing) => {
+            ReconcileAction::Fail(interrupted_error(
+                "recycle source still exists after staging may have started; refusing an unknown replay",
+            ))
+        }
+        (PathProbe::NotFound, PathProbe::Exists(_), JournalPhase::Prepared) => {
+            ReconcileAction::Fail(interrupted_error(
+                "recycle staging exists before filesystem execution was durably started",
+            ))
+        }
+        (PathProbe::Exists(_), PathProbe::Exists(_), _) => {
+            ReconcileAction::Fail(interrupted_error(
+                "recycle source and staging path both exist during recovery",
+            ))
+        }
+        (PathProbe::NotFound, PathProbe::NotFound, JournalPhase::Prepared) => {
+            ReconcileAction::Fail(interrupted_error(
+                "recycle source disappeared before filesystem execution started",
+            ))
+        }
+        (_, _, JournalPhase::Legacy) => ReconcileAction::Fail(interrupted_error(
+            "legacy recycle intent has no durable execution phase",
+        )),
+        (PathProbe::Error(_), _, _) | (_, PathProbe::Error(_), _) => {
+            unreachable!("probe errors returned above")
+        }
+    }
+}
+
+fn restore_staged_recycle_for_retry(
+    database: &Database,
+    intent: &mut JournalIntent,
+) -> FsOpsResult<FsOpsResult<FileOperationRecord>> {
+    restore_recycle_staging(intent)?;
+    let transaction = Transaction::new_unchecked(
+        database.connection_for_fsops(),
+        TransactionBehavior::Immediate,
+    )?;
+    let updated = transaction.execute(
+        "UPDATE file_operations SET journal_phase = 'prepared' WHERE id = ?1 AND status = 'pending' AND journal_phase = 'executing'",
+        [intent.id],
+    )?;
+    if updated != 1 {
+        return Err(FsOpsError::new(
+            FsOpsErrorCode::FsError,
+            format!("recycle intent {} could not return to prepared", intent.id),
+        ));
+    }
+    transaction.commit()?;
+    intent.phase = JournalPhase::Prepared;
+    execute_intent(database, intent)
+}
+
+fn restore_recycle_staging(intent: &JournalIntent) -> FsOpsResult<()> {
+    let staging_path = intent
+        .target_path
+        .as_deref()
+        .ok_or_else(|| interrupted_error("recycle intent has no staging path to restore"))?;
+    let staged = super::platform::VerifiedSource::open(staging_path).map_err(|error| {
+        interrupted_error(format!(
+            "cannot open recycle staging '{}': {error}",
+            staging_path.display()
+        ))
+    })?;
+    let expected = intent
+        .source_identity
+        .as_deref()
+        .ok_or_else(|| interrupted_error("recycle intent has no stable source identity"))?;
+    if staged.identity() != expected {
+        return Err(interrupted_error(
+            "recycle staging identity changed before restoration",
+        ));
+    }
+    staged
+        .rename_no_replace(&intent.source_path)
+        .map_err(|error| {
+            interrupted_error(format!(
+                "cannot restore recycle staging to '{}': {error}",
+                intent.source_path.display()
+            ))
+        })
+}
+
+enum RecycleFailureState {
+    Completed,
+    Restored,
+}
+
+fn reconcile_recycle_action_failure(intent: &JournalIntent) -> FsOpsResult<RecycleFailureState> {
+    let staging_path = intent
+        .target_path
+        .as_deref()
+        .ok_or_else(|| interrupted_error("recycle action failed without a staging path"))?;
+    match (probe_path(&intent.source_path), probe_path(staging_path)) {
+        (PathProbe::NotFound, PathProbe::NotFound) => Ok(RecycleFailureState::Completed),
+        (PathProbe::NotFound, PathProbe::Exists(metadata)) => {
+            verify_source_identity(intent, staging_path, &metadata)?;
+            restore_recycle_staging(intent)?;
+            Ok(RecycleFailureState::Restored)
+        }
+        (PathProbe::Exists(metadata), PathProbe::NotFound) => {
+            verify_source_identity(intent, &intent.source_path, &metadata)?;
+            Ok(RecycleFailureState::Restored)
+        }
+        (PathProbe::Exists(source_metadata), PathProbe::Exists(_)) => {
+            verify_source_identity(intent, &intent.source_path, &source_metadata)?;
+            Ok(RecycleFailureState::Restored)
+        }
+        (PathProbe::Error(error), _) => Err(probe_interrupted_error(
+            &intent.source_path,
+            "recycle source after failure",
+            error,
+        )),
+        (_, PathProbe::Error(error)) => Err(probe_interrupted_error(
+            staging_path,
+            "recycle staging after failure",
+            error,
+        )),
     }
 }
 
@@ -578,6 +1084,70 @@ fn verify_source_identity(
     Ok(())
 }
 
+fn open_verified_execution_source(
+    intent: &JournalIntent,
+) -> FsOpsResult<super::platform::VerifiedSource> {
+    let expected = intent.source_identity.as_deref().ok_or_else(|| {
+        interrupted_error("file-operation execution requires a persisted stable source identity")
+    })?;
+    let source = super::platform::VerifiedSource::open(&intent.source_path).map_err(|error| {
+        FsOpsError::new(
+            FsOpsErrorCode::FsError,
+            format!(
+                "cannot open protected file-operation source '{}': {error}",
+                intent.source_path.display()
+            ),
+        )
+    })?;
+    if source.identity() != expected {
+        return Err(interrupted_error(
+            "file-operation source identity changed before execution",
+        ));
+    }
+    Ok(source)
+}
+
+fn validate_execution_source(
+    database: &Database,
+    intent: &JournalIntent,
+    source_identity: &str,
+) -> FsOpsResult<()> {
+    if source_identity != intent.source_identity.as_deref().unwrap_or_default() {
+        return Err(interrupted_error(
+            "protected file-operation handle does not match the journal identity",
+        ));
+    }
+    verify_entity_snapshot(database, intent)?;
+    if intent.kind == FileOperationKind::DeletePermanent {
+        let root_id = intent
+            .root_id
+            .ok_or_else(|| interrupted_error("permanent-delete intent has no root id"))?;
+        let root_path = enabled_root_path(database.connection_for_fsops(), root_id)?;
+        let metadata = match probe_path(&intent.source_path) {
+            PathProbe::Exists(metadata) => metadata,
+            PathProbe::NotFound => {
+                return Err(interrupted_error(
+                    "protected permanent-delete source disappeared before execution",
+                ))
+            }
+            PathProbe::Error(error) => {
+                return Err(probe_interrupted_error(
+                    &intent.source_path,
+                    "permanent-delete source",
+                    error,
+                ))
+            }
+        };
+        validate_permanent_delete_path(
+            &intent.source_path,
+            &root_path,
+            &metadata,
+            Some(source_identity),
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_permanent_delete_replay(
     database: &Database,
     intent: &JournalIntent,
@@ -687,24 +1257,27 @@ fn filesystem_identity(_path: &Path, _metadata: &fs::Metadata) -> Option<String>
     None
 }
 
-fn perform_filesystem_action(intent: &JournalIntent) -> std::io::Result<()> {
+fn perform_filesystem_action(
+    intent: &JournalIntent,
+    source: super::platform::VerifiedSource,
+) -> std::io::Result<()> {
     match intent.kind {
-        FileOperationKind::Rename | FileOperationKind::Move => atomic_rename(
-            &intent.source_path,
-            intent.target_path.as_deref().ok_or_else(|| {
+        FileOperationKind::Rename | FileOperationKind::Move => {
+            source.rename_no_replace(intent.target_path.as_deref().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing target path")
-            })?,
-        ),
-        FileOperationKind::DeletePermanent => match intent.entity_kind {
-            Some(EntityKind::File) => fs::remove_file(&intent.source_path),
-            Some(EntityKind::Folder) => fs::remove_dir_all(&intent.source_path),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "missing delete entity kind",
-            )),
-        },
-        FileOperationKind::DeleteRecycle => trash::delete(&intent.source_path)
-            .map_err(|error| std::io::Error::other(error.to_string())),
+            })?)
+        }
+        FileOperationKind::DeletePermanent => source.delete_permanent(),
+        FileOperationKind::DeleteRecycle => {
+            let staging_path = intent.target_path.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "recycle intent has no protected staging path",
+                )
+            })?;
+            source.rename_no_replace(staging_path)?;
+            trash::delete(staging_path).map_err(|error| std::io::Error::other(error.to_string()))
+        }
     }
 }
 
@@ -722,16 +1295,20 @@ fn filesystem_operation_error(intent: &JournalIntent, error: std::io::Error) -> 
 }
 
 fn persist_intents(
-    database: &Mutex<Database>,
+    database: &Database,
     kind: FileOperationKind,
     prepared: Vec<PreparedIntent>,
-) -> FsOpsResult<Vec<JournalIntent>> {
-    let guard = database.lock().expect("database mutex poisoned");
-    let transaction =
-        Transaction::new_unchecked(guard.connection_for_fsops(), TransactionBehavior::Immediate)?;
+) -> FsOpsResult<PersistedBatch> {
+    let transaction = Transaction::new_unchecked(
+        database.connection_for_fsops(),
+        TransactionBehavior::Immediate,
+    )?;
     let group_id = Uuid::now_v7().to_string();
     let started_at = now_millis();
     let mut intents = Vec::with_capacity(prepared.len());
+    let total = prepared.len() as i64;
+    let mut first_error = None;
+    let mut preflight_failures = 0i64;
 
     for prepared in prepared {
         let error_code = prepared
@@ -742,18 +1319,25 @@ fn persist_intents(
             .preflight_error
             .as_ref()
             .map(|error| error.message.as_str());
+        let status = if prepared.preflight_error.is_some() {
+            "failed"
+        } else {
+            "pending"
+        };
         transaction.execute(
             r#"INSERT INTO file_operations(
-                 operation, source_path, target_path, status, created_at,
+                 operation, source_path, target_path, status, created_at, finished_at,
                  operation_group_id, entity_kind, entity_id, root_id,
                  target_folder_id, attempt_count, journal_phase,
                  source_identity, error_code, error
-               ) VALUES (?1, ?2, ?3, 'pending', unixepoch(), ?4, ?5, ?6, ?7,
-                         ?8, 0, 'prepared', ?9, ?10, ?11)"#,
+               ) VALUES (?1, ?2, ?3, ?4, unixepoch(),
+                         CASE WHEN ?4 = 'failed' THEN unixepoch() ELSE NULL END,
+                         ?5, ?6, ?7, ?8, ?9, 0, 'prepared', ?10, ?11, ?12)"#,
             params![
                 prepared.kind.as_str(),
                 prepared.source_path,
                 prepared.target_path,
+                status,
                 group_id,
                 prepared.entity_kind.map(EntityKind::as_str),
                 prepared.entity_id,
@@ -764,6 +1348,13 @@ fn persist_intents(
                 error_detail,
             ],
         )?;
+        if let Some(error) = prepared.preflight_error {
+            preflight_failures += 1;
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+            continue;
+        }
         intents.push(JournalIntent {
             id: transaction.last_insert_rowid(),
             group_id: group_id.clone(),
@@ -782,17 +1373,25 @@ fn persist_intents(
         });
     }
 
-    let mut operation = new_group_operation(&group_id, kind, intents.len() as i64, started_at);
-    let appended = guard.publish_notification_operation_in_transaction(
+    let mut operation = new_group_operation(&group_id, kind, total, started_at);
+    let phase_appended = database.publish_notification_operation_in_transaction(
         &transaction,
         &mut operation,
         PublishMode::Phase,
     )?;
+    let state_appended = if preflight_failures > 0 {
+        publish_group_state_in_transaction(database, &transaction, &group_id)?
+    } else {
+        false
+    };
     transaction.commit()?;
-    if appended {
-        guard.notification_outbox_wake().notify_one();
+    if phase_appended || state_appended {
+        database.notification_outbox_wake().notify_one();
     }
-    Ok(intents)
+    Ok(PersistedBatch {
+        intents,
+        first_error,
+    })
 }
 
 fn mark_attempt(database: &Database, intent: &mut JournalIntent) -> FsOpsResult<()> {
@@ -1129,7 +1728,9 @@ fn operation_record_in_transaction(
     operation_id: i64,
 ) -> FsOpsResult<FileOperationRecord> {
     Ok(transaction.query_row(
-        r#"SELECT id, operation, source_path, target_path, status,
+        r#"SELECT id, operation, source_path,
+                  CASE WHEN operation LIKE 'delete_%' THEN NULL ELSE target_path END,
+                  status,
                   created_at, finished_at, error, operation_group_id
            FROM file_operations WHERE id = ?1"#,
         [operation_id],
@@ -1419,6 +2020,8 @@ fn prepare_move(
     let mut prepared = {
         let guard = database.lock().expect("database mutex poisoned");
         let conn = guard.connection_for_fsops();
+        let (file_ids, folder_ids) =
+            normalize_batch_ids(conn, &request.file_ids, &request.folder_ids)?;
         let target = load_folder_path(conn, request.target_folder_id)?;
         let target_error = target.as_ref().is_none().then(|| {
             FsOpsError::new(
@@ -1426,19 +2029,19 @@ fn prepare_move(
                 format!("target folder not found: {}", request.target_folder_id),
             )
         });
-        let mut prepared = Vec::with_capacity(request.file_ids.len() + request.folder_ids.len());
-        for file_id in &request.file_ids {
+        let mut prepared = Vec::with_capacity(file_ids.len() + folder_ids.len());
+        for file_id in file_ids {
             prepared.push(prepare_move_file(
                 conn,
-                *file_id,
+                file_id,
                 target.as_ref(),
                 target_error.clone(),
             )?);
         }
-        for folder_id in &request.folder_ids {
+        for folder_id in folder_ids {
             prepared.push(prepare_move_folder(
                 conn,
-                *folder_id,
+                folder_id,
                 target.as_ref(),
                 request.target_folder_id,
                 target_error.clone(),
@@ -1603,9 +2206,11 @@ fn prepare_delete(
     let mut prepared = {
         let guard = database.lock().expect("database mutex poisoned");
         let conn = guard.connection_for_fsops();
-        let mut prepared = Vec::with_capacity(request.file_ids.len() + request.folder_ids.len());
-        for file_id in &request.file_ids {
-            prepared.push(match load_file_info(conn, *file_id)? {
+        let (file_ids, folder_ids) =
+            normalize_batch_ids(conn, &request.file_ids, &request.folder_ids)?;
+        let mut prepared = Vec::with_capacity(file_ids.len() + folder_ids.len());
+        for file_id in file_ids {
+            prepared.push(match load_file_info(conn, file_id)? {
                 Some(info) => {
                     let root_path = request
                         .permanent
@@ -1614,10 +2219,12 @@ fn prepare_delete(
                     PreparedIntent {
                         kind,
                         entity_kind: Some(EntityKind::File),
-                        entity_id: Some(*file_id),
+                        entity_id: Some(file_id),
                         root_id: Some(info.root_id),
                         source_path: info.path.to_string_lossy().into_owned(),
-                        target_path: None,
+                        target_path: (!request.permanent)
+                            .then(|| recycle_staging_path(&info.path))
+                            .map(|path| path.to_string_lossy().into_owned()),
                         target_folder_id: None,
                         delete_root_path,
                         source_identity: None,
@@ -1627,7 +2234,7 @@ fn prepare_delete(
                 None => missing_intent(
                     kind,
                     EntityKind::File,
-                    *file_id,
+                    file_id,
                     "delete",
                     FsOpsError::new(
                         FsOpsErrorCode::NotFound,
@@ -1636,8 +2243,8 @@ fn prepare_delete(
                 ),
             });
         }
-        for folder_id in &request.folder_ids {
-            prepared.push(match load_folder_info(conn, *folder_id)? {
+        for folder_id in folder_ids {
+            prepared.push(match load_folder_info(conn, folder_id)? {
                 Some(info) => {
                     let mut error = info.parent_id.is_none().then(|| {
                         FsOpsError::new(
@@ -1659,10 +2266,12 @@ fn prepare_delete(
                     PreparedIntent {
                         kind,
                         entity_kind: Some(EntityKind::Folder),
-                        entity_id: Some(*folder_id),
+                        entity_id: Some(folder_id),
                         root_id: Some(info.root_id),
                         source_path: info.path.to_string_lossy().into_owned(),
-                        target_path: None,
+                        target_path: (!request.permanent)
+                            .then(|| recycle_staging_path(&info.path))
+                            .map(|path| path.to_string_lossy().into_owned()),
                         target_folder_id: None,
                         delete_root_path: root_path,
                         source_identity: None,
@@ -1672,7 +2281,7 @@ fn prepare_delete(
                 None => missing_intent(
                     kind,
                     EntityKind::Folder,
-                    *folder_id,
+                    folder_id,
                     "delete",
                     FsOpsError::new(
                         FsOpsErrorCode::NotFound,
@@ -1691,6 +2300,84 @@ fn prepare_delete(
         }
     }
     Ok(prepared)
+}
+
+fn normalize_batch_ids(
+    conn: &rusqlite::Connection,
+    file_ids: &[i64],
+    folder_ids: &[i64],
+) -> FsOpsResult<(Vec<i64>, Vec<i64>)> {
+    let selected_folders: BTreeSet<i64> = folder_ids.iter().copied().collect();
+    let mut logical_folders = Vec::with_capacity(selected_folders.len());
+    for folder_id in selected_folders.iter().copied() {
+        if !has_selected_folder_ancestor(conn, folder_id, &selected_folders)? {
+            logical_folders.push(folder_id);
+        }
+    }
+
+    let mut logical_files = Vec::new();
+    for file_id in file_ids.iter().copied().collect::<BTreeSet<_>>() {
+        let folder_id: Option<i64> = conn
+            .query_row(
+                "SELECT folder_id FROM files WHERE id = ?1 AND status = 'active'",
+                [file_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let covered = match folder_id {
+            Some(folder_id) => folder_or_ancestor_is_selected(conn, folder_id, &selected_folders)?,
+            None => false,
+        };
+        if !covered {
+            logical_files.push(file_id);
+        }
+    }
+    Ok((logical_files, logical_folders))
+}
+
+fn has_selected_folder_ancestor(
+    conn: &rusqlite::Connection,
+    folder_id: i64,
+    selected: &BTreeSet<i64>,
+) -> FsOpsResult<bool> {
+    let parent_id: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT parent_id FROM folders WHERE id = ?1 AND status = 'active'",
+            [folder_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match parent_id.flatten() {
+        Some(parent_id) => folder_or_ancestor_is_selected(conn, parent_id, selected),
+        None => Ok(false),
+    }
+}
+
+fn folder_or_ancestor_is_selected(
+    conn: &rusqlite::Connection,
+    mut folder_id: i64,
+    selected: &BTreeSet<i64>,
+) -> FsOpsResult<bool> {
+    let mut visited = HashSet::new();
+    loop {
+        if selected.contains(&folder_id) {
+            return Ok(true);
+        }
+        if !visited.insert(folder_id) {
+            return Ok(false);
+        }
+        let parent_id: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1 AND status = 'active'",
+                [folder_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match parent_id.flatten() {
+            Some(parent_id) => folder_id = parent_id,
+            None => return Ok(false),
+        }
+    }
 }
 
 fn enabled_root_path(conn: &rusqlite::Connection, root_id: i64) -> FsOpsResult<PathBuf> {
@@ -1743,7 +2430,13 @@ fn apply_delete_filesystem_preflight(intent: &mut PreparedIntent) {
     match probe_path(source_path) {
         PathProbe::Exists(metadata) => {
             match validate_permanent_delete_path(source_path, root_path, &metadata, None) {
-                Ok(identity) => intent.source_identity = identity,
+                Ok(Some(identity)) => intent.source_identity = Some(identity),
+                Ok(None) => {
+                    intent.preflight_error = Some(FsOpsError::new(
+                        FsOpsErrorCode::Interrupted,
+                        "filesystem did not provide a stable permanent-delete identity",
+                    ));
+                }
                 Err(error) => intent.preflight_error = Some(error),
             }
         }
@@ -1770,11 +2463,9 @@ fn apply_source_identity_preflight(intent: &mut PreparedIntent) {
         return;
     }
     let source_path = Path::new(&intent.source_path);
-    match probe_path(source_path) {
-        PathProbe::Exists(metadata) => {
-            intent.source_identity = filesystem_identity(source_path, &metadata)
-        }
-        PathProbe::NotFound => {
+    match super::platform::VerifiedSource::open(source_path) {
+        Ok(source) => intent.source_identity = Some(source.identity().to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             intent.preflight_error = Some(FsOpsError::new(
                 FsOpsErrorCode::NotFound,
                 format!(
@@ -1783,7 +2474,7 @@ fn apply_source_identity_preflight(intent: &mut PreparedIntent) {
                 ),
             ));
         }
-        PathProbe::Error(error) => {
+        Err(error) => {
             intent.preflight_error = Some(FsOpsError::new(
                 FsOpsErrorCode::FsError,
                 format!(
@@ -1793,6 +2484,11 @@ fn apply_source_identity_preflight(intent: &mut PreparedIntent) {
             ));
         }
     }
+}
+
+fn recycle_staging_path(source_path: &Path) -> PathBuf {
+    let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
+    parent.join(format!(".megle-recycle-{}", Uuid::now_v7()))
 }
 
 fn missing_intent(

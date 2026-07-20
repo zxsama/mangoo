@@ -27,14 +27,10 @@ pub const SESSION_HEADER: &str = "X-Megle-Session";
 #[derive(Clone)]
 pub struct AppState {
     pub writer: DbWriter,
-    /// A separate write connection used ONLY by the infrequent, user-initiated
-    /// file operations (rename/move/delete) and plugin discovery, which take a
-    /// `&Mutex<Database>` and manage fine-grained lock/unlock around interleaved
-    /// filesystem work. These are single user actions (never bursts), so they do
-    /// not reintroduce the folder-switch write storm that the single `writer`
-    /// funnels; keeping them off the writer avoids blocking the actor on slow
-    /// cross-volume copies. `None` for in-memory/test DBs (they route through the
-    /// writer instead — see the fsops fallback).
+    /// A reopened connection used for file-operation preflight reads and plugin
+    /// discovery. File-operation journal writes are submitted as short jobs to
+    /// `writer`; filesystem syscalls run outside both connections on Tokio's
+    /// blocking pool. `None` for in-memory/test databases.
     pub fsops_database: Option<Arc<std::sync::Mutex<Database>>>,
     pub task_queue: TaskSender,
     read_database_path: Option<PathBuf>,
@@ -76,9 +72,9 @@ impl AppState {
     pub fn new_with_worker(database: Database, worker_database: Database) -> Self {
         let read_database_path = database.path().map(Path::to_path_buf);
         let watcher_database = database.reopen().expect("reopen watcher database");
-        // A dedicated connection for the infrequent fsops/plugin-discover writes,
-        // which take a `&Mutex<Database>`. Reopened before `database` is moved
-        // into the writer. `None` when reopen is unavailable (in-memory).
+        // Reopened before `database` is moved into the writer. File operations
+        // use it only for preflight reads; their journal writes use `writer`.
+        // Plugin discovery retains its existing dedicated-connection boundary.
         let fsops_database = database
             .reopen()
             .expect("reopen fsops database")
