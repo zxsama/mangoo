@@ -528,8 +528,8 @@ if (!startupFailureBody) {
 const beforeQuitBody = functionBody(main, 'app.on("before-quit", (event) =>');
 if (!beforeQuitBody) {
   fail("desktop main must handle before-quit cleanup");
-} else if (!beforeQuitBody.includes("pendingCoreProcess?.stop()")) {
-  fail("desktop main must stop pending Core process on before-quit");
+} else if (!beforeQuitBody.includes("stopCoreProcesses")) {
+  fail("desktop main must stop and await Core processes on before-quit");
 }
 
 if (!process.exitCode) {

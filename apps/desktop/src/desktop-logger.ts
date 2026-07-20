@@ -39,7 +39,16 @@ export class DesktopLogger {
   log(source: ProcessLogSource, level: ProcessLogLevel, ...args: unknown[]): void {
     this.writeConsole(level, args);
     if (this.closed) return;
-    const normalized = normalizeLog(source, level, args);
+    let normalized: NormalizedLog;
+    try {
+      normalized = normalizeLog(source, level, args);
+    } catch {
+      normalized = {
+        source,
+        level,
+        message: "[log serialization failed]"
+      };
+    }
     this.pending.push(normalized);
     this.scheduleDrain();
   }
@@ -83,7 +92,12 @@ export class DesktopLogger {
   }
 
   private writeConsole(level: ProcessLogLevel, args: unknown[]): void {
-    const method = this.console[level] ?? this.console.log;
+    let method: ConsoleMethod | undefined;
+    try {
+      method = this.console[level] ?? this.console.log;
+    } catch {
+      return;
+    }
     if (!method) return;
     try {
       method(...args);

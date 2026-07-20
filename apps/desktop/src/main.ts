@@ -15,7 +15,12 @@ import fsSync from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { startCoreProcess, waitForCoreHealth, type CoreProcessHandle } from "./core-process.js";
+import {
+  startCoreProcess,
+  stopCoreProcesses,
+  waitForCoreHealth,
+  type CoreProcessHandle
+} from "./core-process.js";
 import { createCoreSession, type CoreSession } from "./core-session.js";
 import { desktopLogger } from "./desktop-logger.js";
 import * as libraryRegistry from "./library-registry.js";
@@ -932,7 +937,7 @@ async function startCoreSession(): Promise<CoreSession> {
       }
       return session;
     } catch (error) {
-      pendingProcess?.stop();
+      await pendingProcess?.stop();
       pendingCoreProcess = null;
       coreProcess = null;
       coreSession = null;
@@ -987,7 +992,7 @@ async function restartCoreForLibrary(dbPath: string): Promise<void> {
   pushLibraryPhase("starting-core");
   const base = coreSession ?? (await createCoreSession());
   // Stop the current Core and wait for the port to free up.
-  coreProcess?.stop();
+  await coreProcess?.stop();
   coreProcess = null;
   await waitForPortFree(base.bindAddress);
 
@@ -1000,7 +1005,7 @@ async function restartCoreForLibrary(dbPath: string): Promise<void> {
     pushLibraryPhase("opening-library");
     await waitForCoreHealth(session.baseUrl, session.sessionToken);
   } catch (error) {
-    handle.stop();
+    await handle.stop();
     pendingCoreProcess = null;
     throw error;
   }
@@ -1448,13 +1453,15 @@ app
 
 function handleDesktopStartupFailure(error: unknown): void {
   desktopLogger.error("main", "[megle] desktop startup failed:", error);
-  pendingCoreProcess?.stop();
-  pendingCoreProcess = null;
-  coreProcess?.stop();
-  coreProcess = null;
-  coreReadyPromise = null;
-  coreSession = null;
-  app.exit(1);
+  void (async () => {
+    await stopCoreProcesses([pendingCoreProcess, coreProcess]);
+    pendingCoreProcess = null;
+    coreProcess = null;
+    coreReadyPromise = null;
+    coreSession = null;
+    await desktopLogger.close();
+    app.exit(1);
+  })();
 }
 
 async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
@@ -1508,19 +1515,17 @@ app.on("before-quit", (event) => {
       try {
         await persistWindowState();
       } finally {
-        await desktopLogger.close();
-        pendingCoreProcess?.stop();
+        await stopCoreProcesses([pendingCoreProcess, coreProcess]);
         pendingCoreProcess = null;
-        coreProcess?.stop();
         coreProcess = null;
+        await desktopLogger.close();
         app.exit(0);
       }
     })();
     return;
   }
 
-  pendingCoreProcess?.stop();
+  void stopCoreProcesses([pendingCoreProcess, coreProcess]);
   pendingCoreProcess = null;
-  coreProcess?.stop();
   coreProcess = null;
 });

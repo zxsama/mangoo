@@ -44,6 +44,8 @@ export interface ProcessLogBufferOptions {
 
 type StoredLine = ProcessLogLine & { readonly bytes: number };
 type ProcessLogSubscriber = (line: ProcessLogLine) => void;
+type QueuedNotification = { readonly generation: number; readonly line: ProcessLogLine };
+type SanitizeContext = { readonly seen: WeakSet<object>; keys: number };
 
 const MAX_MESSAGE_BYTES = 16 * 1024;
 const MAX_METADATA_DEPTH = 6;
@@ -51,47 +53,59 @@ const MAX_METADATA_KEYS = 128;
 const MAX_METADATA_ARRAY_ITEMS = 128;
 const MAX_METADATA_STRING_LENGTH = 4 * 1024;
 const REDACTED = "[redacted]";
+const UNREADABLE = "[unreadable]";
 
 const SECRET_TEXT_PATTERN =
   /((?:MEGLE_SESSION_TOKEN|SESSION_TOKEN|SESSIONTOKEN|X-MEGLE-SESSION|AUTHORIZATION|BEARER|TOKEN)\s*[:=]\s*)([^\s,;]+)/gi;
+const SECRET_JSON_PATTERN =
+  /((?:["']?(?:sessionToken|session_token|session-token|token|auth|authorization|bearer|secret|password|cookie)["']?)\s*:\s*["'])([^"']*)(["'])/gi;
 const WINDOWS_PATH_PATTERN = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+/g;
 const UNIX_SENSITIVE_PATH_PATTERN = /(?:\/Users\/|\/home\/|\/private\/var\/|\/tmp\/)[^\s"'`<>]+/gi;
 const SENSITIVE_METADATA_KEY_PATTERN =
-  /(?:token|secret|password|authorization|cookie|(?:^|[_-])path$|(?:^|[_-])filepath$|(?:^|[_-])directory$|(?:^|[_-])rootpath$)/i;
+  /(?:sessiontoken|session_token|session-token|token|auth|authorization|bearer|secret|password|cookie|(?:^|[_-])path$|(?:^|[_-])filepath$|(?:^|[_-])directory$|(?:^|[_-])rootpath$)/i;
 
 export function sanitizeProcessLogMessage(value: string): string {
   let message = value.replace(/\r\n?/g, "\\n");
   message = message.replace(SECRET_TEXT_PATTERN, `$1${REDACTED}`);
+  message = message.replace(SECRET_JSON_PATTERN, `$1${REDACTED}$3`);
   message = message.replace(WINDOWS_PATH_PATTERN, REDACTED);
   message = message.replace(UNIX_SENSITIVE_PATH_PATTERN, REDACTED);
   return truncateUtf8(message, MAX_MESSAGE_BYTES);
 }
 
+export function sanitizeProcessLogValue(value: unknown): unknown {
+  try {
+    return sanitizeMetadataValue(value, "value", { seen: new WeakSet<object>(), keys: 0 }, 0);
+  } catch {
+    return UNREADABLE;
+  }
+}
+
 export function sanitizeProcessLogMetadata(value: unknown): ProcessLogMetadata | undefined {
   if (value === undefined) return undefined;
-  const seen = new WeakSet<object>();
-  const normalized = sanitizeMetadataValue(value, "metadata", seen, 0, { keys: 0 });
+  const normalized = sanitizeProcessLogValue(value);
   if (normalized === undefined) return undefined;
   if (isRecord(normalized)) return normalized;
   return { value: normalized };
 }
 
-export function formatProcessLogValue(value: unknown): string {
-  if (value instanceof Error) {
-    return `${value.name}: ${value.message}`;
+export function safeSerializeProcessLogValue(value: unknown): string {
+  const normalized = sanitizeProcessLogValue(value);
+  try {
+    const serialized = JSON.stringify(normalized);
+    return serialized === undefined ? UNREADABLE : serialized;
+  } catch {
+    return UNREADABLE;
   }
-  if (typeof value === "string") return value;
+}
+
+export function formatProcessLogValue(value: unknown): string {
+  if (typeof value === "string") return sanitizeProcessLogMessage(value);
   if (value === null) return "null";
   if (value === undefined) return "undefined";
   if (typeof value === "bigint") return `${value.toString()}n`;
-  if (typeof value !== "object") return String(value);
-
-  try {
-    const serialized = JSON.stringify(value, createSafeJsonReplacer());
-    return serialized === undefined ? String(value) : serialized;
-  } catch {
-    return "[unserializable]";
-  }
+  if (typeof value !== "object") return sanitizeProcessLogMessage(String(value));
+  return safeSerializeProcessLogValue(value);
 }
 
 export class ProcessLogBuffer {
@@ -101,8 +115,9 @@ export class ProcessLogBuffer {
   private readonly lines: StoredLine[] = [];
   private readonly subscribers = new Set<ProcessLogSubscriber>();
   private readonly flushWaiters = new Set<() => void>();
-  private pendingNotifications: ProcessLogLine[] = [];
+  private pendingNotifications: QueuedNotification[] = [];
   private notificationScheduled = false;
+  private notificationGeneration = 0;
   private totalBytes = 0;
   private nextSequence = 1;
 
@@ -120,28 +135,35 @@ export class ProcessLogBuffer {
     timestamp = this.now()
   ): ProcessLogLine | null {
     const sequence = this.nextSequence++;
-    const candidate = this.fitLine(
-      {
+    let candidate: StoredLine | null;
+    try {
+      candidate = this.fitLine({
         sequence,
         timestamp: Number.isFinite(timestamp) ? timestamp : this.now(),
         source,
         level,
         message: sanitizeProcessLogMessage(message),
         metadata: sanitizeProcessLogMetadata(metadata)
-      }
-    );
+      });
+    } catch {
+      candidate = this.fitLine({ sequence, timestamp: this.now(), source, level, message: UNREADABLE });
+    }
     if (!candidate) return null;
 
-    this.lines.push(candidate);
-    this.totalBytes += candidate.bytes;
+    const stored = freezeStoredLine(candidate);
+    this.lines.push(stored);
+    this.totalBytes += stored.bytes;
     while (this.lines.length > this.maxEntries || this.totalBytes > this.maxBytes) {
       const removed = this.lines.shift();
       if (!removed) break;
       this.totalBytes -= removed.bytes;
     }
-    this.pendingNotifications.push(stripBytes(candidate));
+    this.pendingNotifications.push({
+      generation: this.notificationGeneration,
+      line: stripBytes(stored)
+    });
     this.scheduleNotificationFlush();
-    return stripBytes(candidate);
+    return stripBytes(stored);
   }
 
   snapshot(filter: ProcessLogFilter = {}): ProcessLogLine[] {
@@ -171,6 +193,8 @@ export class ProcessLogBuffer {
   clear(): void {
     this.lines.length = 0;
     this.totalBytes = 0;
+    this.notificationGeneration += 1;
+    this.pendingNotifications = [];
   }
 
   get size(): number {
@@ -234,10 +258,11 @@ export class ProcessLogBuffer {
     this.notificationScheduled = false;
     const pending = this.pendingNotifications;
     this.pendingNotifications = [];
-    for (const line of pending) {
+    for (const queued of pending) {
+      if (queued.generation !== this.notificationGeneration) continue;
       for (const subscriber of this.subscribers) {
         try {
-          subscriber(line);
+          subscriber(queued.line);
         } catch {
           // A log consumer must never interrupt the producer or another consumer.
         }
@@ -256,9 +281,15 @@ function positiveInteger(value: number | undefined, fallback: number): number {
   return Number.isInteger(value) && value !== undefined && value > 0 ? value : fallback;
 }
 
+function freezeStoredLine(line: StoredLine): StoredLine {
+  const metadata = line.metadata ? deepFreeze(sanitizeProcessLogMetadata(line.metadata)) : undefined;
+  return Object.freeze({ ...line, metadata });
+}
+
 function stripBytes(line: StoredLine): ProcessLogLine {
+  const metadata = line.metadata ? sanitizeProcessLogMetadata(line.metadata) : undefined;
   const { bytes: _bytes, ...publicLine } = line;
-  return publicLine;
+  return { ...publicLine, metadata };
 }
 
 function estimateLineBytes(line: ProcessLogLine): number {
@@ -287,13 +318,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function sanitizeMetadataValue(
-  value: unknown,
-  key: string,
-  seen: WeakSet<object>,
-  depth: number,
-  budget: { keys: number }
-): unknown {
+function sanitizeMetadataValue(value: unknown, key: string, context: SanitizeContext, depth: number): unknown {
   if (SENSITIVE_METADATA_KEY_PATTERN.test(key)) return REDACTED;
   if (value === null || typeof value === "boolean" || typeof value === "number") return value;
   if (typeof value === "string") return truncateUtf8(sanitizeProcessLogMessage(value), MAX_METADATA_STRING_LENGTH);
@@ -301,44 +326,80 @@ function sanitizeMetadataValue(
   if (typeof value === "undefined") return undefined;
   if (typeof value === "function" || typeof value === "symbol") return "[unserializable]";
   if (depth >= MAX_METADATA_DEPTH) return "[truncated]";
-  if (seen.has(value)) return "[circular]";
-  seen.add(value);
+  if (context.seen.has(value)) return "[circular]";
+  context.seen.add(value);
 
-  if (value instanceof Error) {
-    return {
-      name: value.name,
-      message: truncateUtf8(sanitizeProcessLogMessage(value.message), MAX_METADATA_STRING_LENGTH),
-      stack: value.stack ? truncateUtf8(sanitizeProcessLogMessage(value.stack), MAX_METADATA_STRING_LENGTH) : undefined
-    };
-  }
-  if (value instanceof Date) return value.toISOString();
-  if (Array.isArray(value)) {
-    return value
-      .slice(0, MAX_METADATA_ARRAY_ITEMS)
-      .map((item) => sanitizeMetadataValue(item, "value", seen, depth + 1, budget));
-  }
-
-  const output: Record<string, unknown> = {};
-  for (const [childKey, childValue] of Object.entries(value)) {
-    if (budget.keys++ >= MAX_METADATA_KEYS) {
-      output.__truncated__ = true;
-      break;
+  try {
+    if (value instanceof Error) {
+      return {
+        name: safeProperty(value, "name"),
+        message: safeProperty(value, "message"),
+        stack: safeProperty(value, "stack")
+      };
     }
-    const normalized = sanitizeMetadataValue(childValue, childKey, seen, depth + 1, budget);
-    if (normalized !== undefined) output[childKey] = normalized;
+    if (value instanceof Date) {
+      const time = value.getTime();
+      return Number.isFinite(time) ? value.toISOString() : "[invalid date]";
+    }
+    if (Array.isArray(value)) {
+      const output: unknown[] = [];
+      const length = Math.min(value.length, MAX_METADATA_ARRAY_ITEMS);
+      for (let index = 0; index < length; index += 1) {
+        let item: unknown;
+        try {
+          item = value[index];
+        } catch {
+          item = UNREADABLE;
+        }
+        output.push(sanitizeMetadataValue(item, "value", context, depth + 1));
+      }
+      if (value.length > length) output.push("[truncated]");
+      return output;
+    }
+
+    const output: Record<string, unknown> = {};
+    let keys: string[];
+    try {
+      keys = Object.keys(value);
+    } catch {
+      return UNREADABLE;
+    }
+    for (const childKey of keys) {
+      if (context.keys++ >= MAX_METADATA_KEYS) {
+        output.__truncated__ = true;
+        break;
+      }
+      let childValue: unknown;
+      try {
+        childValue = (value as Record<string, unknown>)[childKey];
+      } catch {
+        childValue = UNREADABLE;
+      }
+      try {
+        const normalized = sanitizeMetadataValue(childValue, childKey, context, depth + 1);
+        if (normalized !== undefined) output[childKey] = normalized;
+      } catch {
+        output[childKey] = UNREADABLE;
+      }
+    }
+    return output;
+  } catch {
+    return UNREADABLE;
   }
-  return output;
 }
 
-function createSafeJsonReplacer(): (key: string, value: unknown) => unknown {
-  const seen = new WeakSet<object>();
-  return (key, value) => {
-    if (typeof value === "object" && value !== null) {
-      if (seen.has(value)) return "[circular]";
-      seen.add(value);
-    }
-    if (value instanceof Error) return sanitizeProcessLogMetadata(value);
-    if (typeof value === "bigint") return `${value.toString()}n`;
-    return value;
-  };
+function safeProperty(value: object, key: string): string | undefined {
+  try {
+    const property = (value as Record<string, unknown>)[key];
+    return property === undefined ? undefined : sanitizeProcessLogMessage(String(property));
+  } catch {
+    return UNREADABLE;
+  }
+}
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (typeof value !== "object" || value === null || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
 }
