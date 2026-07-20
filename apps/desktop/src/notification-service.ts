@@ -322,6 +322,15 @@ function fallbackThumbnailKey(libraryId: string): string {
   return `thumbnail\u0000${libraryId}`;
 }
 
+function sameNotificationOperationPayload(
+  left: DesktopNotificationOperation,
+  right: DesktopNotificationOperation
+): boolean {
+  const { libraryId: _leftLibraryId, libraryName: _leftLibraryName, ...leftPayload } = left;
+  const { libraryId: _rightLibraryId, libraryName: _rightLibraryName, ...rightPayload } = right;
+  return JSON.stringify(leftPayload) === JSON.stringify(rightPayload);
+}
+
 function rendererErrorOperationId(libraryId: string, report: RendererErrorReport): string {
   return `renderer-error:${libraryId}:${report.source}:${report.code}:${report.target}`;
 }
@@ -1135,9 +1144,9 @@ export class NotificationService {
             await this.markStoreUnavailable(error);
           }
           if (this.store === store && (await this.refreshStoredSnapshot())) return;
-          this.fallbackActionBaseDetails.delete(key);
-          this.upsertFallbackOperation(updated);
-          this.reconcileFallbackRetryableFailure(updated, detail !== null);
+          this.upsertFallbackOperation(operation);
+          this.applyFallbackActionOverlay(operation, detail);
+          this.reconcileFallbackRetryableFailure(operation, detail !== null);
           this.emitSnapshot();
         }
         return;
@@ -1145,23 +1154,7 @@ export class NotificationService {
         await this.markStoreUnavailable(error);
       }
     }
-    if (detail === null) {
-      const baseDetail = this.fallbackActionBaseDetails.has(key)
-        ? this.fallbackActionBaseDetails.get(key) ?? null
-        : operation.errorDetail;
-      this.fallbackActionBaseDetails.delete(key);
-      this.upsertFallbackOperation({ ...operation, errorDetail: baseDetail });
-    } else {
-      const baseDetail = this.fallbackActionBaseDetails.has(key)
-        ? this.fallbackActionBaseDetails.get(key) ?? null
-        : operation.errorDetail;
-      this.fallbackActionBaseDetails.delete(key);
-      this.upsertFallbackOperation({ ...operation, errorDetail: detail });
-      if (this.fallbackOperations.has(key)) {
-        this.fallbackActionBaseDetails.set(key, baseDetail);
-      }
-    }
-    if (this.fallbackOperations.has(key)) {
+    if (this.applyFallbackActionOverlay(operation, detail)) {
       this.pendingActionErrors.set(key, { operation, detail, updatedAt });
     }
     this.reconcileFallbackRetryableFailure(operation, detail !== null);
@@ -1313,7 +1306,7 @@ export class NotificationService {
       ...this.storedSnapshot.active,
       ...this.storedSnapshot.latestImportantResults
     ]) {
-      this.upsertFallbackOperation(operation);
+      this.seedFallbackOperation(operation);
     }
     for (const summary of this.storedSnapshot.thumbnailSummaries) {
       this.upsertFallbackThumbnail(summary);
@@ -1404,6 +1397,17 @@ export class NotificationService {
       fallbackFailure?.revision ?? -1
     );
     if (operation.revision < knownRevision) return;
+    if (operation.revision === knownRevision) {
+      if (!existing) return;
+      const comparableExisting = this.fallbackActionBaseDetails.has(key)
+        ? {
+            ...existing,
+            errorDetail: this.fallbackActionBaseDetails.get(key) ?? null
+          }
+        : existing;
+      if (sameNotificationOperationPayload(comparableExisting, operation)) return;
+      return;
+    }
     if (existing && operation.revision > existing.revision) {
       this.fallbackActionBaseDetails.delete(key);
       this.pendingActionErrors.delete(key);
@@ -1414,6 +1418,36 @@ export class NotificationService {
     this.fallbackOperations.set(key, operation);
     this.reconcileFallbackRetryableFailure(operation, undefined, knownRevision);
     this.touchFallbackRecord(fallbackOperationKey(operation.libraryId, operation.operationId));
+  }
+
+  private seedFallbackOperation(operation: DesktopNotificationOperation): void {
+    const key = libraryKey(operation.libraryId, operation.operationId);
+    const existing = this.fallbackOperations.get(key);
+    if (existing && operation.revision <= existing.revision) return;
+    this.fallbackOperations.set(key, operation);
+    this.touchFallbackRecord(fallbackOperationKey(operation.libraryId, operation.operationId));
+  }
+
+  private applyFallbackActionOverlay(
+    operation: DesktopNotificationOperation,
+    detail: string | null
+  ): boolean {
+    const key = libraryKey(operation.libraryId, operation.operationId);
+    const existing = this.fallbackOperations.get(key);
+    if (!existing || existing.revision !== operation.revision) return false;
+
+    const baseDetail = this.fallbackActionBaseDetails.has(key)
+      ? this.fallbackActionBaseDetails.get(key) ?? null
+      : existing.errorDetail;
+    if (detail === null) {
+      this.fallbackActionBaseDetails.delete(key);
+      this.fallbackOperations.set(key, { ...existing, errorDetail: baseDetail });
+    } else {
+      this.fallbackActionBaseDetails.set(key, baseDetail);
+      this.fallbackOperations.set(key, { ...existing, errorDetail: detail });
+    }
+    this.touchFallbackRecord(fallbackOperationKey(operation.libraryId, operation.operationId));
+    return this.fallbackOperations.has(key);
   }
 
   private reconcileFallbackRetryableFailure(

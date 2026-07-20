@@ -1476,6 +1476,72 @@ describe("notification service", () => {
     assert.equal(failedAgain.hasRetryableFailure, true);
   });
 
+  it("rejects conflicting fallback payloads at the same revision", async () => {
+    const failed = operation("failed:conflict", 1, "failed", {
+      currentValue: 4,
+      errorDetail: "original failure",
+      retryable: true
+    });
+    const runFallback = async (operations: NotificationOperationInput[]) => {
+      const events = operations.map((item, index) => event(index + 1, item));
+      const service = await createNotificationService({
+        openStore: async () => {
+          throw new Error("worker unavailable");
+        },
+        fetch: async () => response({ items: events, maxSequence: events.length }),
+        now: () => NOW
+      });
+      await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+      const compact = await service.compactSnapshot();
+      const history = await service.history({ limit: 20, offset: 0 });
+      await service.close();
+      return { compact, history };
+    };
+
+    const conflict = await runFallback([
+      failed,
+      {
+        ...failed,
+        status: "succeeded",
+        currentValue: 99,
+        errorDetail: "conflicting detail",
+        retryable: false
+      }
+    ]);
+    assert.deepEqual(conflict.compact.retryableFailures, [
+      {
+        libraryId: LIBRARY_A.id,
+        operationId: "failed:conflict",
+        revision: 1
+      }
+    ]);
+    assert.equal(conflict.compact.latestImportantResults[0]?.status, "failed");
+    assert.equal(conflict.compact.latestImportantResults[0]?.currentValue, 4);
+    assert.equal(conflict.compact.latestImportantResults[0]?.errorDetail, "original failure");
+    assert.equal(conflict.history.total, 1);
+    assert.equal(conflict.history.items[0]?.status, "failed");
+    assert.equal(conflict.history.items[0]?.currentValue, 4);
+    assert.equal(conflict.history.items[0]?.errorDetail, "original failure");
+
+    const identical = await runFallback([failed, { ...failed }]);
+    assert.equal(identical.history.total, 1);
+    assert.equal(identical.history.items[0]?.status, "failed");
+    assert.equal(identical.compact.retryableFailures[0]?.revision, 1);
+
+    const succeeded = await runFallback([
+      failed,
+      operation("failed:conflict", 2, "succeeded", {
+        currentValue: 100,
+        errorDetail: null,
+        retryable: false
+      })
+    ]);
+    assert.deepEqual(succeeded.compact.retryableFailures, []);
+    assert.equal(succeeded.compact.latestImportantResults[0]?.status, "succeeded");
+    assert.equal(succeeded.history.items[0]?.revision, 2);
+    assert.equal(succeeded.history.items[0]?.status, "succeeded");
+  });
+
   it("does not clear a stored failure with an older or same-revision fallback success", async () => {
     const store = new FakeStore();
     await store.upsertOperations(LIBRARY_A, [
