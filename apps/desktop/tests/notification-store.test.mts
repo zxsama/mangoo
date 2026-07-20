@@ -39,6 +39,35 @@ function createTestStore(databasePath = testDatabasePath()) {
   return createNotificationStore({ databasePath, workerUrl: TEST_WORKER_URL });
 }
 
+function createTrackedTestStores(databasePath: string, workerUrls: URL[]): NotificationStore[] {
+  return workerUrls.map(
+    (workerUrl) => new NotificationStore({ databasePath, workerUrl })
+  );
+}
+
+async function settleTrackedStoreReadiness(
+  stores: NotificationStore[]
+): Promise<PromiseSettledResult<NotificationStore>[]> {
+  return Promise.allSettled(
+    stores.map(async (store) => {
+      await store.ready();
+      return store;
+    })
+  );
+}
+
+async function closeTrackedStores(stores: NotificationStore[]): Promise<void> {
+  const settled = await Promise.allSettled(stores.map((store) => store.close()));
+  const rejected = settled.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected"
+  );
+  if (rejected) throw rejected.reason;
+}
+
+function activeMessagePortCount(): number {
+  return process.getActiveResourcesInfo().filter((resource) => resource === "MessagePort").length;
+}
+
 function waitForWorkerMessage(worker: Worker, timeoutMs = 500): Promise<NotificationStoreWorkerMessage> {
   return new Promise((resolve, reject) => {
     const timeoutId = setTimeout(() => {
@@ -795,11 +824,17 @@ describe("notification store", () => {
 
   it("allows concurrent first opens of the same empty v0 database", async () => {
     const databasePath = testDatabasePath();
-    const [first, second] = await Promise.all([
-      createTestStore(databasePath),
-      createTestStore(databasePath)
-    ]);
+    const stores = createTrackedTestStores(databasePath, [TEST_WORKER_URL, TEST_WORKER_URL]);
     try {
+      const settled = await settleTrackedStoreReadiness(stores);
+      assert.ok(
+        settled.every((result) => result.status === "fulfilled"),
+        `concurrent open failed: ${settled
+          .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+          .map((result) => String(result.reason))
+          .join("; ")}`
+      );
+      const [first, second] = stores;
       await first.applyOutboxBatch(
         LIBRARY_A,
         [event(1, operation("concurrent-init", 1, "running"))],
@@ -807,8 +842,57 @@ describe("notification store", () => {
       );
       assert.equal(await second.cursor(LIBRARY_A.id), 1);
     } finally {
-      await Promise.all([first.close(), second.close()]);
+      await closeTrackedStores(stores);
     }
+  });
+
+  it("stably initializes WAL across repeated concurrent first opens", async () => {
+    for (let round = 0; round < 64; round += 1) {
+      const databasePath = testDatabasePath();
+      const stores = createTrackedTestStores(databasePath, [TEST_WORKER_URL, TEST_WORKER_URL]);
+      let settled: PromiseSettledResult<NotificationStore>[] = [];
+      try {
+        settled = await settleTrackedStoreReadiness(stores);
+        assert.ok(
+          settled.every((result) => result.status === "fulfilled"),
+          `round ${round} concurrent open failed: ${settled
+            .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+            .map((result) => String(result.reason))
+            .join("; ")}`
+        );
+      } finally {
+        await closeTrackedStores(stores);
+      }
+
+      const inspection = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        assert.equal(inspection.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
+      } finally {
+        inspection.close();
+      }
+    }
+  });
+
+  it("fault-injected partial open releases every MessagePort for natural process exit", async () => {
+    const baselinePorts = activeMessagePortCount();
+    const failingWorkerUrl = dataWorkerUrl(`
+      import { parentPort } from "node:worker_threads";
+      parentPort.postMessage({
+        type: "startupError",
+        error: { name: "InjectedStartupError", message: "injected startup failure" }
+      });
+      setInterval(() => {}, 1_000);
+    `);
+    const stores = createTrackedTestStores(testDatabasePath(), [TEST_WORKER_URL, failingWorkerUrl]);
+    try {
+      const settled = await settleTrackedStoreReadiness(stores);
+      assert.equal(settled.filter((result) => result.status === "fulfilled").length, 1);
+      assert.equal(settled.filter((result) => result.status === "rejected").length, 1);
+    } finally {
+      await closeTrackedStores(stores);
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(activeMessagePortCount(), baselinePorts);
   });
 
   it("serializes concurrent requests and closes without leaking pending calls", async () => {

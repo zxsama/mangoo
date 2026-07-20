@@ -20,6 +20,9 @@ import type {
 } from "./notification-types.js";
 
 const SCHEMA_VERSION = 4;
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
+const SQLITE_INITIALIZATION_RETRY_DELAYS_MS = [2, 4, 8, 16, 32, 64, 128, 256] as const;
+const SQLITE_RETRY_SLEEP = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 const COMPLETED_RETENTION_LIMIT = 2_000;
 const COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const OPERATION_STATUSES = new Set(["pending", "running", "succeeded", "failed", "cancelled"]);
@@ -157,24 +160,41 @@ function validateThumbnailSummary(summary: ThumbnailCacheSummary): void {
   }
 }
 
-function openDatabase(databasePath: string): DatabaseSync {
-  assertString(databasePath, "databasePath");
-  const database = new DatabaseSync(databasePath);
-  database.exec("PRAGMA busy_timeout = 5000;");
-  database.exec("PRAGMA journal_mode = WAL;");
-  database.exec("PRAGMA synchronous = NORMAL;");
-
+function readSchemaVersion(database: DatabaseSync): number {
   const versionRow = database.prepare("PRAGMA user_version").get() as
     | { user_version?: unknown }
     | undefined;
   const version = Number(versionRow?.user_version ?? 0);
   if (!Number.isSafeInteger(version) || version < 0 || version > SCHEMA_VERSION) {
-    database.close();
     throw new Error(`Unsupported notification database schema version: ${version}`);
   }
-  if (version === 0) {
-    database.exec("BEGIN IMMEDIATE;");
+  return version;
+}
+
+function withImmediateTransaction(database: DatabaseSync, operation: () => void): void {
+  database.exec("BEGIN IMMEDIATE;");
+  try {
+    operation();
+    database.exec("COMMIT;");
+  } catch (error) {
     try {
+      database.exec("ROLLBACK;");
+    } catch {
+      // Preserve the operation error; the outer initializer owns retry/close.
+    }
+    throw error;
+  }
+}
+
+function initializeSchema(database: DatabaseSync): void {
+  const observedVersion = readSchemaVersion(database);
+  if (observedVersion === SCHEMA_VERSION) return;
+
+  withImmediateTransaction(database, () => {
+    // Another worker may have completed initialization while this worker
+    // waited for the write lock, so schema decisions must use the locked view.
+    const lockedVersion = readSchemaVersion(database);
+    if (lockedVersion === 0) {
       database.exec(`
         CREATE TABLE IF NOT EXISTS operations (
           library_id TEXT NOT NULL,
@@ -222,21 +242,9 @@ function openDatabase(databasePath: string): DatabaseSync {
           batch_id TEXT PRIMARY KEY,
           applied_at INTEGER NOT NULL
         );
-        PRAGMA user_version = ${SCHEMA_VERSION};
       `);
-      database.exec("COMMIT;");
-    } catch (error) {
-      database.exec("ROLLBACK;");
-      database.close();
-      throw error;
     }
-  }
-  if (version > 0 && version < SCHEMA_VERSION) {
-    database.exec("BEGIN IMMEDIATE;");
-    try {
-      const lockedVersion = Number(
-        (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version
-      );
+    if (lockedVersion > 0 && lockedVersion < SCHEMA_VERSION) {
       if (lockedVersion === 1) {
         database.exec("DROP INDEX IF EXISTS idx_operations_history;");
         database.exec(HISTORY_INDEX_SQL);
@@ -273,16 +281,61 @@ function openDatabase(databasePath: string): DatabaseSync {
           );
         `);
       }
-      database.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
-      database.exec("COMMIT;");
+    }
+
+    database.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+  });
+}
+
+function isSqliteBusyOrLocked(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const sqliteError = error as { code?: unknown; errcode?: unknown; message?: unknown };
+  if (sqliteError.code === "SQLITE_BUSY" || sqliteError.code === "SQLITE_LOCKED") return true;
+  if (sqliteError.errcode === 5 || sqliteError.errcode === 6) return true;
+  return (
+    typeof sqliteError.message === "string" &&
+    /\b(?:database(?: table| schema)? is locked|database is busy)\b/i.test(sqliteError.message)
+  );
+}
+
+function initializeWithBusyRetry(database: DatabaseSync): void {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const journalMode = database.prepare("PRAGMA journal_mode = WAL").get() as
+        | { journal_mode?: unknown }
+        | undefined;
+      if (String(journalMode?.journal_mode ?? "").toLowerCase() !== "wal") {
+        throw new Error("Notification database failed to enter WAL journal mode");
+      }
+      database.exec("PRAGMA synchronous = NORMAL;");
+      initializeSchema(database);
+      database.exec("PRAGMA foreign_keys = ON;");
+      const verifiedMode = database.prepare("PRAGMA journal_mode").get() as
+        | { journal_mode?: unknown }
+        | undefined;
+      if (String(verifiedMode?.journal_mode ?? "").toLowerCase() !== "wal") {
+        throw new Error("Notification database journal mode is not WAL after initialization");
+      }
+      return;
     } catch (error) {
-      database.exec("ROLLBACK;");
-      database.close();
-      throw error;
+      const delayMs = SQLITE_INITIALIZATION_RETRY_DELAYS_MS[attempt];
+      if (!isSqliteBusyOrLocked(error) || delayMs === undefined) throw error;
+      Atomics.wait(SQLITE_RETRY_SLEEP, 0, 0, delayMs);
     }
   }
-  database.exec("PRAGMA foreign_keys = ON;");
-  return database;
+}
+
+function openDatabase(databasePath: string): DatabaseSync {
+  assertString(databasePath, "databasePath");
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
+    initializeWithBusyRetry(database);
+    return database;
+  } catch (error) {
+    database.close();
+    throw error;
+  }
 }
 
 class NotificationStoreDatabase {
