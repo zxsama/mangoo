@@ -17,6 +17,7 @@ import type {
   NotificationLibraryIdentity,
   NotificationLocalRecoveryBatch,
   NotificationOperationInput,
+  NotificationRendererErrorRecordResult,
   NotificationRetentionResult,
   NotificationStoreEvent,
   NotificationStoredSnapshot,
@@ -90,7 +91,7 @@ export interface NotificationServiceStore {
     report: RendererErrorReport,
     reportId: string,
     occurredAt: number
-  ): Promise<DesktopNotificationOperation>;
+  ): Promise<NotificationRendererErrorRecordResult>;
   hasLegacyImport(libraryId: string): Promise<boolean>;
   importLegacyOperations(
     library: NotificationLibraryIdentity,
@@ -503,13 +504,13 @@ export class NotificationService {
     const library = { id: report.libraryId, name: report.libraryName };
     if (this.store) {
       const store = this.store;
-      let committed: DesktopNotificationOperation | null = null;
+      let result: NotificationRendererErrorRecordResult | null = null;
       try {
-        committed = await store.recordRendererError(library, report, reportId, occurredAt);
+        result = await store.recordRendererError(library, report, reportId, occurredAt);
       } catch (error) {
         await this.markStoreUnavailable(error);
       }
-      if (committed) {
+      if (result) {
         if (this.store === store) {
           try {
             await this.cleanupRetentionIfDue(store);
@@ -518,8 +519,10 @@ export class NotificationService {
           }
         }
         if (this.store === store && (await this.refreshStoredSnapshot())) return;
-        this.upsertFallbackOperation(committed);
-        this.emitSnapshot();
+        if (result.operation) {
+          this.upsertFallbackOperation(result.operation);
+          this.emitSnapshot();
+        }
         return;
       }
     }

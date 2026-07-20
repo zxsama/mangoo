@@ -116,6 +116,10 @@ export interface RendererErrorReport {
   detail: string | null;
 }
 
+export type NotificationRendererErrorRecordResult =
+  | { outcome: "applied"; operation: DesktopNotificationOperation }
+  | { outcome: "duplicate"; operation: DesktopNotificationOperation | null };
+
 export interface NotificationActionResult {
   ok: boolean;
   message: string | null;

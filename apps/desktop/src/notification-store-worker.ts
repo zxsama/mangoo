@@ -8,6 +8,7 @@ import type {
   NotificationLocalRecoveryBatch,
   NotificationLibraryIdentity,
   NotificationOperationInput,
+  NotificationRendererErrorRecordResult,
   NotificationRetentionResult,
   NotificationStoreRequest,
   NotificationStoreSerializedError,
@@ -645,7 +646,7 @@ class NotificationStoreDatabase {
     report: RendererErrorReport,
     reportIds: string[],
     occurredAt: number
-  ): DesktopNotificationOperation {
+  ): NotificationRendererErrorRecordResult {
     validateLibrary(library);
     assertObject(report, "renderer error report");
     for (const [name, value] of [
@@ -683,11 +684,8 @@ class NotificationStoreDatabase {
       }
       const existing = this.getOperation(library.id, operationId);
       if (newReportCount === 0) {
-        if (!existing) {
-          throw new Error("renderer report marker exists without its operation");
-        }
         this.database.exec("RELEASE record_renderer_error;");
-        return existing;
+        return { outcome: "duplicate", operation: existing };
       }
       const revision = (existing?.revision ?? 0) + 1;
       const occurrenceCount = (existing?.occurrenceCount ?? 0) + newReportCount;
@@ -723,7 +721,10 @@ class NotificationStoreDatabase {
       };
       this.upsertOperationRows(library, [operation]);
       this.database.exec("RELEASE record_renderer_error;");
-      return { ...operation, libraryId: library.id, libraryName: library.name };
+      return {
+        outcome: "applied",
+        operation: { ...operation, libraryId: library.id, libraryName: library.name }
+      };
     } catch (error) {
       this.database.exec("ROLLBACK TO record_renderer_error; RELEASE record_renderer_error;");
       throw error;

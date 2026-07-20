@@ -24,6 +24,7 @@ import type {
   NotificationLibraryIdentity,
   NotificationLocalRecoveryBatch,
   NotificationOperationInput,
+  NotificationRendererErrorRecordResult,
   NotificationStoreEvent,
   NotificationStoredSnapshot,
   RendererErrorReport,
@@ -285,13 +286,12 @@ class FakeStore implements NotificationServiceStore {
     report: RendererErrorReport,
     reportId: string,
     occurredAt: number
-  ): Promise<DesktopNotificationOperation> {
+  ): Promise<NotificationRendererErrorRecordResult> {
     const operationId = `renderer-error:${library.id}:${report.source}:${report.code}:${report.target}`;
     const key = `${library.id}/${operationId}`;
     const existing = this.operations.get(key);
     if (this.rendererReportIds.has(reportId)) {
-      if (!existing) throw new Error("renderer report marker exists without its operation");
-      return existing;
+      return { outcome: "duplicate", operation: existing ?? null };
     }
     this.rendererReportIds.add(reportId);
     const value = operation(operationId, (existing?.revision ?? 0) + 1, "failed", {
@@ -313,7 +313,7 @@ class FakeStore implements NotificationServiceStore {
     });
     const desktop = { ...value, libraryId: library.id, libraryName: library.name };
     this.operations.set(key, desktop);
-    return desktop;
+    return { outcome: "applied", operation: desktop };
   }
 
   async hasLegacyImport(libraryId: string): Promise<boolean> {
@@ -1223,6 +1223,31 @@ describe("notification service", () => {
     assert.equal((await service.compactSnapshot()).thumbnailSummaries.length, 1);
     assert.ok(reports.length >= 3);
     unsubscribe();
+    await service.close();
+  });
+
+  it("keeps the store healthy when a retained renderer marker has no operation", async () => {
+    const store = new FakeStore();
+    store.rendererReportIds.add("retained-report");
+    const service = await createNotificationService({
+      store,
+      createReportId: () => "retained-report",
+      now: () => NOW
+    });
+
+    await service.reportRendererError({
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "renderer",
+      code: "retained-marker",
+      target: "folder:retained",
+      title: "Retained renderer marker",
+      message: "Its operation has already been evicted",
+      detail: null
+    });
+
+    assert.equal((await service.compactSnapshot()).syncHealth.state, "healthy");
+    assert.equal((await service.history({ limit: 20, offset: 0 })).total, 0);
     await service.close();
   });
 

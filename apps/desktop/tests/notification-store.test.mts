@@ -398,8 +398,9 @@ describe("notification store", () => {
         "aggregate-2",
         NOW + 1
       );
-      assert.equal(aggregated.revision, 2);
-      assert.equal(aggregated.occurrenceCount, 2);
+      assert.equal(aggregated.outcome, "applied");
+      assert.equal(aggregated.operation?.revision, 2);
+      assert.equal(aggregated.operation?.occurrenceCount, 2);
       assert.equal(
         (
           await store.getOperation(
@@ -435,7 +436,8 @@ describe("notification store", () => {
         "report-b",
         NOW + 1
       );
-      assert.equal(distinct.occurrenceCount, 2);
+      assert.equal(distinct.outcome, "applied");
+      assert.equal(distinct.operation?.occurrenceCount, 2);
     } finally {
       await store.close();
     }
@@ -448,7 +450,113 @@ describe("notification store", () => {
         "report-a",
         NOW + 2
       );
-      assert.equal(replayed.occurrenceCount, 2, "the same report id must survive restart");
+      assert.equal(replayed.outcome, "duplicate");
+      assert.equal(
+        replayed.operation?.occurrenceCount,
+        2,
+        "the same report id must survive restart"
+      );
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("keeps renderer report ids idempotent after their operation is evicted", async () => {
+    const databasePath = testDatabasePath();
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "renderer",
+      code: "overflow-evicted",
+      target: "folder:overflow",
+      title: "Overflow evicted report",
+      message: "The operation may age out before its report marker",
+      detail: null
+    };
+    const operationId =
+      `renderer-error:${LIBRARY_A.id}:${report.source}:${report.code}:${report.target}`;
+    let store = await createTestStore(databasePath);
+    try {
+      await store.recordRendererError(
+        LIBRARY_A,
+        report,
+        "overflow-report",
+        NOW - 10_000
+      );
+
+      const newerEvents: NotificationStoreEvent[] = [];
+      for (let index = 0; index < 2_000; index += 1) {
+        const timestamp = NOW - (2_000 - index);
+        newerEvents.push(
+          event(
+            index + 1,
+            operation(`newer:${index}`, 1, "succeeded", {
+              updatedAt: timestamp,
+              completedAt: timestamp
+            })
+          )
+        );
+      }
+      await store.applyOutboxBatch(LIBRARY_A, newerEvents, newerEvents.length);
+      assert.equal((await store.cleanupRetention(NOW)).deletedOverflow, 1);
+      assert.equal(await store.getOperation(LIBRARY_A.id, operationId), null);
+    } finally {
+      await store.close();
+    }
+
+    store = await createTestStore(databasePath);
+    try {
+      const duplicate = await store.recordRendererError(
+        LIBRARY_A,
+        report,
+        "overflow-report",
+        NOW + 1
+      );
+      assert.deepEqual(duplicate, { outcome: "duplicate", operation: null });
+      assert.equal(await store.getOperation(LIBRARY_A.id, operationId), null);
+
+      const distinct = await store.recordRendererError(
+        LIBRARY_A,
+        report,
+        "overflow-report-distinct",
+        NOW + 2
+      );
+      assert.equal(distinct.outcome, "applied");
+      assert.equal(distinct.operation?.occurrenceCount, 1);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("accepts a renderer report id again after its marker retention expires", async () => {
+    const store = await createTestStore();
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "renderer",
+      code: "expired-marker",
+      target: "folder:expired",
+      title: "Expired marker report",
+      message: "The report id can be reused after the retention window",
+      detail: null
+    };
+    try {
+      await store.recordRendererError(
+        LIBRARY_A,
+        report,
+        "expired-report",
+        NOW - 31 * DAY_MS
+      );
+      await store.cleanupRetention(NOW);
+
+      const replayed = await store.recordRendererError(
+        LIBRARY_A,
+        report,
+        "expired-report",
+        NOW + 1
+      );
+      assert.equal(replayed.outcome, "applied");
+      assert.equal(replayed.operation?.occurrenceCount, 1);
     } finally {
       await store.close();
     }

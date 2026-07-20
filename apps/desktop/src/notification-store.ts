@@ -9,6 +9,7 @@ import type {
   NotificationLocalRecoveryBatch,
   NotificationLibraryIdentity,
   NotificationOperationInput,
+  NotificationRendererErrorRecordResult,
   NotificationRetentionResult,
   NotificationStoreEvent,
   NotificationStoreRequest,
@@ -221,8 +222,8 @@ export class NotificationStore {
     report: RendererErrorReport,
     reportId: string,
     occurredAt: number
-  ): Promise<DesktopNotificationOperation> {
-    return this.request<DesktopNotificationOperation>({
+  ): Promise<NotificationRendererErrorRecordResult> {
+    return this.request<NotificationRendererErrorRecordResult>({
       requestId: this.nextRequestId(),
       method: "recordRendererError",
       params: { library, report, reportId, occurredAt }
