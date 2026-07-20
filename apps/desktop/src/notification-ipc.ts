@@ -272,6 +272,115 @@ export class LatestValueBroadcastQueue<T> {
   }
 }
 
+export interface NotificationIpcBroadcastTarget {
+  readonly id: number;
+  isDestroyed(): boolean;
+  send(channel: string, payload: unknown): void;
+}
+
+export class NotificationIpcBroadcastTargets<T> {
+  private readonly targets = new Map<number, NotificationIpcBroadcastTarget>();
+  private readonly channel: string;
+
+  constructor(channel: string) {
+    this.channel = channel;
+  }
+
+  get size(): number {
+    return this.targets.size;
+  }
+
+  register(target: NotificationIpcBroadcastTarget): void {
+    if (target.isDestroyed()) {
+      this.targets.delete(target.id);
+      return;
+    }
+    this.targets.set(target.id, target);
+  }
+
+  clearTarget(targetId: number): boolean {
+    return this.targets.delete(targetId);
+  }
+
+  clear(): void {
+    this.targets.clear();
+  }
+
+  broadcast(payload: T): void {
+    for (const [targetId, target] of this.targets) {
+      if (target.isDestroyed()) {
+        this.targets.delete(targetId);
+        continue;
+      }
+      try {
+        target.send(this.channel, payload);
+      } catch {
+        this.targets.delete(targetId);
+      }
+    }
+  }
+}
+
+type NavigationListener = (
+  event: unknown,
+  navigationUrl: string,
+  isInPlace: boolean,
+  isMainFrame: boolean,
+  frameProcessId?: number,
+  frameRoutingId?: number
+) => void;
+
+export interface NotificationIpcNavigableTarget {
+  readonly id: number;
+  on(event: "did-start-navigation", listener: NavigationListener): unknown;
+  removeListener(event: "did-start-navigation", listener: NavigationListener): unknown;
+}
+
+export class NotificationIpcTargetLifecycle {
+  private readonly tracked = new Map<
+    number,
+    { target: NotificationIpcNavigableTarget; listener: NavigationListener }
+  >();
+  private readonly clearTargetCallback: (targetId: number) => void;
+
+  constructor(clearTarget: (targetId: number) => void) {
+    this.clearTargetCallback = clearTarget;
+  }
+
+  track(target: NotificationIpcNavigableTarget): () => void {
+    const existing = this.tracked.get(target.id);
+    if (existing?.target !== target) {
+      this.release(target.id);
+      const listener: NavigationListener = (
+        _event,
+        _navigationUrl,
+        _isInPlace,
+        isMainFrame
+      ) => {
+        if (isMainFrame === true) this.clearTargetCallback(target.id);
+      };
+      target.on("did-start-navigation", listener);
+      this.tracked.set(target.id, { target, listener });
+    }
+    return () => {
+      if (this.tracked.get(target.id)?.target === target) this.release(target.id);
+    };
+  }
+
+  release(targetId: number): boolean {
+    const current = this.tracked.get(targetId);
+    if (!current) return false;
+    this.tracked.delete(targetId);
+    current.target.removeListener("did-start-navigation", current.listener);
+    this.clearTargetCallback(targetId);
+    return true;
+  }
+
+  clear(): void {
+    for (const targetId of [...this.tracked.keys()]) this.release(targetId);
+  }
+}
+
 interface ProcessLogSubscriptionBuffer {
   snapshotAndSubscribe(
     subscriber: (batch: ProcessLogBatch) => void,

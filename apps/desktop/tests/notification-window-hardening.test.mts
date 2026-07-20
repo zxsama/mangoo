@@ -49,6 +49,112 @@ class LogTarget extends EventEmitter {
   }
 }
 
+function createNavigationTargetHarness(ids = ["subscription-old", "subscription-new"]) {
+  assert.ok(ipcModule);
+  assert.equal(typeof ipcModule.NotificationIpcBroadcastTargets, "function");
+  assert.equal(typeof ipcModule.NotificationIpcTargetLifecycle, "function");
+  const subscribers: Array<(batch: unknown) => void> = [];
+  let underlyingUnsubscribes = 0;
+  const logs = new ipcModule.ProcessLogIpcSubscriptions(
+    {
+      snapshotAndSubscribe(subscriber: (batch: unknown) => void) {
+        subscribers.push(subscriber);
+        return {
+          snapshot: [],
+          afterSequence: 0,
+          unsubscribe: () => {
+            underlyingUnsubscribes += 1;
+          }
+        };
+      }
+    },
+    channels.logsChanged,
+    () => ids.shift()
+  );
+  const broadcasts = new ipcModule.NotificationIpcBroadcastTargets(channels.changed);
+  const lifecycle = new ipcModule.NotificationIpcTargetLifecycle((targetId: number) => {
+    logs.clearTarget(targetId);
+    broadcasts.clearTarget(targetId);
+  });
+  const target = new LogTarget();
+  lifecycle.track(target);
+  return {
+    broadcasts,
+    lifecycle,
+    logs,
+    subscribers,
+    target,
+    get underlyingUnsubscribes() {
+      return underlyingUnsubscribes;
+    }
+  };
+}
+
+test("main-frame navigation clears notification and log targets before later delivery", () => {
+  const harness = createNavigationTargetHarness();
+  harness.broadcasts.register(harness.target);
+  harness.logs.snapshotAndSubscribe(harness.target, {});
+
+  harness.target.emit("did-start-navigation", {}, "http://localhost/#/notifications", false, true);
+
+  assert.equal(harness.logs.size, 0);
+  assert.equal(harness.broadcasts.size, 0);
+  assert.equal(harness.underlyingUnsubscribes, 1);
+  harness.subscribers[0]?.({ lines: [], afterSequence: 1, droppedBeforeSequence: null });
+  harness.broadcasts.broadcast({ marker: "stale" });
+  assert.deepEqual(harness.target.sent, [], "old renderer targets must receive no post-navigation IPC");
+  harness.lifecycle.release(harness.target.id);
+});
+
+test("subframe navigation preserves notification and log targets", () => {
+  const harness = createNavigationTargetHarness();
+  harness.broadcasts.register(harness.target);
+  harness.logs.snapshotAndSubscribe(harness.target, {});
+
+  harness.target.emit("did-start-navigation", {}, "http://localhost/embedded", false, false);
+
+  assert.equal(harness.logs.size, 1);
+  assert.equal(harness.broadcasts.size, 1);
+  assert.equal(harness.underlyingUnsubscribes, 0);
+  harness.subscribers[0]?.({ lines: [], afterSequence: 2, droppedBeforeSequence: null });
+  harness.broadcasts.broadcast({ marker: "live" });
+  assert.deepEqual(
+    harness.target.sent.map(([channel]) => channel),
+    [channels.logsChanged, channels.changed]
+  );
+  harness.lifecycle.release(harness.target.id);
+  assert.equal(harness.target.listenerCount("did-start-navigation"), 0);
+});
+
+test("reloaded pages can resubscribe without stale cleanup cancelling the new token", () => {
+  const harness = createNavigationTargetHarness();
+  harness.lifecycle.track(harness.target);
+  assert.equal(harness.target.listenerCount("did-start-navigation"), 1);
+  harness.broadcasts.register(harness.target);
+  const first = harness.logs.snapshotAndSubscribe(harness.target, {});
+  harness.target.emit("did-start-navigation", {}, "http://localhost/#/notifications", false, true);
+
+  harness.broadcasts.register(harness.target);
+  const second = harness.logs.snapshotAndSubscribe(harness.target, {});
+  assert.equal(harness.logs.unsubscribe(harness.target.id, first.subscriptionId), false);
+  harness.subscribers[0]?.({ lines: [], afterSequence: 3, droppedBeforeSequence: null });
+  harness.subscribers[1]?.({ lines: [], afterSequence: 4, droppedBeforeSequence: null });
+
+  assert.equal(harness.logs.size, 1);
+  assert.equal(harness.broadcasts.size, 1);
+  assert.deepEqual(harness.target.sent, [
+    [
+      channels.logsChanged,
+      {
+        subscriptionId: second.subscriptionId,
+        batch: { lines: [], afterSequence: 4, droppedBeforeSequence: null }
+      }
+    ]
+  ]);
+  harness.lifecycle.release(harness.target.id);
+  assert.equal(harness.target.listenerCount("did-start-navigation"), 0);
+});
+
 test("log subscription tokens prevent stale cleanup from cancelling a replacement", () => {
   assert.ok(ipcModule);
   const subscribers: Array<(batch: unknown) => void> = [];
@@ -378,7 +484,13 @@ test("hardening source contract uses shared DTOs, sender authorization, and fail
   assert.match(main, /const session = await ensureCoreReady\(\);[\s\S]*focusExistingSecondaryWindow\(role\)/);
   assert.match(main, /render-process-gone[\s\S]*destroyFailedSecondaryWindow/);
   assert.match(main, /did-fail-load[\s\S]*destroyFailedSecondaryWindow/);
-  assert.match(main, /processLogSubscriptions\.clearTarget/);
+  assert.match(
+    main,
+    /ipcMain\.handle\(NOTIFICATION_IPC_CHANNELS\.compact, async \(event\) => \{\s*requireNotificationIpcAccess\([^;]+;\s*notificationBroadcastTargets\.register\(event\.sender\);\s*const service = await ensureNotificationService\(\)/
+  );
+  assert.match(main, /notificationIpcTargetLifecycle\.track\(window\.webContents\)/);
+  assert.match(main, /releaseIpcTargetLifecycle\(\)/);
+  assert.match(read("apps/desktop/src/notification-ipc.ts"), /did-start-navigation/);
   assert.match(preload, /windowRole === "notifications"/);
   assert.doesNotMatch(preload, /onLogs:/);
 });

@@ -40,6 +40,8 @@ import { sessionForDbPath } from "./core-session.js";
 import {
   LatestValueBroadcastQueue,
   NOTIFICATION_IPC_CHANNELS,
+  NotificationIpcBroadcastTargets,
+  NotificationIpcTargetLifecycle,
   ProcessLogIpcSubscriptions,
   assertNotificationIpcAccess,
   parseNotificationAction,
@@ -144,12 +146,19 @@ let shutdownPromise: Promise<void> | null = null;
 const coreLifecycleQueue = new CoreLifecycleQueue();
 let notificationRuntime: NotificationRuntime<NotificationService> | null = null;
 let notificationChangeSubscription: (() => void) | null = null;
-const notificationBroadcastQueue = new LatestValueBroadcastQueue<NotificationCompactSnapshot>(
-  broadcastNotificationSnapshot
-);
 const processLogSubscriptions = new ProcessLogIpcSubscriptions(
   processLogBuffer,
   NOTIFICATION_IPC_CHANNELS.logsChanged
+);
+const notificationBroadcastTargets = new NotificationIpcBroadcastTargets<NotificationCompactSnapshot>(
+  NOTIFICATION_IPC_CHANNELS.changed
+);
+const notificationIpcTargetLifecycle = new NotificationIpcTargetLifecycle((targetId) => {
+  processLogSubscriptions.clearTarget(targetId);
+  notificationBroadcastTargets.clearTarget(targetId);
+});
+const notificationBroadcastQueue = new LatestValueBroadcastQueue<NotificationCompactSnapshot>(
+  broadcastNotificationSnapshot
 );
 let persistDebounceTimer: NodeJS.Timeout | null = null;
 let mainWindowReadyToShow: Promise<void> | null = null;
@@ -255,12 +264,7 @@ function requireNotificationIpcAccess(
 }
 
 function broadcastNotificationSnapshot(snapshot: NotificationCompactSnapshot): void {
-  const targets = [mainWindow, secondaryWindows.notifications];
-  for (const window of targets) {
-    if (window && !window.isDestroyed()) {
-      window.webContents.send(NOTIFICATION_IPC_CHANNELS.changed, snapshot);
-    }
-  }
+  notificationBroadcastTargets.broadcast(snapshot);
 }
 
 function ensureNotificationRuntime(): NotificationRuntime<NotificationService> {
@@ -332,6 +336,8 @@ async function closeNotificationRuntime(): Promise<void> {
   notificationChangeSubscription?.();
   notificationChangeSubscription = null;
   notificationBroadcastQueue.close();
+  notificationIpcTargetLifecycle.clear();
+  notificationBroadcastTargets.clear();
   processLogSubscriptions.clear();
   await runtime?.close();
 }
@@ -614,7 +620,9 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.closeWindow, (event) => {
 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.compact, async (event) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.compact);
-  return (await ensureNotificationService()).compactSnapshot();
+  notificationBroadcastTargets.register(event.sender);
+  const service = await ensureNotificationService();
+  return service.compactSnapshot();
 });
 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.history, async (event, input: unknown) => {
@@ -939,6 +947,7 @@ async function createWindow(): Promise<void> {
     }
   });
   const window = mainWindow;
+  const releaseIpcTargetLifecycle = notificationIpcTargetLifecycle.track(window.webContents);
   applyWindowMaterial(window);
   shellReadyVisibleWindowId = null;
   shellReadyRevealPromise = null;
@@ -987,6 +996,7 @@ async function createWindow(): Promise<void> {
   window.on("close", closeAllSecondaryWindows);
 
   window.on("closed", () => {
+    releaseIpcTargetLifecycle();
     if (activeWindowDrag?.windowId === window.id) {
       activeWindowDrag = null;
     }
@@ -1074,7 +1084,7 @@ async function createSecondaryWindow(
       ]
     }
   });
-  const webContentsId = window.webContents.id;
+  const releaseIpcTargetLifecycle = notificationIpcTargetLifecycle.track(window.webContents);
   secondaryWindows[role] = window;
   secondaryWindowReadiness[role] = {
     windowId: window.id,
@@ -1097,7 +1107,12 @@ async function createSecondaryWindow(
     (_event, errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
       if (!isMainFrame) return;
       desktopLogger.error("renderer", `${role} renderer failed to load`, { errorCode });
-      destroyFailedSecondaryWindow(role, window, webContentsId, openingToken);
+      destroyFailedSecondaryWindow(
+        role,
+        window,
+        openingToken,
+        releaseIpcTargetLifecycle
+      );
     }
   );
   window.webContents.on("render-process-gone", (_event, details) => {
@@ -1105,7 +1120,12 @@ async function createSecondaryWindow(
       reason: details.reason,
       exitCode: details.exitCode
     });
-    destroyFailedSecondaryWindow(role, window, webContentsId, openingToken);
+    destroyFailedSecondaryWindow(
+      role,
+      window,
+      openingToken,
+      releaseIpcTargetLifecycle
+    );
   });
   window.on("blur", () => {
     if (activeWindowDrag?.windowId === window.id) {
@@ -1117,7 +1137,12 @@ async function createSecondaryWindow(
     schedulePersistWindowState();
   });
   window.on("closed", () => {
-    clearSecondaryWindowState(role, window, webContentsId, openingToken);
+    clearSecondaryWindowState(
+      role,
+      window,
+      openingToken,
+      releaseIpcTargetLifecycle
+    );
   });
 
   const devServer = process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173";
@@ -1125,7 +1150,12 @@ async function createSecondaryWindow(
     await window.loadURL(`${devServer}${config.route}`);
   } catch (error) {
     desktopLogger.warn("main", `[megle] ${role} window loadURL rejected:`, error);
-    destroyFailedSecondaryWindow(role, window, webContentsId, openingToken);
+    destroyFailedSecondaryWindow(
+      role,
+      window,
+      openingToken,
+      releaseIpcTargetLifecycle
+    );
     throw error;
   }
 }
@@ -1133,11 +1163,11 @@ async function createSecondaryWindow(
 function clearSecondaryWindowState(
   role: SecondaryWindowRole,
   window: BrowserWindow,
-  webContentsId: number,
-  openingToken: symbol
+  openingToken: symbol,
+  releaseIpcTargetLifecycle: () => void
 ): void {
   secondaryWindowOpenings.clear(role, openingToken);
-  processLogSubscriptions.clearTarget(webContentsId);
+  releaseIpcTargetLifecycle();
   if (activeWindowDrag?.windowId === window.id) activeWindowDrag = null;
   if (secondaryWindows[role] === window) secondaryWindows[role] = null;
   clearSecondaryWindowReadyFallback(role, window.id);
@@ -1151,10 +1181,15 @@ function clearSecondaryWindowState(
 function destroyFailedSecondaryWindow(
   role: SecondaryWindowRole,
   window: BrowserWindow,
-  webContentsId: number,
-  openingToken: symbol
+  openingToken: symbol,
+  releaseIpcTargetLifecycle: () => void
 ): void {
-  clearSecondaryWindowState(role, window, webContentsId, openingToken);
+  clearSecondaryWindowState(
+    role,
+    window,
+    openingToken,
+    releaseIpcTargetLifecycle
+  );
   if (!window.isDestroyed()) window.destroy();
 }
 
