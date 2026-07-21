@@ -44,6 +44,17 @@ for (const retiredValue of ["listFileOperations", "loadRecentOps", "recentOps", 
     fail(`useLibraryData must not retain legacy Recent runtime value ${retiredValue}`);
   }
 }
+const retiredPresentationPaths = [
+  `apps/web/src/features/tasks/${["Task", "Panel"].join("")}.tsx`,
+  `apps/web/src/features/tasks/${["Task", "Center"].join("")}.tsx`,
+  `apps/web/src/features/tasks/${["Task", "Overlay"].join("")}.tsx`,
+  `apps/web/src/features/file-ops/${["Recent", "Ops", "Panel"].join("")}.tsx`
+];
+for (const retiredPath of retiredPresentationPaths) {
+  if (existsSync(path.join(root, retiredPath))) {
+    fail(`legacy Tasks/Recent presentation must stay retired: ${retiredPath}`);
+  }
+}
 const refreshCurrentScanViewBlock = sourceMatch(
   useLibraryData,
   /const\s+refreshCurrentScanView\s*=\s*useCallback\([\s\S]*?\n\s*\]\);\n\n\s*const\s+loadLibrary/
@@ -124,7 +135,6 @@ const librarySidebar = read("apps/web/src/features/library/LibrarySidebar.tsx");
 const folderTreeState = read("apps/web/src/core/folderTreeState.ts");
 const subfolderStrip = read("apps/web/src/features/library/SubfolderStrip.tsx");
 const settingsView = read("apps/web/src/features/settings/settingsPanels.tsx");
-const recentOpsPanel = read("apps/web/src/features/file-ops/RecentOpsPanel.tsx");
 const pluginsView = read("apps/web/src/features/plugins/PluginsView.tsx");
 const previewPanelPath = "apps/web/src/features/preview/PreviewPanel.tsx";
 const previewPanel = existsSync(path.join(root, previewPanelPath))
@@ -906,7 +916,7 @@ if (/animation:\s*shimmer/.test(read("apps/web/src/styles.css"))) {
 if (
   /Loading children|loading"\s*:|>\s*loading\s*</.test(librarySidebar) ||
   /正在加载子文件夹/.test(subfolderStrip) ||
-  /Loading…|Loading plugins/.test(recentOpsPanel + pluginsView)
+  /Loading plugins/.test(pluginsView)
 ) {
   fail("Global refresh surfaces must not replace existing chrome with Loading text");
 }
@@ -1869,13 +1879,26 @@ for (const value of [
     fail(`unified notification titlebar control missing ${value}`);
   }
 }
+const retiredTaskSurfaceName = ["tasks", "palette"].join("-");
+const retiredRecentSurfaceName = ["recent", "operations"].join("-");
 for (const retiredValue of [
-  'data-titlebar-control="tasks-palette"',
-  'data-titlebar-control="recent-operations"',
+  `data-titlebar-control="${retiredTaskSurfaceName}"`,
+  `data-titlebar-control="${retiredRecentSurfaceName}"`,
   "top-action-label"
 ]) {
   if (shellRightActionsBlock.includes(retiredValue)) {
     fail(`ShellRightActions must retire ${retiredValue}`);
+  }
+}
+const shellPresentationSource = [app, shellTitlebar, shellOverlayHost].join("\n");
+for (const [label, pattern] of [
+  ["Tasks titlebar control", new RegExp(`data-titlebar-control=["'](?:tasks|${retiredTaskSurfaceName})["']`)],
+  ["Recent titlebar control", new RegExp(`data-titlebar-control=["'](?:recent|${retiredRecentSurfaceName})["']`)],
+  ["Tasks compact popover", /data-compact-popover-(?:trigger|root)=["']tasks["']/],
+  ["Recent compact popover", /data-compact-popover-(?:trigger|root)=["']recent["']/]
+]) {
+  if (pattern.test(shellPresentationSource)) {
+    fail(`${label} must not be reintroduced beside the unified notification center`);
   }
 }
 if ((shellRightActionsBlock.match(/data-titlebar-control="notifications"/g) ?? []).length !== 1) {
@@ -1918,7 +1941,13 @@ if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopover)) {
 if (!app.includes('type CompactPopover = "notifications" | "filter" | "sort" | null')) {
   fail("App must coordinate notifications with the shared compact-popover state");
 }
-for (const retiredState of ["taskCenterOpen", '=== "tasks"', '=== "recent"']) {
+for (const retiredState of [
+  ["recent", "OpsOpen"].join(""),
+  ["task", "PaletteOpen"].join(""),
+  ["task", "CenterOpen"].join(""),
+  '=== "tasks"',
+  '=== "recent"'
+]) {
   if (app.includes(retiredState)) {
     fail(`App must retire legacy Tasks/Recent overlay state: ${retiredState}`);
   }

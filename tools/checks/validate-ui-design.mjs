@@ -41,7 +41,6 @@ const secondaryWindowInterfaceStyle = read("apps/web/src/app-shell/useSecondaryW
 const overlayScrollbars = readOptional("apps/web/src/app-shell/useOverlayScrollbars.ts") ?? "";
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const shellOverlayHost = readOptional("apps/web/src/app-shell/ShellOverlayHost.tsx");
-const taskOverlay = readOptional("apps/web/src/features/tasks/TaskOverlay.tsx");
 const webIndex = read("apps/web/index.html");
 const webFaviconSvg = readOptional("apps/web/public/favicon.svg");
 const windowChrome = read("apps/web/src/features/window-chrome/WindowChrome.tsx");
@@ -78,7 +77,6 @@ const shortcutBindings = readOptional("apps/web/src/features/shortcuts/shortcutB
 const useShortcuts = read("apps/web/src/features/shortcuts/useShortcuts.ts");
 const settingsView = read("apps/web/src/features/settings/settingsPanels.tsx");
 const interfaceStyle = read("apps/web/src/features/settings/interfaceStyle.ts");
-const taskPanel = read("apps/web/src/features/tasks/TaskPanel.tsx");
 const contextMenu = read("apps/web/src/features/file-ops/ContextMenu.tsx");
 const desktopBridge = read("apps/web/src/core/desktop.ts");
 const coreClientContract = read("packages/core-client/src/generated-contract.ts");
@@ -92,6 +90,18 @@ const desktopMainAst = ts.createSourceFile(
   true,
   ts.ScriptKind.TS
 );
+
+const retiredPresentationPaths = [
+  `apps/web/src/features/tasks/${["Task", "Panel"].join("")}.tsx`,
+  `apps/web/src/features/tasks/${["Task", "Center"].join("")}.tsx`,
+  `apps/web/src/features/tasks/${["Task", "Overlay"].join("")}.tsx`,
+  `apps/web/src/features/file-ops/${["Recent", "Ops", "Panel"].join("")}.tsx`
+];
+for (const retiredPath of retiredPresentationPaths) {
+  if (existsSync(path.join(root, retiredPath))) {
+    fail(`legacy Tasks/Recent surface must stay retired: ${retiredPath}`);
+  }
+}
 
 for (const value of ["previewPlaceholder", "previewPlaceholderFormat", "servedBy", "db_blob"]) {
   if (!coreClientContract.includes(value)) {
@@ -261,11 +271,9 @@ if (
 for (const selector of [
   ".plugins-detail-pane",
   ".settings-section",
-  ".task-card",
   ".plugin-card",
   ".grid-empty-search",
   ".grid-empty-folder",
-  ".recent-op-row",
   ".move-tree"
 ]) {
   const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
@@ -307,7 +315,7 @@ if (
   fail("desktop workbench surfaces must not paint a top-left to bottom-right decorative layout gradient");
 }
 
-for (const selector of [".plugins-body", ".settings-body", ".task-center", ".onboarding-hero"]) {
+for (const selector of [".plugins-body", ".settings-body", ".onboarding-hero"]) {
   const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
   if (blocks.some((block) => hasNonTransparentBackground(block))) {
     fail(`${selector} must not paint a bottom-layer gray background over native desktop acrylic`);
@@ -328,7 +336,6 @@ for (const value of [
 for (const value of [
   ".shell-titlebar,",
   ".library-sidebar,",
-  ".task-panel,",
   ".toolbar,",
   ".inspector-panel",
   "background: transparent"
@@ -341,7 +348,6 @@ for (const value of [
 for (const selector of [
   ".shell-titlebar",
   ".library-sidebar",
-  ".task-panel",
   ".toolbar",
   ".inspector-panel"
 ]) {
@@ -367,7 +373,6 @@ for (const selector of [
 for (const value of [
   ".context-menu",
   ".dialog-panel",
-  ".recent-ops-drawer",
   "backdrop-filter: blur(var(--glass-elevated-blur)) saturate(1.5)"
 ]) {
   if (!stylesForChecks.includes(value)) {
@@ -613,27 +618,6 @@ for (const [selector, checks, message] of [
     '.megle-overlay-scrollbar[data-scrollbar-dragging="true"] .megle-overlay-scrollbar-thumb',
     [/opacity:\s*1/],
     "custom overlay scrollbar thumb must show at full opacity only while dragged"
-  ]
-]) {
-  const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
-  if (!blocks.some((block) => checks.every((check) => check.test(block)))) {
-    fail(message);
-  }
-}
-
-for (const [selector, checks, message] of [
-  [
-    ".task-drawer-panel",
-    [/top:\s*calc\(var\(--shell-titlebar-height\)\s*\+\s*16px\)/],
-    "task drawer must preserve its 16px gap below the variable main titlebar"
-  ],
-  [
-    ".recent-ops-drawer",
-    [
-      /top:\s*calc\(var\(--shell-titlebar-height\)\s*\+\s*2px\)/,
-      /max-height:\s*calc\(100vh\s*-\s*var\(--shell-titlebar-height\)\s*-\s*22px\)/
-    ],
-    "recent operations drawer must track the variable main titlebar height"
   ]
 ]) {
   const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
@@ -956,23 +940,6 @@ for (const selector of ["html", "body", "#root", ".app-shell"]) {
     backgroundMessage: `${selector} must not paint a full-window non-transparent background`,
     backdropMessage: `${selector} must not apply backdrop-filter over the transparent Electron window`
   });
-}
-
-if (!taskOverlay) {
-  fail("task overlay component must exist for floating task drawer and center surfaces");
-} else {
-  if (!/useEffect\(\(\) => \{\s*if \(!open\) return;[\s\S]*?event\.key !== "Escape"[\s\S]*?onClose\(\)/.test(taskOverlay)) {
-    fail("compact task drawer must share the Escape close listener with center task overlay");
-  }
-  if (/if \(!modalOpen\) return;[\s\S]*?event\.key !== "Escape"/.test(taskOverlay)) {
-    fail("task overlay Escape handling must not be gated to the modal-only center state");
-  }
-  if (!/role=\{mode === "center" \? "dialog" : "complementary"\}/.test(taskOverlay)) {
-    fail("compact task drawer must stay complementary instead of becoming modal");
-  }
-  if (!/aria-modal=\{mode === "center" \? "true" : undefined\}/.test(taskOverlay)) {
-    fail("only task center should expose aria-modal");
-  }
 }
 
 if (!/rel="icon"/.test(webIndex) || !/href="\/favicon\.svg"/.test(webIndex)) {
@@ -1539,9 +1506,22 @@ for (const value of [
     fail(`notification titlebar control missing ${value}`);
   }
 }
-for (const retiredValue of ["tasks-palette", "recent-operations", "top-action-label"]) {
+const retiredTaskSurfaceName = ["tasks", "palette"].join("-");
+const retiredRecentSurfaceName = ["recent", "operations"].join("-");
+for (const retiredValue of [retiredTaskSurfaceName, retiredRecentSurfaceName, "top-action-label"]) {
   if (shellRightActionsBlock.includes(retiredValue)) {
     fail(`notification titlebar replacement must remove ${retiredValue}`);
+  }
+}
+const shellPresentationSource = [app, appShell, shellTitlebar, shellOverlayHost ?? ""].join("\n");
+for (const [label, pattern] of [
+  ["Tasks titlebar surface", new RegExp(`data-titlebar-control=["'](?:tasks|${retiredTaskSurfaceName})["']`)],
+  ["Recent titlebar surface", new RegExp(`data-titlebar-control=["'](?:recent|${retiredRecentSurfaceName})["']`)],
+  ["Tasks compact popover", /data-compact-popover-(?:trigger|root)=["']tasks["']/],
+  ["Recent compact popover", /data-compact-popover-(?:trigger|root)=["']recent["']/]
+]) {
+  if (pattern.test(shellPresentationSource)) {
+    fail(`${label} must not be reintroduced beside the notification center`);
   }
 }
 if ((shellRightActionsBlock.match(/data-titlebar-control="notifications"/g) ?? []).length !== 1) {
@@ -2654,8 +2634,7 @@ for (const value of [
   "animation: none !important",
   "transition: none !important",
   "transform: none !important",
-  ".spin",
-  ".task-progress-bar.indeterminate .task-progress-fill"
+  ".spin"
 ]) {
   if (!stylesForChecks.includes(value)) {
     fail(`reduced motion must prevent shimmer/spin/liquid flicker: missing ${value}`);

@@ -66,6 +66,7 @@ The desktop shell (`apps/desktop/src/main.ts`, `core-process.ts`, `core-session.
 
 - `contracts/core-api/openapi.yaml` is the single source of truth for HTTP endpoints, DTO names, and status codes. UI, Core, and tests all flow from it.
 - `packages/core-client` (`@megle/core-client`) holds a hand-maintained `generated-contract.ts` aligned to the OpenAPI by `scripts/check-contract.mjs`. Treat it as a generator placeholder: edit when the contract changes, never the other way around.
+- `packages/notification-contract` (`@megle/notification-contract`) owns the type-only Desktop/Web preload boundary for notification snapshots, history, actions, subscriptions, and process logs. It reuses generated Core operation types and must remain free of runtime Node dependencies.
 - `contracts/plugins/manifest.schema.json` defines plugin manifest fields and capabilities (`decoder`, `metadata`, `action`, `import-provider`).
 - SQLite schema lives in `crates/core/migrations/NNNN_*.sql` (currently `0001`–`0017`; `0014` is applied in code, not as a file). A new migration must be (1) created as the SQL file, (2) declared in `crates/core/src/db/migrations.rs`, (3) gated in `Database::apply_migrations` (`crates/core/src/db/mod.rs`), and (4) asserted in `tools/checks/validate_sqlite_schema.py` (`MIGRATIONS` plus `REQUIRED_TABLES`/`REQUIRED_INDEXES`).
 - Some structural checks grep Rust source for implementation markers and **specific test names** (e.g. `tools/checks/validate-core-api.mjs` pins viewport-window markers in `db/mod.rs`). Renaming a guarded function/test or deleting a marked code pattern fails the check — update the check alongside the rename.
@@ -80,13 +81,13 @@ When adding an API path, plugin capability, table, or index, update the contract
 
 ### Web UI Layout
 
-`apps/web/src` is split into `app/` (App shell), `core/` (HTTP client, types, query hooks), `design/` (tokens), and `features/` (`library`, `media-grid`, `preview`, `tasks`). The UI talks to Core via `@megle/core-client`; it must not import Node filesystem APIs or call raw `fetch`. Stack: TanStack Query for server state, TanStack Virtual for the grid, Zustand for UI state.
+`apps/web/src` is split into `app/` (App shell), `core/` (HTTP client, types, query hooks), `design/` (tokens), and `features/` (`library`, `media-grid`, `preview`, `notifications`). The UI talks to Core via `@megle/core-client`; it must not import Node filesystem APIs or call raw `fetch`. Stack: TanStack Query for server state, TanStack Virtual for the grid, Zustand for UI state.
 
 `apps/web/src/core/client.ts` and `types.ts` are thin runtime config + re-export wrappers over `@megle/core-client`. UI code consumes hooks (`useLibraryData`) or the wrapped client — it must not declare duplicate Core DTOs, call raw `fetch`, or read `thumbnailCacheKey` directly. Web boundary checks (`check:web`) currently use lightweight source regexes; if they start producing false positives or negatives, escalate to AST parsing rather than weakening the rules.
 
 ### Approved UI Direction
 
-UI must follow `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md`: Eagle-like information architecture, frameless Electron chrome, layered liquid glass design system, dense dark content stage. One design language across all screens, menus, dialogs, inspectors, settings, plugins, and task views. Liquid glass lives on chrome and control layers only — the media grid, preview canvas, and other heavy content surfaces stay dark and stable. Implementation stack: Radix UI primitives + Tailwind CSS + Lucide. Don't grow `apps/web/src/styles.css` into the permanent design system; introduce shared `design-tokens` and `ui` package boundaries instead. First implementation milestone is a reusable app shell covering Library, Settings, Plugins, and Tasks before per-feature polish.
+UI must follow `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md`: Eagle-like information architecture, frameless Electron chrome, layered liquid glass design system, dense dark content stage. One design language across all screens, menus, dialogs, inspectors, settings, plugins, and the notification center. Liquid glass lives on chrome and control layers only — the media grid, preview canvas, and other heavy content surfaces stay dark and stable. Implementation stack: Radix UI primitives + Tailwind CSS + Lucide. Don't grow `apps/web/src/styles.css` into the permanent design system; introduce shared `design-tokens` and `ui` package boundaries instead. The reusable app shell covers Library, Settings, Plugins, and the unified notification surface before per-feature polish.
 
 ### Unified Pointer-Highlight System
 
@@ -215,6 +216,22 @@ The app opens multiple libraries, one at a time. **A library = a single `.sqlite
 - **IPC + bridge:** `megle:list-libraries`/`switch-library`/`create-library`/`open-library`/`remove-library-from-list`/`rename-library`/`pick-library-file`/`pick-new-library-path`, plus a `megle:library-load-phase` push. Renderer wrappers live in `apps/web/src/core/desktop.ts`; types in `apps/web/src/core/libraryTypes.ts` (`LibrarySummary`, `LibraryLoadPhase`). Root add/remove reuse the existing `@megle/core-client` (`addRoot`/`removeRoot`) and act ONLY on the active library.
 - **Load phase / overlay:** `LibraryLoadPhase = "starting-core" | "opening-library" | "loading-media" | "ready" | {kind:"error";message}`. `App.tsx` holds `libraryPhase`, subscribes via `subscribeLibraryPhase`, and renders `LibraryLoadingOverlay` over the center pane until ready. IMPORTANT: cold start pushes NO phase events (only the switch path emits them), so the phase advances to `"ready"` from ANY non-error phase once `library.roots` resolve — don't gate it only on `"loading-media"` or the overlay hangs on cold start.
 - **UI:** sidebar top = current-library name + switch button (opens `LibrarySwitcher`); the switcher popup lists libraries with per-row add/remove-folder (active library only, greyed for inactive) + create/open footer; full management is planned for a Settings section (not yet built). Create/open auto-switch.
+
+### Unified Notification Center
+
+Notifications form one operation-level pipeline across every library rather than separate Tasks and Recent surfaces:
+
+```text
+Core library DB -> notification_operation_heads + notification_outbox
+Desktop userData/notifications.sqlite -> durable all-library mirror
+Preload @megle/notification-contract -> typed snapshots, history, actions, and subscriptions
+Web notifications feature -> compact status, full history/actions, and local process logs
+```
+
+- **Core library DB:** `notification_operation_heads` stores the current operation head and `notification_outbox` publishes revisioned changes transactionally. Core remains authoritative for active library work; the existing file-operation audit/history endpoint stays available for migration and recovery.
+- **Desktop durable mirror:** `apps/desktop/src/notification-service.ts` drains and acknowledges each library Outbox only after `userData/notifications.sqlite` persists the revision. The mirror survives library switches and desktop restarts and powers cross-library status/history; process logs remain local to the desktop session and use a bounded buffer.
+- **Typed preload boundary:** renderer code uses the `@megle/notification-contract` bridge for compact snapshots, paged history/facets, cancel/retry actions, change subscriptions, and snapshot-plus-subscribe process logs. Do not bypass IPC with renderer-owned notification transport.
+- **Web constraints:** no raw fetch for notification data, no notification polling, and no per-thumbnail notifications. Thumbnail activity is aggregated by library, while every background operation declares one logical grouping key and one presentation class (`important`, `history_only`, or `status_only`).
 
 ## Next Execution Order
 

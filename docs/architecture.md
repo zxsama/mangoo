@@ -63,6 +63,32 @@ Megle.exe
 
 Core API 首选本地 HTTP 或 named pipe。为了未来 Web/Docker，业务 API 设计为 HTTP/JSON 或 HTTP + streaming，桌面端再包一层安全 token 和本机访问限制。
 
+## Unified Notification Center
+
+统一通知中心按“库内事实、桌面跨库镜像、preload 类型边界、Web 展示”分层：
+
+```text
+Core library DB
+  notification_operation_heads + notification_outbox
+          |
+          v
+Desktop main
+  userData/notifications.sqlite durable all-library mirror
+  bounded local process-log buffer
+          |
+          v
+Preload @megle/notification-contract
+  snapshots + paged history + actions + subscriptions
+          |
+          v
+Web notification popover/window
+```
+
+- Core 在每个 library DB 内事务性更新 operation head，并向 `notification_outbox` 写入带 revision 的事件。Desktop 只有在持久化镜像成功后才确认 Outbox sequence，因此切库、重启和短暂故障不会丢失历史。
+- Desktop 的 `notifications.sqlite` 聚合所有已打开库的 operation-level 状态与历史；本地 Core/Desktop/renderer 进程日志进入有界会话缓冲区，不写回 media library DB。
+- Preload 暴露类型化 compact snapshot、分页 history/facets、cancel/retry action、change subscription，以及 process-log snapshot-plus-subscribe。Web 不直接请求 notification Core endpoint，也不轮询通知。
+- 缩略图完成/失败按 library 聚合，禁止每个 thumbnail 生成一条通知。每个后台任务必须提供稳定 logical grouping key 和 presentation class，确保高频进度只更新同一个 operation head。
+
 ## 数据模型
 
 几百万文件不能简单把完整路径重复写进一张大表。建议拆分目录和文件。
@@ -266,5 +292,5 @@ Core API 首选本地 HTTP 或 named pipe。为了未来 Web/Docker，业务 API
 操作日志：
 
 - 每个真实文件操作写入 `file_operations`。
-- UI 可展示最近操作和失败项。
+- Desktop 将操作组同步到跨库通知历史；统一通知中心展示进度、结果和失败项。
 - 后续可以做撤销，但首版至少要可追踪。

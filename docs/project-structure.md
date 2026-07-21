@@ -34,6 +34,14 @@ tools/
 - `tools/bench` is for heavier performance experiments. It may generate large ignored artifacts.
 - `tools/checks` is for quick checks that should run every time the structure changes.
 
+## Unified Notification Center Modules
+
+- `crates/core/src/db/notification_outbox.rs` and migration `0021_notification_outbox.sql` own each library DB's operation heads, revisioned Outbox, acknowledgements, and file-operation grouping link. Core audit endpoints remain available for legacy migration and operation history.
+- `apps/desktop/src/notification-service.ts` owns Outbox synchronization, cross-library snapshots, history/actions, and degraded fallback behavior. `notification-store.ts` plus `notification-store-worker.ts` own the durable `userData/notifications.sqlite` mirror; `process-log-buffer.ts` owns bounded local process logs.
+- `apps/desktop/src/notification-ipc.ts`, `notification-ipc-channels.cjs`, and `preload.cjs` expose the narrow typed renderer boundary. Shared DTOs and bridge signatures belong in `packages/notification-contract`, not in Desktop or Web copies.
+- `apps/web/src/features/notifications/` owns the compact notification popover, standalone status/history/process-log window, presentation models, and subscriptions. It consumes preload snapshots/actions only: no raw notification fetch, polling loop, or per-thumbnail event rows.
+- Every future background task must declare a stable logical grouping key and a presentation class (`important`, `history_only`, or `status_only`) before it enters the notification pipeline. One logical operation may update its head many times, but it must not fan out into notification spam.
+
 ## What Not To Create Yet
 
 - Do not create a separate `server/` product for Web/Docker. Web/Docker must reuse Core and `apps/web`.
