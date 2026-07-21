@@ -35,6 +35,7 @@ import {
 } from "./mediaResources";
 import { runThumbnailCacheEnqueueBatches } from "./thumbnailCacheEnqueue";
 import { decideRootScanRefresh } from "./scanRefresh";
+import { publishThumbnailCacheStats, reportLibraryError } from "./notificationReporting";
 import type { ThumbnailGenerationMode } from "../features/preview/previewPreferences";
 
 const INITIAL_MEDIA_WINDOW_LIMIT = 96;
@@ -62,6 +63,34 @@ const SHOW_SUBFOLDER_CONTENTS_STORAGE_KEY = "megle.library.subfolder-content-ope
 const SEEN_THUMBNAIL_PERSIST_BATCH_SIZE = 128;
 const SEEN_THUMBNAIL_PERSIST_DEBOUNCE_MS = 500;
 const SEEN_THUMBNAIL_PERSIST_RETRY_MS = 10_000;
+
+function reportLibraryFailure(
+  cause: unknown,
+  source: string,
+  target: string,
+  fallbackCode: string
+): void {
+  reportLibraryError({
+    source,
+    code: libraryErrorCode(cause, fallbackCode),
+    target,
+    message: errorMessage(cause)
+  });
+}
+
+function libraryErrorCode(cause: unknown, fallbackCode: string): string {
+  if (cause instanceof CoreApiError) {
+    if (cause.body && typeof cause.body === "object") {
+      const code = (cause.body as Record<string, unknown>).code;
+      if (typeof code === "string" && code.trim()) return code;
+    }
+    return `http-${cause.status}`;
+  }
+  if (cause instanceof Error && cause.name && cause.name !== "Error") {
+    return cause.name;
+  }
+  return fallbackCode;
+}
 
 export type LibrarySort =
   | "mtime_desc"
@@ -127,7 +156,6 @@ export interface LibraryState {
   searchState: SearchState;
   searchActive: boolean;
   metadataSaving: boolean;
-  error: string | null;
   lastScan: ScanSummary | null;
   diagnostics: DesktopDiagnostics | null;
   diagnosticsProbed: boolean;
@@ -355,7 +383,6 @@ export function useLibraryData(
   const [busyTaskIds, setBusyTaskIds] = useState<Set<number>>(() => new Set());
   const [taskPollFailures, setTaskPollFailures] = useState(0);
   const [scanRefreshFailures, setScanRefreshFailures] = useState(0);
-  const [error, setError] = useState<string | null>(null);
   const [lastScan, setLastScan] = useState<ScanSummary | null>(null);
   const [tags, setTags] = useState<TagRecord[]>([]);
   const [searchState, setSearchState] = useState<SearchState>({
@@ -514,13 +541,14 @@ export function useLibraryData(
       );
       if (thumbnailCacheStatsControllerRef.current === controller) {
         setThumbnailCacheStats(stats);
+        publishThumbnailCacheStats(stats);
       }
       return stats;
     } catch (cause) {
       if (isAbortError(cause)) {
         return null;
       }
-      setError(errorMessage(cause));
+      reportLibraryFailure(cause, "thumbnail-cache", "library", "stats-load-failed");
       return null;
     } finally {
       if (thumbnailCacheStatsControllerRef.current === controller) {
@@ -550,7 +578,12 @@ export function useLibraryData(
         );
       } catch (cause) {
         if (!isAbortError(cause)) {
-          setError(errorMessage(cause));
+          reportLibraryFailure(
+            cause,
+            "thumbnail-cache",
+            "library",
+            `${refreshMode}-enqueue-failed`
+          );
         }
       } finally {
         if (thumbnailCacheActionControllerRef.current === controller) {
@@ -714,7 +747,12 @@ export function useLibraryData(
           }
           thumbnailPriorityScopeSyncTrailingPendingRef.current = false;
           void flushThumbnailPriorityScopeSync().catch((cause) => {
-            setError(errorMessage(cause));
+            reportLibraryFailure(
+              cause,
+              "thumbnail-priority",
+              "viewport",
+              "scope-sync-failed"
+            );
           });
           openThumbnailScopeSyncWindow();
         }, THUMBNAIL_SCOPE_SYNC_DEBOUNCE_MS);
@@ -729,7 +767,12 @@ export function useLibraryData(
           return;
         }
         void flushThumbnailPriorityScopeSync().catch((cause) => {
-          setError(errorMessage(cause));
+          reportLibraryFailure(
+            cause,
+            "thumbnail-priority",
+            priority,
+            "scope-sync-failed"
+          );
         });
         if (priority === "visible") {
           openThumbnailScopeSyncWindow();
@@ -744,7 +787,12 @@ export function useLibraryData(
         return;
       }
       void flushThumbnailPriorityScopeSync().catch((cause) => {
-        setError(errorMessage(cause));
+        reportLibraryFailure(
+          cause,
+          "thumbnail-priority",
+          priority,
+          "scope-sync-failed"
+        );
       });
       openThumbnailScopeSyncWindow();
     },
@@ -791,7 +839,12 @@ export function useLibraryData(
     } catch (cause) {
       if (!isAbortError(cause)) {
         retryDelayMs = SEEN_THUMBNAIL_PERSIST_RETRY_MS;
-        setError(errorMessage(cause));
+        reportLibraryFailure(
+          cause,
+          "thumbnail-persist",
+          "visible-batch",
+          "persist-failed"
+        );
       }
     } finally {
       if (seenThumbnailPersistControllerRef.current === controller) {
@@ -968,7 +1021,7 @@ export function useLibraryData(
               if (cause instanceof Error && cause.name === "AbortError") {
                 return;
               }
-              setError(errorMessage(cause));
+              // Per-thumbnail failures remain tile-local; never emit one notification per item.
             });
           pendingRequests.push(retryRequest);
           continue;
@@ -1193,7 +1246,12 @@ export function useLibraryData(
         if (isAbortError(cause)) {
           return [];
         }
-        setError(errorMessage(cause));
+        reportLibraryFailure(
+          cause,
+          "folder-load",
+          `folder:${folderId}`,
+          "ancestor-load-failed"
+        );
         throw cause;
       } finally {
         if (folderAncestorControllersRef.current.get(folderId) === controller) {
@@ -1225,7 +1283,6 @@ export function useLibraryData(
       const controller = new AbortController();
       folderChildControllersRef.current.set(requestKey, controller);
       setLoadingMoreFolderIds((current) => new Set(current).add(folderId));
-      setError(null);
       try {
         const page = await client.listFolderChildren(folderId, {
           cursor: cursor ?? undefined,
@@ -1247,7 +1304,12 @@ export function useLibraryData(
         if (isAbortError(cause)) {
           return;
         }
-        setError(errorMessage(cause));
+        reportLibraryFailure(
+          cause,
+          "folder-load",
+          `folder:${folderId}`,
+          "child-page-load-failed"
+        );
       } finally {
         if (folderChildControllersRef.current.get(requestKey) === controller) {
           folderChildControllersRef.current.delete(requestKey);
@@ -1556,7 +1618,12 @@ export function useLibraryData(
           return;
         }
         if (scope.requestGeneration === mediaPageGeneration.current) {
-          setError(errorMessage(cause));
+          reportLibraryFailure(
+            cause,
+            "media-load",
+            `folder:${scope.folderId ?? "root"}`,
+            "window-load-failed"
+          );
         }
       } finally {
         if (mediaPageControllersRef.current.get(requestKey) === controller) {
@@ -1711,7 +1778,6 @@ export function useLibraryData(
       setLoadedMediaRanges([]);
       mediaCursorByStartIndexRef.current.clear();
       setMediaNextCursor(null);
-      setError(null);
 
       try {
         await loadMediaWindow({
@@ -1731,7 +1797,12 @@ export function useLibraryData(
           return;
         }
       } catch (cause) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(
+          cause,
+          "media-load",
+          `folder:${folderId ?? "root"}`,
+          "reload-failed"
+        );
         throw cause;
       } finally {
         if (
@@ -1827,7 +1898,6 @@ export function useLibraryData(
     inFlightMediaPageKeys.current.clear();
     loadedMediaPageKeys.current.clear();
     setLoading(true);
-    setError(null);
     try {
       const result = await loadRoots(scope);
       const root =
@@ -1878,7 +1948,7 @@ export function useLibraryData(
         selectMedia(null);
       }
     } catch (cause) {
-      setError(errorMessage(cause));
+      reportLibraryFailure(cause, "library-load", "library", "load-failed");
     } finally {
       setLoading(false);
     }
@@ -1983,7 +2053,7 @@ export function useLibraryData(
       })
       .catch((cause) => {
         if (!cancelled) {
-          setError(errorMessage(cause));
+          reportLibraryFailure(cause, "tag-load", "library", "list-failed");
         }
       });
     return () => {
@@ -2013,7 +2083,12 @@ export function useLibraryData(
       })
       .catch((cause) => {
         if (!cancelled) {
-          setError(errorMessage(cause));
+          reportLibraryFailure(
+            cause,
+            "metadata-load",
+            `file:${selectedMediaId}`,
+            "load-failed"
+          );
         }
       });
     return () => {
@@ -2101,7 +2176,12 @@ export function useLibraryData(
         })
         .catch((cause) => {
           if (!isAbortError(cause)) {
-            setError(errorMessage(cause));
+            reportLibraryFailure(
+              cause,
+              "thumbnail-cache",
+              scopeKey,
+              "auto-enqueue-failed"
+            );
           }
         });
 
@@ -2149,13 +2229,23 @@ export function useLibraryData(
           thumbnailPriorityScopeSyncKeyRef.current = null;
           void flushThumbnailPriorityScopeSync().catch((cause) => {
             if (!isAbortError(cause)) {
-              setError(errorMessage(cause));
+              reportLibraryFailure(
+                cause,
+                "thumbnail-priority",
+                scopeKey,
+                "retry-sync-failed"
+              );
             }
           });
         })
         .catch((cause) => {
           if (!isAbortError(cause)) {
-            setError(errorMessage(cause));
+            reportLibraryFailure(
+              cause,
+              "thumbnail-cache",
+              scopeKey,
+              "auto-retry-failed"
+            );
           }
         })
         .finally(() => {
@@ -2238,7 +2328,12 @@ export function useLibraryData(
         .catch((cause) => {
           if (!cancelled && !isAbortError(cause)) {
             pendingInteractiveScanRequestRef.current = null;
-            setError(errorMessage(cause));
+            reportLibraryFailure(
+              cause,
+              "folder-scan",
+              `folder:${selectedFolderId}`,
+              "enqueue-failed"
+            );
           }
         });
     }, INTERACTIVE_FOLDER_SCAN_DEBOUNCE_MS);
@@ -2293,7 +2388,7 @@ export function useLibraryData(
     }
     if (shouldRefreshRootsList) {
       void refreshRootsList().catch((cause) => {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "root-load", "library", "refresh-failed");
       });
     }
     if (interactiveRefreshScope) {
@@ -2302,7 +2397,12 @@ export function useLibraryData(
         folderId: interactiveRefreshScope.folderId,
         incremental: true
       }).catch((cause) => {
-        setError(errorMessage(cause));
+        reportLibraryFailure(
+          cause,
+          "media-load",
+          `folder:${interactiveRefreshScope.folderId ?? "root"}`,
+          "scan-refresh-failed"
+        );
       });
     }
   }, [loadLibrary, reloadCurrentMedia, refreshRootsList, selectedFolderId, selectedRootId, tasks]);
@@ -2315,7 +2415,7 @@ export function useLibraryData(
     const timer = window.setInterval(() => {
       void loadTasks().catch((cause) => {
         setTaskPollFailures((failures) => failures + 1);
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "task-sync", "library", "poll-failed");
       });
     }, 1000);
     return () => window.clearInterval(timer);
@@ -2337,7 +2437,12 @@ export function useLibraryData(
         })
         .catch((cause) => {
           setScanRefreshFailures((failures) => failures + 1);
-          setError(errorMessage(cause));
+          reportLibraryFailure(
+            cause,
+            "scan-refresh",
+            `root:${selectedRootIdRef.current ?? "active"}`,
+            "refresh-failed"
+          );
         })
         .finally(() => {
           scanRefreshInFlightRef.current = false;
@@ -2378,7 +2483,6 @@ export function useLibraryData(
     setScanRefreshFailures(0);
     setLoading(true);
     setLoadingMoreMedia(false);
-    setError(null);
     setMedia([]);
     setMediaNextCursor(null);
     setSelectedFolderInfoState(null);
@@ -2404,7 +2508,12 @@ export function useLibraryData(
         );
         if (entry.hasChildren !== false) {
           void loadFolderChildren(entry.folderId).catch((cause) => {
-            setError(errorMessage(cause));
+            reportLibraryFailure(
+              cause,
+              "folder-load",
+              `folder:${entry.folderId}`,
+              "navigation-child-load-failed"
+            );
           });
         }
       }
@@ -2414,7 +2523,12 @@ export function useLibraryData(
         includeDescendants: showChildFolderContentsRef.current,
         setLoadingState: true
       }).catch((cause) => {
-        setError(errorMessage(cause));
+        reportLibraryFailure(
+          cause,
+          "media-load",
+          `folder:${entry.folderId ?? "root"}`,
+          "navigation-load-failed"
+        );
       });
     },
     [
@@ -2445,7 +2559,6 @@ export function useLibraryData(
       if (!trimmedPath) return;
 
       setAddingRoot(true);
-      setError(null);
       try {
         const response = await client.addRoot(trimmedPath);
         setLastScan(response.scan);
@@ -2463,7 +2576,7 @@ export function useLibraryData(
         await loadTasks();
         await loadLibrary(response.rootId ? { rootId: response.rootId, folderId: null } : undefined);
       } catch (cause) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "root-action", "root:add", "add-failed");
       } finally {
         setAddingRoot(false);
       }
@@ -2482,12 +2595,11 @@ export function useLibraryData(
   const rescanRoot = useCallback(
     async (rootId: number) => {
       setRescanningRootIds((current) => new Set(current).add(rootId));
-      setError(null);
       try {
         await client.enqueueScan(rootId);
         await loadTasks();
       } catch (cause) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "root-scan", `root:${rootId}`, "enqueue-failed");
       } finally {
         setRescanningRootIds((current) => {
           const next = new Set(current);
@@ -2501,7 +2613,6 @@ export function useLibraryData(
 
   const removeRoot = useCallback(
     async (rootId: number) => {
-      setError(null);
       // Optimistic: drop the root from the sidebar immediately.
       setRoots((current) => current.filter((root) => root.id !== rootId));
       if (selectedRootIdRef.current === rootId) {
@@ -2513,7 +2624,7 @@ export function useLibraryData(
         // server-side correction reconciles (without a full loadLibrary reflow).
         await refreshRootsList();
       } catch (cause) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "root-action", `root:${rootId}`, "remove-failed");
         await refreshRootsList();
       }
     },
@@ -2535,12 +2646,11 @@ export function useLibraryData(
   const cancelTask = useCallback(
     async (taskId: number) => {
       markTaskBusy(taskId, true);
-      setError(null);
       try {
         await client.cancelTask(taskId);
         await loadTasks();
       } catch (cause) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "task-action", `task:${taskId}`, "cancel-failed");
       } finally {
         markTaskBusy(taskId, false);
       }
@@ -2551,12 +2661,11 @@ export function useLibraryData(
   const retryTask = useCallback(
     async (taskId: number) => {
       markTaskBusy(taskId, true);
-      setError(null);
       try {
         await client.retryTask(taskId);
         await loadTasks();
       } catch (cause) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "task-action", `task:${taskId}`, "retry-failed");
       } finally {
         markTaskBusy(taskId, false);
       }
@@ -2568,7 +2677,7 @@ export function useLibraryData(
     try {
       await loadTasks();
     } catch (cause) {
-      setError(errorMessage(cause));
+      reportLibraryFailure(cause, "task-sync", "library", "refresh-failed");
     }
   }, [loadTasks]);
 
@@ -2668,7 +2777,7 @@ export function useLibraryData(
             current.map((item) => (item.id === fileId ? previousMediaRow : item))
           );
         }
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "metadata-save", `file:${fileId}`, "update-failed");
       } finally {
         setMetadataSaving(false);
       }
@@ -2712,7 +2821,7 @@ export function useLibraryData(
         reflectFileTagsLocally(fileId, response.tagIds);
       } catch (cause) {
         if (previous) reflectFileTagsLocally(fileId, previous);
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "tag-save", `file:${fileId}`, "replace-failed");
       }
     },
     [capturePreviousTagIds, client, reflectFileTagsLocally]
@@ -2729,7 +2838,7 @@ export function useLibraryData(
         reflectFileTagsLocally(fileId, response.tagIds);
       } catch (cause) {
         if (previous) reflectFileTagsLocally(fileId, previous);
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "tag-save", `file:${fileId}`, "add-failed");
       }
     },
     [capturePreviousTagIds, client, reflectFileTagsLocally]
@@ -2746,7 +2855,7 @@ export function useLibraryData(
         reflectFileTagsLocally(fileId, response.tagIds);
       } catch (cause) {
         if (previous) reflectFileTagsLocally(fileId, previous);
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "tag-save", `file:${fileId}`, "remove-failed");
       }
     },
     [capturePreviousTagIds, client, reflectFileTagsLocally]
@@ -2762,7 +2871,7 @@ export function useLibraryData(
         });
         return tag;
       } catch (cause) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "tag-action", "tag:create", "create-failed");
         return null;
       }
     },
@@ -2779,7 +2888,7 @@ export function useLibraryData(
           tagIds: current.tagIds.filter((id) => id !== tagId)
         }));
       } catch (cause) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "tag-action", `tag:${tagId}`, "delete-failed");
       }
     },
     [client]
@@ -2814,7 +2923,6 @@ export function useLibraryData(
         setMedia(previousMedia);
         selectMedia(previousSelectedMediaId);
         const result = fileOpFailure(cause);
-        setError(result.message ?? "Rename failed");
         return result;
       }
     },
@@ -2849,7 +2957,6 @@ export function useLibraryData(
         setFolderChildrenByParent(previousChildren);
         setFolderDescendantsByParent(previousDescendants);
         const result = fileOpFailure(cause);
-        setError(result.message ?? "Rename failed");
         return result;
       }
     },
@@ -2883,7 +2990,6 @@ export function useLibraryData(
       } catch (cause) {
         setMedia(previousMedia);
         const result = fileOpFailure(cause);
-        setError(result.message ?? "Move failed");
         return result;
       }
     },
@@ -2939,7 +3045,6 @@ export function useLibraryData(
         setFolderChildrenByParent(previousChildren);
         setFolderDescendantsByParent(previousDescendants);
         const result = fileOpFailure(cause);
-        setError(result.message ?? "Delete failed");
         return result;
       }
     },
@@ -3000,7 +3105,7 @@ export function useLibraryData(
       }
     } catch (cause) {
       if (!isAbortError(cause)) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "thumbnail-cache", "library", "generate-all-failed");
       }
     } finally {
       if (thumbnailCacheActionControllerRef.current === controller) {
@@ -3072,7 +3177,7 @@ export function useLibraryData(
       await refreshThumbnailCacheStats();
     } catch (cause) {
       if (!isAbortError(cause)) {
-        setError(errorMessage(cause));
+        reportLibraryFailure(cause, "thumbnail-cache", "library", "clear-failed");
       }
     } finally {
       setThumbnailCacheActionBusy(false);
@@ -3118,7 +3223,6 @@ export function useLibraryData(
     searchState,
     searchActive,
     metadataSaving,
-    error,
     lastScan,
     diagnostics,
     diagnosticsProbed,
@@ -3164,7 +3268,12 @@ export function useLibraryData(
         includeDescendants: nextShowChildFolderContents,
         setLoadingState: true
       }).catch((cause) => {
-        setError(errorMessage(cause));
+        reportLibraryFailure(
+          cause,
+          "media-load",
+          `folder:${selectedFolderIdRef.current ?? "root"}`,
+          "subfolder-mode-load-failed"
+        );
       });
     },
     setSelectedMediaId: (mediaId: number | null) => {
@@ -3185,7 +3294,12 @@ export function useLibraryData(
         } else {
           next.add(folderId);
           void loadFolderChildren(folderId).catch((cause) => {
-            setError(errorMessage(cause));
+            reportLibraryFailure(
+              cause,
+              "folder-load",
+              `folder:${folderId}`,
+              "expand-load-failed"
+            );
           });
         }
         return next;

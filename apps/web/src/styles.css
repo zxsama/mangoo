@@ -1155,15 +1155,6 @@ button:disabled {
   border-bottom: 1px solid var(--line);
 }
 
-.error-strip {
-  min-height: 32px;
-  padding: 8px 16px;
-  color: #ffd2ce;
-  background: rgba(228, 124, 115, 0.16);
-  border: 1px solid rgba(228, 124, 115, 0.28);
-  border-radius: var(--radius-surface);
-}
-
 .grid-surface {
   display: flex;
   position: relative;

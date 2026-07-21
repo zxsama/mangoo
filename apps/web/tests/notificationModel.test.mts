@@ -17,6 +17,12 @@ import {
   progressView
 } from "../src/features/notifications/notificationModel.ts";
 import { createNotificationStore } from "../src/features/notifications/useNotifications.ts";
+import {
+  publishThumbnailCacheStats,
+  reportLibraryError,
+  rendererErrorKey,
+  thumbnailSummary
+} from "../src/core/notificationReporting.ts";
 
 function operation(
   operationId: string,
@@ -149,6 +155,190 @@ function bridge(
     ...overrides
   };
 }
+
+describe("notification reporting", () => {
+  it("maps shared thumbnail stats with the approved completion math", () => {
+    assert.deepEqual(
+      thumbnailSummary(
+        {
+          cachedCount: 80,
+          missingCount: 12,
+          staleCount: 8,
+          failedCount: 2,
+          pendingCandidateCount: 20,
+          totalBlobBytes: 1024,
+          activeBulkTaskCount: 1
+        },
+        "lib-a",
+        "Artists",
+        1000
+      ),
+      {
+        libraryId: "lib-a",
+        libraryName: "Artists",
+        cachedCount: 80,
+        remainingCount: 20,
+        failedCount: 2,
+        activeBulkTaskCount: 1,
+        percent: 80,
+        observedAt: 1000
+      }
+    );
+  });
+
+  it("builds a stable renderer-error deduplication key", () => {
+    assert.equal(
+      rendererErrorKey({ source: "media-load", code: "timeout", target: "folder:4" }),
+      "media-load:timeout:folder:4"
+    );
+    assert.equal(
+      rendererErrorKey({ source: " Media Load ", code: " HTTP 504 ", target: " Folder:4 " }),
+      "media-load:http-504:folder:4"
+    );
+  });
+
+  it("bounds renderer reports and never throws bridge failures into browsing code", async () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    const reports: unknown[] = [];
+    try {
+      (globalThis as { window?: unknown }).window = {};
+      assert.doesNotThrow(() =>
+        reportLibraryError({
+          source: "media-load",
+          code: "timeout",
+          target: "folder:4",
+          message: "request timed out"
+        })
+      );
+
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          listLibraries: async () => [
+            {
+              id: "lib-a",
+              name: "Artists",
+              dbPath: "artists.sqlite",
+              available: true,
+              active: true
+            }
+          ],
+          notifications: bridge({
+            reportError: async (input) => {
+              reports.push(input);
+              throw new Error("notification store unavailable");
+            }
+          })
+        }
+      };
+
+      assert.doesNotThrow(() =>
+        reportLibraryError({
+          source: " Media Load ",
+          code: " HTTP 504 ",
+          target: " Folder:4 ",
+          message: "request timed out"
+        })
+      );
+      reportLibraryError({
+        source: "media-load",
+        code: "http-504",
+        target: "folder:4",
+        message: "request timed out"
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(reports, [
+        {
+          libraryId: "lib-a",
+          libraryName: "Artists",
+          source: "media-load",
+          code: "http-504",
+          target: "folder:4",
+          title: "Media load failed",
+          message: "request timed out",
+          detail: null
+        }
+      ]);
+
+      reportLibraryError({
+        source: "media-load",
+        code: "timeout",
+        target: "folder:4",
+        message: "x".repeat(4001)
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(reports.length, 1);
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
+
+  it("publishes shared thumbnail stats through the frozen Desktop summary contract", async () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    const summaries: unknown[] = [];
+    try {
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          listLibraries: async () => [
+            {
+              id: "lib-a",
+              name: "Artists",
+              dbPath: "artists.sqlite",
+              available: true,
+              active: true
+            }
+          ],
+          notifications: bridge({
+            publishThumbnailSummary: async (input) => {
+              summaries.push(input);
+              return true;
+            }
+          })
+        }
+      };
+
+      publishThumbnailCacheStats(
+        {
+          cachedCount: 80,
+          missingCount: 12,
+          staleCount: 8,
+          failedCount: 2,
+          pendingCandidateCount: 20,
+          totalBlobBytes: 1024,
+          activeBulkTaskCount: 1
+        },
+        1000
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.deepEqual(summaries, [
+        {
+          libraryId: "lib-a",
+          libraryName: "Artists",
+          observedAt: 1000,
+          cachedCount: 80,
+          totalCandidateCount: 100,
+          missingCount: 12,
+          staleCount: 8,
+          failedCount: 2,
+          pendingCount: 20,
+          activeBulkTaskCount: 1,
+          totalCacheBytes: 1024,
+          completionPercent: 80
+        }
+      ]);
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
+});
 
 describe("notification selectors", () => {
   it("reports only Desktop-declared log gaps, not filtered sequence jumps", () => {

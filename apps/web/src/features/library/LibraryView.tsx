@@ -406,7 +406,6 @@ export function LibraryCenterPane({
         className={previewMedia ? "grid-surface grid-surface-preview-active" : "grid-surface"}
         aria-label="Media workspace"
       >
-        {library.error ? <div className="error-strip">{library.error}</div> : null}
         <div className="library-grid-content">
           <div
             aria-hidden={previewMedia ? true : undefined}

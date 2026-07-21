@@ -1206,17 +1206,17 @@ if (/expandedFolderIds/.test(refreshCurrentScanViewBlock)) {
   fail("useLibraryData scan refresh must not fan out across expanded folders");
 }
 if (
-  !/reloadCurrentMedia\s*=\s*useCallback[\s\S]*?catch\s*\(\s*cause\s*\)\s*\{[\s\S]*?setError\(errorMessage\(cause\)\);[\s\S]*?throw\s+cause;[\s\S]*?\}/.test(
+  !/reloadCurrentMedia\s*=\s*useCallback[\s\S]*?catch\s*\(\s*cause\s*\)\s*\{[\s\S]*?reportLibraryFailure\(\s*cause,\s*"media-load",[\s\S]*?\);[\s\S]*?throw\s+cause;[\s\S]*?\}/.test(
     useLibraryData
   )
 ) {
   fail("reloadCurrentMedia must rethrow reload failures so scan refresh backoff can trip");
 }
 if (
-  !/reloadCurrentMedia\(\{[\s\S]*?\}\)\s*\.catch\(\(cause\)\s*=>\s*\{[\s\S]*?setError\(errorMessage\(cause\)\)/.test(
+  !/reloadCurrentMedia\(\{[\s\S]*?\}\)\s*\.catch\(\(cause\)\s*=>\s*\{[\s\S]*?reportLibraryFailure\(\s*cause,\s*"media-load",/.test(
     selectLibraryFolderBlock || selectedRootHandlerBlock
   ) ||
-  !/reloadCurrentMedia\(\{[\s\S]*?\}\)\s*\.catch\(\(cause\)\s*=>\s*\{[\s\S]*?setError\(errorMessage\(cause\)\)/.test(
+  !/reloadCurrentMedia\(\{[\s\S]*?\}\)\s*\.catch\(\(cause\)\s*=>\s*\{[\s\S]*?reportLibraryFailure\(\s*cause,\s*"media-load",/.test(
     selectLibraryFolderBlock || selectedFolderHandlerBlock
   )
 ) {
