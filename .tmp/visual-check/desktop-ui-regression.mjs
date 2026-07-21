@@ -1474,6 +1474,261 @@ async function notificationPopoverFixtureEvidence(client) {
   }
 }
 
+async function notificationWindowFixtureEvidence(client) {
+  const fixtureUrl = `${webUrl}/tests/fixtures/notification-window.html?state=full`;
+  const opened = await evaluate(
+    client,
+    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "megle-notification-window-fixture", "popup=yes,width=1040,height=760,resizable=yes"))`
+  );
+  if (!opened) throw new Error("Electron refused to open the notification window fixture");
+
+  const target = await waitForTarget(
+    (page) => page.url.includes("/tests/fixtures/notification-window.html"),
+    10000
+  );
+  const fixtureClient = new CdpClient(target.webSocketDebuggerUrl);
+  await fixtureClient.ready;
+  await Promise.all([
+    fixtureClient.send("Page.enable"),
+    fixtureClient.send("Runtime.enable")
+  ]);
+
+  const evidenceExpression = `(() => {
+    const owner = document.querySelector("[data-notification-window-fixture]");
+    const body = document.querySelector(".notification-window-body");
+    const nav = document.querySelector(".notification-window-nav");
+    const content = document.querySelector(".notification-window-content");
+    const titlebar = document.querySelector(".secondary-window-titlebar");
+    const bodyStyle = body ? getComputedStyle(body) : null;
+    const navStyle = nav ? getComputedStyle(nav) : null;
+    const contentStyle = content ? getComputedStyle(content) : null;
+    const titlebarStyle = titlebar ? getComputedStyle(titlebar) : null;
+    return {
+      state: owner?.getAttribute("data-notification-window-fixture") ?? null,
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      selectedPage: document.querySelector('.notification-window-tab[aria-selected="true"]')?.getAttribute("data-fixture-page") ?? null,
+      tabCount: document.querySelectorAll('.notification-window-tab[role="tab"]').length,
+      bodyGrid: bodyStyle?.gridTemplateColumns ?? null,
+      bodyBackground: bodyStyle?.backgroundImage ?? null,
+      navBorderRightWidth: navStyle?.borderRightWidth ?? null,
+      navBackground: navStyle?.backgroundColor ?? null,
+      contentOverflow: contentStyle?.overflow ?? null,
+      titlebarBorderBottomWidth: titlebarStyle?.borderBottomWidth ?? null,
+      status: {
+        active: document.querySelectorAll(".notification-status-operation").length,
+        determinate: document.querySelectorAll('.notification-window-progress:not(.indeterminate)').length,
+        indeterminate: document.querySelectorAll(".notification-window-progress.indeterminate").length,
+        thumbnails: document.querySelectorAll(".notification-thumbnail-card").length,
+        results: document.querySelectorAll(".notification-status-result").length,
+        degraded: Boolean(document.querySelector(".notification-status-health"))
+      },
+      history: {
+        present: Boolean(document.querySelector(".notification-history-view")),
+        filterCount: document.querySelectorAll(".notification-history-filters select").length,
+        renderedRows: document.querySelectorAll(".notification-history-row").length,
+        actionError: document.querySelector(".notification-row-action-error")?.textContent?.trim() ?? null,
+        footer: document.querySelector(".notification-history-footer")?.textContent?.trim() ?? null
+      },
+      logs: {
+        present: Boolean(document.querySelector(".notification-process-log-view")),
+        renderedLines: document.querySelectorAll(".notification-log-line").length,
+        gap: document.querySelector(".notification-log-gap")?.textContent?.trim() ?? null,
+        liveState: document.querySelector(".notification-log-live-state")?.textContent?.trim() ?? null,
+        actionMessage: document.querySelector(".notification-log-footer span:last-child")?.textContent?.trim() ?? null,
+        controls: {
+          pause: Boolean(document.querySelector('button[aria-label="暂停日志"], button[aria-label="继续日志"]')),
+          follow: Boolean(document.querySelector('button[aria-label="自动跟随最新日志"]')),
+          copy: Boolean(document.querySelector('button[aria-label="复制选中或可见日志"]')),
+          clear: Boolean(document.querySelector('button[aria-label="清空当前会话日志"]')),
+          export: Boolean(document.querySelector('button[aria-label="导出当前日志"]'))
+        }
+      },
+      metrics: window.notificationWindowFixture?.getMetrics() ?? null
+    };
+  })()`;
+
+  try {
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector('[data-notification-window-fixture="full"] .notification-status-view'))`,
+      10000,
+      "full notification window fixture"
+    );
+    const status = await evaluate(fixtureClient, evidenceExpression);
+    const statusScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-window-fixture-status.png"
+    );
+
+    await clickSelector(fixtureClient, '[data-fixture-page="history"]');
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector(".notification-history-view")) && window.notificationWindowFixture?.getMetrics().historyQueries > 0`,
+      10000,
+      "notification history fixture"
+    );
+    await delay(120);
+    const historyInitial = await evaluate(fixtureClient, evidenceExpression);
+    const retrySelector = '[data-notification-operation$=":retry-error"] .notification-row-action';
+    if (await evaluate(fixtureClient, `Boolean(document.querySelector(${JSON.stringify(retrySelector)}))`)) {
+      await evaluate(
+        fixtureClient,
+        `document.querySelector(${JSON.stringify(retrySelector)})?.click()`
+      );
+      await waitFor(
+        fixtureClient,
+        `Boolean(document.querySelector(".notification-row-action-error"))`,
+        10000,
+        "notification retry error fixture"
+      );
+    }
+    const loadMoreSelector = ".notification-history-footer .notification-primary-action";
+    if (await evaluate(fixtureClient, `Boolean(document.querySelector(${JSON.stringify(loadMoreSelector)}))`)) {
+      await clickSelector(fixtureClient, loadMoreSelector);
+      await delay(120);
+    }
+    const history = await evaluate(fixtureClient, evidenceExpression);
+    const historyScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-window-fixture-history.png"
+    );
+
+    await clickSelector(fixtureClient, '[data-fixture-page="logs"]');
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector(".notification-process-log-view")) && window.notificationWindowFixture?.getMetrics().activeLogSubscriptions === 1`,
+      10000,
+      "notification logs fixture subscription"
+    );
+    await evaluate(
+      fixtureClient,
+      `document.querySelector('button[aria-label="暂停日志"]')?.click()`
+    );
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector('button[aria-label="继续日志"]'))`,
+      10000,
+      "notification paused log control"
+    );
+    await evaluate(fixtureClient, `window.notificationWindowFixture.emitGap()`);
+    await waitFor(
+      fixtureClient,
+      `document.querySelector(".notification-log-live-state")?.textContent?.includes("条待显示")`,
+      10000,
+      "notification paused log buffer"
+    );
+    await evaluate(
+      fixtureClient,
+      `document.querySelector('button[aria-label="继续日志"]')?.click()`
+    );
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector(".notification-log-gap"))`,
+      10000,
+      "notification log gap fixture"
+    );
+    const logsGap = await evaluate(fixtureClient, evidenceExpression);
+    await evaluate(
+      fixtureClient,
+      `document.querySelector('button[aria-label="自动跟随最新日志"]')?.click()`
+    );
+    await evaluate(
+      fixtureClient,
+      `document.querySelector('button[aria-label="复制选中或可见日志"]')?.click()`
+    );
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector(".notification-log-footer span:last-child")?.textContent?.trim())`,
+      10000,
+      "notification log copy fixture"
+    );
+    await evaluate(
+      fixtureClient,
+      `document.querySelector('button[aria-label="导出当前日志"]')?.click()`
+    );
+    await waitFor(
+      fixtureClient,
+      `document.querySelector(".notification-log-footer span:last-child")?.textContent?.includes("已导出")`,
+      10000,
+      "notification log export fixture"
+    );
+    await evaluate(
+      fixtureClient,
+      `document.querySelector('button[aria-label="清空当前会话日志"]')?.click()`
+    );
+    await waitFor(
+      fixtureClient,
+      `document.querySelector(".notification-log-footer span:last-child")?.textContent?.includes("已清空")`,
+      10000,
+      "notification log clear fixture"
+    );
+    const logs = await evaluate(fixtureClient, evidenceExpression);
+    const logsScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-window-fixture-logs.png"
+    );
+
+    await clickSelector(fixtureClient, '[data-fixture-page="status"]');
+    await waitFor(
+      fixtureClient,
+      `window.notificationWindowFixture?.getMetrics().activeLogSubscriptions === 0 && !document.querySelector(".notification-process-log-view")`,
+      10000,
+      "notification log tab cleanup fixture"
+    );
+    const cleanup = await evaluate(fixtureClient, evidenceExpression);
+
+    const resize = await resizeScriptOpenedWindow(fixtureClient, 640, 620);
+    await waitFor(fixtureClient, `window.innerWidth <= 660`, 10000, "narrow notification window fixture");
+    const narrow = await evaluate(fixtureClient, evidenceExpression);
+    const narrowScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-window-fixture-narrow.png"
+    );
+
+    await fixtureClient.send("Page.navigate", {
+      url: `${webUrl}/tests/fixtures/notification-window.html?state=degraded`
+    });
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector('[data-notification-window-fixture="degraded"] .notification-status-health'))`,
+      10000,
+      "degraded notification window fixture"
+    );
+    const degraded = await evaluate(fixtureClient, evidenceExpression);
+    const degradedScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-window-fixture-degraded.png"
+    );
+
+    return {
+      status,
+      historyInitial,
+      history,
+      logsGap,
+      logs,
+      cleanup,
+      narrow,
+      degraded,
+      resize,
+      screenshots: {
+        status: statusScreenshot,
+        history: historyScreenshot,
+        logs: logsScreenshot,
+        narrow: narrowScreenshot,
+        degraded: degradedScreenshot
+      }
+    };
+  } finally {
+    await evaluate(fixtureClient, `window.close()`).catch(() => undefined);
+    fixtureClient.close();
+    await waitForTargetCount(
+      (page) => page.url.includes("/tests/fixtures/notification-window.html"),
+      0,
+      10000
+    ).catch(() => undefined);
+  }
+}
+
 async function glassMaterialEvidence(client) {
   await pressKey(client, "Escape", "Escape", 27);
   await waitForCompactPopoverState(client, null).catch(() => undefined);
@@ -1789,9 +2044,91 @@ async function notificationsSecondaryWindowEvidence(client) {
       10000,
       "Notification native-window reveal"
     );
+    await waitFor(
+      notificationsClient,
+      `Boolean(document.querySelector("#notification-panel-status .notification-status-view"))`,
+      10000,
+      "Notification default status page"
+    );
     const screenshotPath = await screenshot(
       notificationsClient,
       "ui-notifications-secondary-window.png"
+    );
+    const statusEvidence = await evaluate(
+      notificationsClient,
+      `(() => {
+        const body = document.querySelector(".notification-window-body");
+        const nav = document.querySelector(".notification-window-nav");
+        const content = document.querySelector(".notification-window-content");
+        const titlebar = document.querySelector(".secondary-window-titlebar");
+        const bodyStyle = body ? getComputedStyle(body) : null;
+        const navStyle = nav ? getComputedStyle(nav) : null;
+        const contentStyle = content ? getComputedStyle(content) : null;
+        const titlebarStyle = titlebar ? getComputedStyle(titlebar) : null;
+        return {
+          tabCount: document.querySelectorAll('.notification-window-tab[role="tab"]').length,
+          selectedTab: document.querySelector('.notification-window-tab[aria-selected="true"]')?.id ?? null,
+          activeCount: document.querySelectorAll(".notification-status-operation").length,
+          thumbnailCount: document.querySelectorAll(".notification-thumbnail-card").length,
+          resultCount: document.querySelectorAll(".notification-status-result").length,
+          degraded: Boolean(document.querySelector(".notification-status-health")),
+          bodyGrid: bodyStyle?.gridTemplateColumns ?? null,
+          bodyBackground: bodyStyle?.backgroundImage ?? null,
+          navBorderRight: navStyle?.borderRight ?? null,
+          navBackground: navStyle?.backgroundColor ?? null,
+          contentOverflow: contentStyle?.overflow ?? null,
+          titlebarBorderBottom: titlebarStyle?.borderBottom ?? null
+        };
+      })()`
+    );
+
+    await clickSelector(notificationsClient, "#notification-tab-history");
+    await waitFor(
+      notificationsClient,
+      `Boolean(document.querySelector(".notification-history-view"))`,
+      10000,
+      "Notification history page"
+    );
+    const historyEvidence = await evaluate(
+      notificationsClient,
+      `(() => ({
+        filterCount: document.querySelectorAll(".notification-history-filters select").length,
+        virtualRows: document.querySelectorAll(".notification-history-row").length,
+        actionCount: document.querySelectorAll(".notification-row-action").length,
+        unreadControls: [...document.querySelectorAll("button, input, select")].filter((node) => /未读|已读/.test(node.textContent || node.getAttribute("aria-label") || "")).length
+      }))()`
+    );
+
+    await clickSelector(notificationsClient, "#notification-tab-logs");
+    await waitFor(
+      notificationsClient,
+      `Boolean(document.querySelector(".notification-process-log-view"))`,
+      10000,
+      "Notification process log page"
+    );
+    const logsScreenshotPath = await screenshot(
+      notificationsClient,
+      "ui-notifications-secondary-window-logs.png"
+    );
+    const logsEvidence = await evaluate(
+      notificationsClient,
+      `(() => ({
+        sourceFilter: Boolean(document.querySelector('.notification-log-toolbar select option[value="main"]')),
+        levelFilter: Boolean(document.querySelector('.notification-log-toolbar select option[value="error"]')),
+        pause: Boolean(document.querySelector('button[aria-label="暂停日志"], button[aria-label="继续日志"]')),
+        follow: Boolean(document.querySelector('button[aria-label="自动跟随最新日志"]')),
+        copy: Boolean(document.querySelector('button[aria-label="复制选中或可见日志"]')),
+        clear: Boolean(document.querySelector('button[aria-label="清空当前会话日志"]')),
+        export: Boolean(document.querySelector('button[aria-label="导出当前日志"]')),
+        virtualLines: document.querySelectorAll(".notification-log-line").length
+      }))()`
+    );
+    await clickSelector(notificationsClient, "#notification-tab-status");
+    await waitFor(
+      notificationsClient,
+      `Boolean(document.querySelector("#notification-panel-status .notification-status-view")) && !document.querySelector(".notification-process-log-view")`,
+      10000,
+      "Notification log page cleanup"
     );
     const firstTargets = await waitForTargetCount(
       (page) => page.url.includes("#/notifications"),
@@ -1885,12 +2222,14 @@ async function notificationsSecondaryWindowEvidence(client) {
 
     return {
       screenshotPath,
+      logsScreenshotPath,
       firstTargetId: firstTargets[0]?.id ?? null,
       repeatedTargetId: repeatedTargets[0]?.id ?? null,
       initialBounds,
       requestedPosition,
       movedBounds,
       restoredBounds,
+      pages: { status: statusEvidence, history: historyEvidence, logs: logsEvidence },
       window: windowEvidence
     };
   } finally {
@@ -2846,6 +3185,7 @@ try {
   const pointerTileThumb = await evaluate(client, pointerEvidenceExpression());
   const localEdgeHighlight = await screenshot(client, "ui-local-edge-highlight.png");
   const notificationFixture = await notificationPopoverFixtureEvidence(client);
+  const notificationWindowFixture = await notificationWindowFixtureEvidence(client);
 
   summary = {
     run: {
@@ -2858,6 +3198,7 @@ try {
       settingsInterfaceStyle: settingsInterfaceStyle.screenshotPath,
       pluginsSecondaryWindow: pluginsSecondaryWindow.screenshotPath,
       notificationsSecondaryWindow: notificationsSecondaryWindow.screenshotPath,
+      notificationsSecondaryWindowLogs: notificationsSecondaryWindow.logsScreenshotPath,
       selectedPortraitRightPreview,
       centralLandscapeFit,
       centralLandscapeActual,
@@ -2866,6 +3207,7 @@ try {
       pointerWindowOuterEdge: pointerWindowOuterEdgeScreenshot,
       localEdgeHighlight,
       notificationFixture: notificationFixture.screenshots,
+      notificationWindowFixture: notificationWindowFixture.screenshots,
       windowBackdrop: windowBackdrop.path ?? null
     },
     verification: {
@@ -2888,6 +3230,7 @@ try {
       notificationButtonStyle,
       compactPopovers,
       notificationFixture,
+      notificationWindowFixture,
       inspectorPortrait,
       inspectorPreviewApiResponsesBeforeCentralOpen,
       inspectorThumbnailBlobResponsesBeforeCentralOpen,
@@ -3215,6 +3558,28 @@ try {
   ) {
     hardFailures.push("Notification window single-instance/position/material/reveal contract failed");
   }
+  const notificationPages = notificationsWindowEvidence.pages;
+  if (
+    notificationPages?.status?.tabCount !== 3 ||
+    notificationPages.status.selectedTab !== "notification-tab-status" ||
+    !notificationPages.status.bodyBackground?.includes("gradient") ||
+    !/^0px none/.test(notificationPages.status.navBorderRight ?? "") ||
+    notificationPages.status.contentOverflow !== "hidden" ||
+    !/^1px solid/.test(notificationPages.status.titlebarBorderBottom ?? "") ||
+    notificationPages.history?.filterCount < 5 ||
+    notificationPages.history?.unreadControls !== 0 ||
+    notificationPages.history?.virtualRows >= 100 ||
+    !notificationPages.logs?.sourceFilter ||
+    !notificationPages.logs?.levelFilter ||
+    !notificationPages.logs?.pause ||
+    !notificationPages.logs?.follow ||
+    !notificationPages.logs?.copy ||
+    !notificationPages.logs?.clear ||
+    !notificationPages.logs?.export ||
+    notificationPages.logs?.virtualLines >= 100
+  ) {
+    hardFailures.push("Notification window status/history/log page contract failed");
+  }
   if (
     !summary.evidence.settingsInterfaceStyle.present ||
     summary.evidence.settingsInterfaceStyle.rangeSliderCount < 29 ||
@@ -3482,6 +3847,50 @@ try {
     ) ?? [];
   if (unexpectedFixtureConsoleErrors.length || unexpectedFixtureNetworkProblems.length) {
     hardFailures.push("notification test renderer emitted unexpected console or network failures");
+  }
+  const fullWindowFixture = summary.evidence.notificationWindowFixture;
+  if (
+    fullWindowFixture?.status?.tabCount !== 3 ||
+    fullWindowFixture.status.status?.active !== 2 ||
+    fullWindowFixture.status.status?.indeterminate !== 1 ||
+    fullWindowFixture.status.status?.thumbnails !== 2 ||
+    fullWindowFixture.status.status?.results !== 3 ||
+    !fullWindowFixture.status.bodyBackground?.includes("gradient") ||
+    fullWindowFixture.status.navBorderRightWidth !== "0px" ||
+    fullWindowFixture.status.contentOverflow !== "hidden" ||
+    fullWindowFixture.status.titlebarBorderBottomWidth !== "1px"
+  ) {
+    hardFailures.push("full notification window fixture is missing status/material/no-divider coverage");
+  }
+  if (
+    !fullWindowFixture?.historyInitial?.history?.present ||
+    fullWindowFixture.historyInitial.history.filterCount < 5 ||
+    fullWindowFixture.historyInitial.history.renderedRows >= 100 ||
+    !fullWindowFixture.history?.history?.actionError?.includes("Fixture retry rejected") ||
+    !fullWindowFixture.history?.history?.footer?.includes("200")
+  ) {
+    hardFailures.push("full notification window fixture is missing history paging/action coverage");
+  }
+  if (
+    !fullWindowFixture?.logsGap?.logs?.gap ||
+    !fullWindowFixture.logsGap.logs.controls.pause ||
+    !fullWindowFixture.logsGap.logs.controls.follow ||
+    !fullWindowFixture.logsGap.logs.controls.copy ||
+    !fullWindowFixture.logsGap.logs.controls.clear ||
+    !fullWindowFixture.logsGap.logs.controls.export ||
+    fullWindowFixture.logsGap.logs.renderedLines >= 100 ||
+    !fullWindowFixture.logs?.logs?.actionMessage?.includes("已清空") ||
+    fullWindowFixture.cleanup?.metrics?.activeLogSubscriptions !== 0 ||
+    fullWindowFixture.cleanup?.metrics?.logUnsubscriptions < 1
+  ) {
+    hardFailures.push("full notification window fixture is missing bounded logs/actions/tab-cleanup coverage");
+  }
+  if (
+    fullWindowFixture?.narrow?.viewport?.width > 660 ||
+    fullWindowFixture?.narrow?.navBorderRightWidth !== "0px" ||
+    !fullWindowFixture?.degraded?.status?.degraded
+  ) {
+    hardFailures.push("full notification window fixture is missing narrow/degraded coverage");
   }
   const notificationMaximizeEvidence = summary.evidence.notificationMaximize;
   if (

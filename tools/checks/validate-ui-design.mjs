@@ -63,6 +63,10 @@ const libraryInspectorPane = readOptional("apps/web/src/features/library/Library
 const pluginsView = read("apps/web/src/features/plugins/PluginsView.tsx");
 const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
 const notificationWindow = read("apps/web/src/features/notifications/NotificationWindow.tsx");
+const notificationStatusView = read("apps/web/src/features/notifications/NotificationStatusView.tsx");
+const notificationHistoryView = read("apps/web/src/features/notifications/NotificationHistoryView.tsx");
+const processLogView = read("apps/web/src/features/notifications/ProcessLogView.tsx");
+const notificationWindowFixture = read("apps/web/tests/fixtures/notificationWindowVisualFixture.tsx");
 const notificationPopover = read("apps/web/src/features/notifications/NotificationPopover.tsx");
 const filterMenu = readOptional("apps/web/src/features/library/FilterMenu.tsx");
 const mediaGrid = read("apps/web/src/features/media-grid/MediaGrid.tsx");
@@ -1509,6 +1513,18 @@ for (const [label, source, values] of [
     }
   }
 }
+for (const value of [
+  "data-notification-window-fixture",
+  "activeLogSubscriptions",
+  "logUnsubscriptions",
+  "droppedBeforeSequence",
+  "retry-error",
+  "thumbnailSummaries"
+]) {
+  if (!notificationWindowFixture.includes(value)) {
+    fail(`notification full-window renderer fixture missing ${value}`);
+  }
+}
 
 const shellRightActionsBlock =
   shellTitlebar.match(/export function ShellRightActions[\s\S]*?\n}\n/)?.[0] ?? "";
@@ -1795,6 +1811,32 @@ if (!webMain.includes('windowRole === "plugins"') || !webMain.includes('import("
 }
 if (!webMain.includes('windowRole === "notifications"') || !webMain.includes('import("./features/notifications/NotificationWindow")')) {
   fail("web entry must render NotificationWindow as a standalone renderer mode");
+}
+
+for (const value of [
+  'role="notifications"',
+  'role="tablist"',
+  "NotificationStatusView",
+  "NotificationHistoryView",
+  "ProcessLogView",
+  "notification-window-nav",
+  "notification-window-content"
+]) {
+  if (!notificationWindow.includes(value)) {
+    fail(`full notification center window missing ${value}`);
+  }
+}
+if (/\b(?:unread|readAt|markRead|未读|已读)\b/i.test(notificationWindow)) {
+  fail("notification center must not introduce read or unread state");
+}
+for (const [label, source, values] of [
+  ["status", notificationStatusView, ["notification-status-active", "notification-status-thumbnails", "notification-status-results", "notification-status-health"]],
+  ["history", notificationHistoryView, ["useVirtualizer", "cancellable", "retryable", "loadMoreHistory"]],
+  ["process logs", processLogView, ["useVirtualizer", "openLogSubscription", "unsubscribe", "droppedBeforeSequence", "clearLogs", "Blob", "LOG_PAGE_SIZE = 200", "加载更早日志"]]
+]) {
+  for (const value of values) {
+    if (!source.includes(value)) fail(`notification ${label} view missing ${value}`);
+  }
 }
 
 if (!shortcutBindings) {
