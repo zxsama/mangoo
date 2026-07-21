@@ -71,6 +71,7 @@ function reportLibraryFailure(
   fallbackCode: string
 ): void {
   reportLibraryError({
+    cause,
     source,
     code: libraryErrorCode(cause, fallbackCode),
     target,
@@ -160,6 +161,7 @@ export interface LibraryState {
   diagnostics: DesktopDiagnostics | null;
   diagnosticsProbed: boolean;
   thumbnailCacheStats: ThumbnailCacheStatsResponse | null;
+  thumbnailCacheStatsLibraryId: string | null;
   thumbnailCacheStatsLoading: boolean;
   thumbnailCacheActionBusy: boolean;
   refreshThumbnailCacheStats: () => Promise<ThumbnailCacheStatsResponse | null>;
@@ -251,6 +253,7 @@ type PendingInteractiveScanRequest = {
 };
 
 type UseLibraryDataOptions = {
+  activeLibraryId?: string | null;
   persistentThumbnailCacheAutoRefresh: boolean;
   // How thumbnails are generated and whether they persist. Drives both the
   // whole-library auto-generation ("allPersist") and whether displayed
@@ -290,6 +293,8 @@ export function useLibraryData(
   const interactiveFolderScanControllerRef = useRef<AbortController | null>(null);
   const thumbnailPriorityScopeSyncControllerRef = useRef<AbortController | null>(null);
   const thumbnailCacheStatsControllerRef = useRef<AbortController | null>(null);
+  const activeLibraryIdRef = useRef(options.activeLibraryId ?? null);
+  activeLibraryIdRef.current = options.activeLibraryId ?? null;
   const thumbnailCacheActionControllerRef = useRef<AbortController | null>(null);
   const thumbnailCacheAutoRefreshTimerRef = useRef<number | null>(null);
   const lastThumbnailCacheAutoRefreshScopeKeyRef = useRef<string | null>(null);
@@ -399,8 +404,10 @@ export function useLibraryData(
   const metadataEditGenerationRef = useRef(0);
   const [diagnostics, setDiagnostics] = useState<DesktopDiagnostics | null>(null);
   const [diagnosticsProbed, setDiagnosticsProbed] = useState(false);
-  const [thumbnailCacheStats, setThumbnailCacheStats] =
-    useState<ThumbnailCacheStatsResponse | null>(null);
+  const [thumbnailCacheStatsSnapshot, setThumbnailCacheStatsSnapshot] = useState<{
+    libraryId: string | null;
+    stats: ThumbnailCacheStatsResponse;
+  } | null>(null);
   const [thumbnailCacheStatsLoading, setThumbnailCacheStatsLoading] = useState(false);
   const [thumbnailCacheActionBusy, setThumbnailCacheActionBusy] = useState(false);
   const loadedMediaById = useMemo(() => {
@@ -529,6 +536,7 @@ export function useLibraryData(
     // folder switches, so stats never interfere with thumbnail refresh.
     thumbnailCacheStatsControllerRef.current?.abort();
     const controller = new AbortController();
+    const requestLibraryId = activeLibraryIdRef.current;
     thumbnailCacheStatsControllerRef.current = controller;
     setThumbnailCacheStatsLoading(true);
     try {
@@ -539,9 +547,12 @@ export function useLibraryData(
           signal: controller.signal
         }
       );
-      if (thumbnailCacheStatsControllerRef.current === controller) {
-        setThumbnailCacheStats(stats);
-        publishThumbnailCacheStats(stats);
+      if (
+        thumbnailCacheStatsControllerRef.current === controller &&
+        requestLibraryId === activeLibraryIdRef.current
+      ) {
+        setThumbnailCacheStatsSnapshot({ libraryId: requestLibraryId, stats });
+        publishThumbnailCacheStats(stats, Date.now(), requestLibraryId);
       }
       return stats;
     } catch (cause) {
@@ -554,9 +565,18 @@ export function useLibraryData(
       if (thumbnailCacheStatsControllerRef.current === controller) {
         thumbnailCacheStatsControllerRef.current = null;
       }
-      setThumbnailCacheStatsLoading(false);
+      if (thumbnailCacheStatsControllerRef.current === null) {
+        setThumbnailCacheStatsLoading(false);
+      }
     }
   }, [client]);
+
+  useEffect(() => {
+    thumbnailCacheStatsControllerRef.current?.abort();
+    thumbnailCacheStatsControllerRef.current = null;
+    setThumbnailCacheStatsSnapshot(null);
+    setThumbnailCacheStatsLoading(false);
+  }, [options.activeLibraryId]);
 
   const enqueueThumbnailCacheLoop = useCallback(
     async (scope: { rootId?: number; folderId?: number; includeDescendants?: boolean }, refreshMode: ThumbnailCacheRefreshMode) => {
@@ -1796,14 +1816,6 @@ export function useLibraryData(
         ) {
           return;
         }
-      } catch (cause) {
-        reportLibraryFailure(
-          cause,
-          "media-load",
-          `folder:${folderId ?? "root"}`,
-          "reload-failed"
-        );
-        throw cause;
       } finally {
         if (
           setLoadingState &&
@@ -1968,6 +1980,10 @@ export function useLibraryData(
   useEffect(() => {
     const unsubscribe = subscribeLibraryPhase((phase) => {
       if (phase === "loading-media") {
+        thumbnailCacheStatsControllerRef.current?.abort();
+        thumbnailCacheStatsControllerRef.current = null;
+        setThumbnailCacheStatsSnapshot(null);
+        setThumbnailCacheStatsLoading(false);
         void loadLibrary({ rootId: null, folderId: null });
       }
     });
@@ -2522,14 +2538,7 @@ export function useLibraryData(
         folderId: entry.folderId,
         includeDescendants: showChildFolderContentsRef.current,
         setLoadingState: true
-      }).catch((cause) => {
-        reportLibraryFailure(
-          cause,
-          "media-load",
-          `folder:${entry.folderId ?? "root"}`,
-          "navigation-load-failed"
-        );
-      });
+      }).catch(() => undefined);
     },
     [
       loadFolderChildren,
@@ -3226,7 +3235,8 @@ export function useLibraryData(
     lastScan,
     diagnostics,
     diagnosticsProbed,
-    thumbnailCacheStats,
+    thumbnailCacheStats: thumbnailCacheStatsSnapshot?.stats ?? null,
+    thumbnailCacheStatsLibraryId: thumbnailCacheStatsSnapshot?.libraryId ?? null,
     thumbnailCacheStatsLoading,
     thumbnailCacheActionBusy,
     refreshThumbnailCacheStats,
@@ -3267,14 +3277,7 @@ export function useLibraryData(
         folderId: selectedFolderIdRef.current,
         includeDescendants: nextShowChildFolderContents,
         setLoadingState: true
-      }).catch((cause) => {
-        reportLibraryFailure(
-          cause,
-          "media-load",
-          `folder:${selectedFolderIdRef.current ?? "root"}`,
-          "subfolder-mode-load-failed"
-        );
-      });
+      }).catch(() => undefined);
     },
     setSelectedMediaId: (mediaId: number | null) => {
       if (mediaId !== null) {

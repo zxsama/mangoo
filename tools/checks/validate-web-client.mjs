@@ -48,6 +48,10 @@ const refreshCurrentScanViewBlock = sourceMatch(
   useLibraryData,
   /const\s+refreshCurrentScanView\s*=\s*useCallback\([\s\S]*?\n\s*\]\);\n\n\s*const\s+loadLibrary/
 );
+const reloadCurrentMediaBlock = sourceMatch(
+  useLibraryData,
+  /const\s+reloadCurrentMedia\s*=\s*useCallback\([\s\S]*?\n\s*\]\s*\);\n\n\s*const\s+refreshCurrentScanView/
+);
 const loadLibraryBlock = sourceMatch(
   useLibraryData,
   /const\s+loadLibrary\s*=\s*useCallback\([\s\S]*?\n\s*\]\);/
@@ -1205,22 +1209,17 @@ if (
 if (/expandedFolderIds/.test(refreshCurrentScanViewBlock)) {
   fail("useLibraryData scan refresh must not fan out across expanded folders");
 }
-if (
-  !/reloadCurrentMedia\s*=\s*useCallback[\s\S]*?catch\s*\(\s*cause\s*\)\s*\{[\s\S]*?reportLibraryFailure\(\s*cause,\s*"media-load",[\s\S]*?\);[\s\S]*?throw\s+cause;[\s\S]*?\}/.test(
-    useLibraryData
-  )
-) {
-  fail("reloadCurrentMedia must rethrow reload failures so scan refresh backoff can trip");
+if (!reloadCurrentMediaBlock) {
+  fail("useLibraryData must keep reloadCurrentMedia as an inspectable useCallback");
 }
 if (
-  !/reloadCurrentMedia\(\{[\s\S]*?\}\)\s*\.catch\(\(cause\)\s*=>\s*\{[\s\S]*?reportLibraryFailure\(\s*cause,\s*"media-load",/.test(
-    selectLibraryFolderBlock || selectedRootHandlerBlock
-  ) ||
-  !/reloadCurrentMedia\(\{[\s\S]*?\}\)\s*\.catch\(\(cause\)\s*=>\s*\{[\s\S]*?reportLibraryFailure\(\s*cause,\s*"media-load",/.test(
-    selectLibraryFolderBlock || selectedFolderHandlerBlock
+  /reportLibraryFailure\([\s\S]*?throw\s+cause/.test(reloadCurrentMediaBlock) ||
+  /navigation-load-failed/.test(selectLibraryFolderBlock) ||
+  !/reloadCurrentMedia\(\{[\s\S]*?\}\)\s*\.catch\(\(\)\s*=>\s*undefined\)/.test(
+    selectLibraryFolderBlock
   )
 ) {
-  fail("useLibraryData navigation-triggered media reloads must catch rethrown failures");
+  fail("useLibraryData media reload reporting must not report, rethrow, and report again at navigation");
 }
 if (
   !/const\s+prepareNavigationMediaReload\s*=\s*useCallback\(\(\)\s*=>\s*\{[\s\S]*?scanRefreshSelectionVersionRef\.current\s*\+=\s*1[\s\S]*?setScanRefreshFailures\(0\)/.test(

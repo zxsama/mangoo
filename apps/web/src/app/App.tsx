@@ -69,6 +69,9 @@ import {
   type LibraryGridPreferences
 } from "../features/media-grid/gridPreferences";
 import { OnboardingHero } from "../features/onboarding/OnboardingHero";
+import {
+  shouldRequestActiveLibraryThumbnailRefresh
+} from "../features/notifications/notificationModel";
 import { useNotifications } from "../features/notifications/useNotifications";
 import {
   readStoredPreviewPreferences,
@@ -100,7 +103,7 @@ export function App() {
   const notifications = useNotifications();
   const notificationModel = notifications.compact;
   const [notificationAnchor, setNotificationAnchor] = useState<HTMLButtonElement | null>(null);
-  const notificationThumbnailRefreshRequestedRef = useRef(false);
+  const notificationThumbnailRefreshRequestedRef = useRef<string | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewDisplayedMediaId, setPreviewDisplayedMediaId] = useState<number | null>(null);
   const previewNavigationLockedRef = useRef(false);
@@ -123,11 +126,13 @@ export function App() {
   );
   const [libraryPhase, setLibraryPhase] = useState<LibraryLoadPhase>("starting-core");
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
   const [activeLibraryName, setActiveLibraryName] = useState<string>("Library");
   const [activeLibraryIcon, setActiveLibraryIcon] = useState<string | undefined>(undefined);
   const [activeLibraryColor, setActiveLibraryColor] = useState<string | undefined>(undefined);
   const hasLoadedActiveLibraryNameRef = useRef(false);
   const library = useLibraryData({
+    activeLibraryId,
     persistentThumbnailCacheAutoRefresh:
       previewPreferences.persistentThumbnailCacheAutoRefresh,
     thumbnailGenerationMode: previewPreferences.thumbnailGenerationMode
@@ -253,6 +258,7 @@ export function App() {
     void listLibraries().then((libraries) => {
       if (cancelled) return;
       const active = libraries.find((entry) => entry.active);
+      setActiveLibraryId(active?.id ?? null);
       setActiveLibraryName(active?.name ?? "Library");
       setActiveLibraryIcon(active?.icon);
       setActiveLibraryColor(active?.color);
@@ -374,24 +380,29 @@ export function App() {
 
   useEffect(() => {
     if (!notificationsOpen) {
-      notificationThumbnailRefreshRequestedRef.current = false;
+      notificationThumbnailRefreshRequestedRef.current = null;
       return;
     }
-    if (
-      library.thumbnailCacheStats ||
-      notificationModel.thumbnail.summaries.length > 0 ||
-      notificationThumbnailRefreshRequestedRef.current
-    ) {
+    if (!shouldRequestActiveLibraryThumbnailRefresh({
+      activeLibraryId,
+      summaries: notificationModel.thumbnail.summaries,
+      statsLibraryId: library.thumbnailCacheStatsLibraryId,
+      requestedLibraryId: notificationThumbnailRefreshRequestedRef.current
+    })) {
       return;
     }
-    notificationThumbnailRefreshRequestedRef.current = true;
+    const requestedLibraryId = activeLibraryId;
+    if (!requestedLibraryId) return;
+    notificationThumbnailRefreshRequestedRef.current = requestedLibraryId;
     queueMicrotask(() => {
+      if (notificationThumbnailRefreshRequestedRef.current !== requestedLibraryId) return;
       void library.refreshThumbnailCacheStats();
     });
   }, [
+    activeLibraryId,
     library.refreshThumbnailCacheStats,
-    library.thumbnailCacheStats,
-    notificationModel.thumbnail.summaries.length,
+    library.thumbnailCacheStatsLibraryId,
+    notificationModel.thumbnail.summaries,
     notificationsOpen
   ]);
 

@@ -14,7 +14,8 @@ import {
   mergeNotificationHistoryPages,
   notificationIndicator,
   processLogGapSequence,
-  progressView
+  progressView,
+  shouldRequestActiveLibraryThumbnailRefresh
 } from "../src/features/notifications/notificationModel.ts";
 import { createNotificationStore } from "../src/features/notifications/useNotifications.ts";
 import {
@@ -276,6 +277,67 @@ describe("notification reporting", () => {
     }
   });
 
+  it("reports a nested renderer failure exactly once with the owning context", async () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    const reports: unknown[] = [];
+    try {
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          listLibraries: async () => [
+            {
+              id: "lib-a",
+              name: "Artists",
+              dbPath: "artists.sqlite",
+              available: true,
+              active: true
+            }
+          ],
+          notifications: bridge({
+            reportError: async (input) => {
+              reports.push(input);
+              return true;
+            }
+          })
+        }
+      };
+
+      const cause = new Error("media reload failed");
+      reportLibraryError({
+        cause,
+        source: "media-load",
+        code: "reload-failed",
+        target: "folder:4",
+        message: cause.message
+      });
+      reportLibraryError({
+        cause,
+        source: "scan-refresh",
+        code: "refresh-failed",
+        target: "root:2",
+        message: cause.message
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.equal(reports.length, 1);
+      assert.deepEqual(reports[0], {
+        libraryId: "lib-a",
+        libraryName: "Artists",
+        source: "media-load",
+        code: "reload-failed",
+        target: "folder:4",
+        title: "Media load failed",
+        message: "media reload failed",
+        detail: null
+      });
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
+
   it("publishes shared thumbnail stats through the frozen Desktop summary contract", async () => {
     const previousWindow = (globalThis as { window?: unknown }).window;
     const summaries: unknown[] = [];
@@ -330,6 +392,22 @@ describe("notification reporting", () => {
           completionPercent: 80
         }
       ]);
+
+      publishThumbnailCacheStats(
+        {
+          cachedCount: 90,
+          missingCount: 5,
+          staleCount: 5,
+          failedCount: 0,
+          pendingCandidateCount: 10,
+          totalBlobBytes: 2048,
+          activeBulkTaskCount: 0
+        },
+        1001,
+        "lib-b"
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(summaries.length, 1);
     } finally {
       if (previousWindow === undefined) {
         delete (globalThis as { window?: unknown }).window;
@@ -341,6 +419,47 @@ describe("notification reporting", () => {
 });
 
 describe("notification selectors", () => {
+  it("requests one deferred thumbnail refresh for each active library", () => {
+    const summaries = [thumbnail("library-a")];
+
+    assert.equal(
+      shouldRequestActiveLibraryThumbnailRefresh({
+        activeLibraryId: "library-b",
+        summaries,
+        statsLibraryId: "library-a",
+        requestedLibraryId: "library-a"
+      }),
+      true
+    );
+    assert.equal(
+      shouldRequestActiveLibraryThumbnailRefresh({
+        activeLibraryId: "library-b",
+        summaries,
+        statsLibraryId: "library-a",
+        requestedLibraryId: "library-b"
+      }),
+      false
+    );
+    assert.equal(
+      shouldRequestActiveLibraryThumbnailRefresh({
+        activeLibraryId: "library-b",
+        summaries: [...summaries, thumbnail("library-b")],
+        statsLibraryId: "library-a",
+        requestedLibraryId: "library-a"
+      }),
+      false
+    );
+    assert.equal(
+      shouldRequestActiveLibraryThumbnailRefresh({
+        activeLibraryId: "library-b",
+        summaries,
+        statsLibraryId: "library-b",
+        requestedLibraryId: "library-a"
+      }),
+      false
+    );
+  });
+
   it("reports only Desktop-declared log gaps, not filtered sequence jumps", () => {
     assert.equal(
       processLogGapSequence({

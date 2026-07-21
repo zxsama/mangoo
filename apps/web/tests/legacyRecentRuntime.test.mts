@@ -28,8 +28,9 @@ describe("legacy Recent runtime removal", () => {
   });
 
   it("routes broad workspace status through the renderer notification boundary", () => {
-    assert.match(source, /publishThumbnailCacheStats\(stats\)/);
+    assert.match(source, /publishThumbnailCacheStats\(stats, Date\.now\(\), requestLibraryId\)/);
     assert.match(source, /reportLibraryError\(\{/);
+    assert.match(source, /thumbnailCacheStatsLibraryId/);
     assert.doesNotMatch(source, /\bsetError\b/);
     assert.doesNotMatch(source, /\berror:\s*string\s*\|\s*null/);
 
@@ -50,6 +51,8 @@ describe("legacy Recent runtime removal", () => {
     assert.doesNotMatch(libraryViewSource, /error-strip|library\.error/);
     assert.doesNotMatch(stylesSource, /\.error-strip\s*\{/);
     assert.match(appSource, /notificationThumbnailRefreshRequestedRef/);
+    assert.match(appSource, /shouldRequestActiveLibraryThumbnailRefresh/);
+    assert.match(appSource, /statsLibraryId: library\.thumbnailCacheStatsLibraryId/);
     assert.match(appSource, /queueMicrotask\(\(\)\s*=>/);
     assert.match(appSource, /library\.refreshThumbnailCacheStats\(\)/);
 
@@ -58,5 +61,12 @@ describe("legacy Recent runtime removal", () => {
       appSource.indexOf("const shellRightActions")
     );
     assert.doesNotMatch(deferredRefreshSection, /setInterval\(/);
+
+    const navigationReloadSection = source.slice(
+      source.indexOf("const selectLibraryFolder ="),
+      source.indexOf("const navigateFolderHistory =")
+    );
+    assert.match(navigationReloadSection, /\.catch\(\(\)\s*=>\s*undefined\)/);
+    assert.doesNotMatch(navigationReloadSection, /reportLibraryFailure\([\s\S]*navigation-load-failed/);
   });
 });

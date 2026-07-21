@@ -12,6 +12,8 @@ const ERROR_CODE_MAX_LENGTH = 128;
 const ERROR_TARGET_MAX_LENGTH = 512;
 const ERROR_MESSAGE_MAX_LENGTH = 4_000;
 const inFlightRendererErrorKeys = new Set<string>();
+// Preserve the first operation boundary when the same failure propagates through nested catches.
+const reportedRendererErrorCauses = new WeakSet<object>();
 
 export interface ThumbnailSummarySnapshot {
   libraryId: string;
@@ -31,6 +33,7 @@ export interface RendererErrorKeyInput {
 }
 
 export interface LibraryErrorReportInput extends RendererErrorKeyInput {
+  cause?: unknown;
   message: string;
 }
 
@@ -66,6 +69,9 @@ export function reportLibraryError(input: LibraryErrorReportInput): void {
   const notifications = bridge?.notifications;
   const normalized = normalizeLibraryError(input);
   if (!bridge || !notifications?.reportError || !normalized) return;
+  const cause = errorCauseObject(input.cause);
+  if (cause && reportedRendererErrorCauses.has(cause)) return;
+  if (cause) reportedRendererErrorCauses.add(cause);
   const dedupeKey = rendererErrorKey(normalized);
   if (inFlightRendererErrorKeys.has(dedupeKey)) return;
   inFlightRendererErrorKeys.add(dedupeKey);
@@ -89,7 +95,8 @@ export function reportLibraryError(input: LibraryErrorReportInput): void {
 
 export function publishThumbnailCacheStats(
   stats: ThumbnailCacheStatsResponse,
-  observedAt = Date.now()
+  observedAt = Date.now(),
+  expectedLibraryId?: string | null
 ): void {
   const bridge = desktopBridge();
   const notifications = bridge?.notifications;
@@ -98,6 +105,10 @@ export function publishThumbnailCacheStats(
   void (async () => {
     const library = await activeLibraryIdentity(bridge);
     if (!library) return;
+    const boundedExpectedLibraryId = expectedLibraryId
+      ? boundedString(expectedLibraryId, LIBRARY_ID_MAX_LENGTH)
+      : null;
+    if (boundedExpectedLibraryId && library.libraryId !== boundedExpectedLibraryId) return;
     const snapshot = thumbnailSummary(
       stats,
       library.libraryId,
@@ -165,6 +176,10 @@ function normalizeLibraryError(
 
 function normalizeDedupePart(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, "-");
+}
+
+function errorCauseObject(cause: unknown): object | null {
+  return typeof cause === "object" && cause !== null ? cause : null;
 }
 
 function rendererErrorTitle(source: string): string {
