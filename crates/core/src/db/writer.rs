@@ -1,4 +1,6 @@
 use std::any::Any;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -21,10 +23,77 @@ struct QueuedJob {
 /// the checkpoint (run by the actor between job batches) always gets its window.
 #[derive(Clone)]
 pub struct DbWriter {
+    inner: Arc<DbWriterInner>,
+}
+
+struct DbWriterInner {
     sender: mpsc::UnboundedSender<QueuedJob>,
     /// Process-stable identity for this actor (shared across clones), used for
     /// per-Core-instance bookkeeping like wakeup de-duplication.
     instance_id: usize,
+    notification_flush_signal: Arc<NotificationFlushSignal>,
+}
+
+impl Drop for DbWriterInner {
+    fn drop(&mut self) {
+        self.notification_flush_signal.notify();
+    }
+}
+
+pub(super) struct NotificationFlushSignal {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl NotificationFlushSignal {
+    pub(super) fn new() -> Self {
+        Self {
+            generation: Mutex::new(0),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub(super) fn notify(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = generation.wrapping_add(1);
+        self.changed.notify_one();
+    }
+
+    fn generation(&self) -> u64 {
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait_for_change(&self, observed: u64, timeout: Option<Duration>) -> bool {
+        let generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *generation != observed {
+            return true;
+        }
+        match timeout {
+            Some(timeout) => {
+                let (generation, _) = self
+                    .changed
+                    .wait_timeout_while(generation, timeout, |value| *value == observed)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *generation != observed
+            }
+            None => {
+                let generation = self
+                    .changed
+                    .wait_while(generation, |value| *value == observed)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *generation != observed
+            }
+        }
+    }
 }
 
 impl DbWriter {
@@ -32,21 +101,33 @@ impl DbWriter {
     pub fn spawn(database: Database) -> DbWriter {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT_INSTANCE_ID: AtomicUsize = AtomicUsize::new(1);
+        let notification_flush_signal = database.notification_flush_signal();
         let (sender, receiver) = mpsc::unbounded_channel::<QueuedJob>();
         std::thread::Builder::new()
             .name("megle-db-writer".to_string())
             .spawn(move || run_writer_actor(database, receiver))
             .expect("spawn db writer thread");
-        DbWriter {
-            sender,
-            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
-        }
+        let writer = DbWriter {
+            inner: Arc::new(DbWriterInner {
+                sender,
+                instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+                notification_flush_signal: Arc::clone(&notification_flush_signal),
+            }),
+        };
+        let scheduler_writer = Arc::downgrade(&writer.inner);
+        std::thread::Builder::new()
+            .name("megle-notification-flush".to_string())
+            .spawn(move || {
+                run_notification_flush_scheduler(scheduler_writer, notification_flush_signal)
+            })
+            .expect("spawn notification flush scheduler");
+        writer
     }
 
     /// A process-stable identity for this writer (and thus this Core instance).
     /// Clones share it; distinct actors differ.
     pub fn instance_id(&self) -> usize {
-        self.instance_id
+        self.inner.instance_id
     }
 
     /// Submit a write job and await its typed result. The closure runs on the
@@ -88,7 +169,8 @@ impl DbWriter {
         let job: WriteJob = Box::new(move |database| {
             op(database).map(|value| Box::new(value) as Box<dyn Any + Send>)
         });
-        self.sender
+        self.inner
+            .sender
             .send(QueuedJob { job, reply })
             .map_err(|_| anyhow::anyhow!("database writer is unavailable"))
     }
@@ -120,7 +202,64 @@ fn run_writer_actor(mut database: Database, mut receiver: mpsc::UnboundedReceive
             database.wal_size_bytes()
         );
     }
+    if let Err(error) = database.flush_dirty_notification_heads() {
+        tracing::warn!(%error, "writer shutdown notification flush failed");
+    }
     crate::debug_log!("writer actor exited (channel closed)");
+}
+
+fn run_notification_flush_scheduler(
+    writer: Weak<DbWriterInner>,
+    signal: Arc<NotificationFlushSignal>,
+) {
+    loop {
+        let observed = signal.generation();
+        let Some(inner) = writer.upgrade() else {
+            break;
+        };
+        let handle = DbWriter { inner };
+        let next_due =
+            handle.write_blocking(|database| database.next_dirty_notification_flush_at());
+        drop(handle);
+        let next_due = match next_due {
+            Ok(next_due) => next_due,
+            Err(error) => {
+                tracing::warn!(%error, "notification trailing-flush scheduling query failed");
+                if !signal.wait_for_change(observed, None) {
+                    continue;
+                }
+                continue;
+            }
+        };
+        let Some(next_due) = next_due else {
+            signal.wait_for_change(observed, None);
+            continue;
+        };
+        let now = crate::db::unix_timestamp_millis();
+        if next_due > now {
+            let timeout = Duration::from_millis((next_due - now) as u64);
+            if signal.wait_for_change(observed, Some(timeout)) {
+                continue;
+            }
+        }
+        let Some(inner) = writer.upgrade() else {
+            break;
+        };
+        let handle = DbWriter { inner };
+        let flush_at = crate::db::unix_timestamp_millis();
+        let flush_result =
+            handle.write_blocking(move |database| database.flush_due_notification_heads(flush_at));
+        drop(handle);
+        if let Err(error) = flush_result {
+            tracing::warn!(%error, "notification trailing flush failed");
+            let failed_generation = signal.generation();
+            let Some(liveness) = writer.upgrade() else {
+                break;
+            };
+            drop(liveness);
+            signal.wait_for_change(failed_generation, None);
+        }
+    }
 }
 
 fn run_one(database: &mut Database, queued: QueuedJob) {
@@ -138,7 +277,190 @@ fn run_one(database: &mut Database, queued: QueuedJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::notification_outbox::{NotificationOperation, PublishMode};
     use crate::db::Database;
+
+    fn notification_operation(operation_id: &str, updated_at: i64) -> NotificationOperation {
+        NotificationOperation {
+            operation_id: operation_id.to_string(),
+            revision: 0,
+            kind: "root_scan".to_string(),
+            category: "task".to_string(),
+            origin: "user".to_string(),
+            presentation: "important".to_string(),
+            status: "running".to_string(),
+            phase: Some("working".to_string()),
+            title: "Scan".to_string(),
+            summary: None,
+            task_id: Some(1),
+            root_id: Some(1),
+            folder_id: None,
+            file_id: None,
+            current_value: 0,
+            total_value: Some(100),
+            unit: Some("items".to_string()),
+            error_code: None,
+            error_detail: None,
+            cancellable: true,
+            retryable: false,
+            attempt: 1,
+            occurrence_count: 1,
+            started_at: updated_at,
+            updated_at,
+            completed_at: None,
+        }
+    }
+
+    async fn publish_notification(
+        writer: &DbWriter,
+        mut operation: NotificationOperation,
+        mode: PublishMode,
+    ) -> NotificationOperation {
+        writer
+            .write(move |database| {
+                database.publish_notification_operation(&mut operation, mode)?;
+                Ok(operation)
+            })
+            .await
+            .expect("publish notification")
+    }
+
+    async fn wait_for_notification_revision(
+        writer: &DbWriter,
+        revision: i64,
+    ) -> Vec<crate::db::notification_outbox::NotificationOutboxEvent> {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let events = writer
+                    .write(|database| database.list_notification_outbox(0, 200))
+                    .await
+                    .expect("list notification outbox");
+                if events
+                    .last()
+                    .is_some_and(|event| event.operation.revision >= revision)
+                {
+                    return events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("notification trailing flush must complete")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notification_progress_scheduler_flushes_the_latest_burst_value() {
+        let mut database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        database.set_notification_progress_interval_for_test(500);
+        let writer = DbWriter::spawn(database);
+        let mut operation =
+            notification_operation("task:trailing-burst", crate::db::unix_timestamp_millis());
+        operation = publish_notification(&writer, operation, PublishMode::Phase).await;
+        for value in 1..=20 {
+            operation.current_value = value;
+            operation.updated_at = crate::db::unix_timestamp_millis();
+            operation = publish_notification(&writer, operation, PublishMode::Progress).await;
+        }
+
+        let events = wait_for_notification_revision(&writer, operation.revision).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "the burst should produce one trailing event"
+        );
+        assert_eq!(events.last().unwrap().operation.current_value, 20);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notification_progress_scheduler_flushes_continuous_updates_each_window() {
+        let mut database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        database.set_notification_progress_interval_for_test(30);
+        let writer = DbWriter::spawn(database);
+        let mut operation =
+            notification_operation("task:continuous", crate::db::unix_timestamp_millis());
+        operation = publish_notification(&writer, operation, PublishMode::Phase).await;
+        for value in 1..=9 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            operation.current_value = value;
+            operation.updated_at = crate::db::unix_timestamp_millis();
+            operation = publish_notification(&writer, operation, PublishMode::Progress).await;
+        }
+
+        let events = wait_for_notification_revision(&writer, operation.revision).await;
+        assert!(
+            events.len() >= 3,
+            "continuous progress should flush once per window"
+        );
+        assert_eq!(events.last().unwrap().operation.current_value, 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_notification_cancels_the_pending_progress_flush() {
+        let mut database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        database.set_notification_progress_interval_for_test(80);
+        let writer = DbWriter::spawn(database);
+        let mut operation =
+            notification_operation("task:terminal-cancels", crate::db::unix_timestamp_millis());
+        operation = publish_notification(&writer, operation, PublishMode::Phase).await;
+        operation.current_value = 1;
+        operation.updated_at = crate::db::unix_timestamp_millis();
+        operation = publish_notification(&writer, operation, PublishMode::Progress).await;
+        operation.status = "succeeded".to_string();
+        operation.completed_at = Some(crate::db::unix_timestamp_millis());
+        operation.updated_at = operation.completed_at.unwrap();
+        operation = publish_notification(&writer, operation, PublishMode::Terminal).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+        let events = writer
+            .write(|database| database.list_notification_outbox(0, 200))
+            .await
+            .expect("list notification outbox");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.operation.revision)
+                .collect::<Vec<_>>(),
+            vec![1, operation.revision]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reopened_notification_producer_cannot_lose_the_scheduler_wake() {
+        let dir = std::env::temp_dir().join(format!(
+            "megle-notification-wake-{}-{}",
+            std::process::id(),
+            crate::db::unix_timestamp_millis()
+        ));
+        std::fs::create_dir_all(&dir).expect("create notification test dir");
+        let db_path = dir.join("wake.sqlite");
+        let mut database = Database::open(&db_path).expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        database.set_notification_progress_interval_for_test(40);
+        let producer = database
+            .reopen()
+            .expect("reopen producer")
+            .expect("file database");
+        let writer = DbWriter::spawn(database);
+        let mut operation =
+            notification_operation("task:reopened-producer", crate::db::unix_timestamp_millis());
+        producer
+            .publish_notification_operation(&mut operation, PublishMode::Phase)
+            .expect("publish phase from reopened connection");
+        operation.current_value = 7;
+        operation.updated_at = crate::db::unix_timestamp_millis();
+        producer
+            .publish_notification_operation(&mut operation, PublishMode::Progress)
+            .expect("publish dirty progress from reopened connection");
+
+        let events = wait_for_notification_revision(&writer, operation.revision).await;
+        assert_eq!(events.last().unwrap().operation.current_value, 7);
+        drop(producer);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_completes_over_a_file_db_with_a_concurrent_writer_connection() {

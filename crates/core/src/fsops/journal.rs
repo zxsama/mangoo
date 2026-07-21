@@ -444,9 +444,7 @@ pub(super) fn begin_test_group(
         PublishMode::Phase,
     )?;
     transaction.commit()?;
-    if appended {
-        guard.notification_outbox_wake().notify_waiters();
-    }
+    guard.notification_operation_committed(appended);
     Ok(group_id)
 }
 
@@ -1758,9 +1756,7 @@ fn persist_intents(
         false
     };
     transaction.commit()?;
-    if phase_appended || state_appended {
-        database.notification_outbox_wake().notify_waiters();
-    }
+    database.notification_operation_committed(phase_appended || state_appended);
     Ok(PersistedBatch {
         intents,
         first_error,
@@ -1854,9 +1850,7 @@ fn finalize_intent(
     let appended = publish_group_state_in_transaction(database, &transaction, &intent.group_id)?;
     let record = operation_record_in_transaction(&transaction, intent.id)?;
     transaction.commit()?;
-    if appended {
-        database.notification_outbox_wake().notify_waiters();
-    }
+    database.notification_operation_committed(appended);
     Ok(record)
 }
 

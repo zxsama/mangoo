@@ -51,6 +51,8 @@ pub struct Database {
     connection: Connection,
     path: Option<PathBuf>,
     notification_outbox_wake: Arc<tokio::sync::Notify>,
+    notification_flush_signal: Arc<writer::NotificationFlushSignal>,
+    notification_progress_interval_ms: i64,
 }
 
 pub struct NewRoot {
@@ -688,13 +690,21 @@ impl Database {
     }
 
     fn from_connection(connection: Connection, path: Option<PathBuf>) -> anyhow::Result<Self> {
-        Self::from_connection_with_wake(connection, path, Arc::new(tokio::sync::Notify::new()))
+        Self::from_connection_with_notification_state(
+            connection,
+            path,
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(writer::NotificationFlushSignal::new()),
+            notification_outbox::DEFAULT_PROGRESS_EMIT_INTERVAL_MS,
+        )
     }
 
-    fn from_connection_with_wake(
+    fn from_connection_with_notification_state(
         connection: Connection,
         path: Option<PathBuf>,
         notification_outbox_wake: Arc<tokio::sync::Notify>,
+        notification_flush_signal: Arc<writer::NotificationFlushSignal>,
+        notification_progress_interval_ms: i64,
     ) -> anyhow::Result<Self> {
         // Set busy_timeout BEFORE any other operation so the busy handler
         // is registered for every subsequent SQL statement, including the
@@ -710,6 +720,8 @@ impl Database {
             connection,
             path,
             notification_outbox_wake,
+            notification_flush_signal,
+            notification_progress_interval_ms,
         })
     }
 
@@ -718,10 +730,12 @@ impl Database {
             return Ok(None);
         };
         let connection = Connection::open(path)?;
-        Self::from_connection_with_wake(
+        Self::from_connection_with_notification_state(
             connection,
             Some(path.clone()),
             Arc::clone(&self.notification_outbox_wake),
+            Arc::clone(&self.notification_flush_signal),
+            self.notification_progress_interval_ms,
         )
         .map(Some)
     }
@@ -730,6 +744,23 @@ impl Database {
     /// Reopened connections for the same Core instance intentionally share it.
     pub fn notification_outbox_wake(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.notification_outbox_wake)
+    }
+
+    fn notification_flush_signal(&self) -> Arc<writer::NotificationFlushSignal> {
+        Arc::clone(&self.notification_flush_signal)
+    }
+
+    pub(crate) fn notification_operation_committed(&self, appended: bool) {
+        if appended {
+            self.notification_outbox_wake.notify_waiters();
+        }
+        self.notification_flush_signal.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_notification_progress_interval_for_test(&mut self, interval_ms: i64) {
+        assert!(interval_ms > 0);
+        self.notification_progress_interval_ms = interval_ms;
     }
 
     fn publish_task_notification_in_transaction(
@@ -828,9 +859,7 @@ impl Database {
     }
 
     fn publish_task_notification_after_commit(&self, appended: bool) {
-        if appended {
-            self.notification_outbox_wake.notify_waiters();
-        }
+        self.notification_operation_committed(appended);
     }
 
     #[cfg(test)]

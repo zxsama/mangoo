@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::Database;
 
 const MAX_OUTBOX_PAGE: i64 = 200;
-const PROGRESS_EMIT_INTERVAL_MS: i64 = 1_000;
+pub(super) const DEFAULT_PROGRESS_EMIT_INTERVAL_MS: i64 = 1_000;
 
 /// The complete logical operation snapshot persisted in a head and delivered
 /// through the Outbox. Strings intentionally mirror the Core API contract so
@@ -78,9 +78,7 @@ impl Database {
         let appended =
             self.publish_notification_operation_in_transaction(&transaction, operation, mode)?;
         transaction.commit()?;
-        if appended {
-            self.notification_outbox_wake.notify_waiters();
-        }
+        self.notification_operation_committed(appended);
         Ok(appended)
     }
 
@@ -114,7 +112,12 @@ impl Database {
                 (revision.saturating_add(1), last_outbox_at)
             })
             .unwrap_or((1, None));
-        let append = should_emit(mode, previous_last_outbox_at, operation.updated_at);
+        let append = should_emit(
+            mode,
+            previous_last_outbox_at,
+            operation.updated_at,
+            self.notification_progress_interval_ms,
+        );
         let dirty = !append;
         operation.revision = next_revision;
         let payload_json =
@@ -201,9 +204,26 @@ impl Database {
     /// Emit the latest state of every throttled head without creating another
     /// logical revision. This is used by recovery/periodic flush paths.
     pub fn flush_dirty_notification_heads(&self) -> anyhow::Result<usize> {
+        self.flush_notification_heads(None)
+    }
+
+    pub(crate) fn flush_due_notification_heads(&self, now_ms: i64) -> anyhow::Result<usize> {
+        self.flush_notification_heads(Some(now_ms))
+    }
+
+    pub(crate) fn next_dirty_notification_flush_at(&self) -> anyhow::Result<Option<i64>> {
+        Ok(self.connection.query_row(
+            "SELECT MIN(COALESCE(last_outbox_at, updated_at) + ?1) FROM notification_operation_heads WHERE dirty = 1",
+            [self.notification_progress_interval_ms],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn flush_notification_heads(&self, due_at: Option<i64>) -> anyhow::Result<usize> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let dirty_heads = collect_dirty_heads(&transaction)?;
+        let dirty_heads =
+            collect_dirty_heads(&transaction, due_at, self.notification_progress_interval_ms)?;
         let mut appended = 0usize;
         for (operation_id, revision, payload_json, updated_at) in dirty_heads {
             let operation = deserialize_operation(&payload_json, Some(&operation_id))?;
@@ -213,12 +233,13 @@ impl Database {
                     operation_id
                 ));
             }
-            if append_event_if_missing_in_transaction(&transaction, &operation, updated_at)? {
+            let emitted_at = due_at.unwrap_or(updated_at);
+            if append_event_if_missing_in_transaction(&transaction, &operation, emitted_at)? {
                 appended += 1;
             }
             transaction.execute(
                 "UPDATE notification_operation_heads SET dirty = 0, last_outbox_at = ?2 WHERE operation_id = ?1 AND revision = ?3",
-                params![operation_id, updated_at, revision],
+                params![operation_id, emitted_at, revision],
             )?;
         }
         transaction.commit()?;
@@ -263,11 +284,16 @@ impl Database {
     }
 }
 
-fn should_emit(mode: PublishMode, previous_last_outbox_at: Option<i64>, now_ms: i64) -> bool {
+fn should_emit(
+    mode: PublishMode,
+    previous_last_outbox_at: Option<i64>,
+    now_ms: i64,
+    progress_emit_interval_ms: i64,
+) -> bool {
     match mode {
         PublishMode::Phase | PublishMode::Terminal => true,
         PublishMode::Progress => previous_last_outbox_at
-            .map(|last| now_ms.saturating_sub(last) >= PROGRESS_EMIT_INTERVAL_MS)
+            .map(|last| now_ms.saturating_sub(last) >= progress_emit_interval_ms)
             .unwrap_or(true),
     }
 }
@@ -322,12 +348,14 @@ fn deserialize_operation(
 
 fn collect_dirty_heads(
     transaction: &Transaction<'_>,
+    due_at: Option<i64>,
+    progress_emit_interval_ms: i64,
 ) -> anyhow::Result<Vec<(String, i64, String, i64)>> {
     let mut statement = transaction.prepare(
-        "SELECT operation_id, revision, payload_json, updated_at FROM notification_operation_heads WHERE dirty = 1 ORDER BY updated_at ASC, operation_id ASC",
+        "SELECT operation_id, revision, payload_json, updated_at FROM notification_operation_heads WHERE dirty = 1 AND (?1 IS NULL OR COALESCE(last_outbox_at, updated_at) + ?2 <= ?1) ORDER BY updated_at ASC, operation_id ASC",
     )?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params![due_at, progress_emit_interval_ms], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
@@ -465,7 +493,7 @@ mod tests {
         assert!(db
             .publish_notification_operation(&mut operation, PublishMode::Phase)
             .unwrap());
-        operation.updated_at += PROGRESS_EMIT_INTERVAL_MS;
+        operation.updated_at += DEFAULT_PROGRESS_EMIT_INTERVAL_MS;
         assert!(db
             .publish_notification_operation(&mut operation, PublishMode::Progress)
             .unwrap());
