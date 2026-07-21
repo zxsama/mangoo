@@ -1047,6 +1047,93 @@ describe("notification service", () => {
     }
   });
 
+  it("backs off 1,000 upstream AbortErrors before the legacy import succeeds", async () => {
+    const store = new FakeStore();
+    let legacyRequests = 0;
+    const delays: number[] = [];
+    let importCompleted!: () => void;
+    const imported = new Promise<void>((resolve) => {
+      importCompleted = resolve;
+    });
+    const importLegacyOperations = store.importLegacyOperations.bind(store);
+    store.importLegacyOperations = async (...args) => {
+      const result = await importLegacyOperations(...args);
+      if (result) importCompleted();
+      return result;
+    };
+    const service = await createNotificationService({
+      store,
+      fetch: async (input, init) => {
+        if (!String(input).includes("/file-ops?")) return waitForAbort(init?.signal);
+        legacyRequests += 1;
+        if (legacyRequests <= 1_000) {
+          throw new DOMException("upstream request aborted itself", "AbortError");
+        }
+        return response({ items: [], nextCursor: null });
+      },
+      retryDelay: async (delay, signal) => {
+        if (signal.aborted) throw signal.reason;
+        delays.push(delay);
+      },
+      now: () => NOW
+    });
+
+    try {
+      await service.attachLibrary(LIBRARY_A, SESSION_A);
+      await Promise.race([
+        imported,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("legacy AbortErrors were not retried")), 500)
+        )
+      ]);
+      assert.equal(legacyRequests, 1_001);
+      assert.equal(delays.length, 1_000, "every active AbortError must enter backoff");
+      assert.deepEqual(delays.slice(0, 6), [250, 500, 1_000, 2_000, 4_000, 5_000]);
+      assert.equal(delays.at(-1), 5_000);
+      assert.equal(store.imported.has(LIBRARY_A.id), true);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("treats a switch-aborted legacy request as lifecycle cancellation without retry", async () => {
+    const store = new FakeStore();
+    store.imported.add(LIBRARY_B.id);
+    let legacyRequests = 0;
+    let retryCalls = 0;
+    let legacyReadStarted!: () => void;
+    const legacyRead = new Promise<void>((resolve) => {
+      legacyReadStarted = resolve;
+    });
+    const service = await createNotificationService({
+      store,
+      fetch: async (input, init) => {
+        if (!String(input).includes("/file-ops?")) return waitForAbort(init?.signal);
+        legacyRequests += 1;
+        legacyReadStarted();
+        return waitForAbort(init?.signal);
+      },
+      retryDelay: async (_delay, signal) => {
+        retryCalls += 1;
+        if (signal.aborted) throw signal.reason;
+      },
+      now: () => NOW
+    });
+
+    try {
+      await service.attachLibrary(LIBRARY_A, SESSION_A);
+      await legacyRead;
+      await service.attachLibrary(LIBRARY_B, SESSION_B);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(legacyRequests, 1);
+      assert.equal(retryCalls, 0);
+      assert.equal(store.imported.has(LIBRARY_A.id), false);
+    } finally {
+      await service.close();
+    }
+  });
+
   it("caps sustained legacy retry backoff without a busy loop", async () => {
     const store = new FakeStore();
     const delays: number[] = [];

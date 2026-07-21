@@ -990,7 +990,7 @@ export class NotificationService {
           active.controller.signal
         );
       } catch (error) {
-        if (isAbort(error, active.controller.signal)) return;
+        if (!this.isCurrentActive(active)) return;
         this.setHealth(
           this.store ? "syncing" : "degraded",
           active.library.id,
