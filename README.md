@@ -8,6 +8,12 @@ Current phase: Phase 1 skeleton. The repository is contract-first so the Electro
 
 Megle includes a persistent all-library notification center with aggregated task progress and local process logs. Notification history survives library switches and desktop restarts while active work remains grouped into concise operation-level status.
 
+### Capabilities
+
+- **Scope**: `all-library-persistent`
+- **Progress**: `aggregated-logical-task-progress`
+- **Logs**: `local-process-logs`
+
 ## Start Here
 
 - [Docs index](docs/README.md)

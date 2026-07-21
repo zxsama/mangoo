@@ -233,6 +233,12 @@ Web apps/web/src/features/notifications/ -> compact status, full history/actions
 - **Typed preload boundary:** renderer code uses the `packages/notification-contract` (`@megle/notification-contract`) bridge for compact snapshots, paged history/facets, cancel/retry actions, change subscriptions, and snapshot-plus-subscribe process logs. Do not bypass IPC with renderer-owned notification transport.
 - **Web constraints:** no raw fetch for notification data, no notification polling, and no per-thumbnail notifications. Thumbnail activity is aggregated by library, while every background operation declares one logical grouping key and one presentation class (`important`, `history_only`, or `status_only`).
 
+#### Retired Surfaces
+
+- **Task Center**: `retired`
+- **Task Drawer**: `retired`
+- **Recent Ops Panel**: `retired`
+
 ## Next Execution Order
 
 1. Execute the integrated complete-product plan at `docs/superpowers/plans/2026-05-16-megle-complete-product-plan.md`, starting with the UI foundation track.

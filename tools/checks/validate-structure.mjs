@@ -75,7 +75,7 @@ function requireDocumentSection(documentPath, headingAliases, requiredMarkers = 
   return section;
 }
 
-function normalizedGuidanceText(source) {
+function normalizedContractToken(source) {
   return source
     .normalize("NFKC")
     .toLocaleLowerCase()
@@ -84,82 +84,204 @@ function normalizedGuidanceText(source) {
     .trim();
 }
 
-function markdownGuidanceStatements(document) {
+function markdownSections(document) {
   const lines = document.replace(/<!--[\s\S]*?-->/g, "").split("\n");
-  const headings = [];
-  const statements = [];
+  const sections = [];
+  const stack = [];
+  let inCodeFence = false;
+
   for (const line of lines) {
-    const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
-    if (heading) {
-      const level = heading[1].length;
-      headings.length = level - 1;
-      headings[level - 1] = heading[2];
-      statements.push(headings.filter(Boolean).join(" "));
+    if (/^\s*```/.test(line)) {
+      inCodeFence = !inCodeFence;
+      if (stack.length > 0) stack.at(-1).lines.push(line);
       continue;
     }
-    const content = line.trim();
-    if (!content) continue;
-    for (const sentence of content.split(/[.!?。！？;；]+/)) {
-      const trimmed = sentence.trim();
-      if (trimmed) statements.push([...headings.filter(Boolean), trimmed].join(" "));
+    const heading = inCodeFence ? null : line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      const level = heading[1].length;
+      while (stack.length > 0 && stack.at(-1).level >= level) stack.pop();
+      const section = {
+        heading: heading[2],
+        level,
+        lines: [],
+        parent: stack.at(-1) ?? null
+      };
+      sections.push(section);
+      stack.push(section);
+      continue;
+    }
+    if (stack.length > 0) stack.at(-1).lines.push(line);
+  }
+
+  return sections;
+}
+
+function headingMatches(section, aliases) {
+  const heading = normalizedContractToken(section.heading);
+  return aliases.some((alias) => heading === normalizedContractToken(alias));
+}
+
+function hasHistoricalOrArchivedContext(section) {
+  for (let current = section; current; current = current.parent) {
+    if (/^(?:historical|archived)(?:\s|$)|^(?:历史|归档|已归档)/u.test(normalizedContractToken(current.heading))) {
+      return true;
     }
   }
-  return statements;
+  return false;
 }
 
-function findRetiredSurfaceRequirement(document) {
-  const surfacePatterns = [
-    /(?<![\p{L}\p{N}_-])task(?:[\s-]+)?(?:drawers?|centers?)(?![\p{L}\p{N}_-])/iu,
-    /(?<![\p{L}\p{N}_-])recent(?:[\s-]+)?(?:ops|operations)(?:[\s-]+)?(?:panels?|drawers?)(?![\p{L}\p{N}_-])/iu,
-    /(?:任务抽屉|任务中心|最近操作(?:面板|抽屉))/u
-  ];
-  const retiredSurfaceProhibition =
-    /\b(?:(?:(?:do|must|should)\s+not|never)\s+(?:be\s+)?(?:reintroduce(?:d)?|restore(?:d)?|use(?:d)?|add(?:ed)?|render(?:ed)?|open(?:ed)?|implement(?:ed)?|require(?:d)?|provide(?:d)?|keep|kept|show(?:n)?|bring\s+back|brought\s+back)|avoid\s+(?:reintroducing|restoring|using|adding|rendering|opening|implementing|requiring|providing|keeping|showing|bringing\s+back))\b|(?:(?:不要|不得|禁止)(?:再|重新)?|不再)(?:引入|恢复|使用|添加|提供|保留|展示|打开|实现|要求)/u;
-  const explicitRetiredStatus =
-    /\b(?:must|should|will)\s+(?:remain|stay)\s+(?:retired|removed|replaced|superseded|deprecated)\b|(?:必须|应该|将)(?:保持|继续)(?:退役|已移除|已删除|已取代|已替换)/u;
-  const historicalContext =
-    /\b(?:historical|history|legacy|retired|removed|replaced|superseded|deprecated|formerly|previously|no\s+longer)\b|(?:历史|旧版|退役|已移除|已删除|已取代|已替换|不再)/u;
-  const positiveRequirement =
-    /\b(?:must|should|required|require|use|restore|reintroduce|add|provide|keep|show|render|open|implement)\b|(?:必须|应该|需要|使用|恢复|重新引入|添加|提供|保留|展示|打开|实现)/u;
+const currentClaudeHeadings = new Set([
+  "project overview",
+  "web ui layout",
+  "approved ui direction",
+  "anti-patterns to avoid",
+  "current guidance",
+  "unified notification center",
+  "next execution order",
+  "项目概览",
+  "web ui 布局",
+  "已批准 ui 方向",
+  "需避免的反模式",
+  "当前指导",
+  "统一通知中心",
+  "下一执行顺序"
+]);
 
-  for (const statement of markdownGuidanceStatements(document)) {
-    const normalized = normalizedGuidanceText(statement);
-    const matchedSurface = surfacePatterns.map((pattern) => normalized.match(pattern)?.[0]).find(Boolean);
-    if (!matchedSurface) continue;
-    if (retiredSurfaceProhibition.test(normalized) || explicitRetiredStatus.test(normalized)) continue;
-    if (historicalContext.test(normalized) && !positiveRequirement.test(normalized)) continue;
-    return matchedSurface;
+function isCurrentClaudeSection(section) {
+  const heading = normalizedContractToken(section.heading);
+  return (
+    currentClaudeHeadings.has(heading) ||
+    /^(?:current implementation state|phase summary)(?:\s|\(|（|$)/u.test(heading) ||
+    /^(?:(?:historical|archived)\s+phase summary)(?:\s|\(|（|$)/u.test(heading) ||
+    /^(?:当前实现状态|阶段摘要|(?:历史|归档)阶段摘要)(?:\s|\(|（|$)/u.test(heading)
+  );
+}
+
+const retiredSurfaceDefinitions = [
+  {
+    label: "Task Center",
+    pattern: /(?<![\p{L}\p{N}_-])task(?:[\s-]+)?centers?(?![\p{L}\p{N}_-])/iu
+  },
+  {
+    label: "Task Drawer",
+    pattern: /(?<![\p{L}\p{N}_-])task(?:[\s-]+)?drawers?(?![\p{L}\p{N}_-])/iu
+  },
+  {
+    label: "Recent Ops Panel",
+    pattern:
+      /(?<![\p{L}\p{N}_-])recent(?:[\s-]+)?(?:ops|operations)(?:[\s-]+)?(?:panels?|drawers?)(?![\p{L}\p{N}_-])/iu
   }
-  return null;
+];
+
+function parseVisibleKeyValueItems(section) {
+  const items = [];
+  for (const line of section.lines) {
+    const visibleLine = line.replace(/[*_`]/g, "").trim();
+    const item = visibleLine.match(/^[-+*]\s*([^:：]+?)\s*[:：]\s*(\S(?:.*\S)?)\s*$/u);
+    if (!item) continue;
+    items.push({
+      key: normalizedContractToken(item[1]),
+      value: normalizedContractToken(item[2])
+    });
+  }
+  return items;
 }
 
-function missingNotificationReadmeConcepts(section) {
-  const normalized = normalizedGuidanceText(section);
-  const crossLibrary =
-    /\b(?:all|every|cross)[\s-]+librar(?:y|ies)\b/u.test(normalized) ||
-    /\bacross\s+(?:(?:all|every)\s+)?librar(?:y|ies)\b/u.test(normalized) ||
-    /(?:跨(?:资源|资料)?库|全(?:资源|资料)?库|所有(?:资源|资料)?库)/u.test(normalized);
-  const persistent =
-    /\b(?:persist\w*|durable)\b/u.test(normalized) ||
-    /(?:持久化|持久|持续保留|重启后(?:仍|继续)?保留)/u.test(normalized);
-  const aggregation =
-    /\b(?:aggregat\w*|group\w*|consolidat\w*|summari[sz]\w*)\b/u.test(normalized) ||
-    /(?:聚合|汇总|合并|归并)/u.test(normalized);
-  const task =
-    /\b(?:tasks?|background\s+(?:work|jobs?|operations?))\b/u.test(normalized) ||
-    /(?:任务|后台(?:工作|任务|操作))/u.test(normalized);
-  const progress = /\bprogress\b/u.test(normalized) || /进度/u.test(normalized);
-  const local = /\blocal(?:ly)?\b/u.test(normalized) || /(?:本地|本机|会话内)/u.test(normalized);
-  const processLogs =
-    /\b(?:process(?:es)?|runtime|application)\s+logs?\b/u.test(normalized) ||
-    /\blogs?\s+(?:from\s+)?(?:the\s+)?(?:local(?:ly)?\s+)?(?:process(?:es)?|runtime|application)\b/u.test(normalized) ||
-    /(?:进程日志|运行日志)/u.test(normalized);
+function validateStructuredItems(section, specifications, contractName) {
+  const items = section ? parseVisibleKeyValueItems(section) : [];
+  const failures = [];
+  for (const specification of specifications) {
+    const keys = new Set(specification.keys.map(normalizedContractToken));
+    const matches = items.filter((item) => keys.has(item.key));
+    if (matches.length !== 1) {
+      failures.push(`${contractName} requires exactly one ${specification.label} item`);
+      continue;
+    }
+    const values = new Set(specification.values.map(normalizedContractToken));
+    if (!values.has(matches[0].value)) {
+      failures.push(`${contractName} ${specification.label} item has invalid value`);
+    }
+  }
+  return failures;
+}
 
-  const missing = [];
-  if (!crossLibrary || !persistent) missing.push("persistent all-library");
-  if (!aggregation || !task || !progress) missing.push("aggregated task progress");
-  if (!local || !processLogs) missing.push("local process logs");
-  return missing;
+const retiredSurfaceItemSpecifications = retiredSurfaceDefinitions.map(({ label }) => ({
+  label,
+  keys: [label],
+  values: ["retired", "已退役"]
+}));
+
+function validateClaudeRetiredSurfaceContract(document) {
+  const sections = markdownSections(document);
+  const failures = [];
+
+  for (const section of sections) {
+    if (!isCurrentClaudeSection(section) || hasHistoricalOrArchivedContext(section)) continue;
+    for (let lineIndex = 0; lineIndex < section.lines.length; lineIndex += 1) {
+      const line = normalizedContractToken(section.lines[lineIndex].replace(/[*_`]/g, ""));
+      for (const surface of retiredSurfaceDefinitions) {
+        if (surface.pattern.test(line)) {
+          failures.push(
+            `CLAUDE.md section ${section.heading} line ${lineIndex + 1} mentions retired surface ${surface.label} outside Retired Surfaces`
+          );
+        }
+      }
+    }
+  }
+
+  const unifiedSections = sections.filter(
+    (section) =>
+      headingMatches(section, ["Unified Notification Center", "统一通知中心"]) &&
+      !hasHistoricalOrArchivedContext(section)
+  );
+  const unifiedSection = unifiedSections[0] ?? null;
+  const retiredSections = sections.filter(
+    (section) =>
+      headingMatches(section, ["Retired Surfaces", "已退役界面"]) && section.parent === unifiedSection
+  );
+  const retiredSection = retiredSections.length === 1 ? retiredSections[0] : null;
+  failures.push(
+    ...validateStructuredItems(
+      retiredSection,
+      retiredSurfaceItemSpecifications,
+      "CLAUDE.md Unified Notification Center Retired Surfaces"
+    )
+  );
+  return failures;
+}
+
+const readmeCapabilitySpecifications = [
+  {
+    label: "Scope",
+    keys: ["Scope", "范围"],
+    values: ["all-library-persistent", "persistent-all-library", "跨库持久化", "全库持久化"]
+  },
+  {
+    label: "Progress",
+    keys: ["Progress", "进度"],
+    values: ["aggregated-logical-task-progress", "聚合逻辑任务进度"]
+  },
+  {
+    label: "Logs",
+    keys: ["Logs", "日志"],
+    values: ["local-process-logs", "本地进程日志"]
+  }
+];
+
+function validateReadmeNotificationCapabilities(document) {
+  const sections = markdownSections(document);
+  const unifiedSection = sections.find((section) =>
+    headingMatches(section, ["Unified Notification Center", "统一通知中心"])
+  );
+  const capabilitySections = sections.filter(
+    (section) => headingMatches(section, ["Capabilities", "能力"]) && section.parent === unifiedSection
+  );
+  const capabilitySection = capabilitySections.length === 1 ? capabilitySections[0] : null;
+  return validateStructuredItems(
+    capabilitySection,
+    readmeCapabilitySpecifications,
+    "README.md Unified Notification Center Capabilities"
+  );
 }
 
 function assertMarkdownSectionContracts() {
@@ -185,76 +307,99 @@ after-marker
   }
 }
 
-function assertRetiredSurfaceGuidanceContracts() {
-  for (const requiredGuidance of [
-    "Use the Task Drawer for active work.",
-    "Task-Drawers are required for background jobs.",
-    "TaskCenter is required for background jobs.",
-    "The task-center is required for background jobs.",
-    "Render the Recent Ops Panel beside the library.",
-    "RecentOpsPanel should be used beside the library.",
-    "Show the Recent Ops Drawer beside the library.",
-    "Recent-Operations Panels are required for audit history.",
-    "Open the recent-operations drawer for audit history.",
-    "The legacy Task Center should be restored.",
-    "Avoid removing the Task Drawer.",
-    "The Task Center must not be removed.",
-    "不要移除任务抽屉。"
-  ]) {
-    if (findRetiredSurfaceRequirement(requiredGuidance) === null) {
-      fail(`retired surface guidance guard must reject: ${requiredGuidance}`);
+function assertSectionScopedRetiredSurfaceContracts() {
+  const retiredEntries = `
+#### Retired Surfaces
+- **Task Center**: \`retired\`
+- **Task Drawer**: \`retired\`
+- **Recent Ops Panel**: \`retired\`
+`;
+  const validDocument = `
+## Current Guidance
+Background work is presented through the unified notification center.
+## Historical Phase Summary
+The Task Drawer displayed active work and the Recent Ops Panel displayed audit history.
+## Unified Notification Center
+One operation-level pipeline owns current presentation.
+${retiredEntries}
+## Archived Notes
+The Task Center was the required surface in the archived design.
+`;
+  if (validateClaudeRetiredSurfaceContract(validDocument).length !== 0) {
+    fail("retired surface contract must accept structured declarations and skip Historical/Archived sections");
+  }
+
+  const mixedGuidance = `
+## Historical Phase Summary
+The Task Center was the primary task surface.
+## Unified Notification Center
+Do not reintroduce the Recent Ops Panel, but the Task Center is required for active work.
+${retiredEntries}
+`;
+  const mixedFailures = validateClaudeRetiredSurfaceContract(mixedGuidance);
+  for (const surface of ["Task Center", "Recent Ops Panel"]) {
+    if (!mixedFailures.some((failure) => failure.includes(surface))) {
+      fail(`retired surface contract must report each surface independently: ${surface}`);
     }
   }
-  for (const allowedGuidance of [
-    "### Historical Design\nThe Task Drawer and Task Center were replaced by the notification center.",
-    "The recent-ops panel is retired and no longer part of the product.",
-    "The Task Drawer should remain retired.",
-    "Do not reintroduce the Recent Operations Drawer.",
-    "不得重新引入最近操作面板。",
-    "Avoid reintroducing the task-center.",
-    "The notification-task-center metric name remains valid.",
-    "The notification-recent-ops-panel metric name remains valid.",
-    "Task centerline measurements are unrelated."
-  ]) {
-    if (findRetiredSurfaceRequirement(allowedGuidance) !== null) {
-      fail(`retired surface guidance guard must allow explicit historical/retired context: ${allowedGuidance}`);
-    }
+
+  const missingEntry = `
+## Unified Notification Center
+Current notifications use the unified presentation.
+#### Retired Surfaces
+- **Task Center**: \`retired\`
+- **Recent Ops Panel**: \`retired\`
+`;
+  if (!validateClaudeRetiredSurfaceContract(missingEntry).some((failure) => failure.includes("Task Drawer"))) {
+    fail("retired surface contract must require one structured entry per retired surface");
   }
 }
 
-function assertNotificationReadmeConceptContracts() {
-  for (const validSection of [
-    "A persistent all-library notification center with aggregated task progress and local process logs.",
-    "Notifications persist across libraries and aggregate task progress with logs from local processes.",
-    "持久化跨库通知中心，汇总后台任务进度，并提供本地进程日志。",
-    "面向所有资料库的通知会持续保留，汇总后台工作进度及本机运行日志。"
-  ]) {
-    if (missingNotificationReadmeConcepts(validSection).length !== 0) {
-      fail(`README notification concepts must allow equivalent English/Chinese wording: ${validSection}`);
-    }
+function assertStructuredReadmeCapabilityContracts() {
+  const validDocument = `
+## Unified Notification Center
+The body may use freely rewritten natural language about durable status across collections.
+### Capabilities
+- **Scope**: \`all-library-persistent\`
+- **Progress**: \`aggregated-logical-task-progress\`
+- **Logs**: \`local-process-logs\`
+## Start Here
+`;
+  if (validateReadmeNotificationCapabilities(validDocument).length !== 0) {
+    fail("README capability contract must accept visible structured items with freely rewritten body text");
   }
-  const emptyMissing = missingNotificationReadmeConcepts("");
-  if (emptyMissing.length !== 3) {
-    fail("README notification concepts must reject an empty section");
+
+  const translatedDocument = `
+## 统一通知中心
+正文可以自由翻译和改写。
+### 能力
+- **范围**: \`跨库持久化\`
+- **进度**: \`聚合逻辑任务进度\`
+- **日志**: \`本地进程日志\`
+`;
+  if (validateReadmeNotificationCapabilities(translatedDocument).length !== 0) {
+    fail("README capability contract must accept stable Chinese labels and values");
   }
-  const boundedEmptySection = markdownSection(
-    "## Unified Notification Center\n## Start Here\nPersistent all-library progress and local process logs.",
-    ["Unified Notification Center"]
-  );
-  if (boundedEmptySection === null || missingNotificationReadmeConcepts(boundedEmptySection).length !== 3) {
-    fail("README notification concepts must not be satisfied by content after the next section heading");
+
+  const negativeDocument = `
+## Unified Notification Center
+### Capabilities
+- **Scope**: notifications are not available across all libraries
+- **Progress**: do not aggregate logical task progress
+- **Logs**: no local process logs
+`;
+  if (validateReadmeNotificationCapabilities(negativeDocument).length !== 3) {
+    fail("README capability contract must reject negated natural-language capability claims");
   }
-  const partialMissing = missingNotificationReadmeConcepts(
-    "A durable cross-library notification center with local runtime logs."
-  );
-  if (partialMissing.length !== 1 || partialMissing[0] !== "aggregated task progress") {
-    fail("README notification concepts must report the specifically missing concept");
+
+  if (validateReadmeNotificationCapabilities("## Unified Notification Center\n").length !== 3) {
+    fail("README capability contract must reject an empty notification section");
   }
 }
 
 assertMarkdownSectionContracts();
-assertRetiredSurfaceGuidanceContracts();
-assertNotificationReadmeConceptContracts();
+assertSectionScopedRetiredSurfaceContracts();
+assertStructuredReadmeCapabilityContracts();
 
 const requiredDirs = [
   "apps/desktop/src",
@@ -383,12 +528,9 @@ for (const capability of ["decoder", "metadata", "action", "import-provider"]) {
   }
 }
 
-const readmeNotificationSection = requireDocumentSection(
-  "README.md",
-  ["Unified Notification Center", "统一通知中心"]
-);
-for (const missingConcept of missingNotificationReadmeConcepts(readmeNotificationSection)) {
-  fail(`README.md Unified Notification Center section missing concept: ${missingConcept}`);
+requireDocumentSection("README.md", ["Unified Notification Center", "统一通知中心"]);
+for (const capabilityFailure of validateReadmeNotificationCapabilities(readText("README.md"))) {
+  fail(capabilityFailure);
 }
 requireDocumentSection(
   "CLAUDE.md",
@@ -432,9 +574,8 @@ requireDocumentSection(
   "CLAUDE.md",
   ["Historical Phase Summary (1–10)", "历史阶段摘要（1–10）"]
 );
-const retiredSurfaceRequirement = findRetiredSurfaceRequirement(readText("CLAUDE.md"));
-if (retiredSurfaceRequirement) {
-  fail(`CLAUDE.md current guidance must not require retired surface: ${retiredSurfaceRequirement}`);
+for (const retiredSurfaceFailure of validateClaudeRetiredSurfaceContract(readText("CLAUDE.md"))) {
+  fail(retiredSurfaceFailure);
 }
 
 if (!process.exitCode) {
