@@ -3,7 +3,8 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   legacyRendererErrorOperationId,
-  rendererErrorOperationId
+  rendererErrorOperationId,
+  type RendererErrorIdentity
 } from "@megle/notification-contract";
 
 import type {
@@ -51,6 +52,43 @@ interface OperationRow {
   library_name: string;
   payload_json: string;
   action_error_detail?: string | null;
+}
+
+interface StoredRendererErrorIdentity extends RendererErrorIdentity {
+  libraryId: string;
+}
+
+type StoredNotificationOperation = NotificationOperationInput & {
+  rendererErrorIdentity?: StoredRendererErrorIdentity;
+};
+
+function verifiedLegacyRendererOperation(
+  row: OperationRow,
+  legacyOperationId: string,
+  canonicalOperationId: string
+): DesktopNotificationOperation | null {
+  try {
+    const stored = JSON.parse(row.payload_json) as StoredNotificationOperation;
+    const identity = stored.rendererErrorIdentity;
+    if (
+      !identity ||
+      typeof identity.libraryId !== "string" ||
+      typeof identity.source !== "string" ||
+      typeof identity.code !== "string" ||
+      typeof identity.target !== "string" ||
+      identity.libraryId !== row.library_id ||
+      stored.operationId !== legacyOperationId ||
+      stored.kind !== "renderer_error" ||
+      stored.errorCode !== identity.code ||
+      legacyRendererErrorOperationId(identity.libraryId, identity) !== legacyOperationId ||
+      rendererErrorOperationId(identity.libraryId, identity) !== canonicalOperationId
+    ) {
+      return null;
+    }
+    return rowToOperation(row);
+  } catch {
+    return null;
+  }
 }
 
 function serializeError(error: unknown): NotificationStoreSerializedError {
@@ -852,10 +890,23 @@ class NotificationStoreDatabase {
       }
       let existing = this.getOperation(library.id, operationId);
       if (!existing && legacyOperationId !== operationId) {
-        const legacy = this.getOperation(library.id, legacyOperationId);
+        const legacyRow = this.database
+          .prepare(
+            `SELECT library_id, library_name, payload_json
+             FROM operations WHERE library_id = ? AND operation_id = ?`
+          )
+          .get(library.id, legacyOperationId) as OperationRow | undefined;
+        const legacy = legacyRow
+          ? verifiedLegacyRendererOperation(legacyRow, legacyOperationId, operationId)
+          : null;
         if (legacy) {
           const { libraryId: _libraryId, libraryName: _libraryName, ...legacyPayload } = legacy;
-          this.upsertOperationRows(library, [{ ...legacyPayload, operationId }]);
+          const migratedOperation: StoredNotificationOperation = {
+            ...legacyPayload,
+            operationId,
+            rendererErrorIdentity: { libraryId: library.id, ...operationIdentity }
+          };
+          this.upsertOperationRows(library, [migratedOperation]);
           this.database
             .prepare("DELETE FROM operations WHERE library_id = ? AND operation_id = ?")
             .run(library.id, legacyOperationId);
@@ -870,7 +921,7 @@ class NotificationStoreDatabase {
       const occurrenceCount = (existing?.occurrenceCount ?? 0) + newReportCount;
       assertSafeInteger(revision, "renderer error revision", 1);
       assertSafeInteger(occurrenceCount, "renderer error occurrenceCount", 1);
-      const operation: NotificationOperationInput = {
+      const operation: StoredNotificationOperation = {
         operationId,
         revision,
         kind: "renderer_error",
@@ -896,7 +947,8 @@ class NotificationStoreDatabase {
         occurrenceCount,
         startedAt: existing?.startedAt ?? occurredAt,
         updatedAt: occurredAt,
-        completedAt: occurredAt
+        completedAt: occurredAt,
+        rendererErrorIdentity: { libraryId: library.id, ...operationIdentity }
       };
       this.upsertOperationRows(library, [operation]);
       this.database.exec("RELEASE record_renderer_error;");
@@ -1064,7 +1116,8 @@ class NotificationStoreDatabase {
 }
 
 function rowToOperation(row: OperationRow): DesktopNotificationOperation {
-  const operation = JSON.parse(row.payload_json) as NotificationOperationInput;
+  const stored = JSON.parse(row.payload_json) as StoredNotificationOperation;
+  const { rendererErrorIdentity: _rendererErrorIdentity, ...operation } = stored;
   return {
     ...operation,
     errorDetail: row.action_error_detail ?? operation.errorDetail,

@@ -135,6 +135,40 @@ function operation(
   };
 }
 
+function legacyRendererOperation(
+  operationId: string,
+  report: RendererErrorReport,
+  occurrenceCount: number,
+  verifiable: boolean
+): NotificationOperationInput {
+  const input = operation(operationId, occurrenceCount, "failed", {
+    kind: "renderer_error",
+    category: "error",
+    origin: "system",
+    title: report.title,
+    summary: report.message,
+    taskId: null,
+    rootId: null,
+    currentValue: occurrenceCount,
+    totalValue: null,
+    unit: "occurrences",
+    errorCode: report.code,
+    occurrenceCount,
+    cancellable: false,
+    retryable: false
+  });
+  if (!verifiable) return input;
+  return {
+    ...input,
+    rendererErrorIdentity: {
+      libraryId: report.libraryId,
+      source: report.source,
+      code: report.code,
+      target: report.target
+    }
+  } as NotificationOperationInput;
+}
+
 function event(sequence: number, input: NotificationOperationInput): NotificationStoreEvent {
   return { sequence, operation: input };
 }
@@ -673,22 +707,7 @@ describe("notification store", () => {
 
     try {
       await store.upsertOperations(LIBRARY_A, [
-        operation(legacyOperationId, 4, "failed", {
-          kind: "renderer_error",
-          category: "error",
-          origin: "system",
-          title: report.title,
-          summary: report.message,
-          taskId: null,
-          rootId: null,
-          currentValue: 4,
-          totalValue: null,
-          unit: "occurrences",
-          errorCode: report.code,
-          occurrenceCount: 4,
-          cancellable: false,
-          retryable: false
-        })
+        legacyRendererOperation(legacyOperationId, report, 4, true)
       ]);
 
       await store.recordRendererError(LIBRARY_A, report, "migration-report", NOW + 1);
@@ -697,6 +716,119 @@ describe("notification store", () => {
         5
       );
       assert.equal(await store.getOperation(LIBRARY_A.id, legacyOperationId), null);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("does not migrate an unverifiable colliding v1 row to the first v2 identity", async () => {
+    const store = await createTestStore();
+    const first: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "a:b",
+      code: "c",
+      target: "d",
+      title: "First",
+      message: "first",
+      detail: null
+    };
+    const second: RendererErrorReport = {
+      ...first,
+      source: "a",
+      code: "b:c",
+      title: "Second",
+      message: "second"
+    };
+    const legacyOperationId =
+      `renderer-error:${LIBRARY_A.id}:${first.source}:${first.code}:${first.target}`;
+    assert.equal(
+      legacyOperationId,
+      `renderer-error:${LIBRARY_A.id}:${second.source}:${second.code}:${second.target}`
+    );
+
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        legacyRendererOperation(legacyOperationId, first, 4, false)
+      ]);
+
+      await store.recordRendererError(LIBRARY_A, second, "collision-second", NOW + 1);
+      assert.equal((await store.getOperation(LIBRARY_A.id, legacyOperationId))?.occurrenceCount, 4);
+      assert.equal(
+        await store.getOperation(LIBRARY_A.id, rendererErrorOperationId(LIBRARY_A.id, first)),
+        null
+      );
+      assert.equal(
+        (await store.getOperation(
+          LIBRARY_A.id,
+          rendererErrorOperationId(LIBRARY_A.id, second)
+        ))?.occurrenceCount,
+        1
+      );
+      assert.deepEqual(
+        (await store.history({ libraryId: LIBRARY_A.id, limit: 20, offset: 0 })).items
+          .map((item) => item.operationId)
+          .sort(),
+        [legacyOperationId, rendererErrorOperationId(LIBRARY_A.id, second)].sort()
+      );
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("migrates a colliding v1 row only when its matching v2 identity arrives", async () => {
+    const store = await createTestStore();
+    const first: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "a:b",
+      code: "c",
+      target: "d",
+      title: "First",
+      message: "first",
+      detail: null
+    };
+    const second: RendererErrorReport = {
+      ...first,
+      source: "a",
+      code: "b:c",
+      title: "Second",
+      message: "second"
+    };
+    const legacyOperationId =
+      `renderer-error:${LIBRARY_A.id}:${first.source}:${first.code}:${first.target}`;
+
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        legacyRendererOperation(legacyOperationId, first, 4, true)
+      ]);
+
+      await store.recordRendererError(LIBRARY_A, second, "collision-second", NOW + 1);
+      await store.recordRendererError(LIBRARY_A, first, "collision-first", NOW + 2);
+      assert.equal(await store.getOperation(LIBRARY_A.id, legacyOperationId), null);
+      assert.equal(
+        (await store.getOperation(
+          LIBRARY_A.id,
+          rendererErrorOperationId(LIBRARY_A.id, first)
+        ))?.occurrenceCount,
+        5
+      );
+      assert.equal(
+        (await store.getOperation(
+          LIBRARY_A.id,
+          rendererErrorOperationId(LIBRARY_A.id, second)
+        ))?.occurrenceCount,
+        1
+      );
+      assert.deepEqual(
+        (await store.history({ libraryId: LIBRARY_A.id, limit: 20, offset: 0 })).items
+          .map((item) => item.operationId)
+          .sort(),
+        [
+          rendererErrorOperationId(LIBRARY_A.id, first),
+          rendererErrorOperationId(LIBRARY_A.id, second)
+        ].sort()
+      );
     } finally {
       await store.close();
     }

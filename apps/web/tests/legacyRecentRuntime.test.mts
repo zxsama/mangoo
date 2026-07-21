@@ -105,8 +105,8 @@ describe("legacy Recent runtime removal", () => {
     assert.match(appSource, /phase === "loading-media"[\s\S]*?setActiveLibraryId\(null\)/);
     assert.match(settingsWindowSource, /listLibraries/);
     assert.match(settingsWindowSource, /subscribeLibraryPhase/);
-    assert.match(settingsWindowSource, /libraryContextRevisionRef/);
-    assert.match(settingsWindowSource, /libraryContextRevisionRef\.current !== revision/);
+    assert.match(settingsWindowSource, /createLibraryContextTracker/);
+    assert.match(settingsWindowSource, /tracker\.onPhase\(phase\)/);
     assert.match(settingsWindowSource, /activeLibraryId/);
     assert.match(settingsWindowSource, /activeLibraryName/);
     assert.match(source, /attempt: LibraryErrorReportAttempt \| null/);

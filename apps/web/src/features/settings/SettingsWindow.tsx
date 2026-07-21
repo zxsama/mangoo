@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
 import { useSecondaryWindowInterfaceStyle } from "../../app-shell/useSecondaryWindowInterfaceStyle";
 import { getDesktopBridge, listLibraries, subscribeLibraryPhase } from "../../core/desktop";
+import { createLibraryContextTracker } from "../../core/libraryContextTracker";
 import { broadcastPreference } from "../../core/preferenceSync";
 import { useLibraryData } from "../../core/useLibraryData";
 import {
@@ -33,39 +34,18 @@ export function SettingsWindow() {
     libraryId: string;
     libraryName: string;
   } | null>(null);
-  const libraryContextRevisionRef = useRef(0);
 
   useEffect(() => {
-    let cancelled = false;
-    const refreshActiveLibraryContext = async (revision: number) => {
-      try {
-        const libraries = await listLibraries();
-        if (cancelled || libraryContextRevisionRef.current !== revision) return;
-        const active = libraries.find((library) => library.active);
-        setActiveLibraryContext(
-          active ? { libraryId: active.id, libraryName: active.name } : null
-        );
-      } catch {
-        if (!cancelled && libraryContextRevisionRef.current === revision) {
-          setActiveLibraryContext(null);
-        }
-      }
-    };
-
-    libraryContextRevisionRef.current += 1;
-    void refreshActiveLibraryContext(libraryContextRevisionRef.current);
+    const tracker = createLibraryContextTracker({
+      loadLibraries: listLibraries,
+      onContext: setActiveLibraryContext
+    });
+    void tracker.start();
     const unsubscribe = subscribeLibraryPhase((phase) => {
-      libraryContextRevisionRef.current += 1;
-      const revision = libraryContextRevisionRef.current;
-      if (phase === "loading-media") {
-        setActiveLibraryContext(null);
-      } else if (phase === "ready") {
-        void refreshActiveLibraryContext(revision);
-      }
+      void tracker.onPhase(phase);
     });
     return () => {
-      cancelled = true;
-      libraryContextRevisionRef.current += 1;
+      tracker.dispose();
       unsubscribe();
     };
   }, []);
