@@ -114,7 +114,7 @@ function markdownSections(document) {
   const stack = [];
   const listContexts = [];
   let inCodeFence = false;
-  let inIndentedCode = false;
+  let indentedCodeContext = null;
 
   for (const line of lines) {
     if (/^\s*(?:```|~~~)/.test(line)) {
@@ -133,14 +133,15 @@ function markdownSections(document) {
 
     const isBlank = /^\s*$/u.test(line);
     const indent = leadingIndentWidth(line);
-    if (inIndentedCode) {
-      if (isBlank || indent >= 4) {
+    if (indentedCodeContext) {
+      if (isBlank || indent >= indentedCodeContext.codeIndent) {
         if (stack.length > 0) {
           stack.at(-1).lines.push({ text: line, inFence: false, inIndentedCode: true });
         }
         continue;
       }
-      inIndentedCode = false;
+      listContexts.splice(0, listContexts.length, ...indentedCodeContext.listContexts);
+      indentedCodeContext = null;
     }
 
     const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
@@ -165,7 +166,10 @@ function markdownSections(document) {
     );
     const codeIndent = parentList ? parentList.contentIndent + 4 : 4;
     if (!isBlank && indent >= codeIndent) {
-      inIndentedCode = true;
+      indentedCodeContext = {
+        codeIndent,
+        listContexts: listContexts.slice()
+      };
       listContexts.length = 0;
       if (stack.length > 0) {
         stack.at(-1).lines.push({ text: line, inFence: false, inIndentedCode: true });
@@ -592,6 +596,45 @@ The body may use freely rewritten natural language about durable status across c
 `;
   if (validateReadmeNotificationCapabilities(nestedListDocument).length !== 0) {
     fail("README capability contract must accept real capability items in a normal nested list");
+  }
+
+  const parentListCodeThenNestedDocument = `
+## Unified Notification Center
+### Capabilities
+- Notification contract:
+      - **Scope**: \`not-visible-code\`
+      code continuation
+    - **Scope**: \`all-library-persistent\`
+    - **Progress**: \`aggregated-logical-task-progress\`
+    - **Logs**: \`local-process-logs\`
+`;
+  if (validateReadmeNotificationCapabilities(parentListCodeThenNestedDocument).length !== 0) {
+    fail("README capability contract must exit six-space list code when valid nested items dedent to four spaces");
+  }
+
+  const mixedIndentCodeThenNestedDocument = `
+## Unified Notification Center
+### Capabilities
+- Notification contract:
+ \t  - **Scope**: \`not-visible-code\`
+ \t  mixed-indentation code continuation
+ \t- **Scope**: \`all-library-persistent\`
+ \t- **Progress**: \`aggregated-logical-task-progress\`
+ \t- **Logs**: \`local-process-logs\`
+`;
+  if (validateReadmeNotificationCapabilities(mixedIndentCodeThenNestedDocument).length !== 0) {
+    fail("README capability contract must use column widths for mixed tab-space code dedent");
+  }
+
+  const mixedIndentCodeOnlyDocument = `
+## Unified Notification Center
+### Capabilities
+ \t- **Scope**: \`all-library-persistent\`
+ \t- **Progress**: \`aggregated-logical-task-progress\`
+ \t- **Logs**: \`local-process-logs\`
+`;
+  if (validateReadmeNotificationCapabilities(mixedIndentCodeOnlyDocument).length !== 3) {
+    fail("README capability contract must keep mixed tab-space top-level code invisible");
   }
 }
 
