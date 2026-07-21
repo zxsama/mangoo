@@ -1,6 +1,7 @@
 import { ChevronDown, ChevronRight, RefreshCw, RotateCcw, Square } from "lucide-react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  useCallback,
   useDeferredValue,
   useEffect,
   useMemo,
@@ -17,6 +18,7 @@ import type {
 import type { NotificationHistoryState } from "./useNotifications";
 
 const PAGE_SIZE = 100;
+const MAX_CLIENT_FILTER_PAGES = 50;
 
 type NotificationAction = (
   libraryId: string,
@@ -65,10 +67,24 @@ export function NotificationHistoryView({
   );
   const queryRef = useRef<DesktopNotificationHistoryQuery>(query);
 
+  const loadCurrentQuery = useCallback(
+    async (nextQuery: DesktopNotificationHistoryQuery) => {
+      let next = await loadHistory(nextQuery);
+      if (!source && !kind) return next;
+      let pageCount = 0;
+      while (next.nextOffset !== null && pageCount < MAX_CLIENT_FILTER_PAGES) {
+        next = await loadMoreHistory();
+        pageCount += 1;
+      }
+      return next;
+    },
+    [kind, loadHistory, loadMoreHistory, source]
+  );
+
   useEffect(() => {
     queryRef.current = query;
-    void loadHistory(query);
-  }, [loadHistory, query]);
+    void loadCurrentQuery(query);
+  }, [loadCurrentQuery, query]);
 
   const libraries = useMemo(() => {
     const values = new Map<string, string>();
@@ -128,7 +144,7 @@ export function NotificationHistoryView({
       return;
     }
     setActionState(null);
-    await loadHistory(queryRef.current);
+    await loadCurrentQuery(queryRef.current);
   };
 
   const resetFilters = () => {
@@ -153,7 +169,7 @@ export function NotificationHistoryView({
             aria-label="刷新通知历史"
             className="notification-icon-action"
             disabled={history.loading}
-            onClick={() => void loadHistory(query)}
+            onClick={() => void loadCurrentQuery(query)}
             type="button"
           >
             <RefreshCw aria-hidden="true" size={15} />
@@ -312,7 +328,11 @@ export function NotificationHistoryView({
       <footer className="notification-history-footer">
         <span>
           已加载 {history.items.length.toLocaleString()} / {history.total.toLocaleString()}
-          {source || kind ? "，来源和类型筛选应用于已加载记录" : ""}
+          {source || kind
+            ? history.nextOffset === null
+              ? "，来源和类型筛选已应用于当前上限内记录"
+              : "，来源和类型筛选正在分页加载"
+            : ""}
         </span>
         {history.nextOffset !== null ? (
           <button
