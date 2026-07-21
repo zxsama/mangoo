@@ -11,6 +11,10 @@ const settingsWindowSource = readFileSync(
   new URL("../src/features/settings/SettingsWindow.tsx", import.meta.url),
   "utf8"
 );
+const settingsPanelsSource = readFileSync(
+  new URL("../src/features/settings/settingsPanels.tsx", import.meta.url),
+  "utf8"
+);
 const libraryViewSource = readFileSync(
   new URL("../src/features/library/LibraryView.tsx", import.meta.url),
   "utf8"
@@ -52,20 +56,24 @@ describe("legacy Recent runtime removal", () => {
     assert.doesNotMatch(perThumbnailRequestSection, /reportLibrary(?:Error|Failure)\(/);
   });
 
-  it("removes the broad workspace banner while preserving deferred snapshot refresh", () => {
+  it("keeps compact notifications read-only and leaves refresh to the shared stats schedule", () => {
     assert.doesNotMatch(libraryViewSource, /error-strip|library\.error/);
     assert.doesNotMatch(stylesSource, /\.error-strip\s*\{/);
-    assert.match(appSource, /notificationThumbnailRefreshRequestedRef/);
-    assert.match(appSource, /shouldRequestActiveLibraryThumbnailRefresh/);
-    assert.match(appSource, /statsLibraryId: library\.thumbnailCacheStatsLibraryId/);
-    assert.match(appSource, /queueMicrotask\(\(\)\s*=>/);
-    assert.match(appSource, /library\.refreshThumbnailCacheStats\(\)/);
-
-    const deferredRefreshSection = appSource.slice(
-      appSource.indexOf("notificationThumbnailRefreshRequestedRef"),
+    const compactOpenSection = appSource.slice(
+      appSource.indexOf("const notificationsOpen"),
       appSource.indexOf("const shellRightActions")
     );
-    assert.doesNotMatch(deferredRefreshSection, /setInterval\(/);
+    assert.doesNotMatch(
+      compactOpenSection,
+      /refreshThumbnailCacheStats|queueMicrotask|setInterval|setTimeout/
+    );
+    assert.doesNotMatch(
+      compactOpenSection,
+      /useEffect\(/,
+      "StrictMode effect replay must not create compact-open requests"
+    );
+    assert.match(settingsPanelsSource, /statsPollActive\s*\?\s*8000\s*:\s*20000/);
+    assert.match(settingsPanelsSource, /window\.setInterval\(/);
 
     const navigationReloadSection = source.slice(
       source.indexOf("const selectLibraryFolder ="),

@@ -69,9 +69,6 @@ import {
   type LibraryGridPreferences
 } from "../features/media-grid/gridPreferences";
 import { OnboardingHero } from "../features/onboarding/OnboardingHero";
-import {
-  shouldRequestActiveLibraryThumbnailRefresh
-} from "../features/notifications/notificationModel";
 import { useNotifications } from "../features/notifications/useNotifications";
 import {
   readStoredPreviewPreferences,
@@ -103,7 +100,6 @@ export function App() {
   const notifications = useNotifications();
   const notificationModel = notifications.compact;
   const [notificationAnchor, setNotificationAnchor] = useState<HTMLButtonElement | null>(null);
-  const notificationThumbnailRefreshRequestedRef = useRef<string | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewDisplayedMediaId, setPreviewDisplayedMediaId] = useState<number | null>(null);
   const previewNavigationLockedRef = useRef(false);
@@ -387,34 +383,6 @@ export function App() {
   const notificationsOpen = activeCompactPopover === "notifications";
   const filterMenuOpen = activeCompactPopover === "filter";
   const sortMenuOpen = activeCompactPopover === "sort";
-
-  useEffect(() => {
-    if (!notificationsOpen) {
-      notificationThumbnailRefreshRequestedRef.current = null;
-      return;
-    }
-    if (!shouldRequestActiveLibraryThumbnailRefresh({
-      activeLibraryId,
-      summaries: notificationModel.thumbnail.summaries,
-      statsLibraryId: library.thumbnailCacheStatsLibraryId,
-      requestedLibraryId: notificationThumbnailRefreshRequestedRef.current
-    })) {
-      return;
-    }
-    const requestedLibraryId = activeLibraryId;
-    if (!requestedLibraryId) return;
-    notificationThumbnailRefreshRequestedRef.current = requestedLibraryId;
-    queueMicrotask(() => {
-      if (notificationThumbnailRefreshRequestedRef.current !== requestedLibraryId) return;
-      void library.refreshThumbnailCacheStats();
-    });
-  }, [
-    activeLibraryId,
-    library.refreshThumbnailCacheStats,
-    library.thumbnailCacheStatsLibraryId,
-    notificationModel.thumbnail.summaries,
-    notificationsOpen
-  ]);
 
   const onToggleNotifications = useCallback(() => {
     toggleCompactPopover("notifications");

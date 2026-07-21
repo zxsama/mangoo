@@ -14,8 +14,7 @@ import {
   mergeNotificationHistoryPages,
   notificationIndicator,
   processLogGapSequence,
-  progressView,
-  shouldRequestActiveLibraryThumbnailRefresh
+  progressView
 } from "../src/features/notifications/notificationModel.ts";
 import { createNotificationStore } from "../src/features/notifications/useNotifications.ts";
 import {
@@ -654,47 +653,6 @@ describe("notification reporting", () => {
 });
 
 describe("notification selectors", () => {
-  it("requests one deferred thumbnail refresh for each active library", () => {
-    const summaries = [thumbnail("library-a")];
-
-    assert.equal(
-      shouldRequestActiveLibraryThumbnailRefresh({
-        activeLibraryId: "library-b",
-        summaries,
-        statsLibraryId: "library-a",
-        requestedLibraryId: "library-a"
-      }),
-      true
-    );
-    assert.equal(
-      shouldRequestActiveLibraryThumbnailRefresh({
-        activeLibraryId: "library-b",
-        summaries,
-        statsLibraryId: "library-a",
-        requestedLibraryId: "library-b"
-      }),
-      false
-    );
-    assert.equal(
-      shouldRequestActiveLibraryThumbnailRefresh({
-        activeLibraryId: "library-b",
-        summaries: [...summaries, thumbnail("library-b")],
-        statsLibraryId: "library-a",
-        requestedLibraryId: "library-a"
-      }),
-      false
-    );
-    assert.equal(
-      shouldRequestActiveLibraryThumbnailRefresh({
-        activeLibraryId: "library-b",
-        summaries,
-        statsLibraryId: "library-b",
-        requestedLibraryId: "library-a"
-      }),
-      false
-    );
-  });
-
   it("reports only Desktop-declared log gaps, not filtered sequence jumps", () => {
     assert.equal(
       processLogGapSequence({

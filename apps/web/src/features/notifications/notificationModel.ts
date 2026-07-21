@@ -56,29 +56,10 @@ export interface NotificationHistoryCollection {
   conflictError: string | null;
 }
 
-export interface ActiveLibraryThumbnailRefreshInput {
-  activeLibraryId: string | null;
-  summaries: readonly DesktopThumbnailCacheSummary[];
-  statsLibraryId: string | null;
-  requestedLibraryId: string | null;
-}
-
 const ACTIVE_STATUSES = new Set<DesktopNotificationOperation["status"]>([
   "pending",
   "running"
 ]);
-
-export function shouldRequestActiveLibraryThumbnailRefresh(
-  input: ActiveLibraryThumbnailRefreshInput
-): boolean {
-  const { activeLibraryId } = input;
-  if (!activeLibraryId) return false;
-  return (
-    input.statsLibraryId !== activeLibraryId &&
-    input.requestedLibraryId !== activeLibraryId &&
-    !input.summaries.some((summary) => summary.libraryId === activeLibraryId)
-  );
-}
 
 export function progressView(operation: DesktopNotificationOperation): ProgressViewModel {
   const total = operation.totalValue;
