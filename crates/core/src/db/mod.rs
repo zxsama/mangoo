@@ -744,7 +744,7 @@ impl Database {
             task_id,
             origin_override,
             mode,
-            None,
+            unix_timestamp_millis(),
         )
     }
 
@@ -754,8 +754,13 @@ impl Database {
         task_id: i64,
         origin_override: Option<NotificationOrigin>,
         mode: notification_outbox::PublishMode,
-        updated_at_override: Option<i64>,
+        updated_at_ms: i64,
     ) -> anyhow::Result<bool> {
+        if updated_at_ms < 0 {
+            return Err(anyhow::anyhow!(
+                "notification timestamp must be non-negative"
+            ));
+        }
         let task = task_record_in_transaction(transaction, task_id)?;
         let Some(descriptor) = task_notification_descriptor(&task.kind)? else {
             return Ok(false);
@@ -767,8 +772,7 @@ impl Database {
             .unwrap_or_else(|| NotificationOrigin::Background.as_str().to_owned());
         let terminal = matches!(task.status.as_str(), "succeeded" | "failed" | "cancelled");
         let started_at = task.created_at.saturating_mul(1_000);
-        let updated_at =
-            updated_at_override.unwrap_or_else(|| task.updated_at.saturating_mul(1_000));
+        let updated_at = updated_at_ms;
         let presentation =
             if task.status == "succeeded" && matches!(origin.as_str(), "background" | "recovery") {
                 "history_only"
@@ -2679,17 +2683,47 @@ impl Database {
         task_id: i64,
         attempt_generation: i64,
     ) -> anyhow::Result<()> {
+        self.mark_task_succeeded_for_attempt_with_clock(
+            task_id,
+            attempt_generation,
+            unix_timestamp_millis,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_task_succeeded_for_attempt_at_millis_for_test(
+        &self,
+        task_id: i64,
+        attempt_generation: i64,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.mark_task_succeeded_for_attempt_with_clock(task_id, attempt_generation, || {
+            updated_at_ms
+        })
+    }
+
+    fn mark_task_succeeded_for_attempt_with_clock(
+        &self,
+        task_id: i64,
+        attempt_generation: i64,
+        clock: impl FnOnce() -> i64,
+    ) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
+        let updated_at_ms = clock();
+        if updated_at_ms < 0 {
+            return Err(anyhow::anyhow!("task timestamp must be non-negative"));
+        }
         let updated = transaction.execute(
             "UPDATE tasks SET status = 'succeeded', updated_at = ?1, error = NULL WHERE id = ?2 AND status = 'running' AND attempt_generation = ?3",
-            (unix_timestamp(), task_id, attempt_generation),
+            (updated_at_ms / 1_000, task_id, attempt_generation),
         )?;
         let appended = if updated == 1 {
-            self.publish_task_notification_in_transaction(
+            self.publish_task_notification_in_transaction_at_millis(
                 &transaction,
                 task_id,
                 None,
                 notification_outbox::PublishMode::Terminal,
+                updated_at_ms,
             )?
         } else {
             false
@@ -3239,7 +3273,7 @@ impl Database {
                 task_id,
                 None,
                 notification_outbox::PublishMode::Progress,
-                Some(updated_at_ms),
+                updated_at_ms,
             )?
         } else {
             false
@@ -12283,6 +12317,188 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task_terminal_in_same_millisecond_preserves_progress_timestamp() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/terminal-same-millisecond".to_string(),
+                display_name: "Terminal same millisecond".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task(root_id)
+            .expect("create root scan task");
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark task running");
+        let attempt_generation = database
+            .current_task_attempt_generation(task_id)
+            .expect("read task attempt");
+        let baseline = database
+            .notification_heads_for_test()
+            .expect("read running head")
+            .pop()
+            .expect("running head");
+        let completed_at = baseline.updated_at + 1_000;
+
+        database
+            .update_task_scan_progress_for_attempt_at_millis_for_test(
+                task_id,
+                attempt_generation,
+                TaskScanProgress {
+                    items_seen: 1,
+                    items_total: Some(1),
+                    folders_seen: 0,
+                    media_files_seen: 1,
+                    skipped_files: 0,
+                },
+                completed_at,
+            )
+            .expect("publish progress");
+        database
+            .mark_task_succeeded_for_attempt_at_millis_for_test(
+                task_id,
+                attempt_generation,
+                completed_at,
+            )
+            .expect("publish terminal");
+
+        let terminal = database
+            .notification_heads_for_test()
+            .expect("read terminal head")
+            .pop()
+            .expect("terminal head");
+        assert_eq!(terminal.status, "succeeded");
+        assert_eq!(terminal.updated_at, completed_at);
+        assert_eq!(terminal.completed_at, Some(completed_at));
+    }
+
+    #[test]
+    fn task_terminal_after_ten_second_synthetic_progress_does_not_retreat() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/terminal-after-progress".to_string(),
+                display_name: "Terminal after progress".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task(root_id)
+            .expect("create root scan task");
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark task running");
+        let attempt_generation = database
+            .current_task_attempt_generation(task_id)
+            .expect("read task attempt");
+        let baseline_updated_at = database
+            .notification_heads_for_test()
+            .expect("read running head")
+            .pop()
+            .expect("running head")
+            .updated_at;
+        let final_progress_at = baseline_updated_at + 10_000;
+
+        database
+            .update_task_scan_progress_for_attempt_at_millis_for_test(
+                task_id,
+                attempt_generation,
+                TaskScanProgress {
+                    items_seen: 10_000,
+                    items_total: Some(10_000),
+                    folders_seen: 100,
+                    media_files_seen: 10_000,
+                    skipped_files: 0,
+                },
+                final_progress_at,
+            )
+            .expect("publish final synthetic progress");
+        database
+            .mark_task_succeeded_for_attempt_at_millis_for_test(
+                task_id,
+                attempt_generation,
+                final_progress_at + 1,
+            )
+            .expect("publish terminal");
+
+        let terminal = database
+            .notification_heads_for_test()
+            .expect("read terminal head")
+            .pop()
+            .expect("terminal head");
+        assert_eq!(terminal.updated_at, final_progress_at + 1);
+        assert_eq!(terminal.completed_at, Some(final_progress_at + 1));
+    }
+
+    #[test]
+    fn task_terminal_clock_rollback_keeps_history_monotonic() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/terminal-clock-rollback".to_string(),
+                display_name: "Terminal clock rollback".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task(root_id)
+            .expect("create root scan task");
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark task running");
+        let attempt_generation = database
+            .current_task_attempt_generation(task_id)
+            .expect("read task attempt");
+        let baseline_sequence = database
+            .list_notification_outbox(0, 200)
+            .expect("read running event")
+            .last()
+            .cloned()
+            .expect("running event");
+        let final_progress_at = baseline_sequence.operation.updated_at + 10_000;
+
+        database
+            .update_task_scan_progress_for_attempt_at_millis_for_test(
+                task_id,
+                attempt_generation,
+                TaskScanProgress {
+                    items_seen: 10_000,
+                    items_total: Some(10_000),
+                    folders_seen: 100,
+                    media_files_seen: 10_000,
+                    skipped_files: 0,
+                },
+                final_progress_at,
+            )
+            .expect("publish final progress");
+        database
+            .mark_task_succeeded_for_attempt_at_millis_for_test(
+                task_id,
+                attempt_generation,
+                baseline_sequence.operation.updated_at + 2_000,
+            )
+            .expect("publish terminal after clock rollback");
+
+        let events = database
+            .list_notification_outbox(baseline_sequence.sequence, 200)
+            .expect("read progress and terminal history");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation.updated_at, final_progress_at);
+        assert_eq!(events[1].operation.updated_at, final_progress_at);
+        assert_eq!(events[1].operation.completed_at, Some(final_progress_at));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].operation.updated_at <= pair[1].operation.updated_at));
+
+        let terminal = database
+            .notification_heads_for_test()
+            .expect("read terminal head")
+            .pop()
+            .expect("terminal head");
+        assert_eq!(terminal.updated_at, final_progress_at);
+        assert_eq!(terminal.completed_at, Some(final_progress_at));
+    }
+
     struct NotificationBenchmarkTempDir {
         path: PathBuf,
     }
@@ -12439,8 +12655,13 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
+        let terminal_updated_at = baseline_updated_at + RAPID_PROGRESS_UPDATES + 1;
         database
-            .mark_task_succeeded_current_attempt_for_test(rapid_task_id)
+            .mark_task_succeeded_for_attempt_at_millis_for_test(
+                rapid_task_id,
+                attempt_generation,
+                terminal_updated_at,
+            )
             .expect("publish rapid production terminal event");
         let terminal_last_sequence: i64 = database
             .connection
@@ -12460,6 +12681,28 @@ mod tests {
             .expect("count persisted production terminal events");
         assert_eq!(terminal_event_count, 1);
         assert_eq!(persisted_progress_events, active_operation_seconds);
+        let rapid_history = database
+            .list_notification_outbox(baseline_sequence, 200)
+            .expect("read rapid progress and terminal history");
+        assert_eq!(
+            rapid_history
+                .last()
+                .expect("rapid terminal event")
+                .operation
+                .updated_at,
+            terminal_updated_at
+        );
+        assert_eq!(
+            rapid_history
+                .last()
+                .expect("rapid terminal event")
+                .operation
+                .completed_at,
+            Some(terminal_updated_at)
+        );
+        assert!(rapid_history
+            .windows(2)
+            .all(|pair| pair[0].operation.updated_at <= pair[1].operation.updated_at));
 
         let mut active_task_ids = Vec::with_capacity(ACTIVE_OPERATION_COUNT);
         for _ in 0..ACTIVE_OPERATION_COUNT {
@@ -12681,6 +12924,8 @@ mod tests {
                 "expectedProgressEvents": EXPECTED_PROGRESS_EVENTS,
                 "sampledProgressOffsetsMs": sampled_progress_offsets_ms,
                 "terminalEventCount": terminal_event_count,
+                "terminalUpdatedOffsetMs": terminal_updated_at - baseline_updated_at,
+                "rapidHistoryMonotonic": true,
                 "activeOperationSeconds": active_operation_seconds,
                 "inputElapsedMs": input_elapsed_ms,
                 "outboxRowCount": outbox_row_count,
@@ -12693,6 +12938,68 @@ mod tests {
             "{PROBE_PREFIX}{}",
             serde_json::to_string(&probe).expect("serialize benchmark probe")
         );
+    }
+
+    #[test]
+    #[ignore = "invoked by tools/bench/notification-center-bench.mjs"]
+    fn notification_center_benchmark_fault_probe() {
+        const PROBE_PREFIX: &str = "MEGLE_NOTIFICATION_BENCH_FAULT_JSON:";
+        let temp_dir = NotificationBenchmarkTempDir::new();
+        let database_path = temp_dir.database_path("fault");
+        let database = Database::open(&database_path).expect("open fault-probe database");
+        database
+            .apply_migrations()
+            .expect("apply fault-probe migrations");
+        database
+            .add_root(NewRoot {
+                path: "D:/megle-notification-fault-probe".to_string(),
+                display_name: "Notification fault probe".to_string(),
+            })
+            .expect("write fault-probe database");
+        let (schema_migration_count, latest_schema_version): (i64, i64) = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read initialized schema");
+        let sidecars_observed = [
+            database_path.clone(),
+            PathBuf::from(format!("{}-wal", database_path.display())),
+            PathBuf::from(format!("{}-shm", database_path.display())),
+        ]
+        .into_iter()
+        .filter(|candidate| candidate.exists())
+        .map(|candidate| {
+            candidate
+                .file_name()
+                .expect("fault-probe sidecar basename")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            sidecars_observed,
+            vec!["fault.sqlite", "fault.sqlite-wal", "fault.sqlite-shm"]
+        );
+        let payload = serde_json::json!({
+            "processId": std::process::id(),
+            "tempDirectory": temp_dir.path,
+            "databaseInitialized": true,
+            "schemaMigrationCount": schema_migration_count,
+            "latestSchemaVersion": latest_schema_version,
+            "sidecarsObserved": sidecars_observed
+        });
+        println!(
+            "{PROBE_PREFIX}{}",
+            serde_json::to_string(&payload).expect("serialize fault-probe evidence")
+        );
+        use std::io::Write as _;
+        std::io::stdout()
+            .flush()
+            .expect("flush fault-probe evidence");
+        panic!("intentional notification benchmark Core failure after database initialization");
     }
 
     #[test]

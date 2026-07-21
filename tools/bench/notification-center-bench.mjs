@@ -10,6 +10,7 @@ import { performance } from "node:perf_hooks";
 const SOURCE_MODE_ARGUMENT = "--notification-center-source-mode";
 const INJECTED_FAILURE_ARGUMENT = "--notification-center-injected-failure";
 const CORE_PROBE_PREFIX = "MEGLE_NOTIFICATION_BENCH_JSON:";
+const CORE_FAULT_PROBE_PREFIX = "MEGLE_NOTIFICATION_BENCH_FAULT_JSON:";
 const BENCHMARK_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(BENCHMARK_DIRECTORY, "../..");
 const BENCHMARK_SCRATCH_ROOT = path.join(REPOSITORY_ROOT, ".tmp", "notification-center-bench");
@@ -233,6 +234,13 @@ function notificationProbeTempDirectories() {
     .sort();
 }
 
+function parseSinglePrefixedJson(stdout, prefix, label) {
+  const payloadLines = stdout.split(/\r?\n/).filter((line) => line.includes(prefix));
+  assert.equal(payloadLines.length, 1, `${label} must emit exactly one JSON payload`);
+  const payload = payloadLines[0].slice(payloadLines[0].indexOf(prefix) + prefix.length);
+  return JSON.parse(payload);
+}
+
 function runCoreProbe() {
   const tempDirectoriesBefore = notificationProbeTempDirectories();
   const startedAt = performance.now();
@@ -258,14 +266,11 @@ function runCoreProbe() {
     tempDirectoriesBefore,
     "production Core probe must remove its internal temp directory and SQLite sidecars"
   );
-  const payloadLines = result.stdout
-    .split(/\r?\n/)
-    .filter((line) => line.includes(CORE_PROBE_PREFIX));
-  assert.equal(payloadLines.length, 1, "production Core probe must emit exactly one JSON payload");
-  const payload = payloadLines[0].slice(
-    payloadLines[0].indexOf(CORE_PROBE_PREFIX) + CORE_PROBE_PREFIX.length
+  const probe = parseSinglePrefixedJson(
+    result.stdout,
+    CORE_PROBE_PREFIX,
+    "production Core probe"
   );
-  const probe = JSON.parse(payload);
 
   assert.equal(probe.metrics.rapidProgressUpdates, RAPID_PROGRESS_UPDATES);
   assert.equal(probe.metrics.logicalProgressRevisionCount, RAPID_PROGRESS_UPDATES);
@@ -273,6 +278,8 @@ function runCoreProbe() {
   assert.equal(probe.metrics.persistedProgressEvents, EXPECTED_PROGRESS_EVENTS);
   assert.equal(probe.metrics.activeOperationSeconds, EXPECTED_PROGRESS_EVENTS);
   assert.equal(probe.metrics.terminalEventCount, 1);
+  assert.equal(probe.metrics.terminalUpdatedOffsetMs, RAPID_PROGRESS_UPDATES + 1);
+  assert.equal(probe.metrics.rapidHistoryMonotonic, true);
   assert.deepEqual(
     probe.metrics.sampledProgressOffsetsMs,
     Array.from({ length: EXPECTED_PROGRESS_EVENTS }, (_, index) => (index + 1) * 1_000)
@@ -446,44 +453,102 @@ async function runCleanupSelfTest() {
   assertRunDirectoryRemoved(storeRunDirectory, "post-create failure");
   assertStoreWorkerStopped(postCreateStore, "post-create failure");
 
-  let cargoRunDirectory;
-  let cargoStore;
-  let cargoFailure;
-  let cargoFailureResult;
+  let coreFailureRunDirectory;
+  let coreFailureStore;
+  let coreFailure;
+  let coreFailureResult;
+  let coreFaultProbe;
   try {
     await withNotificationStoreRun({
-      prefix: `cleanup-cargo-${suffix}`,
+      prefix: `cleanup-core-${suffix}`,
       onRunDirectory(runDirectory) {
-        cargoRunDirectory = runDirectory;
+        coreFailureRunDirectory = runDirectory;
       },
       onStoreCreated(store) {
-        cargoStore = store;
+        coreFailureStore = store;
       },
       async execute() {
-        cargoFailureResult = spawnCargo(["test", "-p", "megle-core-missing-package"]);
-        assert.notEqual(cargoFailureResult.status, 0, "fault-injected Cargo child must fail");
-        throw new Error(`injected Cargo child nonzero exit ${cargoFailureResult.status}`);
+        coreFailureResult = spawnCargo([
+          "test",
+          "-p",
+          "megle-core",
+          "db::tests::notification_center_benchmark_fault_probe",
+          "--",
+          "--ignored",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ]);
+        assert.notEqual(
+          coreFailureResult.status,
+          0,
+          "fault-injected Core test binary must fail after startup"
+        );
+        coreFaultProbe = parseSinglePrefixedJson(
+          coreFailureResult.stdout,
+          CORE_FAULT_PROBE_PREFIX,
+          "fault-injected Core test binary"
+        );
+        assert.notEqual(
+          coreFaultProbe.processId,
+          coreFailureResult.pid,
+          "Core test binary pid must differ from the Cargo process pid"
+        );
+        assert.equal(coreFaultProbe.databaseInitialized, true);
+        assert.ok(coreFaultProbe.schemaMigrationCount > 0);
+        assert.ok(coreFaultProbe.latestSchemaVersion > 0);
+        assert.deepEqual(coreFaultProbe.sidecarsObserved.sort(), [
+          "fault.sqlite",
+          "fault.sqlite-shm",
+          "fault.sqlite-wal"
+        ]);
+        const relativeTempDirectory = path.relative(os.tmpdir(), coreFaultProbe.tempDirectory);
+        assert.ok(relativeTempDirectory && !relativeTempDirectory.startsWith(".."));
+        assert.equal(path.isAbsolute(relativeTempDirectory), false);
+        assert.ok(
+          path.basename(coreFaultProbe.tempDirectory).startsWith("megle-notification-benchmark-")
+        );
+        assert.equal(
+          processExists(coreFaultProbe.processId),
+          false,
+          "fault-injected Core test binary must not remain running"
+        );
+        assert.equal(
+          fs.existsSync(coreFaultProbe.tempDirectory),
+          false,
+          "fault-injected Core temp database and sidecars must be removed"
+        );
+        throw new Error(`injected Core test binary nonzero exit ${coreFailureResult.status}`);
       }
     });
   } catch (error) {
-    cargoFailure = error;
+    coreFailure = error;
   }
-  assert.match(String(cargoFailure), /injected Cargo child nonzero exit/);
-  assert.ok(cargoFailureResult && cargoFailureResult.status !== 0);
-  assert.equal(processExists(cargoFailureResult.pid), false);
-  assertRunDirectoryRemoved(cargoRunDirectory, "Cargo child failure");
-  assertStoreWorkerStopped(cargoStore, "Cargo child failure");
+  assert.match(String(coreFailure), /injected Core test binary nonzero exit/);
+  assert.ok(coreFailureResult && coreFailureResult.status !== 0);
+  assert.ok(coreFaultProbe, "fault-injected Core test binary must report startup evidence");
+  assert.equal(processExists(coreFailureResult.pid), false);
+  assert.equal(processExists(coreFaultProbe.processId), false);
+  assertRunDirectoryRemoved(coreFailureRunDirectory, "Core test binary failure");
+  assertStoreWorkerStopped(coreFailureStore, "Core test binary failure");
 
   return {
     importFailureRunRemoved: true,
     startupFailureRunRemoved: true,
     postCreateFailureRunRemoved: true,
-    cargoChildFailureRunRemoved: true,
+    coreFailureRunRemoved: true,
     startupFailureWorkerStopped: true,
     postCreateFailureWorkerStopped: true,
-    cargoFailureWorkerStopped: true,
-    cargoFailureChildStopped: true,
-    cargoFailureExitCode: cargoFailureResult.status,
+    coreFailureWorkerStopped: true,
+    cargoProcessStopped: true,
+    coreTestBinaryStopped: true,
+    coreFailureTempDirectoryRemoved: true,
+    coreFailureDatabaseInitialized: true,
+    coreFailureExitCode: coreFailureResult.status,
+    coreFailureProcessId: coreFaultProbe.processId,
+    coreFailureSchemaMigrationCount: coreFaultProbe.schemaMigrationCount,
+    coreFailureLatestSchemaVersion: coreFaultProbe.latestSchemaVersion,
+    coreFailureSidecarsObserved: coreFaultProbe.sidecarsObserved,
     sidecarsObservedBeforeFailure
   };
 }
@@ -716,6 +781,8 @@ async function runBenchmark() {
             persistedEventCount: coreProbe.probe.metrics.persistedProgressEvents,
             sampledOffsetsMs: coreProbe.probe.metrics.sampledProgressOffsetsMs,
             terminalEventCount: coreProbe.probe.metrics.terminalEventCount,
+            terminalUpdatedOffsetMs: coreProbe.probe.metrics.terminalUpdatedOffsetMs,
+            historyTimestampsMonotonic: coreProbe.probe.metrics.rapidHistoryMonotonic,
             totalOutboxEventCount: coreProbe.probe.metrics.outboxRowCount,
             inputElapsedMs: Number(coreProbe.probe.metrics.inputElapsedMs.toFixed(3))
           },
@@ -764,6 +831,7 @@ async function runBenchmark() {
           aggregateRowsAndCountsExact: true,
           progressSamplingExact: true,
           terminalEventPresent: true,
+          progressTerminalTimestampsMonotonic: true,
           completedHistoryExact: true,
           retentionOverflowExact: true,
           allActiveRowsRetained: true,

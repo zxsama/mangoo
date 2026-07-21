@@ -98,18 +98,22 @@ impl Database {
             ));
         }
 
-        let previous: Option<(i64, Option<i64>)> = transaction
+        let previous: Option<(i64, Option<i64>, i64)> = transaction
             .query_row(
-                "SELECT revision, last_outbox_at FROM notification_operation_heads WHERE operation_id = ?1",
+                "SELECT revision, last_outbox_at, updated_at FROM notification_operation_heads WHERE operation_id = ?1",
                 [&operation.operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let next_revision = previous
-            .as_ref()
-            .map(|(revision, _)| revision.saturating_add(1))
-            .unwrap_or(1);
-        let previous_last_outbox_at = previous.and_then(|(_, last)| last);
+        let (next_revision, previous_last_outbox_at) = previous
+            .map(|(revision, last_outbox_at, previous_updated_at)| {
+                operation.updated_at = operation.updated_at.max(previous_updated_at);
+                if let Some(completed_at) = operation.completed_at.as_mut() {
+                    *completed_at = (*completed_at).max(operation.updated_at);
+                }
+                (revision.saturating_add(1), last_outbox_at)
+            })
+            .unwrap_or((1, None));
         let append = should_emit(mode, previous_last_outbox_at, operation.updated_at);
         let dirty = !append;
         operation.revision = next_revision;
