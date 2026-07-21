@@ -3853,7 +3853,7 @@ try {
   if (
     fullWindowFixture?.status?.tabCount !== 3 ||
     fullWindowFixture.status.status?.active !== 2 ||
-    fullWindowFixture.status.status?.cancelActions !== 2 ||
+    fullWindowFixture.status.status?.cancelActions !== 1 ||
     fullWindowFixture.status.status?.indeterminate !== 1 ||
     fullWindowFixture.status.status?.thumbnails !== 2 ||
     fullWindowFixture.status.status?.results !== 3 ||

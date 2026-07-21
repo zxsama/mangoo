@@ -1,13 +1,13 @@
 import { startTransition, useSyncExternalStore } from "react";
 import type {
   DesktopNotificationCompactSnapshot,
+  DesktopNotificationHistoryFacets,
   DesktopNotificationHistoryQuery,
   DesktopNotificationsBridge,
   DesktopProcessLogBatch,
   DesktopProcessLogExportResult,
   DesktopProcessLogFilter,
   DesktopProcessLogPage,
-  NotificationLibraryIdentity,
   ProcessLogSubscriptionHandle as DesktopProcessLogSubscriptionHandle,
   ProcessLogSubscriptionInitialSnapshot
 } from "@megle/notification-contract";
@@ -89,11 +89,16 @@ export class NotificationExternalStore {
   private disconnectGeneration = 0;
   private compactConnectionGeneration = 0;
   private compactEventRevision = 0;
+  private compactRequestGeneration = 0;
   private compactLoad: Promise<void> | null = null;
   private historyGeneration = 0;
   private historyStartOffset = 0;
   private historyPages = new Map<number, NotificationHistoryPageSlice>();
   private historyRequests = new Map<string, Promise<NotificationHistoryState>>();
+  private actionRequests = new Map<
+    string,
+    Promise<{ ok: boolean; message: string | null }>
+  >();
   private logGeneration = 0;
   private activeLogSubscription: { generation: number; unsubscribe: () => void } | null = null;
 
@@ -207,20 +212,36 @@ export class NotificationExternalStore {
   async refreshCompact(): Promise<NotificationRequestResult<boolean>> {
     const bridge = this.currentBridge();
     if (!bridge) return { ok: false, error: "通知状态仅在桌面模式可用" };
+    const connectionGeneration = this.compactConnectionGeneration;
+    const eventRevision = this.compactEventRevision;
+    const requestGeneration = ++this.compactRequestGeneration;
     try {
-      this.applyCompactSnapshot(await bridge.getCompactSnapshot());
+      const snapshot = await bridge.getCompactSnapshot();
+      if (
+        connectionGeneration === this.compactConnectionGeneration &&
+        eventRevision === this.compactEventRevision &&
+        requestGeneration === this.compactRequestGeneration
+      ) {
+        this.applyCompactSnapshot(snapshot);
+      }
       return { ok: true, value: true };
     } catch (error) {
-      this.applyBridgeError(error);
+      if (
+        connectionGeneration === this.compactConnectionGeneration &&
+        eventRevision === this.compactEventRevision &&
+        requestGeneration === this.compactRequestGeneration
+      ) {
+        this.applyBridgeError(error);
+      }
       return { ok: false, error: errorMessage(error) };
     }
   }
 
-  async listLibraries(): Promise<NotificationRequestResult<NotificationLibraryIdentity[]>> {
+  async getHistoryFacets(): Promise<NotificationRequestResult<DesktopNotificationHistoryFacets>> {
     const bridge = this.currentBridge();
-    if (!bridge) return { ok: false, error: "资源库列表仅在桌面模式可用" };
+    if (!bridge) return { ok: false, error: "通知筛选项仅在桌面模式可用" };
     try {
-      return { ok: true, value: await bridge.listLibraries() };
+      return { ok: true, value: await bridge.getHistoryFacets() };
     } catch (error) {
       return { ok: false, error: errorMessage(error) };
     }
@@ -334,6 +355,7 @@ export class NotificationExternalStore {
     this.disconnectBridge = null;
     this.bridge = null;
     this.compactConnectionGeneration += 1;
+    this.compactRequestGeneration += 1;
     this.compactLoad = null;
     this.historyGeneration += 1;
     this.historyRequests.clear();
@@ -355,6 +377,7 @@ export class NotificationExternalStore {
     this.bridge = bridge;
     const connectionGeneration = ++this.compactConnectionGeneration;
     const loadEventRevision = this.compactEventRevision;
+    const requestGeneration = ++this.compactRequestGeneration;
     let subscriptionError: string | null = null;
 
     try {
@@ -373,7 +396,8 @@ export class NotificationExternalStore {
       .then((snapshot) => {
         if (
           connectionGeneration === this.compactConnectionGeneration &&
-          this.compactEventRevision === loadEventRevision
+          this.compactEventRevision === loadEventRevision &&
+          requestGeneration === this.compactRequestGeneration
         ) {
           this.applyCompactSnapshot(
             subscriptionError
@@ -393,7 +417,8 @@ export class NotificationExternalStore {
       .catch((error) => {
         if (
           connectionGeneration === this.compactConnectionGeneration &&
-          this.compactEventRevision === loadEventRevision
+          this.compactEventRevision === loadEventRevision &&
+          requestGeneration === this.compactRequestGeneration
         ) {
           this.applyBridgeError(error);
         }
@@ -412,6 +437,7 @@ export class NotificationExternalStore {
       this.disconnectBridge = null;
       this.bridge = null;
       this.compactConnectionGeneration += 1;
+      this.compactRequestGeneration += 1;
       this.compactLoad = null;
     });
   }
@@ -499,18 +525,33 @@ export class NotificationExternalStore {
     this.setSnapshot({ ...this.snapshot, history });
   }
 
-  private async performAction(
+  private performAction(
     action: "cancel" | "retry",
     libraryId: string,
     operationId: string
-  ) {
+  ): Promise<{ ok: boolean; message: string | null }> {
+    const requestKey = `${libraryId}\u0000${operationId}\u0000${action}`;
+    const existing = this.actionRequests.get(requestKey);
+    if (existing) return existing;
     const bridge = this.currentBridge();
-    if (!bridge) return { ok: false, message: "通知操作仅在桌面模式可用" };
+    if (!bridge) return Promise.resolve({ ok: false, message: "通知操作仅在桌面模式可用" });
+    let bridgeRequest: Promise<{ ok: boolean; message: string | null }>;
     try {
-      return await bridge[action](libraryId, operationId);
+      bridgeRequest = bridge[action](libraryId, operationId);
     } catch (error) {
-      return { ok: false, message: errorMessage(error) };
+      return Promise.resolve({ ok: false, message: errorMessage(error) });
     }
+    const request = bridgeRequest.catch((error) => ({
+      ok: false,
+      message: errorMessage(error)
+    }));
+    this.actionRequests.set(requestKey, request);
+    void request.then(() => {
+      if (this.actionRequests.get(requestKey) === request) {
+        this.actionRequests.delete(requestKey);
+      }
+    });
+    return request;
   }
 
   private setSnapshot(snapshot: NotificationStoreSnapshot): void {
@@ -532,7 +573,7 @@ const loadMoreHistory = notificationStore.loadMoreHistory.bind(notificationStore
 const cancel = notificationStore.cancel.bind(notificationStore);
 const retry = notificationStore.retry.bind(notificationStore);
 const refreshCompact = notificationStore.refreshCompact.bind(notificationStore);
-const listLibraries = notificationStore.listLibraries.bind(notificationStore);
+const getHistoryFacets = notificationStore.getHistoryFacets.bind(notificationStore);
 const getLogPage = notificationStore.getLogPage.bind(notificationStore);
 const exportLogs = notificationStore.exportLogs.bind(notificationStore);
 const openLogSubscription = notificationStore.openLogSubscription.bind(notificationStore);
@@ -559,7 +600,7 @@ export function useNotifications() {
     cancel,
     retry,
     refreshCompact,
-    listLibraries,
+    getHistoryFacets,
     getLogPage,
     exportLogs,
     openLogSubscription,

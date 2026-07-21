@@ -644,11 +644,17 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.compact, async (event) => {
   return service.compactSnapshot();
 });
 
-ipcMain.handle(NOTIFICATION_IPC_CHANNELS.libraries, (event) => {
-  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.libraries);
-  return getRegistry().libraries
-    .map(({ id, name }) => ({ id, name }))
-    .sort((left, right) => left.name.localeCompare(right.name));
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.historyFacets, async (event) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.historyFacets);
+  const facets = await (await ensureNotificationService()).historyFacets();
+  const libraries = new Map(facets.libraries.map(({ id, name }) => [id, name]));
+  for (const { id, name } of getRegistry().libraries) libraries.set(id, name);
+  return {
+    libraries: [...libraries]
+      .map(([id, name]) => ({ id, name }))
+      .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id)),
+    kinds: facets.kinds
+  };
 });
 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.history, async (event, input: unknown) => {

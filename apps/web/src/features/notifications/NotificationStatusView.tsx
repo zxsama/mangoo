@@ -7,13 +7,19 @@ import {
   Radio,
   Square
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { DesktopThumbnailCacheSummary } from "@megle/notification-contract";
 import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
 import type { NotificationRequestResult } from "./useNotifications";
+import {
+  beginNotificationAction,
+  notificationActionKey,
+  settleNotificationAction,
+  type NotificationActionStates
+} from "./notificationActionModel";
 
 type NotificationAction = (
   libraryId: string,
@@ -29,10 +35,18 @@ export function NotificationStatusView({
   model: CompactNotificationModel;
   refreshCompact(): Promise<NotificationRequestResult<boolean>>;
 }) {
-  const [cancelState, setCancelState] = useState<{
-    key: string;
-    error: string | null;
-  } | null>(null);
+  const [actionStates, setActionStates] = useState<NotificationActionStates>(() => new Map());
+  const actionStatesRef = useRef(actionStates);
+  const actionRequestIdRef = useRef(0);
+  const commitActionStates = (next: NotificationActionStates) => {
+    actionStatesRef.current = next;
+    setActionStates(next);
+  };
+  useEffect(() => {
+    const clearedActionStates: NotificationActionStates = new Map();
+    actionStatesRef.current = clearedActionStates;
+    setActionStates(clearedActionStates);
+  }, [model.activeLibraryId]);
   const hasStatus =
     model.active.length > 0 ||
     model.thumbnail.summaries.length > 0 ||
@@ -82,30 +96,42 @@ export function NotificationStatusView({
             title="正在进行"
           />
           <div className="notification-status-operation-list">
-            {model.active.map((operation) => (
-              <ActiveOperation
-                cancelError={
-                  cancelState?.key === `${operation.libraryId}:${operation.operationId}`
-                    ? cancelState.error
-                    : null
-                }
-                cancelling={
-                  cancelState?.key === `${operation.libraryId}:${operation.operationId}` &&
-                  cancelState.error === null
-                }
-                key={`${operation.libraryId}:${operation.operationId}`}
-                onCancel={async () => {
-                  const key = `${operation.libraryId}:${operation.operationId}`;
-                  setCancelState({ key, error: null });
-                  const result = await cancel(operation.libraryId, operation.operationId);
-                  await refreshCompact();
-                  setCancelState(
-                    result.ok ? null : { key, error: result.message || "取消未完成" }
-                  );
-                }}
-                operation={operation}
-              />
-            ))}
+            {model.active.map((operation) => {
+              const actionKey = notificationActionKey(
+                operation.libraryId,
+                operation.operationId,
+                "cancel"
+              );
+              const actionState = actionStates.get(actionKey);
+              return (
+                <ActiveOperation
+                  cancelError={actionState?.error ?? null}
+                  cancelling={actionState?.pending === true}
+                  key={`${operation.libraryId}:${operation.operationId}`}
+                  onCancel={async () => {
+                    const requestId = ++actionRequestIdRef.current;
+                    const started = beginNotificationAction(
+                      actionStatesRef.current,
+                      actionKey,
+                      requestId
+                    );
+                    if (!started.started) return;
+                    commitActionStates(started.states);
+                    const result = await cancel(operation.libraryId, operation.operationId);
+                    await refreshCompact();
+                    commitActionStates(
+                      settleNotificationAction(
+                        actionStatesRef.current,
+                        actionKey,
+                        requestId,
+                        result.ok ? null : result.message || "取消未完成"
+                      )
+                    );
+                  }}
+                  operation={operation}
+                />
+              );
+            })}
           </div>
         </section>
       ) : null}

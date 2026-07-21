@@ -493,7 +493,7 @@ test("hardening source contract uses shared DTOs, sender authorization, and fail
   assert.match(read("apps/desktop/src/notification-ipc.ts"), /did-start-navigation/);
   assert.match(preload, /windowRole === "notifications"/);
   assert.doesNotMatch(preload, /onLogs:/);
-  assert.match(preload, /NOTIFICATION_IPC_CHANNELS\.libraries/);
+  assert.match(preload, /NOTIFICATION_IPC_CHANNELS\.historyFacets/);
   assert.match(preload, /NOTIFICATION_IPC_CHANNELS\.logsExport/);
   assert.match(main, /dialog\.showSaveDialog/);
   assert.match(main, /NOTIFICATION_IPC_CHANNELS\.logsExport/);

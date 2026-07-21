@@ -250,6 +250,21 @@ class FakeStore implements NotificationServiceStore {
     };
   }
 
+  async historyFacets() {
+    const libraries = new Map<string, string>();
+    const kinds = new Set<string>();
+    for (const item of this.operations.values()) {
+      libraries.set(item.libraryId, item.libraryName);
+      kinds.add(item.kind);
+    }
+    return {
+      libraries: [...libraries]
+        .map(([id, name]) => ({ id, name }))
+        .sort((left, right) => left.name.localeCompare(right.name)),
+      kinds: [...kinds].sort()
+    };
+  }
+
   async getOperation(libraryId: string, operationId: string): Promise<DesktopNotificationOperation | null> {
     this.getOperationCalls.push(`${libraryId}/${operationId}`);
     return this.operations.get(`${libraryId}/${operationId}`) ?? null;
@@ -907,6 +922,58 @@ describe("notification service", () => {
     assert.equal((await service.cancelOperation(LIBRARY_A.id, "task:7")).ok, true);
     assert.equal((await service.retryOperation(LIBRARY_A.id, "task:7")).ok, true);
     assert.deepEqual(actionPaths, ["/api/tasks/7/cancel", "/api/tasks/7/retry"]);
+    await service.close();
+  });
+
+  it("projects action capabilities to the active library and refreshes them after switching", async () => {
+    const store = new FakeStore();
+    store.imported.add(LIBRARY_A.id);
+    store.imported.add(LIBRARY_B.id);
+    await store.upsertOperations(LIBRARY_A, [
+      operation("a:active", 1, "running", { cancellable: true, retryable: false }),
+      operation("a:failed", 1, "failed", { cancellable: false, retryable: true })
+    ]);
+    await store.upsertOperations(LIBRARY_B, [
+      operation("b:active", 1, "running", { cancellable: true, retryable: false }),
+      operation("b:failed", 1, "failed", { cancellable: false, retryable: true })
+    ]);
+    const service = await createNotificationService({
+      store,
+      fetch: async (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(init.signal?.reason ?? new DOMException("Aborted", "AbortError")),
+            { once: true }
+          );
+        }),
+      now: () => NOW
+    });
+    const pushed: NotificationCompactSnapshot[] = [];
+    const unsubscribe = service.subscribe((snapshot) => pushed.push(snapshot));
+
+    await service.attachLibrary(LIBRARY_A, SESSION_A);
+    let compact = await service.compactSnapshot();
+    assert.equal(compact.active.find((item) => item.libraryId === LIBRARY_A.id)?.cancellable, true);
+    assert.equal(compact.active.find((item) => item.libraryId === LIBRARY_B.id)?.cancellable, false);
+    let history = await service.history({ statuses: ["failed"], limit: 20, offset: 0 });
+    assert.equal(history.items.find((item) => item.libraryId === LIBRARY_A.id)?.retryable, true);
+    assert.equal(history.items.find((item) => item.libraryId === LIBRARY_B.id)?.retryable, false);
+
+    await service.attachLibrary(LIBRARY_B, SESSION_B);
+    compact = await service.compactSnapshot();
+    assert.equal(compact.active.find((item) => item.libraryId === LIBRARY_A.id)?.cancellable, false);
+    assert.equal(compact.active.find((item) => item.libraryId === LIBRARY_B.id)?.cancellable, true);
+    history = await service.history({ statuses: ["failed"], limit: 20, offset: 0 });
+    assert.equal(history.items.find((item) => item.libraryId === LIBRARY_A.id)?.retryable, false);
+    assert.equal(history.items.find((item) => item.libraryId === LIBRARY_B.id)?.retryable, true);
+    assert.equal(
+      pushed.at(-1)?.active.find((item) => item.libraryId === LIBRARY_B.id)?.cancellable,
+      true,
+      "the library switch broadcast must refresh projected capabilities"
+    );
+
+    unsubscribe();
     await service.close();
   });
 

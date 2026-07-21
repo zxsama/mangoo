@@ -316,6 +316,61 @@ describe("notification store", () => {
     }
   });
 
+  it("treats LIKE wildcard characters as literal history search text", async () => {
+    const store = await createTestStore();
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        operation("literal-wildcards", 1, "failed", {
+          title: "Progress 100%_done",
+          errorDetail: "folder_name%_failed"
+        }),
+        operation("wildcard-lookalike", 1, "failed", {
+          title: "Progress 100x-done",
+          errorDetail: "folder_name-1-failed"
+        })
+      ]);
+
+      for (const search of ["%_", "name%_"]) {
+        const result = await store.history({ search, limit: 20, offset: 0 });
+        assert.deepEqual(
+          result.items.map((item) => item.operationId),
+          ["literal-wildcards"],
+          `search should treat ${search} literally`
+        );
+      }
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("lists history facets independently from the current page", async () => {
+    const store = await createTestStore();
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        operation("newest-kind", 1, "succeeded", {
+          kind: "root_scan",
+          updatedAt: NOW + 10,
+          completedAt: NOW + 10
+        })
+      ]);
+      await store.upsertOperations(LIBRARY_B, [
+        operation("older-kind", 1, "succeeded", {
+          kind: "legacy_cleanup",
+          updatedAt: NOW - 10,
+          completedAt: NOW - 10
+        })
+      ]);
+
+      const page = await store.history({ limit: 1, offset: 0 });
+      assert.deepEqual(page.items.map((item) => item.kind), ["root_scan"]);
+      const facets = await store.historyFacets();
+      assert.deepEqual(facets.libraries, [LIBRARY_A, LIBRARY_B]);
+      assert.deepEqual(facets.kinds, ["legacy_cleanup", "root_scan"]);
+    } finally {
+      await store.close();
+    }
+  });
+
   it("limits compact important results to the newest three without a time cutoff", async () => {
     const store = await createTestStore();
     try {

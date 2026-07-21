@@ -5,6 +5,7 @@ import { Worker } from "node:worker_threads";
 import type {
   DesktopNotificationOperation,
   NotificationHistoryPage,
+  NotificationHistoryFacets,
   NotificationHistoryQuery,
   NotificationLocalRecoveryBatch,
   NotificationLibraryIdentity,
@@ -189,6 +190,14 @@ export class NotificationStore {
       requestId: this.nextRequestId(),
       method: "history",
       params: { query }
+    });
+  }
+
+  async historyFacets(): Promise<NotificationHistoryFacets> {
+    return this.request<NotificationHistoryFacets>({
+      requestId: this.nextRequestId(),
+      method: "historyFacets",
+      params: {}
     });
   }
 

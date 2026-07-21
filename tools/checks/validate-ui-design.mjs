@@ -1831,7 +1831,7 @@ if (/\b(?:unread|readAt|markRead|未读|已读)\b/i.test(notificationWindow)) {
 }
 for (const [label, source, values] of [
   ["status", notificationStatusView, ["notification-status-active", "notification-status-thumbnails", "notification-status-results", "notification-status-health", "cancellable", "cancel"]],
-  ["history", notificationHistoryView, ["useVirtualizer", "cancellable", "retryable", "loadMoreHistory", "listLibraries", "origins", "kinds"]],
+  ["history", notificationHistoryView, ["useVirtualizer", "cancellable", "retryable", "loadMoreHistory", "getHistoryFacets", "origins", "kinds"]],
   ["process logs", processLogView, ["useVirtualizer", "openLogSubscription", "unsubscribe", "processLogGapSequence", "clearLogs", "exportLogs", "LOG_PAGE_SIZE = 200", "加载更早日志"]]
 ]) {
   for (const value of values) {

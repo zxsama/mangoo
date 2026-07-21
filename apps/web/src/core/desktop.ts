@@ -4,6 +4,7 @@ import type { DesktopNotificationsBridge } from "@megle/notification-contract";
 export type {
   DesktopNotificationCategory,
   DesktopNotificationCompactSnapshot,
+  DesktopNotificationHistoryFacets,
   DesktopNotificationHistoryPage,
   DesktopNotificationHistoryQuery,
   DesktopNotificationOperation,

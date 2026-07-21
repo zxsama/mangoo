@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import type {
   DesktopNotificationOperation,
+  NotificationHistoryFacets,
   NotificationHistoryPage,
   NotificationHistoryQuery,
   NotificationLocalRecoveryBatch,
@@ -75,6 +76,10 @@ function assertNullableString(value: unknown, label: string): void {
   if (value !== null && typeof value !== "string") {
     throw new TypeError(`${label} must be a string or null`);
   }
+}
+
+function escapeSqlLikeLiteral(value: string): string {
+  return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
 }
 
 function rendererReportMarkerId(reportId: string): string {
@@ -660,21 +665,21 @@ class NotificationStoreDatabase {
       const search = query.search.trim();
       if (search.length > 0) {
         clauses.push(`(
-          json_extract(operations.payload_json, '$.title') LIKE ?
-          OR json_extract(operations.payload_json, '$.summary') LIKE ?
-          OR json_extract(operations.payload_json, '$.errorDetail') LIKE ?
-          OR json_extract(operations.payload_json, '$.errorCode') LIKE ?
+          json_extract(operations.payload_json, '$.title') LIKE ? ESCAPE '\\'
+          OR json_extract(operations.payload_json, '$.summary') LIKE ? ESCAPE '\\'
+          OR json_extract(operations.payload_json, '$.errorDetail') LIKE ? ESCAPE '\\'
+          OR json_extract(operations.payload_json, '$.errorCode') LIKE ? ESCAPE '\\'
           OR EXISTS (
             SELECT 1 FROM action_errors
             WHERE action_errors.library_id = operations.library_id
               AND action_errors.operation_id = operations.operation_id
-              AND action_errors.detail LIKE ?
+              AND action_errors.detail LIKE ? ESCAPE '\\'
           )
-          OR ('Root ' || json_extract(operations.payload_json, '$.rootId')) LIKE ?
-          OR ('Folder ' || json_extract(operations.payload_json, '$.folderId')) LIKE ?
-          OR ('File ' || json_extract(operations.payload_json, '$.fileId')) LIKE ?
+          OR ('Root ' || json_extract(operations.payload_json, '$.rootId')) LIKE ? ESCAPE '\\'
+          OR ('Folder ' || json_extract(operations.payload_json, '$.folderId')) LIKE ? ESCAPE '\\'
+          OR ('File ' || json_extract(operations.payload_json, '$.fileId')) LIKE ? ESCAPE '\\'
         )`);
-        const pattern = `%${search}%`;
+        const pattern = `%${escapeSqlLikeLiteral(search)}%`;
         bindings.push(pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern);
       }
     }
@@ -698,6 +703,32 @@ class NotificationStoreDatabase {
       .all(...bindings, limit, offset) as unknown as OperationRow[];
     const nextOffset = offset + rows.length < totalRow.total ? offset + rows.length : null;
     return { items: rows.map(rowToOperation), total: totalRow.total, nextOffset };
+  }
+
+  historyFacets(): NotificationHistoryFacets {
+    const libraries = this.database
+      .prepare(
+        `SELECT library_id, MAX(library_name) AS library_name
+         FROM operations
+         GROUP BY library_id
+         ORDER BY library_name COLLATE NOCASE ASC, library_id ASC`
+      )
+      .all()
+      .map((row) => {
+        const value = row as { library_id: string; library_name: string };
+        return { id: value.library_id, name: value.library_name };
+      });
+    const kinds = this.database
+      .prepare(
+        `SELECT DISTINCT json_extract(payload_json, '$.kind') AS kind
+         FROM operations
+         WHERE json_type(payload_json, '$.kind') = 'text'
+           AND json_extract(payload_json, '$.kind') <> ''
+         ORDER BY kind COLLATE NOCASE ASC`
+      )
+      .all()
+      .map((row) => (row as { kind: string }).kind);
+    return { libraries, kinds };
   }
 
   getOperation(libraryId: string, operationId: string): DesktopNotificationOperation | null {
@@ -1043,6 +1074,8 @@ function executeRequest(store: NotificationStoreDatabase, request: NotificationS
       return store.compactSnapshot();
     case "history":
       return store.history(request.params.query);
+    case "historyFacets":
+      return store.historyFacets();
     case "getOperation":
       return store.getOperation(request.params.libraryId, request.params.operationId);
     case "setOperationActionError":
@@ -1088,6 +1121,7 @@ const REQUEST_METHODS = new Set<NotificationStoreRequest["method"]>([
   "markAcknowledged",
   "compactSnapshot",
   "history",
+  "historyFacets",
   "getOperation",
   "setOperationActionError",
   "recordRendererError",

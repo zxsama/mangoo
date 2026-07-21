@@ -329,7 +329,7 @@ for (const value of [
   "reportError",
   "publishThumbnailSummary",
   "onChanged",
-  "listLibraries",
+  "getHistoryFacets",
   "getLogs",
   "exportLogs",
   "snapshotAndSubscribeLogs",
@@ -344,7 +344,7 @@ for (const value of [
   }
 }
 for (const value of [
-  "NOTIFICATION_IPC_CHANNELS.libraries",
+  "NOTIFICATION_IPC_CHANNELS.historyFacets",
   "NOTIFICATION_IPC_CHANNELS.logsExport",
   "dialog.showSaveDialog",
   "processLogBuffer.snapshot"

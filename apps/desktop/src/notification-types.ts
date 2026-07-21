@@ -4,6 +4,7 @@ import type {
   NotificationCategory,
   NotificationCompactSnapshot,
   NotificationHistoryPage,
+  NotificationHistoryFacets,
   NotificationHistoryQuery,
   NotificationLibraryIdentity,
   NotificationOperationInput,
@@ -21,6 +22,7 @@ export type {
   NotificationCategory,
   NotificationCompactSnapshot,
   NotificationHistoryPage,
+  NotificationHistoryFacets,
   NotificationHistoryQuery,
   NotificationLibraryIdentity,
   NotificationOperationInput,
@@ -109,6 +111,7 @@ export type NotificationStoreRequest =
     }
   | { requestId: string; method: "compactSnapshot"; params: Record<string, never> }
   | { requestId: string; method: "history"; params: { query: NotificationHistoryQuery } }
+  | { requestId: string; method: "historyFacets"; params: Record<string, never> }
   | {
       requestId: string;
       method: "getOperation";

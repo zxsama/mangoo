@@ -30,7 +30,7 @@ describe("full notification center contract", () => {
     assert.match(historySource, /loadMoreHistory/);
     assert.match(historySource, /origins/);
     assert.match(historySource, /kinds/);
-    assert.match(historySource, /Promise\.all\(\[loadCurrentQuery\(queryRef\.current\), refreshCompact\(\)\]\)/);
+    assert.match(historySource, /getHistoryFacets/);
     assert.doesNotMatch(historySource, /MAX_CLIENT_FILTER_PAGES/);
     assert.doesNotMatch(historySource, /visibleItemss*=s*useMemo/);
     assert.doesNotMatch(historySource, /raw fetch|node:fs/i);
@@ -47,6 +47,8 @@ describe("full notification center contract", () => {
     assert.match(logSource, /unsubscribe/);
     assert.match(logSource, /useVirtualizer/);
     assert.match(logSource, /processLogGapSequence/);
+    assert.match(logSource, /isCurrentProcessLogPageRequest/);
+    assert.match(logSource, /coalesceProcessLogBatches/);
     assert.match(logSource, /clearLogs/);
     assert.match(logSource, /exportLogs/);
     assert.doesNotMatch(logSource, /new Blob|URL\.createObjectURL|anchor\.download/);

@@ -35,8 +35,8 @@ test("notification IPC permissions isolate privileged history, action and log ac
   assert.equal(canAccess("settings", channels.compact), false);
   assert.equal(canAccess("notifications", channels.history), true);
   assert.equal(canAccess("main", channels.history), false);
-  assert.equal(canAccess("notifications", channels.libraries), true);
-  assert.equal(canAccess("main", channels.libraries), false);
+  assert.equal(canAccess("notifications", channels.historyFacets), true);
+  assert.equal(canAccess("main", channels.historyFacets), false);
   assert.equal(canAccess("notifications", channels.cancel), true);
   assert.equal(canAccess("plugins", channels.cancel), false);
   assert.equal(canAccess("notifications", channels.logsPage), true);

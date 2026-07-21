@@ -68,7 +68,7 @@ function operation(index: number, overrides: Partial<DesktopNotificationOperatio
     errorCode: index % 7 === 0 ? "fixture_error" : null,
     errorDetail: index % 7 === 0 ? "Fixture action failed" : null,
     cancellable: false,
-    retryable: index % 7 === 0,
+    retryable: libraryId === "artists" && index % 7 === 0,
     attempt: 1,
     occurrenceCount: 1,
     startedAt: now - index * 2_000 - 4_000,
@@ -99,7 +99,7 @@ const activeOperations = [
     currentValue: 0,
     totalValue: null,
     completedAt: null,
-    cancellable: true
+    cancellable: false
   })
 ];
 
@@ -137,20 +137,20 @@ const compactSnapshot: DesktopNotificationCompactSnapshot = {
   ],
   latestImportantResults: [
     operation(1, { title: "删除 Archive 索引" }),
-    operation(7, { operationId: "retry-error", title: "移动 Portraits" }),
+    operation(6, { operationId: "retry-error", status: "failed", retryable: true, title: "移动 Portraits" }),
     operation(2, { status: "cancelled", title: "扫描已取消" })
   ],
   hasRetryableFailure: true,
   syncHealth: {
     state: fixtureState === "degraded" ? "degraded" : "healthy",
-    libraryId: null,
+    libraryId: "artists",
     detail: fixtureState === "degraded" ? "测试同步连接已暂停" : null,
     updatedAt: now
   }
 };
 
 const allHistory = Array.from({ length: 240 }, (_, index) =>
-  operation(index, index === 7 ? { operationId: "retry-error", retryable: true } : {})
+  operation(index, index === 6 ? { operationId: "retry-error", status: "failed", retryable: true } : {})
 );
 
 function filterHistory(query: DesktopNotificationHistoryQuery) {
@@ -330,14 +330,18 @@ function NotificationWindowVisualFixture() {
               ) : null}
               {page === "history" ? (
                 <NotificationHistoryView
+                  activeLibraryId="artists"
                   cancel={async () => ({ ok: true, message: null })}
                   history={history}
-                  listLibraries={async () => ({
+                  getHistoryFacets={async () => ({
                     ok: true,
-                    value: [
-                      { id: "artists", name: "Artists" },
-                      { id: "references", name: "References" }
-                    ]
+                    value: {
+                      libraries: [
+                        { id: "artists", name: "Artists" },
+                        { id: "references", name: "References" }
+                      ],
+                      kinds: ["file_move", "root_scan"]
+                    }
                   })}
                   loadHistory={loadHistory}
                   loadMoreHistory={loadMoreHistory}

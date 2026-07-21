@@ -87,6 +87,13 @@ export interface NotificationHistoryPage {
 
 export type DesktopNotificationHistoryPage = NotificationHistoryPage;
 
+export interface NotificationHistoryFacets {
+  libraries: NotificationLibraryIdentity[];
+  kinds: string[];
+}
+
+export type DesktopNotificationHistoryFacets = NotificationHistoryFacets;
+
 export interface RendererErrorReport {
   libraryId: string;
   libraryName: string;
@@ -195,7 +202,7 @@ export interface RendererLogEntryInput {
 
 export interface NotificationIpcBridge {
   getCompactSnapshot(): Promise<NotificationCompactSnapshot>;
-  listLibraries(): Promise<NotificationLibraryIdentity[]>;
+  getHistoryFacets(): Promise<NotificationHistoryFacets>;
   listHistory(query: NotificationHistoryQuery): Promise<NotificationHistoryPage>;
   cancel(libraryId: string, operationId: string): Promise<NotificationActionResult>;
   retry(libraryId: string, operationId: string): Promise<NotificationActionResult>;

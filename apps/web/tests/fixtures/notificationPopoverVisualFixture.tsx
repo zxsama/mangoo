@@ -88,6 +88,7 @@ function operation(
 
 function fullModel(): CompactNotificationModel {
   return {
+    activeLibraryId: "artists",
     active: [
       operation("重新索引 Artists"),
       operation("分析 References", {
@@ -183,6 +184,7 @@ function fullModel(): CompactNotificationModel {
 function modelFor(state: FixtureState): CompactNotificationModel {
   if (state === "full") return fullModel();
   return {
+    activeLibraryId: null,
     active: [],
     thumbnail: {
       summaries: [],

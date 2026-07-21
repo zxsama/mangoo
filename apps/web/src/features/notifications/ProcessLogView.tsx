@@ -31,6 +31,11 @@ import type {
   OpenNotificationLogSubscription
 } from "./useNotifications";
 import { processLogGapSequence } from "./notificationModel";
+import {
+  coalesceProcessLogBatches,
+  isCurrentProcessLogPageRequest,
+  processLogFilterIdentity
+} from "./processLogModel";
 
 const MAX_RENDERED_LOG_LINES = 5_000;
 const MAX_PAUSED_BATCH_LINES = 1_000;
@@ -73,6 +78,10 @@ export function ProcessLogView({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pausedRef = useRef(false);
   const bufferedBatchesRef = useRef<DesktopProcessLogBatch[]>([]);
+  const bufferedLineCountRef = useRef(0);
+  const pausedDroppedSequenceRef = useRef<number | null>(null);
+  const queryGenerationRef = useRef(0);
+  const loadingOlderRef = useRef(false);
 
   const query = useMemo<DesktopProcessLogFilter>(
     () => ({
@@ -83,6 +92,12 @@ export function ProcessLogView({
     }),
     [deferredSearch, level, source]
   );
+  const queryIdentity = useMemo(() => processLogFilterIdentity(query), [query]);
+  const queryIdentityRef = useRef(queryIdentity);
+  if (queryIdentityRef.current !== queryIdentity) {
+    queryIdentityRef.current = queryIdentity;
+    queryGenerationRef.current += 1;
+  }
 
   const deliverBatch = useCallback((batch: DesktopProcessLogBatch) => {
     const gap = processLogGapSequence(batch);
@@ -98,15 +113,18 @@ export function ProcessLogView({
     }
     const bufferedBatches = bufferedBatchesRef.current;
     bufferedBatches.push(batch);
-    let bufferedLineCount = bufferedBatches.reduce((total, value) => total + value.lines.length, 0);
-    while (bufferedLineCount > MAX_PAUSED_BATCH_LINES && bufferedBatches.length > 0) {
+    bufferedLineCountRef.current += batch.lines.length;
+    while (bufferedLineCountRef.current > MAX_PAUSED_BATCH_LINES && bufferedBatches.length > 0) {
       const removed = bufferedBatches.shift();
-      bufferedLineCount -= removed?.lines.length ?? 0;
+      bufferedLineCountRef.current -= removed?.lines.length ?? 0;
       if (removed?.lines.length) {
-        setGapSequence(removed.lines[removed.lines.length - 1]?.sequence ?? null);
+        pausedDroppedSequenceRef.current = Math.max(
+          pausedDroppedSequenceRef.current ?? 0,
+          removed.lines[removed.lines.length - 1]?.sequence ?? 0
+        );
       }
     }
-    setQueuedLineCount(bufferedLineCount);
+    setQueuedLineCount(bufferedLineCountRef.current);
   }, [deliverBatch]);
 
   useEffect(() => {
@@ -117,8 +135,12 @@ export function ProcessLogView({
     setGapSequence(null);
     setLines([]);
     bufferedBatchesRef.current = [];
+    bufferedLineCountRef.current = 0;
+    pausedDroppedSequenceRef.current = null;
     setQueuedLineCount(0);
     setHasOlder(false);
+    loadingOlderRef.current = false;
+    setLoadingOlder(false);
 
     void openLogSubscription(query, receiveBatch).then((result) => {
       if (!result.ok) {
@@ -173,8 +195,20 @@ export function ProcessLogView({
     pausedRef.current = false;
     setPaused(false);
     const pending = bufferedBatchesRef.current.splice(0);
+    const merged = coalesceProcessLogBatches(
+      pending,
+      MAX_PAUSED_BATCH_LINES,
+      pausedDroppedSequenceRef.current
+    );
+    bufferedLineCountRef.current = 0;
+    pausedDroppedSequenceRef.current = null;
     setQueuedLineCount(0);
-    for (const batch of pending) deliverBatch(batch);
+    if (merged.droppedBeforeSequence !== null) {
+      setGapSequence(merged.droppedBeforeSequence);
+    }
+    if (merged.lines.length > 0) {
+      setLines((current) => mergeLogLines(current, merged.lines));
+    }
   };
 
   const handleCopy = async () => {
@@ -206,9 +240,14 @@ export function ProcessLogView({
     }
     setLines([]);
     bufferedBatchesRef.current = [];
+    bufferedLineCountRef.current = 0;
+    pausedDroppedSequenceRef.current = null;
     setQueuedLineCount(0);
     setGapSequence(null);
     setHasOlder(false);
+    queryGenerationRef.current += 1;
+    loadingOlderRef.current = false;
+    setLoadingOlder(false);
     setActionMessage("已清空当前会话日志");
   };
 
@@ -232,13 +271,27 @@ export function ProcessLogView({
 
   const handleLoadOlder = async () => {
     const oldestSequence = lines[0]?.sequence;
-    if (oldestSequence == null || loadingOlder) return;
+    if (oldestSequence == null || loadingOlderRef.current) return;
+    const requestIdentity = {
+      queryIdentity,
+      generation: queryGenerationRef.current
+    };
+    loadingOlderRef.current = true;
     setLoadingOlder(true);
     const result = await getLogPage({
       ...query,
       beforeSequence: oldestSequence,
       limit: LOG_PAGE_SIZE
     });
+    if (
+      !isCurrentProcessLogPageRequest(requestIdentity, {
+        queryIdentity: queryIdentityRef.current,
+        generation: queryGenerationRef.current
+      })
+    ) {
+      return;
+    }
+    loadingOlderRef.current = false;
     setLoadingOlder(false);
     if (!result.ok) {
       setActionMessage(result.error);

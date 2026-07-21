@@ -13,6 +13,7 @@ import type {
   NotificationActionResult,
   NotificationCompactSnapshot,
   NotificationHistoryPage,
+  NotificationHistoryFacets,
   NotificationHistoryQuery,
   NotificationLibraryIdentity,
   NotificationLocalRecoveryBatch,
@@ -71,6 +72,7 @@ export interface NotificationServiceStore {
   markAcknowledged(libraryId: string, sequence: number): Promise<void>;
   compactSnapshot(): Promise<NotificationStoredSnapshot>;
   history(query: NotificationHistoryQuery): Promise<NotificationHistoryPage>;
+  historyFacets(): Promise<NotificationHistoryFacets>;
   getOperation(
     libraryId: string,
     operationId: string
@@ -365,6 +367,15 @@ function cloneCompactSnapshot(snapshot: NotificationCompactSnapshot): Notificati
   };
 }
 
+function projectOperationCapabilities(
+  operation: DesktopNotificationOperation,
+  activeLibraryId: string | null
+): DesktopNotificationOperation {
+  if (operation.libraryId === activeLibraryId) return operation;
+  if (!operation.cancellable && !operation.retryable) return operation;
+  return { ...operation, cancellable: false, retryable: false };
+}
+
 export class NotificationService {
   private store: NotificationServiceStore | null;
   private readonly openStore: ((signal: AbortSignal) => Promise<NotificationServiceStore>) | null;
@@ -502,12 +513,40 @@ export class NotificationService {
     validateHistoryQuery(query);
     if (this.store) {
       try {
-        return await this.store.history(query);
+        const page = await this.store.history(query);
+        return {
+          ...page,
+          items: page.items.map((operation) =>
+            projectOperationCapabilities(operation, this.active?.library.id ?? null)
+          )
+        };
       } catch (error) {
         await this.markStoreUnavailable(error);
       }
     }
     return this.fallbackHistory(query);
+  }
+
+  async historyFacets(): Promise<NotificationHistoryFacets> {
+    if (this.store) {
+      try {
+        return await this.store.historyFacets();
+      } catch (error) {
+        await this.markStoreUnavailable(error);
+      }
+    }
+    const libraries = new Map<string, string>();
+    const kinds = new Set<string>();
+    for (const operation of this.fallbackOperations.values()) {
+      libraries.set(operation.libraryId, operation.libraryName || operation.libraryId);
+      if (operation.kind) kinds.add(operation.kind);
+    }
+    return {
+      libraries: [...libraries]
+        .map(([id, name]) => ({ id, name }))
+        .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id)),
+      kinds: [...kinds].sort((left, right) => left.localeCompare(right))
+    };
   }
 
   subscribe(listener: (snapshot: NotificationCompactSnapshot) => void): () => void {
@@ -1567,7 +1606,11 @@ export class NotificationService {
         left.operationId.localeCompare(right.operationId)
     );
     return {
-      items: items.slice(offset, offset + limit),
+      items: items
+        .slice(offset, offset + limit)
+        .map((operation) =>
+          projectOperationCapabilities(operation, this.active?.library.id ?? null)
+        ),
       total: items.length,
       nextOffset: offset + limit < items.length ? offset + limit : null
     };
@@ -1576,9 +1619,13 @@ export class NotificationService {
   private currentCompactSnapshot(): NotificationCompactSnapshot {
     if (this.store) {
       return {
-        active: this.storedSnapshot.active,
+        active: this.storedSnapshot.active.map((operation) =>
+          projectOperationCapabilities(operation, this.active?.library.id ?? null)
+        ),
         thumbnailSummaries: this.storedSnapshot.thumbnailSummaries,
-        latestImportantResults: this.storedSnapshot.latestImportantResults,
+        latestImportantResults: this.storedSnapshot.latestImportantResults.map((operation) =>
+          projectOperationCapabilities(operation, this.active?.library.id ?? null)
+        ),
         hasRetryableFailure: this.storedSnapshot.retryableFailures.length > 0,
         syncHealth: this.health
       };
@@ -1587,7 +1634,10 @@ export class NotificationService {
     return {
       active: operations
         .filter((item) => item.status === "pending" || item.status === "running")
-        .sort((left, right) => right.updatedAt - left.updatedAt),
+        .sort((left, right) => right.updatedAt - left.updatedAt)
+        .map((operation) =>
+          projectOperationCapabilities(operation, this.active?.library.id ?? null)
+        ),
       thumbnailSummaries: [...this.fallbackThumbnails.values()].sort((left, right) =>
         left.libraryName.localeCompare(right.libraryName)
       ),
@@ -1603,7 +1653,10 @@ export class NotificationService {
             (right.completedAt ?? right.updatedAt) - (left.completedAt ?? left.updatedAt) ||
             right.updatedAt - left.updatedAt
         )
-        .slice(0, 3),
+        .slice(0, 3)
+        .map((operation) =>
+          projectOperationCapabilities(operation, this.active?.library.id ?? null)
+        ),
       hasRetryableFailure:
         this.durableRetryableFailures.size > 0 || this.fallbackRetryableFailures.size > 0,
       syncHealth: this.health

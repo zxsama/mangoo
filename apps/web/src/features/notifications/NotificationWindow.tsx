@@ -110,9 +110,10 @@ export function NotificationWindow() {
             role="tabpanel"
           >
             <NotificationHistoryView
+              activeLibraryId={notifications.compact.activeLibraryId}
               cancel={notifications.cancel}
+              getHistoryFacets={notifications.getHistoryFacets}
               history={notifications.history}
-              listLibraries={notifications.listLibraries}
               loadHistory={notifications.loadHistory}
               loadMoreHistory={notifications.loadMoreHistory}
               refreshCompact={notifications.refreshCompact}

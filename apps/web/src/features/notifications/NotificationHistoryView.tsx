@@ -11,15 +11,21 @@ import {
 } from "react";
 import type {
   DesktopNotificationCategory,
+  DesktopNotificationHistoryFacets,
   DesktopNotificationHistoryQuery,
   DesktopNotificationOperation,
-  DesktopNotificationStatus,
-  NotificationLibraryIdentity
+  DesktopNotificationStatus
 } from "@megle/notification-contract";
 import type {
   NotificationHistoryState,
   NotificationRequestResult
 } from "./useNotifications";
+import {
+  beginNotificationAction,
+  notificationActionKey,
+  settleNotificationAction,
+  type NotificationActionStates
+} from "./notificationActionModel";
 
 const PAGE_SIZE = 100;
 
@@ -29,9 +35,10 @@ type NotificationAction = (
 ) => Promise<{ ok: boolean; message: string | null }>;
 
 interface NotificationHistoryViewProps {
+  activeLibraryId: string | null;
   cancel: NotificationAction;
   history: NotificationHistoryState;
-  listLibraries(): Promise<NotificationRequestResult<NotificationLibraryIdentity[]>>;
+  getHistoryFacets(): Promise<NotificationRequestResult<DesktopNotificationHistoryFacets>>;
   loadHistory(query: DesktopNotificationHistoryQuery): Promise<NotificationHistoryState>;
   loadMoreHistory(): Promise<NotificationHistoryState>;
   refreshCompact(): Promise<NotificationRequestResult<boolean>>;
@@ -39,9 +46,10 @@ interface NotificationHistoryViewProps {
 }
 
 export function NotificationHistoryView({
+  activeLibraryId,
   cancel,
+  getHistoryFacets,
   history,
-  listLibraries,
   loadHistory,
   loadMoreHistory,
   refreshCompact,
@@ -54,14 +62,16 @@ export function NotificationHistoryView({
   const [category, setCategory] = useState<DesktopNotificationCategory | "">("");
   const [source, setSource] = useState<DesktopNotificationOperation["origin"] | "">("");
   const [kind, setKind] = useState("");
-  const [libraries, setLibraries] = useState<NotificationLibraryIdentity[]>([]);
-  const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [facets, setFacets] = useState<DesktopNotificationHistoryFacets>({
+    libraries: [],
+    kinds: []
+  });
+  const [facetError, setFacetError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
-  const [actionState, setActionState] = useState<{
-    key: string;
-    action: "cancel" | "retry";
-    error: string | null;
-  } | null>(null);
+  const [actionStates, setActionStates] = useState<NotificationActionStates>(() => new Map());
+  const actionStatesRef = useRef(actionStates);
+  const actionRequestIdRef = useRef(0);
+  const facetRequestGenerationRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const query = useMemo<DesktopNotificationHistoryQuery>(
@@ -77,6 +87,7 @@ export function NotificationHistoryView({
     [category, deferredSearch, kind, libraryId, source, status]
   );
   const queryRef = useRef<DesktopNotificationHistoryQuery>(query);
+  const activeLibraryIdRef = useRef(activeLibraryId);
 
   const loadCurrentQuery = useCallback(
     (nextQuery: DesktopNotificationHistoryQuery) => loadHistory(nextQuery),
@@ -88,28 +99,39 @@ export function NotificationHistoryView({
     void loadCurrentQuery(query);
   }, [loadCurrentQuery, query]);
 
-  useEffect(() => {
-    let active = true;
-    void listLibraries().then((result) => {
-      if (!active) return;
-      if (!result.ok) {
-        setLibraryError(result.error);
-        return;
-      }
-      setLibraries(
-        [...result.value].sort((left, right) => left.name.localeCompare(right.name, "zh-CN"))
-      );
-      setLibraryError(null);
+  const loadFacets = useCallback(async () => {
+    const generation = ++facetRequestGenerationRef.current;
+    const result = await getHistoryFacets();
+    if (generation !== facetRequestGenerationRef.current) return;
+    if (!result.ok) {
+      setFacetError(result.error);
+      return;
+    }
+    setFacets({
+      libraries: [...result.value.libraries].sort(
+        (left, right) => left.name.localeCompare(right.name, "zh-CN")
+      ),
+      kinds: [...result.value.kinds]
     });
-    return () => {
-      active = false;
-    };
-  }, [listLibraries]);
+    setFacetError(null);
+  }, [getHistoryFacets]);
 
-  const kinds = useMemo(
-    () => [...new Set(history.items.map((item) => item.kind))].sort(),
-    [history.items]
-  );
+  useEffect(() => {
+    if (activeLibraryIdRef.current === activeLibraryId) return;
+    activeLibraryIdRef.current = activeLibraryId;
+    const clearedActionStates: NotificationActionStates = new Map();
+    actionStatesRef.current = clearedActionStates;
+    setActionStates(clearedActionStates);
+    if (!history.query) return;
+    void Promise.all([loadCurrentQuery(queryRef.current), loadFacets()]);
+  }, [activeLibraryId, history.query, loadCurrentQuery, loadFacets]);
+
+  useEffect(() => {
+    void loadFacets();
+    return () => {
+      facetRequestGenerationRef.current += 1;
+    };
+  }, [loadFacets]);
 
   const virtualizer = useVirtualizer({
     count: history.items.length,
@@ -135,16 +157,37 @@ export function NotificationHistoryView({
     action: "cancel" | "retry",
     operation: DesktopNotificationOperation
   ) => {
-    const key = `${operation.libraryId}:${operation.operationId}`;
-    setActionState({ key, action, error: null });
+    const actionKey = notificationActionKey(
+      operation.libraryId,
+      operation.operationId,
+      action
+    );
+    const requestId = ++actionRequestIdRef.current;
+    const started = beginNotificationAction(
+      actionStatesRef.current,
+      actionKey,
+      requestId
+    );
+    if (!started.started) return;
+    actionStatesRef.current = started.states;
+    setActionStates(started.states);
     const result = await (action === "cancel" ? cancel : retry)(
       operation.libraryId,
       operation.operationId
     );
-    await Promise.all([loadCurrentQuery(queryRef.current), refreshCompact()]);
-    setActionState(
-      result.ok ? null : { key, action, error: result.message || "操作未完成" }
+    await Promise.all([
+      loadCurrentQuery(queryRef.current),
+      refreshCompact(),
+      loadFacets()
+    ]);
+    const settled = settleNotificationAction(
+      actionStatesRef.current,
+      actionKey,
+      requestId,
+      result.ok ? null : result.message || "操作未完成"
     );
+    actionStatesRef.current = settled;
+    setActionStates(settled);
   };
 
   const resetFilters = () => {
@@ -169,7 +212,7 @@ export function NotificationHistoryView({
             aria-label="刷新通知历史"
             className="notification-icon-action"
             disabled={history.loading}
-            onClick={() => void loadCurrentQuery(query)}
+            onClick={() => void Promise.all([loadCurrentQuery(query), loadFacets()])}
             type="button"
           >
             <RefreshCw aria-hidden="true" size={15} />
@@ -189,7 +232,7 @@ export function NotificationHistoryView({
         </label>
         <FilterSelect label="资源库" onChange={setLibraryId} value={libraryId}>
           <option value="">所有资源库</option>
-          {libraries.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
+          {facets.libraries.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
         </FilterSelect>
         <FilterSelect
           label="状态"
@@ -227,14 +270,14 @@ export function NotificationHistoryView({
         </FilterSelect>
         <FilterSelect label="类型" onChange={setKind} value={kind}>
           <option value="">所有类型</option>
-          {kinds.map((value) => <option key={value} value={value}>{kindLabel(value)}</option>)}
+          {facets.kinds.map((value) => <option key={value} value={value}>{kindLabel(value)}</option>)}
         </FilterSelect>
         <button className="notification-text-action" onClick={resetFilters} type="button">
           重置
         </button>
       </div>
 
-      {libraryError ? <p className="notification-inline-error" role="alert">{libraryError}</p> : null}
+      {facetError ? <p className="notification-inline-error" role="alert">{facetError}</p> : null}
       {history.error ? <p className="notification-inline-error" role="alert">{history.error}</p> : null}
 
       <div className="notification-history-list" ref={scrollRef}>
@@ -247,8 +290,21 @@ export function NotificationHistoryView({
           >
             {virtualizer.getVirtualItems().map((virtualRow) => {
               const operation = history.items[virtualRow.index];
-              const key = `${operation.libraryId}:${operation.operationId}`;
-              const isExpanded = expanded.has(key);
+              const operationKey = `${operation.libraryId}:${operation.operationId}`;
+              const cancelKey = notificationActionKey(
+                operation.libraryId,
+                operation.operationId,
+                "cancel"
+              );
+              const retryKey = notificationActionKey(
+                operation.libraryId,
+                operation.operationId,
+                "retry"
+              );
+              const cancelState = actionStates.get(cancelKey);
+              const retryState = actionStates.get(retryKey);
+              const actionError = cancelState?.error ?? retryState?.error ?? null;
+              const isExpanded = expanded.has(operationKey);
               return (
                 <div
                   className="notification-virtual-row"
@@ -261,13 +317,13 @@ export function NotificationHistoryView({
                 >
                   <article
                     className={`notification-history-row status-${operation.status}`}
-                    data-notification-operation={`${operation.libraryId}:${operation.operationId}`}
+                    data-notification-operation={operationKey}
                   >
                     <button
                       aria-expanded={isExpanded}
                       aria-label={`${isExpanded ? "收起" : "展开"}${operation.title}`}
                       className="notification-history-disclosure"
-                      onClick={() => toggleExpanded(key)}
+                      onClick={() => toggleExpanded(operationKey)}
                       type="button"
                     >
                       {isExpanded ? <ChevronDown aria-hidden="true" size={15} /> : <ChevronRight aria-hidden="true" size={15} />}
@@ -288,8 +344,8 @@ export function NotificationHistoryView({
                         </time>
                       </div>
                       {isExpanded ? <OperationDetails operation={operation} /> : null}
-                      {actionState?.key === key && actionState.error ? (
-                        <p className="notification-row-action-error" role="alert">{actionState.error}</p>
+                      {actionError ? (
+                        <p className="notification-row-action-error" role="alert">{actionError}</p>
                       ) : null}
                     </div>
                     <div className="notification-history-actions">
@@ -297,24 +353,24 @@ export function NotificationHistoryView({
                         <button
                           aria-label={`取消 ${operation.title}`}
                           className="notification-row-action"
-                          disabled={actionState?.key === key}
+                          disabled={cancelState?.pending === true}
                           onClick={() => void runAction("cancel", operation)}
                           type="button"
                         >
                           <Square aria-hidden="true" size={13} />
-                          {actionState?.key === key && actionState.action === "cancel" ? "取消中…" : "取消"}
+                          {cancelState?.pending ? "取消中…" : "取消"}
                         </button>
                       ) : null}
                       {operation.retryable ? (
                         <button
                           aria-label={`重试 ${operation.title}`}
                           className="notification-row-action"
-                          disabled={actionState?.key === key}
+                          disabled={retryState?.pending === true}
                           onClick={() => void runAction("retry", operation)}
                           type="button"
                         >
                           <RotateCcw aria-hidden="true" size={13} />
-                          {actionState?.key === key && actionState.action === "retry" ? "重试中…" : "重试"}
+                          {retryState?.pending ? "重试中…" : "重试"}
                         </button>
                       ) : null}
                     </div>

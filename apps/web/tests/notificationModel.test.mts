@@ -125,7 +125,7 @@ function bridge(
 ): DesktopNotificationsBridge {
   return {
     getCompactSnapshot: async () => compact(),
-    listLibraries: async () => [],
+    getHistoryFacets: async () => ({ libraries: [], kinds: [] }),
     listHistory: async () => ({ items: [], total: 0, nextOffset: null }),
     cancel: async () => ({ ok: true, message: null }),
     retry: async () => ({ ok: true, message: null }),
@@ -192,6 +192,7 @@ describe("notification selectors", () => {
     );
 
     assert.deepEqual(model.active.map((item) => item.operationId), ["pending", "running"]);
+    assert.equal(model.activeLibraryId, "library-a");
     assert.deepEqual(model.results.map((item) => item.operationId), [
       "result:4",
       "result:3",
@@ -587,6 +588,39 @@ describe("notification external store", () => {
     off();
   });
 
+  it("does not let a stale explicit compact refresh overwrite a newer push", async () => {
+    const refresh = deferred<DesktopNotificationCompactSnapshot>();
+    let snapshotCalls = 0;
+    let changed: ((snapshot: DesktopNotificationCompactSnapshot) => void) | null = null;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          getCompactSnapshot: () => {
+            snapshotCalls += 1;
+            return snapshotCalls === 1
+              ? Promise.resolve(compact({ active: [operation("initial")] }))
+              : refresh.promise;
+          },
+          onChanged: (callback) => {
+            changed = callback;
+            return () => undefined;
+          }
+        })
+    });
+    const off = store.subscribe(() => undefined);
+    await store.whenIdle();
+
+    const refreshing = store.refreshCompact();
+    changed?.(compact({ active: [operation("pushed", { revision: 3 })] }));
+    refresh.resolve(compact({ active: [operation("stale-refresh", { revision: 2 })] }));
+    await refreshing;
+
+    assert.deepEqual(store.getSnapshot().compact.active.map((item) => item.operationId), [
+      "pushed"
+    ]);
+    off();
+  });
+
   it("provides a stable degraded model when the bridge is unavailable or fails", async () => {
     const unavailable = createNotificationStore({ getBridge: () => null });
     const before = unavailable.getSnapshot();
@@ -817,6 +851,43 @@ describe("notification external store", () => {
     off();
   });
 
+  it("coalesces duplicate actions while keeping different operations independent", async () => {
+    const cancelAction = deferred<{ ok: boolean; message: string | null }>();
+    const retryAction = deferred<{ ok: boolean; message: string | null }>();
+    let cancelCalls = 0;
+    let retryCalls = 0;
+    const store = createNotificationStore({
+      getBridge: () =>
+        bridge({
+          cancel: () => {
+            cancelCalls += 1;
+            return cancelAction.promise;
+          },
+          retry: () => {
+            retryCalls += 1;
+            return retryAction.promise;
+          }
+        })
+    });
+
+    const firstCancel = store.cancel("library-a", "operation-a");
+    const duplicateCancel = store.cancel("library-a", "operation-a");
+    const independentRetry = store.retry("library-a", "operation-b");
+    assert.equal(cancelCalls, 1);
+    assert.equal(retryCalls, 1);
+
+    retryAction.resolve({ ok: false, message: "retry failed" });
+    assert.deepEqual(await independentRetry, { ok: false, message: "retry failed" });
+    cancelAction.resolve({ ok: true, message: null });
+    assert.deepEqual(await Promise.all([firstCancel, duplicateCancel]), [
+      { ok: true, message: null },
+      { ok: true, message: null }
+    ]);
+
+    await store.cancel("library-a", "operation-a");
+    assert.equal(cancelCalls, 2, "a settled action may be submitted again after capabilities refresh");
+  });
+
   it("converts bridge action exceptions into typed failures", async () => {
     const store = createNotificationStore({
       getBridge: () =>
@@ -921,7 +992,10 @@ describe("notification external store", () => {
             if (query.search === "fail") throw new Error("page unavailable");
             return { lines: [], hasMore: true, nextBeforeSequence: 12 };
           },
-          listLibraries: async () => [{ id: "library-a", name: "Artists" }],
+          getHistoryFacets: async () => ({
+            libraries: [{ id: "library-a", name: "Artists" }],
+            kinds: ["root_scan"]
+          }),
           exportLogs: async () => ({
             saved: true,
             canceled: false,
@@ -943,9 +1017,12 @@ describe("notification external store", () => {
       ok: false,
       error: "page unavailable"
     });
-    assert.deepEqual(await store.listLibraries(), {
+    assert.deepEqual(await store.getHistoryFacets(), {
       ok: true,
-      value: [{ id: "library-a", name: "Artists" }]
+      value: {
+        libraries: [{ id: "library-a", name: "Artists" }],
+        kinds: ["root_scan"]
+      }
     });
     assert.deepEqual(await store.exportLogs({ source: "core" }), {
       ok: true,

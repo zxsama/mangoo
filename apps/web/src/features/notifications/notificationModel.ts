@@ -35,6 +35,7 @@ export interface ThumbnailAggregateViewModel {
 }
 
 export interface CompactNotificationModel {
+  activeLibraryId: string | null;
   active: NotificationOperationViewModel[];
   thumbnail: ThumbnailAggregateViewModel;
   results: NotificationOperationViewModel[];
@@ -108,6 +109,7 @@ export function buildCompactNotificationModel(
     .slice(0, 3)
     .map(operationViewModel);
   return {
+    activeLibraryId: snapshot.syncHealth.libraryId,
     active,
     thumbnail: buildThumbnailAggregate(snapshot.thumbnailSummaries),
     results,

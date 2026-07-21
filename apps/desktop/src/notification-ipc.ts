@@ -24,7 +24,7 @@ export interface NotificationIpcChannels {
   readonly openWindow: string;
   readonly closeWindow: string;
   readonly compact: string;
-  readonly libraries: string;
+  readonly historyFacets: string;
   readonly history: string;
   readonly cancel: string;
   readonly retry: string;
@@ -60,7 +60,7 @@ const CHANNEL_PERMISSIONS = new Map<string, ReadonlySet<NotificationIpcWindowRol
   [NOTIFICATION_IPC_CHANNELS.openWindow, MAIN_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.closeWindow, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.compact, MAIN_AND_NOTIFICATION_ROLES],
-  [NOTIFICATION_IPC_CHANNELS.libraries, NOTIFICATION_WINDOW_ONLY],
+  [NOTIFICATION_IPC_CHANNELS.historyFacets, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.history, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.cancel, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.retry, NOTIFICATION_WINDOW_ONLY],
