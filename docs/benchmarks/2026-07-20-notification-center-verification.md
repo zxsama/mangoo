@@ -234,3 +234,32 @@ Authoritative controlled interaction evidence remains under `.tmp/task16-notific
 - Root purge running determinate progress was too fast to sample before terminal.
 - Controlled real-renderer duplicate-error injection and simultaneous visible Main/Core/Renderer log content remain unverified.
 - Screenshot evidence covers layout/state/rendering, not human judgment of physical-display anti-aliasing.
+
+## Final Integration Reverification
+
+After the fixed Task 16 evidence above, the cross-task review found and fixed
+legacy-import retry, degraded-store bounds, online trailing progress flush,
+partial Core log buffering, and compact-popover recount coupling. The final
+reviewed code endpoint is `2559f42fad7e62653931f9e914409531e7b3c529`.
+
+Fresh verification at that endpoint:
+
+- `node tools/bench/notification-center-bench.mjs`: PASS in 14,687.943 ms.
+  The production-path probe completed 10,000 thumbnails, emitted zero per-item
+  notification rows, persisted four exact library aggregates, sampled ten
+  progress events at 1,000 ms intervals, retained 2,000 completed rows, deleted
+  exactly 100 overflow rows, and retained all 20 active rows. The Desktop
+  Store/Worker portion completed in 96.871 ms.
+- `npm test`: PASS in 63.5 seconds. This includes structure, Core API/client,
+  notification contract, Desktop, Web, UI design, schema, and Rust gates. Rust
+  reported 395 passed and 2 ignored tests.
+- The benchmark cleanup self-tests confirmed Store/Worker and Core child
+  termination plus temporary SQLite/WAL/SHM cleanup. The three default Electron
+  profile notification files remained absent after this run.
+- A final read-only integration review reported no remaining integration
+  findings after `2559f42`.
+
+The OS-backdrop harness and broad Artists interaction were not rerun for these
+non-visual integration fixes. Their overall FAIL / NOT VERIFIED status and the
+residual risks above remain unchanged; this section does not promote them to
+PASS.
