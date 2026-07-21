@@ -1,6 +1,6 @@
 # Unified Notification Center Verification
 
-Date: 2026-07-21 (Asia/Shanghai)
+Date: 2026-07-22 (Asia/Shanghai)
 
 ## Scope and Fixed Revisions
 
@@ -8,13 +8,15 @@ Date: 2026-07-21 (Asia/Shanghai)
 - Initial Task 16 verification commit: `38f21e38d507275372e94b6ac44180e8f5cbd784` (`test: verify unified notification center`).
 - First findings follow-up: `6f523577d6aec6526606b19d412b68ff2965a15d` (`test: verify unified notification center`).
 - Production-path benchmark hardening: `606f992d6c37a17e3103413107f32cb440cc5510` (`test: harden notification center benchmark`).
-- Focused gates, three benchmark runs, and `npm test` reported below ran against the exact code content committed as `606f992d6c37a17e3103413107f32cb440cc5510`.
+- Monotonic timestamp and real Core fault-probe fix: `55142d46b3703cb0f75fa0a7596b86b9471f28a7` (`fix(core): keep notification timestamps monotonic`).
+- Focused gates, three benchmark runs, and `npm test` reported below ran against the exact code content committed as `55142d46b3703cb0f75fa0a7596b86b9471f28a7`.
 - Environment: Windows, Node `v22.14.0`, npm `10.9.2`, rustc `1.95.0`, cargo `1.95.0`, Python `3.11.9`.
 
-Two Task 1-15 files were changed only for real defects found during Task 16:
+Three Task 1-15 files were changed only for real defects found during Task 16:
 
 - `apps/web/src/core/notificationReporting.ts`: the Settings renderer used shared library state and attempted the Main-role-only `megle:notifications-thumbnail-summary` IPC. The fix role-gates notification publishing and has regression coverage.
-- `crates/core/src/db/mod.rs`: the benchmark needed observable production persistence behavior, not a parallel algorithm. The existing progress path now delegates through a private injectable-clock seam while retaining the normal system clock, and the test probe drives the real task/outbox and thumbnail completion/DB update functions. The probe itself is test-only, creates its own OS temporary directories, accepts no external DB/output path, and emits only prefixed JSON on stdout.
+- `crates/core/src/db/mod.rs`: the benchmark needed observable production persistence behavior, not a parallel algorithm. Progress and terminal notifications now use the same millisecond clock seam, and the test probe drives the real task/outbox and thumbnail completion/DB update functions. The probe itself is test-only, creates its own OS temporary directories, accepts no external DB/output path, and emits only prefixed JSON on stdout.
+- `crates/core/src/db/notification_outbox.rs`: each new revision clamps `updated_at`, and terminal `completed_at`, to the preceding head timestamp. This prevents notification history from moving backward if the system clock rolls back.
 
 No validator or visual baseline was weakened or changed.
 
@@ -25,20 +27,22 @@ No validator or visual baseline was weakened or changed.
 | `npm run check:core-api` | PASS | Core API contract alignment. |
 | `npm run check:core-client` | PASS | Contract/typecheck and 41/41 tests. |
 | `npm run check:schema` | PASS | SQLite migrations/schema/index checks. |
-| `npm run check:rust` | PASS | 388 passed, 0 failed, 1 ignored benchmark probe; the `jpeg-decoder` profile warning remains unattributed. |
+| `npm run check:rust` | PASS | 391 passed, 0 failed, 2 ignored benchmark probes; the `jpeg-decoder` profile warning remains unattributed. |
 | `npm run check:desktop` | PASS | Desktop boundary/typecheck and 156/156 tests. |
 | `npm run check:web` | PASS | Web boundary/typecheck and 122/122 tests. |
 | `npm run check:ui-design` | PASS | Liquid Glass design boundaries. |
 | `node tools/bench/notification-center-bench.mjs` | PASS x3 | Identical deterministic counts in all three runs; elapsed observations differed as expected. |
-| `npm test` | PASS | Final full repository gate, exit 0 in 62.9 seconds. |
+| `npm test` | PASS | Final full repository gate, exit 0 in 63.4 seconds. |
 
-The focused gates were run individually before the final aggregate gate.
+Rust, Desktop, Web, and the benchmark were run individually before the final aggregate gate. The final `npm test` reran them and covered the remaining listed repository gates.
 
 ## Production-Boundary Benchmark
 
 The benchmark invokes `cargo test -p megle-core db::tests::notification_center_benchmark_probe -- --ignored --exact --nocapture --test-threads=1`. The Rust probe internally creates four file-backed Core SQLite libraries. For every one of 10,000 thumbnails it creates real media, requests and starts the production thumbnail task, and calls `publish_thumbnail_and_succeed_task_if_source_fingerprint_and_task_attempt_current`, exercising the production cache/blob/media/task DB updates. It then queries production cache statistics.
 
-The progress workload sends 10,000 updates through `update_task_scan_progress_for_attempt` using a deterministic synthetic schedule from `+1 ms` through `+10,000 ms`. The production persistence function receives the test clock through its clock seam. Exact persisted progress offsets must be `1,000` through `10,000 ms` in one-second steps. A 500 ms implementation would persist 20 progress events and fail; a per-input implementation would persist 10,000 and fail.
+The progress workload sends 10,000 updates through `update_task_scan_progress_for_attempt` using a deterministic synthetic schedule from `+1 ms` through `+10,000 ms`. The production persistence function receives the test clock through its clock seam, then the terminal transition uses the same seam at `+10,001 ms`. Exact persisted progress offsets must be `1,000` through `10,000 ms` in one-second steps and terminal history must remain monotonic. A 500 ms implementation would persist 20 progress events and fail; a per-input implementation would persist 10,000 and fail.
+
+Ordinary Rust regression tests also cover a progress and terminal transition in the same millisecond, terminal completion after synthetic `+10,000 ms` progress, and a terminal clock rollback from `+10,000 ms` to `+2,000 ms`. In the rollback case the terminal head, outbox payload, and `completed_at` remain at the last progress timestamp, so history sorting does not retreat.
 
 The JavaScript side calls the real Web `publishThumbnailCacheStats` reporting boundary once for each Core result, then uses production Desktop `NotificationStore`, `worker_threads`, `NotificationStoreDatabase`, and SQLite WAL. No machine-specific elapsed-time threshold is asserted.
 
@@ -56,6 +60,8 @@ These values were identical in all three runs.
 | Persisted progress events | 10 |
 | Persisted progress offsets (ms) | 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000 |
 | Terminal events | 1 |
+| Terminal updated offset (ms) | 10001 |
+| Progress/terminal history timestamps monotonic | true |
 | Total Core outbox events | 53 |
 | Completed operations seeded | 2,100 |
 | Synthetic completed operations | 2,099 |
@@ -105,24 +111,25 @@ All values are milliseconds and are observations only.
 
 | Metric | Run 1 | Run 2 | Run 3 |
 | --- | ---: | ---: | ---: |
-| Core child PID | 68156 | 72256 | 57872 |
-| Core process | 18732.122 | 18868.227 | 18643.349 |
-| Progress inputs | 1668.680 | 1657.553 | 1734.476 |
-| All thumbnail completions | 16514.051 | 16747.332 | 16439.164 |
-| Library 1 completions | 3520.847 | 3589.174 | 3555.762 |
-| Library 2 completions | 4005.146 | 3906.560 | 3892.615 |
-| Library 3 completions | 3868.895 | 4100.712 | 3955.823 |
-| Library 4 completions | 4002.898 | 4058.662 | 3932.235 |
-| Web reporting | 1.682 | 1.181 | 1.795 |
-| Worker startup | 50.225 | 49.259 | 54.479 |
-| Worker progress apply | 2.111 | 1.997 | 2.102 |
-| Worker thumbnail reporting | 1.682 | 1.181 | 1.795 |
-| Worker terminal batches | 31.676 | 30.177 | 30.588 |
-| Worker retention | 2.156 | 1.625 | 2.066 |
-| Worker compact read | 1.859 | 1.206 | 1.428 |
-| Worker close | 13.911 | 11.970 | 12.251 |
-| Total store/worker elapsed | 103.620 | 97.415 | 104.709 |
-| End-to-end benchmark | 18913.968 | 19044.365 | 18830.549 |
+| Core child PID | 38980 | 37368 | 28904 |
+| Fault-probe Core child PID | 73716 | 14268 | 65872 |
+| Core process | 18314.932 | 18317.968 | 18938.253 |
+| Progress inputs | 1765.939 | 1645.915 | 1728.906 |
+| All thumbnail completions | 16014.372 | 16193.428 | 16635.636 |
+| Library 1 completions | 3495.776 | 3524.941 | 3572.682 |
+| Library 2 completions | 3781.763 | 3847.052 | 4012.599 |
+| Library 3 completions | 3808.022 | 3796.562 | 4039.711 |
+| Library 4 completions | 3727.964 | 3880.218 | 3848.216 |
+| Web reporting | 1.571 | 1.129 | 1.221 |
+| Worker startup | 48.936 | 52.251 | 52.708 |
+| Worker progress apply | 1.876 | 1.891 | 1.912 |
+| Worker thumbnail reporting | 1.571 | 1.129 | 1.221 |
+| Worker terminal batches | 28.149 | 29.537 | 33.841 |
+| Worker retention | 1.926 | 2.087 | 2.187 |
+| Worker compact read | 1.635 | 1.855 | 1.668 |
+| Worker close | 13.791 | 14.339 | 14.416 |
+| Total store/worker elapsed | 97.884 | 103.089 | 107.953 |
+| End-to-end benchmark | 18487.217 | 18501.986 | 19132.397 |
 
 ### Cleanup and Failure Injection
 
@@ -136,15 +143,22 @@ All three runs produced the following exact cleanup results:
 | Post-create failure run directory removed | PASS |
 | Post-create failure worker stopped | PASS |
 | SQLite, WAL, and SHM observed before injected post-create failure | PASS |
-| Cargo/Core nonzero child run directory removed | PASS |
-| Cargo/Core nonzero child stopped | PASS |
-| Store worker paired with Cargo failure stopped | PASS |
-| Injected Cargo exit code | 101 |
+| Fault-probe Core test binary started and reported a PID distinct from Cargo | PASS |
+| Fault-probe Core database initialized with schema migrations 24/24 | PASS |
+| Fault-probe Core DB, WAL, and SHM observed before failure | PASS |
+| Cargo test command exit code after the intentional Core test panic | 101 |
+| Cargo process stopped | PASS |
+| Core test binary stopped | PASS |
+| Store worker paired with Core failure stopped | PASS |
+| Fault-probe Core temporary DB directory and sidecars removed | PASS |
+| Store run directory paired with Core failure removed | PASS |
 | Rust probe internal temporary directories removed | PASS |
 | Successful-run Core child stopped | PASS |
 | Stale prior success deleted before forced failure | PASS |
 | Forced failure published no success evidence | PASS |
 | Forced-failure child stopped / exit code | PASS / 1 |
+
+The nonzero cleanup path invokes the real ignored `notification_center_benchmark_fault_probe`. Cargo successfully builds and starts the `megle-core` test binary; that binary creates and migrates its internal temporary SQLite database, observes `fault.sqlite`, `fault.sqlite-wal`, and `fault.sqlite-shm`, emits prefixed startup evidence, and then intentionally panics. The benchmark accepts the nonzero result only after proving the Cargo process, distinct Core test-binary process, and paired production Desktop store worker have all stopped and both temporary directories have been removed. It does not use a missing-package or command-line parse failure.
 
 The benchmark deletes stale success output before starting and publishes temporary output atomically only after successful store closure and cleanup. This report embeds the authoritative counts and does not depend on an ignored benchmark result file.
 
@@ -166,7 +180,7 @@ All later Electron launches used controlled worktree profiles. The OS harness pr
 --user-data-dir=C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\data-desktop-ui\electron-user-data
 ```
 
-The Artists follow-up used `.tmp/task16-followup-artists-user-data`. No Electron process was launched for the `606f992d6c37a17e3103413107f32cb440cc5510` benchmark hardening follow-up. Its final audit again confirmed the three default AppData notification files absent.
+The Artists follow-up used `.tmp/task16-followup-artists-user-data`. No Electron process was launched for the benchmark hardening or monotonic timestamp follow-ups through `55142d46b3703cb0f75fa0a7596b86b9471f28a7`. The final audit again confirmed the three default AppData notification files absent.
 
 Cleanup evidence:
 
