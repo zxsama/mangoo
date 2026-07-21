@@ -185,7 +185,12 @@ export function publishThumbnailCacheStats(
 ): Promise<boolean> {
   const bridge = desktopBridge();
   const notifications = bridge?.notifications;
-  if (!bridge || !notifications?.publishThumbnailSummary || !context) {
+  if (
+    !bridge ||
+    (bridge.windowRole !== undefined && bridge.windowRole !== "main") ||
+    !notifications?.publishThumbnailSummary ||
+    !context
+  ) {
     return Promise.resolve(false);
   }
   const libraryId = boundedString(context.libraryId, LIBRARY_ID_MAX_LENGTH);

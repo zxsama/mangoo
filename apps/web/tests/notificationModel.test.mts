@@ -610,6 +610,47 @@ describe("notification reporting", () => {
       }
     }
   });
+
+  it("does not publish thumbnail summaries from a non-main renderer role", async () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    let publishCalls = 0;
+    try {
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          windowRole: "settings",
+          notifications: bridge({
+            publishThumbnailSummary: async () => {
+              publishCalls += 1;
+              return true;
+            }
+          })
+        }
+      };
+
+      const accepted = await publishThumbnailCacheStats(
+        {
+          cachedCount: 1,
+          missingCount: 1,
+          staleCount: 0,
+          failedCount: 0,
+          pendingCandidateCount: 1,
+          totalBlobBytes: 1024,
+          activeBulkTaskCount: 0
+        },
+        { libraryId: "lib-a", libraryName: "Artists" },
+        1000
+      );
+
+      assert.equal(accepted, false);
+      assert.equal(publishCalls, 0);
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
 });
 
 describe("notification selectors", () => {
