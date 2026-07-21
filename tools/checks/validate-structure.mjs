@@ -84,19 +84,66 @@ function normalizedContractToken(source) {
     .trim();
 }
 
+function leadingIndentWidth(line) {
+  let width = 0;
+  for (const character of line) {
+    if (character === " ") {
+      width += 1;
+    } else if (character === "\t") {
+      width += 4 - (width % 4);
+    } else {
+      break;
+    }
+  }
+  return width;
+}
+
+function listItemLayout(line) {
+  const item = line.match(/^([ \t]*)([-+*]|\d+[.)])([ \t]+)\S/u);
+  if (!item) return null;
+  const indent = leadingIndentWidth(item[1]);
+  return {
+    indent,
+    contentIndent: indent + item[2].length + leadingIndentWidth(item[3])
+  };
+}
+
 function markdownSections(document) {
   const lines = document.replace(/<!--[\s\S]*?-->/g, "").split("\n");
   const sections = [];
   const stack = [];
+  const listContexts = [];
   let inCodeFence = false;
+  let inIndentedCode = false;
 
   for (const line of lines) {
     if (/^\s*(?:```|~~~)/.test(line)) {
-      if (stack.length > 0) stack.at(-1).lines.push({ text: line, inFence: true });
+      if (stack.length > 0) {
+        stack.at(-1).lines.push({ text: line, inFence: true, inIndentedCode: false });
+      }
       inCodeFence = !inCodeFence;
       continue;
     }
-    const heading = inCodeFence ? null : line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (inCodeFence) {
+      if (stack.length > 0) {
+        stack.at(-1).lines.push({ text: line, inFence: true, inIndentedCode: false });
+      }
+      continue;
+    }
+
+    const isBlank = /^\s*$/u.test(line);
+    const indent = leadingIndentWidth(line);
+    if (inIndentedCode) {
+      if (isBlank || indent >= 4) {
+        if (stack.length > 0) {
+          stack.at(-1).lines.push({ text: line, inFence: false, inIndentedCode: true });
+        }
+        continue;
+      }
+      inIndentedCode = false;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
     if (heading) {
       const level = heading[1].length;
       while (stack.length > 0 && stack.at(-1).level >= level) stack.pop();
@@ -108,9 +155,37 @@ function markdownSections(document) {
       };
       sections.push(section);
       stack.push(section);
+      listContexts.length = 0;
       continue;
     }
-    if (stack.length > 0) stack.at(-1).lines.push({ text: line, inFence: inCodeFence });
+
+    const listItem = listItemLayout(line);
+    const parentList = listContexts.findLast(
+      (context) => context.indent < indent && context.contentIndent <= indent
+    );
+    const codeIndent = parentList ? parentList.contentIndent + 4 : 4;
+    if (!isBlank && indent >= codeIndent) {
+      inIndentedCode = true;
+      listContexts.length = 0;
+      if (stack.length > 0) {
+        stack.at(-1).lines.push({ text: line, inFence: false, inIndentedCode: true });
+      }
+      continue;
+    }
+
+    if (stack.length > 0) {
+      stack.at(-1).lines.push({ text: line, inFence: false, inIndentedCode: false });
+    }
+    if (listItem) {
+      while (listContexts.length > 0 && listContexts.at(-1).indent >= listItem.indent) {
+        listContexts.pop();
+      }
+      listContexts.push(listItem);
+    } else if (!isBlank) {
+      while (listContexts.length > 0 && indent < listContexts.at(-1).contentIndent) {
+        listContexts.pop();
+      }
+    }
   }
 
   return sections;
@@ -161,7 +236,7 @@ const retiredSurfaceDefinitions = [
 function parseVisibleKeyValueItems(section) {
   const items = [];
   for (const line of section.lines) {
-    if (line.inFence) continue;
+    if (line.inFence || line.inIndentedCode) continue;
     const bullet = line.text.trim().match(/^[-+*]\s+(.+)$/u);
     if (!bullet) continue;
     const visibleLine = bullet[1].replace(/\*\*|__|`/g, "").trim();
@@ -217,6 +292,14 @@ function validateClaudeRetiredSurfaceContract(document) {
 
   for (const section of sections) {
     if (hasHistoricalOrArchivedContext(section) || isWithinSection(section, retiredSection)) continue;
+    const heading = normalizedContractToken(section.heading.replace(/[*_`]/g, ""));
+    for (const surface of retiredSurfaceDefinitions) {
+      if (surface.pattern.test(heading)) {
+        failures.push(
+          `CLAUDE.md section heading ${section.heading} mentions retired surface ${surface.label} outside Retired Surfaces`
+        );
+      }
+    }
     for (let lineIndex = 0; lineIndex < section.lines.length; lineIndex += 1) {
       const line = normalizedContractToken(section.lines[lineIndex].text.replace(/[*_`]/g, ""));
       for (const surface of retiredSurfaceDefinitions) {
@@ -399,6 +482,27 @@ ${retiredEntries}
       fail(`retired surface contract must reject current Chinese requirements: ${surface}`);
     }
   }
+
+  for (const headingDocument of [
+    `## Task Center\n## Unified Notification Center\n${retiredEntries}`,
+    `## 任务中心\n## Unified Notification Center\n${retiredEntries}`
+  ]) {
+    if (!validateClaudeRetiredSurfaceContract(headingDocument).some((failure) => failure.includes("section heading"))) {
+      fail(`retired surface contract must scan current section headings: ${headingDocument.split("\n")[0]}`);
+    }
+  }
+
+  const allowedRetiredAndHistoricalHeadings = `
+## Unified Notification Center
+${retiredEntries}
+##### Task Center
+##### 任务中心
+## Historical Task Center
+### Task Drawer
+`;
+  if (validateClaudeRetiredSurfaceContract(allowedRetiredAndHistoricalHeadings).length !== 0) {
+    fail("retired surface contract must skip headings inside canonical Retired and Historical subtrees");
+  }
 }
 
 function assertStructuredReadmeCapabilityContracts() {
@@ -453,6 +557,41 @@ The body may use freely rewritten natural language about durable status across c
 `;
   if (validateReadmeNotificationCapabilities(fencedOnlyDocument).length !== 3) {
     fail("README capability contract must reject markers that exist only inside a fenced code block");
+  }
+
+  const indentedOnlyDocument = `
+## Unified Notification Center
+### Capabilities
+    capability example:
+    - **Scope**: \`all-library-persistent\`
+    - **Progress**: \`aggregated-logical-task-progress\`
+    - **Logs**: \`local-process-logs\`
+`;
+  if (validateReadmeNotificationCapabilities(indentedOnlyDocument).length !== 3) {
+    fail("README capability contract must reject markers in a four-space indented code block and its continuation lines");
+  }
+
+  const tabIndentedOnlyDocument = `
+## Unified Notification Center
+### Capabilities
+\t- **Scope**: \`all-library-persistent\`
+\t- **Progress**: \`aggregated-logical-task-progress\`
+\t- **Logs**: \`local-process-logs\`
+`;
+  if (validateReadmeNotificationCapabilities(tabIndentedOnlyDocument).length !== 3) {
+    fail("README capability contract must reject markers in a tab-indented code block");
+  }
+
+  const nestedListDocument = `
+## Unified Notification Center
+### Capabilities
+- Notification contract:
+    - **Scope**: \`all-library-persistent\`
+    - **Progress**: \`aggregated-logical-task-progress\`
+    - **Logs**: \`local-process-logs\`
+`;
+  if (validateReadmeNotificationCapabilities(nestedListDocument).length !== 0) {
+    fail("README capability contract must accept real capability items in a normal nested list");
   }
 }
 
