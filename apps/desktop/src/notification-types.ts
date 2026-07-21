@@ -64,7 +64,8 @@ export interface NotificationRetentionResult {
 export interface NotificationPendingRendererError {
   library: NotificationLibraryIdentity;
   report: RendererErrorReport;
-  reportIds: string[];
+  occurrenceCount: number;
+  uncertainReportId: string | null;
   occurredAt: number;
 }
 

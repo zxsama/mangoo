@@ -1000,7 +1000,8 @@ describe("notification store", () => {
         {
           library: LIBRARY_A,
           report,
-          reportIds: ["recovery-report-1", "recovery-report-2"],
+          occurrenceCount: 2,
+          uncertainReportId: null,
           occurredAt: NOW
         }
       ],
@@ -1015,7 +1016,7 @@ describe("notification store", () => {
         }
       ],
       createdAt: NOW
-    };
+    } as unknown as NotificationLocalRecoveryBatch;
     try {
       await store.upsertOperations(LIBRARY_A, [task]);
       assert.equal(await store.applyLocalRecoveryBatch(batch, NOW), true);
@@ -1034,6 +1035,57 @@ describe("notification store", () => {
         "action failed"
       );
       assert.equal((await store.compactSnapshot()).thumbnailSummaries[0]?.cachedCount, 70);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("recovers an aggregate after a committed report response is lost without double-counting", async () => {
+    const store = await createTestStore();
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "recovery",
+      code: "lost-response",
+      target: "folder:lost-response",
+      title: "Lost response",
+      message: "The worker response was lost after commit",
+      detail: null
+    };
+    const batch = {
+      batchId: "recovery-lost-response",
+      rendererErrors: [
+        {
+          library: LIBRARY_A,
+          report,
+          occurrenceCount: 10,
+          uncertainReportId: "possibly-committed-report",
+          occurredAt: NOW + 10
+        }
+      ],
+      thumbnails: [],
+      actionErrors: [],
+      createdAt: NOW + 10
+    } as unknown as NotificationLocalRecoveryBatch;
+    try {
+      await store.recordRendererError(
+        LIBRARY_A,
+        report,
+        "possibly-committed-report",
+        NOW
+      );
+
+      assert.equal(await store.applyLocalRecoveryBatch(batch, NOW + 10), true);
+      assert.equal(await store.applyLocalRecoveryBatch(batch, NOW + 11), false);
+      assert.equal(
+        (
+          await store.getOperation(
+            LIBRARY_A.id,
+            rendererErrorOperationId(LIBRARY_A.id, report)
+          )
+        )?.occurrenceCount,
+        10
+      );
     } finally {
       await store.close();
     }

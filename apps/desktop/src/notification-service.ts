@@ -36,8 +36,10 @@ const OUTBOX_WAIT_MS = 30_000;
 const LEGACY_PAGE_LIMIT = 200;
 const LEGACY_LOGICAL_LIMIT = 2_000;
 const LEGACY_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const CORE_UNIX_SECOND_MS = 1_000;
 const RETENTION_CADENCE_MS = 5 * 60 * 1_000;
 const FALLBACK_RECORD_LIMIT = 500;
+const FALLBACK_REPORT_ID_LIMIT = 2_048;
 const MIN_RETRY_MS = 250;
 const MAX_RETRY_MS = 5_000;
 const OPERATION_CATEGORIES = new Set(["task", "file_operation", "error", "thumbnail_cache"]);
@@ -133,7 +135,8 @@ interface PendingOutboxBatch {
 interface PendingRendererError {
   library: NotificationLibraryIdentity;
   report: RendererErrorReport;
-  reportIds: string[];
+  occurrenceCount: number;
+  uncertainReportId: string | null;
   occurredAt: number;
 }
 
@@ -188,6 +191,18 @@ function assertSafeSequence(value: unknown, name: string): asserts value is numb
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new TypeError(`${name} must be a non-negative safe integer`);
   }
+}
+
+function coreUnixSecondsToDesktopMilliseconds(value: number, name: string): number {
+  const milliseconds = value * CORE_UNIX_SECOND_MS;
+  assertSafeSequence(milliseconds, name);
+  return milliseconds;
+}
+
+function legacyRetentionCutoffMilliseconds(now: number): number {
+  return (
+    Math.floor((now - LEGACY_RETENTION_MS) / CORE_UNIX_SECOND_MS) * CORE_UNIX_SECOND_MS
+  );
 }
 
 function parseNotificationOutboxAckResponse(value: unknown): NotificationOutboxAckResponse {
@@ -399,11 +414,13 @@ export class NotificationService {
   >();
   private readonly fallbackThumbnails = new Map<string, ThumbnailCacheSummary>();
   private readonly fallbackRecordOrder = new Map<string, true>();
+  private readonly fallbackReportIds = new Map<string, true>();
   private readonly pendingRendererErrors = new Map<string, PendingRendererError>();
   private readonly pendingLocalThumbnails = new Map<string, ThumbnailCacheSummary>();
   private readonly pendingActionErrors = new Map<string, PendingActionError>();
   private readonly pendingRecoveryBatches: NotificationLocalRecoveryBatch[] = [];
   private readonly protectedRecoveryBatchIds = new Set<string>();
+  private readonly appliedRecoveryRecordKeys = new Set<string>();
   private readonly legacyImports = new Map<string, Promise<void>>();
   private readonly fallbackActionBaseDetails = new Map<string, string | null>();
   private lastRetentionAt: number | null = null;
@@ -584,12 +601,14 @@ export class NotificationService {
     occurredAt: number
   ): Promise<void> {
     const library = { id: report.libraryId, name: report.libraryName };
+    let uncertainReportId: string | null = null;
     if (this.store) {
       const store = this.store;
       let result: NotificationRendererErrorRecordResult | null = null;
       try {
         result = await store.recordRendererError(library, report, reportId, occurredAt);
       } catch (error) {
+        uncertainReportId = reportId;
         await this.markStoreUnavailable(error);
       }
       if (result) {
@@ -611,13 +630,14 @@ export class NotificationService {
     const operationId = rendererErrorOperationId(library.id, report);
     const key = libraryKey(library.id, operationId);
     const pending = this.pendingRendererErrors.get(key);
-    if (pending?.reportIds.includes(reportId)) return;
+    if (!this.rememberFallbackReportId(reportId)) return;
     this.recordFallbackRendererError(library, report, occurredAt);
     if (!this.fallbackOperations.has(key)) return;
     this.pendingRendererErrors.set(key, {
       library,
       report,
-      reportIds: [...(pending?.reportIds ?? []), reportId],
+      occurrenceCount: (pending?.occurrenceCount ?? 0) + 1,
+      uncertainReportId: pending?.uncertainReportId ?? uncertainReportId,
       occurredAt: Math.max(pending?.occurredAt ?? occurredAt, occurredAt)
     });
     this.emitSnapshot();
@@ -920,7 +940,7 @@ export class NotificationService {
     const store = this.store;
     if (await store.hasLegacyImport(library.id)) return;
 
-    const cutoff = this.now() - LEGACY_RETENTION_MS;
+    const cutoff = legacyRetentionCutoffMilliseconds(this.now());
     const groupedOperations = new Map<string, LegacyOperationAggregate>();
     const ungroupedSummary: LegacyImportSummaryAggregate = {
       total: 0,
@@ -1041,7 +1061,20 @@ export class NotificationService {
       ) {
         throw new TypeError("invalid legacy operationGroupId");
       }
-      return item as FileOperationRecord;
+      return {
+        ...item,
+        createdAt: coreUnixSecondsToDesktopMilliseconds(
+          item.createdAt,
+          "legacy file operation createdAt milliseconds"
+        ),
+        finishedAt:
+          item.finishedAt === null
+            ? null
+            : coreUnixSecondsToDesktopMilliseconds(
+                item.finishedAt,
+                "legacy file operation finishedAt milliseconds"
+              )
+      } as FileOperationRecord;
     });
     return { items, nextCursor: nextCursor ?? null };
   }
@@ -1269,7 +1302,7 @@ export class NotificationService {
       this.pendingLocalThumbnails.size > 0 ||
       this.pendingActionErrors.size > 0
     ) {
-      this.pendingRecoveryBatches.push({
+      const pendingBatch: NotificationLocalRecoveryBatch = {
         batchId: randomUUID(),
         rendererErrors: [...this.pendingRendererErrors.values()],
         thumbnails: [...this.pendingLocalThumbnails.values()],
@@ -1281,15 +1314,103 @@ export class NotificationService {
           updatedAt: pending.updatedAt
         })),
         createdAt: this.now()
-      });
+      };
+      const mutableBatch = this.pendingRecoveryBatches.find(
+        (batch) => !this.protectedRecoveryBatchIds.has(batch.batchId)
+      );
+      if (mutableBatch) {
+        this.mergeLocalRecoveryBatch(mutableBatch, pendingBatch);
+      } else {
+        this.pendingRecoveryBatches.push(pendingBatch);
+      }
       this.pendingRendererErrors.clear();
       this.pendingLocalThumbnails.clear();
       this.pendingActionErrors.clear();
     }
-    for (const batch of this.pendingRecoveryBatches) {
+    while (this.pendingRecoveryBatches.length > 0) {
+      const batch = this.pendingRecoveryBatches[0]!;
       // Once transmission starts, keep the payload stable even if the commit response is lost.
       this.protectedRecoveryBatchIds.add(batch.batchId);
       await store.applyLocalRecoveryBatch(batch, this.now());
+      this.rememberAppliedRecoveryRecords(batch);
+      this.pendingRecoveryBatches.shift();
+      this.protectedRecoveryBatchIds.delete(batch.batchId);
+    }
+  }
+
+  private mergeLocalRecoveryBatch(
+    target: NotificationLocalRecoveryBatch,
+    incoming: NotificationLocalRecoveryBatch
+  ): void {
+    const rendererErrors = new Map(
+      target.rendererErrors.map((pending) => [
+        libraryKey(
+          pending.library.id,
+          rendererErrorOperationId(pending.library.id, pending.report)
+        ),
+        pending
+      ])
+    );
+    for (const pending of incoming.rendererErrors) {
+      const key = libraryKey(
+        pending.library.id,
+        rendererErrorOperationId(pending.library.id, pending.report)
+      );
+      const existing = rendererErrors.get(key);
+      rendererErrors.set(
+        key,
+        existing
+          ? {
+              ...pending,
+              occurrenceCount: existing.occurrenceCount + pending.occurrenceCount,
+              uncertainReportId: existing.uncertainReportId ?? pending.uncertainReportId,
+              occurredAt: Math.max(existing.occurredAt, pending.occurredAt)
+            }
+          : pending
+      );
+    }
+    target.rendererErrors = [...rendererErrors.values()];
+
+    const thumbnails = new Map(target.thumbnails.map((summary) => [summary.libraryId, summary]));
+    for (const summary of incoming.thumbnails) {
+      const existing = thumbnails.get(summary.libraryId);
+      if (!existing || summary.observedAt >= existing.observedAt) {
+        thumbnails.set(summary.libraryId, summary);
+      }
+    }
+    target.thumbnails = [...thumbnails.values()];
+
+    const actionErrors = new Map(
+      target.actionErrors.map((pending) => [
+        libraryKey(pending.libraryId, pending.operationId),
+        pending
+      ])
+    );
+    for (const pending of incoming.actionErrors) {
+      const key = libraryKey(pending.libraryId, pending.operationId);
+      const existing = actionErrors.get(key);
+      if (!existing || pending.updatedAt >= existing.updatedAt) actionErrors.set(key, pending);
+    }
+    target.actionErrors = [...actionErrors.values()];
+    target.createdAt = Math.min(target.createdAt, incoming.createdAt);
+  }
+
+  private rememberAppliedRecoveryRecords(batch: NotificationLocalRecoveryBatch): void {
+    for (const pending of batch.rendererErrors) {
+      this.appliedRecoveryRecordKeys.add(
+        fallbackOperationKey(
+          pending.library.id,
+          rendererErrorOperationId(pending.library.id, pending.report)
+        )
+      );
+    }
+    for (const summary of batch.thumbnails) {
+      this.appliedRecoveryRecordKeys.add(fallbackThumbnailKey(summary.libraryId));
+    }
+    for (const pending of batch.actionErrors) {
+      this.appliedRecoveryRecordKeys.add(
+        fallbackOperationKey(pending.libraryId, pending.operationId)
+      );
     }
   }
 
@@ -1668,6 +1789,19 @@ export class NotificationService {
     this.fallbackThumbnails.clear();
     this.fallbackActionBaseDetails.clear();
     this.fallbackRecordOrder.clear();
+    this.fallbackReportIds.clear();
+    this.appliedRecoveryRecordKeys.clear();
+  }
+
+  private rememberFallbackReportId(reportId: string): boolean {
+    if (this.fallbackReportIds.has(reportId)) return false;
+    this.fallbackReportIds.set(reportId, true);
+    while (this.fallbackReportIds.size > FALLBACK_REPORT_ID_LIMIT) {
+      const oldest = this.fallbackReportIds.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.fallbackReportIds.delete(oldest);
+    }
+    return true;
   }
 
   private upsertFallbackThumbnail(summary: ThumbnailCacheSummary): boolean {
@@ -1683,34 +1817,16 @@ export class NotificationService {
     this.fallbackRecordOrder.delete(recordKey);
     this.fallbackRecordOrder.set(recordKey, true);
     while (this.fallbackRecordOrder.size > FALLBACK_RECORD_LIMIT) {
-      const oldest = [...this.fallbackRecordOrder.keys()].find(
-        (key) => !this.isAppliedRecoveryRecord(key)
-      );
+      let oldest: string | undefined;
+      for (const key of this.fallbackRecordOrder.keys()) {
+        if (!this.appliedRecoveryRecordKeys.has(key)) {
+          oldest = key;
+          break;
+        }
+      }
       if (typeof oldest !== "string") break;
       this.evictFallbackRecord(oldest);
     }
-  }
-
-  private isAppliedRecoveryRecord(recordKey: string): boolean {
-    const [kind, libraryId, ...rest] = recordKey.split("\u0000");
-    const operationId = rest.join("\u0000");
-    return this.pendingRecoveryBatches.some((batch) => {
-      if (!this.protectedRecoveryBatchIds.has(batch.batchId)) return false;
-      if (kind === "thumbnail") {
-        return batch.thumbnails.some((summary) => summary.libraryId === libraryId);
-      }
-      if (kind !== "operation") return false;
-      return (
-        batch.rendererErrors.some(
-          (pending) =>
-            pending.library.id === libraryId &&
-            rendererErrorOperationId(pending.library.id, pending.report) === operationId
-        ) ||
-        batch.actionErrors.some(
-          (pending) => pending.libraryId === libraryId && pending.operationId === operationId
-        )
-      );
-    });
   }
 
   private evictFallbackRecord(recordKey: string): void {
@@ -1721,6 +1837,7 @@ export class NotificationService {
       this.pendingLocalThumbnails.delete(libraryId);
       for (let index = this.pendingRecoveryBatches.length - 1; index >= 0; index -= 1) {
         const batch = this.pendingRecoveryBatches[index]!;
+        if (this.protectedRecoveryBatchIds.has(batch.batchId)) continue;
         batch.thumbnails = batch.thumbnails.filter((item) => item.libraryId !== libraryId);
         if (
           batch.rendererErrors.length === 0 &&
@@ -1750,6 +1867,7 @@ export class NotificationService {
     }
     for (let index = this.pendingRecoveryBatches.length - 1; index >= 0; index -= 1) {
       const batch = this.pendingRecoveryBatches[index]!;
+      if (this.protectedRecoveryBatchIds.has(batch.batchId)) continue;
       batch.rendererErrors = batch.rendererErrors.filter(
         (pending) =>
           pending.library.id !== libraryId ||

@@ -33,6 +33,7 @@ import type {
 } from "../src/notification-types.ts";
 
 const NOW = Date.UTC(2026, 6, 20, 12);
+const NOW_SECONDS = Math.floor(NOW / 1_000);
 const LIBRARY_A: NotificationLibraryIdentity = { id: "library-a", name: "Library A" };
 const LIBRARY_B: NotificationLibraryIdentity = { id: "library-b", name: "Library B" };
 const SESSION_A = {
@@ -100,8 +101,8 @@ function fileOperationRecord(
     sourcePath: "source",
     targetPath: "target",
     status: "succeeded",
-    createdAt: NOW - 1_000,
-    finishedAt: NOW - 500,
+    createdAt: NOW_SECONDS - 1,
+    finishedAt: NOW_SECONDS,
     error: null,
     ...overrides
   };
@@ -298,11 +299,19 @@ class FakeStore implements NotificationServiceStore {
   ): Promise<boolean> {
     if (this.recoveryBatches.has(batch.batchId)) return false;
     for (const pending of batch.rendererErrors) {
-      for (const reportId of pending.reportIds) {
+      const aggregate = pending as unknown as {
+        occurrenceCount: number;
+        uncertainReportId: string | null;
+      };
+      assert.equal(Number.isSafeInteger(aggregate.occurrenceCount), true);
+      assert.equal(aggregate.occurrenceCount > 0, true);
+      for (let index = 0; index < aggregate.occurrenceCount; index += 1) {
         await this.recordRendererError(
           pending.library,
           pending.report,
-          reportId,
+          index === 0 && aggregate.uncertainReportId
+            ? aggregate.uncertainReportId
+            : `${batch.batchId}:${rendererErrorOperationId(pending.library.id, pending.report)}:${index}`,
           pending.occurredAt
         );
       }
@@ -704,7 +713,7 @@ describe("notification service", () => {
   it("aggregates contract-shaped legacy rows by operationGroupId", async () => {
     const store = new FakeStore();
     const requested: string[] = [];
-    const recent = NOW - 1_000;
+    const recent = NOW_SECONDS - 1;
     const service = await createNotificationService({
       store,
       fetch: async (input) => {
@@ -801,8 +810,8 @@ describe("notification service", () => {
               sourcePath: "a",
               targetPath: "b",
               status: "succeeded",
-              createdAt: NOW - 100,
-              finishedAt: NOW - 50,
+              createdAt: NOW_SECONDS - 100,
+              finishedAt: NOW_SECONDS - 50,
               error: null
             })
           ],
@@ -827,8 +836,8 @@ describe("notification service", () => {
         sourcePath: `source-${index}`,
         targetPath: `target-${index}`,
         status: index === 999 ? "failed" : "succeeded",
-        createdAt: NOW - 1_000 - index,
-        finishedAt: NOW - 500 - index,
+        createdAt: NOW_SECONDS - 1_000 - index,
+        finishedAt: NOW_SECONDS - 500 - index,
         error: index === 999 ? "busy" : null
       })
     );
@@ -858,11 +867,89 @@ describe("notification service", () => {
     await service.close();
   });
 
+  it("converts Core Unix seconds and includes the cutoff second without importing older rows", async () => {
+    const store = new FakeStore();
+    const now = NOW + 987;
+    const cutoffSecond = Math.floor((now - 30 * 24 * 60 * 60 * 1_000) / 1_000);
+    const service = await createNotificationService({
+      store,
+      fetch: async () =>
+        response({
+          items: [
+            fileOperationRecord({
+              id: 2,
+              operationGroupId: "file-group:cutoff",
+              createdAt: cutoffSecond,
+              finishedAt: cutoffSecond
+            }),
+            fileOperationRecord({
+              id: 1,
+              operationGroupId: "file-group:expired",
+              createdAt: cutoffSecond - 1,
+              finishedAt: cutoffSecond - 1
+            })
+          ],
+          nextCursor: null
+        }),
+      now: () => now
+    });
+
+    await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
+
+    assert.equal(store.operations.size, 1);
+    const imported = store.operations.get(`${LIBRARY_A.id}/file-group:cutoff`);
+    assert.equal(imported?.startedAt, cutoffSecond * 1_000);
+    assert.equal(imported?.completedAt, cutoffSecond * 1_000);
+    assert.equal(store.imported.has(LIBRARY_A.id), true);
+    await service.close();
+  });
+
+  it("marks a successfully checked empty legacy history and skips later requests", async () => {
+    const store = new FakeStore();
+    let requests = 0;
+    const service = await createNotificationService({
+      store,
+      fetch: async () => {
+        requests += 1;
+        return response({ items: [], nextCursor: null });
+      },
+      now: () => NOW
+    });
+
+    await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
+    await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
+
+    assert.equal(requests, 1);
+    assert.equal(store.operations.size, 0);
+    assert.equal(store.imported.has(LIBRARY_A.id), true);
+    await service.close();
+  });
+
+  it("does not request legacy history for an already marked library", async () => {
+    const store = new FakeStore();
+    store.imported.add(LIBRARY_A.id);
+    let requests = 0;
+    const service = await createNotificationService({
+      store,
+      fetch: async () => {
+        requests += 1;
+        return response({ items: [], nextCursor: null });
+      },
+      now: () => NOW
+    });
+
+    await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
+
+    assert.equal(requests, 0);
+    assert.equal(store.operations.size, 0);
+    await service.close();
+  });
+
   it("rolls back a failed legacy marker and retries safely after the cutoff changes", async () => {
     const store = new FakeStore();
     store.failLegacyImport = true;
     let now = NOW;
-    const cutoffEdge = NOW - 30 * 24 * 60 * 60 * 1_000 + 1;
+    const cutoffEdge = Math.floor((NOW - 30 * 24 * 60 * 60 * 1_000) / 1_000);
     const service = await createNotificationService({
       store,
       fetch: async () =>
@@ -889,7 +976,7 @@ describe("notification service", () => {
     assert.equal(store.imported.has(LIBRARY_A.id), false);
 
     store.failLegacyImport = false;
-    now += 2;
+    now += 1_000;
     await service.runLegacyImportForTest(LIBRARY_A, SESSION_A);
     assert.equal(store.operations.size, 0, "the now-expired row must not conflict with the retry");
     assert.equal(store.imported.has(LIBRARY_A.id), true);
@@ -1293,6 +1380,126 @@ describe("notification service", () => {
     );
     assert.equal(recoveredStore.recoveryBatches.size, 1);
     assert.equal((await service.compactSnapshot()).syncHealth.state, "healthy");
+    await service.close();
+  });
+
+  it("aggregates 10,000 degraded reports in bounded O(1)-per-report recovery state", async () => {
+    const recoveredStore = new FakeStore();
+    let opens = 0;
+    let capturedBatch: NotificationLocalRecoveryBatch | null = null;
+    const originalApplyRecovery = recoveredStore.applyLocalRecoveryBatch.bind(recoveredStore);
+    recoveredStore.applyLocalRecoveryBatch = async (batch) => {
+      capturedBatch = batch;
+      return originalApplyRecovery(batch);
+    };
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "bounded-fallback",
+      code: "same-operation",
+      target: "folder:10k",
+      title: "Repeated failure",
+      message: "Repeated failure",
+      detail: null
+    };
+    const service = await createNotificationService({
+      openStore: async () => {
+        opens += 1;
+        if (opens === 1) throw new Error("initial worker unavailable");
+        return recoveredStore;
+      },
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.includes("/notifications/outbox?")) {
+          return response({ items: [], maxSequence: 0 });
+        }
+        if (url.includes("/file-ops?")) return response({ items: [], nextCursor: null });
+        return ackResponse({ acknowledged: true });
+      },
+      now: () => NOW
+    });
+
+    for (let index = 0; index < 10_000; index += 1) {
+      await service.reportRendererError({ ...report, reportId: `report-${index}` });
+    }
+    await service.reportRendererError({ ...report, reportId: "report-9999" });
+
+    const degraded = await service.compactSnapshot();
+    assert.equal(degraded.latestImportantResults[0]?.occurrenceCount, 10_000);
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+
+    const aggregate = capturedBatch?.rendererErrors[0] as unknown as {
+      occurrenceCount: number;
+      uncertainReportId: string | null;
+      reportIds?: string[];
+    };
+    assert.equal(aggregate.occurrenceCount, 10_000);
+    assert.equal(aggregate.uncertainReportId, null);
+    assert.equal(aggregate.reportIds, undefined);
+    assert.ok(JSON.stringify(capturedBatch).length < 2_000, "payload must not scale with report IDs");
+    assert.equal(
+      (
+        await recoveredStore.getOperation(
+          LIBRARY_A.id,
+          rendererErrorOperationId(LIBRARY_A.id, report)
+        )
+      )?.occurrenceCount,
+      10_000
+    );
+    await service.close();
+  });
+
+  it("keeps 500 degraded renderer operations independently recoverable", async () => {
+    const recoveredStore = new FakeStore();
+    let opens = 0;
+    let capturedBatch: NotificationLocalRecoveryBatch | null = null;
+    const originalApplyRecovery = recoveredStore.applyLocalRecoveryBatch.bind(recoveredStore);
+    recoveredStore.applyLocalRecoveryBatch = async (batch) => {
+      capturedBatch = batch;
+      return originalApplyRecovery(batch);
+    };
+    const service = await createNotificationService({
+      openStore: async () => {
+        opens += 1;
+        if (opens === 1) throw new Error("initial worker unavailable");
+        return recoveredStore;
+      },
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.includes("/notifications/outbox?")) {
+          return response({ items: [], maxSequence: 0 });
+        }
+        if (url.includes("/file-ops?")) return response({ items: [], nextCursor: null });
+        return ackResponse({ acknowledged: true });
+      },
+      now: () => NOW
+    });
+
+    for (let index = 0; index < 500; index += 1) {
+      await service.reportRendererError({
+        libraryId: LIBRARY_A.id,
+        libraryName: LIBRARY_A.name,
+        source: "bounded-fallback",
+        code: "many-operations",
+        target: `folder:${index}`,
+        title: `Failure ${index}`,
+        message: "Failure",
+        detail: null,
+        reportId: `operation-report-${index}`
+      });
+    }
+
+    assert.equal((await service.history({ limit: 200, offset: 0 })).total, 500);
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    assert.equal(capturedBatch?.rendererErrors.length, 500);
+    assert.equal(
+      capturedBatch?.rendererErrors.every(
+        (pending) =>
+          (pending as unknown as { occurrenceCount: number }).occurrenceCount === 1
+      ),
+      true
+    );
+    assert.equal(recoveredStore.operations.size, 500);
     await service.close();
   });
 

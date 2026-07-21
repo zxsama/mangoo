@@ -845,7 +845,8 @@ class NotificationStoreDatabase {
     library: NotificationLibraryIdentity,
     report: RendererErrorReport,
     reportIds: string[],
-    occurredAt: number
+    occurredAt: number,
+    occurrenceCount = reportIds.length
   ): NotificationRendererErrorRecordResult {
     validateLibrary(library);
     assertObject(report, "renderer error report");
@@ -859,12 +860,14 @@ class NotificationStoreDatabase {
       assertString(value, `renderer error ${name}`);
     }
     assertNullableString(report.detail, "renderer error detail");
-    if (!Array.isArray(reportIds) || reportIds.length === 0) {
-      throw new TypeError("renderer reportIds must be a non-empty array");
-    }
+    if (!Array.isArray(reportIds)) throw new TypeError("renderer reportIds must be an array");
     const uniqueReportIds = [...new Set(reportIds)];
     for (const reportId of uniqueReportIds) assertString(reportId, "renderer reportId");
     assertSafeInteger(occurredAt, "renderer error occurredAt");
+    assertSafeInteger(occurrenceCount, "renderer error occurrenceCount", 1);
+    if (occurrenceCount < uniqueReportIds.length) {
+      throw new RangeError("renderer error occurrenceCount must include every reportId");
+    }
 
     const operationIdentity = {
       source: report.source,
@@ -881,7 +884,7 @@ class NotificationStoreDatabase {
       const insertMarker = this.database.prepare(
         "INSERT INTO local_recovery_batches(batch_id, applied_at) VALUES (?, ?)"
       );
-      let newReportCount = 0;
+      let newReportCount = occurrenceCount - uniqueReportIds.length;
       for (const reportId of uniqueReportIds) {
         const markerId = rendererReportMarkerId(reportId);
         if (markerExists.get(markerId)) continue;
@@ -918,9 +921,9 @@ class NotificationStoreDatabase {
         return { outcome: "duplicate", operation: existing };
       }
       const revision = (existing?.revision ?? 0) + 1;
-      const occurrenceCount = (existing?.occurrenceCount ?? 0) + newReportCount;
+      const nextOccurrenceCount = (existing?.occurrenceCount ?? 0) + newReportCount;
       assertSafeInteger(revision, "renderer error revision", 1);
-      assertSafeInteger(occurrenceCount, "renderer error occurrenceCount", 1);
+      assertSafeInteger(nextOccurrenceCount, "renderer error occurrenceCount", 1);
       const operation: StoredNotificationOperation = {
         operationId,
         revision,
@@ -936,7 +939,7 @@ class NotificationStoreDatabase {
         rootId: null,
         folderId: null,
         fileId: null,
-        currentValue: occurrenceCount,
+        currentValue: nextOccurrenceCount,
         totalValue: null,
         unit: "occurrences",
         errorCode: report.code,
@@ -944,7 +947,7 @@ class NotificationStoreDatabase {
         cancellable: false,
         retryable: false,
         attempt: 1,
-        occurrenceCount,
+        occurrenceCount: nextOccurrenceCount,
         startedAt: existing?.startedAt ?? occurredAt,
         updatedAt: occurredAt,
         completedAt: occurredAt,
@@ -1002,11 +1005,17 @@ class NotificationStoreDatabase {
       }
       for (const pending of batch.rendererErrors) {
         assertObject(pending, "pending renderer error");
+        assertSafeInteger(pending.occurrenceCount, "pending renderer error occurrenceCount", 1);
+        assertNullableString(
+          pending.uncertainReportId,
+          "pending renderer error uncertainReportId"
+        );
         this.recordRendererError(
           pending.library,
           pending.report,
-          pending.reportIds,
-          pending.occurredAt
+          pending.uncertainReportId ? [pending.uncertainReportId] : [],
+          pending.occurredAt,
+          pending.occurrenceCount
         );
       }
       for (const summary of batch.thumbnails) this.publishThumbnailSummary(summary);
