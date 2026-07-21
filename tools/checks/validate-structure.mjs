@@ -91,9 +91,9 @@ function markdownSections(document) {
   let inCodeFence = false;
 
   for (const line of lines) {
-    if (/^\s*```/.test(line)) {
+    if (/^\s*(?:```|~~~)/.test(line)) {
+      if (stack.length > 0) stack.at(-1).lines.push({ text: line, inFence: true });
       inCodeFence = !inCodeFence;
-      if (stack.length > 0) stack.at(-1).lines.push(line);
       continue;
     }
     const heading = inCodeFence ? null : line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
@@ -110,7 +110,7 @@ function markdownSections(document) {
       stack.push(section);
       continue;
     }
-    if (stack.length > 0) stack.at(-1).lines.push(line);
+    if (stack.length > 0) stack.at(-1).lines.push({ text: line, inFence: inCodeFence });
   }
 
   return sections;
@@ -130,54 +130,42 @@ function hasHistoricalOrArchivedContext(section) {
   return false;
 }
 
-const currentClaudeHeadings = new Set([
-  "project overview",
-  "web ui layout",
-  "approved ui direction",
-  "anti-patterns to avoid",
-  "current guidance",
-  "unified notification center",
-  "next execution order",
-  "项目概览",
-  "web ui 布局",
-  "已批准 ui 方向",
-  "需避免的反模式",
-  "当前指导",
-  "统一通知中心",
-  "下一执行顺序"
-]);
-
-function isCurrentClaudeSection(section) {
-  const heading = normalizedContractToken(section.heading);
-  return (
-    currentClaudeHeadings.has(heading) ||
-    /^(?:current implementation state|phase summary)(?:\s|\(|（|$)/u.test(heading) ||
-    /^(?:(?:historical|archived)\s+phase summary)(?:\s|\(|（|$)/u.test(heading) ||
-    /^(?:当前实现状态|阶段摘要|(?:历史|归档)阶段摘要)(?:\s|\(|（|$)/u.test(heading)
-  );
+function isWithinSection(section, ancestor) {
+  for (let current = section; current; current = current.parent) {
+    if (current === ancestor) return true;
+  }
+  return false;
 }
 
 const retiredSurfaceDefinitions = [
   {
     label: "Task Center",
-    pattern: /(?<![\p{L}\p{N}_-])task(?:[\s-]+)?centers?(?![\p{L}\p{N}_-])/iu
+    keys: ["Task Center", "任务中心"],
+    pattern:
+      /(?<![\p{L}\p{N}_-])task(?:[\s-]+)?centers?(?![\p{L}\p{N}_-])|任务中心/iu
   },
   {
     label: "Task Drawer",
-    pattern: /(?<![\p{L}\p{N}_-])task(?:[\s-]+)?drawers?(?![\p{L}\p{N}_-])/iu
+    keys: ["Task Drawer", "Task Panel", "任务抽屉", "任务面板"],
+    pattern:
+      /(?<![\p{L}\p{N}_-])task(?:[\s-]+)?(?:drawers?|panels?)(?![\p{L}\p{N}_-])|任务(?:抽屉|面板)/iu
   },
   {
     label: "Recent Ops Panel",
+    keys: ["Recent Ops Panel", "Recent Ops Drawer", "最近操作面板", "最近操作抽屉"],
     pattern:
-      /(?<![\p{L}\p{N}_-])recent(?:[\s-]+)?(?:ops|operations)(?:[\s-]+)?(?:panels?|drawers?)(?![\p{L}\p{N}_-])/iu
+      /(?<![\p{L}\p{N}_-])recent(?:[\s-]+)?(?:ops|operations)(?:[\s-]+)?(?:panels?|drawers?)(?![\p{L}\p{N}_-])|最近操作(?:面板|抽屉)/iu
   }
 ];
 
 function parseVisibleKeyValueItems(section) {
   const items = [];
   for (const line of section.lines) {
-    const visibleLine = line.replace(/[*_`]/g, "").trim();
-    const item = visibleLine.match(/^[-+*]\s*([^:：]+?)\s*[:：]\s*(\S(?:.*\S)?)\s*$/u);
+    if (line.inFence) continue;
+    const bullet = line.text.trim().match(/^[-+*]\s+(.+)$/u);
+    if (!bullet) continue;
+    const visibleLine = bullet[1].replace(/\*\*|__|`/g, "").trim();
+    const item = visibleLine.match(/^([^:：]+?)\s*[:：]\s*(\S(?:.*\S)?)\s*$/u);
     if (!item) continue;
     items.push({
       key: normalizedContractToken(item[1]),
@@ -205,29 +193,15 @@ function validateStructuredItems(section, specifications, contractName) {
   return failures;
 }
 
-const retiredSurfaceItemSpecifications = retiredSurfaceDefinitions.map(({ label }) => ({
+const retiredSurfaceItemSpecifications = retiredSurfaceDefinitions.map(({ label, keys }) => ({
   label,
-  keys: [label],
-  values: ["retired", "已退役"]
+  keys,
+  values: ["retired", "已退役", "退役"]
 }));
 
 function validateClaudeRetiredSurfaceContract(document) {
   const sections = markdownSections(document);
   const failures = [];
-
-  for (const section of sections) {
-    if (!isCurrentClaudeSection(section) || hasHistoricalOrArchivedContext(section)) continue;
-    for (let lineIndex = 0; lineIndex < section.lines.length; lineIndex += 1) {
-      const line = normalizedContractToken(section.lines[lineIndex].replace(/[*_`]/g, ""));
-      for (const surface of retiredSurfaceDefinitions) {
-        if (surface.pattern.test(line)) {
-          failures.push(
-            `CLAUDE.md section ${section.heading} line ${lineIndex + 1} mentions retired surface ${surface.label} outside Retired Surfaces`
-          );
-        }
-      }
-    }
-  }
 
   const unifiedSections = sections.filter(
     (section) =>
@@ -240,6 +214,21 @@ function validateClaudeRetiredSurfaceContract(document) {
       headingMatches(section, ["Retired Surfaces", "已退役界面"]) && section.parent === unifiedSection
   );
   const retiredSection = retiredSections.length === 1 ? retiredSections[0] : null;
+
+  for (const section of sections) {
+    if (hasHistoricalOrArchivedContext(section) || isWithinSection(section, retiredSection)) continue;
+    for (let lineIndex = 0; lineIndex < section.lines.length; lineIndex += 1) {
+      const line = normalizedContractToken(section.lines[lineIndex].text.replace(/[*_`]/g, ""));
+      for (const surface of retiredSurfaceDefinitions) {
+        if (surface.pattern.test(line)) {
+          failures.push(
+            `CLAUDE.md section ${section.heading} line ${lineIndex + 1} mentions retired surface ${surface.label} outside Retired Surfaces`
+          );
+        }
+      }
+    }
+  }
+
   failures.push(
     ...validateStructuredItems(
       retiredSection,
@@ -353,6 +342,63 @@ Current notifications use the unified presentation.
   if (!validateClaudeRetiredSurfaceContract(missingEntry).some((failure) => failure.includes("Task Drawer"))) {
     fail("retired surface contract must require one structured entry per retired surface");
   }
+
+  const inheritedCurrentGuidance = `
+## Current Guidance
+### Security Boundary
+The Task Center is required for privileged work.
+### Unified Notification Center
+#### Status Details
+The Task Drawer is required for nested status.
+${retiredEntries}
+`;
+  const inheritedFailures = validateClaudeRetiredSurfaceContract(inheritedCurrentGuidance);
+  for (const surface of ["Task Center", "Task Drawer"]) {
+    if (!inheritedFailures.some((failure) => failure.includes(surface))) {
+      fail(`retired surface contract must inherit current context into child sections: ${surface}`);
+    }
+  }
+
+  const currentTopLevelGuidance = `
+## High-Level Architecture
+### Security Boundary
+The Recent Ops Panel is required for security events.
+## Unified Notification Center
+${retiredEntries}
+`;
+  if (!validateClaudeRetiredSurfaceContract(currentTopLevelGuidance).some((failure) => failure.includes("Recent Ops Panel"))) {
+    fail("retired surface contract must check current top-level guidance such as Security Boundary");
+  }
+
+  const validChineseDocument = `
+## 统一通知中心
+当前通知只使用统一展示。
+#### 已退役界面
+- **任务中心**: \`已退役\`
+- **任务抽屉**: \`已退役\`
+- **最近操作面板**: \`已退役\`
+## 历史阶段摘要
+任务中心曾用于展示后台任务，任务抽屉曾用于展示进度。
+`;
+  if (validateClaudeRetiredSurfaceContract(validChineseDocument).length !== 0) {
+    fail("retired surface contract must accept Chinese structured entries and skip Chinese historical sections");
+  }
+
+  const currentChineseRequirement = `
+## 当前指导
+任务中心必须用于后台任务，任务面板必须用于展示进度，最近操作面板必须用于历史记录。
+## 统一通知中心
+#### 已退役界面
+- **任务中心**: \`已退役\`
+- **任务抽屉**: \`已退役\`
+- **最近操作面板**: \`已退役\`
+`;
+  const chineseFailures = validateClaudeRetiredSurfaceContract(currentChineseRequirement);
+  for (const surface of ["Task Center", "Task Drawer", "Recent Ops Panel"]) {
+    if (!chineseFailures.some((failure) => failure.includes(`mentions retired surface ${surface}`))) {
+      fail(`retired surface contract must reject current Chinese requirements: ${surface}`);
+    }
+  }
 }
 
 function assertStructuredReadmeCapabilityContracts() {
@@ -394,6 +440,19 @@ The body may use freely rewritten natural language about durable status across c
 
   if (validateReadmeNotificationCapabilities("## Unified Notification Center\n").length !== 3) {
     fail("README capability contract must reject an empty notification section");
+  }
+
+  const fencedOnlyDocument = `
+## Unified Notification Center
+### Capabilities
+\`\`\`markdown
+- **Scope**: \`all-library-persistent\`
+- **Progress**: \`aggregated-logical-task-progress\`
+- **Logs**: \`local-process-logs\`
+\`\`\`
+`;
+  if (validateReadmeNotificationCapabilities(fencedOnlyDocument).length !== 3) {
+    fail("README capability contract must reject markers that exist only inside a fenced code block");
   }
 }
 
