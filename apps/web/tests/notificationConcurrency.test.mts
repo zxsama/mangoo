@@ -131,6 +131,48 @@ describe("process log request lifecycle", () => {
     assert.equal(merged.lines.at(-1)?.sequence, 1_500);
     assert.equal(merged.droppedBeforeSequence, 500);
   });
+
+  it("coalesces ten thousand empty gap batches without growing the batch queue", () => {
+    let buffered = createPausedProcessLogBuffer();
+    for (let index = 0; index < 10_000; index += 1) {
+      buffered = appendPausedProcessLogBatch(buffered, {
+        lines: [],
+        afterSequence: index + 1,
+        droppedBeforeSequence: index
+      });
+    }
+    const merged = coalescePausedProcessLogBuffer(buffered);
+
+    assert.equal(buffered.batches.length, 0);
+    assert.equal(buffered.lineCount, 0);
+    assert.equal(merged.lines.length, 0);
+    assert.equal(merged.afterSequence, 10_000);
+    assert.equal(merged.droppedBeforeSequence, 9_999);
+  });
+
+  it("keeps line batches bounded while coalescing intervening empty gap metadata", () => {
+    let buffered = appendPausedProcessLogBatch(
+      createPausedProcessLogBuffer(),
+      logBatch(1, 600, null)
+    );
+    for (let index = 1; index <= 10_000; index += 1) {
+      buffered = appendPausedProcessLogBatch(buffered, {
+        lines: [],
+        afterSequence: 600 + index,
+        droppedBeforeSequence: 500 + index
+      });
+    }
+    buffered = appendPausedProcessLogBatch(buffered, logBatch(10_601, 600, null));
+    const merged = coalescePausedProcessLogBuffer(buffered);
+
+    assert.equal(buffered.batches.length, 2);
+    assert.equal(buffered.lineCount, MAX_PAUSED_LOG_LINES);
+    assert.equal(merged.lines.length, MAX_PAUSED_LOG_LINES);
+    assert.equal(merged.lines[0]?.sequence, 201);
+    assert.equal(merged.lines.at(-1)?.sequence, 11_200);
+    assert.equal(merged.afterSequence, 11_200);
+    assert.equal(merged.droppedBeforeSequence, 10_500);
+  });
 });
 
 function logBatch(

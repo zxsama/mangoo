@@ -9,6 +9,7 @@ export const MAX_PAUSED_LOG_LINES = 1_000;
 export interface PausedProcessLogBuffer {
   batches: readonly DesktopProcessLogBatch[];
   lineCount: number;
+  afterSequence: number;
   droppedBeforeSequence: number | null;
 }
 
@@ -92,19 +93,23 @@ export function createProcessLogPageRequestController(
 }
 
 export function createPausedProcessLogBuffer(): PausedProcessLogBuffer {
-  return { batches: [], lineCount: 0, droppedBeforeSequence: null };
+  return { batches: [], lineCount: 0, afterSequence: 0, droppedBeforeSequence: null };
 }
 
 export function appendPausedProcessLogBatch(
   current: PausedProcessLogBuffer,
   batch: DesktopProcessLogBatch
 ): PausedProcessLogBuffer {
-  const batches = [...current.batches, batch];
-  let lineCount = current.lineCount + batch.lines.length;
+  const afterSequence = Math.max(current.afterSequence, batch.afterSequence);
   let droppedBeforeSequence = maxNullableSequence(
     current.droppedBeforeSequence,
     batch.droppedBeforeSequence
   );
+  if (batch.lines.length === 0) {
+    return { ...current, afterSequence, droppedBeforeSequence };
+  }
+  const batches = [...current.batches, batch];
+  let lineCount = current.lineCount + batch.lines.length;
   let excess = Math.max(0, lineCount - MAX_PAUSED_LOG_LINES);
   while (excess > 0 && batches.length > 0) {
     const first = batches[0];
@@ -122,17 +127,21 @@ export function appendPausedProcessLogBatch(
     if (removeCount === first.lines.length) batches.shift();
     else batches[0] = { ...first, lines: first.lines.slice(removeCount) };
   }
-  return { batches, lineCount, droppedBeforeSequence };
+  return { batches, lineCount, afterSequence, droppedBeforeSequence };
 }
 
 export function coalescePausedProcessLogBuffer(
   buffer: PausedProcessLogBuffer
 ): DesktopProcessLogBatch {
-  return coalesceProcessLogBatches(
+  const merged = coalesceProcessLogBatches(
     buffer.batches,
     MAX_PAUSED_LOG_LINES,
     buffer.droppedBeforeSequence
   );
+  return {
+    ...merged,
+    afterSequence: Math.max(merged.afterSequence, buffer.afterSequence)
+  };
 }
 
 export function coalesceProcessLogBatches(
