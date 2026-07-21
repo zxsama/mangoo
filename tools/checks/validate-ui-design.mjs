@@ -103,21 +103,9 @@ for (const retiredPath of retiredPresentationPaths) {
   }
 }
 
-const retiredRecentDrawerPhrase = ["recent", "ops", "drawer"].join("\\s+");
-const retiredRecentDrawerComment = new RegExp(
-  `/\\*[^*]*\\b${retiredRecentDrawerPhrase}\\b[^*]*\\*/`,
-  "i"
-);
-if (retiredRecentDrawerComment.test(styles)) {
-  fail("legacy Recent drawer CSS comment must stay retired");
-}
-for (const retiredSelectorPrefix of [
-  `.${["recent", "ops", ""].join("-")}`,
-  `.${["recent", "op", ""].join("-")}`
-]) {
-  if (stylesForChecks.includes(retiredSelectorPrefix)) {
-    fail(`legacy Recent CSS selector must stay retired: ${retiredSelectorPrefix}*`);
-  }
+const retiredPresentationSelector = findRetiredPresentationSelector(styles);
+if (retiredPresentationSelector) {
+  fail(`legacy Tasks/Recent CSS selector must stay retired: ${retiredPresentationSelector}*`);
 }
 
 for (const value of ["previewPlaceholder", "previewPlaceholderFormat", "servedBy", "db_blob"]) {
@@ -403,6 +391,7 @@ if (!stylesForChecks.includes("-webkit-app-region: no-drag")) {
 
 assertExactSelectorHelperContracts();
 assertCssCommentStrippingContracts();
+assertRetiredPresentationSelectorContracts();
 assertJsxStructuralHelperContracts();
 assertReturnedObjectMappingHelperContracts();
 
@@ -3665,6 +3654,34 @@ function stripCssComments(source) {
   return source.replace(/\/\*[\s\S]*?\*\//g, "");
 }
 
+function findRetiredPresentationSelector(source) {
+  const sourceWithoutComments = stripCssComments(source);
+  const retiredSelectorPrefixes = [
+    ".task-panel",
+    ".task-card",
+    ".task-drawer-",
+    ".task-overlay-",
+    ".task-center",
+    ".task-row",
+    ".task-table",
+    ".task-filter-",
+    ".task-progress",
+    ".task-action",
+    ".task-counters",
+    ".task-list",
+    ".task-copy",
+    ".task-error",
+    ".recent-ops-",
+    ".recent-op-"
+  ];
+  for (const match of sourceWithoutComments.matchAll(/(?:^|[{}])\s*([^@{}][^{}]*)\{/g)) {
+    const selectorPrelude = match[1];
+    const retiredPrefix = retiredSelectorPrefixes.find((prefix) => selectorPrelude.includes(prefix));
+    if (retiredPrefix) return retiredPrefix;
+  }
+  return null;
+}
+
 function lastCssSelectorCompound(selector) {
   let compoundStart = 0;
   let bracketDepth = 0;
@@ -3825,6 +3842,31 @@ function assertCssCommentStrippingContracts() {
 
   if (declarationBlocks.some((block) => hasNonNoneDeclaration(block, "backdrop-filter"))) {
     fail("CSS declaration helpers must ignore commented backdrop-filter declarations");
+  }
+}
+
+function assertRetiredPresentationSelectorContracts() {
+  const allowed = `
+    /* .task-card { color: red; } .recent-op-row { color: red; } */
+    .notification-task-card { color: green; }
+    [data-task-kind="scan"] { color: green; }
+    .allowed-copy::before { content: ".task-card"; }
+  `;
+  if (findRetiredPresentationSelector(allowed) !== null) {
+    fail("retired CSS selector guard must ignore comments and notification/task data classes");
+  }
+  for (const selector of [
+    ".task-card",
+    ".task-drawer-panel",
+    ".task-overlay-backdrop",
+    ".task-center-list",
+    ".task-progress-bar",
+    ".recent-ops-drawer",
+    ".recent-op-row"
+  ]) {
+    if (findRetiredPresentationSelector(`${selector} { color: red; }`) === null) {
+      fail(`retired CSS selector guard must reject ${selector}`);
+    }
   }
 }
 

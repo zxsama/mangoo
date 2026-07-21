@@ -39,10 +39,40 @@ function sourceMatch(source, pattern) {
 }
 
 const useLibraryData = read("apps/web/src/core/useLibraryData.ts");
+const designTokens = read("apps/web/src/design/tokens.ts");
 for (const retiredValue of ["listFileOperations", "loadRecentOps", "recentOps", "recentOpsLoading"]) {
   if (useLibraryData.includes(retiredValue)) {
     fail(`useLibraryData must not retain legacy Recent runtime value ${retiredValue}`);
   }
+}
+const libraryStateContract = sourceMatch(
+  useLibraryData,
+  /export interface LibraryState \{[\s\S]*?\n\}/
+);
+const libraryStateReturn = sourceMatch(
+  useLibraryData,
+  /\n  return \{\n    roots,[\s\S]*?\n  \};\n\}/
+);
+for (const retiredMember of ["tasks", "busyTaskIds", "cancelTask", "retryTask", "refreshTasks"]) {
+  const memberPattern = new RegExp(`^\\s*${retiredMember}\\s*(?::|,)`, "m");
+  if (memberPattern.test(libraryStateContract) || memberPattern.test(libraryStateReturn)) {
+    fail(`useLibraryData must keep ${retiredMember} internal or remove its retired public API`);
+  }
+}
+for (const [label, pattern] of [
+  ["busy task state", /const \[busyTaskIds,\s*setBusyTaskIds\]/],
+  ["busy task callback", /const markTaskBusy = useCallback/],
+  ["cancel task callback", /const cancelTask = useCallback/],
+  ["retry task callback", /const retryTask = useCallback/],
+  ["refresh task callback", /const refreshTasks = useCallback/]
+]) {
+  if (pattern.test(useLibraryData)) {
+    fail(`useLibraryData must remove retired ${label}`);
+  }
+}
+const retiredTaskPanelWidth = ["task", "PanelWidth"].join("");
+if (designTokens.includes(retiredTaskPanelWidth)) {
+  fail(`design tokens must remove unused ${retiredTaskPanelWidth}`);
 }
 const retiredPresentationPaths = [
   `apps/web/src/features/tasks/${["Task", "Panel"].join("")}.tsx`,

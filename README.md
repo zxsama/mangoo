@@ -4,6 +4,8 @@ Windows-first local media browser and manager for existing folders.
 
 Current phase: Phase 1 skeleton. The repository is contract-first so the Electron desktop shell, reusable React UI, Rust Core, SQLite schema, plugin protocol, and tests stay aligned.
 
+## Unified Notification Center
+
 Megle includes a persistent all-library notification center with aggregated task progress and local process logs. Notification history survives library switches and desktop restarts while active work remains grouped into concise operation-level status.
 
 Start here:

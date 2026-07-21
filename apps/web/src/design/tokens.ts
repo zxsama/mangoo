@@ -1,7 +1,6 @@
 export const workbenchLayout = {
   navWidth: 72,
   sidebarWidth: 292,
-  taskPanelWidth: 320,
   tileMinWidth: 148,
   tileGap: 7,
   tileLabelHeight: 17

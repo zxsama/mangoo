@@ -144,8 +144,6 @@ export interface LibraryState {
   addingRoot: boolean;
   rescanningRootIds: Set<number>;
   scanActive: boolean;
-  tasks: TaskRecord[];
-  busyTaskIds: Set<number>;
   tags: TagRecord[];
   tagsById: Map<number, TagRecord>;
   searchState: SearchState;
@@ -192,9 +190,6 @@ export interface LibraryState {
   loadMoreMedia: () => Promise<void>;
   rescanRoot: (rootId: number) => Promise<void>;
   removeRoot: (rootId: number) => Promise<void>;
-  cancelTask: (taskId: number) => Promise<void>;
-  retryTask: (taskId: number) => Promise<void>;
-  refreshTasks: () => Promise<void>;
   refresh: () => Promise<void>;
   addRoot: (path: string) => Promise<void>;
   setQ: (q: string) => void;
@@ -387,7 +382,6 @@ export function useLibraryData(
   const [addingRoot, setAddingRoot] = useState(false);
   const [rescanningRootIds, setRescanningRootIds] = useState<Set<number>>(() => new Set());
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  const [busyTaskIds, setBusyTaskIds] = useState<Set<number>>(() => new Set());
   const [taskPollFailures, setTaskPollFailures] = useState(0);
   const [scanRefreshFailures, setScanRefreshFailures] = useState(0);
   const [lastScan, setLastScan] = useState<ScanSummary | null>(null);
@@ -2829,77 +2823,6 @@ export function useLibraryData(
     [client, createReportingAttempt, refreshRootsList, reportLibraryFailure]
   );
 
-  const markTaskBusy = useCallback((taskId: number, busy: boolean) => {
-    setBusyTaskIds((current) => {
-      const next = new Set(current);
-      if (busy) {
-        next.add(taskId);
-      } else {
-        next.delete(taskId);
-      }
-      return next;
-    });
-  }, []);
-
-  const cancelTask = useCallback(
-    async (taskId: number) => {
-      const reportingAttempt = createReportingAttempt();
-      markTaskBusy(taskId, true);
-      try {
-        await client.cancelTask(taskId);
-        await loadTasks();
-      } catch (cause) {
-        void reportLibraryFailure(
-          cause,
-          "task-action",
-          `task:${taskId}`,
-          "cancel-failed",
-          reportingAttempt
-        );
-      } finally {
-        markTaskBusy(taskId, false);
-      }
-    },
-    [client, createReportingAttempt, loadTasks, markTaskBusy, reportLibraryFailure]
-  );
-
-  const retryTask = useCallback(
-    async (taskId: number) => {
-      const reportingAttempt = createReportingAttempt();
-      markTaskBusy(taskId, true);
-      try {
-        await client.retryTask(taskId);
-        await loadTasks();
-      } catch (cause) {
-        void reportLibraryFailure(
-          cause,
-          "task-action",
-          `task:${taskId}`,
-          "retry-failed",
-          reportingAttempt
-        );
-      } finally {
-        markTaskBusy(taskId, false);
-      }
-    },
-    [client, createReportingAttempt, loadTasks, markTaskBusy, reportLibraryFailure]
-  );
-
-  const refreshTasks = useCallback(async () => {
-    const reportingAttempt = createReportingAttempt();
-    try {
-      await loadTasks();
-    } catch (cause) {
-      void reportLibraryFailure(
-        cause,
-        "task-sync",
-        "library",
-        "refresh-failed",
-        reportingAttempt
-      );
-    }
-  }, [createReportingAttempt, loadTasks, reportLibraryFailure]);
-
   const setQ = useCallback((q: string) => {
     setSearchState((current) => (current.q === q ? current : { ...current, q }));
   }, []);
@@ -3526,8 +3449,6 @@ export function useLibraryData(
     addingRoot,
     rescanningRootIds,
     scanActive,
-    tasks,
-    busyTaskIds,
     tags,
     tagsById,
     searchState,
@@ -3615,9 +3536,6 @@ export function useLibraryData(
     loadMoreMedia,
     rescanRoot,
     removeRoot,
-    cancelTask,
-    retryTask,
-    refreshTasks,
     refresh,
     addRoot,
     setQ,

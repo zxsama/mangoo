@@ -36,7 +36,7 @@ tools/
 
 ## Unified Notification Center Modules
 
-- `crates/core/src/db/notification_outbox.rs` and migration `0021_notification_outbox.sql` own each library DB's operation heads, revisioned Outbox, acknowledgements, and file-operation grouping link. Core audit endpoints remain available for legacy migration and operation history.
+- `crates/core/src/db/notification_outbox.rs` and migration `0021_notification_outbox.sql` own each library DB's operation heads, revisioned Outbox, acknowledgements, and the `file_operations.operation_group_id` grouping link. Core audit endpoints remain available for legacy migration and operation history.
 - `apps/desktop/src/notification-service.ts` owns Outbox synchronization, cross-library snapshots, history/actions, and degraded fallback behavior. `notification-store.ts` plus `notification-store-worker.ts` own the durable `userData/notifications.sqlite` mirror; `process-log-buffer.ts` owns bounded local process logs.
 - `apps/desktop/src/notification-ipc.ts`, `notification-ipc-channels.cjs`, and `preload.cjs` expose the narrow typed renderer boundary. Shared DTOs and bridge signatures belong in `packages/notification-contract`, not in Desktop or Web copies.
 - `apps/web/src/features/notifications/` owns the compact notification popover, standalone status/history/process-log window, presentation models, and subscriptions. It consumes preload snapshots/actions only: no raw notification fetch, polling loop, or per-thumbnail event rows.

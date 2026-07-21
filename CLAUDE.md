@@ -68,7 +68,7 @@ The desktop shell (`apps/desktop/src/main.ts`, `core-process.ts`, `core-session.
 - `packages/core-client` (`@megle/core-client`) holds a hand-maintained `generated-contract.ts` aligned to the OpenAPI by `scripts/check-contract.mjs`. Treat it as a generator placeholder: edit when the contract changes, never the other way around.
 - `packages/notification-contract` (`@megle/notification-contract`) owns the type-only Desktop/Web preload boundary for notification snapshots, history, actions, subscriptions, and process logs. It reuses generated Core operation types and must remain free of runtime Node dependencies.
 - `contracts/plugins/manifest.schema.json` defines plugin manifest fields and capabilities (`decoder`, `metadata`, `action`, `import-provider`).
-- SQLite schema lives in `crates/core/migrations/NNNN_*.sql` (currently `0001`–`0017`; `0014` is applied in code, not as a file). A new migration must be (1) created as the SQL file, (2) declared in `crates/core/src/db/migrations.rs`, (3) gated in `Database::apply_migrations` (`crates/core/src/db/mod.rs`), and (4) asserted in `tools/checks/validate_sqlite_schema.py` (`MIGRATIONS` plus `REQUIRED_TABLES`/`REQUIRED_INDEXES`).
+- SQLite schema is current through `0024`. Version `0014` is the code-owned `apply_interactive_folder_scan_task_migration` in `Database::apply_migrations`; every other version is a numbered SQL file. The latest files are `crates/core/migrations/0021_notification_outbox.sql`, `0022_file_operation_journal.sql`, `0023_file_operation_recovery_metadata.sql`, and `crates/core/migrations/0024_file_operation_object_binding.sql`. A new migration must be (1) created as SQL unless it genuinely requires code-owned transformation, (2) declared in `crates/core/src/db/migrations.rs` when file-backed, (3) gated in `Database::apply_migrations` (`crates/core/src/db/mod.rs`), and (4) asserted in `tools/checks/validate_sqlite_schema.py` (`MIGRATIONS` plus `REQUIRED_TABLES`/`REQUIRED_INDEXES`).
 - Some structural checks grep Rust source for implementation markers and **specific test names** (e.g. `tools/checks/validate-core-api.mjs` pins viewport-window markers in `db/mod.rs`). Renaming a guarded function/test or deleting a marked code pattern fails the check — update the check alongside the rename.
 
 When adding an API path, plugin capability, table, or index, update the contract and the corresponding check before wiring code.
@@ -168,16 +168,16 @@ Phase 1 skeleton with several routes already wired. When extending, build on wha
 - `npm test` currently passes end-to-end including `cargo fmt --all --check` and `cargo test --workspace`.
 - `npm audit` reports one high-severity issue. **Do not** run `npm audit fix --force` without reviewing package impact.
 
-### Phase Summary (1–10)
+### Historical Phase Summary (1–10)
 
-Phases 1–10 of the master plan are complete. Each phase ships both Core and UI work inside the same shell, not back-end first.
+This is a historical delivery record, not the current presentation contract. Current background work, file-operation history, actions, and process logs are presented only through the **Unified Notification Center** documented below.
 
 1. **Phase 1 — App skeleton.** Electron + Vite + Axum + SQLite wired with session-token auth, exact dev CORS, durable scan-task queue, and routes/migrations under one Cargo crate.
 2. **Phase 2 — Real directory browsing.** Add root, scan, populate folders/files/media, browse the real folder tree and grid, open the preview shell.
 3. **Phase 3 — Thumbnails and preview.** Tiny/grid/preview pipeline, viewport-priority scheduling, neighbor prefetch, stable dark grid surface, no-layout-shift tile loading.
-4. **Phase 4 — Task center and watcher.** Background scan/thumbnail queue, persistent `notify` watcher with overflow recovery, task drawer + Task Center page with cancel/retry, recovery on Core restart.
+4. **Phase 4 — Background work and watcher.** Background scan/thumbnail queue, persistent `notify` watcher with overflow recovery, durable task state with cancel/retry semantics, recovery on Core restart.
 5. **Phase 5 — Metadata, search, organizing.** Tags, ratings, favorites, notes, full-text search, filter chips, sort-by-rating, inspector metadata editing.
-6. **Phase 6 — Real file operations.** Rename, move, recycle/permanent delete with validation, conflict handling, atomic DB+filesystem transactions, recent-ops panel.
+6. **Phase 6 — Real file operations.** Rename, move, recycle/permanent delete with validation, conflict handling, atomic DB+filesystem transactions, durable audit history and operation grouping. Its presentation is now owned by the unified center.
 7. **Phase 7 — Advanced media.** Real image decoder + resizer and FFmpeg sidecar for video posters, populate `width/height/duration/codec`, graceful failure for unsupported formats.
 8. **Phase 8 — Plugin manager.** Manifest discovery, enable/disable, capabilities/permissions display, plugin detail inspector. No runtime yet — registration only.
 9. **Phase 9 — Web / Docker.** Headless Core mode, Basic auth, mounted roots, HTTP asset delivery, the same React app shell served as static files.
@@ -224,13 +224,13 @@ Notifications form one operation-level pipeline across every library rather than
 ```text
 Core library DB -> notification_operation_heads + notification_outbox
 Desktop userData/notifications.sqlite -> durable all-library mirror
-Preload @megle/notification-contract -> typed snapshots, history, actions, and subscriptions
-Web notifications feature -> compact status, full history/actions, and local process logs
+Preload packages/notification-contract -> typed snapshots, history, actions, and subscriptions
+Web apps/web/src/features/notifications/ -> compact status, full history/actions, and local process logs
 ```
 
 - **Core library DB:** `notification_operation_heads` stores the current operation head and `notification_outbox` publishes revisioned changes transactionally. Core remains authoritative for active library work; the existing file-operation audit/history endpoint stays available for migration and recovery.
 - **Desktop durable mirror:** `apps/desktop/src/notification-service.ts` drains and acknowledges each library Outbox only after `userData/notifications.sqlite` persists the revision. The mirror survives library switches and desktop restarts and powers cross-library status/history; process logs remain local to the desktop session and use a bounded buffer.
-- **Typed preload boundary:** renderer code uses the `@megle/notification-contract` bridge for compact snapshots, paged history/facets, cancel/retry actions, change subscriptions, and snapshot-plus-subscribe process logs. Do not bypass IPC with renderer-owned notification transport.
+- **Typed preload boundary:** renderer code uses the `packages/notification-contract` (`@megle/notification-contract`) bridge for compact snapshots, paged history/facets, cancel/retry actions, change subscriptions, and snapshot-plus-subscribe process logs. Do not bypass IPC with renderer-owned notification transport.
 - **Web constraints:** no raw fetch for notification data, no notification polling, and no per-thumbnail notifications. Thumbnail activity is aggregated by library, while every background operation declares one logical grouping key and one presentation class (`important`, `history_only`, or `status_only`).
 
 ## Next Execution Order

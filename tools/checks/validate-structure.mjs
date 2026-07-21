@@ -39,6 +39,67 @@ function readJson(relativePath) {
   return JSON.parse(readFileSync(path.join(root, relativePath), "utf8"));
 }
 
+function readText(relativePath) {
+  return readFileSync(path.join(root, relativePath), "utf8").replace(/\r\n/g, "\n");
+}
+
+function markdownSection(document, headingAliases) {
+  const lines = document.replace(/<!--[\s\S]*?-->/g, "").split("\n");
+  const aliases = new Set(headingAliases.map((heading) => heading.toLocaleLowerCase()));
+  for (let index = 0; index < lines.length; index += 1) {
+    const heading = lines[index].match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (!heading || !aliases.has(heading[2].toLocaleLowerCase())) continue;
+    const level = heading[1].length;
+    let end = index + 1;
+    while (end < lines.length) {
+      const nextHeading = lines[end].match(/^(#{1,6})\s+/);
+      if (nextHeading && nextHeading[1].length <= level) break;
+      end += 1;
+    }
+    return lines.slice(index + 1, end).join("\n").trim();
+  }
+  return null;
+}
+
+function requireDocumentSection(documentPath, headingAliases, requiredMarkers = []) {
+  const section = markdownSection(readText(documentPath), headingAliases);
+  if (section === null) {
+    fail(`${documentPath} missing section heading: ${headingAliases.join(" / ")}`);
+    return "";
+  }
+  for (const marker of requiredMarkers) {
+    if (!section.includes(marker)) {
+      fail(`${documentPath} section ${headingAliases[0]} missing semantic marker: ${marker}`);
+    }
+  }
+  return section;
+}
+
+function assertMarkdownSectionContracts() {
+  const probe = `
+<!--
+## Unified Notification Center
+comment-only-marker
+-->
+outside-marker
+## Unified Notification Center
+current-marker
+## Next Section
+after-marker
+`;
+  const section = markdownSection(probe, ["Unified Notification Center"]);
+  if (
+    section !== "current-marker" ||
+    section.includes("comment-only-marker") ||
+    section.includes("outside-marker") ||
+    section.includes("after-marker")
+  ) {
+    fail("Markdown section checks must ignore comments and markers outside the active section");
+  }
+}
+
+assertMarkdownSectionContracts();
+
 const requiredDirs = [
   "apps/desktop/src",
   "apps/web/src",
@@ -166,33 +227,56 @@ for (const capability of ["decoder", "metadata", "action", "import-provider"]) {
   }
 }
 
-for (const [documentPath, requiredMarkers] of [
+requireDocumentSection("README.md", ["Unified Notification Center", "统一通知中心"]);
+requireDocumentSection(
+  "CLAUDE.md",
+  ["Unified Notification Center", "统一通知中心"],
   [
-    "README.md",
-    ["persistent all-library notification center", "aggregated task progress", "local process logs"]
-  ],
+    "notification_operation_heads",
+    "notification_outbox",
+    "apps/desktop/src/notification-service.ts",
+    "packages/notification-contract",
+    "apps/web/src/features/notifications/"
+  ]
+);
+requireDocumentSection(
+  "CLAUDE.md",
+  ["Contract-First Boundaries", "契约优先边界"],
   [
-    "CLAUDE.md",
-    [
-      "### Unified Notification Center",
-      "notification_operation_heads",
-      "userData/notifications.sqlite",
-      "@megle/notification-contract",
-      "no notification polling",
-      "no per-thumbnail notifications"
-    ]
-  ],
+    "crates/core/migrations/0024_file_operation_object_binding.sql",
+    "apply_interactive_folder_scan_task_migration",
+    "tools/checks/validate_sqlite_schema.py"
+  ]
+);
+requireDocumentSection(
+  "docs/project-structure.md",
+  ["Unified Notification Center Modules", "统一通知中心模块"],
   [
-    "docs/project-structure.md",
-    ["## Unified Notification Center Modules", "logical grouping key", "presentation class"]
-  ],
-  ["docs/architecture.md", ["## Unified Notification Center", "notification_outbox"]]
+    "crates/core/src/db/notification_outbox.rs",
+    "apps/desktop/src/notification-service.ts",
+    "packages/notification-contract",
+    "apps/web/src/features/notifications/",
+    "operation_group_id",
+    "history_only",
+    "status_only"
+  ]
+);
+requireDocumentSection(
+  "docs/architecture.md",
+  ["Unified Notification Center", "统一通知中心"],
+  ["notification_operation_heads", "notification_outbox", "notifications.sqlite", "@megle/notification-contract"]
+);
+const historicalPhaseSummary = requireDocumentSection(
+  "CLAUDE.md",
+  ["Historical Phase Summary (1–10)", "历史阶段摘要（1–10）"]
+);
+for (const retiredPresentation of [
+  ["task", "drawer"].join(" "),
+  ["Task", "Center"].join(" "),
+  ["recent", "ops", "panel"].join("-")
 ]) {
-  const document = readFileSync(path.join(root, documentPath), "utf8");
-  for (const marker of requiredMarkers) {
-    if (!document.includes(marker)) {
-      fail(`${documentPath} missing unified notification documentation marker: ${marker}`);
-    }
+  if (historicalPhaseSummary.toLocaleLowerCase().includes(retiredPresentation.toLocaleLowerCase())) {
+    fail(`CLAUDE.md historical phase summary must not present retired surface as current: ${retiredPresentation}`);
   }
 }
 
