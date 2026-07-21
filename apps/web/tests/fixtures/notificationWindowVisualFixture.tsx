@@ -153,6 +153,23 @@ const allHistory = Array.from({ length: 240 }, (_, index) =>
   operation(index, index === 7 ? { operationId: "retry-error", retryable: true } : {})
 );
 
+function filterHistory(query: DesktopNotificationHistoryQuery) {
+  return allHistory.filter((item) => {
+    if (query.libraryId && item.libraryId !== query.libraryId) return false;
+    if (query.statuses?.length && !query.statuses.includes(item.status)) return false;
+    if (query.categories?.length && !query.categories.includes(item.category)) return false;
+    if (query.origins?.length && !query.origins.includes(item.origin)) return false;
+    if (query.kinds?.length && !query.kinds.includes(item.kind)) return false;
+    if (
+      query.search &&
+      !`${item.title} ${item.summary} ${item.errorDetail}`
+        .toLowerCase()
+        .includes(query.search.toLowerCase())
+    ) return false;
+    return true;
+  });
+}
+
 const allLogs: DesktopProcessLogLine[] = Array.from({ length: 260 }, (_, index) => ({
   sequence: index + 1,
   timestamp: now - (260 - index) * 200,
@@ -187,13 +204,7 @@ function NotificationWindowVisualFixture() {
   const loadHistory = useCallback(async (query: DesktopNotificationHistoryQuery) => {
     metricsRef.current.historyQueries += 1;
     const offset = query.offset ?? 0;
-    const filtered = allHistory.filter((item) => {
-      if (query.libraryId && item.libraryId !== query.libraryId) return false;
-      if (query.statuses?.length && !query.statuses.includes(item.status)) return false;
-      if (query.categories?.length && !query.categories.includes(item.category)) return false;
-      if (query.search && !`${item.title} ${item.summary} ${item.errorDetail}`.toLowerCase().includes(query.search.toLowerCase())) return false;
-      return true;
-    });
+    const filtered = filterHistory(query);
     const items = filtered.slice(offset, offset + (query.limit ?? 100));
     const nextOffset = offset + items.length < filtered.length ? offset + items.length : null;
     const next: NotificationHistoryState = {
@@ -212,11 +223,13 @@ function NotificationWindowVisualFixture() {
   const loadMoreHistory = useCallback(async () => {
     const query = history.query ?? { limit: 100 };
     const offset = history.nextOffset ?? history.items.length;
-    const pageItems = allHistory.slice(offset, offset + (query.limit ?? 100));
+    const filtered = filterHistory(query);
+    const pageItems = filtered.slice(offset, offset + (query.limit ?? 100));
     const next: NotificationHistoryState = {
       ...history,
       items: [...history.items, ...pageItems],
-      nextOffset: offset + pageItems.length < allHistory.length ? offset + pageItems.length : null,
+      total: filtered.length,
+      nextOffset: offset + pageItems.length < filtered.length ? offset + pageItems.length : null,
       loading: false
     };
     setHistory(next);
@@ -308,19 +321,43 @@ function NotificationWindowVisualFixture() {
           </nav>
           <main className="notification-window-content">
             <section className="notification-window-panel" role="tabpanel">
-              {page === "status" ? <NotificationStatusView model={buildCompactNotificationModel(compactSnapshot)} /> : null}
+              {page === "status" ? (
+                <NotificationStatusView
+                  cancel={async () => ({ ok: true, message: null })}
+                  model={buildCompactNotificationModel(compactSnapshot)}
+                  refreshCompact={async () => ({ ok: true, value: true })}
+                />
+              ) : null}
               {page === "history" ? (
                 <NotificationHistoryView
                   cancel={async () => ({ ok: true, message: null })}
                   history={history}
+                  listLibraries={async () => ({
+                    ok: true,
+                    value: [
+                      { id: "artists", name: "Artists" },
+                      { id: "references", name: "References" }
+                    ]
+                  })}
                   loadHistory={loadHistory}
                   loadMoreHistory={loadMoreHistory}
+                  refreshCompact={async () => ({ ok: true, value: true })}
                   retry={async (_libraryId, operationId) => operationId === "retry-error" ? { ok: false, message: "Fixture retry rejected" } : { ok: true, message: null }}
                 />
               ) : null}
               {page === "logs" ? (
                 <ProcessLogView
                   clearLogs={async () => ({ ok: true, value: true })}
+                  exportLogs={async () => ({
+                    ok: true,
+                    value: {
+                      saved: true,
+                      canceled: false,
+                      filePath: "fixture.txt",
+                      lineCount: allLogs.length,
+                      error: null
+                    }
+                  })}
                   getLogPage={async (query) => ({ ok: true, value: pageLogs(query) })}
                   openLogSubscription={openLogSubscription}
                 />

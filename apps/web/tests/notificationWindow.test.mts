@@ -28,19 +28,31 @@ describe("full notification center contract", () => {
     assert.match(historySource, /retryable/);
     assert.match(historySource, /useVirtualizer/);
     assert.match(historySource, /loadMoreHistory/);
+    assert.match(historySource, /origins/);
+    assert.match(historySource, /kinds/);
+    assert.match(historySource, /Promise\.all\(\[loadCurrentQuery\(queryRef\.current\), refreshCompact\(\)\]\)/);
+    assert.doesNotMatch(historySource, /MAX_CLIENT_FILTER_PAGES/);
+    assert.doesNotMatch(historySource, /visibleItemss*=s*useMemo/);
     assert.doesNotMatch(historySource, /raw fetch|node:fs/i);
+  });
+
+  it("exposes cancellation for active operations in the full status view", () => {
+    assert.match(statusSource, /cancel/);
+    assert.match(statusSource, /cancellable/);
+    assert.match(windowSource, /refreshCompact/);
   });
 
   it("subscribes to logs only while mounted and renders a bounded window", () => {
     assert.match(logSource, /openLogSubscription/);
     assert.match(logSource, /unsubscribe/);
     assert.match(logSource, /useVirtualizer/);
-    assert.match(logSource, /droppedBeforeSequence/);
+    assert.match(logSource, /processLogGapSequence/);
     assert.match(logSource, /clearLogs/);
-    assert.match(logSource, /Blob/);
+    assert.match(logSource, /exportLogs/);
+    assert.doesNotMatch(logSource, /new Blob|URL\.createObjectURL|anchor\.download/);
     assert.match(logSource, /LOG_PAGE_SIZE = 200/);
     assert.match(logSource, /加载更早日志/);
-    assert.match(logSource, /MAX_RENDERED_LOG_LINES \/ LOG_PAGE_SIZE/);
+    assert.doesNotMatch(logSource, /firstSequence.*lastSequenceRef/);
     assert.doesNotMatch(logSource, /node:fs|fetch\s*\(/);
   });
 

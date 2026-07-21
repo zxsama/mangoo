@@ -95,7 +95,11 @@ export function NotificationWindow() {
             id="notification-panel-status"
             role="tabpanel"
           >
-            <NotificationStatusView model={notifications.compact} />
+            <NotificationStatusView
+              cancel={notifications.cancel}
+              model={notifications.compact}
+              refreshCompact={notifications.refreshCompact}
+            />
           </section>
         ) : null}
         {page === "history" ? (
@@ -108,8 +112,10 @@ export function NotificationWindow() {
             <NotificationHistoryView
               cancel={notifications.cancel}
               history={notifications.history}
+              listLibraries={notifications.listLibraries}
               loadHistory={notifications.loadHistory}
               loadMoreHistory={notifications.loadMoreHistory}
+              refreshCompact={notifications.refreshCompact}
               retry={notifications.retry}
             />
           </section>
@@ -123,6 +129,7 @@ export function NotificationWindow() {
           >
             <ProcessLogView
               clearLogs={notifications.clearLogs}
+              exportLogs={notifications.exportLogs}
               getLogPage={notifications.getLogPage}
               openLogSubscription={notifications.openLogSubscription}
             />

@@ -20,3 +20,5 @@ void traceLevel;
 void start.subscriptionId;
 void event.subscriptionId;
 void bridge.snapshotAndSubscribeLogs;
+void bridge.listLibraries;
+void bridge.exportLogs;

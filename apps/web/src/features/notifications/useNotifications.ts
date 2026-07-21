@@ -4,8 +4,10 @@ import type {
   DesktopNotificationHistoryQuery,
   DesktopNotificationsBridge,
   DesktopProcessLogBatch,
+  DesktopProcessLogExportResult,
   DesktopProcessLogFilter,
   DesktopProcessLogPage,
+  NotificationLibraryIdentity,
   ProcessLogSubscriptionHandle as DesktopProcessLogSubscriptionHandle,
   ProcessLogSubscriptionInitialSnapshot
 } from "@megle/notification-contract";
@@ -202,6 +204,28 @@ export class NotificationExternalStore {
     return this.performAction("retry", libraryId, operationId);
   }
 
+  async refreshCompact(): Promise<NotificationRequestResult<boolean>> {
+    const bridge = this.currentBridge();
+    if (!bridge) return { ok: false, error: "通知状态仅在桌面模式可用" };
+    try {
+      this.applyCompactSnapshot(await bridge.getCompactSnapshot());
+      return { ok: true, value: true };
+    } catch (error) {
+      this.applyBridgeError(error);
+      return { ok: false, error: errorMessage(error) };
+    }
+  }
+
+  async listLibraries(): Promise<NotificationRequestResult<NotificationLibraryIdentity[]>> {
+    const bridge = this.currentBridge();
+    if (!bridge) return { ok: false, error: "资源库列表仅在桌面模式可用" };
+    try {
+      return { ok: true, value: await bridge.listLibraries() };
+    } catch (error) {
+      return { ok: false, error: errorMessage(error) };
+    }
+  }
+
   async getLogPage(
     query: DesktopProcessLogFilter
   ): Promise<NotificationRequestResult<DesktopProcessLogPage>> {
@@ -209,6 +233,18 @@ export class NotificationExternalStore {
     if (!bridge) return { ok: false, error: "进程日志仅在桌面模式可用" };
     try {
       return { ok: true, value: await bridge.getLogs(query) };
+    } catch (error) {
+      return { ok: false, error: errorMessage(error) };
+    }
+  }
+
+  async exportLogs(
+    query: DesktopProcessLogFilter
+  ): Promise<NotificationRequestResult<DesktopProcessLogExportResult>> {
+    const bridge = this.currentBridge();
+    if (!bridge) return { ok: false, error: "进程日志仅在桌面模式可用" };
+    try {
+      return { ok: true, value: await bridge.exportLogs(query) };
     } catch (error) {
       return { ok: false, error: errorMessage(error) };
     }
@@ -495,7 +531,10 @@ const loadHistory = notificationStore.loadHistory.bind(notificationStore);
 const loadMoreHistory = notificationStore.loadMoreHistory.bind(notificationStore);
 const cancel = notificationStore.cancel.bind(notificationStore);
 const retry = notificationStore.retry.bind(notificationStore);
+const refreshCompact = notificationStore.refreshCompact.bind(notificationStore);
+const listLibraries = notificationStore.listLibraries.bind(notificationStore);
 const getLogPage = notificationStore.getLogPage.bind(notificationStore);
+const exportLogs = notificationStore.exportLogs.bind(notificationStore);
 const openLogSubscription = notificationStore.openLogSubscription.bind(notificationStore);
 const clearLogs = notificationStore.clearLogs.bind(notificationStore);
 
@@ -519,7 +558,10 @@ export function useNotifications() {
     loadMoreHistory,
     cancel,
     retry,
+    refreshCompact,
+    listLibraries,
     getLogPage,
+    exportLogs,
     openLogSubscription,
     clearLogs
   };
@@ -540,6 +582,8 @@ function historyQueryIdentity(query: DesktopNotificationHistoryQuery): string {
     libraryId: query.libraryId ?? null,
     statuses: [...(query.statuses ?? [])].sort(),
     categories: [...(query.categories ?? [])].sort(),
+    origins: [...(query.origins ?? [])].sort(),
+    kinds: [...(query.kinds ?? [])].sort(),
     search: query.search?.trim() ?? "",
     limit: query.limit ?? 50
   });

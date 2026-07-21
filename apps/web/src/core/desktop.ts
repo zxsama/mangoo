@@ -10,6 +10,7 @@ export type {
   DesktopNotificationsBridge,
   DesktopNotificationStatus,
   DesktopProcessLogBatch,
+  DesktopProcessLogExportResult,
   DesktopProcessLogFilter,
   DesktopProcessLogLevel,
   DesktopProcessLogLine,

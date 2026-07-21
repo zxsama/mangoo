@@ -18,6 +18,7 @@ import {
 } from "react";
 import type {
   DesktopProcessLogBatch,
+  DesktopProcessLogExportResult,
   DesktopProcessLogFilter,
   DesktopProcessLogLevel,
   DesktopProcessLogLine,
@@ -29,6 +30,7 @@ import type {
   NotificationRequestResult,
   OpenNotificationLogSubscription
 } from "./useNotifications";
+import { processLogGapSequence } from "./notificationModel";
 
 const MAX_RENDERED_LOG_LINES = 5_000;
 const MAX_PAUSED_BATCH_LINES = 1_000;
@@ -36,7 +38,12 @@ const LOG_PAGE_SIZE = 200;
 
 interface ProcessLogViewProps {
   clearLogs(): Promise<NotificationRequestResult<boolean>>;
-  getLogPage(query: DesktopProcessLogFilter): Promise<NotificationRequestResult<DesktopProcessLogPage>>;
+  exportLogs(
+    query: DesktopProcessLogFilter
+  ): Promise<NotificationRequestResult<DesktopProcessLogExportResult>>;
+  getLogPage(
+    query: DesktopProcessLogFilter
+  ): Promise<NotificationRequestResult<DesktopProcessLogPage>>;
   openLogSubscription(
     query: DesktopProcessLogFilter,
     listener: (batch: DesktopProcessLogBatch) => void
@@ -45,6 +52,7 @@ interface ProcessLogViewProps {
 
 export function ProcessLogView({
   clearLogs,
+  exportLogs,
   getLogPage,
   openLogSubscription
 }: ProcessLogViewProps) {
@@ -65,7 +73,6 @@ export function ProcessLogView({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pausedRef = useRef(false);
   const bufferedBatchesRef = useRef<DesktopProcessLogBatch[]>([]);
-  const lastSequenceRef = useRef(0);
 
   const query = useMemo<DesktopProcessLogFilter>(
     () => ({
@@ -78,15 +85,9 @@ export function ProcessLogView({
   );
 
   const deliverBatch = useCallback((batch: DesktopProcessLogBatch) => {
-    if (batch.droppedBeforeSequence !== null) {
-      setGapSequence(batch.droppedBeforeSequence);
-    }
-    const firstSequence = batch.lines[0]?.sequence;
-    if (firstSequence != null && lastSequenceRef.current > 0 && firstSequence > lastSequenceRef.current + 1) {
-      setGapSequence(firstSequence - 1);
-    }
+    const gap = processLogGapSequence(batch);
+    if (gap !== null) setGapSequence(gap);
     if (batch.lines.length === 0) return;
-    lastSequenceRef.current = Math.max(lastSequenceRef.current, batch.afterSequence);
     setLines((current) => mergeLogLines(current, batch.lines));
   }, []);
 
@@ -118,7 +119,6 @@ export function ProcessLogView({
     bufferedBatchesRef.current = [];
     setQueuedLineCount(0);
     setHasOlder(false);
-    lastSequenceRef.current = 0;
 
     void openLogSubscription(query, receiveBatch).then((result) => {
       if (!result.ok) {
@@ -136,7 +136,6 @@ export function ProcessLogView({
       const snapshot = [...result.value.snapshot.snapshot]
         .sort((left, right) => left.sequence - right.sequence)
         .slice(-MAX_RENDERED_LOG_LINES);
-      lastSequenceRef.current = result.value.snapshot.afterSequence;
       setLines(snapshot);
       setHasOlder(snapshot.length >= LOG_PAGE_SIZE);
       setLoading(false);
@@ -210,38 +209,25 @@ export function ProcessLogView({
     setQueuedLineCount(0);
     setGapSequence(null);
     setHasOlder(false);
-    lastSequenceRef.current = 0;
     setActionMessage("已清空当前会话日志");
   };
 
   const handleExport = async () => {
     setActionMessage(null);
-    const exported: DesktopProcessLogLine[] = [];
-    let beforeSequence: number | undefined;
-    for (let pageIndex = 0; pageIndex < MAX_RENDERED_LOG_LINES / LOG_PAGE_SIZE; pageIndex += 1) {
-      const result = await getLogPage({
-        ...query,
-        ...(beforeSequence == null ? {} : { beforeSequence }),
-        limit: LOG_PAGE_SIZE
-      });
-      if (!result.ok) {
-        setActionMessage(result.error);
-        return;
-      }
-      exported.push(...result.value.lines);
-      if (!result.value.hasMore || result.value.nextBeforeSequence === null) break;
-      beforeSequence = result.value.nextBeforeSequence;
+    const result = await exportLogs(query);
+    if (!result.ok) {
+      setActionMessage(result.error);
+      return;
     }
-    const exportLines = mergeLogLines([], exported);
-    const payload = exportLines.map(formatLogLine).join("\n");
-    const blob = new Blob([payload], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `megle-process-logs-${new Date().toISOString().replaceAll(":", "-")}.txt`;
-    anchor.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
-    setActionMessage(`已导出 ${exportLines.length.toLocaleString()} 行日志`);
+    if (result.value.canceled) {
+      setActionMessage("已取消导出");
+      return;
+    }
+    if (!result.value.saved) {
+      setActionMessage(result.value.error || "日志导出失败");
+      return;
+    }
+    setActionMessage(`已导出 ${result.value.lineCount.toLocaleString()} 行日志`);
   };
 
   const handleLoadOlder = async () => {

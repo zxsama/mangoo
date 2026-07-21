@@ -595,7 +595,7 @@ class NotificationStoreDatabase {
       throw new RangeError("history limit cannot exceed 200");
     }
 
-    const clauses = ["operations.status NOT IN ('pending', 'running')"];
+    const clauses: string[] = [];
     const bindings: Array<string | number> = [];
     if (query.libraryId !== undefined) {
       assertString(query.libraryId, "history libraryId");
@@ -626,18 +626,60 @@ class NotificationStoreDatabase {
       clauses.push(`operations.category IN (${query.categories.map(() => "?").join(", ")})`);
       bindings.push(...query.categories);
     }
+    if (query.origins !== undefined) {
+      if (!Array.isArray(query.origins) || query.origins.length === 0) {
+        throw new TypeError("history origins must be a non-empty array");
+      }
+      for (const origin of query.origins) {
+        if (!ORIGINS.has(origin)) {
+          throw new TypeError("history origin is invalid");
+        }
+      }
+      clauses.push(
+        `json_extract(operations.payload_json, '$.origin') IN (${query.origins.map(() => "?").join(", ")})`
+      );
+      bindings.push(...query.origins);
+    }
+    if (query.kinds !== undefined) {
+      if (!Array.isArray(query.kinds) || query.kinds.length === 0 || query.kinds.length > 50) {
+        throw new TypeError("history kinds must be a non-empty array");
+      }
+      for (const kind of query.kinds) {
+        assertString(kind, "history kind");
+        if (kind.length > 128) throw new RangeError("history kind exceeds 128 characters");
+      }
+      clauses.push(
+        `json_extract(operations.payload_json, '$.kind') IN (${query.kinds.map(() => "?").join(", ")})`
+      );
+      bindings.push(...query.kinds);
+    }
     if (query.search !== undefined) {
       if (typeof query.search !== "string") {
         throw new TypeError("history search must be a string");
       }
       const search = query.search.trim();
       if (search.length > 0) {
-        clauses.push("(json_extract(operations.payload_json, '$.title') LIKE ? OR json_extract(operations.payload_json, '$.summary') LIKE ?)");
-        bindings.push(`%${search}%`, `%${search}%`);
+        clauses.push(`(
+          json_extract(operations.payload_json, '$.title') LIKE ?
+          OR json_extract(operations.payload_json, '$.summary') LIKE ?
+          OR json_extract(operations.payload_json, '$.errorDetail') LIKE ?
+          OR json_extract(operations.payload_json, '$.errorCode') LIKE ?
+          OR EXISTS (
+            SELECT 1 FROM action_errors
+            WHERE action_errors.library_id = operations.library_id
+              AND action_errors.operation_id = operations.operation_id
+              AND action_errors.detail LIKE ?
+          )
+          OR ('Root ' || json_extract(operations.payload_json, '$.rootId')) LIKE ?
+          OR ('Folder ' || json_extract(operations.payload_json, '$.folderId')) LIKE ?
+          OR ('File ' || json_extract(operations.payload_json, '$.fileId')) LIKE ?
+        )`);
+        const pattern = `%${search}%`;
+        bindings.push(pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern);
       }
     }
 
-    const where = clauses.join(" AND ");
+    const where = clauses.length > 0 ? clauses.join(" AND ") : "1 = 1";
     const totalRow = this.database
       .prepare(`SELECT COUNT(*) AS total FROM operations WHERE ${where}`)
       .get(...bindings) as { total: number };

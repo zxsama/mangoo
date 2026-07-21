@@ -2,6 +2,7 @@ import type {
   DesktopNotificationCompactSnapshot,
   DesktopNotificationHistoryPage,
   DesktopNotificationOperation,
+  DesktopProcessLogBatch,
   DesktopThumbnailCacheSummary
 } from "@megle/notification-contract";
 
@@ -85,6 +86,10 @@ export function notificationIndicator(input: {
 }): NotificationIndicator {
   if (input.retryableFailure) return "failure";
   return input.active ? "active" : "idle";
+}
+
+export function processLogGapSequence(batch: DesktopProcessLogBatch): number | null {
+  return batch.droppedBeforeSequence;
 }
 
 export function buildCompactNotificationModel(

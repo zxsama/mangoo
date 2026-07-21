@@ -5873,6 +5873,13 @@ button:disabled {
   font-weight: 600;
 }
 
+.notification-status-operation-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .notification-window-progress {
   position: relative;
   height: 4px;

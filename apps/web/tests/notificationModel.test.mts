@@ -13,6 +13,7 @@ import {
   buildCompactNotificationModel,
   mergeNotificationHistoryPages,
   notificationIndicator,
+  processLogGapSequence,
   progressView
 } from "../src/features/notifications/notificationModel.ts";
 import { createNotificationStore } from "../src/features/notifications/useNotifications.ts";
@@ -124,6 +125,7 @@ function bridge(
 ): DesktopNotificationsBridge {
   return {
     getCompactSnapshot: async () => compact(),
+    listLibraries: async () => [],
     listHistory: async () => ({ items: [], total: 0, nextOffset: null }),
     cancel: async () => ({ ok: true, message: null }),
     retry: async () => ({ ok: true, message: null }),
@@ -131,6 +133,13 @@ function bridge(
     publishThumbnailSummary: async () => true,
     onChanged: () => () => undefined,
     getLogs: async () => ({ lines: [], hasMore: false, nextBeforeSequence: null }),
+    exportLogs: async () => ({
+      saved: true,
+      canceled: false,
+      filePath: "logs.txt",
+      lineCount: 0,
+      error: null
+    }),
     snapshotAndSubscribeLogs: () => ({
       ready: Promise.resolve({ snapshot: [], afterSequence: 0 }),
       unsubscribe: () => undefined
@@ -142,6 +151,27 @@ function bridge(
 }
 
 describe("notification selectors", () => {
+  it("reports only Desktop-declared log gaps, not filtered sequence jumps", () => {
+    assert.equal(
+      processLogGapSequence({
+        lines: [
+          { sequence: 41, timestamp: 1, source: "core", level: "warn", message: "filtered" }
+        ],
+        afterSequence: 41,
+        droppedBeforeSequence: null
+      }),
+      null
+    );
+    assert.equal(
+      processLogGapSequence({
+        lines: [],
+        afterSequence: 80,
+        droppedBeforeSequence: 63
+      }),
+      63
+    );
+  });
+
   it("keeps all active logical operations and limits important terminal results to three", () => {
     const model = buildCompactNotificationModel(
       compact({
@@ -639,12 +669,21 @@ describe("notification external store", () => {
           }
         })
     });
-    const query = { search: " same ", statuses: ["failed" as const], limit: 20, offset: 0 };
+    const query = {
+      search: " same ",
+      statuses: ["failed" as const],
+      origins: ["background" as const, "user" as const],
+      kinds: ["root_scan", "delete_folder"],
+      limit: 20,
+      offset: 0
+    };
 
     const first = store.loadHistory(query);
     const strictModeReplay = store.loadHistory({
       search: "same",
       statuses: ["failed"],
+      origins: ["user", "background"],
+      kinds: ["delete_folder", "root_scan"],
       limit: 20,
       offset: 0
     });
@@ -874,7 +913,7 @@ describe("notification external store", () => {
     assert.equal(unsubscribes, 2);
   });
 
-  it("wraps log page and clear errors without throwing", async () => {
+  it("wraps library, compact, log page, export and clear requests without throwing", async () => {
     const store = createNotificationStore({
       getBridge: () =>
         bridge({
@@ -882,6 +921,14 @@ describe("notification external store", () => {
             if (query.search === "fail") throw new Error("page unavailable");
             return { lines: [], hasMore: true, nextBeforeSequence: 12 };
           },
+          listLibraries: async () => [{ id: "library-a", name: "Artists" }],
+          exportLogs: async () => ({
+            saved: true,
+            canceled: false,
+            filePath: "logs.txt",
+            lineCount: 4,
+            error: null
+          }),
           clearLogs: async () => {
             throw new Error("clear unavailable");
           }
@@ -896,6 +943,21 @@ describe("notification external store", () => {
       ok: false,
       error: "page unavailable"
     });
+    assert.deepEqual(await store.listLibraries(), {
+      ok: true,
+      value: [{ id: "library-a", name: "Artists" }]
+    });
+    assert.deepEqual(await store.exportLogs({ source: "core" }), {
+      ok: true,
+      value: {
+        saved: true,
+        canceled: false,
+        filePath: "logs.txt",
+        lineCount: 4,
+        error: null
+      }
+    });
+    assert.deepEqual(await store.refreshCompact(), { ok: true, value: true });
     assert.deepEqual(await store.clearLogs(), {
       ok: false,
       error: "clear unavailable"

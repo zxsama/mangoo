@@ -70,6 +70,8 @@ export interface NotificationHistoryQuery {
   libraryId?: string;
   statuses?: NotificationOperationStatus[];
   categories?: NotificationCategory[];
+  origins?: NotificationOrigin[];
+  kinds?: string[];
   search?: string;
   limit?: number;
   offset?: number;
@@ -145,6 +147,16 @@ export interface ProcessLogPage {
 
 export type DesktopProcessLogPage = ProcessLogPage;
 
+export interface ProcessLogExportResult {
+  readonly saved: boolean;
+  readonly canceled: boolean;
+  readonly filePath: string | null;
+  readonly lineCount: number;
+  readonly error: string | null;
+}
+
+export type DesktopProcessLogExportResult = ProcessLogExportResult;
+
 export interface ProcessLogBatch {
   readonly lines: readonly ProcessLogLine[];
   readonly afterSequence: number;
@@ -183,6 +195,7 @@ export interface RendererLogEntryInput {
 
 export interface NotificationIpcBridge {
   getCompactSnapshot(): Promise<NotificationCompactSnapshot>;
+  listLibraries(): Promise<NotificationLibraryIdentity[]>;
   listHistory(query: NotificationHistoryQuery): Promise<NotificationHistoryPage>;
   cancel(libraryId: string, operationId: string): Promise<NotificationActionResult>;
   retry(libraryId: string, operationId: string): Promise<NotificationActionResult>;
@@ -190,6 +203,7 @@ export interface NotificationIpcBridge {
   publishThumbnailSummary(input: ThumbnailCacheSummary): Promise<boolean>;
   onChanged(cb: (snapshot: NotificationCompactSnapshot) => void): () => void;
   getLogs(query: ProcessLogFilter): Promise<ProcessLogPage>;
+  exportLogs(query: ProcessLogFilter): Promise<ProcessLogExportResult>;
   snapshotAndSubscribeLogs(
     query: ProcessLogFilter,
     cb: (batch: ProcessLogBatch) => void

@@ -13,12 +13,15 @@ import type {
   DesktopNotificationCategory,
   DesktopNotificationHistoryQuery,
   DesktopNotificationOperation,
-  DesktopNotificationStatus
+  DesktopNotificationStatus,
+  NotificationLibraryIdentity
 } from "@megle/notification-contract";
-import type { NotificationHistoryState } from "./useNotifications";
+import type {
+  NotificationHistoryState,
+  NotificationRequestResult
+} from "./useNotifications";
 
 const PAGE_SIZE = 100;
-const MAX_CLIENT_FILTER_PAGES = 50;
 
 type NotificationAction = (
   libraryId: string,
@@ -28,16 +31,20 @@ type NotificationAction = (
 interface NotificationHistoryViewProps {
   cancel: NotificationAction;
   history: NotificationHistoryState;
+  listLibraries(): Promise<NotificationRequestResult<NotificationLibraryIdentity[]>>;
   loadHistory(query: DesktopNotificationHistoryQuery): Promise<NotificationHistoryState>;
   loadMoreHistory(): Promise<NotificationHistoryState>;
+  refreshCompact(): Promise<NotificationRequestResult<boolean>>;
   retry: NotificationAction;
 }
 
 export function NotificationHistoryView({
   cancel,
   history,
+  listLibraries,
   loadHistory,
   loadMoreHistory,
+  refreshCompact,
   retry
 }: NotificationHistoryViewProps) {
   const [search, setSearch] = useState("");
@@ -47,6 +54,8 @@ export function NotificationHistoryView({
   const [category, setCategory] = useState<DesktopNotificationCategory | "">("");
   const [source, setSource] = useState<DesktopNotificationOperation["origin"] | "">("");
   const [kind, setKind] = useState("");
+  const [libraries, setLibraries] = useState<NotificationLibraryIdentity[]>([]);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [actionState, setActionState] = useState<{
     key: string;
@@ -60,25 +69,18 @@ export function NotificationHistoryView({
       ...(libraryId ? { libraryId } : {}),
       ...(status ? { statuses: [status] } : {}),
       ...(category ? { categories: [category] } : {}),
+      ...(source ? { origins: [source] } : {}),
+      ...(kind ? { kinds: [kind] } : {}),
       ...(deferredSearch ? { search: deferredSearch } : {}),
       limit: PAGE_SIZE
     }),
-    [category, deferredSearch, libraryId, status]
+    [category, deferredSearch, kind, libraryId, source, status]
   );
   const queryRef = useRef<DesktopNotificationHistoryQuery>(query);
 
   const loadCurrentQuery = useCallback(
-    async (nextQuery: DesktopNotificationHistoryQuery) => {
-      let next = await loadHistory(nextQuery);
-      if (!source && !kind) return next;
-      let pageCount = 0;
-      while (next.nextOffset !== null && pageCount < MAX_CLIENT_FILTER_PAGES) {
-        next = await loadMoreHistory();
-        pageCount += 1;
-      }
-      return next;
-    },
-    [kind, loadHistory, loadMoreHistory, source]
+    (nextQuery: DesktopNotificationHistoryQuery) => loadHistory(nextQuery),
+    [loadHistory]
   );
 
   useEffect(() => {
@@ -86,36 +88,36 @@ export function NotificationHistoryView({
     void loadCurrentQuery(query);
   }, [loadCurrentQuery, query]);
 
-  const libraries = useMemo(() => {
-    const values = new Map<string, string>();
-    for (const item of history.items) {
-      values.set(item.libraryId, item.libraryName || item.libraryId);
-    }
-    return [...values.entries()].sort((left, right) =>
-      left[1].localeCompare(right[1], "zh-CN")
-    );
-  }, [history.items]);
+  useEffect(() => {
+    let active = true;
+    void listLibraries().then((result) => {
+      if (!active) return;
+      if (!result.ok) {
+        setLibraryError(result.error);
+        return;
+      }
+      setLibraries(
+        [...result.value].sort((left, right) => left.name.localeCompare(right.name, "zh-CN"))
+      );
+      setLibraryError(null);
+    });
+    return () => {
+      active = false;
+    };
+  }, [listLibraries]);
 
   const kinds = useMemo(
     () => [...new Set(history.items.map((item) => item.kind))].sort(),
     [history.items]
   );
 
-  const visibleItems = useMemo(
-    () =>
-      history.items.filter(
-        (item) => (!source || item.origin === source) && (!kind || item.kind === kind)
-      ),
-    [history.items, kind, source]
-  );
-
   const virtualizer = useVirtualizer({
-    count: visibleItems.length,
+    count: history.items.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 82,
     overscan: 7,
     getItemKey: (index) => {
-      const item = visibleItems[index];
+      const item = history.items[index];
       return item ? `${item.libraryId}:${item.operationId}:${item.revision}` : index;
     }
   });
@@ -139,12 +141,10 @@ export function NotificationHistoryView({
       operation.libraryId,
       operation.operationId
     );
-    if (!result.ok) {
-      setActionState({ key, action, error: result.message || "操作未完成" });
-      return;
-    }
-    setActionState(null);
-    await loadCurrentQuery(queryRef.current);
+    await Promise.all([loadCurrentQuery(queryRef.current), refreshCompact()]);
+    setActionState(
+      result.ok ? null : { key, action, error: result.message || "操作未完成" }
+    );
   };
 
   const resetFilters = () => {
@@ -189,7 +189,7 @@ export function NotificationHistoryView({
         </label>
         <FilterSelect label="资源库" onChange={setLibraryId} value={libraryId}>
           <option value="">所有资源库</option>
-          {libraries.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          {libraries.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
         </FilterSelect>
         <FilterSelect
           label="状态"
@@ -234,10 +234,11 @@ export function NotificationHistoryView({
         </button>
       </div>
 
+      {libraryError ? <p className="notification-inline-error" role="alert">{libraryError}</p> : null}
       {history.error ? <p className="notification-inline-error" role="alert">{history.error}</p> : null}
 
       <div className="notification-history-list" ref={scrollRef}>
-        {visibleItems.length === 0 && !history.loading ? (
+        {history.items.length === 0 && !history.loading ? (
           <div className="notification-list-empty">没有符合当前筛选条件的通知。</div>
         ) : (
           <div
@@ -245,7 +246,7 @@ export function NotificationHistoryView({
             style={{ height: virtualizer.getTotalSize() }}
           >
             {virtualizer.getVirtualItems().map((virtualRow) => {
-              const operation = visibleItems[virtualRow.index];
+              const operation = history.items[virtualRow.index];
               const key = `${operation.libraryId}:${operation.operationId}`;
               const isExpanded = expanded.has(key);
               return (
@@ -328,11 +329,6 @@ export function NotificationHistoryView({
       <footer className="notification-history-footer">
         <span>
           已加载 {history.items.length.toLocaleString()} / {history.total.toLocaleString()}
-          {source || kind
-            ? history.nextOffset === null
-              ? "，来源和类型筛选已应用于当前上限内记录"
-              : "，来源和类型筛选正在分页加载"
-            : ""}
         </span>
         {history.nextOffset !== null ? (
           <button

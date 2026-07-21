@@ -24,6 +24,7 @@ export interface NotificationIpcChannels {
   readonly openWindow: string;
   readonly closeWindow: string;
   readonly compact: string;
+  readonly libraries: string;
   readonly history: string;
   readonly cancel: string;
   readonly retry: string;
@@ -31,6 +32,7 @@ export interface NotificationIpcChannels {
   readonly thumbnailSummary: string;
   readonly changed: string;
   readonly logsPage: string;
+  readonly logsExport: string;
   readonly logsSubscribe: string;
   readonly logsUnsubscribe: string;
   readonly logsClear: string;
@@ -58,12 +60,14 @@ const CHANNEL_PERMISSIONS = new Map<string, ReadonlySet<NotificationIpcWindowRol
   [NOTIFICATION_IPC_CHANNELS.openWindow, MAIN_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.closeWindow, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.compact, MAIN_AND_NOTIFICATION_ROLES],
+  [NOTIFICATION_IPC_CHANNELS.libraries, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.history, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.cancel, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.retry, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.reportError, ALL_RENDERER_ROLES],
   [NOTIFICATION_IPC_CHANNELS.thumbnailSummary, MAIN_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.logsPage, NOTIFICATION_WINDOW_ONLY],
+  [NOTIFICATION_IPC_CHANNELS.logsExport, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.logsSubscribe, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.logsUnsubscribe, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.logsClear, NOTIFICATION_WINDOW_ONLY],
@@ -72,6 +76,7 @@ const CHANNEL_PERMISSIONS = new Map<string, ReadonlySet<NotificationIpcWindowRol
 
 const OPERATION_STATUSES = new Set(["pending", "running", "succeeded", "failed", "cancelled"]);
 const OPERATION_CATEGORIES = new Set(["task", "file_operation", "error", "thumbnail_cache"]);
+const OPERATION_ORIGINS = new Set(["user", "background", "recovery", "system"]);
 const LOG_SOURCES = new Set<ProcessLogSource>(["main", "core", "renderer"]);
 const LOG_LEVELS = new Set<ProcessLogLevel>(["trace", "debug", "info", "warn", "error"]);
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
@@ -112,6 +117,17 @@ export function parseNotificationHistoryQuery(value: unknown): NotificationHisto
       OPERATION_CATEGORIES,
       4
     ) as NonNullable<NotificationHistoryQuery["categories"]>;
+  }
+  if (input.origins !== undefined) {
+    query.origins = boundedStringArray(
+      input.origins,
+      "origins",
+      OPERATION_ORIGINS,
+      4
+    ) as NonNullable<NotificationHistoryQuery["origins"]>;
+  }
+  if (input.kinds !== undefined) {
+    query.kinds = boundedFreeStringArray(input.kinds, "kinds", 50, 128);
   }
   return query;
 }
@@ -519,4 +535,16 @@ function boundedStringArray<T extends string>(
     throw new RangeError(`${name} must contain between 1 and ${maxItems} items`);
   }
   return value.map((item) => enumString(item, name, allowed));
+}
+
+function boundedFreeStringArray(
+  value: unknown,
+  name: string,
+  maxItems: number,
+  maxLength: number
+): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > maxItems) {
+    throw new RangeError(`${name} must contain between 1 and ${maxItems} items`);
+  }
+  return value.map((item) => boundedString(item, name, maxLength));
 }

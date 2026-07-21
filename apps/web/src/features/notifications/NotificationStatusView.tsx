@@ -4,15 +4,35 @@ import {
   CircleDashed,
   Image,
   Layers3,
-  Radio
+  Radio,
+  Square
 } from "lucide-react";
+import { useState } from "react";
 import type { DesktopThumbnailCacheSummary } from "@megle/notification-contract";
 import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
+import type { NotificationRequestResult } from "./useNotifications";
 
-export function NotificationStatusView({ model }: { model: CompactNotificationModel }) {
+type NotificationAction = (
+  libraryId: string,
+  operationId: string
+) => Promise<{ ok: boolean; message: string | null }>;
+
+export function NotificationStatusView({
+  cancel,
+  model,
+  refreshCompact
+}: {
+  cancel: NotificationAction;
+  model: CompactNotificationModel;
+  refreshCompact(): Promise<NotificationRequestResult<boolean>>;
+}) {
+  const [cancelState, setCancelState] = useState<{
+    key: string;
+    error: string | null;
+  } | null>(null);
   const hasStatus =
     model.active.length > 0 ||
     model.thumbnail.summaries.length > 0 ||
@@ -63,7 +83,28 @@ export function NotificationStatusView({ model }: { model: CompactNotificationMo
           />
           <div className="notification-status-operation-list">
             {model.active.map((operation) => (
-              <ActiveOperation key={`${operation.libraryId}:${operation.operationId}`} operation={operation} />
+              <ActiveOperation
+                cancelError={
+                  cancelState?.key === `${operation.libraryId}:${operation.operationId}`
+                    ? cancelState.error
+                    : null
+                }
+                cancelling={
+                  cancelState?.key === `${operation.libraryId}:${operation.operationId}` &&
+                  cancelState.error === null
+                }
+                key={`${operation.libraryId}:${operation.operationId}`}
+                onCancel={async () => {
+                  const key = `${operation.libraryId}:${operation.operationId}`;
+                  setCancelState({ key, error: null });
+                  const result = await cancel(operation.libraryId, operation.operationId);
+                  await refreshCompact();
+                  setCancelState(
+                    result.ok ? null : { key, error: result.message || "取消未完成" }
+                  );
+                }}
+                operation={operation}
+              />
             ))}
           </div>
         </section>
@@ -101,7 +142,7 @@ export function NotificationStatusView({ model }: { model: CompactNotificationMo
           <div className="notification-status-result-list">
             {model.results.map((operation) => (
               <article
-                className={`notification-status-result notification-status-${operation.status}`}
+                className={`notification-status-result status-${operation.status}`}
                 key={`${operation.libraryId}:${operation.operationId}`}
               >
                 <div className="notification-status-row-heading">
@@ -153,7 +194,17 @@ function SectionHeading({
   );
 }
 
-function ActiveOperation({ operation }: { operation: NotificationOperationViewModel }) {
+function ActiveOperation({
+  cancelError,
+  cancelling,
+  onCancel,
+  operation
+}: {
+  cancelError: string | null;
+  cancelling: boolean;
+  onCancel(): Promise<void>;
+  operation: NotificationOperationViewModel;
+}) {
   return (
     <article className="notification-status-operation">
       <div className="notification-status-row-heading">
@@ -174,7 +225,22 @@ function ActiveOperation({ operation }: { operation: NotificationOperationViewMo
       >
         <span style={{ width: operation.progress.percent == null ? undefined : `${operation.progress.percent}%` }} />
       </div>
-      <span className="notification-status-progress-caption">{operation.progress.label}</span>
+      <div className="notification-status-operation-footer">
+        <span className="notification-status-progress-caption">{operation.progress.label}</span>
+        {operation.cancellable ? (
+          <button
+            aria-label={`取消 ${operation.title}`}
+            className="notification-row-action"
+            disabled={cancelling}
+            onClick={() => void onCancel()}
+            type="button"
+          >
+            <Square aria-hidden="true" size={13} />
+            {cancelling ? "取消中…" : "取消"}
+          </button>
+        ) : null}
+      </div>
+      {cancelError ? <p className="notification-row-action-error" role="alert">{cancelError}</p> : null}
     </article>
   );
 }

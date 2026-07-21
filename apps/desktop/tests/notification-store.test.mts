@@ -259,11 +259,58 @@ describe("notification store", () => {
       );
 
       const onlyA = await store.history({ libraryId: LIBRARY_A.id, limit: 20, offset: 0 });
-      assert.equal(onlyA.total, 1);
-      assert.deepEqual(onlyA.items.map((item) => item.operationId), ["a:done"]);
+      assert.equal(onlyA.total, 2);
+      assert.deepEqual(onlyA.items.map((item) => item.operationId), ["a:active", "a:done"]);
       const all = await store.history({ limit: 20, offset: 0 });
-      assert.equal(all.total, 2);
-      assert.deepEqual(all.items.map((item) => item.operationId), ["b:done", "a:done"]);
+      assert.equal(all.total, 4);
+      assert.deepEqual(all.items.map((item) => item.operationId), [
+        "b:active",
+        "a:active",
+        "b:done",
+        "a:done"
+      ]);
+      const active = await store.history({ statuses: ["pending", "running"], limit: 20, offset: 0 });
+      assert.equal(active.total, 2);
+      assert.deepEqual(active.items.map((item) => item.operationId), ["b:active", "a:active"]);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("applies origin and kind filters and searches targets and error details", async () => {
+    const store = await createTestStore();
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        operation("target-error", 1, "failed", {
+          kind: "delete_folder",
+          origin: "background",
+          summary: null,
+          errorCode: "folder_delete_failed",
+          errorDetail: "permission denied for folder",
+          rootId: 7,
+          folderId: 8,
+          fileId: 9
+        }),
+        operation("other-kind", 1, "succeeded", {
+          kind: "root_scan",
+          origin: "user"
+        })
+      ]);
+
+      const filtered = await store.history({
+        origins: ["background"],
+        kinds: ["delete_folder"],
+        limit: 1,
+        offset: 0
+      });
+      assert.equal(filtered.total, 1);
+      assert.equal(filtered.items[0]?.operationId, "target-error");
+
+      for (const search of ["permission denied", "folder_delete_failed", "Root 7", "Folder 8", "File 9"]) {
+        const result = await store.history({ search, limit: 20, offset: 0 });
+        assert.equal(result.total, 1, `search should match ${search}`);
+        assert.equal(result.items[0]?.operationId, "target-error");
+      }
     } finally {
       await store.close();
     }
@@ -806,7 +853,7 @@ describe("notification store", () => {
       assert.deepEqual(compact.active.map((item) => item.operationId), ["active:old"]);
       assert.equal(compact.retryableFailures.length, 2_000);
       const history = await store.history({ limit: 100, offset: 0 });
-      assert.equal(history.total, 2_000);
+      assert.equal(history.total, 2_001);
       assert.equal(history.items[0]?.operationId, "completed:2004");
       assert.equal(history.items.at(-1)?.operationId, "completed:1905");
     } finally {

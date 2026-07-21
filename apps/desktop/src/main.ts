@@ -381,6 +381,25 @@ function registeredNotificationLibrary(libraryId: string): { id: string; name: s
   if (!library) throw new Error("notification library not found");
   return { id: library.id, name: library.name };
 }
+
+function formatProcessLogExport(
+  lines: ReturnType<typeof processLogBuffer.snapshot>
+): string {
+  return lines
+    .map((line) => {
+      let metadata = "";
+      if (line.metadata) {
+        try {
+          metadata = ` ${JSON.stringify(line.metadata)}`;
+        } catch {
+          metadata = " [metadata unavailable]";
+        }
+      }
+      return `${new Date(line.timestamp).toISOString()} #${line.sequence} [${line.source}/${line.level}] ${line.message}${metadata}`;
+    })
+    .join("\r\n");
+}
+
 function toSummaries(reg: libraryRegistry.LibraryRegistry): Array<{
   id: string; name: string; dbPath: string; available: boolean; active: boolean; icon?: string; color?: string;
 }> {
@@ -625,6 +644,13 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.compact, async (event) => {
   return service.compactSnapshot();
 });
 
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.libraries, (event) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.libraries);
+  return getRegistry().libraries
+    .map(({ id, name }) => ({ id, name }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+});
+
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.history, async (event, input: unknown) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.history);
   return (await ensureNotificationService()).history(parseNotificationHistoryQuery(input));
@@ -682,6 +708,45 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.thumbnailSummary, async (event, input: 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.logsPage, (event, input: unknown) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.logsPage);
   return processLogBuffer.page(parseProcessLogFilter(input));
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.logsExport, async (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.logsExport);
+  const { limit: _limit, ...filter } = parseProcessLogFilter(input);
+  const lines = processLogBuffer.snapshot(filter);
+  const owner = windowForIpcEvent(event);
+  const defaultPath = path.join(
+    app.getPath("documents"),
+    `megle-process-logs-${new Date().toISOString().replaceAll(":", "-")}.txt`
+  );
+  const options = {
+    defaultPath,
+    filters: [{ name: "Text", extensions: ["txt"] }]
+  };
+  const result = owner
+    ? await dialog.showSaveDialog(owner, options)
+    : await dialog.showSaveDialog(options);
+  if (result.canceled || !result.filePath) {
+    return { saved: false, canceled: true, filePath: null, lineCount: 0, error: null };
+  }
+  try {
+    await fsp.writeFile(result.filePath, formatProcessLogExport(lines), "utf8");
+    return {
+      saved: true,
+      canceled: false,
+      filePath: result.filePath,
+      lineCount: lines.length,
+      error: null
+    };
+  } catch (error) {
+    return {
+      saved: false,
+      canceled: false,
+      filePath: result.filePath,
+      lineCount: 0,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
 });
 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.logsSubscribe, (event, input: unknown) => {

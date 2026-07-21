@@ -1830,13 +1830,19 @@ if (/\b(?:unread|readAt|markRead|未读|已读)\b/i.test(notificationWindow)) {
   fail("notification center must not introduce read or unread state");
 }
 for (const [label, source, values] of [
-  ["status", notificationStatusView, ["notification-status-active", "notification-status-thumbnails", "notification-status-results", "notification-status-health"]],
-  ["history", notificationHistoryView, ["useVirtualizer", "cancellable", "retryable", "loadMoreHistory"]],
-  ["process logs", processLogView, ["useVirtualizer", "openLogSubscription", "unsubscribe", "droppedBeforeSequence", "clearLogs", "Blob", "LOG_PAGE_SIZE = 200", "加载更早日志"]]
+  ["status", notificationStatusView, ["notification-status-active", "notification-status-thumbnails", "notification-status-results", "notification-status-health", "cancellable", "cancel"]],
+  ["history", notificationHistoryView, ["useVirtualizer", "cancellable", "retryable", "loadMoreHistory", "listLibraries", "origins", "kinds"]],
+  ["process logs", processLogView, ["useVirtualizer", "openLogSubscription", "unsubscribe", "processLogGapSequence", "clearLogs", "exportLogs", "LOG_PAGE_SIZE = 200", "加载更早日志"]]
 ]) {
   for (const value of values) {
     if (!source.includes(value)) fail(`notification ${label} view missing ${value}`);
   }
+}
+if (/new Blob|URL\.createObjectURL|anchor\.download/.test(processLogView)) {
+  fail("notification process log export must use the narrow Desktop save-dialog bridge");
+}
+if (/MAX_CLIENT_FILTER_PAGES|visibleItems\s*=\s*useMemo/.test(notificationHistoryView)) {
+  fail("notification history source/kind filters must remain in the Desktop paged query");
 }
 
 if (!shortcutBindings) {

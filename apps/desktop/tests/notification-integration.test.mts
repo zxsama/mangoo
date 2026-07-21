@@ -35,10 +35,14 @@ test("notification IPC permissions isolate privileged history, action and log ac
   assert.equal(canAccess("settings", channels.compact), false);
   assert.equal(canAccess("notifications", channels.history), true);
   assert.equal(canAccess("main", channels.history), false);
+  assert.equal(canAccess("notifications", channels.libraries), true);
+  assert.equal(canAccess("main", channels.libraries), false);
   assert.equal(canAccess("notifications", channels.cancel), true);
   assert.equal(canAccess("plugins", channels.cancel), false);
   assert.equal(canAccess("notifications", channels.logsPage), true);
   assert.equal(canAccess("main", channels.logsPage), false);
+  assert.equal(canAccess("notifications", channels.logsExport), true);
+  assert.equal(canAccess("main", channels.logsExport), false);
   assert.equal(canAccess("main", channels.thumbnailSummary), true);
   assert.equal(canAccess("notifications", channels.thumbnailSummary), false);
   assert.equal(canAccess("plugins", channels.rendererLogs), true);
@@ -50,6 +54,8 @@ test("notification IPC validators reject malformed or unbounded renderer payload
 
   assert.throws(() => ipcModule.parseNotificationHistoryQuery({ limit: 201 }), /limit/i);
   assert.throws(() => ipcModule.parseNotificationHistoryQuery({ search: "x".repeat(501) }), /search/i);
+  assert.throws(() => ipcModule.parseNotificationHistoryQuery({ origins: ["invalid"] }), /origins/i);
+  assert.throws(() => ipcModule.parseNotificationHistoryQuery({ kinds: ["x".repeat(129)] }), /kinds/i);
   assert.throws(() => ipcModule.parseNotificationAction("", "task:1"), /library/i);
   assert.throws(() => ipcModule.parseNotificationAction("library", "x".repeat(257)), /operation/i);
   assert.throws(
@@ -91,6 +97,10 @@ test("notification IPC validators reject malformed or unbounded renderer payload
     limit: 25,
     offset: 5
   });
+  assert.deepEqual(
+    ipcModule.parseNotificationHistoryQuery({ origins: ["background"], kinds: ["root_scan"] }),
+    { origins: ["background"], kinds: ["root_scan"] }
+  );
   assert.deepEqual(ipcModule.parseNotificationAction("library", "task:1"), {
     libraryId: "library",
     operationId: "task:1"

@@ -329,7 +329,9 @@ for (const value of [
   "reportError",
   "publishThumbnailSummary",
   "onChanged",
+  "listLibraries",
   "getLogs",
+  "exportLogs",
   "snapshotAndSubscribeLogs",
   "clearLogs",
   "emitRendererLogs"
@@ -339,6 +341,16 @@ for (const value of [
   }
   if (!notificationContract.includes(value)) {
     fail(`typed Web notification bridge missing ${value}`);
+  }
+}
+for (const value of [
+  "NOTIFICATION_IPC_CHANNELS.libraries",
+  "NOTIFICATION_IPC_CHANNELS.logsExport",
+  "dialog.showSaveDialog",
+  "processLogBuffer.snapshot"
+]) {
+  if (!main.includes(value)) {
+    fail(`desktop notification history/export boundary missing ${value}`);
   }
 }
 if (!preload.includes("notifications: notificationsBridge") ||

@@ -1516,6 +1516,7 @@ async function notificationWindowFixtureEvidence(client) {
       titlebarBorderBottomWidth: titlebarStyle?.borderBottomWidth ?? null,
       status: {
         active: document.querySelectorAll(".notification-status-operation").length,
+        cancelActions: document.querySelectorAll('.notification-status-operation button[aria-label^="取消 "]').length,
         determinate: document.querySelectorAll('.notification-window-progress:not(.indeterminate)').length,
         indeterminate: document.querySelectorAll(".notification-window-progress.indeterminate").length,
         thumbnails: document.querySelectorAll(".notification-thumbnail-card").length,
@@ -3852,6 +3853,7 @@ try {
   if (
     fullWindowFixture?.status?.tabCount !== 3 ||
     fullWindowFixture.status.status?.active !== 2 ||
+    fullWindowFixture.status.status?.cancelActions !== 2 ||
     fullWindowFixture.status.status?.indeterminate !== 1 ||
     fullWindowFixture.status.status?.thumbnails !== 2 ||
     fullWindowFixture.status.status?.results !== 3 ||

@@ -110,6 +110,7 @@ const windowControls = {
 /** @type {import("@megle/notification-contract").NotificationIpcBridge} */
 const notificationsBridge = {
   getCompactSnapshot: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.compact),
+  listLibraries: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.libraries),
   listHistory: (query) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.history, query),
   cancel: (libraryId, operationId) =>
     ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.cancel, libraryId, operationId),
@@ -120,6 +121,7 @@ const notificationsBridge = {
     ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.thumbnailSummary, input),
   onChanged: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.changed, cb),
   getLogs: (query) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsPage, query),
+  exportLogs: (query) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsExport, query),
   snapshotAndSubscribeLogs,
   clearLogs: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.logsClear),
   emitRendererLogs: (entries) => ipcRenderer.send(NOTIFICATION_IPC_CHANNELS.rendererLogs, entries)

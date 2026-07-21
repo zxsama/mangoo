@@ -307,6 +307,27 @@ function validateHistoryQuery(query: NotificationHistoryQuery): void {
       throw new TypeError("history category is invalid");
     }
   }
+  if (query.origins !== undefined) {
+    if (!Array.isArray(query.origins) || query.origins.length === 0) {
+      throw new TypeError("history origins must be a non-empty array");
+    }
+    if (query.origins.some((origin) => !(OPERATION_ORIGINS as Set<unknown>).has(origin))) {
+      throw new TypeError("history origin is invalid");
+    }
+  }
+  if (query.kinds !== undefined) {
+    if (!Array.isArray(query.kinds) || query.kinds.length === 0) {
+      throw new TypeError("history kinds must be a non-empty array");
+    }
+    if (
+      query.kinds.length > 50 ||
+      query.kinds.some(
+        (kind) => typeof kind !== "string" || kind.length === 0 || kind.length > 128
+      )
+    ) {
+      throw new TypeError("history kind is invalid");
+    }
+  }
 }
 
 function libraryKey(libraryId: string, operationId: string): string {
@@ -1520,17 +1541,24 @@ export class NotificationService {
   private fallbackHistory(query: NotificationHistoryQuery): NotificationHistoryPage {
     const offset = query.offset ?? 0;
     const limit = Math.min(query.limit ?? 50, 200);
-    let items = [...this.fallbackOperations.values()].filter(
-      (item) => item.status !== "pending" && item.status !== "running"
-    );
+    let items = [...this.fallbackOperations.values()];
     if (query.libraryId) items = items.filter((item) => item.libraryId === query.libraryId);
     if (query.statuses) items = items.filter((item) => query.statuses?.includes(item.status));
     if (query.categories) items = items.filter((item) => query.categories?.includes(item.category));
+    if (query.origins) items = items.filter((item) => query.origins?.includes(item.origin));
+    if (query.kinds) items = items.filter((item) => query.kinds?.includes(item.kind));
     if (query.search?.trim()) {
       const search = query.search.trim().toLocaleLowerCase();
-      items = items.filter((item) =>
-        `${item.title} ${item.summary ?? ""}`.toLocaleLowerCase().includes(search)
-      );
+      items = items.filter((item) => {
+        const targets = [
+          item.rootId === null ? "" : `Root ${item.rootId}`,
+          item.folderId === null ? "" : `Folder ${item.folderId}`,
+          item.fileId === null ? "" : `File ${item.fileId}`
+        ].join(" ");
+        return `${item.title} ${item.summary ?? ""} ${item.errorCode ?? ""} ${item.errorDetail ?? ""} ${targets}`
+          .toLocaleLowerCase()
+          .includes(search);
+      });
     }
     items.sort(
       (left, right) =>
