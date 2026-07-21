@@ -16,7 +16,7 @@ import type {
 import type { NotificationRequestResult } from "./useNotifications";
 import {
   beginNotificationAction,
-  notificationActionKey,
+  notificationOperationActionKey,
   settleNotificationAction,
   type NotificationActionStates
 } from "./notificationActionModel";
@@ -97,22 +97,22 @@ export function NotificationStatusView({
           />
           <div className="notification-status-operation-list">
             {model.active.map((operation) => {
-              const actionKey = notificationActionKey(
+              const actionKey = notificationOperationActionKey(
                 operation.libraryId,
-                operation.operationId,
-                "cancel"
+                operation.operationId
               );
               const actionState = actionStates.get(actionKey);
               return (
                 <ActiveOperation
-                  cancelError={actionState?.error ?? null}
-                  cancelling={actionState?.pending === true}
+                  cancelError={actionState?.errors.cancel ?? null}
+                  cancelling={actionState?.pendingAction === "cancel"}
                   key={`${operation.libraryId}:${operation.operationId}`}
                   onCancel={async () => {
                     const requestId = ++actionRequestIdRef.current;
                     const started = beginNotificationAction(
                       actionStatesRef.current,
                       actionKey,
+                      "cancel",
                       requestId
                     );
                     if (!started.started) return;
@@ -123,6 +123,7 @@ export function NotificationStatusView({
                       settleNotificationAction(
                         actionStatesRef.current,
                         actionKey,
+                        "cancel",
                         requestId,
                         result.ok ? null : result.message || "取消未完成"
                       )

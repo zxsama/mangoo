@@ -47,8 +47,10 @@ describe("full notification center contract", () => {
     assert.match(logSource, /unsubscribe/);
     assert.match(logSource, /useVirtualizer/);
     assert.match(logSource, /processLogGapSequence/);
-    assert.match(logSource, /isCurrentProcessLogPageRequest/);
-    assert.match(logSource, /coalesceProcessLogBatches/);
+    assert.match(logSource, /createProcessLogPageRequestController/);
+    assert.match(logSource, /appendPausedProcessLogBatch/);
+    assert.match(logSource, /coalescePausedProcessLogBuffer/);
+    assert.doesNotMatch(logSource, /queryGenerationRef/);
     assert.match(logSource, /clearLogs/);
     assert.match(logSource, /exportLogs/);
     assert.doesNotMatch(logSource, /new Blob|URL\.createObjectURL|anchor\.download/);

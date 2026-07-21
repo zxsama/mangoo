@@ -32,13 +32,14 @@ import type {
 } from "./useNotifications";
 import { processLogGapSequence } from "./notificationModel";
 import {
-  coalesceProcessLogBatches,
-  isCurrentProcessLogPageRequest,
-  processLogFilterIdentity
+  appendPausedProcessLogBatch,
+  coalescePausedProcessLogBuffer,
+  createPausedProcessLogBuffer,
+  createProcessLogPageRequestController,
+  createProcessLogQueryToken
 } from "./processLogModel";
 
 const MAX_RENDERED_LOG_LINES = 5_000;
-const MAX_PAUSED_BATCH_LINES = 1_000;
 const LOG_PAGE_SIZE = 200;
 
 interface ProcessLogViewProps {
@@ -77,11 +78,7 @@ export function ProcessLogView({
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pausedRef = useRef(false);
-  const bufferedBatchesRef = useRef<DesktopProcessLogBatch[]>([]);
-  const bufferedLineCountRef = useRef(0);
-  const pausedDroppedSequenceRef = useRef<number | null>(null);
-  const queryGenerationRef = useRef(0);
-  const loadingOlderRef = useRef(false);
+  const pausedBufferRef = useRef(createPausedProcessLogBuffer());
 
   const query = useMemo<DesktopProcessLogFilter>(
     () => ({
@@ -92,12 +89,10 @@ export function ProcessLogView({
     }),
     [deferredSearch, level, source]
   );
-  const queryIdentity = useMemo(() => processLogFilterIdentity(query), [query]);
-  const queryIdentityRef = useRef(queryIdentity);
-  if (queryIdentityRef.current !== queryIdentity) {
-    queryIdentityRef.current = queryIdentity;
-    queryGenerationRef.current += 1;
-  }
+  const queryToken = useMemo(() => createProcessLogQueryToken(query), [query]);
+  const [pageRequestController] = useState(() =>
+    createProcessLogPageRequestController(queryToken)
+  );
 
   const deliverBatch = useCallback((batch: DesktopProcessLogBatch) => {
     const gap = processLogGapSequence(batch);
@@ -111,35 +106,22 @@ export function ProcessLogView({
       deliverBatch(batch);
       return;
     }
-    const bufferedBatches = bufferedBatchesRef.current;
-    bufferedBatches.push(batch);
-    bufferedLineCountRef.current += batch.lines.length;
-    while (bufferedLineCountRef.current > MAX_PAUSED_BATCH_LINES && bufferedBatches.length > 0) {
-      const removed = bufferedBatches.shift();
-      bufferedLineCountRef.current -= removed?.lines.length ?? 0;
-      if (removed?.lines.length) {
-        pausedDroppedSequenceRef.current = Math.max(
-          pausedDroppedSequenceRef.current ?? 0,
-          removed.lines[removed.lines.length - 1]?.sequence ?? 0
-        );
-      }
-    }
-    setQueuedLineCount(bufferedLineCountRef.current);
+    const next = appendPausedProcessLogBatch(pausedBufferRef.current, batch);
+    pausedBufferRef.current = next;
+    setQueuedLineCount(next.lineCount);
   }, [deliverBatch]);
 
   useEffect(() => {
     let cancelled = false;
     let unsubscribe: (() => void) | null = null;
+    pageRequestController.commitQuery(queryToken);
     setLoading(true);
     setError(null);
     setGapSequence(null);
     setLines([]);
-    bufferedBatchesRef.current = [];
-    bufferedLineCountRef.current = 0;
-    pausedDroppedSequenceRef.current = null;
+    pausedBufferRef.current = createPausedProcessLogBuffer();
     setQueuedLineCount(0);
     setHasOlder(false);
-    loadingOlderRef.current = false;
     setLoadingOlder(false);
 
     void openLogSubscription(query, receiveBatch).then((result) => {
@@ -165,9 +147,10 @@ export function ProcessLogView({
 
     return () => {
       cancelled = true;
+      pageRequestController.invalidate();
       unsubscribe?.();
     };
-  }, [openLogSubscription, query, receiveBatch]);
+  }, [openLogSubscription, pageRequestController, query, queryToken, receiveBatch]);
 
   useEffect(() => {
     pausedRef.current = paused;
@@ -194,14 +177,8 @@ export function ProcessLogView({
     }
     pausedRef.current = false;
     setPaused(false);
-    const pending = bufferedBatchesRef.current.splice(0);
-    const merged = coalesceProcessLogBatches(
-      pending,
-      MAX_PAUSED_BATCH_LINES,
-      pausedDroppedSequenceRef.current
-    );
-    bufferedLineCountRef.current = 0;
-    pausedDroppedSequenceRef.current = null;
+    const merged = coalescePausedProcessLogBuffer(pausedBufferRef.current);
+    pausedBufferRef.current = createPausedProcessLogBuffer();
     setQueuedLineCount(0);
     if (merged.droppedBeforeSequence !== null) {
       setGapSequence(merged.droppedBeforeSequence);
@@ -239,14 +216,11 @@ export function ProcessLogView({
       return;
     }
     setLines([]);
-    bufferedBatchesRef.current = [];
-    bufferedLineCountRef.current = 0;
-    pausedDroppedSequenceRef.current = null;
+    pausedBufferRef.current = createPausedProcessLogBuffer();
     setQueuedLineCount(0);
     setGapSequence(null);
     setHasOlder(false);
-    queryGenerationRef.current += 1;
-    loadingOlderRef.current = false;
+    pageRequestController.invalidate();
     setLoadingOlder(false);
     setActionMessage("已清空当前会话日志");
   };
@@ -271,34 +245,30 @@ export function ProcessLogView({
 
   const handleLoadOlder = async () => {
     const oldestSequence = lines[0]?.sequence;
-    if (oldestSequence == null || loadingOlderRef.current) return;
-    const requestIdentity = {
-      queryIdentity,
-      generation: queryGenerationRef.current
-    };
-    loadingOlderRef.current = true;
+    if (oldestSequence == null) return;
+    const request = pageRequestController.begin(queryToken);
+    if (!request) return;
     setLoadingOlder(true);
-    const result = await getLogPage({
-      ...query,
-      beforeSequence: oldestSequence,
-      limit: LOG_PAGE_SIZE
-    });
-    if (
-      !isCurrentProcessLogPageRequest(requestIdentity, {
-        queryIdentity: queryIdentityRef.current,
-        generation: queryGenerationRef.current
-      })
-    ) {
-      return;
+    try {
+      const result = await getLogPage({
+        ...query,
+        beforeSequence: oldestSequence,
+        limit: LOG_PAGE_SIZE
+      });
+      if (!pageRequestController.isCurrent(request)) return;
+      if (!result.ok) {
+        setActionMessage(result.error);
+        return;
+      }
+      setLines((current) => mergeLogLines(current, result.value.lines));
+      setHasOlder(result.value.hasMore && result.value.nextBeforeSequence !== null);
+    } catch (error) {
+      if (pageRequestController.isCurrent(request)) {
+        setActionMessage(errorMessage(error));
+      }
+    } finally {
+      if (pageRequestController.finish(request)) setLoadingOlder(false);
     }
-    loadingOlderRef.current = false;
-    setLoadingOlder(false);
-    if (!result.ok) {
-      setActionMessage(result.error);
-      return;
-    }
-    setLines((current) => mergeLogLines(current, result.value.lines));
-    setHasOlder(result.value.hasMore && result.value.nextBeforeSequence !== null);
   };
 
   return (
@@ -452,6 +422,10 @@ function safeJson(value: unknown): string {
   } catch {
     return "[metadata unavailable]";
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatLogTime(value: number): string {

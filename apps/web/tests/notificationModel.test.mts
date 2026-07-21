@@ -872,9 +872,14 @@ describe("notification external store", () => {
 
     const firstCancel = store.cancel("library-a", "operation-a");
     const duplicateCancel = store.cancel("library-a", "operation-a");
+    const blockedRetry = store.retry("library-a", "operation-a");
     const independentRetry = store.retry("library-a", "operation-b");
     assert.equal(cancelCalls, 1);
     assert.equal(retryCalls, 1);
+    assert.deepEqual(await blockedRetry, {
+      ok: false,
+      message: "该操作已有动作正在执行"
+    });
 
     retryAction.resolve({ ok: false, message: "retry failed" });
     assert.deepEqual(await independentRetry, { ok: false, message: "retry failed" });

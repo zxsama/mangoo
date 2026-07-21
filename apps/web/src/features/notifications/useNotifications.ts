@@ -19,6 +19,10 @@ import {
   type NotificationHistoryCollection,
   type NotificationHistoryPageSlice
 } from "./notificationModel.ts";
+import {
+  notificationOperationActionKey,
+  type NotificationActionName
+} from "./notificationActionModel.ts";
 
 export interface NotificationHistoryState extends NotificationHistoryCollection {
   query: DesktopNotificationHistoryQuery | null;
@@ -97,7 +101,10 @@ export class NotificationExternalStore {
   private historyRequests = new Map<string, Promise<NotificationHistoryState>>();
   private actionRequests = new Map<
     string,
-    Promise<{ ok: boolean; message: string | null }>
+    {
+      action: NotificationActionName;
+      request: Promise<{ ok: boolean; message: string | null }>;
+    }
   >();
   private logGeneration = 0;
   private activeLogSubscription: { generation: number; unsubscribe: () => void } | null = null;
@@ -530,9 +537,12 @@ export class NotificationExternalStore {
     libraryId: string,
     operationId: string
   ): Promise<{ ok: boolean; message: string | null }> {
-    const requestKey = `${libraryId}\u0000${operationId}\u0000${action}`;
+    const requestKey = notificationOperationActionKey(libraryId, operationId);
     const existing = this.actionRequests.get(requestKey);
-    if (existing) return existing;
+    if (existing) {
+      if (existing.action === action) return existing.request;
+      return Promise.resolve({ ok: false, message: "该操作已有动作正在执行" });
+    }
     const bridge = this.currentBridge();
     if (!bridge) return Promise.resolve({ ok: false, message: "通知操作仅在桌面模式可用" });
     let bridgeRequest: Promise<{ ok: boolean; message: string | null }>;
@@ -545,9 +555,9 @@ export class NotificationExternalStore {
       ok: false,
       message: errorMessage(error)
     }));
-    this.actionRequests.set(requestKey, request);
+    this.actionRequests.set(requestKey, { action, request });
     void request.then(() => {
-      if (this.actionRequests.get(requestKey) === request) {
+      if (this.actionRequests.get(requestKey)?.request === request) {
         this.actionRequests.delete(requestKey);
       }
     });

@@ -22,7 +22,7 @@ import type {
 } from "./useNotifications";
 import {
   beginNotificationAction,
-  notificationActionKey,
+  notificationOperationActionKey,
   settleNotificationAction,
   type NotificationActionStates
 } from "./notificationActionModel";
@@ -157,15 +157,15 @@ export function NotificationHistoryView({
     action: "cancel" | "retry",
     operation: DesktopNotificationOperation
   ) => {
-    const actionKey = notificationActionKey(
+    const actionKey = notificationOperationActionKey(
       operation.libraryId,
-      operation.operationId,
-      action
+      operation.operationId
     );
     const requestId = ++actionRequestIdRef.current;
     const started = beginNotificationAction(
       actionStatesRef.current,
       actionKey,
+      action,
       requestId
     );
     if (!started.started) return;
@@ -183,6 +183,7 @@ export function NotificationHistoryView({
     const settled = settleNotificationAction(
       actionStatesRef.current,
       actionKey,
+      action,
       requestId,
       result.ok ? null : result.message || "操作未完成"
     );
@@ -291,19 +292,14 @@ export function NotificationHistoryView({
             {virtualizer.getVirtualItems().map((virtualRow) => {
               const operation = history.items[virtualRow.index];
               const operationKey = `${operation.libraryId}:${operation.operationId}`;
-              const cancelKey = notificationActionKey(
+              const operationActionKey = notificationOperationActionKey(
                 operation.libraryId,
-                operation.operationId,
-                "cancel"
+                operation.operationId
               );
-              const retryKey = notificationActionKey(
-                operation.libraryId,
-                operation.operationId,
-                "retry"
-              );
-              const cancelState = actionStates.get(cancelKey);
-              const retryState = actionStates.get(retryKey);
-              const actionError = cancelState?.error ?? retryState?.error ?? null;
+              const actionState = actionStates.get(operationActionKey);
+              const cancelPending = actionState?.pendingAction === "cancel";
+              const retryPending = actionState?.pendingAction === "retry";
+              const actionPending = Boolean(actionState?.pendingAction);
               const isExpanded = expanded.has(operationKey);
               return (
                 <div
@@ -344,8 +340,15 @@ export function NotificationHistoryView({
                         </time>
                       </div>
                       {isExpanded ? <OperationDetails operation={operation} /> : null}
-                      {actionError ? (
-                        <p className="notification-row-action-error" role="alert">{actionError}</p>
+                      {actionState?.errors.cancel ? (
+                        <p className="notification-row-action-error" role="alert">
+                          取消：{actionState.errors.cancel}
+                        </p>
+                      ) : null}
+                      {actionState?.errors.retry ? (
+                        <p className="notification-row-action-error" role="alert">
+                          重试：{actionState.errors.retry}
+                        </p>
                       ) : null}
                     </div>
                     <div className="notification-history-actions">
@@ -353,24 +356,24 @@ export function NotificationHistoryView({
                         <button
                           aria-label={`取消 ${operation.title}`}
                           className="notification-row-action"
-                          disabled={cancelState?.pending === true}
+                          disabled={actionPending}
                           onClick={() => void runAction("cancel", operation)}
                           type="button"
                         >
                           <Square aria-hidden="true" size={13} />
-                          {cancelState?.pending ? "取消中…" : "取消"}
+                          {cancelPending ? "取消中…" : "取消"}
                         </button>
                       ) : null}
                       {operation.retryable ? (
                         <button
                           aria-label={`重试 ${operation.title}`}
                           className="notification-row-action"
-                          disabled={retryState?.pending === true}
+                          disabled={actionPending}
                           onClick={() => void runAction("retry", operation)}
                           type="button"
                         >
                           <RotateCcw aria-hidden="true" size={13} />
-                          {retryState?.pending ? "重试中…" : "重试"}
+                          {retryPending ? "重试中…" : "重试"}
                         </button>
                       ) : null}
                     </div>
