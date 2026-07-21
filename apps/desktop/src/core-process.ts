@@ -2,7 +2,6 @@ import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import type { CoreSession } from "./core-session.js";
 import type { ProcessLogLevel } from "./process-log-buffer.js";
@@ -32,29 +31,78 @@ export interface CoreProcessLifecycleOptions {
   readonly requestWindowsStop?: (child: ChildProcess) => void;
 }
 
+const CORE_OUTPUT_PARTIAL_MAX_BYTES = 12 * 1024;
+
 export function createCoreOutputLineSplitter(onLine: (line: string) => void): {
   push: (chunk: string | Uint8Array) => void;
   flush: () => void;
 } {
-  let pending = "";
-  const decoder = new StringDecoder("utf8");
+  const pending = Buffer.allocUnsafe(CORE_OUTPUT_PARTIAL_MAX_BYTES);
+  let pendingLength = 0;
+  let omittedBytes = 0;
+
+  const append = (bytes: Buffer): void => {
+    const kept = Math.min(bytes.length, CORE_OUTPUT_PARTIAL_MAX_BYTES - pendingLength);
+    if (kept > 0) {
+      bytes.copy(pending, pendingLength, 0, kept);
+      pendingLength += kept;
+    }
+    omittedBytes += bytes.length - kept;
+  };
+
+  const emitPending = (stripCarriageReturn: boolean): void => {
+    let visibleLength = pendingLength;
+    if (stripCarriageReturn && visibleLength > 0 && pending[visibleLength - 1] === 0x0d) {
+      visibleLength -= 1;
+    }
+    if (omittedBytes > 0) {
+      const completeLength = completeUtf8PrefixLength(pending, visibleLength);
+      omittedBytes += visibleLength - completeLength;
+      const prefix = pending.subarray(0, completeLength).toString("utf8");
+      onLine(`${prefix}${prefix.length > 0 ? " " : ""}[truncated ${omittedBytes} bytes]`);
+    } else {
+      onLine(pending.subarray(0, visibleLength).toString("utf8"));
+    }
+    pendingLength = 0;
+    omittedBytes = 0;
+  };
+
   return {
     push(chunk) {
-      pending += decoder.write(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk);
-      const lines = pending.split(/\r?\n/);
-      pending = lines.pop() ?? "";
-      for (const line of lines) onLine(line);
+      const bytes = typeof chunk === "string"
+        ? Buffer.from(chunk, "utf8")
+        : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const newline = bytes.indexOf(0x0a, offset);
+        if (newline < 0) {
+          append(bytes.subarray(offset));
+          return;
+        }
+        append(bytes.subarray(offset, newline));
+        emitPending(true);
+        offset = newline + 1;
+      }
     },
     flush() {
-      pending += decoder.end();
-      const lines = pending.split(/\r?\n/);
-      pending = lines.pop() ?? "";
-      for (const line of lines) onLine(line);
-      if (pending.length === 0) return;
-      onLine(pending);
-      pending = "";
+      if (pendingLength === 0 && omittedBytes === 0) return;
+      emitPending(false);
     }
   };
+}
+
+function completeUtf8PrefixLength(bytes: Buffer, length: number): number {
+  if (length === 0) return 0;
+  let leadIndex = length - 1;
+  while (leadIndex >= 0 && (bytes[leadIndex]! & 0xc0) === 0x80) leadIndex -= 1;
+  if (leadIndex < 0) return 0;
+  const lead = bytes[leadIndex]!;
+  const expectedLength =
+    (lead & 0x80) === 0 ? 1 :
+    (lead & 0xe0) === 0xc0 ? 2 :
+    (lead & 0xf0) === 0xe0 ? 3 :
+    (lead & 0xf8) === 0xf0 ? 4 : 1;
+  return leadIndex + expectedLength > length ? leadIndex : length;
 }
 
 export function startCoreProcess(

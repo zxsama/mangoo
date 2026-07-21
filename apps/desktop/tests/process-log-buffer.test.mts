@@ -599,6 +599,62 @@ test("splits Core stdout and stderr chunks without losing partial lines", () => 
   assert.deepEqual(stderr, ["警告"]);
 });
 
+test("bounds a 6MB Core line before newline and emits one explicit truncation", () => {
+  const lines: string[] = [];
+  const splitter = createCoreOutputLineSplitter((line) => lines.push(line));
+  const totalBytes = 6 * 1024 * 1024 + 17;
+
+  for (let offset = 0; offset < totalBytes; offset += 64 * 1024) {
+    splitter.push(Buffer.alloc(Math.min(64 * 1024, totalBytes - offset), 0x61));
+  }
+  assert.equal(lines.length, 0);
+  splitter.push("\n");
+  splitter.flush();
+  splitter.flush();
+
+  assert.equal(lines.length, 1);
+  assert.ok(Buffer.byteLength(lines[0] ?? "", "utf8") < 32 * 1024);
+  assert.match(lines[0] ?? "", /^a+ \[truncated \d+ bytes\]$/);
+});
+
+test("keeps UTF-8 valid when the bounded Core prefix ends inside a multibyte character", () => {
+  const lines: string[] = [];
+  const splitter = createCoreOutputLineSplitter((line) => lines.push(line));
+  const prefix = Buffer.alloc(20 * 1024 - 1, 0x61);
+  splitter.push(Buffer.concat([prefix, Buffer.from("中😀tail", "utf8"), Buffer.alloc(64 * 1024, 0x62)]));
+  splitter.push("\r");
+  splitter.push("\n");
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0]?.includes("�"), false);
+  assert.match(lines[0] ?? "", /\[truncated \d+ bytes\]$/);
+  splitter.flush();
+  assert.equal(lines.length, 1, "newline plus exit flush must not duplicate the truncated line");
+});
+
+test("Core exit flushes one bounded overlong partial line", async () => {
+  const stdout = new PassThrough();
+  const child = Object.assign(new EventEmitter(), {
+    stdout,
+    stderr: new PassThrough(),
+    kill: () => true
+  });
+  const logs: Array<{ level: string; message: string }> = [];
+  const lifecycle = attachCoreProcessLifecycle(
+    child as unknown as ChildProcess,
+    (_source, level, message) => logs.push({ level, message })
+  );
+  stdout.write(Buffer.alloc(6 * 1024 * 1024 + 1, 0x78));
+
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+  await lifecycle.waitForExit;
+
+  const partials = logs.filter((line) => line.message.includes("[truncated"));
+  assert.equal(partials.length, 1);
+  assert.ok(Buffer.byteLength(partials[0]?.message ?? "", "utf8") < 32 * 1024);
+});
+
 test("routes each complete Core line through the bound console exactly once", async () => {
   const stdout = new PassThrough();
   const stderr = new PassThrough();
