@@ -20,6 +20,7 @@ import type {
   NotificationStoreWorkerMessage,
   ThumbnailCacheSummary
 } from "../src/notification-types.ts";
+import { rendererErrorOperationId } from "@megle/notification-contract";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const NOW = Date.UTC(2026, 6, 20, 12);
@@ -610,11 +611,92 @@ describe("notification store", () => {
         (
           await store.getOperation(
             LIBRARY_A.id,
-            `renderer-error:${LIBRARY_A.id}:${report.source}:${report.code}:${report.target}`
+            rendererErrorOperationId(LIBRARY_A.id, report)
           )
         )?.occurrenceCount,
         2
       );
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("keeps delimiter-colliding renderer identities in separate v2 operations", async () => {
+    const store = await createTestStore();
+    const first: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "a:b",
+      code: "c",
+      target: "d",
+      title: "First",
+      message: "first",
+      detail: null
+    };
+    const second: RendererErrorReport = {
+      ...first,
+      source: "a",
+      code: "b:c",
+      title: "Second",
+      message: "second"
+    };
+    const firstOperationId = rendererErrorOperationId(LIBRARY_A.id, first);
+    const secondOperationId = rendererErrorOperationId(LIBRARY_A.id, second);
+
+    try {
+      await store.recordRendererError(LIBRARY_A, first, "collision-first", NOW);
+      await store.recordRendererError(LIBRARY_A, second, "collision-second", NOW + 1);
+
+      assert.notEqual(firstOperationId, secondOperationId);
+      assert.equal((await store.getOperation(LIBRARY_A.id, firstOperationId))?.occurrenceCount, 1);
+      assert.equal((await store.getOperation(LIBRARY_A.id, secondOperationId))?.occurrenceCount, 1);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("lazily migrates an existing v1 renderer operation to its canonical v2 id", async () => {
+    const store = await createTestStore();
+    const report: RendererErrorReport = {
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "media-load",
+      code: "reload-failed",
+      target: "folder:4",
+      title: "Media load failed",
+      message: "Could not load media",
+      detail: null
+    };
+    const legacyOperationId =
+      `renderer-error:${LIBRARY_A.id}:${report.source}:${report.code}:${report.target}`;
+    const canonicalOperationId = rendererErrorOperationId(LIBRARY_A.id, report);
+
+    try {
+      await store.upsertOperations(LIBRARY_A, [
+        operation(legacyOperationId, 4, "failed", {
+          kind: "renderer_error",
+          category: "error",
+          origin: "system",
+          title: report.title,
+          summary: report.message,
+          taskId: null,
+          rootId: null,
+          currentValue: 4,
+          totalValue: null,
+          unit: "occurrences",
+          errorCode: report.code,
+          occurrenceCount: 4,
+          cancellable: false,
+          retryable: false
+        })
+      ]);
+
+      await store.recordRendererError(LIBRARY_A, report, "migration-report", NOW + 1);
+      assert.equal(
+        (await store.getOperation(LIBRARY_A.id, canonicalOperationId))?.occurrenceCount,
+        5
+      );
+      assert.equal(await store.getOperation(LIBRARY_A.id, legacyOperationId), null);
     } finally {
       await store.close();
     }
@@ -679,7 +761,7 @@ describe("notification store", () => {
       detail: null
     };
     const operationId =
-      `renderer-error:${LIBRARY_A.id}:${report.source}:${report.code}:${report.target}`;
+      rendererErrorOperationId(LIBRARY_A.id, report);
     let store = await createTestStore(databasePath);
     try {
       await store.recordRendererError(
@@ -810,7 +892,7 @@ describe("notification store", () => {
         (
           await store.getOperation(
             LIBRARY_A.id,
-            `renderer-error:${LIBRARY_A.id}:${report.source}:${report.code}:${report.target}`
+            rendererErrorOperationId(LIBRARY_A.id, report)
           )
         )?.occurrenceCount,
         2

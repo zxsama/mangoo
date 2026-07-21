@@ -1,7 +1,7 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
 import { useSecondaryWindowInterfaceStyle } from "../../app-shell/useSecondaryWindowInterfaceStyle";
-import { getDesktopBridge } from "../../core/desktop";
+import { getDesktopBridge, listLibraries, subscribeLibraryPhase } from "../../core/desktop";
 import { broadcastPreference } from "../../core/preferenceSync";
 import { useLibraryData } from "../../core/useLibraryData";
 import {
@@ -29,11 +29,53 @@ export function SettingsWindow() {
   const [previewPreferences, setPreviewPreferences] = useState<PreviewPreferences>(() =>
     readStoredPreviewPreferences()
   );
+  const [activeLibraryContext, setActiveLibraryContext] = useState<{
+    libraryId: string;
+    libraryName: string;
+  } | null>(null);
+  const libraryContextRevisionRef = useRef(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshActiveLibraryContext = async (revision: number) => {
+      try {
+        const libraries = await listLibraries();
+        if (cancelled || libraryContextRevisionRef.current !== revision) return;
+        const active = libraries.find((library) => library.active);
+        setActiveLibraryContext(
+          active ? { libraryId: active.id, libraryName: active.name } : null
+        );
+      } catch {
+        if (!cancelled && libraryContextRevisionRef.current === revision) {
+          setActiveLibraryContext(null);
+        }
+      }
+    };
+
+    libraryContextRevisionRef.current += 1;
+    void refreshActiveLibraryContext(libraryContextRevisionRef.current);
+    const unsubscribe = subscribeLibraryPhase((phase) => {
+      libraryContextRevisionRef.current += 1;
+      const revision = libraryContextRevisionRef.current;
+      if (phase === "loading-media") {
+        setActiveLibraryContext(null);
+      } else if (phase === "ready") {
+        void refreshActiveLibraryContext(revision);
+      }
+    });
+    return () => {
+      cancelled = true;
+      libraryContextRevisionRef.current += 1;
+      unsubscribe();
+    };
+  }, []);
 
   // The thumbnails tab needs cache stats + generation actions, which live on the
   // library hook. Running it here is fine — the settings window is occasional and
   // gets its own Core client from the preload bridge.
   const library = useLibraryData({
+    activeLibraryId: activeLibraryContext?.libraryId ?? null,
+    activeLibraryName: activeLibraryContext?.libraryName ?? null,
     persistentThumbnailCacheAutoRefresh: previewPreferences.persistentThumbnailCacheAutoRefresh,
     thumbnailGenerationMode: previewPreferences.thumbnailGenerationMode
   });

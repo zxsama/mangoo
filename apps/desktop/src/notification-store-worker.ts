@@ -1,6 +1,11 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 
+import {
+  legacyRendererErrorOperationId,
+  rendererErrorOperationId
+} from "@megle/notification-contract";
+
 import type {
   DesktopNotificationOperation,
   NotificationHistoryFacets,
@@ -823,7 +828,13 @@ class NotificationStoreDatabase {
     for (const reportId of uniqueReportIds) assertString(reportId, "renderer reportId");
     assertSafeInteger(occurredAt, "renderer error occurredAt");
 
-    const operationId = `renderer-error:${library.id}:${report.source}:${report.code}:${report.target}`;
+    const operationIdentity = {
+      source: report.source,
+      code: report.code,
+      target: report.target
+    };
+    const operationId = rendererErrorOperationId(library.id, operationIdentity);
+    const legacyOperationId = legacyRendererErrorOperationId(library.id, operationIdentity);
     this.database.exec("SAVEPOINT record_renderer_error;");
     try {
       const markerExists = this.database.prepare(
@@ -839,7 +850,18 @@ class NotificationStoreDatabase {
         insertMarker.run(markerId, occurredAt);
         newReportCount += 1;
       }
-      const existing = this.getOperation(library.id, operationId);
+      let existing = this.getOperation(library.id, operationId);
+      if (!existing && legacyOperationId !== operationId) {
+        const legacy = this.getOperation(library.id, legacyOperationId);
+        if (legacy) {
+          const { libraryId: _libraryId, libraryName: _libraryName, ...legacyPayload } = legacy;
+          this.upsertOperationRows(library, [{ ...legacyPayload, operationId }]);
+          this.database
+            .prepare("DELETE FROM operations WHERE library_id = ? AND operation_id = ?")
+            .run(library.id, legacyOperationId);
+          existing = { ...legacy, operationId };
+        }
+      }
       if (newReportCount === 0) {
         this.database.exec("RELEASE record_renderer_error;");
         return { outcome: "duplicate", operation: existing };

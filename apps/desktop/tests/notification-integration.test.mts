@@ -74,6 +74,21 @@ test("notification IPC validators reject malformed or unbounded renderer payload
   );
   assert.throws(
     () =>
+      ipcModule.parseRendererErrorReport({
+        reportId: "x".repeat(257),
+        libraryId: "library",
+        libraryName: "Library",
+        source: "view",
+        code: "E_VIEW",
+        target: "grid",
+        title: "Failure",
+        message: "failed",
+        detail: null
+      }),
+    /reportId/i
+  );
+  assert.throws(
+    () =>
       ipcModule.parseThumbnailCacheSummary({
         libraryId: "library",
         libraryName: "Library",
@@ -105,6 +120,20 @@ test("notification IPC validators reject malformed or unbounded renderer payload
     libraryId: "library",
     operationId: "task:1"
   });
+  assert.equal(
+    ipcModule.parseRendererErrorReport({
+      reportId: "renderer-attempt-1",
+      libraryId: "library",
+      libraryName: "Library",
+      source: "view",
+      code: "E_VIEW",
+      target: "grid",
+      title: "Failure",
+      message: "failed",
+      detail: null
+    }).reportId,
+    "renderer-attempt-1"
+  );
 });
 
 test("notification snapshot broadcasts coalesce to the newest bounded update", () => {

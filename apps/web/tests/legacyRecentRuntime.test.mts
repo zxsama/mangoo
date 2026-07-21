@@ -7,6 +7,10 @@ const source = readFileSync(
   "utf8"
 );
 const appSource = readFileSync(new URL("../src/app/App.tsx", import.meta.url), "utf8");
+const settingsWindowSource = readFileSync(
+  new URL("../src/features/settings/SettingsWindow.tsx", import.meta.url),
+  "utf8"
+);
 const libraryViewSource = readFileSync(
   new URL("../src/features/library/LibraryView.tsx", import.meta.url),
   "utf8"
@@ -28,8 +32,9 @@ describe("legacy Recent runtime removal", () => {
   });
 
   it("routes broad workspace status through the renderer notification boundary", () => {
-    assert.match(source, /publishThumbnailCacheStats\(stats, Date\.now\(\), requestLibraryId\)/);
-    assert.match(source, /reportLibraryError\(\{/);
+    assert.match(source, /publishThumbnailCacheStats\(stats, requestLibraryContext/);
+    assert.match(source, /createLibraryErrorReportAttempt/);
+    assert.match(source, /reportLibraryErrorAndRethrow/);
     assert.match(source, /thumbnailCacheStatsLibraryId/);
     assert.doesNotMatch(source, /\bsetError\b/);
     assert.doesNotMatch(source, /\berror:\s*string\s*\|\s*null/);
@@ -66,7 +71,46 @@ describe("legacy Recent runtime removal", () => {
       source.indexOf("const selectLibraryFolder ="),
       source.indexOf("const navigateFolderHistory =")
     );
-    assert.match(navigationReloadSection, /\.catch\(\(\)\s*=>\s*undefined\)/);
     assert.doesNotMatch(navigationReloadSection, /reportLibraryFailure\([\s\S]*navigation-load-failed/);
+  });
+
+  it("propagates scan failures to backoff and handles every fire-and-forget task refresh", () => {
+    const scanRefreshSection = source.slice(
+      source.indexOf("const refreshCurrentScanView ="),
+      source.indexOf("const loadLibrary =")
+    );
+    const scanBackoffSection = source.slice(
+      source.indexOf("if (!scanActiveRootTask || scanRefreshFailures >= 3)"),
+      source.indexOf("if (!scanActiveRootTask) {", source.indexOf("if (!scanActiveRootTask || scanRefreshFailures >= 3)"))
+    );
+    const loadTasksSection = source.slice(
+      source.indexOf("const loadTasks ="),
+      source.indexOf("const createScanRefreshSelectionToken =")
+    );
+    assert.match(scanRefreshSection, /reportLibraryErrorAndRethrow/);
+    assert.match(scanRefreshSection, /throw|return\s+reportLibraryErrorAndRethrow/);
+    assert.match(scanBackoffSection, /setScanRefreshFailures\(0\)/);
+    assert.match(scanBackoffSection, /setScanRefreshFailures\(\(failures\)\s*=>\s*failures\s*\+\s*1\)/);
+    assert.match(scanBackoffSection, /retryLibraryErrorReport\(cause\)/);
+    assert.doesNotMatch(scanBackoffSection, /reportLibraryFailure\(/);
+    assert.doesNotMatch(source, /void\s+loadTasks\(\);/);
+    assert.match(source, /const loadTasksSafely = useCallback\([\s\S]*?catch \(cause\)[\s\S]*?await reportLibraryFailure/);
+    assert.match(loadTasksSection, /reportLibraryErrorAndRethrow/);
+    assert.match(loadTasksSection, /requestGeneration === libraryRequestGenerationRef\.current/);
+    assert.match(scanRefreshSection, /void loadTasksSafely\(/);
+  });
+
+  it("provides captured active-library context from both renderer windows", () => {
+    assert.match(appSource, /activeLibraryName,/);
+    assert.match(appSource, /phase === "loading-media"[\s\S]*?setActiveLibraryId\(null\)/);
+    assert.match(settingsWindowSource, /listLibraries/);
+    assert.match(settingsWindowSource, /subscribeLibraryPhase/);
+    assert.match(settingsWindowSource, /libraryContextRevisionRef/);
+    assert.match(settingsWindowSource, /libraryContextRevisionRef\.current !== revision/);
+    assert.match(settingsWindowSource, /activeLibraryId/);
+    assert.match(settingsWindowSource, /activeLibraryName/);
+    assert.match(source, /attempt: LibraryErrorReportAttempt \| null/);
+    assert.doesNotMatch(source, /attempt\?: LibraryErrorReportAttempt/);
+    assert.match(source, /phase === "loading-media"[\s\S]*?activeLibraryContextRef\.current = null/);
   });
 });

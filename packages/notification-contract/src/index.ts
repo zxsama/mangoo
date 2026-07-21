@@ -95,6 +95,8 @@ export interface NotificationHistoryFacets {
 export type DesktopNotificationHistoryFacets = NotificationHistoryFacets;
 
 export interface RendererErrorReport {
+  /** Stable logical occurrence id supplied by the renderer; absent for legacy callers. */
+  reportId?: string;
   libraryId: string;
   libraryName: string;
   source: string;
@@ -103,6 +105,35 @@ export interface RendererErrorReport {
   title: string;
   message: string;
   detail: string | null;
+}
+
+export interface RendererErrorIdentity {
+  source: string;
+  code: string;
+  target: string;
+}
+
+export function rendererErrorIdentityKey(input: RendererErrorIdentity): string {
+  return JSON.stringify([input.source, input.code, input.target]);
+}
+
+export function rendererErrorOperationId(
+  libraryId: string,
+  input: RendererErrorIdentity
+): string {
+  return `renderer-error:v2:${JSON.stringify([
+    libraryId,
+    input.source,
+    input.code,
+    input.target
+  ])}`;
+}
+
+export function legacyRendererErrorOperationId(
+  libraryId: string,
+  input: RendererErrorIdentity
+): string {
+  return `renderer-error:${libraryId}:${input.source}:${input.code}:${input.target}`;
 }
 
 export type DesktopRendererErrorReport = RendererErrorReport;

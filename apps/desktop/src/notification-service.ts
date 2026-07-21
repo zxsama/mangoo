@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+import { rendererErrorOperationId } from "@megle/notification-contract";
+
 import type {
   FileOperationKind,
   FileOperationRecord,
@@ -353,10 +355,6 @@ function sameNotificationOperationPayload(
   return JSON.stringify(leftPayload) === JSON.stringify(rightPayload);
 }
 
-function rendererErrorOperationId(libraryId: string, report: RendererErrorReport): string {
-  return `renderer-error:${libraryId}:${report.source}:${report.code}:${report.target}`;
-}
-
 function cloneCompactSnapshot(snapshot: NotificationCompactSnapshot): NotificationCompactSnapshot {
   return {
     active: snapshot.active.map((item) => ({ ...item })),
@@ -570,7 +568,7 @@ export class NotificationService {
   }
 
   async reportRendererError(report: RendererErrorReport): Promise<void> {
-    const reportId = this.createReportId();
+    const reportId = report.reportId ?? this.createReportId();
     if (typeof reportId !== "string" || reportId.length === 0) {
       throw new TypeError("renderer report id must be a non-empty string");
     }

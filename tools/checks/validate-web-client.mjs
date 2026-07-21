@@ -1128,7 +1128,15 @@ if (!/cursor:\s*cursor\s*\?\?\s*undefined/.test(useLibraryData)) {
 if (!/requestGeneration\s*!==\s*mediaPageGeneration\.current/.test(useLibraryData)) {
   fail("loadMoreMedia must discard stale page responses after media context changes");
 }
-if (!/const\s+loadLibrary\s*=\s*useCallback\(async\s*\(scope\?:\s*LibrarySelectionScope\)\s*=>\s*\{\s*const requestGeneration = \+\+mediaPageGeneration\.current;[\s\S]*?await loadRoots\(scope\)/.test(useLibraryData)) {
+const loadLibraryGenerationIndex = loadLibraryBlock.indexOf(
+  "const requestGeneration = ++mediaPageGeneration.current;"
+);
+const loadLibraryRootsIndex = loadLibraryBlock.indexOf("await loadRoots(scope)");
+if (
+  loadLibraryGenerationIndex < 0 ||
+  loadLibraryRootsIndex < 0 ||
+  loadLibraryGenerationIndex > loadLibraryRootsIndex
+) {
   fail("loadLibrary must invalidate media page generation before awaited reload work starts");
 }
 if (
@@ -1212,14 +1220,21 @@ if (/expandedFolderIds/.test(refreshCurrentScanViewBlock)) {
 if (!reloadCurrentMediaBlock) {
   fail("useLibraryData must keep reloadCurrentMedia as an inspectable useCallback");
 }
+if (/navigation-load-failed/.test(selectLibraryFolderBlock)) {
+  fail("useLibraryData navigation must not add a second report around media reload ownership");
+}
 if (
-  /reportLibraryFailure\([\s\S]*?throw\s+cause/.test(reloadCurrentMediaBlock) ||
-  /navigation-load-failed/.test(selectLibraryFolderBlock) ||
-  !/reloadCurrentMedia\(\{[\s\S]*?\}\)\s*\.catch\(\(\)\s*=>\s*undefined\)/.test(
-    selectLibraryFolderBlock
-  )
+  !/reportLibraryErrorAndRethrow\(/.test(refreshCurrentScanViewBlock) ||
+  !/setScanRefreshFailures\(\(failures\)\s*=>\s*failures\s*\+\s*1\)/.test(
+    scanRefreshEffectBlock
+  ) ||
+  !/retryLibraryErrorReport\(cause\)/.test(scanRefreshEffectBlock) ||
+  /reportLibraryFailure\(/.test(scanRefreshEffectBlock)
 ) {
-  fail("useLibraryData media reload reporting must not report, rethrow, and report again at navigation");
+  fail("useLibraryData scan refresh failures must propagate to backoff and retry the same logical report");
+}
+if (/void\s+loadTasks\(\);/.test(useLibraryData) || !/loadTasksSafely/.test(useLibraryData)) {
+  fail("useLibraryData fire-and-forget task refreshes must use the reporting-safe wrapper");
 }
 if (
   !/const\s+prepareNavigationMediaReload\s*=\s*useCallback\(\(\)\s*=>\s*\{[\s\S]*?scanRefreshSelectionVersionRef\.current\s*\+=\s*1[\s\S]*?setScanRefreshFailures\(0\)/.test(

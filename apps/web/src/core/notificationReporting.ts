@@ -1,19 +1,27 @@
 import type { ThumbnailCacheStatsResponse } from "@megle/core-client";
-import type {
-  DesktopRendererErrorReport,
-  DesktopThumbnailCacheSummary
+import {
+  rendererErrorIdentityKey,
+  type DesktopRendererErrorReport,
+  type DesktopThumbnailCacheSummary
 } from "@megle/notification-contract";
 import { getDesktopBridge, type MegleDesktopBridge } from "./desktop.ts";
 
 const LIBRARY_ID_MAX_LENGTH = 256;
 const LIBRARY_NAME_MAX_LENGTH = 256;
+const REPORT_ID_MAX_LENGTH = 256;
 const ERROR_SOURCE_MAX_LENGTH = 128;
 const ERROR_CODE_MAX_LENGTH = 128;
 const ERROR_TARGET_MAX_LENGTH = 512;
 const ERROR_MESSAGE_MAX_LENGTH = 4_000;
-const inFlightRendererErrorKeys = new Set<string>();
-// Preserve the first operation boundary when the same failure propagates through nested catches.
-const reportedRendererErrorCauses = new WeakSet<object>();
+
+export interface NotificationLibraryContext {
+  libraryId: string;
+  libraryName: string;
+}
+
+export interface LibraryErrorReportAttempt extends NotificationLibraryContext {
+  reportId: string;
+}
 
 export interface ThumbnailSummarySnapshot {
   libraryId: string;
@@ -33,8 +41,51 @@ export interface RendererErrorKeyInput {
 }
 
 export interface LibraryErrorReportInput extends RendererErrorKeyInput {
-  cause?: unknown;
   message: string;
+}
+
+interface AttemptState {
+  completed: boolean;
+  inFlight: Promise<boolean> | null;
+  normalized: Pick<DesktopRendererErrorReport, "source" | "code" | "target" | "message"> | null;
+}
+
+const attemptStates = new WeakMap<LibraryErrorReportAttempt, AttemptState>();
+let reportSequence = 0;
+
+export class ReportedLibraryFailure extends Error {
+  readonly attempt: LibraryErrorReportAttempt | null;
+  readonly originalCause: unknown;
+
+  constructor(attempt: LibraryErrorReportAttempt | null, originalCause: unknown) {
+    super(errorMessage(originalCause));
+    this.name = "ReportedLibraryFailure";
+    this.attempt = attempt;
+    this.originalCause = originalCause;
+  }
+}
+
+export function createLibraryErrorReportAttempt(
+  context: NotificationLibraryContext | null | undefined,
+  reportId?: string
+): LibraryErrorReportAttempt | null {
+  if (!context) return null;
+  const libraryId = boundedString(context.libraryId, LIBRARY_ID_MAX_LENGTH);
+  const libraryName = boundedString(context.libraryName, LIBRARY_NAME_MAX_LENGTH);
+  const boundedReportId =
+    reportId === undefined ? null : boundedString(reportId, REPORT_ID_MAX_LENGTH);
+  if (!libraryId || !libraryName || (reportId !== undefined && !boundedReportId)) return null;
+  let logicalReportId = boundedReportId;
+  const attempt = Object.freeze({
+    libraryId,
+    libraryName,
+    get reportId() {
+      logicalReportId ??= createReportId();
+      return logicalReportId;
+    }
+  });
+  attemptStates.set(attempt, { completed: false, inFlight: null, normalized: null });
+  return attempt;
 }
 
 export function thumbnailSummary(
@@ -61,101 +112,110 @@ export function thumbnailSummary(
 }
 
 export function rendererErrorKey(input: RendererErrorKeyInput): string {
-  return [input.source, input.code, input.target].map(normalizeDedupePart).join(":");
+  return rendererErrorIdentityKey({
+    source: normalizeDedupePart(input.source),
+    code: normalizeDedupePart(input.code),
+    target: normalizeDedupePart(input.target)
+  });
 }
 
-export function reportLibraryError(input: LibraryErrorReportInput): void {
+export function reportLibraryError(
+  attempt: LibraryErrorReportAttempt | null | undefined,
+  input: LibraryErrorReportInput
+): Promise<boolean> {
+  if (!attempt) return Promise.resolve(false);
+  const normalized = normalizeLibraryError(input);
+  if (!normalized) return Promise.resolve(false);
+  const state = attemptStates.get(attempt);
+  if (!state) return Promise.resolve(false);
+  if (state.completed) return Promise.resolve(true);
+  state.normalized ??= normalized;
+  if (state.inFlight) return state.inFlight;
+
   const bridge = desktopBridge();
   const notifications = bridge?.notifications;
-  const normalized = normalizeLibraryError(input);
-  if (!bridge || !notifications?.reportError || !normalized) return;
-  const cause = errorCauseObject(input.cause);
-  if (cause && reportedRendererErrorCauses.has(cause)) return;
-  if (cause) reportedRendererErrorCauses.add(cause);
-  const dedupeKey = rendererErrorKey(normalized);
-  if (inFlightRendererErrorKeys.has(dedupeKey)) return;
-  inFlightRendererErrorKeys.add(dedupeKey);
+  if (!bridge || !notifications?.reportError) return Promise.resolve(false);
 
-  void (async () => {
-    try {
-      const library = await activeLibraryIdentity(bridge);
-      if (!library) return;
-      const report: DesktopRendererErrorReport = {
-        ...library,
-        ...normalized,
-        title: rendererErrorTitle(normalized.source),
-        detail: null
-      };
-      await notifications.reportError(report);
-    } finally {
-      inFlightRendererErrorKeys.delete(dedupeKey);
-    }
-  })().catch(() => undefined);
+  const report: DesktopRendererErrorReport = {
+    reportId: attempt.reportId,
+    libraryId: attempt.libraryId,
+    libraryName: attempt.libraryName,
+    ...state.normalized,
+    title: rendererErrorTitle(state.normalized.source),
+    detail: null
+  };
+  const request = Promise.resolve()
+    .then(() => notifications.reportError(report))
+    .then((accepted) => {
+      if (accepted === true) state.completed = true;
+      return accepted === true;
+    })
+    .catch(() => false);
+  state.inFlight = request.finally(() => {
+    state.inFlight = null;
+  });
+  return state.inFlight;
+}
+
+export async function reportLibraryErrorAndRethrow(
+  attempt: LibraryErrorReportAttempt | null | undefined,
+  input: LibraryErrorReportInput,
+  cause: unknown
+): Promise<never> {
+  if (cause instanceof ReportedLibraryFailure) {
+    await retryLibraryErrorReport(cause);
+    throw cause;
+  }
+  await reportLibraryError(attempt, input);
+  throw new ReportedLibraryFailure(attempt ?? null, cause);
+}
+
+export function retryLibraryErrorReport(cause: unknown): Promise<boolean> {
+  if (!(cause instanceof ReportedLibraryFailure)) return Promise.resolve(false);
+  if (!cause.attempt) return Promise.resolve(false);
+  const state = attemptStates.get(cause.attempt);
+  if (!state?.normalized) return Promise.resolve(false);
+  return reportLibraryError(cause.attempt, state.normalized);
 }
 
 export function publishThumbnailCacheStats(
   stats: ThumbnailCacheStatsResponse,
-  observedAt = Date.now(),
-  expectedLibraryId?: string | null
-): void {
+  context: NotificationLibraryContext | null | undefined,
+  observedAt = Date.now()
+): Promise<boolean> {
   const bridge = desktopBridge();
   const notifications = bridge?.notifications;
-  if (!bridge || !notifications?.publishThumbnailSummary) return;
+  if (!bridge || !notifications?.publishThumbnailSummary || !context) {
+    return Promise.resolve(false);
+  }
+  const libraryId = boundedString(context.libraryId, LIBRARY_ID_MAX_LENGTH);
+  const libraryName = boundedString(context.libraryName, LIBRARY_NAME_MAX_LENGTH);
+  if (!libraryId || !libraryName) return Promise.resolve(false);
 
-  void (async () => {
-    const library = await activeLibraryIdentity(bridge);
-    if (!library) return;
-    const boundedExpectedLibraryId = expectedLibraryId
-      ? boundedString(expectedLibraryId, LIBRARY_ID_MAX_LENGTH)
-      : null;
-    if (boundedExpectedLibraryId && library.libraryId !== boundedExpectedLibraryId) return;
-    const snapshot = thumbnailSummary(
-      stats,
-      library.libraryId,
-      library.libraryName,
-      observedAt
-    );
-    const summary: DesktopThumbnailCacheSummary = {
-      libraryId: snapshot.libraryId,
-      libraryName: snapshot.libraryName,
-      observedAt: snapshot.observedAt,
-      cachedCount: snapshot.cachedCount,
-      totalCandidateCount: snapshot.cachedCount + snapshot.remainingCount,
-      missingCount: stats.missingCount,
-      staleCount: stats.staleCount,
-      failedCount: snapshot.failedCount,
-      pendingCount: stats.pendingCandidateCount,
-      activeBulkTaskCount: snapshot.activeBulkTaskCount,
-      totalCacheBytes: stats.totalBlobBytes,
-      completionPercent: snapshot.percent
-    };
-    await notifications.publishThumbnailSummary(summary);
-  })().catch(() => undefined);
+  const snapshot = thumbnailSummary(stats, libraryId, libraryName, observedAt);
+  const summary: DesktopThumbnailCacheSummary = {
+    libraryId: snapshot.libraryId,
+    libraryName: snapshot.libraryName,
+    observedAt: snapshot.observedAt,
+    cachedCount: snapshot.cachedCount,
+    totalCandidateCount: snapshot.cachedCount + snapshot.remainingCount,
+    missingCount: stats.missingCount,
+    staleCount: stats.staleCount,
+    failedCount: snapshot.failedCount,
+    pendingCount: stats.pendingCandidateCount,
+    activeBulkTaskCount: snapshot.activeBulkTaskCount,
+    totalCacheBytes: stats.totalBlobBytes,
+    completionPercent: snapshot.percent
+  };
+  return Promise.resolve()
+    .then(() => notifications.publishThumbnailSummary(summary))
+    .then((accepted) => accepted === true)
+    .catch(() => false);
 }
 
 function desktopBridge(): MegleDesktopBridge | null {
   if (typeof window === "undefined") return null;
   return getDesktopBridge();
-}
-
-async function activeLibraryIdentity(
-  bridge: MegleDesktopBridge
-): Promise<{ libraryId: string; libraryName: string } | null> {
-  const libraries = await bridge.listLibraries?.();
-  let active = libraries?.find((library) => library.active);
-  if (!active && bridge.getActiveLibraryId) {
-    const activeLibraryId = await bridge.getActiveLibraryId();
-    active = libraries?.find((library) => library.id === activeLibraryId);
-    if (!active && activeLibraryId) {
-      const libraryId = boundedString(activeLibraryId, LIBRARY_ID_MAX_LENGTH);
-      return libraryId ? { libraryId, libraryName: libraryId } : null;
-    }
-  }
-  if (!active) return null;
-
-  const libraryId = boundedString(active.id, LIBRARY_ID_MAX_LENGTH);
-  const libraryName = boundedString(active.name, LIBRARY_NAME_MAX_LENGTH);
-  return libraryId && libraryName ? { libraryId, libraryName } : null;
 }
 
 function normalizeLibraryError(
@@ -178,16 +238,26 @@ function normalizeDedupePart(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, "-");
 }
 
-function errorCauseObject(cause: unknown): object | null {
-  return typeof cause === "object" && cause !== null ? cause : null;
-}
-
 function rendererErrorTitle(source: string): string {
   const words = source.replace(/[-_]+/g, " ");
   return `${words.charAt(0).toUpperCase()}${words.slice(1)} failed`;
 }
 
-function boundedString(value: string, maxLength: number): string | null {
+function boundedString(value: unknown, maxLength: number): string | null {
+  if (typeof value !== "string") return null;
   const normalized = value.trim();
   return normalized.length > 0 && normalized.length <= maxLength ? normalized : null;
+}
+
+function createReportId(): string {
+  const cryptoObject = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  const uuid = cryptoObject?.randomUUID?.();
+  if (uuid) return uuid;
+  reportSequence += 1;
+  return `renderer-${Date.now().toString(36)}-${reportSequence.toString(36)}`;
+}
+
+function errorMessage(cause: unknown): string {
+  if (cause instanceof Error && cause.message) return cause.message;
+  return typeof cause === "string" ? cause : String(cause);
 }

@@ -35,7 +35,16 @@ import {
 } from "./mediaResources";
 import { runThumbnailCacheEnqueueBatches } from "./thumbnailCacheEnqueue";
 import { decideRootScanRefresh } from "./scanRefresh";
-import { publishThumbnailCacheStats, reportLibraryError } from "./notificationReporting";
+import {
+  createLibraryErrorReportAttempt,
+  publishThumbnailCacheStats,
+  reportLibraryError,
+  reportLibraryErrorAndRethrow,
+  ReportedLibraryFailure,
+  retryLibraryErrorReport,
+  type LibraryErrorReportAttempt,
+  type NotificationLibraryContext
+} from "./notificationReporting";
 import type { ThumbnailGenerationMode } from "../features/preview/previewPreferences";
 
 const INITIAL_MEDIA_WINDOW_LIMIT = 96;
@@ -63,21 +72,6 @@ const SHOW_SUBFOLDER_CONTENTS_STORAGE_KEY = "megle.library.subfolder-content-ope
 const SEEN_THUMBNAIL_PERSIST_BATCH_SIZE = 128;
 const SEEN_THUMBNAIL_PERSIST_DEBOUNCE_MS = 500;
 const SEEN_THUMBNAIL_PERSIST_RETRY_MS = 10_000;
-
-function reportLibraryFailure(
-  cause: unknown,
-  source: string,
-  target: string,
-  fallbackCode: string
-): void {
-  reportLibraryError({
-    cause,
-    source,
-    code: libraryErrorCode(cause, fallbackCode),
-    target,
-    message: errorMessage(cause)
-  });
-}
 
 function libraryErrorCode(cause: unknown, fallbackCode: string): string {
   if (cause instanceof CoreApiError) {
@@ -254,6 +248,7 @@ type PendingInteractiveScanRequest = {
 
 type UseLibraryDataOptions = {
   activeLibraryId?: string | null;
+  activeLibraryName?: string | null;
   persistentThumbnailCacheAutoRefresh: boolean;
   // How thumbnails are generated and whether they persist. Drives both the
   // whole-library auto-generation ("allPersist") and whether displayed
@@ -290,11 +285,18 @@ export function useLibraryData(
   const seenThumbnailPersistControllerRef = useRef<AbortController | null>(null);
   const seenThumbnailPersistActiveRef = useRef(true);
   const loadTasksRequestRef = useRef<Promise<TaskRecord[]> | null>(null);
+  const libraryRequestGenerationRef = useRef(0);
   const interactiveFolderScanControllerRef = useRef<AbortController | null>(null);
   const thumbnailPriorityScopeSyncControllerRef = useRef<AbortController | null>(null);
   const thumbnailCacheStatsControllerRef = useRef<AbortController | null>(null);
-  const activeLibraryIdRef = useRef(options.activeLibraryId ?? null);
-  activeLibraryIdRef.current = options.activeLibraryId ?? null;
+  const activeLibraryContextRef = useRef<NotificationLibraryContext | null>(null);
+  activeLibraryContextRef.current =
+    options.activeLibraryId && options.activeLibraryName
+      ? {
+          libraryId: options.activeLibraryId,
+          libraryName: options.activeLibraryName
+        }
+      : null;
   const thumbnailCacheActionControllerRef = useRef<AbortController | null>(null);
   const thumbnailCacheAutoRefreshTimerRef = useRef<number | null>(null);
   const lastThumbnailCacheAutoRefreshScopeKeyRef = useRef<string | null>(null);
@@ -410,6 +412,30 @@ export function useLibraryData(
   } | null>(null);
   const [thumbnailCacheStatsLoading, setThumbnailCacheStatsLoading] = useState(false);
   const [thumbnailCacheActionBusy, setThumbnailCacheActionBusy] = useState(false);
+  const createReportingAttempt = useCallback(
+    (context = activeLibraryContextRef.current) => createLibraryErrorReportAttempt(context),
+    []
+  );
+  const reportLibraryFailure = useCallback(
+    (
+      cause: unknown,
+      source: string,
+      target: string,
+      fallbackCode: string,
+      attempt: LibraryErrorReportAttempt | null
+    ) => {
+      if (cause instanceof ReportedLibraryFailure) {
+        return retryLibraryErrorReport(cause);
+      }
+      return reportLibraryError(attempt, {
+        source,
+        code: libraryErrorCode(cause, fallbackCode),
+        target,
+        message: errorMessage(cause)
+      });
+    },
+    []
+  );
   const loadedMediaById = useMemo(() => {
     const next = new Map<number, MediaRecord>();
     media.forEach((item) => next.set(item.id, item));
@@ -536,7 +562,8 @@ export function useLibraryData(
     // folder switches, so stats never interfere with thumbnail refresh.
     thumbnailCacheStatsControllerRef.current?.abort();
     const controller = new AbortController();
-    const requestLibraryId = activeLibraryIdRef.current;
+    const requestLibraryContext = activeLibraryContextRef.current;
+    const reportingAttempt = createReportingAttempt(requestLibraryContext);
     thumbnailCacheStatsControllerRef.current = controller;
     setThumbnailCacheStatsLoading(true);
     try {
@@ -549,17 +576,26 @@ export function useLibraryData(
       );
       if (
         thumbnailCacheStatsControllerRef.current === controller &&
-        requestLibraryId === activeLibraryIdRef.current
+        sameLibraryContext(requestLibraryContext, activeLibraryContextRef.current)
       ) {
-        setThumbnailCacheStatsSnapshot({ libraryId: requestLibraryId, stats });
-        publishThumbnailCacheStats(stats, Date.now(), requestLibraryId);
+        setThumbnailCacheStatsSnapshot({
+          libraryId: requestLibraryContext?.libraryId ?? null,
+          stats
+        });
+        void publishThumbnailCacheStats(stats, requestLibraryContext);
       }
       return stats;
     } catch (cause) {
       if (isAbortError(cause)) {
         return null;
       }
-      reportLibraryFailure(cause, "thumbnail-cache", "library", "stats-load-failed");
+      void reportLibraryFailure(
+        cause,
+        "thumbnail-cache",
+        "library",
+        "stats-load-failed",
+        reportingAttempt
+      );
       return null;
     } finally {
       if (thumbnailCacheStatsControllerRef.current === controller) {
@@ -569,17 +605,19 @@ export function useLibraryData(
         setThumbnailCacheStatsLoading(false);
       }
     }
-  }, [client]);
+  }, [client, createReportingAttempt, reportLibraryFailure]);
 
   useEffect(() => {
     thumbnailCacheStatsControllerRef.current?.abort();
     thumbnailCacheStatsControllerRef.current = null;
     setThumbnailCacheStatsSnapshot(null);
     setThumbnailCacheStatsLoading(false);
-  }, [options.activeLibraryId]);
+    loadTasksRequestRef.current = null;
+  }, [options.activeLibraryId, options.activeLibraryName]);
 
   const enqueueThumbnailCacheLoop = useCallback(
     async (scope: { rootId?: number; folderId?: number; includeDescendants?: boolean }, refreshMode: ThumbnailCacheRefreshMode) => {
+      const reportingAttempt = createReportingAttempt();
       thumbnailCacheActionControllerRef.current?.abort();
       const controller = new AbortController();
       thumbnailCacheActionControllerRef.current = controller;
@@ -602,7 +640,8 @@ export function useLibraryData(
             cause,
             "thumbnail-cache",
             "library",
-            `${refreshMode}-enqueue-failed`
+            `${refreshMode}-enqueue-failed`,
+            reportingAttempt
           );
         }
       } finally {
@@ -614,7 +653,7 @@ export function useLibraryData(
         void refreshThumbnailCacheStats();
       }
     },
-    [client, refreshThumbnailCacheStats]
+    [client, createReportingAttempt, refreshThumbnailCacheStats, reportLibraryFailure]
   );
 
   const abortStaleMediaPageRequests = useCallback((keepRequestKey?: string) => {
@@ -766,12 +805,14 @@ export function useLibraryData(
             return;
           }
           thumbnailPriorityScopeSyncTrailingPendingRef.current = false;
+          const reportingAttempt = createReportingAttempt();
           void flushThumbnailPriorityScopeSync().catch((cause) => {
             reportLibraryFailure(
               cause,
               "thumbnail-priority",
               "viewport",
-              "scope-sync-failed"
+              "scope-sync-failed",
+              reportingAttempt
             );
           });
           openThumbnailScopeSyncWindow();
@@ -786,12 +827,14 @@ export function useLibraryData(
           thumbnailPriorityScopeSyncTrailingPendingRef.current = true;
           return;
         }
+        const reportingAttempt = createReportingAttempt();
         void flushThumbnailPriorityScopeSync().catch((cause) => {
           reportLibraryFailure(
             cause,
             "thumbnail-priority",
             priority,
-            "scope-sync-failed"
+            "scope-sync-failed",
+            reportingAttempt
           );
         });
         if (priority === "visible") {
@@ -806,20 +849,23 @@ export function useLibraryData(
         thumbnailPriorityScopeSyncTrailingPendingRef.current = true;
         return;
       }
+      const reportingAttempt = createReportingAttempt();
       void flushThumbnailPriorityScopeSync().catch((cause) => {
         reportLibraryFailure(
           cause,
           "thumbnail-priority",
           priority,
-          "scope-sync-failed"
+          "scope-sync-failed",
+          reportingAttempt
         );
       });
       openThumbnailScopeSyncWindow();
     },
-    [flushThumbnailPriorityScopeSync]
+    [createReportingAttempt, flushThumbnailPriorityScopeSync, reportLibraryFailure]
   );
 
   const flushSeenThumbnailPersistQueue = useCallback(async () => {
+    const reportingAttempt = createReportingAttempt();
     if (!seenThumbnailPersistActiveRef.current) {
       return;
     }
@@ -863,7 +909,8 @@ export function useLibraryData(
           cause,
           "thumbnail-persist",
           "visible-batch",
-          "persist-failed"
+          "persist-failed",
+          reportingAttempt
         );
       }
     } finally {
@@ -884,7 +931,7 @@ export function useLibraryData(
         }, retryDelayMs);
       }
     }
-  }, [client]);
+  }, [client, createReportingAttempt, reportLibraryFailure]);
 
   const scheduleSeenThumbnailPersist = useCallback(
     (mediaIds: number[]) => {
@@ -1161,8 +1208,9 @@ export function useLibraryData(
       const controller = new AbortController();
       folderChildControllersRef.current.set(requestKey, controller);
       setLoadingFolderIds((current) => new Set(current).add(folderId));
+      const reportingAttempt = createReportingAttempt();
 
-      const request = (async () => {
+      const rawRequest = (async () => {
         const cursor = null;
         const page = await client.listFolderChildren(folderId, {
           cursor: cursor ?? undefined,
@@ -1191,34 +1239,46 @@ export function useLibraryData(
         }
         return page.items;
       })();
+      let request: Promise<FolderRecord[]>;
+      request = rawRequest
+        .catch((cause) => {
+          if (isAbortError(cause)) {
+            return [];
+          }
+          return reportLibraryErrorAndRethrow(
+            reportingAttempt,
+            {
+              source: "folder-load",
+              code: libraryErrorCode(cause, "child-load-failed"),
+              target: `folder:${folderId}`,
+              message: errorMessage(cause)
+            },
+            cause
+          );
+        })
+        .finally(() => {
+          if (folderChildControllersRef.current.get(requestKey) === controller) {
+            folderChildControllersRef.current.delete(requestKey);
+          }
+          if (folderChildInitialRequestsRef.current.get(folderId) === request) {
+            folderChildInitialRequestsRef.current.delete(folderId);
+          }
+          setLoadingFolderIds((current) => {
+            const next = new Set(current);
+            next.delete(folderId);
+            return next;
+          });
+        });
 
       folderChildInitialRequestsRef.current.set(folderId, request);
-      try {
-        return await request;
-      } catch (cause) {
-        if (isAbortError(cause)) {
-          return [];
-        }
-        throw cause;
-      } finally {
-        if (folderChildControllersRef.current.get(requestKey) === controller) {
-          folderChildControllersRef.current.delete(requestKey);
-        }
-        if (folderChildInitialRequestsRef.current.get(folderId) === request) {
-          folderChildInitialRequestsRef.current.delete(folderId);
-        }
-        setLoadingFolderIds((current) => {
-          const next = new Set(current);
-          next.delete(folderId);
-          return next;
-        });
-      }
+      return request;
     },
-    [client]
+    [client, createReportingAttempt]
   );
 
   const revealFolderPath = useCallback(
     async (folderId: number): Promise<FolderRecord[]> => {
+      const reportingAttempt = createReportingAttempt();
       const cachedPath = folderAncestorPathCacheRef.current.get(folderId);
       if (cachedPath) {
         const mergedChildren = mergeFolderAncestorPath(
@@ -1238,7 +1298,7 @@ export function useLibraryData(
 
       const controller = new AbortController();
       folderAncestorControllersRef.current.set(folderId, controller);
-      const request = (async () => {
+      const rawRequest = (async () => {
         const response = await client.listFolderAncestors(folderId, {
           requestPriority: "navigation",
           signal: controller.signal
@@ -1258,35 +1318,41 @@ export function useLibraryData(
         setExpandedFolderIds((current) => expandFolderPath(current, path));
         return path;
       })();
+      let request: Promise<FolderRecord[]>;
+      request = rawRequest
+        .catch((cause) => {
+          if (isAbortError(cause)) {
+            return [];
+          }
+          return reportLibraryErrorAndRethrow(
+            reportingAttempt,
+            {
+              source: "folder-load",
+              code: libraryErrorCode(cause, "ancestor-load-failed"),
+              target: `folder:${folderId}`,
+              message: errorMessage(cause)
+            },
+            cause
+          );
+        })
+        .finally(() => {
+          if (folderAncestorControllersRef.current.get(folderId) === controller) {
+            folderAncestorControllersRef.current.delete(folderId);
+          }
+          if (folderAncestorRequestsRef.current.get(folderId) === request) {
+            folderAncestorRequestsRef.current.delete(folderId);
+          }
+        });
 
       folderAncestorRequestsRef.current.set(folderId, request);
-      try {
-        return await request;
-      } catch (cause) {
-        if (isAbortError(cause)) {
-          return [];
-        }
-        reportLibraryFailure(
-          cause,
-          "folder-load",
-          `folder:${folderId}`,
-          "ancestor-load-failed"
-        );
-        throw cause;
-      } finally {
-        if (folderAncestorControllersRef.current.get(folderId) === controller) {
-          folderAncestorControllersRef.current.delete(folderId);
-        }
-        if (folderAncestorRequestsRef.current.get(folderId) === request) {
-          folderAncestorRequestsRef.current.delete(folderId);
-        }
-      }
+      return request;
     },
-    [client]
+    [client, createReportingAttempt]
   );
 
   const loadMoreFolderChildren = useCallback(
     async (folderId: number) => {
+      const reportingAttempt = createReportingAttempt();
       const cursor = folderChildNextCursorByParent[folderId];
       if (!cursor || loadingMoreFolderIds.has(folderId)) {
         return;
@@ -1328,7 +1394,8 @@ export function useLibraryData(
           cause,
           "folder-load",
           `folder:${folderId}`,
-          "child-page-load-failed"
+          "child-page-load-failed",
+          reportingAttempt
         );
       } finally {
         if (folderChildControllersRef.current.get(requestKey) === controller) {
@@ -1342,7 +1409,13 @@ export function useLibraryData(
         inFlightFolderChildPageKeys.current.delete(requestKey);
       }
     },
-    [client, folderChildNextCursorByParent, loadingMoreFolderIds]
+    [
+      client,
+      createReportingAttempt,
+      folderChildNextCursorByParent,
+      loadingMoreFolderIds,
+      reportLibraryFailure
+    ]
   );
 
   const loadFolderDescendants = useCallback(
@@ -1484,13 +1557,30 @@ export function useLibraryData(
       return loadTasksRequestRef.current;
     }
 
-    const request = client
+    const reportingAttempt = createReportingAttempt();
+    const requestGeneration = libraryRequestGenerationRef.current;
+    let request: Promise<TaskRecord[]>;
+    request = client
       .listTasks()
       .then((response) => {
-        setTasks(response.items);
-        setTaskPollFailures(0);
+        if (requestGeneration === libraryRequestGenerationRef.current) {
+          setTasks(response.items);
+          setTaskPollFailures(0);
+        }
         return response.items;
       })
+      .catch((cause) =>
+        reportLibraryErrorAndRethrow(
+          reportingAttempt,
+          {
+            source: "task-sync",
+            code: libraryErrorCode(cause, "list-failed"),
+            target: "library",
+            message: errorMessage(cause)
+          },
+          cause
+        )
+      )
       .finally(() => {
         if (loadTasksRequestRef.current === request) {
           loadTasksRequestRef.current = null;
@@ -1498,7 +1588,20 @@ export function useLibraryData(
       });
     loadTasksRequestRef.current = request;
     return request;
-  }, [client]);
+  }, [client, createReportingAttempt]);
+
+  const loadTasksSafely = useCallback(
+    async (source: string, target: string, fallbackCode: string): Promise<TaskRecord[] | null> => {
+      const attempt = createReportingAttempt();
+      try {
+        return await loadTasks();
+      } catch (cause) {
+        await reportLibraryFailure(cause, source, target, fallbackCode, attempt);
+        return null;
+      }
+    },
+    [createReportingAttempt, loadTasks, reportLibraryFailure]
+  );
 
   const createScanRefreshSelectionToken = useCallback((): ScanRefreshSelectionToken | null => {
     if (selectedRootId === null) {
@@ -1560,6 +1663,7 @@ export function useLibraryData(
       requestGeneration: number;
       selectFirst?: boolean;
     }) => {
+      const reportingAttempt = createReportingAttempt();
       if (scope.requestGeneration !== mediaPageGeneration.current) {
         return;
       }
@@ -1642,7 +1746,8 @@ export function useLibraryData(
             cause,
             "media-load",
             `folder:${scope.folderId ?? "root"}`,
-            "window-load-failed"
+            "window-load-failed",
+            reportingAttempt
           );
         }
       } finally {
@@ -1655,7 +1760,7 @@ export function useLibraryData(
         }
       }
     },
-    [abortStaleMediaPageRequests, loadMediaPage]
+    [abortStaleMediaPageRequests, createReportingAttempt, loadMediaPage, reportLibraryFailure]
   );
 
   const requestMediaWindow = useCallback(
@@ -1839,71 +1944,82 @@ export function useLibraryData(
   );
 
   const refreshCurrentScanView = useCallback(async () => {
-    const selectionToken = createScanRefreshSelectionToken();
-    if (!selectionToken || !isCurrentScanRefreshSelection(selectionToken)) {
-      return;
-    }
-
-    // Refresh only the roots LIST (status/lastScanAt) — do NOT re-select, or a
-    // refresh that started before a folder click would snap the selection and
-    // tree expansion back to the previously-selected folder.
-    const refreshedRoots = await refreshRootsList();
-    if (!isCurrentScanRefreshSelection(selectionToken)) {
-      return;
-    }
-    const root = refreshedRoots.find((item) => item.id === selectionToken.rootId) ?? null;
-    const resolvedFolderId = selectionToken.folderId ?? root?.rootFolderId ?? null;
-    if (selectionToken.folderId !== null || resolvedFolderId !== null) {
-      const folderId = selectionToken.folderId ?? resolvedFolderId;
-      if (folderId === null) {
+    const reportingAttempt = createReportingAttempt();
+    let failureTarget = `root:${selectedRootIdRef.current ?? "active"}`;
+    try {
+      const selectionToken = createScanRefreshSelectionToken();
+      if (!selectionToken || !isCurrentScanRefreshSelection(selectionToken)) {
         return;
       }
-      // Refresh the folder tree FIRST, before tasks and media. The tree does not
-      // depend on tasks; awaiting loadTasks() first (GET /api/tasks can be slow
-      // with a large task table mid-scan) made the sidebar structure wait a full
-      // refresh cycle to update. Prioritize directory structure.
-      //
-      // Force a re-fetch: loadFolderChildren short-circuits on its cache, so once
-      // the sidebar cached the few sibling folders indexed early in the scan it
-      // would never pick up the rest as they are scanned in (a deep folder tree
-      // indexes its first child's contents fully before the next sibling appears).
-      // React reconciles by key so already-shown folders do not flicker.
-      await loadFolderChildren(folderId, { force: true });
+      failureTarget = `root:${selectionToken.rootId}`;
+
+      // Refresh only the roots LIST (status/lastScanAt) — do NOT re-select, or a
+      // refresh that started before a folder click would snap the selection and
+      // tree expansion back to the previously-selected folder.
+      const refreshedRoots = await refreshRootsList();
       if (!isCurrentScanRefreshSelection(selectionToken)) {
         return;
       }
-      if (root?.rootFolderId && root.rootFolderId !== folderId) {
-        await loadFolderChildren(root.rootFolderId, { force: true });
+      const root = refreshedRoots.find((item) => item.id === selectionToken.rootId) ?? null;
+      const resolvedFolderId = selectionToken.folderId ?? root?.rootFolderId ?? null;
+      if (selectionToken.folderId !== null || resolvedFolderId !== null) {
+        const folderId = selectionToken.folderId ?? resolvedFolderId;
+        if (folderId === null) {
+          return;
+        }
+        failureTarget = `folder:${folderId}`;
+        // Refresh the folder tree FIRST, before tasks and media. The tree does not
+        // depend on tasks; refreshing tasks first can delay visible tree updates.
+        await loadFolderChildren(folderId, { force: true });
+        if (!isCurrentScanRefreshSelection(selectionToken)) {
+          return;
+        }
+        if (root?.rootFolderId && root.rootFolderId !== folderId) {
+          await loadFolderChildren(root.rootFolderId, { force: true });
+        }
+        // Tasks/scan progress are not needed for the tree; refresh them after the
+        // structure is on screen without creating an unhandled rejection.
+        void loadTasksSafely("task-sync", "library", "scan-task-load-failed");
+        await reloadCurrentMedia({
+          rootId: selectionToken.rootId,
+          folderId: selectionToken.folderId ?? resolvedFolderId,
+          scanRefreshSelectionToken: selectionToken,
+          incremental: true
+        });
+        return;
       }
-      // Tasks/scan progress are not needed for the tree; refresh them after the
-      // structure is on screen (fire without blocking the media reload below).
-      void loadTasks();
+
+      void loadTasksSafely("task-sync", "library", "scan-task-load-failed");
       await reloadCurrentMedia({
         rootId: selectionToken.rootId,
-        folderId: selectionToken.folderId ?? resolvedFolderId,
+        folderId: null,
         scanRefreshSelectionToken: selectionToken,
         incremental: true
       });
-      return;
+    } catch (cause) {
+      return reportLibraryErrorAndRethrow(
+        reportingAttempt,
+        {
+          source: "scan-refresh",
+          code: libraryErrorCode(cause, "refresh-failed"),
+          target: failureTarget,
+          message: errorMessage(cause)
+        },
+        cause
+      );
     }
-
-    void loadTasks();
-    await reloadCurrentMedia({
-      rootId: selectionToken.rootId,
-      folderId: null,
-      scanRefreshSelectionToken: selectionToken,
-      incremental: true
-    });
   }, [
     createScanRefreshSelectionToken,
+    createReportingAttempt,
     isCurrentScanRefreshSelection,
     loadFolderChildren,
+    loadTasksSafely,
     refreshRootsList,
-    loadTasks,
     reloadCurrentMedia
   ]);
 
   const loadLibrary = useCallback(async (scope?: LibrarySelectionScope) => {
+    const reportingAttempt = createReportingAttempt();
     const requestGeneration = ++mediaPageGeneration.current;
     abortStaleMediaPageRequests();
     abortStaleFolderRequests();
@@ -1931,12 +2047,12 @@ export function useLibraryData(
         setFolderDescendantsByParent({});
         setFolderChildNextCursorByParent({});
       }
-      void loadTasks();
+      void loadTasksSafely("task-sync", "library", "library-task-load-failed");
 
       if (root) {
         const folderFilter = folderId !== null && folderId !== undefined ? folderId : undefined;
         setMedia([]);
-      setMediaSlots(new Map());
+        setMediaSlots(new Map());
         setMediaTotalCount(0);
         setLoadedMediaRanges([]);
         mediaCursorByStartIndexRef.current.clear();
@@ -1960,7 +2076,13 @@ export function useLibraryData(
         selectMedia(null);
       }
     } catch (cause) {
-      reportLibraryFailure(cause, "library-load", "library", "load-failed");
+      void reportLibraryFailure(
+        cause,
+        "library-load",
+        "library",
+        "load-failed",
+        reportingAttempt
+      );
     } finally {
       setLoading(false);
     }
@@ -1968,9 +2090,11 @@ export function useLibraryData(
     loadMediaWindow,
     abortStaleFolderRequests,
     abortStaleMediaPageRequests,
+    createReportingAttempt,
     loadFolderChildren,
     loadRoots,
-    loadTasks
+    loadTasksSafely,
+    reportLibraryFailure
   ]);
 
   useEffect(() => {
@@ -1980,10 +2104,13 @@ export function useLibraryData(
   useEffect(() => {
     const unsubscribe = subscribeLibraryPhase((phase) => {
       if (phase === "loading-media") {
+        libraryRequestGenerationRef.current += 1;
+        activeLibraryContextRef.current = null;
         thumbnailCacheStatsControllerRef.current?.abort();
         thumbnailCacheStatsControllerRef.current = null;
         setThumbnailCacheStatsSnapshot(null);
         setThumbnailCacheStatsLoading(false);
+        loadTasksRequestRef.current = null;
         void loadLibrary({ rootId: null, folderId: null });
       }
     });
@@ -2060,6 +2187,7 @@ export function useLibraryData(
   // Load tag list once and refresh on demand via createTag/deleteTag.
   useEffect(() => {
     let cancelled = false;
+    const reportingAttempt = createReportingAttempt();
     void client
       .listTags()
       .then((response) => {
@@ -2069,13 +2197,19 @@ export function useLibraryData(
       })
       .catch((cause) => {
         if (!cancelled) {
-          reportLibraryFailure(cause, "tag-load", "library", "list-failed");
+          void reportLibraryFailure(
+            cause,
+            "tag-load",
+            "library",
+            "list-failed",
+            reportingAttempt
+          );
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [client]);
+  }, [client, createReportingAttempt, reportLibraryFailure]);
 
   // Load user metadata for the currently selected media item.
   useEffect(() => {
@@ -2084,6 +2218,7 @@ export function useLibraryData(
       return;
     }
     let cancelled = false;
+    const reportingAttempt = createReportingAttempt();
     const requestGeneration = metadataEditGenerationRef.current;
     const requestMediaId = selectedMediaId;
     void client
@@ -2103,14 +2238,15 @@ export function useLibraryData(
             cause,
             "metadata-load",
             `file:${selectedMediaId}`,
-            "load-failed"
+            "load-failed",
+            reportingAttempt
           );
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [client, selectedMediaId]);
+  }, [client, createReportingAttempt, reportLibraryFailure, selectedMediaId]);
 
   useEffect(() => {
     if (!selectedMedia) {
@@ -2176,6 +2312,7 @@ export function useLibraryData(
         return;
       }
       lastThumbnailCacheAutoRefreshScopeKeyRef.current = scopeKey;
+      const enqueueReportingAttempt = createReportingAttempt();
       void client
         .enqueueThumbnailCache(
           {
@@ -2196,7 +2333,8 @@ export function useLibraryData(
               cause,
               "thumbnail-cache",
               scopeKey,
-              "auto-enqueue-failed"
+              "auto-enqueue-failed",
+              enqueueReportingAttempt
             );
           }
         });
@@ -2218,6 +2356,7 @@ export function useLibraryData(
       autoRetryFailedThumbnailsControllerRef.current?.abort();
       const retryController = new AbortController();
       autoRetryFailedThumbnailsControllerRef.current = retryController;
+      const retryReportingAttempt = createReportingAttempt();
       void runThumbnailCacheEnqueueBatches(
         client,
         scope,
@@ -2243,13 +2382,15 @@ export function useLibraryData(
           // up the just-revived tasks at viewport priority — the same
           // priority tier as first-time generation.
           thumbnailPriorityScopeSyncKeyRef.current = null;
+          const syncReportingAttempt = createReportingAttempt();
           void flushThumbnailPriorityScopeSync().catch((cause) => {
             if (!isAbortError(cause)) {
               reportLibraryFailure(
                 cause,
                 "thumbnail-priority",
                 scopeKey,
-                "retry-sync-failed"
+                "retry-sync-failed",
+                syncReportingAttempt
               );
             }
           });
@@ -2260,7 +2401,8 @@ export function useLibraryData(
               cause,
               "thumbnail-cache",
               scopeKey,
-              "auto-retry-failed"
+              "auto-retry-failed",
+              retryReportingAttempt
             );
           }
         })
@@ -2282,9 +2424,11 @@ export function useLibraryData(
     };
   }, [
     client,
+    createReportingAttempt,
     currentThumbnailCacheScope,
     flushThumbnailPriorityScopeSync,
     options.persistentThumbnailCacheAutoRefresh,
+    reportLibraryFailure,
     refreshThumbnailCacheStats,
     selectedFolderId,
     selectedRootId,
@@ -2328,6 +2472,7 @@ export function useLibraryData(
       )
     };
 
+    const reportingAttempt = createReportingAttempt();
     let cancelled = false;
     const controller = new AbortController();
     interactiveFolderScanControllerRef.current = controller;
@@ -2348,7 +2493,8 @@ export function useLibraryData(
               cause,
               "folder-scan",
               `folder:${selectedFolderId}`,
-              "enqueue-failed"
+              "enqueue-failed",
+              reportingAttempt
             );
           }
         });
@@ -2361,7 +2507,13 @@ export function useLibraryData(
         interactiveFolderScanControllerRef.current = null;
       }
     };
-  }, [client, selectedFolderId, selectedRoot?.rootFolderId]);
+  }, [
+    client,
+    createReportingAttempt,
+    reportLibraryFailure,
+    selectedFolderId,
+    selectedRoot?.rootFolderId
+  ]);
 
   const previousTaskStatusRef = useRef<Map<number, TaskRecord["status"]>>(new Map());
   useEffect(() => {
@@ -2403,11 +2555,19 @@ export function useLibraryData(
       return;
     }
     if (shouldRefreshRootsList) {
+      const reportingAttempt = createReportingAttempt();
       void refreshRootsList().catch((cause) => {
-        reportLibraryFailure(cause, "root-load", "library", "refresh-failed");
+        void reportLibraryFailure(
+          cause,
+          "root-load",
+          "library",
+          "refresh-failed",
+          reportingAttempt
+        );
       });
     }
     if (interactiveRefreshScope) {
+      const reportingAttempt = createReportingAttempt();
       void reloadCurrentMedia({
         rootId: interactiveRefreshScope.rootId,
         folderId: interactiveRefreshScope.folderId,
@@ -2417,11 +2577,21 @@ export function useLibraryData(
           cause,
           "media-load",
           `folder:${interactiveRefreshScope.folderId ?? "root"}`,
-          "scan-refresh-failed"
+          "scan-refresh-failed",
+          reportingAttempt
         );
       });
     }
-  }, [loadLibrary, reloadCurrentMedia, refreshRootsList, selectedFolderId, selectedRootId, tasks]);
+  }, [
+    createReportingAttempt,
+    loadLibrary,
+    reloadCurrentMedia,
+    reportLibraryFailure,
+    refreshRootsList,
+    selectedFolderId,
+    selectedRootId,
+    tasks
+  ]);
 
   useEffect(() => {
     if (!scanActive || taskPollFailures >= 3) {
@@ -2429,13 +2599,12 @@ export function useLibraryData(
     }
 
     const timer = window.setInterval(() => {
-      void loadTasks().catch((cause) => {
-        setTaskPollFailures((failures) => failures + 1);
-        reportLibraryFailure(cause, "task-sync", "library", "poll-failed");
+      void loadTasksSafely("task-sync", "library", "poll-failed").then((result) => {
+        if (result === null) setTaskPollFailures((failures) => failures + 1);
       });
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [loadTasks, scanActive, taskPollFailures]);
+  }, [loadTasksSafely, scanActive, taskPollFailures]);
 
   useEffect(() => {
     if (!scanActiveRootTask || scanRefreshFailures >= 3) {
@@ -2453,12 +2622,7 @@ export function useLibraryData(
         })
         .catch((cause) => {
           setScanRefreshFailures((failures) => failures + 1);
-          reportLibraryFailure(
-            cause,
-            "scan-refresh",
-            `root:${selectedRootIdRef.current ?? "active"}`,
-            "refresh-failed"
-          );
+          void retryLibraryErrorReport(cause);
         })
         .finally(() => {
           scanRefreshInFlightRef.current = false;
@@ -2509,6 +2673,7 @@ export function useLibraryData(
 
   const selectLibraryFolder = useCallback(
     (entry: FolderNavigationEntry, options?: { recordHistory?: boolean }) => {
+      const reportingAttempt = createReportingAttempt();
       const recordHistory = options?.recordHistory ?? true;
       prepareNavigationMediaReload();
       selectedRootIdRef.current = entry.rootId;
@@ -2528,7 +2693,8 @@ export function useLibraryData(
               cause,
               "folder-load",
               `folder:${entry.folderId}`,
-              "navigation-child-load-failed"
+              "navigation-child-load-failed",
+              reportingAttempt
             );
           });
         }
@@ -2542,8 +2708,10 @@ export function useLibraryData(
     },
     [
       loadFolderChildren,
+      createReportingAttempt,
       prepareNavigationMediaReload,
       pushFolderNavigationEntry,
+      reportLibraryFailure,
       reloadCurrentMedia
     ]
   );
@@ -2567,6 +2735,7 @@ export function useLibraryData(
       const trimmedPath = path.trim();
       if (!trimmedPath) return;
 
+      const reportingAttempt = createReportingAttempt();
       setAddingRoot(true);
       try {
         const response = await client.addRoot(trimmedPath);
@@ -2585,12 +2754,18 @@ export function useLibraryData(
         await loadTasks();
         await loadLibrary(response.rootId ? { rootId: response.rootId, folderId: null } : undefined);
       } catch (cause) {
-        reportLibraryFailure(cause, "root-action", "root:add", "add-failed");
+        void reportLibraryFailure(
+          cause,
+          "root-action",
+          "root:add",
+          "add-failed",
+          reportingAttempt
+        );
       } finally {
         setAddingRoot(false);
       }
     },
-    [client, loadLibrary, loadTasks]
+    [client, createReportingAttempt, loadLibrary, loadTasks, reportLibraryFailure]
   );
 
   const loadMoreMedia = useCallback(async () => {
@@ -2603,12 +2778,19 @@ export function useLibraryData(
 
   const rescanRoot = useCallback(
     async (rootId: number) => {
+      const reportingAttempt = createReportingAttempt();
       setRescanningRootIds((current) => new Set(current).add(rootId));
       try {
         await client.enqueueScan(rootId);
         await loadTasks();
       } catch (cause) {
-        reportLibraryFailure(cause, "root-scan", `root:${rootId}`, "enqueue-failed");
+        void reportLibraryFailure(
+          cause,
+          "root-scan",
+          `root:${rootId}`,
+          "enqueue-failed",
+          reportingAttempt
+        );
       } finally {
         setRescanningRootIds((current) => {
           const next = new Set(current);
@@ -2617,11 +2799,12 @@ export function useLibraryData(
         });
       }
     },
-    [client, loadTasks]
+    [client, createReportingAttempt, loadTasks, reportLibraryFailure]
   );
 
   const removeRoot = useCallback(
     async (rootId: number) => {
+      const reportingAttempt = createReportingAttempt();
       // Optimistic: drop the root from the sidebar immediately.
       setRoots((current) => current.filter((root) => root.id !== rootId));
       if (selectedRootIdRef.current === rootId) {
@@ -2633,11 +2816,17 @@ export function useLibraryData(
         // server-side correction reconciles (without a full loadLibrary reflow).
         await refreshRootsList();
       } catch (cause) {
-        reportLibraryFailure(cause, "root-action", `root:${rootId}`, "remove-failed");
+        void reportLibraryFailure(
+          cause,
+          "root-action",
+          `root:${rootId}`,
+          "remove-failed",
+          reportingAttempt
+        );
         await refreshRootsList();
       }
     },
-    [client, refreshRootsList]
+    [client, createReportingAttempt, refreshRootsList, reportLibraryFailure]
   );
 
   const markTaskBusy = useCallback((taskId: number, busy: boolean) => {
@@ -2654,41 +2843,62 @@ export function useLibraryData(
 
   const cancelTask = useCallback(
     async (taskId: number) => {
+      const reportingAttempt = createReportingAttempt();
       markTaskBusy(taskId, true);
       try {
         await client.cancelTask(taskId);
         await loadTasks();
       } catch (cause) {
-        reportLibraryFailure(cause, "task-action", `task:${taskId}`, "cancel-failed");
+        void reportLibraryFailure(
+          cause,
+          "task-action",
+          `task:${taskId}`,
+          "cancel-failed",
+          reportingAttempt
+        );
       } finally {
         markTaskBusy(taskId, false);
       }
     },
-    [client, loadTasks, markTaskBusy]
+    [client, createReportingAttempt, loadTasks, markTaskBusy, reportLibraryFailure]
   );
 
   const retryTask = useCallback(
     async (taskId: number) => {
+      const reportingAttempt = createReportingAttempt();
       markTaskBusy(taskId, true);
       try {
         await client.retryTask(taskId);
         await loadTasks();
       } catch (cause) {
-        reportLibraryFailure(cause, "task-action", `task:${taskId}`, "retry-failed");
+        void reportLibraryFailure(
+          cause,
+          "task-action",
+          `task:${taskId}`,
+          "retry-failed",
+          reportingAttempt
+        );
       } finally {
         markTaskBusy(taskId, false);
       }
     },
-    [client, loadTasks, markTaskBusy]
+    [client, createReportingAttempt, loadTasks, markTaskBusy, reportLibraryFailure]
   );
 
   const refreshTasks = useCallback(async () => {
+    const reportingAttempt = createReportingAttempt();
     try {
       await loadTasks();
     } catch (cause) {
-      reportLibraryFailure(cause, "task-sync", "library", "refresh-failed");
+      void reportLibraryFailure(
+        cause,
+        "task-sync",
+        "library",
+        "refresh-failed",
+        reportingAttempt
+      );
     }
-  }, [loadTasks]);
+  }, [createReportingAttempt, loadTasks, reportLibraryFailure]);
 
   const setQ = useCallback((q: string) => {
     setSearchState((current) => (current.q === q ? current : { ...current, q }));
@@ -2766,6 +2976,7 @@ export function useLibraryData(
 
   const updateMetadata = useCallback(
     async (fileId: number, patch: UserMetadataUpdate) => {
+      const reportingAttempt = createReportingAttempt();
       const previousMetadata =
         selectedMetadata && selectedMetadata.fileId === fileId ? selectedMetadata : null;
       const previousMediaRow = media.find((item) => item.id === fileId) ?? null;
@@ -2786,12 +2997,25 @@ export function useLibraryData(
             current.map((item) => (item.id === fileId ? previousMediaRow : item))
           );
         }
-        reportLibraryFailure(cause, "metadata-save", `file:${fileId}`, "update-failed");
+        reportLibraryFailure(
+          cause,
+          "metadata-save",
+          `file:${fileId}`,
+          "update-failed",
+          reportingAttempt
+        );
       } finally {
         setMetadataSaving(false);
       }
     },
-    [client, media, reflectMetadataLocally, selectedMetadata]
+    [
+      client,
+      createReportingAttempt,
+      media,
+      reflectMetadataLocally,
+      reportLibraryFailure,
+      selectedMetadata
+    ]
   );
 
   const reflectFileTagsLocally = useCallback((fileId: number, tagIds: number[]) => {
@@ -2822,6 +3046,7 @@ export function useLibraryData(
 
   const setFileTags = useCallback(
     async (fileId: number, tagIds: number[]) => {
+      const reportingAttempt = createReportingAttempt();
       const previous = capturePreviousTagIds(fileId);
       metadataEditGenerationRef.current += 1;
       reflectFileTagsLocally(fileId, tagIds);
@@ -2830,14 +3055,27 @@ export function useLibraryData(
         reflectFileTagsLocally(fileId, response.tagIds);
       } catch (cause) {
         if (previous) reflectFileTagsLocally(fileId, previous);
-        reportLibraryFailure(cause, "tag-save", `file:${fileId}`, "replace-failed");
+        reportLibraryFailure(
+          cause,
+          "tag-save",
+          `file:${fileId}`,
+          "replace-failed",
+          reportingAttempt
+        );
       }
     },
-    [capturePreviousTagIds, client, reflectFileTagsLocally]
+    [
+      capturePreviousTagIds,
+      client,
+      createReportingAttempt,
+      reflectFileTagsLocally,
+      reportLibraryFailure
+    ]
   );
 
   const addFileTag = useCallback(
     async (fileId: number, tagId: number) => {
+      const reportingAttempt = createReportingAttempt();
       const previous = capturePreviousTagIds(fileId);
       const optimistic = previous && previous.includes(tagId) ? previous : [...(previous ?? []), tagId];
       metadataEditGenerationRef.current += 1;
@@ -2847,14 +3085,27 @@ export function useLibraryData(
         reflectFileTagsLocally(fileId, response.tagIds);
       } catch (cause) {
         if (previous) reflectFileTagsLocally(fileId, previous);
-        reportLibraryFailure(cause, "tag-save", `file:${fileId}`, "add-failed");
+        reportLibraryFailure(
+          cause,
+          "tag-save",
+          `file:${fileId}`,
+          "add-failed",
+          reportingAttempt
+        );
       }
     },
-    [capturePreviousTagIds, client, reflectFileTagsLocally]
+    [
+      capturePreviousTagIds,
+      client,
+      createReportingAttempt,
+      reflectFileTagsLocally,
+      reportLibraryFailure
+    ]
   );
 
   const removeFileTag = useCallback(
     async (fileId: number, tagId: number) => {
+      const reportingAttempt = createReportingAttempt();
       const previous = capturePreviousTagIds(fileId);
       const optimistic = (previous ?? []).filter((id) => id !== tagId);
       metadataEditGenerationRef.current += 1;
@@ -2864,14 +3115,27 @@ export function useLibraryData(
         reflectFileTagsLocally(fileId, response.tagIds);
       } catch (cause) {
         if (previous) reflectFileTagsLocally(fileId, previous);
-        reportLibraryFailure(cause, "tag-save", `file:${fileId}`, "remove-failed");
+        reportLibraryFailure(
+          cause,
+          "tag-save",
+          `file:${fileId}`,
+          "remove-failed",
+          reportingAttempt
+        );
       }
     },
-    [capturePreviousTagIds, client, reflectFileTagsLocally]
+    [
+      capturePreviousTagIds,
+      client,
+      createReportingAttempt,
+      reflectFileTagsLocally,
+      reportLibraryFailure
+    ]
   );
 
   const createTag = useCallback(
     async (name: string, color?: string | null) => {
+      const reportingAttempt = createReportingAttempt();
       try {
         const tag = await client.createTag({ name, color: color ?? null });
         setTags((current) => {
@@ -2880,15 +3144,22 @@ export function useLibraryData(
         });
         return tag;
       } catch (cause) {
-        reportLibraryFailure(cause, "tag-action", "tag:create", "create-failed");
+        reportLibraryFailure(
+          cause,
+          "tag-action",
+          "tag:create",
+          "create-failed",
+          reportingAttempt
+        );
         return null;
       }
     },
-    [client]
+    [client, createReportingAttempt, reportLibraryFailure]
   );
 
   const deleteTag = useCallback(
     async (tagId: number) => {
+      const reportingAttempt = createReportingAttempt();
       try {
         await client.deleteTag(tagId);
         setTags((current) => current.filter((tag) => tag.id !== tagId));
@@ -2897,10 +3168,16 @@ export function useLibraryData(
           tagIds: current.tagIds.filter((id) => id !== tagId)
         }));
       } catch (cause) {
-        reportLibraryFailure(cause, "tag-action", `tag:${tagId}`, "delete-failed");
+        reportLibraryFailure(
+          cause,
+          "tag-action",
+          `tag:${tagId}`,
+          "delete-failed",
+          reportingAttempt
+        );
       }
     },
-    [client]
+    [client, createReportingAttempt, reportLibraryFailure]
   );
 
   useEffect(() => {
@@ -3084,6 +3361,7 @@ export function useLibraryData(
   }, [currentThumbnailCacheScope, enqueueThumbnailCacheLoop]);
 
   const generateAllThumbnailCache = useCallback(async () => {
+    const reportingAttempt = createReportingAttempt();
     // Whole-library generation walks the library with a keyset cursor: each
     // request scans one bounded window (Core returns `nextCursor`) and enqueues
     // the candidates in it. This keeps every writer job short so interactive
@@ -3114,7 +3392,13 @@ export function useLibraryData(
       }
     } catch (cause) {
       if (!isAbortError(cause)) {
-        reportLibraryFailure(cause, "thumbnail-cache", "library", "generate-all-failed");
+        reportLibraryFailure(
+          cause,
+          "thumbnail-cache",
+          "library",
+          "generate-all-failed",
+          reportingAttempt
+        );
       }
     } finally {
       if (thumbnailCacheActionControllerRef.current === controller) {
@@ -3123,7 +3407,12 @@ export function useLibraryData(
       setThumbnailCacheActionBusy(false);
       void refreshThumbnailCacheStats();
     }
-  }, [client, refreshThumbnailCacheStats]);
+  }, [
+    client,
+    createReportingAttempt,
+    refreshThumbnailCacheStats,
+    reportLibraryFailure
+  ]);
 
   // Whole-library background generation, only in "allPersist" mode. Kicked off
   // once per root (the enqueue is idempotent server-side and bulk-priority, so
@@ -3180,18 +3469,30 @@ export function useLibraryData(
   }, [currentThumbnailCacheScope, enqueueThumbnailCacheLoop]);
 
   const clearPersistentThumbnailCache = useCallback(async () => {
+    const reportingAttempt = createReportingAttempt();
     try {
       setThumbnailCacheActionBusy(true);
       await client.clearThumbnailCache({ requestPriority: "interactive" });
       await refreshThumbnailCacheStats();
     } catch (cause) {
       if (!isAbortError(cause)) {
-        reportLibraryFailure(cause, "thumbnail-cache", "library", "clear-failed");
+        reportLibraryFailure(
+          cause,
+          "thumbnail-cache",
+          "library",
+          "clear-failed",
+          reportingAttempt
+        );
       }
     } finally {
       setThumbnailCacheActionBusy(false);
     }
-  }, [client, refreshThumbnailCacheStats]);
+  }, [
+    client,
+    createReportingAttempt,
+    refreshThumbnailCacheStats,
+    reportLibraryFailure
+  ]);
 
   return {
     roots,
@@ -3290,6 +3591,7 @@ export function useLibraryData(
     requestFolderChildren: loadFolderChildren,
     revealFolderPath,
     toggleFolderExpanded: (folderId: number) => {
+      const reportingAttempt = createReportingAttempt();
       setExpandedFolderIds((current) => {
         const next = new Set(current);
         if (next.has(folderId)) {
@@ -3301,7 +3603,8 @@ export function useLibraryData(
               cause,
               "folder-load",
               `folder:${folderId}`,
-              "expand-load-failed"
+              "expand-load-failed",
+              reportingAttempt
             );
           });
         }
@@ -3745,10 +4048,20 @@ function buildSearchParams(
 }
 
 function errorMessage(cause: unknown): string {
+  if (cause instanceof ReportedLibraryFailure) {
+    return errorMessage(cause.originalCause);
+  }
   if (cause instanceof Error) {
     return cause.message;
   }
-  return "Core request failed";
+  return typeof cause === "string" ? cause : "Core request failed";
+}
+
+function sameLibraryContext(
+  left: NotificationLibraryContext | null,
+  right: NotificationLibraryContext | null
+): boolean {
+  return left?.libraryId === right?.libraryId && left?.libraryName === right?.libraryName;
 }
 
 function fileOpFailure(cause: unknown): FileOpResult {

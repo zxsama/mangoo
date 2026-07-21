@@ -22,5 +22,15 @@ if (source.includes("NotificationRetryableFailureReference") || source.includes(
 if (!/interface NotificationCompactSnapshot[\s\S]*hasRetryableFailure: boolean;[\s\S]*syncHealth: NotificationSyncHealth;/.test(source)) {
   throw new Error("notification compact snapshot must expose one authoritative failure boolean");
 }
+if (!/interface RendererErrorReport[\s\S]*reportId\?: string;/.test(source)) {
+  throw new Error("renderer error reports must support a stable logical occurrence id");
+}
+if (
+  !source.includes("rendererErrorIdentityKey") ||
+  !source.includes("rendererErrorOperationId") ||
+  !source.includes("legacyRendererErrorOperationId")
+) {
+  throw new Error("renderer error identity and legacy migration helpers must stay shared");
+}
 
 console.log("PASS: shared notification contract boundary");

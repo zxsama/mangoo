@@ -7,6 +7,7 @@ import type {
   FileOperationRecord,
   NotificationOutboxAckResponse
 } from "@megle/core-client/generated-contract";
+import { rendererErrorOperationId } from "@megle/notification-contract";
 
 import {
   createNotificationService,
@@ -118,7 +119,7 @@ function ackResponse(body: NotificationOutboxAckResponse): Response {
 }
 
 function rendererErrorOperationIdForTest(report: RendererErrorReport): string {
-  return `renderer-error:${report.libraryId}:${report.source}:${report.code}:${report.target}`;
+  return rendererErrorOperationId(report.libraryId, report);
 }
 
 function emptySnapshot(): NotificationStoredSnapshot {
@@ -325,7 +326,7 @@ class FakeStore implements NotificationServiceStore {
     reportId: string,
     occurredAt: number
   ): Promise<NotificationRendererErrorRecordResult> {
-    const operationId = `renderer-error:${library.id}:${report.source}:${report.code}:${report.target}`;
+    const operationId = rendererErrorOperationId(library.id, report);
     const key = `${library.id}/${operationId}`;
     const existing = this.operations.get(key);
     if (this.rendererReportIds.has(reportId)) {
@@ -1224,13 +1225,21 @@ describe("notification service", () => {
     assert.ok(
       await recoveredStore.getOperation(
         LIBRARY_A.id,
-        `renderer-error:${LIBRARY_A.id}:recovery:initial:folder:1`
+        rendererErrorOperationId(LIBRARY_A.id, {
+          source: "recovery",
+          code: "initial",
+          target: "folder:1"
+        })
       )
     );
     assert.ok(
       await recoveredStore.getOperation(
         LIBRARY_A.id,
-        `renderer-error:${LIBRARY_A.id}:recovery:injected:folder:1`
+        rendererErrorOperationId(LIBRARY_A.id, {
+          source: "recovery",
+          code: "injected",
+          target: "folder:1"
+        })
       )
     );
     assert.equal(recoveredStore.summaries.get(LIBRARY_A.id)?.observedAt, 200);
@@ -1313,6 +1322,30 @@ describe("notification service", () => {
     assert.equal((await service.compactSnapshot()).thumbnailSummaries.length, 1);
     assert.ok(reports.length >= 3);
     unsubscribe();
+    await service.close();
+  });
+
+  it("uses a renderer-supplied report id to make IPC retries idempotent", async () => {
+    const store = new FakeStore();
+    const service = await createNotificationService({ store, now: () => NOW });
+    const report: RendererErrorReport = {
+      reportId: "renderer-attempt-1",
+      libraryId: LIBRARY_A.id,
+      libraryName: LIBRARY_A.name,
+      source: "media-load",
+      code: "reload-failed",
+      target: "folder:4",
+      title: "Media load failed",
+      message: "Could not load media",
+      detail: null
+    };
+
+    await service.reportRendererError(report);
+    await service.reportRendererError(report);
+    assert.equal((await service.history({ limit: 20, offset: 0 })).items[0]?.occurrenceCount, 1);
+
+    await service.reportRendererError({ ...report, reportId: "renderer-attempt-2" });
+    assert.equal((await service.history({ limit: 20, offset: 0 })).items[0]?.occurrenceCount, 2);
     await service.close();
   });
 
@@ -1901,7 +1934,7 @@ describe("notification service", () => {
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
     const stored = await recoveredStore.getOperation(
       LIBRARY_A.id,
-      `renderer-error:${LIBRARY_A.id}:${report.source}:${report.code}:${report.target}`
+      rendererErrorOperationId(LIBRARY_A.id, report)
     );
     assert.equal(stored?.occurrenceCount, 7);
     await service.close();

@@ -144,7 +144,12 @@ export function parseNotificationAction(
 
 export function parseRendererErrorReport(value: unknown): RendererErrorReport {
   const input = record(value, "renderer error report");
+  const reportId =
+    input.reportId === undefined
+      ? undefined
+      : boundedString(input.reportId, "reportId", 256);
   return {
+    ...(reportId ? { reportId } : {}),
     libraryId: boundedString(input.libraryId, "libraryId", 256),
     libraryName: boundedString(input.libraryName, "libraryName", 256),
     source: boundedString(input.source, "source", 128),

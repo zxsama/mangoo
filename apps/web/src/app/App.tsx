@@ -133,6 +133,7 @@ export function App() {
   const hasLoadedActiveLibraryNameRef = useRef(false);
   const library = useLibraryData({
     activeLibraryId,
+    activeLibraryName,
     persistentThumbnailCacheAutoRefresh:
       previewPreferences.persistentThumbnailCacheAutoRefresh,
     thumbnailGenerationMode: previewPreferences.thumbnailGenerationMode
@@ -243,7 +244,16 @@ export function App() {
     void notifyDesktopShellReady();
   }, []);
 
-  useEffect(() => subscribeLibraryPhase(setLibraryPhase), []);
+  useEffect(
+    () =>
+      subscribeLibraryPhase((phase) => {
+        setLibraryPhase(phase);
+        if (phase === "loading-media") {
+          setActiveLibraryId(null);
+        }
+      }),
+    []
+  );
 
   // Derive the sidebar's displayed library name from the registry: fetch it on
   // mount (the initial render may predate any "ready" transition) and again

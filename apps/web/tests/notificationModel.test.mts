@@ -19,9 +19,13 @@ import {
 } from "../src/features/notifications/notificationModel.ts";
 import { createNotificationStore } from "../src/features/notifications/useNotifications.ts";
 import {
+  createLibraryErrorReportAttempt,
   publishThumbnailCacheStats,
   reportLibraryError,
+  reportLibraryErrorAndRethrow,
   rendererErrorKey,
+  ReportedLibraryFailure,
+  retryLibraryErrorReport,
   thumbnailSummary
 } from "../src/core/notificationReporting.ts";
 
@@ -190,84 +194,71 @@ describe("notification reporting", () => {
   it("builds a stable renderer-error deduplication key", () => {
     assert.equal(
       rendererErrorKey({ source: "media-load", code: "timeout", target: "folder:4" }),
-      "media-load:timeout:folder:4"
+      '["media-load","timeout","folder:4"]'
     );
     assert.equal(
       rendererErrorKey({ source: " Media Load ", code: " HTTP 504 ", target: " Folder:4 " }),
-      "media-load:http-504:folder:4"
+      '["media-load","http-504","folder:4"]'
+    );
+    assert.notEqual(
+      rendererErrorKey({ source: "a:b", code: "c", target: "d" }),
+      rendererErrorKey({ source: "a", code: "b:c", target: "d" })
     );
   });
 
   it("bounds renderer reports and never throws bridge failures into browsing code", async () => {
     const previousWindow = (globalThis as { window?: unknown }).window;
-    const reports: unknown[] = [];
     try {
       (globalThis as { window?: unknown }).window = {};
-      assert.doesNotThrow(() =>
-        reportLibraryError({
+      const attempt = createLibraryErrorReportAttempt(
+        { libraryId: "lib-a", libraryName: "Artists" },
+        "attempt-bounds"
+      );
+      assert.equal(
+        await reportLibraryError(attempt, {
           source: "media-load",
           code: "timeout",
           target: "folder:4",
           message: "request timed out"
-        })
+        }),
+        false
       );
 
       (globalThis as { window?: unknown }).window = {
         megleDesktop: {
-          listLibraries: async () => [
-            {
-              id: "lib-a",
-              name: "Artists",
-              dbPath: "artists.sqlite",
-              available: true,
-              active: true
-            }
-          ],
           notifications: bridge({
-            reportError: async (input) => {
-              reports.push(input);
+            reportError: async () => {
               throw new Error("notification store unavailable");
             }
           })
         }
       };
 
-      assert.doesNotThrow(() =>
-        reportLibraryError({
+      assert.equal(
+        await reportLibraryError(attempt, {
           source: " Media Load ",
           code: " HTTP 504 ",
           target: " Folder:4 ",
           message: "request timed out"
-        })
+        }),
+        false
       );
-      reportLibraryError({
-        source: "media-load",
-        code: "http-504",
-        target: "folder:4",
-        message: "request timed out"
-      });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.deepEqual(reports, [
-        {
-          libraryId: "lib-a",
-          libraryName: "Artists",
-          source: "media-load",
-          code: "http-504",
-          target: "folder:4",
-          title: "Media load failed",
-          message: "request timed out",
-          detail: null
-        }
-      ]);
 
-      reportLibraryError({
-        source: "media-load",
-        code: "timeout",
-        target: "folder:4",
-        message: "x".repeat(4001)
-      });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal(reports.length, 1);
+      assert.equal(
+        await reportLibraryError(
+          createLibraryErrorReportAttempt(
+            { libraryId: "lib-a", libraryName: "Artists" },
+            "attempt-overlong"
+          ),
+          {
+            source: "media-load",
+            code: "timeout",
+            target: "folder:4",
+            message: "x".repeat(4001)
+          }
+        ),
+        false
+      );
     } finally {
       if (previousWindow === undefined) {
         delete (globalThis as { window?: unknown }).window;
@@ -277,21 +268,78 @@ describe("notification reporting", () => {
     }
   });
 
-  it("reports a nested renderer failure exactly once with the owning context", async () => {
+  it("retries a failed bridge call with the same logical report id", async () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    const reports: unknown[] = [];
+    let calls = 0;
+    try {
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          notifications: bridge({
+            reportError: async (input) => {
+              calls += 1;
+              reports.push(input);
+              if (calls === 1) throw new Error("IPC response lost");
+              return true;
+            }
+          })
+        }
+      };
+
+      const attempt = createLibraryErrorReportAttempt(
+        { libraryId: "lib-a", libraryName: "Artists" },
+        "attempt-retry"
+      );
+      const input = {
+        source: "media-load",
+        code: "reload-failed",
+        target: "folder:4",
+        message: "media reload failed"
+      };
+
+      assert.equal(await reportLibraryError(attempt, input), false);
+      assert.equal(await reportLibraryError(attempt, input), true);
+      assert.equal(await reportLibraryError(attempt, input), true);
+      assert.equal(calls, 2);
+      assert.deepEqual(reports, [
+        {
+          reportId: "attempt-retry",
+          libraryId: "lib-a",
+          libraryName: "Artists",
+          source: "media-load",
+          code: "reload-failed",
+          target: "folder:4",
+          title: "Media load failed",
+          message: "media reload failed",
+          detail: null
+        },
+        {
+          reportId: "attempt-retry",
+          libraryId: "lib-a",
+          libraryName: "Artists",
+          source: "media-load",
+          code: "reload-failed",
+          target: "folder:4",
+          title: "Media load failed",
+          message: "media reload failed",
+          detail: null
+        }
+      ]);
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
+
+  it("reports one logical attempt once and preserves primitive failures for backoff", async () => {
     const previousWindow = (globalThis as { window?: unknown }).window;
     const reports: unknown[] = [];
     try {
       (globalThis as { window?: unknown }).window = {
         megleDesktop: {
-          listLibraries: async () => [
-            {
-              id: "lib-a",
-              name: "Artists",
-              dbPath: "artists.sqlite",
-              available: true,
-              active: true
-            }
-          ],
           notifications: bridge({
             reportError: async (input) => {
               reports.push(input);
@@ -301,32 +349,36 @@ describe("notification reporting", () => {
         }
       };
 
-      const cause = new Error("media reload failed");
-      reportLibraryError({
-        cause,
-        source: "media-load",
-        code: "reload-failed",
-        target: "folder:4",
-        message: cause.message
-      });
-      reportLibraryError({
-        cause,
+      const attempt = createLibraryErrorReportAttempt(
+        { libraryId: "lib-a", libraryName: "Artists" },
+        "attempt-scan"
+      );
+      const input = {
         source: "scan-refresh",
         code: "refresh-failed",
         target: "root:2",
-        message: cause.message
-      });
-      await new Promise<void>((resolve) => setImmediate(resolve));
+        message: "primitive rejection"
+      };
+      let propagated: unknown;
+      try {
+        await reportLibraryErrorAndRethrow(attempt, input, "primitive rejection");
+      } catch (cause) {
+        propagated = cause;
+      }
 
+      assert.ok(propagated instanceof ReportedLibraryFailure);
+      assert.equal(propagated.originalCause, "primitive rejection");
+      assert.equal(await retryLibraryErrorReport(propagated), true);
       assert.equal(reports.length, 1);
       assert.deepEqual(reports[0], {
+        reportId: "attempt-scan",
         libraryId: "lib-a",
         libraryName: "Artists",
-        source: "media-load",
-        code: "reload-failed",
-        target: "folder:4",
-        title: "Media load failed",
-        message: "media reload failed",
+        source: "scan-refresh",
+        code: "refresh-failed",
+        target: "root:2",
+        title: "Scan refresh failed",
+        message: "primitive rejection",
         detail: null
       });
     } finally {
@@ -338,22 +390,160 @@ describe("notification reporting", () => {
     }
   });
 
-  it("publishes shared thumbnail stats through the frozen Desktop summary contract", async () => {
+  it("keeps nested failure reporting at exactly one business occurrence", async () => {
     const previousWindow = (globalThis as { window?: unknown }).window;
+    const reports: Array<{ source: string; reportId?: string }> = [];
+    try {
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          notifications: bridge({
+            reportError: async (input) => {
+              reports.push(input);
+              return true;
+            }
+          })
+        }
+      };
+
+      const attempt = createLibraryErrorReportAttempt(
+        { libraryId: "lib-a", libraryName: "Artists" },
+        "attempt-nested"
+      );
+      let propagated: unknown;
+      try {
+        await reportLibraryErrorAndRethrow(
+          attempt,
+          {
+            source: "media-load",
+            code: "window-load-failed",
+            target: "folder:4",
+            message: "Core unavailable"
+          },
+          new Error("Core unavailable")
+        );
+      } catch (cause) {
+        propagated = cause;
+      }
+
+      let outerPropagated: unknown;
+      try {
+        await reportLibraryErrorAndRethrow(
+          createLibraryErrorReportAttempt(
+            { libraryId: "lib-a", libraryName: "Artists" },
+            "attempt-nested-outer"
+          ),
+          {
+            source: "scan-refresh",
+            code: "refresh-failed",
+            target: "root:2",
+            message: "Core unavailable"
+          },
+          propagated
+        );
+      } catch (cause) {
+        outerPropagated = cause;
+      }
+
+      assert.equal(outerPropagated, propagated);
+      assert.deepEqual(reports, [
+        {
+          reportId: "attempt-nested",
+          source: "media-load",
+          code: "window-load-failed",
+          target: "folder:4",
+          libraryId: "lib-a",
+          libraryName: "Artists",
+          title: "Media load failed",
+          message: "Core unavailable",
+          detail: null
+        }
+      ]);
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
+
+  it("treats the same Error reused by independent operations as distinct occurrences", async () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    const reports: unknown[] = [];
+    try {
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          notifications: bridge({
+            reportError: async (input) => {
+              reports.push(input);
+              return true;
+            }
+          })
+        }
+      };
+      const sharedCause = new Error("shared object");
+      const input = {
+        source: "media-load",
+        code: "reload-failed",
+        target: "folder:4",
+        message: sharedCause.message
+      };
+
+      const results = await Promise.allSettled([
+        reportLibraryErrorAndRethrow(
+          createLibraryErrorReportAttempt(
+            { libraryId: "lib-a", libraryName: "Artists" },
+            "attempt-independent-a"
+          ),
+          input,
+          sharedCause
+        ),
+        reportLibraryErrorAndRethrow(
+          createLibraryErrorReportAttempt(
+            { libraryId: "lib-a", libraryName: "Artists" },
+            "attempt-independent-b"
+          ),
+          input,
+          sharedCause
+        )
+      ]);
+
+      assert.deepEqual(results.map((result) => result.status), ["rejected", "rejected"]);
+      assert.deepEqual(
+        reports.map((report) => (report as { reportId: string }).reportId),
+        ["attempt-independent-a", "attempt-independent-b"]
+      );
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
+
+  it("keeps async errors and thumbnail summaries owned by their captured library", async () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    const reports: unknown[] = [];
     const summaries: unknown[] = [];
+    let libraryReads = 0;
     try {
       (globalThis as { window?: unknown }).window = {
         megleDesktop: {
           listLibraries: async () => [
             {
-              id: "lib-a",
-              name: "Artists",
-              dbPath: "artists.sqlite",
+              id: "lib-b",
+              name: "References",
+              dbPath: "references.sqlite",
               available: true,
               active: true
             }
           ],
           notifications: bridge({
+            reportError: async (input) => {
+              reports.push(input);
+              return true;
+            },
             publishThumbnailSummary: async (input) => {
               summaries.push(input);
               return true;
@@ -361,8 +551,26 @@ describe("notification reporting", () => {
           })
         }
       };
+      const desktop = (globalThis as { window: { megleDesktop: { listLibraries: () => Promise<unknown> } } }).window
+        .megleDesktop;
+      const listLibraries = desktop.listLibraries;
+      desktop.listLibraries = async () => {
+        libraryReads += 1;
+        return listLibraries();
+      };
 
-      publishThumbnailCacheStats(
+      const library = { libraryId: "lib-a", libraryName: "Artists" };
+      await reportLibraryError(
+        createLibraryErrorReportAttempt(library, "attempt-library-a"),
+        {
+          source: "media-load",
+          code: "reload-failed",
+          target: "folder:4",
+          message: "A failed after the switch"
+        }
+      );
+
+      await publishThumbnailCacheStats(
         {
           cachedCount: 80,
           missingCount: 12,
@@ -372,10 +580,12 @@ describe("notification reporting", () => {
           totalBlobBytes: 1024,
           activeBulkTaskCount: 1
         },
+        library,
         1000
       );
-      await new Promise<void>((resolve) => setImmediate(resolve));
 
+      assert.equal(libraryReads, 0);
+      assert.equal((reports[0] as { libraryId: string }).libraryId, "lib-a");
       assert.deepEqual(summaries, [
         {
           libraryId: "lib-a",
@@ -392,22 +602,6 @@ describe("notification reporting", () => {
           completionPercent: 80
         }
       ]);
-
-      publishThumbnailCacheStats(
-        {
-          cachedCount: 90,
-          missingCount: 5,
-          staleCount: 5,
-          failedCount: 0,
-          pendingCandidateCount: 10,
-          totalBlobBytes: 2048,
-          activeBulkTaskCount: 0
-        },
-        1001,
-        "lib-b"
-      );
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal(summaries.length, 1);
     } finally {
       if (previousWindow === undefined) {
         delete (globalThis as { window?: unknown }).window;
