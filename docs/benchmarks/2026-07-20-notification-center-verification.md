@@ -4,12 +4,13 @@ Date: 2026-07-21 (Asia/Shanghai)
 
 ## Scope and Revisions
 
-- Verified Task 1-15 implementation range: `c2cb5d95d2e040b6951b8522ea0a1707d8df0674..dcc83bb9108fe53c98bbdb13f5292621d6ad6b80`.
-- Task 16 verification commit: the commit containing this report, with subject `test: verify unified notification center`.
-- Starting branch state: `codex/unified-notification-center`, clean at `dcc83bb9108fe53c98bbdb13f5292621d6ad6b80`.
+- Task 1-15 implementation range reviewed: `c2cb5d95d2e040b6951b8522ea0a1707d8df0674..dcc83bb9108fe53c98bbdb13f5292621d6ad6b80`.
+- Initial Task 16 commit: `38f21e38d507275372e94b6ac44180e8f5cbd784` (`test: verify unified notification center`).
+- Review follow-up range: `38f21e38d507275372e94b6ac44180e8f5cbd784..HEAD`; the follow-up commit has subject `test: verify unified notification center`.
+- The follow-up started from a clean `codex/unified-notification-center` worktree.
 - Environment: Windows, Node `v22.14.0`, npm `10.9.2`, rustc `1.95.0`, cargo `1.95.0`, Python `3.11.9`.
 
-Task 16 found one real Task 1-15 defect. The Settings renderer used the shared library hook and attempted the Main-only `megle:notifications-thumbnail-summary` IPC. The promise was caught in Web, but Electron still emitted an IPC access-denied error to stderr. `apps/web/src/core/notificationReporting.ts` now skips thumbnail-summary publication for an explicit non-Main `windowRole`, with a red-green regression in `apps/web/tests/notificationModel.test.mts`. No validator or visual baseline was weakened.
+The follow-up changes `crates/core/src/db/mod.rs`, a Task 1-15 file, only to add an ignored benchmark probe in its `#[cfg(test)]` module. This was required because the previous benchmark incorrectly treated final Desktop operation-head rows as persisted progress events. The probe calls the production task progress transaction and production operation-head/outbox implementation; it does not change production behavior. The production Desktop store, worker, retention code, validators, and visual baselines were not weakened or changed.
 
 ## Automated Gates
 
@@ -18,121 +19,125 @@ Task 16 found one real Task 1-15 defect. The Settings renderer used the shared l
 | `npm run check:core-api` | PASS | Core API contract alignment. |
 | `npm run check:core-client` | PASS | Contract/typecheck and 41/41 tests. |
 | `npm run check:schema` | PASS | SQLite migrations/schema/index checks. |
-| `npm run check:rust` | PASS | 387/387 Rust tests. Existing `jpeg-decoder` profile warning remains. |
+| `npm run check:rust` | PASS | 387 passed, 0 failed, 1 ignored benchmark probe; the `jpeg-decoder` profile warning remains unattributed. |
 | `npm run check:desktop` | PASS | Desktop boundary/typecheck and 156/156 tests. |
-| `npm run check:web` | PASS | Initial 121/121; after the real defect fix, 122/122. |
+| `npm run check:web` | PASS | Web boundary/typecheck and 122/122 tests. |
 | `npm run check:ui-design` | PASS | Liquid Glass design boundaries. |
-| `node tools/bench/notification-center-bench.mjs` | PASS | All required store/worker/retention invariants. |
-| `npm test` | PASS | Two complete repository gates, both exit 0 (61.9 s and 63.4 s). |
+| `node tools/bench/notification-center-bench.mjs` | PASS | Production Core outbox plus Desktop worker/store invariants and cleanup fault injection. |
+| `npm test` | PASS | Final full repository gate, exit 0 in 61.3 seconds. |
 
-The focused commands were run individually before the final aggregate gate. The Web and UI design gates were rerun after the role-guard defect fix.
+The focused gates were run individually before the final aggregate gate.
 
-## Store/Worker Benchmark
+## Production-Boundary Benchmark
 
-The benchmark imports the production `NotificationStore`, passes the production `notification-store-worker.ts` URL, crosses a real `worker_threads` boundary, and writes a real temporary SQLite WAL database. It does not implement a parallel fake persistence or retention algorithm. No machine-specific elapsed-time threshold is asserted.
+The benchmark invokes the ignored Core probe with `cargo test -p megle-core db::tests::notification_center_benchmark_probe -- --ignored --exact --nocapture --test-threads=1`. The probe creates a real file-backed Core SQLite database, then sends 10,000 updates through `update_task_scan_progress_for_attempt`, which publishes through the production operation-head/outbox transaction. The JavaScript benchmark independently queries the resulting Core SQLite sequence interval and head revision, then sends the actual Core outbox events through production `NotificationStore`, `worker_threads`, `NotificationStoreDatabase`, and Desktop SQLite WAL.
 
-Final recorded seed and counts:
+No machine-specific elapsed-time threshold is asserted. The recorded elapsed values are observations only.
 
 | Metric | Value |
 | --- | ---: |
 | Libraries | 4 |
-| Thumbnail completions / summary updates | 10,000 |
-| Rapid progress updates | 10,000 |
-| Completed operations / terminal events | 2,100 |
+| Thumbnail completions / aggregate updates | 10,000 |
+| Production Core rapid progress inputs | 10,000 |
+| Logical Core progress revision advances | 10,000 |
+| Persisted Core progress outbox events | 3 |
+| Active operation-seconds | 2 |
+| Core terminal events in the measured sequence interval | 1 |
+| Total production Core outbox rows delivered to Desktop | 46 |
+| Completed operations | 2,100 |
 | Active operations | 20 |
-| Active operation-seconds | 200 |
-| Notification events sent through the worker | 12,100 |
-| Store write requests | 10,006 |
-| Total store requests | 10,008 |
-| Worker startup | 66.083 ms |
-| Thumbnail summary writes | 580.591 ms |
-| Progress batch | 78.610 ms |
-| Terminal batches | 19.641 ms |
-| Retention | 1.612 ms |
-| Total store/worker elapsed | 794.978 ms |
+| Desktop notification events | 2,145 |
+| Desktop write/read/close requests | 10,006 / 1 / 1 |
+| Core input elapsed | 1,717.660 ms |
+| Core probe process elapsed | 2,293.132 ms |
+| Desktop worker startup | 50.901 ms |
+| Thumbnail aggregate writes | 574.498 ms |
+| Core outbox Desktop apply | 1.361 ms |
+| Terminal batches | 20.765 ms |
+| Retention | 1.275 ms |
+| Store/worker request elapsed | 661.297 ms |
+| End-to-end benchmark elapsed | 2,959.125 ms |
 
-Final database assertions:
+Assertions against real persisted data:
 
-- Per-thumbnail notification rows: `0`.
-- Thumbnail aggregate rows: `4`, not greater than the 4-library count.
-- Persisted active progress rows: `20`, within the 200 operation-second budget (and therefore within `activeOperationSeconds + terminalEventCount`).
-- Completed history rows after retention: `2,000`.
-- Seeded active rows retained: `20/20`.
-- Retention deleted `100` overflow rows and `0` non-expired rows.
-- Evidence: repository-relative `.tmp/notification-center-bench/latest.json`; absolute `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\notification-center-bench\latest.json`.
+- `persistedProgressEvents = 3`, read from Core `notification_outbox` rows between the pre-input and post-flush sequence boundaries. The bound is `activeOperationSeconds + terminalEventCount = 2 + 1 = 3`.
+- An implementation that persisted all 10,000 inputs would produce `10,000 > 3` and fail this assertion.
+- Core head revision advanced exactly 10,000 times, proving all input updates crossed the production boundary even though only three progress events landed in outbox.
+- Per-thumbnail Desktop operation rows were `0`; thumbnail aggregate rows were `4`, equal to the library count.
+- Retention kept `2,000` completed history rows, deleted `100` overflow rows, and retained all `20/20` active rows.
+- The benchmark observed `notifications.sqlite`, `notifications.sqlite-wal`, and `notifications.sqlite-shm`, then injected a post-store-creation failure and verified the run directory disappeared. A separate dynamic-import failure also removed its run directory.
+
+Benchmark evidence: repository-relative `.tmp/notification-center-bench/latest.json`; absolute `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\notification-center-bench\latest.json`.
+
+## Default Profile Cleanup and Isolation
+
+Before cleanup, no Electron or Megle Core process was running. The three exact files below were created at the start of the prior Task 16 interaction (`2026-07-21 21:22:19 +08:00`), while `.tmp/interaction-test/summary.json` was completed at `21:23:11`:
+
+| Exact file | Size | SHA-256 |
+| --- | ---: | --- |
+| `C:\Users\84460\AppData\Roaming\Electron\notifications.sqlite` | 4,096 | `0AB48B25CBA617ED3A4ACCA0161813B314C095EF63544BB4AF60769EB1012977` |
+| `C:\Users\84460\AppData\Roaming\Electron\notifications.sqlite-wal` | 399,672 | `CFE172F82F882111D077EF4C3EAC90D1211317FD732B3B587BA98AA0E9E98114` |
+| `C:\Users\84460\AppData\Roaming\Electron\notifications.sqlite-shm` | 32,768 | `3CFD44DB739B6F6764164B69E39DE1B1F383028A6B41AA2577EB2B5ADB37ED55` |
+
+The database contained only the `megle-dev` library, one running `root_scan`, one pending `interactive_folder_scan`, and one `megle-dev` thumbnail summary from that interaction. No evidence indicated older profile content. A non-recursive cleanup asserted the exact parent and allowed basenames, deleted only these three files, and verified all three absent. No directory or other userData file was removed.
+
+All subsequent Electron launches used controlled worktree profiles. The OS harness process command line recorded:
+
+```text
+--user-data-dir=C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\data-desktop-ui\electron-user-data
+```
+
+That profile created its own notification SQLite/WAL/SHM and `libraries.json`. The follow-up Artists process was directly observed with `--user-data-dir=...\.tmp\task16-followup-artists-user-data`. After both runs, the three default AppData files remained absent.
+
+Cleanup evidence:
+
+| Evidence | Repository-relative path | Absolute path |
+| --- | --- | --- |
+| File metadata and hashes before cleanup | `.tmp/task16-appdata-cleanup/file-metadata-before.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-appdata-cleanup\file-metadata-before.json` |
+| SQLite content before cleanup | `.tmp/task16-appdata-cleanup/sqlite-content-before.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-appdata-cleanup\sqlite-content-before.json` |
+| Exact-file absence after cleanup | `.tmp/task16-appdata-cleanup/file-metadata-after.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-appdata-cleanup\file-metadata-after.json` |
+| Follow-up OS profile and default-file check | `.tmp/task16-appdata-cleanup/followup-os-user-data.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-appdata-cleanup\followup-os-user-data.json` |
 
 ## OS Backdrop Harness
 
-Command:
+The required harness was run with `MEGLE_VISUAL_OS_BACKDROP=1` and an explicit temporary `MEGLE_ELECTRON_USER_DATA_DIR`; both variables were removed in `finally` while preserving the Node exit code.
 
-```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP
-```
+**Overall harness status: FAIL (exit 1).** The current summary contains 24 hard failures: two network/startup-warning groups, five main-titlebar hover/drag/pointer checks, seven non-notification preview checks, and ten shared pointer-highlight checks. The prior report referenced 25; the fresh follow-up summary contains 24, so this report uses the current count. No base-commit harness was run, these failures remain non-notification/unattributed, and their origin is not assigned. No old visual baseline was changed.
 
-The command was run twice, preserving the Node exit code while always removing the environment variable.
-
-**Overall harness status: FAIL (exit 1).** This is not reported as a pass. The second run still failed on the existing non-notification baseline: aborted network requests, existing Cargo startup warnings, OS backdrop pixel thresholds, main titlebar hover/drag/pointer-highlight checks, preview geometry/mode checks, and shared pointer-highlight checks. The repository's old visual baseline was not modified.
-
-**Notification-specific status: PASS.** The summary contains no notification-specific hard failure. Evidence confirms:
-
-- One icon-only notification titlebar control and no legacy Tasks/Recent controls.
-- Compact popover anchoring before maximize, while maximized, and after restore.
-- One full notification window target reused by repeated open calls.
-- Three full-window pages, status as default, five history filters, and bounded rows.
-- Shared secondary-window material, a `1px` titlebar outline, and `0px` pane divider.
-- Native secondary-window reveal completed with `rendererReady=true`, `windowVisible=true`, and `revealFallback=false`.
-- Process-log source/level filters and pause, follow, copy, clear, and export controls.
-- Full/empty/degraded/narrow compact fixtures and status/history/log/degraded full-window fixtures rendered.
-
-The first OS run exposed the Settings-to-Main-only thumbnail-summary IPC defect. After the fix, the second run's startup problems no longer contained any notification IPC denial; only the pre-existing Cargo warnings remained.
-
-Primary visual evidence:
+**Notification-specific assertions: PASS.** None of the 24 hard failures is notification-specific. The current summary confirms one icon-only notification titlebar control, no legacy Tasks/Recent controls, valid compact anchoring before/maximized/restored, one reused notification window target, three full-window pages, five history filters, bounded history rows, shared secondary-window material, native reveal without fallback, and process-log source/level/pause/follow/copy/clear/export controls. Full, empty, degraded, narrow, status, history, and log fixtures rendered and passed the harness's notification checks.
 
 | Evidence | Repository-relative path | Absolute path |
 | --- | --- | --- |
 | Harness summary | `.tmp/visual-check/logs/desktop-ui-regression-summary.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\logs\desktop-ui-regression-summary.json` |
 | Real notification window | `.tmp/visual-check/screenshots/ui-notifications-secondary-window.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notifications-secondary-window.png` |
 | Real process-log page | `.tmp/visual-check/screenshots/ui-notifications-secondary-window-logs.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notifications-secondary-window-logs.png` |
-| Compact active fixture | `.tmp/visual-check/screenshots/ui-notification-compact-fixture-full.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notification-compact-fixture-full.png` |
+| Compact fixture | `.tmp/visual-check/screenshots/ui-notification-compact-fixture-full.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notification-compact-fixture-full.png` |
 | Full status fixture | `.tmp/visual-check/screenshots/ui-notification-window-fixture-status.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notification-window-fixture-status.png` |
 | Full history fixture | `.tmp/visual-check/screenshots/ui-notification-window-fixture-history.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notification-window-fixture-history.png` |
 | Full logs fixture | `.tmp/visual-check/screenshots/ui-notification-window-fixture-logs.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notification-window-fixture-logs.png` |
 
 ## Real Electron Interaction
 
-All destructive scenarios used temporary Core databases and temporary files. `Y:\Repository\Billfish\Artists` was scanned read-only; no source file under Artists was renamed, moved, or deleted.
+`Y:\Repository\Billfish\Artists` was used only as a read-only scan/browse source. Root removal deleted a temporary index, never source files. Move/rename/delete scenarios used copied files under `.tmp` only.
 
 | Scenario | Status | Actual evidence |
 | --- | --- | --- |
-| Root scan aggregation | VERIFIED | An isolated Electron profile and Core DB showed one active `task:1` / `root_scan` operation in the Desktop compact snapshot while Artists was scanning. The popover displayed one running Scan library item. Raw global SQLite contained one running root-scan operation row. |
-| Layout/scroll/resize during active scan | VERIFIED WITH LIMITS | Adaptive, waterfall, grid, and list switched in 288-348 ms; deep scroll and resize to 1180x760 completed with no console errors. API resource-entry delta was recorded as 17, not gated by a machine threshold. The early scan had no media tiles, so preview was not exercised in this isolated run. |
-| Thumbnail aggregate/no per-item | VERIFIED | The isolated global DB contained one `thumbnail_summaries` row and no thumbnail operation. The 10,000-item benchmark independently proved zero per-item rows and bounded aggregates. |
-| Remove root terminal/restart recovery | VERIFIED WITH LIMIT | A safe temporary index of Artists was removed, never the source directory. The first process was terminated immediately after observing pending `root_purge`; `interrupted=true`. After restart, the same `task:2` reached `succeeded`, `currentValue=7550`, `totalValue=7550`, and remained in terminal results. Running determinate intermediate samples were not captured because the purge completed between 50 ms polls. |
-| Move/rename/delete grouping | VERIFIED | A temporary root under `.tmp/task16-fsops-root` used copied PNGs only. Core persisted 5 item audit rows but 3 group IDs: rename 1, move 2, delete-permanent 2. Desktop global SQLite contained exactly 3 matching notification rows, with operation IDs equal to the group IDs and final progress 1/1, 2/2, and 2/2. |
-| Library switch and restart history | VERIFIED WITH LIMIT | A second temporary library was created and became active. After a real switch and a second Electron start, global SQLite still contained all first-library scan/file-operation history with `library_name=Default`. The driver itself exited 1 because it incorrectly expected the compact latest-three IDs to remain exact; a newly recorded renderer error legitimately displaced the oldest compact result, but no history row was lost. |
-| Broad error dedupe/no banner | PARTIAL | One real `renderer_error` row was observed after a non-blocking 404 and no center error strip appeared in the Artists interaction snapshots. A controlled duplicate error was not safely injected through the real renderer, so real-window deduplication is not claimed. Automated Desktop/Web tests cover dedupe and broad-banner removal. |
-| Process logs | VERIFIED WITH LIMIT | Real notification-window controls for source, level, pause, follow, copy, clear, and export were exercised by the OS harness. The controlled fixture verified buffered gaps and subscription cleanup. Simultaneous visible lines from all Main/Core/Renderer sources were not independently observed, so that exact content mix remains unverified. |
-| Browse/scroll/preview under background work | MIXED / OVERALL FAIL | The existing Artists desktop interaction harness completed 52 operations and all 30 folder switches. Five previews succeeded (`p50=246 ms`, `max=3389 ms`), but one preview was not ready after 5156 ms and 648 existing `net::ERR_FILE_NOT_FOUND` console errors were recorded. This pass is not reported as clean or as proof of no visible stalls/request amplification. |
+| Root scan progress aggregation | VERIFIED | A controlled Electron profile showed one active `root_scan` row and one compact popover row during the Artists scan. |
+| Remove root progress/terminal/restart | VERIFIED WITH LIMIT | A safe temporary Artists index was interrupted at pending purge, restarted, and reached `succeeded` at `7550/7550`; running determinate samples completed too quickly to capture. |
+| Move/rename/delete logical grouping | VERIFIED | Temporary copied PNGs produced 5 audit item rows but 3 logical group IDs and exactly 3 Desktop notification rows. |
+| Thumbnail scrolling aggregate/no per-item | VERIFIED WITH LIMIT | Controlled global SQLite held one aggregate and no thumbnail operation; the benchmark separately proved 10,000 aggregate updates create zero per-item rows. |
+| Library switch and restart history | VERIFIED WITH LIMIT | A second temporary library switched and restarted while first-library history remained in controlled global SQLite; a compact latest-three expectation in the driver was displaced by a newer renderer error, so that driver did not exit cleanly. |
+| Broad error dedupe/no banner | PARTIAL | One real `renderer_error` and no broad center error strip were observed. Controlled duplicate injection through the real renderer was not performed; automated Desktop/Web tests cover dedupe. |
+| Process logs | VERIFIED WITH LIMIT | The OS harness exercised source/level filters, pause, follow, copy, clear, and export. Simultaneously visible Main/Core/Renderer lines were not independently observed. |
+| Layout/scroll/resize during scan | VERIFIED WITH LIMIT | The controlled notification interaction switched all four layouts, scrolled, and resized with no console errors; no media tile was available for preview in that run. |
+| Broad Artists browse/scroll/preview follow-up | NOT VERIFIED | The fresh run used `.tmp/task16-followup-artists-user-data` but exceeded the 184-second outer timeout before producing a new summary. Its exact process tree was terminated. No pass or stall/request-amplification claim is made. |
 
-Interaction evidence:
-
-| Evidence | Repository-relative path | Absolute path |
-| --- | --- | --- |
-| Active scan/layout summary | `.tmp/task16-notification-1784641021852/summary.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-notification-1784641021852\summary.json` |
-| Active scan popover | `.tmp/task16-notification-1784641021852/active-root-scan-popover.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-notification-1784641021852\active-root-scan-popover.png` |
-| Root purge restart summary | `.tmp/task16-notification-1784641021852/root-purge-restart/summary.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-notification-1784641021852\root-purge-restart\summary.json` |
-| File-op Core DB | `.tmp/task16-fsops-1784641292966/library.sqlite` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-fsops-1784641292966\library.sqlite` |
-| File-op global notification DB | `.tmp/task16-fsops-1784641292966/electron-user-data/notifications.sqlite` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-fsops-1784641292966\electron-user-data\notifications.sqlite` |
-| Library registry after switch | `.tmp/task16-fsops-1784641292966/electron-user-data/libraries.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\task16-fsops-1784641292966\electron-user-data\libraries.json` |
-| Artists interaction summary | `.tmp/interaction-test/summary.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\interaction-test\summary.json` |
-| Artists final screenshot | `.tmp/interaction-test/shots/99-final.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\interaction-test\shots\99-final.png` |
-
-The first run of the pre-existing `desktop-interaction-test.mjs` requested a temporary Core DB but did not set `MEGLE_ELECTRON_USER_DATA_DIR`; an existing default-profile registry can override the requested DB, and the run may have appended notification records to the default development Electron profile. It is not used as authoritative notification-isolation evidence. All authoritative notification-specific follow-up runs used explicit temporary Core DB and userData paths under `.tmp`. No real Artists files were modified.
+Authoritative controlled interaction evidence remains under `.tmp/task16-notification-1784641021852` and `.tmp/task16-fsops-1784641292966`, each with its own `electron-user-data`. The old `.tmp/interaction-test/summary.json` from the default-profile run is not authoritative notification-isolation evidence.
 
 ## Residual Risk
 
-- The OS-backdrop harness remains overall failing on pre-existing non-notification main-window, network-cancellation, backdrop-pixel, preview, and pointer-highlight baselines.
-- Real display anti-aliasing was not judged by a human during this run; screenshots are evidence for layout/state/rendering only.
-- Root purge running determinate progress was too fast to sample before terminal, although restart recovery and the final 7550/7550 terminal state were observed and focused Rust tests cover intermediate determinate progress.
+- The OS backdrop harness is overall failing on 24 non-notification/unattributed checks; without a base-commit run their origin is not assigned.
+- The fresh broad Artists follow-up timed out, so stall-free browsing, preview readiness, and absence of request amplification are not verified by that run.
+- Root purge running determinate progress was too fast to sample before terminal.
 - Controlled real-renderer duplicate-error injection and simultaneous visible Main/Core/Renderer log content remain unverified.
-- The broad Artists interaction pass was not clean because of one preview timeout and 648 existing file-resource errors; no claim of universally stall-free browsing or absence of request amplification is made.
+- Screenshot evidence covers layout/state/rendering, not human judgment of physical-display anti-aliasing.

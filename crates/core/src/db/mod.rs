@@ -12170,6 +12170,187 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "invoked by tools/bench/notification-center-bench.mjs"]
+    fn notification_center_benchmark_probe() {
+        const RAPID_PROGRESS_UPDATES: i64 = 10_000;
+        const ACTIVE_OPERATION_COUNT: usize = 20;
+        let database_path = std::env::var("MEGLE_NOTIFICATION_BENCH_CORE_DB_PATH")
+            .expect("MEGLE_NOTIFICATION_BENCH_CORE_DB_PATH");
+        let events_path = std::env::var("MEGLE_NOTIFICATION_BENCH_PROBE_PATH")
+            .expect("MEGLE_NOTIFICATION_BENCH_PROBE_PATH");
+        let database_path = std::path::PathBuf::from(database_path);
+        let database = Database::open(&database_path).expect("open benchmark database");
+        database
+            .apply_migrations()
+            .expect("apply benchmark migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/megle-notification-benchmark".to_string(),
+                display_name: "Notification benchmark".to_string(),
+            })
+            .expect("add benchmark root");
+        let rapid_task_id = database
+            .create_root_scan_task(root_id)
+            .expect("create rapid benchmark task");
+        database
+            .mark_task_running_current_attempt_for_test(rapid_task_id)
+            .expect("mark rapid benchmark task running");
+
+        let operation_id = format!("task:{rapid_task_id}");
+        let baseline_sequence: i64 = database
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM notification_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read benchmark baseline sequence");
+        let baseline_revision: i64 = database
+            .connection
+            .query_row(
+                "SELECT revision FROM notification_operation_heads WHERE operation_id = ?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .expect("read benchmark baseline revision");
+
+        let input_started_at = std::time::Instant::now();
+        for index in 0..RAPID_PROGRESS_UPDATES {
+            database
+                .update_task_scan_progress_current_attempt_for_test(
+                    rapid_task_id,
+                    TaskScanProgress {
+                        items_seen: index + 1,
+                        items_total: Some(RAPID_PROGRESS_UPDATES),
+                        folders_seen: index / 10,
+                        media_files_seen: index + 1,
+                        skipped_files: 0,
+                    },
+                )
+                .expect("publish rapid production progress update");
+        }
+        let input_elapsed_ms = input_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let active_operation_seconds = ((input_elapsed_ms.ceil() as i64 + 999) / 1_000).max(1);
+        let rapid_head_revision: i64 = database
+            .connection
+            .query_row(
+                "SELECT revision FROM notification_operation_heads WHERE operation_id = ?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .expect("read rapid head revision");
+        assert_eq!(
+            rapid_head_revision - baseline_revision,
+            RAPID_PROGRESS_UPDATES,
+            "every production progress input must advance the logical head revision"
+        );
+
+        database
+            .flush_dirty_notification_heads()
+            .expect("flush rapid dirty production head");
+        let progress_last_sequence: i64 = database
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM notification_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read progress sequence boundary");
+        let persisted_progress_events: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM notification_outbox WHERE sequence > ?1 AND sequence <= ?2",
+                (baseline_sequence, progress_last_sequence),
+                |row| row.get(0),
+            )
+            .expect("count persisted production progress events");
+
+        database
+            .mark_task_succeeded_current_attempt_for_test(rapid_task_id)
+            .expect("publish rapid production terminal event");
+        let terminal_last_sequence: i64 = database
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM notification_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read terminal sequence boundary");
+        let terminal_event_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM notification_outbox WHERE sequence > ?1 AND sequence <= ?2",
+                (progress_last_sequence, terminal_last_sequence),
+                |row| row.get(0),
+            )
+            .expect("count persisted production terminal events");
+        assert_eq!(terminal_event_count, 1);
+        assert!(
+            persisted_progress_events <= active_operation_seconds + terminal_event_count,
+            "10k rapid progress updates must not persist one outbox event per input"
+        );
+
+        let mut active_task_ids = Vec::with_capacity(ACTIVE_OPERATION_COUNT);
+        for _ in 0..ACTIVE_OPERATION_COUNT {
+            let task_id = database
+                .create_root_scan_task(root_id)
+                .expect("create active benchmark task");
+            database
+                .mark_task_running_current_attempt_for_test(task_id)
+                .expect("mark active benchmark task running");
+            active_task_ids.push(task_id);
+        }
+
+        let outbox_events = database
+            .list_notification_outbox(0, 200)
+            .expect("read production outbox events");
+        let outbox_row_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM notification_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("count production outbox rows");
+        let latest_sequence: i64 = database
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM notification_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read latest production outbox sequence");
+        assert_eq!(outbox_row_count, outbox_events.len() as i64);
+
+        let probe = serde_json::json!({
+            "events": outbox_events,
+            "latestSequence": latest_sequence,
+            "activeOperationIds": active_task_ids
+                .iter()
+                .map(|task_id| format!("task:{task_id}"))
+                .collect::<Vec<_>>(),
+            "rapidOperationId": operation_id,
+            "metrics": {
+                "rapidProgressUpdates": RAPID_PROGRESS_UPDATES,
+                "baselineSequence": baseline_sequence,
+                "baselineRevision": baseline_revision,
+                "rapidHeadRevision": rapid_head_revision,
+                "logicalProgressRevisionCount": rapid_head_revision - baseline_revision,
+                "progressLastSequence": progress_last_sequence,
+                "terminalLastSequence": terminal_last_sequence,
+                "persistedProgressEvents": persisted_progress_events,
+                "terminalEventCount": terminal_event_count,
+                "activeOperationSeconds": active_operation_seconds,
+                "inputElapsedMs": input_elapsed_ms,
+                "outboxRowCount": outbox_row_count
+            }
+        });
+        std::fs::write(
+            events_path,
+            serde_json::to_vec_pretty(&probe).expect("serialize benchmark probe"),
+        )
+        .expect("write benchmark probe");
+    }
+
+    #[test]
     fn task_terminal_notifications_cover_failure_and_cancellation() {
         let database = migrated_database();
         let root_id = database
