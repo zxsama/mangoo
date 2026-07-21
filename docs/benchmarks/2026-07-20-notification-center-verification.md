@@ -2,15 +2,21 @@
 
 Date: 2026-07-21 (Asia/Shanghai)
 
-## Scope and Revisions
+## Scope and Fixed Revisions
 
 - Task 1-15 implementation range reviewed: `c2cb5d95d2e040b6951b8522ea0a1707d8df0674..dcc83bb9108fe53c98bbdb13f5292621d6ad6b80`.
-- Initial Task 16 commit: `38f21e38d507275372e94b6ac44180e8f5cbd784` (`test: verify unified notification center`).
-- Review follow-up range: `38f21e38d507275372e94b6ac44180e8f5cbd784..HEAD`; the follow-up commit has subject `test: verify unified notification center`.
-- The follow-up started from a clean `codex/unified-notification-center` worktree.
+- Initial Task 16 verification commit: `38f21e38d507275372e94b6ac44180e8f5cbd784` (`test: verify unified notification center`).
+- First findings follow-up: `6f523577d6aec6526606b19d412b68ff2965a15d` (`test: verify unified notification center`).
+- Production-path benchmark hardening: `606f992d6c37a17e3103413107f32cb440cc5510` (`test: harden notification center benchmark`).
+- Focused gates, three benchmark runs, and `npm test` reported below ran against the exact code content committed as `606f992d6c37a17e3103413107f32cb440cc5510`.
 - Environment: Windows, Node `v22.14.0`, npm `10.9.2`, rustc `1.95.0`, cargo `1.95.0`, Python `3.11.9`.
 
-The follow-up changes `crates/core/src/db/mod.rs`, a Task 1-15 file, only to add an ignored benchmark probe in its `#[cfg(test)]` module. This was required because the previous benchmark incorrectly treated final Desktop operation-head rows as persisted progress events. The probe calls the production task progress transaction and production operation-head/outbox implementation; it does not change production behavior. The production Desktop store, worker, retention code, validators, and visual baselines were not weakened or changed.
+Two Task 1-15 files were changed only for real defects found during Task 16:
+
+- `apps/web/src/core/notificationReporting.ts`: the Settings renderer used shared library state and attempted the Main-role-only `megle:notifications-thumbnail-summary` IPC. The fix role-gates notification publishing and has regression coverage.
+- `crates/core/src/db/mod.rs`: the benchmark needed observable production persistence behavior, not a parallel algorithm. The existing progress path now delegates through a private injectable-clock seam while retaining the normal system clock, and the test probe drives the real task/outbox and thumbnail completion/DB update functions. The probe itself is test-only, creates its own OS temporary directories, accepts no external DB/output path, and emits only prefixed JSON on stdout.
+
+No validator or visual baseline was weakened or changed.
 
 ## Automated Gates
 
@@ -19,59 +25,132 @@ The follow-up changes `crates/core/src/db/mod.rs`, a Task 1-15 file, only to add
 | `npm run check:core-api` | PASS | Core API contract alignment. |
 | `npm run check:core-client` | PASS | Contract/typecheck and 41/41 tests. |
 | `npm run check:schema` | PASS | SQLite migrations/schema/index checks. |
-| `npm run check:rust` | PASS | 387 passed, 0 failed, 1 ignored benchmark probe; the `jpeg-decoder` profile warning remains unattributed. |
+| `npm run check:rust` | PASS | 388 passed, 0 failed, 1 ignored benchmark probe; the `jpeg-decoder` profile warning remains unattributed. |
 | `npm run check:desktop` | PASS | Desktop boundary/typecheck and 156/156 tests. |
 | `npm run check:web` | PASS | Web boundary/typecheck and 122/122 tests. |
 | `npm run check:ui-design` | PASS | Liquid Glass design boundaries. |
-| `node tools/bench/notification-center-bench.mjs` | PASS | Production Core outbox plus Desktop worker/store invariants and cleanup fault injection. |
-| `npm test` | PASS | Final full repository gate, exit 0 in 61.3 seconds. |
+| `node tools/bench/notification-center-bench.mjs` | PASS x3 | Identical deterministic counts in all three runs; elapsed observations differed as expected. |
+| `npm test` | PASS | Final full repository gate, exit 0 in 62.9 seconds. |
 
 The focused gates were run individually before the final aggregate gate.
 
 ## Production-Boundary Benchmark
 
-The benchmark invokes the ignored Core probe with `cargo test -p megle-core db::tests::notification_center_benchmark_probe -- --ignored --exact --nocapture --test-threads=1`. The probe creates a real file-backed Core SQLite database, then sends 10,000 updates through `update_task_scan_progress_for_attempt`, which publishes through the production operation-head/outbox transaction. The JavaScript benchmark independently queries the resulting Core SQLite sequence interval and head revision, then sends the actual Core outbox events through production `NotificationStore`, `worker_threads`, `NotificationStoreDatabase`, and Desktop SQLite WAL.
+The benchmark invokes `cargo test -p megle-core db::tests::notification_center_benchmark_probe -- --ignored --exact --nocapture --test-threads=1`. The Rust probe internally creates four file-backed Core SQLite libraries. For every one of 10,000 thumbnails it creates real media, requests and starts the production thumbnail task, and calls `publish_thumbnail_and_succeed_task_if_source_fingerprint_and_task_attempt_current`, exercising the production cache/blob/media/task DB updates. It then queries production cache statistics.
 
-No machine-specific elapsed-time threshold is asserted. The recorded elapsed values are observations only.
+The progress workload sends 10,000 updates through `update_task_scan_progress_for_attempt` using a deterministic synthetic schedule from `+1 ms` through `+10,000 ms`. The production persistence function receives the test clock through its clock seam. Exact persisted progress offsets must be `1,000` through `10,000 ms` in one-second steps. A 500 ms implementation would persist 20 progress events and fail; a per-input implementation would persist 10,000 and fail.
 
-| Metric | Value |
+The JavaScript side calls the real Web `publishThumbnailCacheStats` reporting boundary once for each Core result, then uses production Desktop `NotificationStore`, `worker_threads`, `NotificationStoreDatabase`, and SQLite WAL. No machine-specific elapsed-time threshold is asserted.
+
+### Exact Deterministic Metrics
+
+These values were identical in all three runs.
+
+| Seed / Core metric | Exact value |
 | --- | ---: |
 | Libraries | 4 |
-| Thumbnail completions / aggregate updates | 10,000 |
-| Production Core rapid progress inputs | 10,000 |
-| Logical Core progress revision advances | 10,000 |
-| Persisted Core progress outbox events | 3 |
-| Active operation-seconds | 2 |
-| Core terminal events in the measured sequence interval | 1 |
-| Total production Core outbox rows delivered to Desktop | 46 |
-| Completed operations | 2,100 |
-| Active operations | 20 |
-| Desktop notification events | 2,145 |
-| Desktop write/read/close requests | 10,006 / 1 / 1 |
-| Core input elapsed | 1,717.660 ms |
-| Core probe process elapsed | 2,293.132 ms |
-| Desktop worker startup | 50.901 ms |
-| Thumbnail aggregate writes | 574.498 ms |
-| Core outbox Desktop apply | 1.361 ms |
-| Terminal batches | 20.765 ms |
-| Retention | 1.275 ms |
-| Store/worker request elapsed | 661.297 ms |
-| End-to-end benchmark elapsed | 2,959.125 ms |
+| Thumbnail completions | 10,000 |
+| Thumbnail completions per library | 2,500 |
+| Rapid progress inputs | 10,000 |
+| Logical progress revisions | 10,000 |
+| Persisted progress events | 10 |
+| Persisted progress offsets (ms) | 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000 |
+| Terminal events | 1 |
+| Total Core outbox events | 53 |
+| Completed operations seeded | 2,100 |
+| Synthetic completed operations | 2,099 |
+| Active operations seeded | 20 |
+| Active operation seconds | 10 |
 
-Assertions against real persisted data:
+| Desktop/reporting metric | Exact value |
+| --- | ---: |
+| Web reporting calls | 4 |
+| Persisted aggregate rows | 4 |
+| Per-thumbnail notification rows | 0 |
+| Desktop operation rows after retention | 2,020 |
+| Desktop persisted progress rows | 10 |
+| Completed history rows | 2,000 |
+| Overflow rows deleted | 100 |
+| Expired rows deleted | 0 |
+| Active rows retained | 20 |
+| Desktop notification events | 2,152 |
+| Core outbox events applied | 53 |
+| Thumbnail summary updates | 4 |
+| Store write requests | 10 |
+| Store read requests | 1 |
+| Store close requests | 1 |
+| Total store/worker requests | 12 |
 
-- `persistedProgressEvents = 3`, read from Core `notification_outbox` rows between the pre-input and post-flush sequence boundaries. The bound is `activeOperationSeconds + terminalEventCount = 2 + 1 = 3`.
-- An implementation that persisted all 10,000 inputs would produce `10,000 > 3` and fail this assertion.
-- Core head revision advanced exactly 10,000 times, proving all input updates crossed the production boundary even though only three progress events landed in outbox.
-- Per-thumbnail Desktop operation rows were `0`; thumbnail aggregate rows were `4`, equal to the library count.
-- Retention kept `2,000` completed history rows, deleted `100` overflow rows, and retained all `20/20` active rows.
-- The benchmark observed `notifications.sqlite`, `notifications.sqlite-wal`, and `notifications.sqlite-shm`, then injected a post-store-creation failure and verified the run directory disappeared. A separate dynamic-import failure also removed its run directory.
+Each of the four Core libraries and each persisted Desktop summary had these exact values:
 
-Benchmark evidence: repository-relative `.tmp/notification-center-bench/latest.json`; absolute `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\notification-center-bench\latest.json`.
+| Per-library metric | Exact value |
+| --- | ---: |
+| Completion count | 2,500 |
+| Completed thumbnail task rows | 2,500 |
+| Ready thumbnail state rows | 2,500 |
+| Thumbnail blob rows | 2,500 |
+| Per-item thumbnail outbox rows | 0 |
+| Cached count | 2,500 |
+| Total candidate count | 2,500 |
+| Missing / stale / failed / pending / active bulk tasks | 0 / 0 / 0 / 0 / 0 |
+| Total cache bytes | 10,000 |
+| Completion percent | 100 |
+| Observed-at values by library | 1784548800000, 1784548800001, 1784548800002, 1784548800003 |
+
+The aggregate assertion is exact, not an upper bound: four reporting calls produce exactly four aggregate rows, one for each library, with all counts and byte totals matching the real Core DB results. The thumbnail probe also asserts zero per-item Core outbox rows, so an implementation that emits once per completion fails before Desktop aggregation.
+
+### Three-Run Elapsed Metrics
+
+All values are milliseconds and are observations only.
+
+| Metric | Run 1 | Run 2 | Run 3 |
+| --- | ---: | ---: | ---: |
+| Core child PID | 68156 | 72256 | 57872 |
+| Core process | 18732.122 | 18868.227 | 18643.349 |
+| Progress inputs | 1668.680 | 1657.553 | 1734.476 |
+| All thumbnail completions | 16514.051 | 16747.332 | 16439.164 |
+| Library 1 completions | 3520.847 | 3589.174 | 3555.762 |
+| Library 2 completions | 4005.146 | 3906.560 | 3892.615 |
+| Library 3 completions | 3868.895 | 4100.712 | 3955.823 |
+| Library 4 completions | 4002.898 | 4058.662 | 3932.235 |
+| Web reporting | 1.682 | 1.181 | 1.795 |
+| Worker startup | 50.225 | 49.259 | 54.479 |
+| Worker progress apply | 2.111 | 1.997 | 2.102 |
+| Worker thumbnail reporting | 1.682 | 1.181 | 1.795 |
+| Worker terminal batches | 31.676 | 30.177 | 30.588 |
+| Worker retention | 2.156 | 1.625 | 2.066 |
+| Worker compact read | 1.859 | 1.206 | 1.428 |
+| Worker close | 13.911 | 11.970 | 12.251 |
+| Total store/worker elapsed | 103.620 | 97.415 | 104.709 |
+| End-to-end benchmark | 18913.968 | 19044.365 | 18830.549 |
+
+### Cleanup and Failure Injection
+
+All three runs produced the following exact cleanup results:
+
+| Failure-path assertion | Result |
+| --- | --- |
+| Dynamic import failure run directory removed | PASS |
+| Store startup failure run directory removed | PASS |
+| Store startup failure worker stopped | PASS |
+| Post-create failure run directory removed | PASS |
+| Post-create failure worker stopped | PASS |
+| SQLite, WAL, and SHM observed before injected post-create failure | PASS |
+| Cargo/Core nonzero child run directory removed | PASS |
+| Cargo/Core nonzero child stopped | PASS |
+| Store worker paired with Cargo failure stopped | PASS |
+| Injected Cargo exit code | 101 |
+| Rust probe internal temporary directories removed | PASS |
+| Successful-run Core child stopped | PASS |
+| Stale prior success deleted before forced failure | PASS |
+| Forced failure published no success evidence | PASS |
+| Forced-failure child stopped / exit code | PASS / 1 |
+
+The benchmark deletes stale success output before starting and publishes temporary output atomically only after successful store closure and cleanup. This report embeds the authoritative counts and does not depend on an ignored benchmark result file.
 
 ## Default Profile Cleanup and Isolation
 
-Before cleanup, no Electron or Megle Core process was running. The three exact files below were created at the start of the prior Task 16 interaction (`2026-07-21 21:22:19 +08:00`), while `.tmp/interaction-test/summary.json` was completed at `21:23:11`:
+Before cleanup, no Electron or Megle Core process was running. The three exact files below were created at the start of the prior Task 16 interaction (`2026-07-21 21:22:19 +08:00`), while `.tmp/interaction-test/summary.json` completed at `21:23:11`:
 
 | Exact file | Size | SHA-256 |
 | --- | ---: | --- |
@@ -81,13 +160,13 @@ Before cleanup, no Electron or Megle Core process was running. The three exact f
 
 The database contained only the `megle-dev` library, one running `root_scan`, one pending `interactive_folder_scan`, and one `megle-dev` thumbnail summary from that interaction. No evidence indicated older profile content. A non-recursive cleanup asserted the exact parent and allowed basenames, deleted only these three files, and verified all three absent. No directory or other userData file was removed.
 
-All subsequent Electron launches used controlled worktree profiles. The OS harness process command line recorded:
+All later Electron launches used controlled worktree profiles. The OS harness process command line recorded:
 
 ```text
 --user-data-dir=C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\data-desktop-ui\electron-user-data
 ```
 
-That profile created its own notification SQLite/WAL/SHM and `libraries.json`. The follow-up Artists process was directly observed with `--user-data-dir=...\.tmp\task16-followup-artists-user-data`. After both runs, the three default AppData files remained absent.
+The Artists follow-up used `.tmp/task16-followup-artists-user-data`. No Electron process was launched for the `606f992d6c37a17e3103413107f32cb440cc5510` benchmark hardening follow-up. Its final audit again confirmed the three default AppData notification files absent.
 
 Cleanup evidence:
 
@@ -100,11 +179,11 @@ Cleanup evidence:
 
 ## OS Backdrop Harness
 
-The required harness was run with `MEGLE_VISUAL_OS_BACKDROP=1` and an explicit temporary `MEGLE_ELECTRON_USER_DATA_DIR`; both variables were removed in `finally` while preserving the Node exit code.
+The required harness was run during the first findings follow-up with `MEGLE_VISUAL_OS_BACKDROP=1` and an explicit temporary `MEGLE_ELECTRON_USER_DATA_DIR`; both variables were removed in `finally` while preserving the Node exit code. It was not rerun for the later benchmark-only Rust/Node changes.
 
-**Overall harness status: FAIL (exit 1).** The current summary contains 24 hard failures: two network/startup-warning groups, five main-titlebar hover/drag/pointer checks, seven non-notification preview checks, and ten shared pointer-highlight checks. The prior report referenced 25; the fresh follow-up summary contains 24, so this report uses the current count. No base-commit harness was run, these failures remain non-notification/unattributed, and their origin is not assigned. No old visual baseline was changed.
+**Overall harness status: FAIL (exit 1).** The captured summary contains 24 hard failures: two network/startup-warning groups, five main-titlebar hover/drag/pointer checks, seven non-notification preview checks, and ten shared pointer-highlight checks. No base-commit harness comparison was run, so these failures are non-notification/unattributed and are not assigned an origin. No visual baseline was changed.
 
-**Notification-specific assertions: PASS.** None of the 24 hard failures is notification-specific. The current summary confirms one icon-only notification titlebar control, no legacy Tasks/Recent controls, valid compact anchoring before/maximized/restored, one reused notification window target, three full-window pages, five history filters, bounded history rows, shared secondary-window material, native reveal without fallback, and process-log source/level/pause/follow/copy/clear/export controls. Full, empty, degraded, narrow, status, history, and log fixtures rendered and passed the harness's notification checks.
+**Notification-specific assertions: PASS.** None of the 24 hard failures is notification-specific. The summary confirms one icon-only notification titlebar control, no legacy Tasks/Recent controls, valid compact anchoring before/maximized/restored, one reused notification window target, three full-window pages, five history filters, bounded history rows, shared secondary-window material, native reveal without fallback, and process-log source/level/pause/follow/copy/clear/export controls. Full, empty, degraded, narrow, status, history, and log fixtures rendered and passed the notification assertions.
 
 | Evidence | Repository-relative path | Absolute path |
 | --- | --- | --- |
@@ -125,7 +204,7 @@ The required harness was run with `MEGLE_VISUAL_OS_BACKDROP=1` and an explicit t
 | Root scan progress aggregation | VERIFIED | A controlled Electron profile showed one active `root_scan` row and one compact popover row during the Artists scan. |
 | Remove root progress/terminal/restart | VERIFIED WITH LIMIT | A safe temporary Artists index was interrupted at pending purge, restarted, and reached `succeeded` at `7550/7550`; running determinate samples completed too quickly to capture. |
 | Move/rename/delete logical grouping | VERIFIED | Temporary copied PNGs produced 5 audit item rows but 3 logical group IDs and exactly 3 Desktop notification rows. |
-| Thumbnail scrolling aggregate/no per-item | VERIFIED WITH LIMIT | Controlled global SQLite held one aggregate and no thumbnail operation; the benchmark separately proved 10,000 aggregate updates create zero per-item rows. |
+| Thumbnail scrolling aggregate/no per-item | VERIFIED WITH LIMIT | Controlled global SQLite held one aggregate and no thumbnail operation; the production-path benchmark separately completed 10,000 thumbnails with zero Core per-item outbox and zero Desktop per-item operation rows. |
 | Library switch and restart history | VERIFIED WITH LIMIT | A second temporary library switched and restarted while first-library history remained in controlled global SQLite; a compact latest-three expectation in the driver was displaced by a newer renderer error, so that driver did not exit cleanly. |
 | Broad error dedupe/no banner | PARTIAL | One real `renderer_error` and no broad center error strip were observed. Controlled duplicate injection through the real renderer was not performed; automated Desktop/Web tests cover dedupe. |
 | Process logs | VERIFIED WITH LIMIT | The OS harness exercised source/level filters, pause, follow, copy, clear, and export. Simultaneously visible Main/Core/Renderer lines were not independently observed. |
