@@ -739,6 +739,23 @@ impl Database {
         origin_override: Option<NotificationOrigin>,
         mode: notification_outbox::PublishMode,
     ) -> anyhow::Result<bool> {
+        self.publish_task_notification_in_transaction_at_millis(
+            transaction,
+            task_id,
+            origin_override,
+            mode,
+            None,
+        )
+    }
+
+    fn publish_task_notification_in_transaction_at_millis(
+        &self,
+        transaction: &Transaction<'_>,
+        task_id: i64,
+        origin_override: Option<NotificationOrigin>,
+        mode: notification_outbox::PublishMode,
+        updated_at_override: Option<i64>,
+    ) -> anyhow::Result<bool> {
         let task = task_record_in_transaction(transaction, task_id)?;
         let Some(descriptor) = task_notification_descriptor(&task.kind)? else {
             return Ok(false);
@@ -750,7 +767,8 @@ impl Database {
             .unwrap_or_else(|| NotificationOrigin::Background.as_str().to_owned());
         let terminal = matches!(task.status.as_str(), "succeeded" | "failed" | "cancelled");
         let started_at = task.created_at.saturating_mul(1_000);
-        let updated_at = task.updated_at.saturating_mul(1_000);
+        let updated_at =
+            updated_at_override.unwrap_or_else(|| task.updated_at.saturating_mul(1_000));
         let presentation =
             if task.status == "succeeded" && matches!(origin.as_str(), "background" | "recovery") {
                 "history_only"
@@ -3157,7 +3175,42 @@ impl Database {
         attempt_generation: i64,
         progress: TaskScanProgress,
     ) -> anyhow::Result<()> {
+        self.update_task_scan_progress_for_attempt_with_clock(
+            task_id,
+            attempt_generation,
+            progress,
+            unix_timestamp_millis,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_task_scan_progress_for_attempt_at_millis_for_test(
+        &self,
+        task_id: i64,
+        attempt_generation: i64,
+        progress: TaskScanProgress,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.update_task_scan_progress_for_attempt_with_clock(
+            task_id,
+            attempt_generation,
+            progress,
+            || updated_at_ms,
+        )
+    }
+
+    fn update_task_scan_progress_for_attempt_with_clock(
+        &self,
+        task_id: i64,
+        attempt_generation: i64,
+        progress: TaskScanProgress,
+        clock: impl FnOnce() -> i64,
+    ) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
+        let updated_at_ms = clock();
+        if updated_at_ms < 0 {
+            anyhow::bail!("task progress timestamp must be non-negative");
+        }
         let updated = transaction.execute(
             r#"
             UPDATE tasks
@@ -3170,7 +3223,7 @@ impl Database {
             WHERE id = ?7 AND status = 'running' AND attempt_generation = ?8
             "#,
             (
-                unix_timestamp(),
+                updated_at_ms / 1_000,
                 progress.items_seen,
                 progress.items_total,
                 progress.folders_seen,
@@ -3181,11 +3234,12 @@ impl Database {
             ),
         )?;
         let appended = if updated == 1 {
-            self.publish_task_notification_in_transaction(
+            self.publish_task_notification_in_transaction_at_millis(
                 &transaction,
                 task_id,
                 None,
                 notification_outbox::PublishMode::Progress,
+                Some(updated_at_ms),
             )?
         } else {
             false
@@ -12170,16 +12224,107 @@ mod tests {
     }
 
     #[test]
+    fn task_progress_clock_seam_emits_exactly_once_per_second() {
+        const PROGRESS_UPDATES: i64 = 10_000;
+        const EXPECTED_PROGRESS_EVENTS: usize = 10;
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/progress-clock-seam".to_string(),
+                display_name: "Progress clock seam".to_string(),
+            })
+            .expect("add root");
+        let task_id = database
+            .create_root_scan_task(root_id)
+            .expect("create root scan task");
+        database
+            .mark_task_running_current_attempt_for_test(task_id)
+            .expect("mark task running");
+        let attempt_generation = database
+            .current_task_attempt_generation(task_id)
+            .expect("read task attempt");
+        let baseline = database
+            .list_notification_outbox(0, 200)
+            .expect("read baseline outbox")
+            .last()
+            .cloned()
+            .expect("running phase event");
+
+        for index in 0..PROGRESS_UPDATES {
+            database
+                .update_task_scan_progress_for_attempt_at_millis_for_test(
+                    task_id,
+                    attempt_generation,
+                    TaskScanProgress {
+                        items_seen: index + 1,
+                        items_total: Some(PROGRESS_UPDATES),
+                        folders_seen: index / 10,
+                        media_files_seen: index + 1,
+                        skipped_files: 0,
+                    },
+                    baseline.operation.updated_at + index + 1,
+                )
+                .expect("publish scheduled progress");
+        }
+
+        assert_eq!(database.flush_dirty_notification_heads().unwrap(), 0);
+        let progress_events = database
+            .list_notification_outbox(baseline.sequence, 200)
+            .expect("read scheduled progress events");
+        assert_eq!(progress_events.len(), EXPECTED_PROGRESS_EVENTS);
+        assert_eq!(
+            progress_events
+                .iter()
+                .map(|event| event.operation.updated_at - baseline.operation.updated_at)
+                .collect::<Vec<_>>(),
+            (1..=EXPECTED_PROGRESS_EVENTS)
+                .map(|second| second as i64 * 1_000)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    struct NotificationBenchmarkTempDir {
+        path: PathBuf,
+    }
+
+    impl NotificationBenchmarkTempDir {
+        fn new() -> Self {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "megle-notification-benchmark-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create notification benchmark temp dir");
+            Self { path }
+        }
+
+        fn database_path(&self, label: &str) -> PathBuf {
+            self.path.join(format!("{label}.sqlite"))
+        }
+    }
+
+    impl Drop for NotificationBenchmarkTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
     #[ignore = "invoked by tools/bench/notification-center-bench.mjs"]
     fn notification_center_benchmark_probe() {
         const RAPID_PROGRESS_UPDATES: i64 = 10_000;
+        const EXPECTED_PROGRESS_EVENTS: i64 = 10;
         const ACTIVE_OPERATION_COUNT: usize = 20;
-        let database_path = std::env::var("MEGLE_NOTIFICATION_BENCH_CORE_DB_PATH")
-            .expect("MEGLE_NOTIFICATION_BENCH_CORE_DB_PATH");
-        let events_path = std::env::var("MEGLE_NOTIFICATION_BENCH_PROBE_PATH")
-            .expect("MEGLE_NOTIFICATION_BENCH_PROBE_PATH");
-        let database_path = std::path::PathBuf::from(database_path);
-        let database = Database::open(&database_path).expect("open benchmark database");
+        const LIBRARY_COUNT: usize = 4;
+        const THUMBNAIL_COMPLETIONS_PER_LIBRARY: i64 = 2_500;
+        const THUMBNAIL_BLOB_BYTES: i64 = 4;
+        const PROBE_PREFIX: &str = "MEGLE_NOTIFICATION_BENCH_JSON:";
+        let temp_dir = NotificationBenchmarkTempDir::new();
+        let database =
+            Database::open(&temp_dir.database_path("progress")).expect("open benchmark database");
         database
             .apply_migrations()
             .expect("apply benchmark migrations");
@@ -12213,12 +12358,23 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read benchmark baseline revision");
+        let baseline_updated_at = database
+            .list_notification_outbox(0, 200)
+            .expect("read benchmark baseline event")
+            .last()
+            .expect("running phase event")
+            .operation
+            .updated_at;
+        let attempt_generation = database
+            .current_task_attempt_generation(rapid_task_id)
+            .expect("read rapid task attempt");
 
         let input_started_at = std::time::Instant::now();
         for index in 0..RAPID_PROGRESS_UPDATES {
             database
-                .update_task_scan_progress_current_attempt_for_test(
+                .update_task_scan_progress_for_attempt_at_millis_for_test(
                     rapid_task_id,
+                    attempt_generation,
                     TaskScanProgress {
                         items_seen: index + 1,
                         items_total: Some(RAPID_PROGRESS_UPDATES),
@@ -12226,11 +12382,12 @@ mod tests {
                         media_files_seen: index + 1,
                         skipped_files: 0,
                     },
+                    baseline_updated_at + index + 1,
                 )
                 .expect("publish rapid production progress update");
         }
         let input_elapsed_ms = input_started_at.elapsed().as_secs_f64() * 1_000.0;
-        let active_operation_seconds = ((input_elapsed_ms.ceil() as i64 + 999) / 1_000).max(1);
+        let active_operation_seconds = RAPID_PROGRESS_UPDATES / 1_000;
         let rapid_head_revision: i64 = database
             .connection
             .query_row(
@@ -12245,9 +12402,13 @@ mod tests {
             "every production progress input must advance the logical head revision"
         );
 
-        database
-            .flush_dirty_notification_heads()
-            .expect("flush rapid dirty production head");
+        assert_eq!(
+            database
+                .flush_dirty_notification_heads()
+                .expect("flush rapid dirty production head"),
+            0,
+            "the final scheduled update lands exactly on a one-second boundary"
+        );
         let progress_last_sequence: i64 = database
             .connection
             .query_row(
@@ -12264,6 +12425,19 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count persisted production progress events");
+        let sampled_progress_offsets_ms = database
+            .list_notification_outbox(baseline_sequence, 200)
+            .expect("read persisted production progress events")
+            .into_iter()
+            .map(|event| event.operation.updated_at - baseline_updated_at)
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_progress_events, EXPECTED_PROGRESS_EVENTS);
+        assert_eq!(
+            sampled_progress_offsets_ms,
+            (1..=EXPECTED_PROGRESS_EVENTS)
+                .map(|second| second * 1_000)
+                .collect::<Vec<_>>()
+        );
 
         database
             .mark_task_succeeded_current_attempt_for_test(rapid_task_id)
@@ -12285,10 +12459,7 @@ mod tests {
             )
             .expect("count persisted production terminal events");
         assert_eq!(terminal_event_count, 1);
-        assert!(
-            persisted_progress_events <= active_operation_seconds + terminal_event_count,
-            "10k rapid progress updates must not persist one outbox event per input"
-        );
+        assert_eq!(persisted_progress_events, active_operation_seconds);
 
         let mut active_task_ids = Vec::with_capacity(ACTIVE_OPERATION_COUNT);
         for _ in 0..ACTIVE_OPERATION_COUNT {
@@ -12319,6 +12490,176 @@ mod tests {
             )
             .expect("read latest production outbox sequence");
         assert_eq!(outbox_row_count, outbox_events.len() as i64);
+        assert_eq!(outbox_row_count, 53);
+
+        let mut thumbnail_libraries = Vec::with_capacity(LIBRARY_COUNT);
+        let thumbnail_started_at = std::time::Instant::now();
+        for library_index in 0..LIBRARY_COUNT {
+            let thumbnail_database = Database::open(
+                &temp_dir.database_path(&format!("thumbnail-library-{}", library_index + 1)),
+            )
+            .expect("open thumbnail benchmark database");
+            thumbnail_database
+                .apply_migrations()
+                .expect("apply thumbnail benchmark migrations");
+            let root_id = thumbnail_database
+                .add_root(NewRoot {
+                    path: format!("D:/thumbnail-benchmark-library-{}", library_index + 1),
+                    display_name: format!("Thumbnail benchmark library {}", library_index + 1),
+                })
+                .expect("add thumbnail benchmark root");
+            let folder_id = thumbnail_database
+                .upsert_folder(FolderUpsert {
+                    root_id,
+                    parent_id: None,
+                    name: String::new(),
+                    path_hash: format!("thumbnail-root-{library_index}"),
+                    mtime: Some(1),
+                })
+                .expect("add thumbnail benchmark folder");
+
+            let library_started_at = std::time::Instant::now();
+            for completion_index in 0..THUMBNAIL_COMPLETIONS_PER_LIBRARY {
+                let file_id = thumbnail_database
+                    .upsert_file(FileUpsert {
+                        root_id,
+                        folder_id,
+                        name: format!("thumbnail-{completion_index:05}.jpg"),
+                        ext: ".jpg".to_string(),
+                        size: 4_096 + completion_index,
+                        mtime: 1_000 + completion_index,
+                        ctime: None,
+                        file_key: Some(format!("library-{library_index}-file-{completion_index}")),
+                    })
+                    .expect("insert thumbnail benchmark file");
+                thumbnail_database
+                    .upsert_media_kind(file_id, "image")
+                    .expect("insert thumbnail benchmark media");
+                let request = thumbnail_database
+                    .request_thumbnail_task(
+                        file_id,
+                        crate::thumbnails::GRID_320_PROFILE,
+                        ThumbnailTaskPriority::Background,
+                    )
+                    .expect("request production thumbnail task");
+                let task_id = request.task_id.expect("thumbnail task id");
+                let attempt_generation = thumbnail_database
+                    .current_task_attempt_generation(task_id)
+                    .expect("read thumbnail task attempt");
+                let source_fingerprint = thumbnail_database
+                    .get_thumbnail_source(file_id)
+                    .expect("read thumbnail source")
+                    .expect("thumbnail source exists")
+                    .source_fingerprint(crate::thumbnails::GRID_320_PROFILE);
+                thumbnail_database
+                    .mark_thumbnail_task_running_for_attempt(
+                        task_id,
+                        attempt_generation,
+                        &source_fingerprint,
+                    )
+                    .expect("mark production thumbnail task running");
+                let published = thumbnail_database
+                    .publish_thumbnail_and_succeed_task_if_source_fingerprint_and_task_attempt_current(
+                        ThumbnailStateUpsert {
+                            file_id,
+                            profile: crate::thumbnails::GRID_320_PROFILE.to_string(),
+                            state: "ready".to_string(),
+                            cache_key: None,
+                            width: Some(320),
+                            height: Some(320),
+                            byte_size: Some(THUMBNAIL_BLOB_BYTES),
+                            error: None,
+                            source_fingerprint: Some(source_fingerprint.clone()),
+                        },
+                        ThumbBlobRecord {
+                            file_id,
+                            profile: crate::thumbnails::GRID_320_PROFILE.to_string(),
+                            data: b"RIFF".to_vec(),
+                            width: 320,
+                            height: 320,
+                            byte_size: THUMBNAIL_BLOB_BYTES,
+                            output_format: crate::thumbnails::GENERATED_FORMAT.to_string(),
+                            created_at: 1,
+                            updated_at: 1,
+                        },
+                        Some((320, 320)),
+                        &source_fingerprint,
+                        task_id,
+                        attempt_generation,
+                    )
+                    .expect("publish production thumbnail completion");
+                assert!(published);
+            }
+
+            let stats = thumbnail_database
+                .get_thumbnail_cache_stats(ThumbnailCacheScope {
+                    root_id: Some(root_id),
+                    folder_id: None,
+                    include_descendants: true,
+                })
+                .expect("read production thumbnail cache stats");
+            let thumbnail_outbox_rows: i64 = thumbnail_database
+                .connection
+                .query_row("SELECT COUNT(*) FROM notification_outbox", [], |row| {
+                    row.get(0)
+                })
+                .expect("count thumbnail outbox rows");
+            let completed_task_rows: i64 = thumbnail_database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE kind = 'thumbnail' AND status = 'succeeded'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count completed thumbnail tasks");
+            let ready_thumbnail_rows: i64 = thumbnail_database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM thumbs WHERE state = 'ready'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count ready thumbnail rows");
+            let blob_rows: i64 = thumbnail_database
+                .connection
+                .query_row("SELECT COUNT(*) FROM thumb_blobs", [], |row| row.get(0))
+                .expect("count thumbnail blob rows");
+            assert_eq!(thumbnail_outbox_rows, 0);
+            assert_eq!(completed_task_rows, THUMBNAIL_COMPLETIONS_PER_LIBRARY);
+            assert_eq!(ready_thumbnail_rows, THUMBNAIL_COMPLETIONS_PER_LIBRARY);
+            assert_eq!(blob_rows, THUMBNAIL_COMPLETIONS_PER_LIBRARY);
+            assert_eq!(stats.cached_count, THUMBNAIL_COMPLETIONS_PER_LIBRARY);
+            assert_eq!(stats.missing_count, 0);
+            assert_eq!(stats.stale_count, 0);
+            assert_eq!(stats.failed_count, 0);
+            assert_eq!(stats.pending_candidate_count, 0);
+            assert_eq!(stats.active_bulk_task_count, 0);
+            assert_eq!(
+                stats.total_blob_bytes,
+                THUMBNAIL_COMPLETIONS_PER_LIBRARY * THUMBNAIL_BLOB_BYTES
+            );
+
+            thumbnail_libraries.push(serde_json::json!({
+                "libraryId": format!("bench-library-{}", library_index + 1),
+                "libraryName": format!("Benchmark Library {}", library_index + 1),
+                "completionCount": THUMBNAIL_COMPLETIONS_PER_LIBRARY,
+                "completedTaskRows": completed_task_rows,
+                "readyThumbnailRows": ready_thumbnail_rows,
+                "blobRows": blob_rows,
+                "perItemOutboxRows": thumbnail_outbox_rows,
+                "completionElapsedMs": library_started_at.elapsed().as_secs_f64() * 1_000.0,
+                "stats": {
+                    "cachedCount": stats.cached_count,
+                    "missingCount": stats.missing_count,
+                    "staleCount": stats.stale_count,
+                    "failedCount": stats.failed_count,
+                    "pendingCandidateCount": stats.pending_candidate_count,
+                    "totalBlobBytes": stats.total_blob_bytes,
+                    "activeBulkTaskCount": stats.active_bulk_task_count
+                }
+            }));
+        }
+        assert_eq!(thumbnail_libraries.len(), LIBRARY_COUNT);
 
         let probe = serde_json::json!({
             "events": outbox_events,
@@ -12337,17 +12678,21 @@ mod tests {
                 "progressLastSequence": progress_last_sequence,
                 "terminalLastSequence": terminal_last_sequence,
                 "persistedProgressEvents": persisted_progress_events,
+                "expectedProgressEvents": EXPECTED_PROGRESS_EVENTS,
+                "sampledProgressOffsetsMs": sampled_progress_offsets_ms,
                 "terminalEventCount": terminal_event_count,
                 "activeOperationSeconds": active_operation_seconds,
                 "inputElapsedMs": input_elapsed_ms,
-                "outboxRowCount": outbox_row_count
-            }
+                "outboxRowCount": outbox_row_count,
+                "thumbnailCompletionCount": THUMBNAIL_COMPLETIONS_PER_LIBRARY * LIBRARY_COUNT as i64,
+                "thumbnailElapsedMs": thumbnail_started_at.elapsed().as_secs_f64() * 1_000.0
+            },
+            "thumbnailLibraries": thumbnail_libraries
         });
-        std::fs::write(
-            events_path,
-            serde_json::to_vec_pretty(&probe).expect("serialize benchmark probe"),
-        )
-        .expect("write benchmark probe");
+        println!(
+            "{PROBE_PREFIX}{}",
+            serde_json::to_string(&probe).expect("serialize benchmark probe")
+        );
     }
 
     #[test]
