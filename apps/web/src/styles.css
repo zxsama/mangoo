@@ -4106,8 +4106,6 @@ button:disabled {
   color: #ff8b95;
 }
 
-/* Phase 6: file operations — context menu, dialogs, recent ops drawer. */
-
 .top-action {
   display: inline-flex;
   align-items: center;

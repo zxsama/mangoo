@@ -103,6 +103,23 @@ for (const retiredPath of retiredPresentationPaths) {
   }
 }
 
+const retiredRecentDrawerPhrase = ["recent", "ops", "drawer"].join("\\s+");
+const retiredRecentDrawerComment = new RegExp(
+  `/\\*[^*]*\\b${retiredRecentDrawerPhrase}\\b[^*]*\\*/`,
+  "i"
+);
+if (retiredRecentDrawerComment.test(styles)) {
+  fail("legacy Recent drawer CSS comment must stay retired");
+}
+for (const retiredSelectorPrefix of [
+  `.${["recent", "ops", ""].join("-")}`,
+  `.${["recent", "op", ""].join("-")}`
+]) {
+  if (stylesForChecks.includes(retiredSelectorPrefix)) {
+    fail(`legacy Recent CSS selector must stay retired: ${retiredSelectorPrefix}*`);
+  }
+}
+
 for (const value of ["previewPlaceholder", "previewPlaceholderFormat", "servedBy", "db_blob"]) {
   if (!coreClientContract.includes(value)) {
     fail(`Core preview pipeline contract must expose ${value}`);
