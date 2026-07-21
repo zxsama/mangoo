@@ -8,11 +8,9 @@ import {
 } from "lucide-react";
 import {
   useLayoutEffect,
-  useRef,
   useState,
   type CSSProperties,
-  type ReactNode,
-  type RefObject
+  type ReactNode
 } from "react";
 import { createPortal } from "react-dom";
 import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
@@ -20,6 +18,7 @@ import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
+import { observeNotificationPopoverMeasurements } from "./notificationPopoverMeasurement";
 import { resolveNotificationPopoverPosition } from "./notificationPopoverPosition";
 import {
   activeOperationPresentation,
@@ -27,18 +26,18 @@ import {
 } from "./notificationPopoverPresentation";
 
 interface NotificationPopoverProps {
-  anchorRef: RefObject<HTMLElement>;
+  anchor: HTMLElement;
   model: CompactNotificationModel;
   onOpenCenter: () => void;
 }
 
 export function NotificationPopover({
-  anchorRef,
+  anchor,
   model,
   onOpenCenter
 }: NotificationPopoverProps) {
-  const popoverRef = useRef<HTMLElement>(null);
-  const position = useNotificationPopoverPosition(anchorRef, popoverRef);
+  const [popoverElement, setPopoverElement] = useState<HTMLElement | null>(null);
+  const position = useNotificationPopoverPosition(anchor, popoverElement);
   const hasContent =
     model.active.length > 0 || model.thumbnail.summaries.length > 0 || model.results.length > 0;
 
@@ -49,7 +48,7 @@ export function NotificationPopover({
       className="floating-popover notification-popover popup-surface"
       data-compact-popover-root="notifications"
       interactive
-      ref={popoverRef}
+      ref={setPopoverElement}
       style={
         position
           ? {
@@ -215,75 +214,32 @@ export function NotificationPopover({
   );
 }
 
-function useNotificationPopoverPosition(
-  anchorRef: RefObject<HTMLElement>,
-  popoverRef: RefObject<HTMLElement>
-) {
+function useNotificationPopoverPosition(anchor: HTMLElement, popover: HTMLElement | null) {
   const [position, setPosition] = useState<ReturnType<
     typeof resolveNotificationPopoverPosition
   > | null>(null);
 
   useLayoutEffect(() => {
-    const anchor = anchorRef.current;
-    const popover = popoverRef.current;
-    if (!anchor || !popover) return;
+    setPosition(null);
+    if (!popover) return;
 
-    let animationFrame = 0;
-    const update = () => {
-      if (animationFrame) return;
-      animationFrame = window.requestAnimationFrame(() => {
-        animationFrame = 0;
-        const anchorRect = anchor.getBoundingClientRect();
-        const popoverRect = popover.getBoundingClientRect();
-        const viewport = window.visualViewport;
+    return observeNotificationPopoverMeasurements({
+      anchor,
+      onMeasure: (measurement) => {
         const nextPosition = resolveNotificationPopoverPosition({
-          anchor: anchorRect,
-          popover: popoverRect,
-          viewport: {
-            width: viewport?.width ?? window.innerWidth,
-            height: viewport?.height ?? window.innerHeight
-          },
+          anchor: measurement.anchor,
+          popover: measurement.popover,
+          viewport: measurement.viewport,
           gap: 4,
           margin: 8
         });
         setPosition((current) =>
           current && samePopoverPosition(current, nextPosition) ? current : nextPosition
         );
-      });
-    };
-
-    const titlebar = anchor.closest(".shell-titlebar") ?? anchor.parentElement;
-    const resizeObserver = new ResizeObserver(update);
-    resizeObserver.observe(anchor);
-    resizeObserver.observe(popover);
-    if (titlebar) resizeObserver.observe(titlebar);
-
-    const mutationObserver = new MutationObserver(update);
-    if (titlebar) {
-      mutationObserver.observe(titlebar, {
-        attributes: true,
-        attributeFilter: ["class", "style"],
-        childList: true,
-        subtree: true
-      });
-    }
-
-    window.addEventListener("resize", update);
-    window.addEventListener("scroll", update, true);
-    window.visualViewport?.addEventListener("resize", update);
-    window.visualViewport?.addEventListener("scroll", update);
-    update();
-
-    return () => {
-      if (animationFrame) window.cancelAnimationFrame(animationFrame);
-      resizeObserver.disconnect();
-      mutationObserver.disconnect();
-      window.removeEventListener("resize", update);
-      window.removeEventListener("scroll", update, true);
-      window.visualViewport?.removeEventListener("resize", update);
-      window.visualViewport?.removeEventListener("scroll", update);
-    };
-  }, [anchorRef, popoverRef]);
+      },
+      popover
+    });
+  }, [anchor, popover]);
 
   return position;
 }

@@ -98,6 +98,11 @@ const notificationPopoverPath =
 const notificationPopover = existsSync(path.join(root, notificationPopoverPath))
   ? read(notificationPopoverPath)
   : "";
+const notificationPopoverMeasurementPath =
+  "apps/web/src/features/notifications/notificationPopoverMeasurement.ts";
+const notificationPopoverMeasurement = existsSync(path.join(root, notificationPopoverMeasurementPath))
+  ? read(notificationPopoverMeasurementPath)
+  : "";
 const notificationVisualFixturePath =
   "apps/web/tests/fixtures/notificationPopoverVisualFixture.tsx";
 const notificationVisualFixture = existsSync(path.join(root, notificationVisualFixturePath))
@@ -174,7 +179,10 @@ for (const value of [
   "NotificationPopover",
   "LiquidGlassButton",
   "notification-status-dot",
-  'data-titlebar-control="notifications"'
+  'data-titlebar-control="notifications"',
+  "notificationPopoverFixture",
+  "churnDetachedPointerStyles",
+  "resetMeasurements"
 ]) {
   if (!notificationVisualFixture.includes(value)) {
     fail(`notification visual fixture contract missing ${value}`);
@@ -184,6 +192,12 @@ for (const value of [
   "notificationButtonStyleEvidenceExpression",
   "window-blur-closes-notifications",
   "notificationPopoverFixtureEvidence",
+  "notificationAnchorGeometryExpression",
+  "notificationMaximizeAnchorEvidence",
+  "relocate(\"center\")",
+  "churnPointerStyles(500)",
+  "churnDetachedPointerStyles(500)",
+  "Emulation.setPageScaleFactor",
   "resizeScriptOpenedWindow(fixtureClient, 800, 720)",
   "ui-notification-compact-fixture-full.png",
   "ui-notification-compact-fixture-full-narrow.png"
@@ -192,25 +206,70 @@ for (const value of [
     fail(`notification visual harness contract missing ${value}`);
   }
 }
-for (const value of ["notificationButtonRef", "ref={notificationButtonRef}"]) {
-  if (!shellTitlebar.includes(value) && !app.includes(value)) {
-    fail(`notification titlebar anchor contract missing ${value}`);
+for (const [label, source, values] of [
+  [
+    "App notification anchor state",
+    app,
+    [
+      "notificationAnchor",
+      "setNotificationAnchor",
+      "notificationButtonRef={setNotificationAnchor}",
+      "notificationAnchor={notificationAnchor}"
+    ]
+  ],
+  [
+    "ShellTopBar notification callback ref",
+    shellTitlebar,
+    ["RefCallback<HTMLButtonElement>", "ref={notificationButtonRef}"]
+  ],
+  [
+    "ShellOverlayHost notification anchor gating",
+    shellOverlayHost,
+    ["notificationAnchor: HTMLElement | null", "notificationsOpen && notificationAnchor", "anchor={notificationAnchor}"]
+  ],
+  [
+    "NotificationPopover live anchor",
+    notificationPopover,
+    ["anchor: HTMLElement", "popoverElement", "observeNotificationPopoverMeasurements"]
+  ]
+]) {
+  for (const value of values) {
+    if (!source.includes(value)) fail(`${label} contract missing ${value}`);
   }
+}
+for (const [label, source, pattern] of [
+  ["App", app, /notificationButtonRef\s*=\s*useRef/],
+  ["ShellOverlayHost", shellOverlayHost, /notificationAnchorRef|RefObject<HTMLElement>/],
+  ["NotificationPopover", notificationPopover, /anchorRef|\.current\b|RefObject/]
+]) {
+  if (pattern.test(source)) fail(`${label} must not retain the notification RefObject snapshot path`);
 }
 for (const value of [
   "createPortal",
-  "anchorRef",
-  "getBoundingClientRect",
+  "resolveNotificationPopoverPosition",
+  "observeNotificationPopoverMeasurements"
+]) {
+  if (!notificationPopover.includes(value)) {
+    fail(`notification popover true-anchor contract missing ${value}`);
+  }
+}
+for (const value of [
   "ResizeObserver",
   "MutationObserver",
   "visualViewport",
   'addEventListener("resize"',
   'addEventListener("scroll"',
-  "resolveNotificationPopoverPosition"
+  "requestAnimationFrame",
+  "childList: true",
+  "subtree: true",
+  "unobserve(titlebar)"
 ]) {
-  if (!notificationPopover.includes(value)) {
-    fail(`notification popover true-anchor contract missing ${value}`);
+  if (!notificationPopoverMeasurement.includes(value)) {
+    fail(`notification popover measurement contract missing ${value}`);
   }
+}
+if (/attributes\s*:|attributeFilter\s*:/.test(notificationPopoverMeasurement)) {
+  fail("notification popover MutationObserver must ignore pointer-driven style attributes");
 }
 if (/\.notification-popover\s*\{[^}]*\bright\s*:/s.test(read("apps/web/src/styles.css"))) {
   fail("notification popover must not use a fixed right offset instead of the trigger anchor");

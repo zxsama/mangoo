@@ -1,5 +1,5 @@
 import { Bell } from "lucide-react";
-import { StrictMode, useRef, useState } from "react";
+import { StrictMode, useCallback, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../../src/styles.css";
 import { LiquidGlassButton, LiquidGlassLayer } from "../../src/design/liquid-glass";
@@ -13,6 +13,39 @@ import "./notificationPopoverVisualFixture.css";
 type FixtureState = "full" | "empty" | "degraded";
 
 const fixtureParameters = new URLSearchParams(window.location.search);
+const measurementMetrics = { anchorRectCalls: 0, popoverRectCalls: 0 };
+const nativeGetBoundingClientRect = Element.prototype.getBoundingClientRect;
+
+Element.prototype.getBoundingClientRect = function fixtureMeasurementRect() {
+  if (this.matches('[data-titlebar-control="notifications"]')) {
+    measurementMetrics.anchorRectCalls += 1;
+  }
+  if (this.matches('[data-compact-popover-root="notifications"]')) {
+    measurementMetrics.popoverRectCalls += 1;
+  }
+  return nativeGetBoundingClientRect.call(this);
+};
+
+type FixtureAnchorLocation = "center" | "right";
+
+interface NotificationFixtureController {
+  churnDetachedPointerStyles(count: number): void;
+  churnPointerStyles(count: number): void;
+  getMetrics(): {
+    anchorId: string | null;
+    anchorRectCalls: number;
+    detachedAnchorCount: number;
+    location: FixtureAnchorLocation;
+    popoverRectCalls: number;
+  };
+  relocate(location: FixtureAnchorLocation): void;
+  remount(): void;
+  resetMeasurements(): void;
+}
+
+type FixtureWindow = Window & {
+  notificationPopoverFixture?: NotificationFixtureController;
+};
 
 function operation(
   operationId: string,
@@ -159,39 +192,106 @@ function modelFor(state: FixtureState): CompactNotificationModel {
 }
 
 function NotificationPopoverVisualFixture() {
-  const anchorRef = useRef<HTMLButtonElement>(null);
+  const [anchor, setAnchor] = useState<HTMLButtonElement | null>(null);
+  const [anchorLocation, setAnchorLocation] = useState<FixtureAnchorLocation>("right");
+  const [anchorVersion, setAnchorVersion] = useState(0);
+  const anchorNodeRef = useRef<HTMLButtonElement | null>(null);
+  const detachedAnchorsRef = useRef<HTMLButtonElement[]>([]);
   const [open, setOpen] = useState(true);
   const requestedState = fixtureParameters.get("state");
   const state: FixtureState =
     requestedState === "empty" || requestedState === "degraded" ? requestedState : "full";
   const model = modelFor(state);
+  const anchorId = `notification-anchor-${anchorLocation}-${anchorVersion}`;
+  const bindAnchor = useCallback((node: HTMLButtonElement | null) => {
+    const previous = anchorNodeRef.current;
+    if (previous && previous !== node && !detachedAnchorsRef.current.includes(previous)) {
+      detachedAnchorsRef.current.push(previous);
+    }
+    anchorNodeRef.current = node;
+    setAnchor(node);
+  }, []);
+  const notificationButton = (
+    <LiquidGlassButton
+      active={open}
+      aria-label="通知"
+      className="titlebar-icon-button notification-toggle no-drag"
+      data-compact-popover-trigger="notifications"
+      data-fixture-anchor-id={anchorId}
+      data-titlebar-control="notifications"
+      key={anchorId}
+      onClick={() => setOpen((current) => !current)}
+      ref={bindAnchor}
+      tone="control"
+    >
+      <Bell aria-hidden="true" size={15} />
+      {model.indicator === "idle" ? null : (
+        <span className={`notification-status-dot ${model.indicator}`} />
+      )}
+    </LiquidGlassButton>
+  );
+
+  (window as FixtureWindow).notificationPopoverFixture = {
+    churnDetachedPointerStyles(count) {
+      const detached = detachedAnchorsRef.current.at(-1);
+      for (let index = 0; detached && index < count; index += 1) {
+        detached.style.setProperty("--glass-pointer-x", `${index % 100}%`);
+      }
+    },
+    churnPointerStyles(count) {
+      const current = anchorNodeRef.current;
+      for (let index = 0; current && index < count; index += 1) {
+        current.style.setProperty("--glass-pointer-x", `${index % 100}%`);
+        current.style.setProperty("--glass-pointer-y", `${(index * 3) % 100}%`);
+      }
+    },
+    getMetrics() {
+      return {
+        anchorId: anchorNodeRef.current?.dataset.fixtureAnchorId ?? null,
+        anchorRectCalls: measurementMetrics.anchorRectCalls,
+        detachedAnchorCount: detachedAnchorsRef.current.length,
+        location: anchorLocation,
+        popoverRectCalls: measurementMetrics.popoverRectCalls
+      };
+    },
+    relocate(location) {
+      setAnchorLocation(location);
+      setAnchorVersion((current) => current + 1);
+    },
+    remount() {
+      setAnchorVersion((current) => current + 1);
+    },
+    resetMeasurements() {
+      measurementMetrics.anchorRectCalls = 0;
+      measurementMetrics.popoverRectCalls = 0;
+    }
+  };
 
   return (
     <LiquidGlassLayer>
       <main className="notification-visual-fixture" data-notification-fixture={state}>
-        <header className="notification-visual-fixture-titlebar shell-titlebar-right">
+        <div className="notification-visual-fixture-titlebars">
+          <header
+            className="notification-visual-fixture-titlebar shell-titlebar shell-titlebar-center"
+            data-fixture-titlebar="center"
+          >
+            <div className="shell-right-actions no-drag">
+              {anchorLocation === "center" ? notificationButton : null}
+            </div>
+          </header>
+          <header
+            className="notification-visual-fixture-titlebar shell-titlebar shell-titlebar-right"
+            data-fixture-titlebar="right"
+          >
           <div className="shell-right-actions no-drag">
-            <LiquidGlassButton
-              active={open}
-              aria-label="通知"
-              className="titlebar-icon-button notification-toggle no-drag"
-              data-compact-popover-trigger="notifications"
-              data-titlebar-control="notifications"
-              onClick={() => setOpen((current) => !current)}
-              ref={anchorRef}
-              tone="control"
-            >
-              <Bell aria-hidden="true" size={15} />
-              {model.indicator === "idle" ? null : (
-                <span className={`notification-status-dot ${model.indicator}`} />
-              )}
-            </LiquidGlassButton>
+              {anchorLocation === "right" ? notificationButton : null}
           </div>
-        </header>
+          </header>
+        </div>
         <div className="notification-visual-fixture-stage">受控通知状态渲染器</div>
-        {open ? (
+        {open && anchor ? (
           <NotificationPopover
-            anchorRef={anchorRef}
+            anchor={anchor}
             model={model}
             onOpenCenter={() => setOpen(false)}
           />

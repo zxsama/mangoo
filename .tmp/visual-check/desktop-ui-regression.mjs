@@ -1081,6 +1081,57 @@ async function waitForCompactPopoverState(client, expected, timeoutMs = 5000) {
   );
 }
 
+function notificationAnchorGeometryExpression() {
+  return `(() => {
+    const button = document.querySelector('[data-titlebar-control="notifications"]');
+    const popover = document.querySelector('[data-compact-popover-root="notifications"]');
+    if (!button || !popover || getComputedStyle(popover).visibility !== "visible") return false;
+    const buttonRect = button.getBoundingClientRect();
+    const popoverRect = popover.getBoundingClientRect();
+    return Math.abs(popoverRect.right - buttonRect.right) <= 1 &&
+      Math.abs(popoverRect.top - buttonRect.bottom - 4) <= 1 &&
+      popoverRect.left >= 0 &&
+      popoverRect.top >= 0 &&
+      popoverRect.right <= window.innerWidth &&
+      popoverRect.bottom <= window.innerHeight;
+  })()`;
+}
+
+async function waitForNotificationAnchorGeometry(client, label, timeoutMs = 10000) {
+  return waitFor(client, notificationAnchorGeometryExpression(), timeoutMs, label);
+}
+
+async function notificationMaximizeAnchorEvidence(client) {
+  const bridgeAvailable = await evaluate(
+    client,
+    `typeof window.megleDesktop?.windowControls?.maximize === "function" &&
+      typeof window.megleDesktop?.windowControls?.isMaximized === "function"`
+  );
+  if (!bridgeAvailable) return { bridgeAvailable: false };
+
+  if (await desktopMaximizedState(client)) {
+    await evaluate(client, `window.megleDesktop.windowControls.maximize()`);
+    await waitForMaximizedState(client, false);
+  }
+  await clickSelector(client, `[data-compact-popover-trigger="notifications"]`);
+  await waitForCompactPopoverState(client, "notifications");
+  await waitForNotificationAnchorGeometry(client, "notification anchor before maximize");
+  const before = await evaluate(client, compactPopoverEvidenceExpression());
+
+  await evaluate(client, `window.megleDesktop.windowControls.maximize()`);
+  const maximizedState = await waitForMaximizedState(client, true);
+  await waitForNotificationAnchorGeometry(client, "notification anchor after maximize");
+  const maximized = await evaluate(client, compactPopoverEvidenceExpression());
+
+  await evaluate(client, `window.megleDesktop.windowControls.maximize()`);
+  const restoredState = await waitForMaximizedState(client, false);
+  await waitForNotificationAnchorGeometry(client, "notification anchor after restore");
+  const restored = await evaluate(client, compactPopoverEvidenceExpression());
+  await pressKey(client, "Escape", "Escape", 27);
+  await waitForCompactPopoverState(client, null);
+  return { before, bridgeAvailable: true, maximized, maximizedState, restored, restoredState };
+}
+
 async function compactPopoverDismissalEvidence(client) {
   const steps = [];
 
@@ -1232,17 +1283,8 @@ async function notificationPopoverFixtureEvidence(client) {
       captureBeyondViewport: false,
       format: "png"
     });
-    await waitFor(
+    await waitForNotificationAnchorGeometry(
       fixtureClient,
-      `(() => {
-        const button = document.querySelector('[data-titlebar-control="notifications"]');
-        const popover = document.querySelector('[data-compact-popover-root="notifications"]');
-        if (!button || !popover) return false;
-        const popoverRect = popover.getBoundingClientRect();
-        return getComputedStyle(popover).visibility === "visible" &&
-          popoverRect.top > 0 && popoverRect.left > 0;
-      })()`,
-      10000,
       `anchored notification ${state} visual fixture`
     );
     return evaluate(fixtureClient, compactPopoverEvidenceExpression());
@@ -1253,6 +1295,100 @@ async function notificationPopoverFixtureEvidence(client) {
     const fullRendererScreenshot = await rendererScreenshot(
       fixtureClient,
       "ui-notification-compact-fixture-full.png"
+    );
+
+    await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.resetMeasurements()`
+    );
+    const pointerChurnBefore = await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.getMetrics()`
+    );
+    await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.churnPointerStyles(500)`
+    );
+    await delay(180);
+    const pointerChurnAfter = await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.getMetrics()`
+    );
+
+    const anchorBeforeRelocation = pointerChurnAfter.anchorId;
+    await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.relocate("center")`
+    );
+    await waitFor(
+      fixtureClient,
+      `(() => {
+        const metrics = window.notificationPopoverFixture?.getMetrics();
+        return metrics?.location === "center" && metrics.anchorId !== ${JSON.stringify(anchorBeforeRelocation)};
+      })()`,
+      10000,
+      "notification fixture titlebar relocation"
+    );
+    await fixtureClient.send("Page.bringToFront");
+    await fixtureClient.send("Page.captureScreenshot", {
+      captureBeyondViewport: false,
+      format: "png"
+    });
+    await waitForNotificationAnchorGeometry(
+      fixtureClient,
+      "notification anchor after titlebar relocation"
+    );
+    const relocated = await evaluate(fixtureClient, compactPopoverEvidenceExpression());
+
+    await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.resetMeasurements()`
+    );
+    const detachedChurnBefore = await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.getMetrics()`
+    );
+    await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.churnDetachedPointerStyles(500)`
+    );
+    await delay(180);
+    const detachedChurnAfter = await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.getMetrics()`
+    );
+
+    const anchorBeforeRemount = detachedChurnAfter.anchorId;
+    await evaluate(fixtureClient, `window.notificationPopoverFixture.remount()`);
+    await waitFor(
+      fixtureClient,
+      `window.notificationPopoverFixture?.getMetrics().anchorId !== ${JSON.stringify(anchorBeforeRemount)}`,
+      10000,
+      "notification fixture anchor remount"
+    );
+    await fixtureClient.send("Page.bringToFront");
+    await fixtureClient.send("Page.captureScreenshot", {
+      captureBeyondViewport: false,
+      format: "png"
+    });
+    await waitForNotificationAnchorGeometry(
+      fixtureClient,
+      "notification anchor after remount"
+    );
+    const remounted = await evaluate(fixtureClient, compactPopoverEvidenceExpression());
+
+    await evaluate(
+      fixtureClient,
+      `window.notificationPopoverFixture.relocate("right")`
+    );
+    await fixtureClient.send("Page.bringToFront");
+    await fixtureClient.send("Page.captureScreenshot", {
+      captureBeyondViewport: false,
+      format: "png"
+    });
+    await waitForNotificationAnchorGeometry(
+      fixtureClient,
+      "notification anchor after returning right"
     );
     const resize = await resizeScriptOpenedWindow(fixtureClient, 800, 720);
     await waitFor(
@@ -1266,10 +1402,29 @@ async function notificationPopoverFixtureEvidence(client) {
       captureBeyondViewport: false,
       format: "png"
     });
+    await waitForNotificationAnchorGeometry(
+      fixtureClient,
+      "notification anchor after 784px resize"
+    );
     const narrow = await evaluate(fixtureClient, compactPopoverEvidenceExpression());
     const narrowRendererScreenshot = await rendererScreenshot(
       fixtureClient,
       "ui-notification-compact-fixture-full-narrow.png"
+    );
+    await fixtureClient.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1.25 });
+    await fixtureClient.send("Page.captureScreenshot", {
+      captureBeyondViewport: false,
+      format: "png"
+    });
+    await waitForNotificationAnchorGeometry(
+      fixtureClient,
+      "notification anchor after page zoom"
+    );
+    const zoomed = await evaluate(fixtureClient, compactPopoverEvidenceExpression());
+    await fixtureClient.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
+    await waitForNotificationAnchorGeometry(
+      fixtureClient,
+      "notification anchor after zoom reset"
     );
     const empty = await navigate("empty");
     const emptyScreenshot = await rendererScreenshot(
@@ -1285,9 +1440,18 @@ async function notificationPopoverFixtureEvidence(client) {
     return {
       full,
       narrow,
+      zoomed,
+      relocated,
+      remounted,
       empty,
       degraded,
       resize,
+      measurement: {
+        detachedChurnAfter,
+        detachedChurnBefore,
+        pointerChurnAfter,
+        pointerChurnBefore
+      },
       screenshots: {
         fullRenderer: fullRendererScreenshot,
         narrowRenderer: narrowRendererScreenshot,
@@ -2590,6 +2754,7 @@ try {
     layout
   );
   const titlebarDrag = await titlebarDragEvidence(client);
+  const notificationMaximize = await notificationMaximizeAnchorEvidence(client);
   const searchNoDrag = await searchNoDragEvidence(client);
   const settingsInterfaceStyle = await settingsInterfaceStyleEvidence(client);
   const pluginsSecondaryWindow = await pluginsSecondaryWindowEvidence(client);
@@ -2703,6 +2868,7 @@ try {
       titlebarToolGlassNearby,
       titlebarAllButtonsNearby,
       titlebarDrag,
+      notificationMaximize,
       searchNoDrag,
       settingsInterfaceStyle: settingsInterfaceStyle.evidence,
       pluginsSecondaryWindow,
@@ -3206,8 +3372,17 @@ try {
     evidence?.roots?.find((root) => root.name === "notifications") ?? null;
   const fullFixtureRoot = fixtureRoot(fixture?.full);
   const narrowFixtureRoot = fixtureRoot(fixture?.narrow);
+  const zoomedFixtureRoot = fixtureRoot(fixture?.zoomed);
+  const relocatedFixtureRoot = fixtureRoot(fixture?.relocated);
+  const remountedFixtureRoot = fixtureRoot(fixture?.remounted);
   const emptyFixtureRoot = fixtureRoot(fixture?.empty);
   const degradedFixtureRoot = fixtureRoot(fixture?.degraded);
+  const validFixtureAnchor = (root) =>
+    Boolean(
+      root?.anchorGeometry?.viewportContained &&
+        near(root.anchorGeometry.gap, 4, 1) &&
+        (root.anchorGeometry.clampedLeft || near(root.anchorGeometry.rightDelta, 0, 1))
+    );
   if (
     !fullFixtureRoot ||
     fullFixtureRoot.notification?.activeCount !== 2 ||
@@ -3236,6 +3411,21 @@ try {
   ) {
     hardFailures.push("narrow notification visual fixture is detached from its anchor or overflows");
   }
+  if (!validFixtureAnchor(zoomedFixtureRoot)) {
+    hardFailures.push("zoomed notification visual fixture is detached from its anchor or overflows");
+  }
+  if (!validFixtureAnchor(relocatedFixtureRoot) || !validFixtureAnchor(remountedFixtureRoot)) {
+    hardFailures.push("relocated or remounted notification fixture lost its live anchor geometry");
+  }
+  const measurement = fixture?.measurement;
+  if (
+    !measurement ||
+    measurement.pointerChurnAfter.popoverRectCalls !== measurement.pointerChurnBefore.popoverRectCalls ||
+    measurement.detachedChurnAfter.popoverRectCalls !== measurement.detachedChurnBefore.popoverRectCalls ||
+    measurement.detachedChurnAfter.detachedAnchorCount < 1
+  ) {
+    hardFailures.push("notification pointer or detached-node churn triggered redundant measurements");
+  }
   if (!emptyFixtureRoot?.notification?.empty || emptyFixtureRoot.notification.degraded) {
     hardFailures.push("empty notification visual fixture is missing its healthy empty state");
   }
@@ -3255,6 +3445,17 @@ try {
     ) ?? [];
   if (unexpectedFixtureConsoleErrors.length || unexpectedFixtureNetworkProblems.length) {
     hardFailures.push("notification test renderer emitted unexpected console or network failures");
+  }
+  const notificationMaximizeEvidence = summary.evidence.notificationMaximize;
+  if (
+    notificationMaximizeEvidence?.bridgeAvailable &&
+    (!notificationMaximizeEvidence.maximizedState?.matched ||
+      !notificationMaximizeEvidence.restoredState?.matched ||
+      !validFixtureAnchor(notificationMaximizeEvidence.before?.roots?.find((root) => root.name === "notifications")) ||
+      !validFixtureAnchor(notificationMaximizeEvidence.maximized?.roots?.find((root) => root.name === "notifications")) ||
+      !validFixtureAnchor(notificationMaximizeEvidence.restored?.roots?.find((root) => root.name === "notifications")))
+  ) {
+    hardFailures.push("notification anchor geometry did not survive maximize and restore");
   }
   if (inspectorPortrait.centralOpen) hardFailures.push("central preview open during right preview capture");
   if (inspectorPortrait.headingPresent) hardFailures.push("right preview still renders the old heading row");

@@ -17,6 +17,15 @@
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.notification-visual-fixture-titlebars {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.notification-visual-fixture-titlebar .shell-right-actions {
+  width: 100%;
+}
+
 .notification-visual-fixture-stage {
   display: grid;
   min-height: calc(100vh - var(--shell-titlebar-height, 50px));

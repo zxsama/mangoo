@@ -12,7 +12,6 @@ import {
 import { NotificationPopover } from "../features/notifications/NotificationPopover";
 import type { CompactNotificationModel } from "../features/notifications/notificationModel";
 import type { LibraryState } from "../core/useLibraryData";
-import type { RefObject } from "react";
 
 export interface ShellContextMenuState {
   x: number;
@@ -24,7 +23,7 @@ interface ShellOverlayHostProps {
   contextMenu: ShellContextMenuState | null;
   fileOps: FileOpsController;
   library: LibraryState;
-  notificationAnchorRef: RefObject<HTMLElement>;
+  notificationAnchor: HTMLElement | null;
   notificationModel: CompactNotificationModel;
   notificationsOpen: boolean;
   onCloseContextMenu: () => void;
@@ -35,7 +34,7 @@ export function ShellOverlayHost({
   contextMenu,
   fileOps,
   library,
-  notificationAnchorRef,
+  notificationAnchor,
   notificationModel,
   notificationsOpen,
   onCloseContextMenu,
@@ -47,9 +46,9 @@ export function ShellOverlayHost({
 
   return (
     <>
-      {notificationsOpen ? (
+      {notificationsOpen && notificationAnchor ? (
         <NotificationPopover
-          anchorRef={notificationAnchorRef}
+          anchor={notificationAnchor}
           model={notificationModel}
           onOpenCenter={onOpenNotificationCenter}
         />

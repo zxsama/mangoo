@@ -11,7 +11,7 @@ import {
   Package,
   Settings
 } from "lucide-react";
-import type { ComponentProps, ReactNode, RefObject } from "react";
+import type { ComponentProps, ReactNode, RefCallback } from "react";
 import { LiquidGlassButton } from "../design/liquid-glass";
 import { FilterMenu } from "../features/library/FilterMenu";
 import { FolderLocationIcon } from "../features/library/FolderLocationIcon";
@@ -77,7 +77,7 @@ interface PreviewTitlebarToolbarProps {
 }
 
 interface ShellRightActionsProps {
-  notificationButtonRef: RefObject<HTMLButtonElement>;
+  notificationButtonRef: RefCallback<HTMLButtonElement>;
   notificationIndicator: "idle" | "active" | "failure";
   notificationsOpen: boolean;
   onToggleNotifications: () => void;
