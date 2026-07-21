@@ -119,6 +119,21 @@ function ackResponse(body: NotificationOutboxAckResponse): Response {
   return response(body);
 }
 
+function waitForAbort(signal: AbortSignal | null | undefined): Promise<Response> {
+  return new Promise<Response>((_resolve, reject) => {
+    if (!signal) {
+      reject(new Error("missing request abort signal"));
+      return;
+    }
+    const onAbort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function rendererErrorOperationIdForTest(report: RendererErrorReport): string {
   return rendererErrorOperationId(report.libraryId, report);
 }
@@ -665,6 +680,8 @@ describe("notification service", () => {
 
   it("aborts the previous long poll on library switch and never starts duplicate loops", async () => {
     const store = new FakeStore();
+    store.imported.add(LIBRARY_A.id);
+    store.imported.add(LIBRARY_B.id);
     const started: string[] = [];
     const aborted: string[] = [];
     let active = 0;
@@ -981,6 +998,281 @@ describe("notification service", () => {
     assert.equal(store.operations.size, 0, "the now-expired row must not conflict with the retry");
     assert.equal(store.imported.has(LIBRARY_A.id), true);
     await service.close();
+  });
+
+  it("retries temporary legacy read and marker failures in the active session", async () => {
+    const store = new FakeStore();
+    store.failLegacyImport = true;
+    let legacyRequests = 0;
+    let importCompleted!: () => void;
+    const imported = new Promise<void>((resolve) => {
+      importCompleted = resolve;
+    });
+    const importLegacyOperations = store.importLegacyOperations.bind(store);
+    store.importLegacyOperations = async (...args) => {
+      const result = await importLegacyOperations(...args);
+      if (result) importCompleted();
+      return result;
+    };
+    const delays: number[] = [];
+    const service = await createNotificationService({
+      store,
+      fetch: async (input, init) => {
+        if (!String(input).includes("/file-ops?")) return waitForAbort(init?.signal);
+        legacyRequests += 1;
+        if (legacyRequests === 1) throw new Error("legacy history temporarily unavailable");
+        return response({ items: [], nextCursor: null });
+      },
+      retryDelay: async (delay, signal) => {
+        if (signal.aborted) throw signal.reason;
+        delays.push(delay);
+        if (delays.length === 2) store.failLegacyImport = false;
+      },
+      now: () => NOW
+    });
+
+    try {
+      await service.attachLibrary(LIBRARY_A, SESSION_A);
+      await Promise.race([
+        imported,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("legacy import was not retried")), 250)
+        )
+      ]);
+      assert.equal(legacyRequests, 3);
+      assert.deepEqual(delays, [250, 500]);
+      assert.equal(store.imported.has(LIBRARY_A.id), true);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("caps sustained legacy retry backoff without a busy loop", async () => {
+    const store = new FakeStore();
+    const delays: number[] = [];
+    let legacyRequests = 0;
+    let cappedDelayStarted!: () => void;
+    const cappedDelay = new Promise<void>((resolve) => {
+      cappedDelayStarted = resolve;
+    });
+    const service = await createNotificationService({
+      store,
+      fetch: async (input, init) => {
+        if (!String(input).includes("/file-ops?")) return waitForAbort(init?.signal);
+        legacyRequests += 1;
+        throw new Error("legacy history unavailable");
+      },
+      retryDelay: async (delay, signal) => {
+        delays.push(delay);
+        if (delays.length < 7) return;
+        cappedDelayStarted();
+        await new Promise<void>((_resolve, reject) => {
+          const onAbort = () => reject(signal.reason);
+          if (signal.aborted) {
+            onAbort();
+            return;
+          }
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+      now: () => NOW
+    });
+
+    try {
+      await service.attachLibrary(LIBRARY_A, SESSION_A);
+      await Promise.race([
+        cappedDelay,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("legacy retry did not reach its cap")), 250)
+        )
+      ]);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(delays, [250, 500, 1_000, 2_000, 4_000, 5_000, 5_000]);
+      assert.equal(legacyRequests, 7, "a pending capped delay must prevent a busy loop");
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("cancels a legacy retry on switch and isolates a new generation of the same library", async () => {
+    const store = new FakeStore();
+    store.imported.add(LIBRARY_B.id);
+    let legacyRequests = 0;
+    let retryStarted!: () => void;
+    const retrying = new Promise<void>((resolve) => {
+      retryStarted = resolve;
+    });
+    let retryAborted = false;
+    let importCompleted!: () => void;
+    const imported = new Promise<void>((resolve) => {
+      importCompleted = resolve;
+    });
+    const importLegacyOperations = store.importLegacyOperations.bind(store);
+    store.importLegacyOperations = async (...args) => {
+      const result = await importLegacyOperations(...args);
+      if (result && args[0].id === LIBRARY_A.id) importCompleted();
+      return result;
+    };
+    const service = await createNotificationService({
+      store,
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (!url.includes("/file-ops?")) return waitForAbort(init?.signal);
+        legacyRequests += 1;
+        if (legacyRequests === 1) throw new Error("first generation failed");
+        return response({ items: [], nextCursor: null });
+      },
+      retryDelay: async (_delay, signal) => {
+        retryStarted();
+        await new Promise<void>((_resolve, reject) => {
+          const onAbort = () => {
+            retryAborted = true;
+            reject(signal.reason);
+          };
+          if (signal.aborted) {
+            onAbort();
+            return;
+          }
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+      now: () => NOW
+    });
+
+    try {
+      await service.attachLibrary(LIBRARY_A, SESSION_A);
+      await retrying;
+      await service.attachLibrary(LIBRARY_B, SESSION_B);
+      assert.equal(retryAborted, true);
+      assert.equal(legacyRequests, 1);
+
+      await service.attachLibrary(LIBRARY_A, SESSION_A);
+      await Promise.race([
+        imported,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("new library generation did not import")), 250)
+        )
+      ]);
+      assert.equal(legacyRequests, 2);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("cancels a pending legacy retry when the service stops", async () => {
+    const store = new FakeStore();
+    let retryStarted!: () => void;
+    const retrying = new Promise<void>((resolve) => {
+      retryStarted = resolve;
+    });
+    let retryAborted = false;
+    let legacyRequests = 0;
+    const service = await createNotificationService({
+      store,
+      fetch: async (input, init) => {
+        if (!String(input).includes("/file-ops?")) return waitForAbort(init?.signal);
+        legacyRequests += 1;
+        throw new Error("legacy history unavailable");
+      },
+      retryDelay: async (_delay, signal) => {
+        retryStarted();
+        await new Promise<void>((_resolve, reject) => {
+          const onAbort = () => {
+            retryAborted = true;
+            reject(signal.reason);
+          };
+          if (signal.aborted) {
+            onAbort();
+            return;
+          }
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+      now: () => NOW
+    });
+
+    await service.attachLibrary(LIBRARY_A, SESSION_A);
+    await retrying;
+    await Promise.race([
+      service.close(),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("service close did not cancel legacy retry")), 250)
+      )
+    ]);
+    assert.equal(retryAborted, true);
+    assert.equal(legacyRequests, 1);
+  });
+
+  it("joins store recovery to the active legacy import without concurrent duplicates", async () => {
+    const failedStore = new FakeStore();
+    const recoveredStore = new FakeStore();
+    let releaseFirstRead!: () => void;
+    const firstReadBarrier = new Promise<void>((resolve) => {
+      releaseFirstRead = resolve;
+    });
+    let firstReadStarted!: () => void;
+    const firstRead = new Promise<void>((resolve) => {
+      firstReadStarted = resolve;
+    });
+    let recoveredImportCompleted!: () => void;
+    const recoveredImport = new Promise<void>((resolve) => {
+      recoveredImportCompleted = resolve;
+    });
+    const recoveredImportLegacyOperations = recoveredStore.importLegacyOperations.bind(recoveredStore);
+    recoveredStore.importLegacyOperations = async (...args) => {
+      const result = await recoveredImportLegacyOperations(...args);
+      if (result) recoveredImportCompleted();
+      return result;
+    };
+    let fileOpRequests = 0;
+    let activeFileOpRequests = 0;
+    let maxActiveFileOpRequests = 0;
+    let outboxRequests = 0;
+    const service = await createNotificationService({
+      store: failedStore,
+      openStore: async () => recoveredStore,
+      fetch: async (input, init) => {
+        const url = String(input);
+        if (url.includes("/file-ops?")) {
+          fileOpRequests += 1;
+          activeFileOpRequests += 1;
+          maxActiveFileOpRequests = Math.max(maxActiveFileOpRequests, activeFileOpRequests);
+          if (fileOpRequests === 1) {
+            firstReadStarted();
+            await firstReadBarrier;
+          }
+          activeFileOpRequests -= 1;
+          return response({ items: [], nextCursor: null });
+        }
+        outboxRequests += 1;
+        if (outboxRequests === 1) return waitForAbort(init?.signal);
+        return response({ items: [], maxSequence: 0 });
+      },
+      now: () => NOW
+    });
+
+    try {
+      await service.attachLibrary(LIBRARY_A, SESSION_A);
+      await firstRead;
+      failedStore.failSnapshot = true;
+      await service.publishThumbnailSummary(thumbnailSummary());
+      await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+      releaseFirstRead();
+      await Promise.race([
+        recoveredImport,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("recovered store did not receive legacy marker")), 250)
+        )
+      ]);
+
+      assert.equal(maxActiveFileOpRequests, 1);
+      assert.equal(fileOpRequests, 2, "the recovered store needs one serialized verification");
+      assert.equal(failedStore.imported.has(LIBRARY_A.id), true);
+      assert.equal(recoveredStore.imported.has(LIBRARY_A.id), true);
+    } finally {
+      releaseFirstRead();
+      await service.close();
+    }
   });
 
   it("proxies task actions only for the active library", async () => {

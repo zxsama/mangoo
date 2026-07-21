@@ -124,6 +124,9 @@ interface ActiveLibrary {
   controller: AbortController;
   generation: number;
   loop: Promise<void>;
+  legacyImport: Promise<void> | null;
+  legacyImportRequested: boolean;
+  legacyImportComplete: boolean;
 }
 
 interface PendingOutboxBatch {
@@ -421,7 +424,6 @@ export class NotificationService {
   private readonly pendingRecoveryBatches: NotificationLocalRecoveryBatch[] = [];
   private readonly protectedRecoveryBatchIds = new Set<string>();
   private readonly appliedRecoveryRecordKeys = new Set<string>();
-  private readonly legacyImports = new Map<string, Promise<void>>();
   private readonly fallbackActionBaseDetails = new Map<string, string | null>();
   private lastRetentionAt: number | null = null;
   private retentionPromise: Promise<void> | null = null;
@@ -487,7 +489,10 @@ export class NotificationService {
       session,
       controller,
       generation: ++this.activeGeneration,
-      loop: Promise.resolve()
+      loop: Promise.resolve(),
+      legacyImport: null,
+      legacyImportRequested: false,
+      legacyImportComplete: false
     };
     this.active = active;
     this.setHealth(this.store ? "syncing" : "degraded", library.id, this.health.detail);
@@ -496,7 +501,7 @@ export class NotificationService {
         this.setHealth(this.store ? "syncing" : "degraded", library.id, errorMessage(error));
       }
     });
-    void this.ensureLegacyImport(library, session, controller.signal);
+    void this.ensureLegacyImport(active);
   }
 
   async detachLibrary(): Promise<void> {
@@ -728,7 +733,7 @@ export class NotificationService {
 
     const pending = this.pendingOutbox.get(library.id);
     if (!this.store && (await this.tryRecoverStore(signal))) {
-      void this.ensureLegacyImport(library, session, signal);
+      void this.requestLegacyImport(library, session, signal);
     }
     if (!this.store && pending) {
       return;
@@ -913,22 +918,106 @@ export class NotificationService {
     }
   }
 
-  private async ensureLegacyImport(
+  private requestLegacyImport(
     library: NotificationLibraryIdentity,
     session: NotificationCoreSession,
     signal: AbortSignal
   ): Promise<void> {
-    const existing = this.legacyImports.get(library.id);
-    if (existing) return existing;
-    const running = this.importLegacyFileOperations(library, session, signal)
+    const active = this.active;
+    if (
+      active &&
+      active.library.id === library.id &&
+      active.session.baseUrl === session.baseUrl &&
+      active.session.sessionToken === session.sessionToken
+    ) {
+      return this.ensureLegacyImport(active);
+    }
+    return this.importLegacyFileOperations(library, session, signal)
       .catch((error) => {
         if (!isAbort(error, signal)) {
           this.setHealth(this.store ? "syncing" : "degraded", library.id, errorMessage(error));
         }
+      });
+  }
+
+  private ensureLegacyImport(active: ActiveLibrary): Promise<void> {
+    active.legacyImportRequested = true;
+    if (!this.isCurrentActive(active) || active.legacyImportComplete) {
+      return Promise.resolve();
+    }
+    if (active.legacyImport) return active.legacyImport;
+
+    let running!: Promise<void>;
+    running = this.runLegacyImportLoop(active)
+      .catch((error) => {
+        if (!isAbort(error, active.controller.signal)) {
+          this.setHealth(
+            this.store ? "syncing" : "degraded",
+            active.library.id,
+            errorMessage(error)
+          );
+        }
       })
-      .finally(() => this.legacyImports.delete(library.id));
-    this.legacyImports.set(library.id, running);
+      .finally(() => {
+        if (active.legacyImport !== running) return;
+        active.legacyImport = null;
+        if (
+          this.store &&
+          this.isCurrentActive(active) &&
+          active.legacyImportRequested &&
+          !active.legacyImportComplete
+        ) {
+          void this.ensureLegacyImport(active);
+        }
+      });
+    active.legacyImport = running;
     return running;
+  }
+
+  private async runLegacyImportLoop(active: ActiveLibrary): Promise<void> {
+    let delayMs = MIN_RETRY_MS;
+    while (
+      this.isCurrentActive(active) &&
+      active.legacyImportRequested &&
+      !active.legacyImportComplete
+    ) {
+      const store = this.store;
+      if (!store) return;
+      try {
+        await this.importLegacyFileOperations(
+          active.library,
+          active.session,
+          active.controller.signal
+        );
+      } catch (error) {
+        if (isAbort(error, active.controller.signal)) return;
+        this.setHealth(
+          this.store ? "syncing" : "degraded",
+          active.library.id,
+          errorMessage(error)
+        );
+        await this.retryDelay(delayMs, active.controller.signal);
+        delayMs = Math.min(delayMs * 2, MAX_RETRY_MS);
+        continue;
+      }
+
+      if (!this.isCurrentActive(active)) return;
+      if (this.store === store) {
+        active.legacyImportComplete = true;
+        active.legacyImportRequested = false;
+        return;
+      }
+      delayMs = MIN_RETRY_MS;
+    }
+  }
+
+  private isCurrentActive(active: ActiveLibrary): boolean {
+    return (
+      !this.closed &&
+      !active.controller.signal.aborted &&
+      this.active === active &&
+      this.activeGeneration === active.generation
+    );
   }
 
   private async importLegacyFileOperations(
@@ -1918,7 +2007,10 @@ export class NotificationService {
     if (!active) return;
     this.active = null;
     active.controller.abort(new DOMException("Library detached", "AbortError"));
-    await active.loop.catch(() => undefined);
+    await Promise.all([
+      active.loop.catch(() => undefined),
+      active.legacyImport?.catch(() => undefined)
+    ]);
   }
 
   private async openStoreWithSignal(signal: AbortSignal): Promise<NotificationServiceStore> {
