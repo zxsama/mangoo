@@ -39,6 +39,11 @@ function sourceMatch(source, pattern) {
 }
 
 const useLibraryData = read("apps/web/src/core/useLibraryData.ts");
+for (const retiredValue of ["listFileOperations", "loadRecentOps", "recentOps", "recentOpsLoading"]) {
+  if (useLibraryData.includes(retiredValue)) {
+    fail(`useLibraryData must not retain legacy Recent runtime value ${retiredValue}`);
+  }
+}
 const refreshCurrentScanViewBlock = sourceMatch(
   useLibraryData,
   /const\s+refreshCurrentScanView\s*=\s*useCallback\([\s\S]*?\n\s*\]\);\n\n\s*const\s+loadLibrary/
@@ -93,6 +98,12 @@ const notificationPopoverPath =
 const notificationPopover = existsSync(path.join(root, notificationPopoverPath))
   ? read(notificationPopoverPath)
   : "";
+const notificationVisualFixturePath =
+  "apps/web/tests/fixtures/notificationPopoverVisualFixture.tsx";
+const notificationVisualFixture = existsSync(path.join(root, notificationVisualFixturePath))
+  ? read(notificationVisualFixturePath)
+  : "";
+const desktopVisualHarness = read(".tmp/visual-check/desktop-ui-regression.mjs");
 const secondaryWindowFrame = read("apps/web/src/app-shell/SecondaryWindowFrame.tsx");
 const secondaryWindowInterfaceStyle = read("apps/web/src/app-shell/useSecondaryWindowInterfaceStyle.ts");
 const settingsWindow = read("apps/web/src/features/settings/SettingsWindow.tsx");
@@ -155,6 +166,63 @@ for (const value of [
 ]) {
   if (!main.includes(value)) {
     fail(`web entry must route the standalone Plugins window: missing ${value}`);
+  }
+}
+for (const value of [
+  'type FixtureState = "full" | "empty" | "degraded"',
+  "data-notification-fixture",
+  "NotificationPopover",
+  "LiquidGlassButton",
+  "notification-status-dot",
+  'data-titlebar-control="notifications"'
+]) {
+  if (!notificationVisualFixture.includes(value)) {
+    fail(`notification visual fixture contract missing ${value}`);
+  }
+}
+for (const value of [
+  "notificationButtonStyleEvidenceExpression",
+  "window-blur-closes-notifications",
+  "notificationPopoverFixtureEvidence",
+  "resizeScriptOpenedWindow(fixtureClient, 800, 720)",
+  "ui-notification-compact-fixture-full.png",
+  "ui-notification-compact-fixture-full-narrow.png"
+]) {
+  if (!desktopVisualHarness.includes(value)) {
+    fail(`notification visual harness contract missing ${value}`);
+  }
+}
+for (const value of ["notificationButtonRef", "ref={notificationButtonRef}"]) {
+  if (!shellTitlebar.includes(value) && !app.includes(value)) {
+    fail(`notification titlebar anchor contract missing ${value}`);
+  }
+}
+for (const value of [
+  "createPortal",
+  "anchorRef",
+  "getBoundingClientRect",
+  "ResizeObserver",
+  "MutationObserver",
+  "visualViewport",
+  'addEventListener("resize"',
+  'addEventListener("scroll"',
+  "resolveNotificationPopoverPosition"
+]) {
+  if (!notificationPopover.includes(value)) {
+    fail(`notification popover true-anchor contract missing ${value}`);
+  }
+}
+if (/\.notification-popover\s*\{[^}]*\bright\s*:/s.test(read("apps/web/src/styles.css"))) {
+  fail("notification popover must not use a fixed right offset instead of the trigger anchor");
+}
+for (const value of [
+  "notification-operation-phase",
+  "notification-progress-percent",
+  "notification-progress-label",
+  "notification-result-library"
+]) {
+  if (!notificationPopover.includes(value)) {
+    fail(`notification compact content contract missing ${value}`);
   }
 }
 

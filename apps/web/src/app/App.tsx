@@ -99,6 +99,7 @@ export function App() {
     useState<CompactPopover>(null);
   const notifications = useNotifications();
   const notificationModel = notifications.compact;
+  const notificationButtonRef = useRef<HTMLButtonElement>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewDisplayedMediaId, setPreviewDisplayedMediaId] = useState<number | null>(null);
   const previewNavigationLockedRef = useRef(false);
@@ -381,6 +382,7 @@ export function App() {
 
   const shellRightActions = (
     <ShellRightActions
+      notificationButtonRef={notificationButtonRef}
       notificationIndicator={notificationModel.indicator}
       notificationsOpen={notificationsOpen}
       onToggleNotifications={onToggleNotifications}
@@ -669,6 +671,7 @@ export function App() {
           contextMenu={menu}
           fileOps={fileOps}
           library={library}
+          notificationAnchorRef={notificationButtonRef}
           notificationModel={notificationModel}
           notificationsOpen={notificationsOpen}
           onCloseContextMenu={closeMenu}

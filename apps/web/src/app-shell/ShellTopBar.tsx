@@ -11,7 +11,7 @@ import {
   Package,
   Settings
 } from "lucide-react";
-import type { ComponentProps, ReactNode } from "react";
+import type { ComponentProps, ReactNode, RefObject } from "react";
 import { LiquidGlassButton } from "../design/liquid-glass";
 import { FilterMenu } from "../features/library/FilterMenu";
 import { FolderLocationIcon } from "../features/library/FolderLocationIcon";
@@ -77,6 +77,7 @@ interface PreviewTitlebarToolbarProps {
 }
 
 interface ShellRightActionsProps {
+  notificationButtonRef: RefObject<HTMLButtonElement>;
   notificationIndicator: "idle" | "active" | "failure";
   notificationsOpen: boolean;
   onToggleNotifications: () => void;
@@ -404,6 +405,7 @@ export function PreviewTitlebarToolbar({
 }
 
 export function ShellRightActions({
+  notificationButtonRef,
   notificationIndicator,
   notificationsOpen,
   onToggleNotifications
@@ -418,6 +420,7 @@ export function ShellRightActions({
         data-compact-popover-trigger="notifications"
         data-titlebar-control="notifications"
         onClick={onToggleNotifications}
+        ref={notificationButtonRef}
         title="通知"
         tone="control"
         type="button"

@@ -6,32 +6,60 @@ import {
   ListTodo,
   XCircle
 } from "lucide-react";
-import type { CSSProperties, ReactNode } from "react";
+import {
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+  type RefObject
+} from "react";
+import { createPortal } from "react-dom";
 import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
+import { resolveNotificationPopoverPosition } from "./notificationPopoverPosition";
+import {
+  activeOperationPresentation,
+  resultOperationPresentation
+} from "./notificationPopoverPresentation";
 
 interface NotificationPopoverProps {
+  anchorRef: RefObject<HTMLElement>;
   model: CompactNotificationModel;
   onOpenCenter: () => void;
 }
 
 export function NotificationPopover({
+  anchorRef,
   model,
   onOpenCenter
 }: NotificationPopoverProps) {
+  const popoverRef = useRef<HTMLElement>(null);
+  const position = useNotificationPopoverPosition(anchorRef, popoverRef);
   const hasContent =
     model.active.length > 0 || model.thumbnail.summaries.length > 0 || model.results.length > 0;
 
-  return (
+  return createPortal(
     <LiquidGlassSurface
       as="section"
       aria-label="通知状态"
       className="floating-popover notification-popover popup-surface"
       data-compact-popover-root="notifications"
       interactive
+      ref={popoverRef}
+      style={
+        position
+          ? {
+              left: position.left,
+              top: position.top,
+              maxHeight: position.maxHeight,
+              visibility: "visible"
+            }
+          : { left: 0, top: 0, visibility: "hidden" }
+      }
       tone="elevated"
     >
       <header className="notification-popover-header">
@@ -150,7 +178,7 @@ export function NotificationPopover({
                   </span>
                   <div className="notification-result-copy">
                     <strong>{operation.title}</strong>
-                    <span>{resultSummary(operation)}</span>
+                    <ResultDescription operation={operation} />
                   </div>
                   <time dateTime={new Date(operation.updatedAt).toISOString()}>
                     {formatResultTime(operation.updatedAt)}
@@ -182,8 +210,89 @@ export function NotificationPopover({
           打开完整通知中心
         </LiquidGlassButton>
       </footer>
-    </LiquidGlassSurface>
+    </LiquidGlassSurface>,
+    document.body
   );
+}
+
+function useNotificationPopoverPosition(
+  anchorRef: RefObject<HTMLElement>,
+  popoverRef: RefObject<HTMLElement>
+) {
+  const [position, setPosition] = useState<ReturnType<
+    typeof resolveNotificationPopoverPosition
+  > | null>(null);
+
+  useLayoutEffect(() => {
+    const anchor = anchorRef.current;
+    const popover = popoverRef.current;
+    if (!anchor || !popover) return;
+
+    let animationFrame = 0;
+    const update = () => {
+      if (animationFrame) return;
+      animationFrame = window.requestAnimationFrame(() => {
+        animationFrame = 0;
+        const anchorRect = anchor.getBoundingClientRect();
+        const popoverRect = popover.getBoundingClientRect();
+        const viewport = window.visualViewport;
+        const nextPosition = resolveNotificationPopoverPosition({
+          anchor: anchorRect,
+          popover: popoverRect,
+          viewport: {
+            width: viewport?.width ?? window.innerWidth,
+            height: viewport?.height ?? window.innerHeight
+          },
+          gap: 4,
+          margin: 8
+        });
+        setPosition((current) =>
+          current && samePopoverPosition(current, nextPosition) ? current : nextPosition
+        );
+      });
+    };
+
+    const titlebar = anchor.closest(".shell-titlebar") ?? anchor.parentElement;
+    const resizeObserver = new ResizeObserver(update);
+    resizeObserver.observe(anchor);
+    resizeObserver.observe(popover);
+    if (titlebar) resizeObserver.observe(titlebar);
+
+    const mutationObserver = new MutationObserver(update);
+    if (titlebar) {
+      mutationObserver.observe(titlebar, {
+        attributes: true,
+        attributeFilter: ["class", "style"],
+        childList: true,
+        subtree: true
+      });
+    }
+
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    window.visualViewport?.addEventListener("resize", update);
+    window.visualViewport?.addEventListener("scroll", update);
+    update();
+
+    return () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      resizeObserver.disconnect();
+      mutationObserver.disconnect();
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+      window.visualViewport?.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("scroll", update);
+    };
+  }, [anchorRef, popoverRef]);
+
+  return position;
+}
+
+function samePopoverPosition(
+  left: ReturnType<typeof resolveNotificationPopoverPosition>,
+  right: ReturnType<typeof resolveNotificationPopoverPosition>
+): boolean {
+  return left.left === right.left && left.top === right.top && left.maxHeight === right.maxHeight;
 }
 
 function NotificationSection({
@@ -207,19 +316,21 @@ function NotificationSection({
 }
 
 function OperationHeading({ operation }: { operation: NotificationOperationViewModel }) {
+  const presentation = activeOperationPresentation(operation);
   return (
     <div className="notification-row-heading">
       <div>
         <strong>{operation.title}</strong>
         <span>{operation.libraryLabel}</span>
       </div>
-      <span>{operation.progress.determinate ? `${operation.progress.percent}%` : operation.phase}</span>
+      <span className="notification-operation-phase">{presentation.phase}</span>
     </div>
   );
 }
 
 function OperationProgress({ operation }: { operation: NotificationOperationViewModel }) {
   const progress = operation.progress;
+  const presentation = activeOperationPresentation(operation);
   return (
     <>
       <div
@@ -240,7 +351,12 @@ function OperationProgress({ operation }: { operation: NotificationOperationView
           <span className="notification-progress-indeterminate" />
         )}
       </div>
-      <span className="notification-progress-label">{progress.label}</span>
+      <span className="notification-progress-meta">
+        <span className="notification-progress-label">{presentation.progressLabel}</span>
+        {presentation.percentLabel ? (
+          <span className="notification-progress-percent">{presentation.percentLabel}</span>
+        ) : null}
+      </span>
     </>
   );
 }
@@ -255,12 +371,15 @@ function resultIcon(status: NotificationOperationViewModel["status"]) {
   return <CheckCircle2 size={14} />;
 }
 
-function resultSummary(operation: NotificationOperationViewModel): string {
-  const detail = operation.errorDetail?.trim() || operation.summary?.trim();
-  if (detail) return detail;
-  if (operation.status === "failed") return "操作失败";
-  if (operation.status === "cancelled") return "操作已取消";
-  return `${operation.libraryLabel} · 已完成`;
+function ResultDescription({ operation }: { operation: NotificationOperationViewModel }) {
+  const presentation = resultOperationPresentation(operation);
+  return (
+    <span className="notification-result-detail">
+      <span className="notification-result-library">{presentation.libraryLabel}</span>
+      <span aria-hidden="true"> · </span>
+      {presentation.detail}
+    </span>
+  );
 }
 
 function formatResultTime(timestamp: number): string {

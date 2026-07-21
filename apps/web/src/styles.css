@@ -3745,12 +3745,9 @@ button:disabled {
 
 .notification-popover {
   position: fixed;
-  top: calc(var(--shell-titlebar-height) + 4px);
-  right: calc((var(--titlebar-window-control-width) * 3) + 28px);
   z-index: 242;
   display: flex;
   width: min(360px, calc(100vw - 20px));
-  max-height: min(540px, calc(100vh - var(--shell-titlebar-height) - 14px));
   min-height: 150px;
   flex-direction: column;
   overflow: hidden;
@@ -3917,6 +3914,19 @@ button:disabled {
   font-size: 9.5px;
 }
 
+.notification-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.notification-progress-percent {
+  color: var(--text-soft);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+
 .notification-thumbnail-summary {
   display: flex;
   flex-direction: column;
@@ -3972,6 +3982,11 @@ button:disabled {
 .notification-result-copy strong {
   color: var(--text-soft);
   font-size: 11px;
+  font-weight: 600;
+}
+
+.notification-result-library {
+  color: var(--text-soft);
   font-weight: 600;
 }
 
@@ -4032,7 +4047,6 @@ button:disabled {
 
 @media (max-width: 720px) {
   .notification-popover {
-    right: 8px;
     width: min(348px, calc(100vw - 16px));
   }
 }
@@ -7387,6 +7401,7 @@ button:disabled {
    so it matches the center tool buttons. */
 .shell-titlebar-center .titlebar-tool-button,
 .shell-titlebar-center .titlebar-icon-button,
+.shell-right-actions .titlebar-icon-button,
 .shell-titlebar-center .filter-menu-trigger,
 .shell-titlebar-center .sort-menu-trigger,
 .shell-titlebar-utility-button,
@@ -7420,6 +7435,8 @@ button:disabled {
 .shell-titlebar-center .titlebar-tool-button > .liquid-glass-dim,
 .shell-titlebar-center .titlebar-icon-button > .liquid-glass-backdrop,
 .shell-titlebar-center .titlebar-icon-button > .liquid-glass-dim,
+.shell-right-actions .titlebar-icon-button > .liquid-glass-backdrop,
+.shell-right-actions .titlebar-icon-button > .liquid-glass-dim,
 .shell-titlebar-center .filter-menu-trigger > .liquid-glass-backdrop,
 .shell-titlebar-center .filter-menu-trigger > .liquid-glass-dim,
 .shell-titlebar-center .sort-menu-trigger > .liquid-glass-backdrop,
@@ -7448,6 +7465,7 @@ button:disabled {
 
 .shell-titlebar-center .titlebar-tool-button::after,
 .shell-titlebar-center .titlebar-icon-button::after,
+.shell-right-actions .titlebar-icon-button::after,
 .shell-titlebar-center .filter-menu-trigger::after,
 .shell-titlebar-center .sort-menu-trigger::after,
 .shell-titlebar-utility-button::after,
@@ -7463,6 +7481,7 @@ button:disabled {
    a brighter icon on hover, a focus ring, and a steady fill for the open menu. */
 .shell-titlebar-center .titlebar-tool-button:hover:not(:disabled),
 .shell-titlebar-center .titlebar-icon-button:hover:not(:disabled),
+.shell-right-actions .titlebar-icon-button:hover:not(:disabled),
 .shell-titlebar-center .filter-menu-trigger:hover:not(:disabled),
 .shell-titlebar-center .sort-menu-trigger:hover:not(:disabled),
 .shell-titlebar-utility-button:hover:not(:disabled),
@@ -7470,6 +7489,7 @@ button:disabled {
 .shell-library-switcher-button:hover:not(:disabled),
 .shell-titlebar-center .titlebar-tool-button[data-glass-active="true"],
 .shell-titlebar-center .titlebar-icon-button[data-glass-active="true"],
+.shell-right-actions .titlebar-icon-button[data-glass-active="true"],
 .shell-titlebar-center .filter-menu-trigger[data-glass-active="true"],
 .shell-titlebar-center .sort-menu-trigger-open {
   color: #f8fdff;
@@ -7480,6 +7500,7 @@ button:disabled {
 
 .shell-titlebar-center .titlebar-tool-button:focus-visible,
 .shell-titlebar-center .titlebar-icon-button:focus-visible,
+.shell-right-actions .titlebar-icon-button:focus-visible,
 .shell-titlebar-center .filter-menu-trigger:focus-visible,
 .shell-titlebar-center .sort-menu-trigger:focus-visible,
 .shell-titlebar-utility-button:focus-visible,
@@ -7505,6 +7526,7 @@ button:disabled {
    even when the cursor (and its glow) is elsewhere. */
 .shell-titlebar-center .titlebar-tool-button[data-glass-active="true"] > .liquid-glass-backdrop,
 .shell-titlebar-center .titlebar-icon-button[data-glass-active="true"] > .liquid-glass-backdrop,
+.shell-right-actions .titlebar-icon-button[data-glass-active="true"] > .liquid-glass-backdrop,
 .shell-titlebar-center .filter-menu-trigger[data-glass-active="true"] > .liquid-glass-backdrop,
 .shell-titlebar-center .sort-menu-trigger-open > .liquid-glass-backdrop {
   opacity: 1;

@@ -129,14 +129,11 @@ export interface LibraryState {
   metadataSaving: boolean;
   error: string | null;
   lastScan: ScanSummary | null;
-  recentOps: FileOperationRecord[];
-  recentOpsLoading: boolean;
   diagnostics: DesktopDiagnostics | null;
   diagnosticsProbed: boolean;
   thumbnailCacheStats: ThumbnailCacheStatsResponse | null;
   thumbnailCacheStatsLoading: boolean;
   thumbnailCacheActionBusy: boolean;
-  loadRecentOps: () => Promise<void>;
   refreshThumbnailCacheStats: () => Promise<ThumbnailCacheStatsResponse | null>;
   generateCurrentFolderThumbnailCache: () => Promise<void>;
   generateCurrentTreeThumbnailCache: () => Promise<void>;
@@ -373,8 +370,6 @@ export function useLibraryData(
   const [selectedMetadata, setSelectedMetadata] = useState<UserMetadataRecord | null>(null);
   const [metadataSaving, setMetadataSaving] = useState(false);
   const metadataEditGenerationRef = useRef(0);
-  const [recentOps, setRecentOps] = useState<FileOperationRecord[]>([]);
-  const [recentOpsLoading, setRecentOpsLoading] = useState(false);
   const [diagnostics, setDiagnostics] = useState<DesktopDiagnostics | null>(null);
   const [diagnosticsProbed, setDiagnosticsProbed] = useState(false);
   const [thumbnailCacheStats, setThumbnailCacheStats] =
@@ -2790,22 +2785,6 @@ export function useLibraryData(
     [client]
   );
 
-  const loadRecentOps = useCallback(async () => {
-    setRecentOpsLoading(true);
-    try {
-      const response = await client.listFileOperations({ limit: 50 });
-      setRecentOps(response.items);
-    } catch (cause) {
-      setError(errorMessage(cause));
-    } finally {
-      setRecentOpsLoading(false);
-    }
-  }, [client]);
-
-  useEffect(() => {
-    void loadRecentOps();
-  }, [loadRecentOps]);
-
   useEffect(() => {
     let cancelled = false;
     void readDesktopDiagnostics().then((result) => {
@@ -2829,7 +2808,7 @@ export function useLibraryData(
       );
       try {
         await client.renameFileOp({ fileId, newName });
-        await Promise.all([loadRecentOps(), loadLibrary()]);
+        await loadLibrary();
         return { ok: true };
       } catch (cause) {
         setMedia(previousMedia);
@@ -2839,7 +2818,7 @@ export function useLibraryData(
         return result;
       }
     },
-    [client, loadLibrary, loadRecentOps, media, selectedMediaId]
+    [client, loadLibrary, media, selectedMediaId]
   );
 
   const renameFolder = useCallback(
@@ -2864,7 +2843,7 @@ export function useLibraryData(
       setFolderDescendantsByParent((current) => renameFolderInMap(current, folderId, newName));
       try {
         await client.renameFileOp({ folderId, newName });
-        await Promise.all([loadRecentOps(), loadLibrary()]);
+        await loadLibrary();
         return { ok: true };
       } catch (cause) {
         setFolderChildrenByParent(previousChildren);
@@ -2874,7 +2853,7 @@ export function useLibraryData(
         return result;
       }
     },
-    [client, folderChildrenByParent, folderDescendantsByParent, loadLibrary, loadRecentOps]
+    [client, folderChildrenByParent, folderDescendantsByParent, loadLibrary]
   );
 
   const moveItems = useCallback(
@@ -2899,7 +2878,7 @@ export function useLibraryData(
           folderIds: folderIds.length > 0 ? folderIds : undefined,
           targetFolderId: input.targetFolderId
         });
-        await Promise.all([loadRecentOps(), loadLibrary()]);
+        await loadLibrary();
         return { ok: true, operations: response.operations };
       } catch (cause) {
         setMedia(previousMedia);
@@ -2908,7 +2887,7 @@ export function useLibraryData(
         return result;
       }
     },
-    [client, loadLibrary, loadRecentOps, media, selectedFolderId]
+    [client, loadLibrary, media, selectedFolderId]
   );
 
   const deleteItems = useCallback(
@@ -2951,7 +2930,7 @@ export function useLibraryData(
           folderIds: folderIds.length > 0 ? folderIds : undefined,
           permanent: input.permanent
         });
-        await Promise.all([loadRecentOps(), loadLibrary()]);
+        await loadLibrary();
         return { ok: true, operations: response.operations };
       } catch (cause) {
         // Rollback
@@ -2969,7 +2948,6 @@ export function useLibraryData(
       folderChildrenByParent,
       folderDescendantsByParent,
       loadLibrary,
-      loadRecentOps,
       media,
       selectedMediaId
     ]
@@ -3142,14 +3120,11 @@ export function useLibraryData(
     metadataSaving,
     error,
     lastScan,
-    recentOps,
-    recentOpsLoading,
     diagnostics,
     diagnosticsProbed,
     thumbnailCacheStats,
     thumbnailCacheStatsLoading,
     thumbnailCacheActionBusy,
-    loadRecentOps,
     refreshThumbnailCacheStats,
     generateCurrentFolderThumbnailCache,
     generateCurrentTreeThumbnailCache,

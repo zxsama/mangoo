@@ -305,6 +305,33 @@ async function screenshot(client, name) {
   return filePath;
 }
 
+async function rendererScreenshot(client, name) {
+  await delay(220);
+  await client.send("Page.bringToFront").catch(() => undefined);
+  const capture = await client.send("Page.captureScreenshot", {
+    captureBeyondViewport: false,
+    format: "png"
+  });
+  if (typeof capture.data !== "string" || capture.data.length === 0) {
+    throw new Error("Renderer screenshot did not return PNG data");
+  }
+  const filePath = path.join(screenshotDir, name);
+  await writeFile(filePath, Buffer.from(capture.data, "base64"));
+  return filePath;
+}
+
+async function resizeScriptOpenedWindow(client, width, height) {
+  await evaluate(
+    client,
+    `(() => { window.resizeTo(${Math.round(width)}, ${Math.round(height)}); return true; })()`
+  );
+  await delay(320);
+  return evaluate(
+    client,
+    `({ innerWidth: window.innerWidth, innerHeight: window.innerHeight, outerWidth: window.outerWidth, outerHeight: window.outerHeight })`
+  );
+}
+
 async function captureWindowBackdropEvidence(client, name, layout) {
   if (!osBackdropEvidenceEnabled) {
     return {
@@ -1122,7 +1149,165 @@ async function compactPopoverDismissalEvidence(client) {
     evidence: await evaluate(client, compactPopoverEvidenceExpression())
   });
 
+  await clickSelector(client, `[data-compact-popover-trigger="notifications"]`);
+  await waitForCompactPopoverState(client, "notifications");
+  await evaluate(client, `window.dispatchEvent(new Event("blur"))`);
+  await waitForCompactPopoverState(client, null);
+  steps.push({
+    action: "window-blur-closes-notifications",
+    expected: null,
+    evidence: await evaluate(client, compactPopoverEvidenceExpression())
+  });
+
   return { steps };
+}
+
+async function notificationPopoverFixtureEvidence(client) {
+  const fixtureUrl = `${webUrl}/tests/fixtures/notification-popover.html?state=full`;
+  const opened = await evaluate(
+    client,
+    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "megle-notification-popover-fixture", "popup=yes,width=1040,height=760,resizable=yes"))`
+  );
+  if (!opened) throw new Error("Electron refused to open the notification visual fixture window");
+
+  const target = await waitForTarget(
+    (page) => page.url.includes("/tests/fixtures/notification-popover.html"),
+    10000
+  );
+  const fixtureClient = new CdpClient(target.webSocketDebuggerUrl);
+  await fixtureClient.ready;
+  const fixtureConsoleErrors = [];
+  const fixtureNetworkProblems = [];
+  fixtureClient.on("Runtime.consoleAPICalled", (event) => {
+    if (event.type !== "error") return;
+    fixtureConsoleErrors.push({
+      type: event.type,
+      text: event.args?.map((arg) => arg.value ?? arg.description ?? "").join(" ") ?? ""
+    });
+  });
+  fixtureClient.on("Log.entryAdded", (event) => {
+    if (event.entry?.level === "error") {
+      fixtureConsoleErrors.push({ type: "log", text: event.entry.text ?? "" });
+    }
+  });
+  fixtureClient.on("Network.responseReceived", (event) => {
+    if ((event.response?.status ?? 0) >= 400) {
+      fixtureNetworkProblems.push({
+        url: event.response?.url ?? "",
+        status: event.response?.status ?? 0,
+        type: event.type
+      });
+    }
+  });
+  fixtureClient.on("Network.loadingFailed", (event) => {
+    if (event.type !== "WebSocket") {
+      fixtureNetworkProblems.push({
+        requestId: event.requestId,
+        status: "loadingFailed",
+        type: event.type,
+        errorText: event.errorText
+      });
+    }
+  });
+  await Promise.all([
+    fixtureClient.send("Page.enable"),
+    fixtureClient.send("Runtime.enable"),
+    fixtureClient.send("Network.enable"),
+    fixtureClient.send("Log.enable")
+  ]);
+  await fixtureClient.send("Page.bringToFront");
+
+  async function navigate(state) {
+    await fixtureClient.send("Page.navigate", {
+      url: `${webUrl}/tests/fixtures/notification-popover.html?state=${state}`
+    });
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector('[data-notification-fixture="${state}"]') && document.querySelector('[data-compact-popover-root="notifications"]'))`,
+      10000,
+      `notification ${state} visual fixture`
+    );
+    await fixtureClient.send("Page.bringToFront");
+    await fixtureClient.send("Page.captureScreenshot", {
+      captureBeyondViewport: false,
+      format: "png"
+    });
+    await waitFor(
+      fixtureClient,
+      `(() => {
+        const button = document.querySelector('[data-titlebar-control="notifications"]');
+        const popover = document.querySelector('[data-compact-popover-root="notifications"]');
+        if (!button || !popover) return false;
+        const popoverRect = popover.getBoundingClientRect();
+        return getComputedStyle(popover).visibility === "visible" &&
+          popoverRect.top > 0 && popoverRect.left > 0;
+      })()`,
+      10000,
+      `anchored notification ${state} visual fixture`
+    );
+    return evaluate(fixtureClient, compactPopoverEvidenceExpression());
+  }
+
+  try {
+    const full = await navigate("full");
+    const fullRendererScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-compact-fixture-full.png"
+    );
+    const resize = await resizeScriptOpenedWindow(fixtureClient, 800, 720);
+    await waitFor(
+      fixtureClient,
+      `window.innerWidth <= 820 && window.innerHeight >= 620`,
+      10000,
+      "narrow notification fixture viewport"
+    );
+    await fixtureClient.send("Page.bringToFront");
+    await fixtureClient.send("Page.captureScreenshot", {
+      captureBeyondViewport: false,
+      format: "png"
+    });
+    const narrow = await evaluate(fixtureClient, compactPopoverEvidenceExpression());
+    const narrowRendererScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-compact-fixture-full-narrow.png"
+    );
+    const empty = await navigate("empty");
+    const emptyScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-compact-fixture-empty.png"
+    );
+    const degraded = await navigate("degraded");
+    const degradedScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-compact-fixture-degraded.png"
+    );
+
+    return {
+      full,
+      narrow,
+      empty,
+      degraded,
+      resize,
+      screenshots: {
+        fullRenderer: fullRendererScreenshot,
+        narrowRenderer: narrowRendererScreenshot,
+        empty: emptyScreenshot,
+        degraded: degradedScreenshot
+      },
+      navigationDiagnostics: {
+        consoleErrors: fixtureConsoleErrors,
+        networkProblems: fixtureNetworkProblems
+      }
+    };
+  } finally {
+    await evaluate(fixtureClient, `window.close()`).catch(() => undefined);
+    fixtureClient.close();
+    await waitForTargetCount(
+      (page) => page.url.includes("/tests/fixtures/notification-popover.html"),
+      0,
+      10000
+    ).catch(() => undefined);
+  }
 }
 
 async function glassMaterialEvidence(client) {
@@ -2016,10 +2201,64 @@ function titlebarAllButtonsEvidenceExpression() {
   })()`;
 }
 
+function notificationButtonStyleEvidenceExpression() {
+  return `(() => {
+    const notification = document.querySelector('[data-titlebar-control="notifications"]');
+    const center = document.querySelector('.shell-titlebar-center .titlebar-icon-button');
+    const inspect = (element) => {
+      if (!element) return null;
+      const style = getComputedStyle(element);
+      const after = getComputedStyle(element, '::after');
+      return {
+        width: style.width,
+        minWidth: style.minWidth,
+        height: style.height,
+        padding: style.padding,
+        borderWidth: style.borderWidth,
+        borderStyle: style.borderStyle,
+        borderRadius: style.borderRadius,
+        backgroundColor: style.backgroundColor,
+        boxShadow: style.boxShadow,
+        afterBorderWidth: after.borderWidth,
+        afterBoxShadow: after.boxShadow,
+        pointerTarget: element.getAttribute('data-interactive-pointer-target')
+      };
+    };
+    const notificationStyle = inspect(notification);
+    const centerStyle = inspect(center);
+    const comparableProperties = [
+      'width',
+      'minWidth',
+      'height',
+      'padding',
+      'borderWidth',
+      'borderStyle',
+      'borderRadius',
+      'backgroundColor',
+      'boxShadow',
+      'afterBorderWidth',
+      'afterBoxShadow',
+      'pointerTarget'
+    ];
+    return {
+      notification: notificationStyle,
+      center: centerStyle,
+      matchesCenter: Boolean(
+        notificationStyle &&
+        centerStyle &&
+        comparableProperties.every((property) => notificationStyle[property] === centerStyle[property])
+      ),
+      statusDotCount: notification?.querySelectorAll('.notification-status-dot').length ?? 0
+    };
+  })()`;
+}
+
 function compactPopoverEvidenceExpression() {
   return `(() => {
     const notificationButtons = [...document.querySelectorAll('[data-titlebar-control="notifications"]')];
     const legacyButtons = [...document.querySelectorAll('[data-titlebar-control="tasks-palette"], [data-titlebar-control="recent-operations"]')];
+    const notificationButton = notificationButtons[0] ?? null;
+    const anchorRect = notificationButton?.getBoundingClientRect() ?? null;
     const roots = [...document.querySelectorAll("[data-compact-popover-root]")].map((element) => {
       const style = getComputedStyle(element);
       const backdrop = element.querySelector(".liquid-glass-backdrop");
@@ -2044,12 +2283,29 @@ function compactPopoverEvidenceExpression() {
         boxShadow: style.boxShadow,
         border: style.border,
         rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, top: rect.top, right: rect.right, bottom: rect.bottom, left: rect.left },
+        anchorRect: anchorRect
+          ? { x: anchorRect.x, y: anchorRect.y, width: anchorRect.width, height: anchorRect.height, top: anchorRect.top, right: anchorRect.right, bottom: anchorRect.bottom, left: anchorRect.left }
+          : null,
+        anchorGeometry: anchorRect
+          ? {
+              gap: rect.top - anchorRect.bottom,
+              rightDelta: rect.right - anchorRect.right,
+              clampedLeft: rect.left <= 8.5,
+              viewportContained: rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight
+            }
+          : null,
         notification: element.getAttribute("data-compact-popover-root") === "notifications"
           ? {
               activeCount: activeRows.length,
               activeProgressCount: activeRows.filter((row) => row.querySelector(".notification-progress-track")).length,
+              determinateCount: activeRows.filter((row) => row.querySelector(".notification-progress-percent")).length,
+              indeterminateCount: activeRows.filter((row) => row.querySelector(".notification-progress-indeterminate")).length,
+              phaseCount: element.querySelectorAll(".notification-operation-phase").length,
+              progressLabelCount: element.querySelectorAll(".notification-progress-label").length,
+              progressPercentCount: element.querySelectorAll(".notification-progress-percent").length,
               thumbnailCount: element.querySelectorAll(".notification-thumbnail-summary").length,
               resultCount: element.querySelectorAll("[data-notification-result]").length,
+              resultLibraryLabels: [...element.querySelectorAll(".notification-result-library")].map((item) => item.textContent?.trim() ?? ""),
               actionCount: element.querySelectorAll("[data-notification-action], .task-action, [data-action='cancel'], [data-action='retry']").length,
               fullCenterCount: element.querySelectorAll(".notification-open-center").length,
               contentOrder: contentSections.map(([name, node]) => ({ name, top: node.getBoundingClientRect().top })),
@@ -2338,6 +2594,10 @@ try {
   const settingsInterfaceStyle = await settingsInterfaceStyleEvidence(client);
   const pluginsSecondaryWindow = await pluginsSecondaryWindowEvidence(client);
   const notificationsSecondaryWindow = await notificationsSecondaryWindowEvidence(client);
+  const notificationButtonStyle = await evaluate(
+    client,
+    notificationButtonStyleEvidenceExpression()
+  );
   const compactPopovers = await compactPopoverDismissalEvidence(client);
 
   await selectMediaByName(client, "portrait-sample");
@@ -2408,6 +2668,7 @@ try {
   const pointTileThumb = await moveToSelector(client, ".tile-thumb", 0.35, 0.72);
   const pointerTileThumb = await evaluate(client, pointerEvidenceExpression());
   const localEdgeHighlight = await screenshot(client, "ui-local-edge-highlight.png");
+  const notificationFixture = await notificationPopoverFixtureEvidence(client);
 
   summary = {
     run: {
@@ -2427,6 +2688,7 @@ try {
       pointerFarIdle: pointerFarIdleScreenshot,
       pointerWindowOuterEdge: pointerWindowOuterEdgeScreenshot,
       localEdgeHighlight,
+      notificationFixture: notificationFixture.screenshots,
       windowBackdrop: windowBackdrop.path ?? null
     },
     verification: {
@@ -2445,7 +2707,9 @@ try {
       settingsInterfaceStyle: settingsInterfaceStyle.evidence,
       pluginsSecondaryWindow,
       notificationsSecondaryWindow,
+      notificationButtonStyle,
       compactPopovers,
+      notificationFixture,
       inspectorPortrait,
       inspectorPreviewApiResponsesBeforeCentralOpen,
       inspectorThumbnailBlobResponsesBeforeCentralOpen,
@@ -2870,6 +3134,14 @@ try {
   for (const value of Object.values(summary.evidence.settingsInterfaceStyle.materialAfter?.rootBackdropFilters ?? {})) {
     if (!noBackdropFilter(value)) hardFailures.push("root/app-shell backdrop-filter appeared after blur slider update");
   }
+  if (
+    !summary.evidence.notificationButtonStyle?.matchesCenter ||
+    summary.evidence.notificationButtonStyle?.notification?.borderWidth !== "0px" ||
+    summary.evidence.notificationButtonStyle?.notification?.afterBorderWidth !== "0px" ||
+    summary.evidence.notificationButtonStyle?.notification?.pointerTarget !== "true"
+  ) {
+    hardFailures.push("notification button computed style does not match a center titlebar icon button");
+  }
   for (const step of summary.evidence.compactPopovers.steps) {
     if (step.evidence.count > 1) {
       hardFailures.push(`multiple compact popovers remained open after ${step.action}`);
@@ -2910,6 +3182,13 @@ try {
         ) {
           hardFailures.push("notification compact popover overflows the visual harness viewport");
         }
+        if (
+          !near(root.anchorGeometry?.gap, 4, 1) ||
+          !root.anchorGeometry?.viewportContained ||
+          (!root.anchorGeometry?.clampedLeft && !near(root.anchorGeometry?.rightDelta, 0, 1))
+        ) {
+          hardFailures.push("notification compact popover is not anchored to its titlebar button");
+        }
       }
     }
     if (step.evidence.titlebar.notificationButtonCount !== 1) {
@@ -2921,6 +3200,61 @@ try {
     if (step.evidence.titlebar.visibleText.some((text) => /\d/.test(text))) {
       hardFailures.push("notification titlebar button exposes a numeric badge");
     }
+  }
+  const fixture = summary.evidence.notificationFixture;
+  const fixtureRoot = (evidence) =>
+    evidence?.roots?.find((root) => root.name === "notifications") ?? null;
+  const fullFixtureRoot = fixtureRoot(fixture?.full);
+  const narrowFixtureRoot = fixtureRoot(fixture?.narrow);
+  const emptyFixtureRoot = fixtureRoot(fixture?.empty);
+  const degradedFixtureRoot = fixtureRoot(fixture?.degraded);
+  if (
+    !fullFixtureRoot ||
+    fullFixtureRoot.notification?.activeCount !== 2 ||
+    fullFixtureRoot.notification?.activeProgressCount !== 2 ||
+    fullFixtureRoot.notification?.determinateCount !== 1 ||
+    fullFixtureRoot.notification?.indeterminateCount !== 1 ||
+    fullFixtureRoot.notification?.phaseCount !== 2 ||
+    fullFixtureRoot.notification?.progressLabelCount !== 2 ||
+    fullFixtureRoot.notification?.progressPercentCount !== 1 ||
+    fullFixtureRoot.notification?.thumbnailCount !== 1 ||
+    fullFixtureRoot.notification?.resultCount !== 3 ||
+    fullFixtureRoot.notification?.resultLibraryLabels?.length !== 3 ||
+    fullFixtureRoot.notification?.resultLibraryLabels?.some((label) => !label) ||
+    fullFixtureRoot.notification?.actionCount !== 0 ||
+    fullFixtureRoot.notification?.fullCenterCount !== 1
+  ) {
+    hardFailures.push("full notification visual fixture does not cover the required compact content model");
+  }
+  if (
+    !narrowFixtureRoot ||
+    fixture?.narrow?.viewport?.width > 820 ||
+    !narrowFixtureRoot.anchorGeometry?.viewportContained ||
+    !near(narrowFixtureRoot.anchorGeometry?.gap, 4, 1) ||
+    (!narrowFixtureRoot.anchorGeometry?.clampedLeft &&
+      !near(narrowFixtureRoot.anchorGeometry?.rightDelta, 0, 1))
+  ) {
+    hardFailures.push("narrow notification visual fixture is detached from its anchor or overflows");
+  }
+  if (!emptyFixtureRoot?.notification?.empty || emptyFixtureRoot.notification.degraded) {
+    hardFailures.push("empty notification visual fixture is missing its healthy empty state");
+  }
+  if (!degradedFixtureRoot?.notification?.empty || !degradedFixtureRoot.notification.degraded) {
+    hardFailures.push("degraded notification visual fixture is missing its degraded empty state");
+  }
+  const unexpectedFixtureConsoleErrors =
+    fixture?.navigationDiagnostics?.consoleErrors?.filter(
+      (entry) =>
+        !/sandboxed_renderer\.bundle\.js script failed to run|preloadScripts.*startupData/i.test(
+          entry.text ?? ""
+        )
+    ) ?? [];
+  const unexpectedFixtureNetworkProblems =
+    fixture?.navigationDiagnostics?.networkProblems?.filter(
+      (entry) => entry.errorText !== "net::ERR_ABORTED"
+    ) ?? [];
+  if (unexpectedFixtureConsoleErrors.length || unexpectedFixtureNetworkProblems.length) {
+    hardFailures.push("notification test renderer emitted unexpected console or network failures");
   }
   if (inspectorPortrait.centralOpen) hardFailures.push("central preview open during right preview capture");
   if (inspectorPortrait.headingPresent) hardFailures.push("right preview still renders the old heading row");

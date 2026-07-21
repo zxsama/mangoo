@@ -269,6 +269,18 @@ for (const selector of [
     fail(`${selector} must use the local readable glass tint instead of relying on a full-window backing plate`);
   }
 }
+for (const requiredSharedSelector of [
+  ".shell-right-actions .titlebar-icon-button,",
+  ".shell-right-actions .titlebar-icon-button::after,",
+  '.shell-right-actions .titlebar-icon-button[data-glass-active="true"] > .liquid-glass-backdrop'
+]) {
+  if (!stylesForChecks.includes(requiredSharedSelector)) {
+    fail(`notification button must share center titlebar icon styling: missing ${requiredSharedSelector}`);
+  }
+}
+if (!/\.shell-right-actions \.titlebar-icon-button,[\s\S]*?border:\s*0;/.test(stylesForChecks)) {
+  fail("notification titlebar button must remove its liquid-glass border");
+}
 
 for (const [selector, maxAlpha] of [
   [".liquid-glass-tone-chrome", 0.01],
