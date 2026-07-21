@@ -1537,6 +1537,9 @@ for (const value of [
   "notification-progress-fill",
   "notification-progress-indeterminate",
   "notification-thumbnail-summary",
+  "notification-thumbnail-summary-list",
+  "data-notification-thumbnail-library-count",
+  "data-overlay-scroll-container",
   "notification-result-list",
   "notification-popover-empty",
   "notification-popover-degraded",
@@ -1545,6 +1548,14 @@ for (const value of [
   if (!notificationPopover.includes(value)) {
     fail(`notification popover visual contract missing ${value}`);
   }
+}
+if (
+  !/\.notification-popover-body\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*auto;/s.test(
+    stylesForChecks
+  ) ||
+  !/\.notification-popover-footer\s*\{[^}]*flex:\s*0 0 auto;/s.test(stylesForChecks)
+) {
+  fail("notification popover must scroll its content while keeping the full-center footer reachable");
 }
 if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopover)) {
   fail("compact notification UI must not contain task actions");

@@ -174,11 +174,7 @@ function buildThumbnailAggregate(
     }
   }
   const summaries = [...byLibrary.values()]
-    .sort(
-      (left, right) =>
-        left.libraryName.localeCompare(right.libraryName) ||
-        left.libraryId.localeCompare(right.libraryId)
-    );
+    .sort(compareThumbnailLibraries);
   const sum = (pick: (summary: DesktopThumbnailCacheSummary) => number) =>
     summaries.reduce((total, summary) => total + pick(summary), 0);
   const cachedCount = sum((summary) => summary.cachedCount);
@@ -206,6 +202,13 @@ function buildThumbnailAggregate(
         : null,
     active: pendingCount > 0 || activeBulkTaskCount > 0
   };
+}
+
+function compareThumbnailLibraries(
+  left: DesktopThumbnailCacheSummary,
+  right: DesktopThumbnailCacheSummary
+): number {
+  return left.libraryId < right.libraryId ? -1 : left.libraryId > right.libraryId ? 1 : 0;
 }
 
 function deduplicateOperations(

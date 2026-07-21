@@ -235,12 +235,28 @@ describe("notification selectors", () => {
     assert.equal(progressView(operation("overflow", { currentValue: 140 })).percent, 100);
   });
 
-  it("combines thumbnail status without creating per-thumbnail rows", () => {
+  it("keeps one thumbnail aggregate per library in stable library id order", () => {
     const model = buildCompactNotificationModel(
       compact({
         thumbnailSummaries: [
-          thumbnail("library-b", { cachedCount: 20, totalCandidateCount: 50 }),
-          thumbnail("library-a"),
+          thumbnail("library-b", {
+            libraryName: "A References",
+            cachedCount: 20,
+            totalCandidateCount: 50,
+            pendingCount: 7,
+            failedCount: 3,
+            staleCount: 2,
+            completionPercent: 40
+          }),
+          thumbnail("library-a", {
+            libraryName: "Z Artists",
+            cachedCount: 80,
+            totalCandidateCount: 100,
+            pendingCount: 5,
+            failedCount: 1,
+            staleCount: 4,
+            completionPercent: 80
+          }),
           thumbnail("library-a", { observedAt: 400, cachedCount: 1 })
         ]
       })
@@ -250,10 +266,53 @@ describe("notification selectors", () => {
       "library-a",
       "library-b"
     ]);
+    assert.equal(model.thumbnail.summaries.length, model.thumbnail.libraryCount);
+    assert.ok(model.thumbnail.summaries.length <= model.thumbnail.libraryCount);
+    assert.deepEqual(
+      model.thumbnail.summaries.map((item) => ({
+        libraryId: item.libraryId,
+        libraryName: item.libraryName,
+        cachedCount: item.cachedCount,
+        totalCandidateCount: item.totalCandidateCount,
+        pendingCount: item.pendingCount,
+        failedCount: item.failedCount,
+        staleCount: item.staleCount,
+        completionPercent: item.completionPercent
+      })),
+      [
+        {
+          libraryId: "library-a",
+          libraryName: "Z Artists",
+          cachedCount: 80,
+          totalCandidateCount: 100,
+          pendingCount: 5,
+          failedCount: 1,
+          staleCount: 4,
+          completionPercent: 80
+        },
+        {
+          libraryId: "library-b",
+          libraryName: "A References",
+          cachedCount: 20,
+          totalCandidateCount: 50,
+          pendingCount: 7,
+          failedCount: 3,
+          staleCount: 2,
+          completionPercent: 40
+        }
+      ]
+    );
     assert.equal(model.thumbnail.cachedCount, 100);
     assert.equal(model.thumbnail.totalCandidateCount, 150);
     assert.equal(model.thumbnail.completionPercent, 67);
     assert.equal(model.thumbnail.active, true);
+  });
+
+  it("keeps the empty compact model free of thumbnail aggregate rows", () => {
+    const model = buildCompactNotificationModel(compact({ thumbnailSummaries: [] }));
+
+    assert.deepEqual(model.thumbnail.summaries, []);
+    assert.equal(model.thumbnail.libraryCount, 0);
   });
 
   it("exposes degraded health and never introduces read state", () => {

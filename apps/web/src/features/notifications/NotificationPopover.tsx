@@ -13,6 +13,7 @@ import {
   type ReactNode
 } from "react";
 import { createPortal } from "react-dom";
+import type { DesktopThumbnailCacheSummary } from "@megle/notification-contract";
 import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import type {
   CompactNotificationModel,
@@ -111,51 +112,13 @@ export function NotificationPopover({
             icon={<Image aria-hidden="true" size={14} />}
             label="缩略图缓存"
           >
-            <div className="notification-thumbnail-summary">
-              <div className="notification-row-heading">
-                <strong>
-                  {model.thumbnail.libraryCount > 1
-                    ? `${model.thumbnail.libraryCount} 个资源库`
-                    : model.thumbnail.summaries[0]?.libraryName || "当前资源库"}
-                </strong>
-                <span>
-                  {model.thumbnail.completionPercent == null
-                    ? "统计中"
-                    : `${model.thumbnail.completionPercent}%`}
-                </span>
-              </div>
-              <div
-                aria-label="缩略图缓存进度"
-                aria-valuemax={100}
-                aria-valuemin={0}
-                aria-valuenow={model.thumbnail.completionPercent ?? undefined}
-                className="notification-progress-track"
-                role="progressbar"
-              >
-                {model.thumbnail.completionPercent == null ? (
-                  <span className="notification-progress-indeterminate" />
-                ) : (
-                  <span
-                    className="notification-progress-fill"
-                    style={progressStyle(model.thumbnail.completionPercent)}
-                  />
-                )}
-              </div>
-              <div className="notification-thumbnail-metrics">
-                <span>
-                  {model.thumbnail.cachedCount.toLocaleString()} /{" "}
-                  {model.thumbnail.totalCandidateCount.toLocaleString()} 已缓存
-                </span>
-                <span>
-                  {model.thumbnail.pendingCount.toLocaleString()} 待处理
-                  {model.thumbnail.failedCount > 0
-                    ? ` · ${model.thumbnail.failedCount.toLocaleString()} 失败`
-                    : ""}
-                </span>
-                {model.thumbnail.totalCacheBytes == null ? null : (
-                  <span>{formatBytes(model.thumbnail.totalCacheBytes)}</span>
-                )}
-              </div>
+            <div
+              className="notification-thumbnail-summary-list"
+              data-notification-thumbnail-library-count={model.thumbnail.libraryCount}
+            >
+              {model.thumbnail.summaries.map((summary) => (
+                <ThumbnailSummaryRow key={summary.libraryId} summary={summary} />
+              ))}
             </div>
           </NotificationSection>
         ) : null}
@@ -315,6 +278,62 @@ function OperationProgress({ operation }: { operation: NotificationOperationView
       </span>
     </>
   );
+}
+
+function ThumbnailSummaryRow({ summary }: { summary: DesktopThumbnailCacheSummary }) {
+  const status = thumbnailStatusParts(summary);
+  const libraryLabel = summary.libraryName || summary.libraryId;
+  return (
+    <div
+      className="notification-thumbnail-summary"
+      data-notification-thumbnail-library={summary.libraryId}
+      data-notification-thumbnail-library-name={libraryLabel}
+      data-notification-thumbnail-progress={summary.completionPercent ?? "indeterminate"}
+    >
+      <div className="notification-row-heading">
+        <strong>{libraryLabel}</strong>
+        <span className="notification-thumbnail-progress-percent">
+          {summary.completionPercent == null ? "统计中" : `${summary.completionPercent}%`}
+        </span>
+      </div>
+      <div
+        aria-label={`${libraryLabel}缩略图缓存进度`}
+        aria-valuemax={100}
+        aria-valuemin={0}
+        aria-valuenow={summary.completionPercent ?? undefined}
+        className="notification-progress-track"
+        role="progressbar"
+      >
+        {summary.completionPercent == null ? (
+          <span className="notification-progress-indeterminate" />
+        ) : (
+          <span
+            className="notification-progress-fill"
+            style={progressStyle(summary.completionPercent)}
+          />
+        )}
+      </div>
+      <div className="notification-thumbnail-metrics">
+        <span className="notification-thumbnail-cached-total">
+          {summary.cachedCount.toLocaleString()} / {summary.totalCandidateCount.toLocaleString()} 已缓存
+        </span>
+        <span className="notification-thumbnail-status">
+          {status.length > 0 ? status.join(" · ") : "已同步"}
+        </span>
+        {summary.totalCacheBytes == null ? null : <span>{formatBytes(summary.totalCacheBytes)}</span>}
+      </div>
+    </div>
+  );
+}
+
+function thumbnailStatusParts(summary: DesktopThumbnailCacheSummary): string[] {
+  return [
+    summary.pendingCount > 0 ? `${summary.pendingCount.toLocaleString()} 待处理` : null,
+    summary.failedCount > 0 ? `${summary.failedCount.toLocaleString()} 失败` : null,
+    summary.staleCount > 0 ? `${summary.staleCount.toLocaleString()} 过期` : null,
+    summary.missingCount > 0 ? `${summary.missingCount.toLocaleString()} 缺失` : null,
+    summary.activeBulkTaskCount > 0 ? `${summary.activeBulkTaskCount.toLocaleString()} 批处理` : null
+  ].filter((value): value is string => value !== null);
 }
 
 function progressStyle(percent: number): CSSProperties {

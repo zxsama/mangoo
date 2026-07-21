@@ -103,6 +103,8 @@ const notificationPopoverMeasurementPath =
 const notificationPopoverMeasurement = existsSync(path.join(root, notificationPopoverMeasurementPath))
   ? read(notificationPopoverMeasurementPath)
   : "";
+const notificationModel = read("apps/web/src/features/notifications/notificationModel.ts");
+const notificationModelTests = read("apps/web/tests/notificationModel.test.mts");
 const notificationVisualFixturePath =
   "apps/web/tests/fixtures/notificationPopoverVisualFixture.tsx";
 const notificationVisualFixture = existsSync(path.join(root, notificationVisualFixturePath))
@@ -182,7 +184,8 @@ for (const value of [
   'data-titlebar-control="notifications"',
   "notificationPopoverFixture",
   "churnDetachedPointerStyles",
-  "resetMeasurements"
+  "resetMeasurements",
+  "libraryCount: 2"
 ]) {
   if (!notificationVisualFixture.includes(value)) {
     fail(`notification visual fixture contract missing ${value}`);
@@ -200,7 +203,9 @@ for (const value of [
   "Emulation.setPageScaleFactor",
   "resizeScriptOpenedWindow(fixtureClient, 800, 720)",
   "ui-notification-compact-fixture-full.png",
-  "ui-notification-compact-fixture-full-narrow.png"
+  "ui-notification-compact-fixture-full-narrow.png",
+  "thumbnailLibraryCount",
+  "thumbnailSummaries"
 ]) {
   if (!desktopVisualHarness.includes(value)) {
     fail(`notification visual harness contract missing ${value}`);
@@ -278,11 +283,38 @@ for (const value of [
   "notification-operation-phase",
   "notification-progress-percent",
   "notification-progress-label",
-  "notification-result-library"
+  "notification-result-library",
+  "model.thumbnail.summaries.map",
+  "data-notification-thumbnail-library",
+  "data-notification-thumbnail-library-count",
+  "data-notification-thumbnail-progress",
+  "notification-thumbnail-cached-total",
+  "notification-thumbnail-status"
 ]) {
   if (!notificationPopover.includes(value)) {
     fail(`notification compact content contract missing ${value}`);
   }
+}
+for (const value of [
+  "compareThumbnailLibraries",
+  "left.libraryId < right.libraryId",
+  "byLibrary.values()"
+]) {
+  if (!notificationModel.includes(value)) {
+    fail(`notification thumbnail model contract missing ${value}`);
+  }
+}
+for (const value of [
+  "stable library id order",
+  "model.thumbnail.summaries.length <= model.thumbnail.libraryCount",
+  "keeps the empty compact model free of thumbnail aggregate rows"
+]) {
+  if (!notificationModelTests.includes(value)) {
+    fail(`notification thumbnail model tests missing ${value}`);
+  }
+}
+if (notificationPopover.includes("`${model.thumbnail.libraryCount} 个资源库`")) {
+  fail("notification popover must render one thumbnail aggregate row per library");
 }
 
 for (const [label, source] of [
@@ -1846,6 +1878,8 @@ for (const value of [
   "notification-progress-fill",
   "notification-progress-indeterminate",
   "notification-thumbnail-summary",
+  "notification-thumbnail-summary-list",
+  "data-notification-thumbnail-library-count",
   "notification-result-list",
   "notification-popover-empty",
   "notification-popover-degraded",

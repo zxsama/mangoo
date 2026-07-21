@@ -2429,9 +2429,11 @@ function compactPopoverEvidenceExpression() {
       const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
       const rect = element.getBoundingClientRect();
       const activeRows = [...element.querySelectorAll("[data-notification-active-operation]")];
+      const thumbnailRows = [...element.querySelectorAll("[data-notification-thumbnail-library]")];
+      const thumbnailList = element.querySelector("[data-notification-thumbnail-library-count]");
       const contentSections = [
         ["active", element.querySelector(".notification-active-list")],
-        ["thumbnail", element.querySelector(".notification-thumbnail-summary")],
+        ["thumbnail", thumbnailList],
         ["results", element.querySelector(".notification-result-list")],
         ["center", element.querySelector(".notification-open-center")]
       ].filter(([, node]) => Boolean(node));
@@ -2467,7 +2469,17 @@ function compactPopoverEvidenceExpression() {
               phaseCount: element.querySelectorAll(".notification-operation-phase").length,
               progressLabelCount: element.querySelectorAll(".notification-progress-label").length,
               progressPercentCount: element.querySelectorAll(".notification-progress-percent").length,
-              thumbnailCount: element.querySelectorAll(".notification-thumbnail-summary").length,
+              thumbnailCount: thumbnailRows.length,
+              thumbnailLibraryCount: Number(thumbnailList?.getAttribute("data-notification-thumbnail-library-count") ?? 0),
+              thumbnailSummaries: thumbnailRows.map((row) => ({
+                libraryId: row.getAttribute("data-notification-thumbnail-library"),
+                libraryName: row.getAttribute("data-notification-thumbnail-library-name"),
+                progress: row.getAttribute("data-notification-thumbnail-progress"),
+                label: row.querySelector(".notification-row-heading strong")?.textContent?.trim() ?? "",
+                progressLabel: row.querySelector(".notification-thumbnail-progress-percent")?.textContent?.trim() ?? "",
+                cachedTotal: row.querySelector(".notification-thumbnail-cached-total")?.textContent?.trim() ?? "",
+                status: row.querySelector(".notification-thumbnail-status")?.textContent?.trim() ?? ""
+              })),
               resultCount: element.querySelectorAll("[data-notification-result]").length,
               resultLibraryLabels: [...element.querySelectorAll(".notification-result-library")].map((item) => item.textContent?.trim() ?? ""),
               actionCount: element.querySelectorAll("[data-notification-action], .task-action, [data-action='cancel'], [data-action='retry']").length,
@@ -3324,8 +3336,8 @@ try {
         if (root.notification.activeProgressCount !== root.notification.activeCount) {
           hardFailures.push("notification compact active rows are missing progress tracks");
         }
-        if (root.notification.thumbnailCount > 1) {
-          hardFailures.push("notification compact rendered more than one thumbnail aggregate");
+        if (root.notification.thumbnailCount > root.notification.thumbnailLibraryCount) {
+          hardFailures.push("notification compact rendered more thumbnail aggregates than available libraries");
         }
         if (root.notification.resultCount > 3) {
           hardFailures.push("notification compact rendered more than three important results");
@@ -3392,7 +3404,26 @@ try {
     fullFixtureRoot.notification?.phaseCount !== 2 ||
     fullFixtureRoot.notification?.progressLabelCount !== 2 ||
     fullFixtureRoot.notification?.progressPercentCount !== 1 ||
-    fullFixtureRoot.notification?.thumbnailCount !== 1 ||
+    fullFixtureRoot.notification?.thumbnailCount !== 2 ||
+    fullFixtureRoot.notification?.thumbnailLibraryCount !== 2 ||
+    JSON.stringify(fullFixtureRoot.notification?.thumbnailSummaries?.map((item) => item.libraryId)) !==
+      JSON.stringify(["artists", "references"]) ||
+    JSON.stringify(fullFixtureRoot.notification?.thumbnailSummaries?.map((item) => item.libraryName)) !==
+      JSON.stringify(["Artists", "References"]) ||
+    JSON.stringify(fullFixtureRoot.notification?.thumbnailSummaries?.map((item) => item.progress)) !==
+      JSON.stringify(["82", "63"]) ||
+    JSON.stringify(fullFixtureRoot.notification?.thumbnailSummaries?.map((item) => item.progressLabel)) !==
+      JSON.stringify(["82%", "63%"]) ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[0]?.cachedTotal.includes("820") ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[0]?.cachedTotal.includes("1,000") ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[0]?.status.includes("32 待处理") ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[0]?.status.includes("4 失败") ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[0]?.status.includes("24 过期") ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[1]?.cachedTotal.includes("500") ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[1]?.cachedTotal.includes("800") ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[1]?.status.includes("18 待处理") ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[1]?.status.includes("9 失败") ||
+    !fullFixtureRoot.notification?.thumbnailSummaries?.[1]?.status.includes("48 过期") ||
     fullFixtureRoot.notification?.resultCount !== 3 ||
     fullFixtureRoot.notification?.resultLibraryLabels?.length !== 3 ||
     fullFixtureRoot.notification?.resultLibraryLabels?.some((label) => !label) ||
@@ -3426,7 +3457,13 @@ try {
   ) {
     hardFailures.push("notification pointer or detached-node churn triggered redundant measurements");
   }
-  if (!emptyFixtureRoot?.notification?.empty || emptyFixtureRoot.notification.degraded) {
+  if (
+    !emptyFixtureRoot?.notification?.empty ||
+    emptyFixtureRoot.notification.degraded ||
+    emptyFixtureRoot.notification.thumbnailCount !== 0 ||
+    emptyFixtureRoot.notification.thumbnailLibraryCount !== 0 ||
+    emptyFixtureRoot.notification.thumbnailSummaries.length !== 0
+  ) {
     hardFailures.push("empty notification visual fixture is missing its healthy empty state");
   }
   if (!degradedFixtureRoot?.notification?.empty || !degradedFixtureRoot.notification.degraded) {

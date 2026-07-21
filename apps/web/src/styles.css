@@ -3934,6 +3934,13 @@ button:disabled {
   padding: 9px 10px;
 }
 
+.notification-thumbnail-summary-list {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
 .notification-thumbnail-metrics {
   display: flex;
   flex-wrap: wrap;
