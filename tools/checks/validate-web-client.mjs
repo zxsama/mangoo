@@ -152,6 +152,9 @@ const notificationPopoverMeasurement = existsSync(path.join(root, notificationPo
   ? read(notificationPopoverMeasurementPath)
   : "";
 const notificationModel = read("apps/web/src/features/notifications/notificationModel.ts");
+const notificationStatusView = read(
+  "apps/web/src/features/notifications/NotificationStatusView.tsx"
+);
 const notificationModelTests = read("apps/web/tests/notificationModel.test.mts");
 const processLogModel = read("apps/web/src/features/notifications/processLogModel.ts");
 const processLogView = read("apps/web/src/features/notifications/ProcessLogView.tsx");
@@ -1997,11 +2000,21 @@ for (const value of ["NotificationPopover", "useNotifications", "openNotificatio
 for (const value of [
   "aggregateInteractiveFolderScans",
   "sourceOperations",
-  "paths",
+  "scanPaths",
+  "operationId",
+  "libraryId",
   "thumbnailFailureLogIntentForLibrary"
 ]) {
   if (!notificationModel.includes(value)) {
     fail(`notification presentation model missing ${value}`);
+  }
+}
+for (const [label, source] of [
+  ["full notification status", notificationStatusView],
+  ["compact notification popover", notificationPopover]
+]) {
+  if (!source.includes("operation.scanPaths") || !source.includes("key={row.key}")) {
+    fail(`${label} must key scan paths by stable operation identity`);
   }
 }
 for (const value of ["buildProcessLogRows", "ThumbnailFailureDetail", "libraryId", "eventKind"]) {
