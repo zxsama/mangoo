@@ -80,6 +80,7 @@ interface LayoutBuildOptions {
   // reorder-on-load reflow of laying out only the loaded prefix.
   totalCount?: number;
   getItemAt?: (index: number) => MediaRecord | undefined;
+  getItemAspectRatio?: (index: number, item: MediaRecord | undefined) => number;
   estimatedRatio?: number;
 }
 
@@ -298,7 +299,7 @@ export function findDirectionalNeighborIndex(
 }
 
 export function resolveScrollTopForPlacement(
-  placement: LayoutPlacement,
+  placement: Pick<LayoutPlacement, "frameHeight" | "top">,
   viewportHeight: number,
   currentScrollTop: number,
   contentHeight: number
@@ -416,6 +417,7 @@ function buildAdaptiveLayout({
   viewportWidth,
   totalCount,
   getItemAt,
+  getItemAspectRatio,
   estimatedRatio
 }: Omit<LayoutBuildOptions, "layoutMode">): LayoutGeometry {
   const contentWidth = normalizeViewportWidth(viewportWidth, tileMinWidth);
@@ -485,7 +487,8 @@ function buildAdaptiveLayout({
     // Real ratio when the media is loaded; a stable estimate for unloaded slots
     // so a later real ratio does not repack the row (the estimate keeps the row
     // membership stable; only the arriving tile's own width adjusts slightly).
-    const ratio = item ? resolveAspectRatio(item) : fallbackRatio;
+    const ratio = getItemAspectRatio?.(itemIndex, item) ??
+      (item ? resolveAspectRatio(item) : fallbackRatio);
     rowItems.push({ item, itemIndex, ratio });
     ratioSum += ratio;
     const projectedWidth = ratioSum * targetRowHeight + gap * Math.max(0, rowItems.length - 1);
@@ -521,6 +524,7 @@ function buildWaterfallLayout({
   viewportWidth,
   totalCount,
   getItemAt,
+  getItemAspectRatio,
   estimatedRatio
 }: Omit<LayoutBuildOptions, "layoutMode">): LayoutGeometry {
   const contentWidth = normalizeViewportWidth(viewportWidth, tileMinWidth);
@@ -535,7 +539,8 @@ function buildWaterfallLayout({
 
   for (let itemIndex = 0; itemIndex < count; itemIndex += 1) {
     const item = itemAt(itemIndex);
-    const ratio = item ? resolveAspectRatio(item) : fallbackRatio;
+    const ratio = getItemAspectRatio?.(itemIndex, item) ??
+      (item ? resolveAspectRatio(item) : fallbackRatio);
     const thumbHeight = Math.max(1, Math.round(tileWidth / ratio));
     const frameHeight = thumbHeight + labelHeight;
     const itemHeight = frameHeight + gap;

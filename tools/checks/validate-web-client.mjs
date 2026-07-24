@@ -134,6 +134,9 @@ const thumbnailObjectUrlCacheModule = existsSync(path.join(root, thumbnailObject
   : "";
 const mediaGrid = read("apps/web/src/features/media-grid/MediaGrid.tsx");
 const mediaGridLayoutGeometry = read("apps/web/src/features/media-grid/layoutGeometry.ts");
+const windowedMediaGeometry = read(
+  "apps/web/src/features/media-grid/windowedMediaGeometry.ts"
+);
 const main = read("apps/web/src/main.tsx");
 const app = read("apps/web/src/app/App.tsx");
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
@@ -786,22 +789,22 @@ if (
   fail("useLibraryData must flush selected/visible thumbnail scope changes immediately");
 }
 if (
-  !/const\s+uniformWindowLayoutMode\s*=\s*layoutMode\s*===\s*"grid"\s*\|\|\s*layoutMode\s*===\s*"list"/.test(
+  !/resolveMediaGeometryStrategy\s*\(\s*\{[\s\S]*?itemCount:\s*mediaItemCount[\s\S]*?layoutMode/.test(
     mediaGrid
   ) ||
-  // The full-total justified layout is O(totalCount); above a cap it must fall
-  // back to the uniform windowed grid or the renderer freezes at million scale.
-  !/JUSTIFIED_FULL_TOTAL_MAX_ITEMS/.test(mediaGrid) ||
-  !/justifiedTooLargeForFullTotal\s*=\s*[\s\S]*?justifiedLayoutMode\s*&&\s*mediaItemCount\s*>\s*JUSTIFIED_FULL_TOTAL_MAX_ITEMS/.test(
-    mediaGrid
+  !/JUSTIFIED_FULL_TOTAL_MAX_ITEMS\s*=\s*20_000/.test(windowedMediaGeometry) ||
+  !/justifiedOverCap\s*=\s*justified\s*&&\s*itemCount\s*>\s*JUSTIFIED_FULL_TOTAL_MAX_ITEMS/.test(
+    windowedMediaGeometry
   ) ||
-  !/windowedMedia\s*=\s*[\s\S]*?uniformWindowLayoutMode\s*\|\|\s*justifiedTooLargeForFullTotal/.test(
-    mediaGrid
+  !/windowedMedia:\s*[\s\S]*?uniform\s*\|\|\s*justifiedOverCap/.test(windowedMediaGeometry) ||
+  !/justifiedFullTotal:\s*[\s\S]*?justified\s*&&\s*!justifiedOverCap/.test(
+    windowedMediaGeometry
   ) ||
-  !/justifiedFullTotal\s*=\s*[\s\S]*?!justifiedTooLargeForFullTotal/.test(mediaGrid)
+  !/layoutMode\s*===\s*"adaptive"[\s\S]*?buildAdaptiveGeometry/.test(windowedMediaGeometry) ||
+  !/layoutMode\s*===\s*"waterfall"[\s\S]*?buildWaterfallGeometry/.test(windowedMediaGeometry)
 ) {
   fail(
-    "MediaGrid must window grid/list (and over-cap justified/masonry) via the uniform mediaWindow, and use the full-total justified layout only at or below JUSTIFIED_FULL_TOTAL_MAX_ITEMS"
+    "MediaGrid must keep full-total justified geometry below its cap and use bounded adaptive/waterfall geometry above it"
   );
 }
 if (/Load more media/.test(mediaGrid) || /type:\s*"load-more"/.test(mediaGrid)) {

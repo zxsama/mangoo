@@ -36,6 +36,12 @@ import {
   type FolderCoverLayoutPlacement,
   type LayoutPlacement
 } from "./layoutGeometry";
+import {
+  buildWindowedMediaGeometry,
+  resolveMediaGeometryStrategy,
+  stableWindowedAspectRatio,
+  type WindowedMediaPlacement
+} from "./windowedMediaGeometry.ts";
 
 const AHEAD_THUMBNAIL_ROW_COUNT = 4;
 const VISIBLE_THUMBNAIL_REPOLL_MS = 150;
@@ -54,20 +60,6 @@ const CONTENT_HEADER_TOP_GAP = 24;
 const CONTENT_SECTION_HEADER_HEIGHT = SECTION_HEADER_HEIGHT + CONTENT_HEADER_TOP_GAP;
 const EMPTY_ROW_HEIGHT = 132;
 const PROGRESSIVE_EXACT_LAYOUT_PAGE_SIZE = 96;
-const LIST_WINDOW_ROW_HEIGHT_PX = 104;
-const LIST_WINDOW_FRAME_HEIGHT_PX = 90;
-const LIST_WINDOW_THUMBNAIL_WIDTH_PX = 108;
-const LIST_WINDOW_THUMBNAIL_HEIGHT_PX = 72;
-const WINDOWED_MEDIA_COUNT_THRESHOLD = 1000;
-// The full-total justified/masonry layout materializes a placement + segment for
-// EVERY item in the folder (O(totalCount)) and the layout rebuilds on each
-// mediaSlots / estimatedRatio change while scrolling. That is fine for moderate
-// folders, but at hundreds of thousands of items it allocates that many objects
-// per scroll step and freezes the renderer — media-fetch callbacks starve, so
-// tiles blank out and never refresh. Above this cap, justified/masonry folders
-// fall back to the uniform windowed grid (O(viewport)), which already provides a
-// correct total scroll height and placeholder slots.
-const JUSTIFIED_FULL_TOTAL_MAX_ITEMS = 20000;
 const ORIGINAL_FALLBACK_IMAGE_EXTENSIONS = new Set([
   "avif",
   "bmp",
@@ -125,15 +117,6 @@ interface VirtualSectionLayout {
   totalCount: number;
 }
 
-interface MediaWindowGeometry {
-  contentWidth: number;
-  columnCount: number;
-  rowCount: number;
-  rowHeight: number;
-  tileWidth: number;
-  totalSize: number;
-}
-
 interface FolderWindowGeometry {
   columnCount: number;
   coverHeight: number;
@@ -178,47 +161,6 @@ interface MediaGridProps {
   scrollPositionKey?: string;
   thumbnailStatesByMediaId: Record<number, ThumbnailResponse>;
   onContextMenu?: (event: { item: MediaRecord; x: number; y: number; shiftKey: boolean }) => void;
-}
-
-function buildMediaWindowGeometry({
-  count,
-  gap,
-  labelHeight,
-  layoutMode,
-  tileMinWidth,
-  viewportWidth
-}: {
-  count: number;
-  gap: number;
-  labelHeight: number;
-  layoutMode: LibraryLayoutMode;
-  tileMinWidth: number;
-  viewportWidth: number;
-}): MediaWindowGeometry {
-  const contentWidth = Math.max(tileMinWidth, Math.floor(viewportWidth || tileMinWidth));
-  if (layoutMode === "list") {
-    return {
-      contentWidth,
-      columnCount: 1,
-      rowCount: Math.max(0, count),
-      rowHeight: LIST_WINDOW_ROW_HEIGHT_PX,
-      tileWidth: contentWidth,
-      totalSize: Math.max(0, count) * LIST_WINDOW_ROW_HEIGHT_PX
-    };
-  }
-
-  const columnCount = Math.max(1, Math.floor((contentWidth + gap) / (tileMinWidth + gap)));
-  const tileWidth = Math.max(1, Math.floor((contentWidth - gap * (columnCount - 1)) / columnCount));
-  const rowHeight = tileWidth + labelHeight + gap;
-  const rowCount = Math.ceil(Math.max(0, count) / columnCount);
-  return {
-    contentWidth,
-    columnCount,
-    rowCount,
-    rowHeight,
-    tileWidth,
-    totalSize: rowCount * rowHeight
-  };
 }
 
 function buildFolderWindowGeometry({
@@ -341,47 +283,12 @@ export function MediaGrid({
   // FULL folder total using real ratios for loaded slots and a stable estimate
   // for unloaded ones, so the scroll height is correct immediately, unloaded
   // positions hold a placeholder, and real thumbnails fade in without repacking.
-  const uniformWindowLayoutMode = layoutMode === "grid" || layoutMode === "list";
-  const justifiedLayoutMode = layoutMode === "adaptive" || layoutMode === "waterfall";
-  const largeMediaSet =
-    mediaItemCount > items.length || mediaItemCount > WINDOWED_MEDIA_COUNT_THRESHOLD;
-  // A justified/masonry folder past the cap cannot use the O(totalCount) full-
-  // total layout without freezing the renderer, so it renders through the uniform
-  // windowed grid instead (see JUSTIFIED_FULL_TOTAL_MAX_ITEMS).
-  const justifiedTooLargeForFullTotal =
-    justifiedLayoutMode && mediaItemCount > JUSTIFIED_FULL_TOTAL_MAX_ITEMS;
-  // `windowedMedia` = the uniform absolute-index window path (grid/list, plus
-  // over-cap justified folders). Kept narrow so the many render/virtual-row
-  // branches that switch on it still mean "uniform mediaWindow rows".
-  const windowedMedia =
-    mediaSlots !== undefined &&
-    (uniformWindowLayoutMode || justifiedTooLargeForFullTotal) &&
-    largeMediaSet;
-  // Justified/masonry full-total layout: drive the existing non-windowed
-  // (layout.segments) render path, but over placements that span the whole
-  // folder total (real ratio when loaded, estimate otherwise) and prefetch the
-  // visible/ahead slot range so real thumbnails arrive before they scroll in.
-  // Only for folders at or below the cap; larger ones use windowedMedia above.
-  const justifiedFullTotal =
-    mediaSlots !== undefined &&
-    justifiedLayoutMode &&
-    !justifiedTooLargeForFullTotal &&
-    largeMediaSet;
-  // Estimated aspect ratio for not-yet-loaded slots: average of the loaded
-  // slots' real ratios (falls back to 1). Keeps the justified/masonry rows
-  // stable so a late-arriving real ratio does not reflow the layout.
-  const estimatedRatio = useMemo(() => {
-    if (!mediaSlots || mediaSlots.size === 0) return 1;
-    let sum = 0;
-    let n = 0;
-    for (const item of mediaSlots.values()) {
-      if (item && item.width && item.height && item.width > 0 && item.height > 0) {
-        sum += item.width / item.height;
-        n += 1;
-      }
-    }
-    return n > 0 ? sum / n : 1;
-  }, [mediaSlots]);
+  const { justifiedFullTotal, windowedMedia } = resolveMediaGeometryStrategy({
+    hasMediaSlots: mediaSlots !== undefined,
+    itemCount: mediaItemCount,
+    layoutMode,
+    loadedItemCount: items.length
+  });
   // The uniform-window (grid/list) and justified-full-total paths both drive the
   // layout without `layoutItems` (window rows / slot accessor respectively). Only
   // the small-folder fallback (no windowing) uses the ordered loaded list.
@@ -414,7 +321,7 @@ export function MediaGrid({
           ? {
               totalCount: mediaItemCount,
               getItemAt: (index: number) => mediaSlots?.get(index),
-              estimatedRatio
+              getItemAspectRatio: (index: number) => stableWindowedAspectRatio(index)
             }
           : {})
       }),
@@ -426,13 +333,12 @@ export function MediaGrid({
       viewportSize.width,
       justifiedFullTotal,
       mediaItemCount,
-      mediaSlots,
-      estimatedRatio
+      mediaSlots
     ]
   );
   const mediaWindow = useMemo(
     () =>
-      buildMediaWindowGeometry({
+      buildWindowedMediaGeometry({
         count: mediaItemCount,
         gap: gridPreferences.tileGap,
         labelHeight: labelBlockHeight,
@@ -449,7 +355,7 @@ export function MediaGrid({
     ]
   );
   const activeMediaEstimatedSegmentSize = windowedMedia
-    ? mediaWindow.rowHeight
+    ? mediaWindow.estimatedSegmentSize
     : layout.estimatedSegmentSize;
   const folderWindow = useMemo(
     () =>
@@ -535,7 +441,7 @@ export function MediaGrid({
     nextIndex += folderRowCount;
     const contentHeaderIndex = contentHeader ? nextIndex++ : -1;
     const emptyIndex = mediaItemCount === 0 && emptyContent !== undefined ? nextIndex++ : -1;
-    const mediaRowCount = windowedMedia ? mediaWindow.rowCount : layout.segments.length;
+    const mediaRowCount = windowedMedia ? mediaWindow.segmentCount : layout.segments.length;
     const mediaRowStartIndex = mediaRowCount > 0 ? nextIndex : -1;
     nextIndex += mediaRowCount;
     return {
@@ -556,7 +462,7 @@ export function MediaGrid({
     folderWindow.rowCount,
     layout.segments.length,
     mediaItemCount,
-    mediaWindow.rowCount,
+    mediaWindow.segmentCount,
     windowedMedia
   ]);
   const resolveVirtualSegment = useCallback(
@@ -594,7 +500,8 @@ export function MediaGrid({
           type: "media-row",
           mediaSegmentIndex,
           size: windowedMedia
-            ? mediaWindow.rowHeight
+            ? mediaWindow.resolveSegment(mediaSegmentIndex)?.size ??
+              mediaWindow.estimatedSegmentSize
             : layout.segments[mediaSegmentIndex]?.size ?? activeMediaEstimatedSegmentSize
         };
       }
@@ -605,7 +512,7 @@ export function MediaGrid({
       folderSectionVisible,
       folderWindow.rowHeight,
       layout.segments,
-      mediaWindow.rowHeight,
+      mediaWindow,
       virtualSectionLayout,
       windowedMedia
     ]
@@ -661,7 +568,7 @@ export function MediaGrid({
     if (windowedMedia) {
       const slotIndex = slotIndexById.get(selectedMediaId);
       if (slotIndex === undefined) return;
-      mediaSegmentIndex = Math.floor(slotIndex / mediaWindow.columnCount);
+      mediaSegmentIndex = mediaWindow.segmentIndexForItem(slotIndex);
     } else {
       let placementIndex = layoutItemIndexById.get(selectedMediaId);
       if (placementIndex === undefined) {
@@ -686,7 +593,7 @@ export function MediaGrid({
     layout,
     layoutItemIndexById,
     placementSegmentIndexByPlacementIndex,
-    mediaWindow.columnCount,
+    mediaWindow,
     resolveMediaVirtualSegmentIndex,
     selectedMediaId,
     sidebarLayoutTransitionKey,
@@ -711,16 +618,20 @@ export function MediaGrid({
     }
 
     let virtualSegmentIndex: number | undefined;
-    let exactPlacement: LayoutPlacement | undefined;
+    let exactPlacement: LayoutPlacement | WindowedMediaPlacement | undefined;
     if (windowedMedia) {
       const slotIndex = slotIndexById.get(locateRequest.mediaId);
       if (slotIndex !== undefined) {
-        virtualSegmentIndex = resolveMediaLocateVirtualIndex({
-          mediaIndex: slotIndex,
-          columnCount: mediaWindow.columnCount,
-          mediaRowStartIndex: virtualSectionLayout.mediaRowStartIndex,
-          mediaRowCount: virtualSectionLayout.mediaRowCount
-        });
+        const mediaSegmentIndex = mediaWindow.segmentIndexForItem(slotIndex);
+        if (mediaSegmentIndex !== undefined) {
+          virtualSegmentIndex = resolveMediaLocateVirtualIndex({
+            mediaIndex: mediaSegmentIndex,
+            columnCount: 1,
+            mediaRowStartIndex: virtualSectionLayout.mediaRowStartIndex,
+            mediaRowCount: virtualSectionLayout.mediaRowCount
+          });
+          exactPlacement = mediaWindow.resolvePlacement(slotIndex);
+        }
       }
     } else if (justifiedFullTotal && mediaSlots) {
       const target = resolveJustifiedMediaLocateTarget(
@@ -799,7 +710,7 @@ export function MediaGrid({
     layout,
     loading,
     locateRequest,
-    mediaWindow.columnCount,
+    mediaWindow,
     mediaOffset,
     mediaSlots,
     onLocateRequestSettled,
@@ -880,28 +791,27 @@ export function MediaGrid({
     0,
     scrollTop + Math.max(viewportSize.height, activeMediaEstimatedSegmentSize) - mediaOffset
   );
-  const visibleMediaIndexRange = useMemo(() => {
+  const visibleMediaWindow = useMemo(() => {
     if (!windowedMedia) return null;
-    const startRow = Math.max(0, Math.floor(mediaScrollTop / mediaWindow.rowHeight));
-    const endRow = Math.max(
-      startRow,
-      Math.floor(Math.max(mediaScrollTop, visibleRangeEnd - 1) / mediaWindow.rowHeight)
-    );
+    const indexes = mediaWindow.itemIndexesInRange(mediaScrollTop, visibleRangeEnd);
+    if (indexes.length === 0) return null;
     return {
-      start: Math.min(mediaItemCount, startRow * mediaWindow.columnCount),
-      end: Math.min(mediaItemCount, (endRow + 1) * mediaWindow.columnCount)
+      indexes,
+      start: indexes[0]!,
+      end: indexes[indexes.length - 1]! + 1
     };
   }, [
-    mediaWindow.columnCount,
-    mediaWindow.rowHeight,
-    mediaItemCount,
+    mediaWindow,
     mediaScrollTop,
     visibleRangeEnd,
     windowedMedia
   ]);
-  const aheadMediaIndexRange = useMemo(() => {
-    if (!windowedMedia || !visibleMediaIndexRange) return null;
-    const aheadRows = Math.max(1, aheadRowCount);
+  const visibleMediaIndexRange = visibleMediaWindow
+    ? { start: visibleMediaWindow.start, end: visibleMediaWindow.end }
+    : null;
+  const aheadMediaWindow = useMemo(() => {
+    if (!windowedMedia || !visibleMediaWindow) return null;
+    const retentionSize = Math.max(1, aheadRowCount) * mediaWindow.estimatedSegmentSize;
     // Symmetric retention band: `aheadRows` both BELOW and ABOVE the viewport.
     // Without the "behind" band, tiles just scrolled past (above the viewport)
     // left the visible/ahead scope, so their prioritized tasks were demoted and
@@ -912,24 +822,33 @@ export function MediaGrid({
     // ahead=6) and the client request scheduler has a hard timeout + no slot
     // leak, so this no longer risks the 6-connection-pool deadlock that forced
     // the earlier one-directional prefetch (memory UPDATE 10/11, since fixed).
-    const columns = mediaWindow.columnCount;
+    const indexes = mediaWindow.itemIndexesInRange(
+      Math.max(0, mediaScrollTop - retentionSize),
+      visibleRangeEnd + retentionSize
+    );
+    if (indexes.length === 0) return null;
     return {
-      start: Math.max(0, visibleMediaIndexRange.start - aheadRows * columns),
-      end: Math.min(mediaItemCount, visibleMediaIndexRange.end + aheadRows * columns)
+      indexes,
+      start: indexes[0]!,
+      end: indexes[indexes.length - 1]! + 1
     };
   }, [
     aheadRowCount,
-    mediaWindow.columnCount,
-    mediaItemCount,
-    visibleMediaIndexRange,
+    mediaScrollTop,
+    mediaWindow,
+    visibleMediaWindow,
+    visibleRangeEnd,
     windowedMedia
   ]);
+  const aheadMediaIndexRange = aheadMediaWindow
+    ? { start: aheadMediaWindow.start, end: aheadMediaWindow.end }
+    : null;
   const visibleMedia = useMemo(
     () => {
-      if (windowedMedia && visibleMediaIndexRange) {
+      if (windowedMedia && visibleMediaWindow) {
         const ids: number[] = [];
         const signatures: string[] = [];
-        for (let index = visibleMediaIndexRange.start; index < visibleMediaIndexRange.end; index += 1) {
+        for (const index of visibleMediaWindow.indexes) {
           const item = mediaSlots?.get(index);
           if (!item || item.id === selectedMediaId) continue;
           ids.push(item.id);
@@ -937,7 +856,7 @@ export function MediaGrid({
         }
         return {
           ids,
-          key: `${visibleMediaIndexRange.start}:${visibleMediaIndexRange.end}`,
+          key: `${visibleMediaWindow.start}:${visibleMediaWindow.end}`,
           signatureKey: signatures.join("|")
         };
       }
@@ -950,16 +869,16 @@ export function MediaGrid({
       mediaScrollTop,
       mediaSlots,
       selectedMediaId,
-      visibleMediaIndexRange,
+      visibleMediaWindow,
       visibleRangeEnd,
       windowedMedia
     ]
   );
   const aheadMedia = useMemo(() => {
-    if (windowedMedia && aheadMediaIndexRange) {
+    if (windowedMedia && aheadMediaWindow) {
       const ids: number[] = [];
       const signatures: string[] = [];
-      for (let index = aheadMediaIndexRange.start; index < aheadMediaIndexRange.end; index += 1) {
+      for (const index of aheadMediaWindow.indexes) {
         const item = mediaSlots?.get(index);
         if (!item || item.id === selectedMediaId) continue;
         ids.push(item.id);
@@ -967,7 +886,7 @@ export function MediaGrid({
       }
       return {
         ids,
-        key: `${aheadMediaIndexRange.start}:${aheadMediaIndexRange.end}`,
+        key: `${aheadMediaWindow.start}:${aheadMediaWindow.end}`,
         signatureKey: signatures.join("|")
       };
     }
@@ -978,7 +897,7 @@ export function MediaGrid({
     });
   }, [
     activeMediaEstimatedSegmentSize,
-    aheadMediaIndexRange,
+    aheadMediaWindow,
     aheadRowCount,
     layout,
     mediaSlots,
@@ -996,9 +915,10 @@ export function MediaGrid({
       aheadMediaIndexRange?.end ?? visibleMediaIndexRange.end
     );
   }, [
-    aheadMediaIndexRange,
+    aheadMediaIndexRange?.end,
     onRequestMediaWindow,
-    visibleMediaIndexRange,
+    visibleMediaIndexRange?.end,
+    visibleMediaIndexRange?.start,
     windowedMedia
   ]);
 
@@ -1209,11 +1129,9 @@ export function MediaGrid({
         )
       : [];
   const renderedWindowedMediaIndexes = windowedMedia
-    ? renderedMediaSegmentIndexes.flatMap((rowIndex) => {
-        const start = rowIndex * mediaWindow.columnCount;
-        const end = Math.min(mediaItemCount, start + mediaWindow.columnCount);
-        return Array.from({ length: Math.max(0, end - start) }, (_, index) => start + index);
-      })
+    ? [...new Set(renderedMediaSegmentIndexes.flatMap(
+        (segmentIndex) => mediaWindow.resolveSegment(segmentIndex)?.itemIndexes ?? []
+      ))].sort((left, right) => left - right)
     : [];
   // Justified/masonry full-total prefetch: the rendered placement indices are
   // absolute slot indices, so request the media window covering the visible
@@ -1428,8 +1346,10 @@ export function MediaGrid({
       );
     }
 
-    const rowIndex = Math.floor(clampedIndex / mediaWindow.columnCount);
-    const virtualSegmentIndex = resolveMediaVirtualSegmentIndex(rowIndex);
+    const segmentIndex = mediaWindow.segmentIndexForItem(clampedIndex);
+    const virtualSegmentIndex = segmentIndex === undefined
+      ? undefined
+      : resolveMediaVirtualSegmentIndex(segmentIndex);
     if (virtualSegmentIndex !== undefined) {
       virtualRows.scrollToIndex(virtualSegmentIndex, { align: "auto" });
     }
@@ -1437,7 +1357,14 @@ export function MediaGrid({
     if (!element) {
       return;
     }
-    const nextScrollTop = mediaOffset + rowIndex * mediaWindow.rowHeight;
+    const placement = mediaWindow.resolvePlacement(clampedIndex);
+    if (!placement) return;
+    const nextScrollTop = mediaOffset + resolveScrollTopForPlacement(
+      placement,
+      element.clientHeight,
+      Math.max(0, element.scrollTop - mediaOffset),
+      mediaWindow.totalSize
+    );
     if (nextScrollTop !== element.scrollTop) {
       scrollPersistenceUnlockedRef.current = true;
       element.scrollTop = nextScrollTop;
@@ -1565,13 +1492,8 @@ export function MediaGrid({
 
         {renderedWindowedMediaIndexes.map((mediaIndex) => {
           const item = mediaSlots?.get(mediaIndex);
-          const placement = resolveMediaWindowPlacement(
-            mediaIndex,
-            mediaWindow,
-            layoutMode,
-            gridPreferences.tileGap,
-            labelBlockHeight
-          );
+          const placement = mediaWindow.resolvePlacement(mediaIndex);
+          if (!placement) return null;
           const selected = item ? item.id === selectedMediaId : false;
           const thumbnailLoadPriority: ThumbnailRequestPriority = selected
             ? "selected"
@@ -1698,38 +1620,6 @@ export function MediaGrid({
       </div>
     </div>
   );
-}
-
-function resolveMediaWindowPlacement(
-  mediaIndex: number,
-  geometry: MediaWindowGeometry,
-  layoutMode: LibraryLayoutMode,
-  gap: number,
-  labelHeight: number
-) {
-  if (layoutMode === "list") {
-    return {
-      frameHeight: LIST_WINDOW_FRAME_HEIGHT_PX,
-      height: geometry.rowHeight,
-      left: 0,
-      thumbHeight: LIST_WINDOW_THUMBNAIL_HEIGHT_PX,
-      thumbWidth: LIST_WINDOW_THUMBNAIL_WIDTH_PX,
-      top: mediaIndex * geometry.rowHeight,
-      width: geometry.contentWidth
-    };
-  }
-
-  const rowIndex = Math.floor(mediaIndex / geometry.columnCount);
-  const columnIndex = mediaIndex % geometry.columnCount;
-  return {
-    frameHeight: geometry.tileWidth + labelHeight,
-    height: geometry.rowHeight,
-    left: columnIndex * (geometry.tileWidth + gap),
-    thumbHeight: geometry.tileWidth,
-    thumbWidth: geometry.tileWidth,
-    top: rowIndex * geometry.rowHeight,
-    width: geometry.tileWidth
-  };
 }
 
 function resolveFolderWindowPlacement(

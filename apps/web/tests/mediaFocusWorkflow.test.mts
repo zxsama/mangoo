@@ -64,6 +64,63 @@ describe("media focus workflow", () => {
     }
   });
 
+  it("keeps downstream justified geometry stable when an extreme aspect ratio arrives", () => {
+    const targetIndex = 2;
+    const extreme: MediaRecord = {
+      id: 42,
+      rootId: 3,
+      folderId: 7,
+      name: "panorama.jpg",
+      ext: "jpg",
+      size: 1_024,
+      mtime: 100,
+      width: 12_000,
+      height: 300
+    };
+    const stableRatioContract = {
+      getItemAspectRatio: () => 1
+    } as Record<string, unknown>;
+
+    for (const layoutMode of ["adaptive", "waterfall"] as const) {
+      const baseline = buildLayoutGeometry({
+        gap: 8,
+        items: [],
+        labelHeight: 36,
+        layoutMode,
+        viewportWidth: 960,
+        tileMinWidth: 180,
+        totalCount: 40,
+        getItemAt: () => undefined,
+        estimatedRatio: 1,
+        ...stableRatioContract
+      });
+      const loaded = buildLayoutGeometry({
+        gap: 8,
+        items: [],
+        labelHeight: 36,
+        layoutMode,
+        viewportWidth: 960,
+        tileMinWidth: 180,
+        totalCount: 40,
+        getItemAt: (index) => index === targetIndex ? extreme : undefined,
+        estimatedRatio: 1,
+        ...stableRatioContract
+      });
+
+      assert.deepEqual(
+        placementGeometry(loaded.placements[targetIndex]),
+        placementGeometry(baseline.placements[targetIndex]),
+        `${layoutMode} must not resize the arriving tile's stable slot`
+      );
+      assert.deepEqual(
+        placementGeometry(loaded.placements[20]),
+        placementGeometry(baseline.placements[20]),
+        `${layoutMode} must not repack downstream placeholders`
+      );
+      assert.equal(loaded.placements[targetIndex]?.item?.id, extreme.id);
+    }
+  });
+
   it("closes preview before navigation and returns an explicit grid locate request", async () => {
     let previewOpen = true;
     let previewOpened = false;
@@ -94,3 +151,22 @@ describe("media focus workflow", () => {
     ), { requestId: "focus-2", mediaId: 42 });
   });
 });
+
+function placementGeometry(placement: {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  thumbWidth: number;
+  thumbHeight: number;
+} | undefined) {
+  assert.ok(placement);
+  return {
+    left: placement.left,
+    top: placement.top,
+    width: placement.width,
+    height: placement.height,
+    thumbWidth: placement.thumbWidth,
+    thumbHeight: placement.thumbHeight
+  };
+}
