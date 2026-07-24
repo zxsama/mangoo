@@ -160,7 +160,9 @@ export interface LibraryState {
   thumbnailCacheStatsLibraryName: string | null;
   thumbnailCacheStatsLoading: boolean;
   thumbnailCacheActionBusy: boolean;
-  refreshThumbnailCacheStats: () => Promise<ThumbnailCacheSnapshotResponse | null>;
+  refreshThumbnailCacheStats: (options?: {
+    requireNotificationPersistence?: boolean;
+  }) => Promise<ThumbnailCacheSnapshotResponse | null>;
   generateCurrentFolderThumbnailCache: () => Promise<void>;
   generateCurrentTreeThumbnailCache: () => Promise<void>;
   generateAllThumbnailCache: () => Promise<void>;
@@ -555,7 +557,9 @@ export function useLibraryData(
     []
   );
 
-  const refreshThumbnailCacheStats = useCallback(async () => {
+  const refreshThumbnailCacheStats = useCallback(async (
+    refreshOptions: { requireNotificationPersistence?: boolean } = {}
+  ) => {
     // The thumbnail-status tab shows LIBRARY-WIDE progress, so stats are always
     // computed over the whole library ({} scope) — never the current folder.
     // This is deliberate (issue #2): a folder-scoped stats query recomputes an
@@ -577,16 +581,28 @@ export function useLibraryData(
           signal: controller.signal
         }
       );
-      if (
+      const isCurrentSnapshot = () =>
         thumbnailCacheStatsControllerRef.current === controller &&
-        sameLibraryContext(requestLibraryContext, activeLibraryContextRef.current)
-      ) {
+        sameLibraryContext(requestLibraryContext, activeLibraryContextRef.current);
+      if (isCurrentSnapshot()) {
         setThumbnailCacheStatsSnapshot({
           libraryId: requestLibraryContext?.libraryId ?? null,
           libraryName: requestLibraryContext?.libraryName ?? null,
           stats
         });
-        void publishThumbnailCacheStats(stats, requestLibraryContext, Date.now());
+        const persistence = publishThumbnailCacheStats(
+          stats,
+          requestLibraryContext,
+          Date.now()
+        );
+        if (refreshOptions.requireNotificationPersistence) {
+          const published = await persistence;
+          if (!published || !isCurrentSnapshot()) return null;
+        } else {
+          void persistence;
+        }
+      } else if (refreshOptions.requireNotificationPersistence) {
+        return null;
       }
       return stats;
     } catch (cause) {

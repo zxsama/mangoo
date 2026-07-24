@@ -322,13 +322,18 @@ function ThumbnailsTab({
           <StatCell
             label="失败"
             onActivate={failed > 0 ? () => {
-              const intent = thumbnailFailureLogIntentForLibrary(
-                library.thumbnailCacheStatsLibraryId,
-                failed,
-                stats?.failureDetails.length ?? 0,
-                stats?.failureDetailsTruncated ?? false
-              );
-              if (intent) void openNotificationsWindow(intent);
+              void library.refreshThumbnailCacheStats({
+                requireNotificationPersistence: true
+              }).then((freshStats) => {
+                if (!freshStats) return;
+                const intent = thumbnailFailureLogIntentForLibrary(
+                  library.thumbnailCacheStatsLibraryId,
+                  freshStats.failedCount,
+                  freshStats.failureDetails.length,
+                  freshStats.failureDetailsTruncated
+                );
+                if (intent) void openNotificationsWindow(intent);
+              });
             } : undefined}
             value={stats ? failed.toLocaleString() : "-"}
           />

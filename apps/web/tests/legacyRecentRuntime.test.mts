@@ -36,7 +36,7 @@ describe("legacy Recent runtime removal", () => {
   });
 
   it("routes broad workspace status through the renderer notification boundary", () => {
-    assert.match(source, /publishThumbnailCacheStats\(stats, requestLibraryContext/);
+    assert.match(source, /publishThumbnailCacheStats\(\s*stats,\s*requestLibraryContext/);
     assert.match(source, /createLibraryErrorReportAttempt/);
     assert.match(source, /reportLibraryErrorAndRethrow/);
     assert.match(source, /thumbnailCacheStatsLibraryId/);
@@ -82,8 +82,12 @@ describe("legacy Recent runtime removal", () => {
     assert.doesNotMatch(navigationReloadSection, /reportLibraryFailure\([\s\S]*navigation-load-failed/);
   });
 
-  it("opens Settings failure details without republishing a stale local snapshot", () => {
+  it("opens Settings failure details only after a fresh atomic snapshot is persisted", () => {
     assert.doesNotMatch(settingsPanelsSource, /publishThumbnailCacheStats/);
+    assert.match(
+      settingsPanelsSource,
+      /refreshThumbnailCacheStats\(\{\s*requireNotificationPersistence:\s*true\s*\}\)/
+    );
     assert.match(settingsPanelsSource, /openNotificationsWindow\(intent\)/);
   });
 
