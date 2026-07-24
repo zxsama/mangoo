@@ -4394,19 +4394,7 @@ impl Database {
         file_id: i64,
         profile: &str,
     ) -> anyhow::Result<Option<ThumbnailFailureRecord>> {
-        Ok(thumbnail_failures(
-            self,
-            profile,
-            Some(file_id),
-            ThumbnailCacheScope {
-                root_id: None,
-                folder_id: None,
-                include_descendants: false,
-            },
-            1,
-        )?
-        .into_iter()
-        .next())
+        thumbnail_failure_by_file_on_connection(&self.connection, profile, file_id)
     }
 
     #[cfg(test)]
@@ -8899,6 +8887,86 @@ fn thumbnail_failures_on_connection(
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn thumbnail_failure_by_file_sql() -> String {
+    let status_expression = thumbnail_cache_status_sql_expression();
+    format!(
+        r#"
+        WITH RECURSIVE target_file(id, folder_id, root_id, name, failure_kind, error, updated_at) AS (
+            SELECT files.id, files.folder_id, files.root_id, files.name,
+                   COALESCE(thumbs.failure_kind, 'unknown'),
+                   COALESCE(thumbs.error, 'thumbnail generation failed'),
+                   thumbs.updated_at
+            FROM files
+            JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
+            JOIN media ON media.file_id = files.id
+            JOIN thumbs ON thumbs.file_id = files.id
+            LEFT JOIN thumb_blobs
+              ON thumb_blobs.file_id = files.id AND thumb_blobs.profile = thumbs.profile
+            WHERE files.id = ?2
+              AND thumbs.profile = ?1
+              AND ({status_expression}) = 'failed'
+        ),
+        folder_ancestors(id, parent_id, root_id, relative_path, depth) AS (
+            SELECT folders.id, folders.parent_id, folders.root_id,
+                   CASE WHEN folders.parent_id IS NULL THEN '' ELSE folders.name END,
+                   0
+            FROM folders
+            JOIN target_file ON target_file.folder_id = folders.id
+            WHERE folders.status = 'active'
+            UNION ALL
+            SELECT parent.id, parent.parent_id, parent.root_id,
+                   CASE
+                     WHEN parent.parent_id IS NULL THEN folder_ancestors.relative_path
+                     WHEN folder_ancestors.relative_path = '' THEN parent.name
+                     ELSE parent.name || '\' || folder_ancestors.relative_path
+                   END,
+                   folder_ancestors.depth + 1
+            FROM folder_ancestors
+            JOIN folders parent
+              ON parent.id = folder_ancestors.parent_id
+             AND parent.root_id = folder_ancestors.root_id
+             AND parent.status = 'active'
+            WHERE folder_ancestors.depth + 1 < {FOLDER_ANCESTOR_DEPTH_CAP}
+        )
+        SELECT target_file.id, target_file.folder_id, target_file.root_id,
+               roots.display_name ||
+                 CASE WHEN folder_ancestors.relative_path = '' THEN ''
+                      ELSE '\' || folder_ancestors.relative_path END ||
+                 '\' || target_file.name,
+               target_file.failure_kind,
+               target_file.error,
+               target_file.updated_at
+        FROM target_file
+        JOIN roots ON roots.id = target_file.root_id
+        JOIN folder_ancestors
+          ON folder_ancestors.root_id = target_file.root_id
+         AND folder_ancestors.parent_id IS NULL
+        "#
+    )
+}
+
+fn thumbnail_failure_by_file_on_connection(
+    connection: &Connection,
+    profile: &str,
+    file_id: i64,
+) -> anyhow::Result<Option<ThumbnailFailureRecord>> {
+    let sql = thumbnail_failure_by_file_sql();
+    connection
+        .query_row(&sql, (profile, file_id), |row| {
+            Ok(ThumbnailFailureRecord {
+                file_id: row.get(0)?,
+                folder_id: row.get(1)?,
+                root_id: row.get(2)?,
+                relative_path: row.get(3)?,
+                failure_kind: row.get(4)?,
+                error: row.get(5)?,
+                updated_at: row.get::<_, i64>(6)?.saturating_mul(1_000),
+            })
+        })
+        .optional()
         .map_err(Into::into)
 }
 
@@ -13558,6 +13626,73 @@ mod tests {
             "failure diagnostics expose Unix milliseconds for renderer dates"
         );
         assert!(!failures[0].relative_path.contains("D:/"));
+    }
+
+    #[test]
+    fn thumbnail_failure_by_file_walks_only_the_target_ancestor_chain() {
+        let database = migrated_database();
+        let (root_id, root_folder_id) =
+            seed_thumbnail_cache_scope_fixture(&database, "target-failure-path");
+        let parent_folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: Some(root_folder_id),
+                name: "Artists".to_string(),
+                path_hash: "target-failure-artists".to_string(),
+                mtime: Some(11),
+            })
+            .expect("insert parent folder");
+        let folder_id = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: Some(parent_folder_id),
+                name: "Portraits".to_string(),
+                path_hash: "target-failure-portraits".to_string(),
+                mtime: Some(12),
+            })
+            .expect("insert target folder");
+        let file_id = seed_thumbnail_cache_candidate(
+            &database,
+            root_id,
+            folder_id,
+            "broken.jpg",
+            Some("target-failure"),
+            "failed",
+            false,
+            None,
+            None,
+        );
+
+        let failure = database
+            .get_thumbnail_failure(file_id, crate::thumbnails::GRID_320_PROFILE)
+            .expect("read target failure")
+            .expect("target failure exists");
+        assert_eq!(
+            failure.relative_path,
+            "Pictures target-failure-path\\Artists\\Portraits\\broken.jpg"
+        );
+
+        let explain_sql = format!("EXPLAIN QUERY PLAN {}", thumbnail_failure_by_file_sql());
+        let mut statement = database
+            .connection
+            .prepare(&explain_sql)
+            .expect("prepare target failure query plan");
+        let plan = statement
+            .query_map((crate::thumbnails::GRID_320_PROFILE, file_id), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("explain target failure query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect target failure plan")
+            .join("\n");
+        assert!(
+            plan.contains("SEARCH files USING INTEGER PRIMARY KEY"),
+            "target lookup must anchor from the requested file:\n{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN folders") && !plan.contains("MATERIALIZE folder_paths"),
+            "target lookup must not materialize the full folder tree:\n{plan}"
+        );
     }
 
     #[test]
