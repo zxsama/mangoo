@@ -8,7 +8,7 @@ import type {
   ThumbnailCacheEnqueueResponse,
   ThumbnailCacheScopeParams,
   ThumbnailCacheTaskRequest,
-  ThumbnailCacheStatsResponse,
+  ThumbnailCacheSnapshotResponse,
   ThumbnailFailureListResponse,
   DeleteRequest,
   DeleteTagResponse,
@@ -258,7 +258,7 @@ export function createCoreClient(config: CoreClientConfig) {
       params: ThumbnailCacheScopeParams = {},
       options: CoreRequestOptions = {}
     ) =>
-      request<ThumbnailCacheStatsResponse>(`/thumbnails/cache/stats${query(params)}`, {
+      request<ThumbnailCacheSnapshotResponse>(`/thumbnails/cache/stats${query(params)}`, {
         requestPriority: options.requestPriority ?? "metadata",
         signal: options.signal
       }),

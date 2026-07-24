@@ -86,6 +86,11 @@ export interface ThumbnailFailureListResponse {
   truncated: boolean;
 }
 
+export interface ThumbnailCacheSnapshotResponse extends ThumbnailCacheStatsResponse {
+  failureDetails: ThumbnailFailureRecord[];
+  failureDetailsTruncated: boolean;
+}
+
 export interface ThumbnailCacheEnqueueResponse extends ThumbnailCacheStatsResponse {
   acceptedCount: number;
   nextCursor?: number;

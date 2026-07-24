@@ -19,6 +19,7 @@ import {
 import { createNotificationStore } from "../src/features/notifications/useNotifications.ts";
 import {
   createLibraryErrorReportAttempt,
+  emitRendererStartupLog,
   publishThumbnailCacheStats,
   reportLibraryError,
   reportLibraryErrorAndRethrow,
@@ -577,7 +578,17 @@ describe("notification reporting", () => {
           failedCount: 2,
           pendingCandidateCount: 20,
           totalBlobBytes: 1024,
-          activeBulkTaskCount: 1
+          activeBulkTaskCount: 1,
+          failureDetails: [{
+            fileId: 42,
+            folderId: 7,
+            rootId: 3,
+            relativePath: "Artists\\Portraits\\a.jpg",
+            failureKind: "decode",
+            error: "decode failed",
+            updatedAt: 900
+          }],
+          failureDetailsTruncated: true
         },
         library,
         1000
@@ -599,7 +610,16 @@ describe("notification reporting", () => {
           activeBulkTaskCount: 1,
           totalCacheBytes: 1024,
           completionPercent: 80,
-          failureDetails: []
+          failureDetails: [{
+            libraryId: "lib-a",
+            fileId: 42,
+            folderId: 7,
+            rootId: 3,
+            relativePath: "Artists\\Portraits\\a.jpg",
+            failureKind: "decode",
+            error: "decode failed",
+            updatedAt: 900
+          }]
         }
       ]);
     } finally {
@@ -635,7 +655,9 @@ describe("notification reporting", () => {
           failedCount: 0,
           pendingCandidateCount: 1,
           totalBlobBytes: 1024,
-          activeBulkTaskCount: 0
+          activeBulkTaskCount: 0,
+          failureDetails: [],
+          failureDetailsTruncated: false
         },
         { libraryId: "lib-a", libraryName: "Artists" },
         1000
@@ -643,6 +665,74 @@ describe("notification reporting", () => {
 
       assert.equal(accepted, true);
       assert.equal(publishCalls, 1);
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
+
+  it("rejects a positive failure count without details instead of publishing an inconsistent snapshot", async () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    let publishCalls = 0;
+    try {
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          windowRole: "main",
+          notifications: bridge({
+            publishThumbnailSummary: async () => {
+              publishCalls += 1;
+              return true;
+            }
+          })
+        }
+      };
+
+      const accepted = await publishThumbnailCacheStats({
+        cachedCount: 1,
+        missingCount: 0,
+        staleCount: 0,
+        failedCount: 1,
+        pendingCandidateCount: 0,
+        totalBlobBytes: 1024,
+        activeBulkTaskCount: 0,
+        failureDetails: [],
+        failureDetailsTruncated: false
+      }, { libraryId: "lib-a", libraryName: "Artists" });
+
+      assert.equal(accepted, false);
+      assert.equal(publishCalls, 0);
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
+
+  it("emits the renderer startup log once through the bounded structured bridge", () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    const batches: unknown[] = [];
+    try {
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          windowRole: "main",
+          notifications: bridge({
+            emitRendererLogs: (entries) => batches.push(entries)
+          })
+        }
+      };
+
+      assert.equal(emitRendererStartupLog(), true);
+      assert.equal(emitRendererStartupLog(), false);
+      assert.deepEqual(batches, [[{
+        level: "info",
+        message: "Megle renderer ready",
+        metadata: { eventKind: "startup_ready", windowRole: "main" }
+      }]]);
     } finally {
       if (previousWindow === undefined) {
         delete (globalThis as { window?: unknown }).window;

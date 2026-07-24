@@ -118,7 +118,17 @@ function fullModel(): CompactNotificationModel {
           pendingCount: 32,
           activeBulkTaskCount: 1,
           totalCacheBytes: 86 * 1024 * 1024,
-          completionPercent: 82
+          completionPercent: 82,
+          failureDetails: [{
+            libraryId: "artists",
+            fileId: 42,
+            folderId: 7,
+            rootId: 3,
+            relativePath: "Artists\\Portraits\\a.jpg",
+            failureKind: "decode",
+            error: "decode failed",
+            updatedAt: Date.now()
+          }]
         },
         {
           libraryId: "references",
@@ -132,7 +142,17 @@ function fullModel(): CompactNotificationModel {
           pendingCount: 18,
           activeBulkTaskCount: 2,
           totalCacheBytes: 54 * 1024 * 1024,
-          completionPercent: 63
+          completionPercent: 63,
+          failureDetails: [{
+            libraryId: "references",
+            fileId: 84,
+            folderId: 12,
+            rootId: 5,
+            relativePath: "References\\Archive\\b.jpg",
+            failureKind: "decode",
+            error: "decode failed",
+            updatedAt: Date.now()
+          }]
         }
       ],
       libraryCount: 2,

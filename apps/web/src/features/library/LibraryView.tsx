@@ -10,6 +10,7 @@ import { PreviewPanel } from "../preview/PreviewPanel";
 import { SubfolderCard, SubfolderStrip } from "./SubfolderStrip";
 import { buildVisibleSubfolderEntries } from "./subfolderHierarchy";
 import { useFolderCovers } from "./useFolderCovers";
+import type { MediaGridLocateRequest } from "../../app/mediaFocusWorkflow";
 
 const AHEAD_THUMBNAIL_ROW_COUNT = 4;
 const SUBFOLDER_CHILD_PROBE_LIMIT = 12;
@@ -21,6 +22,8 @@ interface LibraryViewProps {
   layoutMode: LibraryLayoutMode;
   previewOpen: boolean;
   sidebarLayoutTransitionKey: string;
+  mediaLocateRequest?: MediaGridLocateRequest | null;
+  onMediaLocateSettled?: (requestId: string, ok: boolean) => void;
   onLocateFolder: (folderId: number) => void;
   onOpenPreview: (mediaId: number) => void;
   onClosePreview: () => void;
@@ -54,6 +57,8 @@ export function LibraryView({
   onClosePreview,
   onFolderContextMenu,
   onLocateFolder,
+  mediaLocateRequest,
+  onMediaLocateSettled,
   onMediaContextMenu,
   onOpenPreview,
   onPreviewCommandChange,
@@ -74,6 +79,8 @@ export function LibraryView({
         onClosePreview={onClosePreview}
         onFolderContextMenu={onFolderContextMenu}
         onLocateFolder={onLocateFolder}
+        mediaLocateRequest={mediaLocateRequest}
+        onMediaLocateSettled={onMediaLocateSettled}
         onMediaContextMenu={onMediaContextMenu}
         onOpenPreview={onOpenPreview}
         onPreviewCommandChange={onPreviewCommandChange}
@@ -97,6 +104,8 @@ export function LibraryCenterPane({
   onClosePreview,
   onFolderContextMenu,
   onLocateFolder,
+  mediaLocateRequest,
+  onMediaLocateSettled,
   onMediaContextMenu,
   onOpenPreview,
   onPreviewCommandChange,
@@ -428,6 +437,8 @@ export function LibraryCenterPane({
               mediaSlots={library.mediaSlots}
               onContextMenu={onMediaContextMenu}
               onLocateFolder={onLocateFolder}
+              locateRequest={mediaLocateRequest}
+              onLocateRequestSettled={onMediaLocateSettled}
               onOpenPreview={handleOpenPreview}
               onRequestMediaWindow={library.requestMediaWindow}
               onRequestThumbnailStates={library.requestThumbnailStates}

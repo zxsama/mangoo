@@ -614,7 +614,7 @@ for (const value of [
   "rootId",
   "folderId",
   "includeDescendants",
-  "ThumbnailCacheStatsResponse"
+  "ThumbnailCacheSnapshotResponse"
 ]) {
   if (!thumbnailCacheStatsOperation.includes(value)) {
     fail(`OpenAPI GET /thumbnails/cache/stats missing ${value}`);
@@ -698,8 +698,8 @@ for (const value of ["media_position", "MediaPositionResponse", "not_found"]) {
 const thumbnailCacheStatsBody = functionBody("get_thumbnail_cache_stats");
 for (const value of [
   "thumbnail_cache_scope(query)",
-  "get_thumbnail_cache_stats",
-  "thumbnail_cache_stats_response"
+  "get_thumbnail_cache_snapshot",
+  "thumbnail_cache_snapshot_response"
 ]) {
   if (!thumbnailCacheStatsBody.includes(value)) {
     fail(`GET /api/thumbnails/cache/stats implementation missing ${value}`);

@@ -6,6 +6,7 @@ const NOTIFICATION_IPC_CHANNELS = Object.freeze({
   closeWindow: "megle:close-notifications-window",
   focusMedia: "megle:notification-focus-media",
   focusMediaRequested: "megle:notification-focus-media-requested",
+  focusMediaCompleted: "megle:notification-focus-media-completed",
   compact: "megle:notifications-compact",
   historyFacets: "megle:notifications-history-facets",
   history: "megle:notifications-history",

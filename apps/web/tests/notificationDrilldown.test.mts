@@ -7,8 +7,10 @@ import type {
   DesktopThumbnailCacheSummary
 } from "@megle/notification-contract";
 import {
+  activateThumbnailFailureLogs,
   buildCompactNotificationModel,
-  thumbnailFailureLogIntent
+  thumbnailFailureLogIntent,
+  thumbnailFailureLogIntentForLibrary
 } from "../src/features/notifications/notificationModel.ts";
 import { buildProcessLogRows } from "../src/features/notifications/processLogModel.ts";
 
@@ -100,6 +102,48 @@ describe("notification drilldown", () => {
       logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
     });
     assert.equal(thumbnailFailureLogIntent(summary(0)), null);
+    assert.equal(thumbnailFailureLogIntent({ ...summary(1), failureDetails: [] }), null);
+  });
+
+  it("delivers the same typed click intent from status surfaces and keeps zero inert", () => {
+    const opened: unknown[] = [];
+    assert.equal(activateThumbnailFailureLogs(summary(1), (intent) => opened.push(intent)), true);
+    assert.equal(activateThumbnailFailureLogs(summary(0), (intent) => opened.push(intent)), false);
+    assert.deepEqual(opened, [{
+      page: "logs",
+      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+    }]);
+  });
+
+  it("builds the Settings failure click intent only from a consistent detail snapshot", () => {
+    assert.deepEqual(thumbnailFailureLogIntentForLibrary("library-a", 2, 1), {
+      page: "logs",
+      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+    });
+    assert.equal(thumbnailFailureLogIntentForLibrary("library-a", 2, 0), null);
+    assert.equal(thumbnailFailureLogIntentForLibrary("library-a", 0, 0), null);
+  });
+
+  it("removes completed scan paths from the aggregate on the next snapshot", () => {
+    const compact = (active: DesktopNotificationOperation[]): DesktopNotificationCompactSnapshot => ({
+      active,
+      thumbnailSummaries: [],
+      latestImportantResults: [],
+      hasRetryableFailure: false,
+      syncHealth: { state: "healthy", libraryId: "library-a", detail: null, updatedAt: 1 }
+    });
+    const both = buildCompactNotificationModel(compact([
+      scan("task:7", "Artists\\Portraits", 20, 100),
+      scan("task:8", "Artists\\Archive", 10, 50)
+    ]));
+    const one = buildCompactNotificationModel(compact([
+      scan("task:8", "Artists\\Archive", 20, 50)
+    ]));
+    const none = buildCompactNotificationModel(compact([]));
+
+    assert.deepEqual(both.active[0]?.paths, ["Artists\\Archive", "Artists\\Portraits"]);
+    assert.deepEqual(one.active[0]?.paths, ["Artists\\Archive"]);
+    assert.equal(none.active.length, 0);
   });
 
   it("merges authoritative persisted failures without duplicating current-session rows", () => {

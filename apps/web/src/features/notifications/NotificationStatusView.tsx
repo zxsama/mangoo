@@ -16,7 +16,7 @@ import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
-import { thumbnailFailureLogIntent } from "./notificationModel";
+import { activateThumbnailFailureLogs } from "./notificationModel";
 import type { NotificationRequestResult } from "./useNotifications";
 import {
   beginNotificationAction,
@@ -332,10 +332,7 @@ function ThumbnailStatus({
             {summary.failedCount > 0 ? (
               <button
                 className="notification-thumbnail-failure-action"
-                onClick={() => {
-                  const intent = thumbnailFailureLogIntent(summary);
-                  if (intent) onOpenFailureLogs(intent);
-                }}
+                onClick={() => activateThumbnailFailureLogs(summary, onOpenFailureLogs)}
                 type="button"
               >
                 {summary.failedCount.toLocaleString()}

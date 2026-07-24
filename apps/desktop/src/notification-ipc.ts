@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type {
   MediaFocusRequest,
+  MediaFocusCompletion,
   NotificationWindowIntent,
   ProcessLogSubscriptionEvent,
   ProcessLogSubscriptionId,
@@ -28,6 +29,7 @@ export interface NotificationIpcChannels {
   readonly closeWindow: string;
   readonly focusMedia: string;
   readonly focusMediaRequested: string;
+  readonly focusMediaCompleted: string;
   readonly compact: string;
   readonly historyFacets: string;
   readonly history: string;
@@ -67,6 +69,7 @@ const CHANNEL_PERMISSIONS = new Map<string, ReadonlySet<NotificationIpcWindowRol
   [NOTIFICATION_IPC_CHANNELS.openWindow, NOTIFICATION_LAUNCHERS],
   [NOTIFICATION_IPC_CHANNELS.closeWindow, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.focusMedia, NOTIFICATION_WINDOW_ONLY],
+  [NOTIFICATION_IPC_CHANNELS.focusMediaCompleted, MAIN_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.compact, MAIN_AND_NOTIFICATION_ROLES],
   [NOTIFICATION_IPC_CHANNELS.historyFacets, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.history, NOTIFICATION_WINDOW_ONLY],
@@ -184,6 +187,9 @@ export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummar
     input.completionPercent === null || input.completionPercent === undefined
       ? null
       : boundedNumber(input.completionPercent, "completionPercent", 0, 100);
+  const failedCount = boundedInteger(input.failedCount, "failedCount", 0, Number.MAX_SAFE_INTEGER);
+  const failureDetails = parseThumbnailFailureDetails(input.failureDetails, libraryId);
+  validateThumbnailFailureSnapshot(failedCount, failureDetails);
   return {
     libraryId,
     libraryName: boundedString(input.libraryName, "libraryName", 256),
@@ -197,7 +203,7 @@ export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummar
     ),
     missingCount: boundedInteger(input.missingCount, "missingCount", 0, Number.MAX_SAFE_INTEGER),
     staleCount: boundedInteger(input.staleCount, "staleCount", 0, Number.MAX_SAFE_INTEGER),
-    failedCount: boundedInteger(input.failedCount, "failedCount", 0, Number.MAX_SAFE_INTEGER),
+    failedCount,
     pendingCount: boundedInteger(input.pendingCount, "pendingCount", 0, Number.MAX_SAFE_INTEGER),
     activeBulkTaskCount: boundedInteger(
       input.activeBulkTaskCount,
@@ -207,12 +213,11 @@ export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummar
     ),
     totalCacheBytes,
     completionPercent,
-    failureDetails: parseThumbnailFailureDetails(input.failureDetails, libraryId)
+    failureDetails
   };
 }
 
-function parseThumbnailFailureDetails(value: unknown, libraryId: string): NonNullable<ThumbnailCacheSummary["failureDetails"]> {
-  if (value === undefined) return [];
+function parseThumbnailFailureDetails(value: unknown, libraryId: string): ThumbnailCacheSummary["failureDetails"] {
   if (!Array.isArray(value)) throw new TypeError("failureDetails must be an array");
   if (value.length > 200) throw new RangeError("failureDetails are limited to 200 entries");
   return value.map((candidate, index) => {
@@ -232,6 +237,21 @@ function parseThumbnailFailureDetails(value: unknown, libraryId: string): NonNul
       updatedAt: boundedInteger(input.updatedAt, `failureDetails ${index} updatedAt`, 0, Number.MAX_SAFE_INTEGER)
     };
   });
+}
+
+function validateThumbnailFailureSnapshot(
+  failedCount: number,
+  failureDetails: ThumbnailCacheSummary["failureDetails"]
+): void {
+  if (failedCount === 0 && failureDetails.length !== 0) {
+    throw new RangeError("zero failedCount must have no failureDetails");
+  }
+  if (failedCount > 0 && failureDetails.length === 0) {
+    throw new RangeError("positive failedCount requires failureDetails");
+  }
+  if (failureDetails.length > failedCount) {
+    throw new RangeError("failureDetails cannot exceed failedCount");
+  }
 }
 
 export function parseProcessLogFilter(value: unknown): ProcessLogFilter {
@@ -298,6 +318,17 @@ export function parseMediaFocusRequest(value: unknown): MediaFocusRequest {
     fileId: boundedInteger(input.fileId, "fileId", 1, Number.MAX_SAFE_INTEGER),
     folderId: boundedInteger(input.folderId, "folderId", 1, Number.MAX_SAFE_INTEGER),
     rootId: boundedInteger(input.rootId, "rootId", 1, Number.MAX_SAFE_INTEGER)
+  };
+}
+
+export function parseMediaFocusCompletion(value: unknown): MediaFocusCompletion {
+  const input = record(value, "media focus completion");
+  if (typeof input.ok !== "boolean") {
+    throw new TypeError("media focus completion ok must be a boolean");
+  }
+  return {
+    requestId: boundedString(input.requestId, "requestId", 256),
+    ok: input.ok
   };
 }
 

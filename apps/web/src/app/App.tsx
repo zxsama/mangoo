@@ -10,7 +10,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FolderRecord, MediaRecord, RootRecord } from "@megle/core-client";
-import type { MediaFocusRequest, NotificationWindowIntent } from "@megle/notification-contract";
+import type { MediaFocusCommand, NotificationWindowIntent } from "@megle/notification-contract";
 import { AppShell } from "../app-shell/AppShell";
 import { useOverlayScrollbars } from "../app-shell/useOverlayScrollbars";
 import {
@@ -78,8 +78,13 @@ import {
   type PreviewPreferences
 } from "../features/preview/previewPreferences";
 import { subscribePreference } from "../core/preferenceSync";
+import { emitRendererStartupLog } from "../core/notificationReporting";
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
+import {
+  prepareMediaFocusNavigation,
+  type MediaGridLocateRequest
+} from "./mediaFocusWorkflow";
 
 type CompactPopover = "notifications" | "filter" | "sort" | null;
 type PreviewViewState = { mode: "fit-long-edge" | "actual"; scale: number };
@@ -95,6 +100,9 @@ const LIBRARY_LAYOUT_STORAGE_KEY = "megle.library.layout-mode";
 
 export function App() {
   useOverlayScrollbars();
+  useEffect(() => {
+    emitRendererStartupLog();
+  }, []);
   const interfaceStyle = useInterfaceStyle();
   const [menu, setMenu] = useState<ShellContextMenuState | null>(null);
   const [activeCompactPopover, setActiveCompactPopover] =
@@ -128,7 +136,11 @@ export function App() {
   const [activeLibraryName, setActiveLibraryName] = useState<string>("Library");
   const [activeLibraryIcon, setActiveLibraryIcon] = useState<string | undefined>(undefined);
   const [activeLibraryColor, setActiveLibraryColor] = useState<string | undefined>(undefined);
-  const [pendingMediaFocus, setPendingMediaFocus] = useState<MediaFocusRequest | null>(null);
+  const [pendingMediaFocus, setPendingMediaFocus] = useState<MediaFocusCommand | null>(null);
+  const pendingMediaFocusRef = useRef<MediaFocusCommand | null>(null);
+  const [mediaGridLocateRequest, setMediaGridLocateRequest] =
+    useState<MediaGridLocateRequest | null>(null);
+  const mediaGridLocateRequestRef = useRef<MediaGridLocateRequest | null>(null);
   const mediaFocusSwitchKeyRef = useRef<string | null>(null);
   const mediaFocusLocateKeyRef = useRef<string | null>(null);
   const hasLoadedActiveLibraryNameRef = useRef(false);
@@ -208,35 +220,92 @@ export function App() {
     setPreviewViewCommands(null);
   }, []);
 
-  useEffect(() => getDesktopBridge()?.onFocusMedia?.(setPendingMediaFocus), []);
+  const completeMediaFocus = useCallback((requestId: string, ok: boolean) => {
+    const bridge = getDesktopBridge();
+    void bridge?.completeMediaFocus?.({ requestId, ok });
+    if (pendingMediaFocusRef.current?.requestId === requestId) {
+      pendingMediaFocusRef.current = null;
+      setPendingMediaFocus(null);
+    }
+    setMediaGridLocateRequest((current) =>
+      current?.requestId === requestId ? null : current
+    );
+    if (mediaGridLocateRequestRef.current?.requestId === requestId) {
+      mediaGridLocateRequestRef.current = null;
+    }
+    if (mediaFocusSwitchKeyRef.current === requestId) mediaFocusSwitchKeyRef.current = null;
+    if (mediaFocusLocateKeyRef.current === requestId) mediaFocusLocateKeyRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    const bridge = getDesktopBridge();
+    return bridge?.onFocusMedia?.((command) => {
+      const previous = pendingMediaFocusRef.current;
+      if (previous && previous.requestId !== command.requestId) {
+        void bridge.completeMediaFocus?.({ requestId: previous.requestId, ok: false });
+      }
+      const previousLocate = mediaGridLocateRequestRef.current;
+      if (previousLocate && previousLocate.requestId !== command.requestId) {
+        void bridge.completeMediaFocus?.({ requestId: previousLocate.requestId, ok: false });
+      }
+      pendingMediaFocusRef.current = command;
+      mediaGridLocateRequestRef.current = null;
+      mediaFocusSwitchKeyRef.current = null;
+      mediaFocusLocateKeyRef.current = null;
+      setMediaGridLocateRequest(null);
+      setPendingMediaFocus(command);
+    });
+  }, []);
 
   useEffect(() => {
     if (!pendingMediaFocus) return;
-    const requestKey = `${pendingMediaFocus.libraryId}:${pendingMediaFocus.fileId}`;
+    const requestKey = pendingMediaFocus.requestId;
     if (activeLibraryId !== pendingMediaFocus.libraryId) {
       if (mediaFocusSwitchKeyRef.current === requestKey) return;
       mediaFocusSwitchKeyRef.current = requestKey;
-      void switchLibrary(pendingMediaFocus.libraryId).then((result) => {
-        if (!result.ok) {
-          setPendingMediaFocus((current) =>
-            current && `${current.libraryId}:${current.fileId}` === requestKey ? null : current
-          );
-        }
-      });
+      void switchLibrary(pendingMediaFocus.libraryId)
+        .then((result) => {
+          if (pendingMediaFocusRef.current?.requestId !== requestKey) return;
+          if (!result.ok) {
+            completeMediaFocus(requestKey, false);
+          } else {
+            mediaFocusSwitchKeyRef.current = null;
+          }
+        })
+        .catch(() => completeMediaFocus(requestKey, false));
       return;
     }
     if (libraryPhase !== "ready" || library.loading) return;
     mediaFocusSwitchKeyRef.current = null;
     if (mediaFocusLocateKeyRef.current === requestKey) return;
     mediaFocusLocateKeyRef.current = requestKey;
-    handleClosePreview();
-    void library.locateMedia(pendingMediaFocus).then(() => {
-      mediaFocusLocateKeyRef.current = null;
-      setPendingMediaFocus((current) =>
-        current && `${current.libraryId}:${current.fileId}` === requestKey ? null : current
-      );
-    });
-  }, [activeLibraryId, handleClosePreview, library, libraryPhase, pendingMediaFocus]);
+    void prepareMediaFocusNavigation(pendingMediaFocus, {
+      closePreview: handleClosePreview,
+      locateMedia: library.locateMedia
+    }).then((locateRequest) => {
+      if (pendingMediaFocusRef.current?.requestId !== requestKey) return;
+      if (!locateRequest) {
+        completeMediaFocus(requestKey, false);
+        return;
+      }
+      pendingMediaFocusRef.current = null;
+      setPendingMediaFocus(null);
+      mediaGridLocateRequestRef.current = locateRequest;
+      setMediaGridLocateRequest(locateRequest);
+    }).catch(() => completeMediaFocus(requestKey, false));
+  }, [
+    activeLibraryId,
+    completeMediaFocus,
+    handleClosePreview,
+    library.loading,
+    library.locateMedia,
+    libraryPhase,
+    pendingMediaFocus
+  ]);
+
+  const handleMediaLocateSettled = useCallback((requestId: string, ok: boolean) => {
+    completeMediaFocus(requestId, ok);
+  }, [completeMediaFocus]);
 
   const toggleSidebars = useCallback(() => {
     setSidebarsHidden((current) => !current);
@@ -696,6 +765,8 @@ export function App() {
         onMediaContextMenu={handleMediaContextMenu}
         onOpenPreview={handleOpenPreview}
         onLocateFolder={locateFolder}
+        mediaLocateRequest={mediaGridLocateRequest}
+        onMediaLocateSettled={handleMediaLocateSettled}
         onPreviewCommandChange={setPreviewViewCommands}
         onPreviewMediaSettled={handlePreviewMediaSettled}
         onPreviewNext={handlePreviewNext}

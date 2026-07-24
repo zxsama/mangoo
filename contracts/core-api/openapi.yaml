@@ -293,7 +293,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ThumbnailCacheStatsResponse"
+                $ref: "#/components/schemas/ThumbnailCacheSnapshotResponse"
   /thumbnails/cache/failures:
     get:
       operationId: listThumbnailCacheFailures
@@ -1752,6 +1752,19 @@ components:
             $ref: "#/components/schemas/ThumbnailFailureRecord"
         truncated:
           type: boolean
+    ThumbnailCacheSnapshotResponse:
+      allOf:
+        - $ref: "#/components/schemas/ThumbnailCacheStatsResponse"
+        - type: object
+          required: [failureDetails, failureDetailsTruncated]
+          properties:
+            failureDetails:
+              type: array
+              maxItems: 100
+              items:
+                $ref: "#/components/schemas/ThumbnailFailureRecord"
+            failureDetailsTruncated:
+              type: boolean
     ThumbnailCacheEnqueueResponse:
       allOf:
         - $ref: "#/components/schemas/ThumbnailCacheStatsResponse"

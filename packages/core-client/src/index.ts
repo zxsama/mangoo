@@ -10,6 +10,7 @@ export type {
   ThumbnailCacheEnqueueResponse,
   ThumbnailCacheRefreshMode,
   ThumbnailCacheScopeParams,
+  ThumbnailCacheSnapshotResponse,
   ThumbnailCacheStatsResponse,
   ThumbnailFailureListResponse,
   ThumbnailFailureRecord,

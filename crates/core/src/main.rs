@@ -95,6 +95,12 @@ async fn main() -> anyhow::Result<()> {
     let web_dir = resolve_web_dir();
 
     let listener = bind_with_retry(bind_addr).await?;
+    let ready_addr = listener.local_addr()?;
+    tracing::info!(
+        event_kind = "startup_ready",
+        bind_addr = %ready_addr,
+        "Megle Core ready"
+    );
     axum::serve(
         listener,
         api::router_with_config(

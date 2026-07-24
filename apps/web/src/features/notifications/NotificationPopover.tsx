@@ -22,7 +22,7 @@ import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
-import { thumbnailFailureLogIntent } from "./notificationModel";
+import { activateThumbnailFailureLogs } from "./notificationModel";
 import { observeNotificationPopoverMeasurements } from "./notificationPopoverMeasurement";
 import { resolveNotificationPopoverPosition } from "./notificationPopoverPosition";
 import {
@@ -345,10 +345,7 @@ function ThumbnailSummaryRow({
         {summary.failedCount > 0 ? (
           <button
             className="notification-thumbnail-failure-action"
-            onClick={() => {
-              const intent = thumbnailFailureLogIntent(summary);
-              if (intent) onOpenCenter(intent);
-            }}
+            onClick={() => activateThumbnailFailureLogs(summary, onOpenCenter)}
             type="button"
           >
             {summary.failedCount.toLocaleString()} 失败

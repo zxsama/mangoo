@@ -49,6 +49,8 @@ test("notification IPC permissions isolate privileged history, action and log ac
   assert.equal(canAccess("settings", channels.openWindow), true);
   assert.equal(canAccess("notifications", channels.focusMedia), true);
   assert.equal(canAccess("settings", channels.focusMedia), false);
+  assert.equal(canAccess("main", channels.focusMediaCompleted), true);
+  assert.equal(canAccess("notifications", channels.focusMediaCompleted), false);
   assert.equal(canAccess("plugins", channels.rendererLogs), true);
   assert.equal(canAccess(null, channels.rendererLogs), false);
 });
@@ -68,6 +70,10 @@ test("notification launch intents and media focus requests are narrow and bounde
     ipcModule.parseMediaFocusRequest({ libraryId: "library-a", fileId: 42, folderId: 7, rootId: 3 }),
     { libraryId: "library-a", fileId: 42, folderId: 7, rootId: 3 }
   );
+  assert.deepEqual(
+    ipcModule.parseMediaFocusCompletion({ requestId: "focus-1", ok: true }),
+    { requestId: "focus-1", ok: true }
+  );
   assert.throws(
     () => ipcModule.parseNotificationWindowIntent({ page: "history", logFilter: {} }),
     /intent/i
@@ -75,6 +81,28 @@ test("notification launch intents and media focus requests are narrow and bounde
   assert.throws(
     () => ipcModule.parseMediaFocusRequest({ libraryId: "library-a", fileId: 0, folderId: 7, rootId: 3 }),
     /fileId/i
+  );
+  assert.throws(
+    () => ipcModule.parseMediaFocusCompletion({ requestId: "focus-1", ok: "yes" }),
+    /boolean/i
+  );
+  assert.throws(
+    () => ipcModule.parseThumbnailCacheSummary({
+      libraryId: "library-a",
+      libraryName: "Artists",
+      observedAt: 1,
+      cachedCount: 1,
+      totalCandidateCount: 2,
+      missingCount: 0,
+      staleCount: 0,
+      failedCount: 1,
+      pendingCount: 0,
+      activeBulkTaskCount: 0,
+      totalCacheBytes: 1,
+      completionPercent: 50,
+      failureDetails: []
+    }),
+    /requires failureDetails/i
   );
 });
 
@@ -130,7 +158,8 @@ test("notification IPC validators reject malformed or unbounded renderer payload
         pendingCount: 0,
         activeBulkTaskCount: 0,
         totalCacheBytes: null,
-        completionPercent: null
+        completionPercent: null,
+        failureDetails: []
       }),
     /cachedCount/i
   );

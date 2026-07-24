@@ -1,4 +1,7 @@
-import type { ThumbnailCacheStatsResponse, ThumbnailFailureRecord } from "@megle/core-client";
+import type {
+  ThumbnailCacheSnapshotResponse,
+  ThumbnailCacheStatsResponse
+} from "@megle/core-client";
 import {
   rendererErrorIdentityKey,
   type DesktopRendererErrorReport,
@@ -52,6 +55,28 @@ interface AttemptState {
 
 const attemptStates = new WeakMap<LibraryErrorReportAttempt, AttemptState>();
 let reportSequence = 0;
+let rendererStartupLogEmitted = false;
+
+export function emitRendererStartupLog(): boolean {
+  const bridge = desktopBridge();
+  const emit = bridge?.notifications?.emitRendererLogs;
+  if (rendererStartupLogEmitted || !emit) return false;
+  rendererStartupLogEmitted = true;
+  try {
+    emit([{
+      level: "info",
+      message: "Megle renderer ready",
+      metadata: {
+        eventKind: "startup_ready",
+        windowRole: bridge.windowRole ?? "main"
+      }
+    }]);
+    return true;
+  } catch {
+    rendererStartupLogEmitted = false;
+    return false;
+  }
+}
 
 export class ReportedLibraryFailure extends Error {
   readonly attempt: LibraryErrorReportAttempt | null;
@@ -179,10 +204,9 @@ export function retryLibraryErrorReport(cause: unknown): Promise<boolean> {
 }
 
 export function publishThumbnailCacheStats(
-  stats: ThumbnailCacheStatsResponse,
+  stats: ThumbnailCacheSnapshotResponse,
   context: NotificationLibraryContext | null | undefined,
-  observedAt = Date.now(),
-  failureDetails: readonly ThumbnailFailureRecord[] = []
+  observedAt = Date.now()
 ): Promise<boolean> {
   const bridge = desktopBridge();
   const notifications = bridge?.notifications;
@@ -197,6 +221,13 @@ export function publishThumbnailCacheStats(
   const libraryId = boundedString(context.libraryId, LIBRARY_ID_MAX_LENGTH);
   const libraryName = boundedString(context.libraryName, LIBRARY_NAME_MAX_LENGTH);
   if (!libraryId || !libraryName) return Promise.resolve(false);
+  if (
+    (stats.failedCount === 0 && stats.failureDetails.length > 0) ||
+    (stats.failedCount > 0 && stats.failureDetails.length === 0) ||
+    stats.failureDetails.length > stats.failedCount
+  ) {
+    return Promise.resolve(false);
+  }
 
   const snapshot = thumbnailSummary(stats, libraryId, libraryName, observedAt);
   const summary: DesktopThumbnailCacheSummary = {
@@ -212,7 +243,7 @@ export function publishThumbnailCacheStats(
     activeBulkTaskCount: snapshot.activeBulkTaskCount,
     totalCacheBytes: stats.totalBlobBytes,
     completionPercent: snapshot.percent,
-    failureDetails: failureDetails.slice(0, 200).map((detail) => ({
+    failureDetails: stats.failureDetails.slice(0, 100).map((detail) => ({
       libraryId,
       ...detail
     }))

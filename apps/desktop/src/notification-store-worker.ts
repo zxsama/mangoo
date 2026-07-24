@@ -225,16 +225,29 @@ function validateThumbnailSummary(summary: ThumbnailCacheSummary): void {
     if (typeof detail.error !== "string") throw new TypeError("thumbnail failure detail.error must be a string");
     assertSafeInteger(detail.updatedAt, "thumbnail failure detail.updatedAt");
   }
+  if (summary.failedCount === 0 && details.length !== 0) {
+    throw new RangeError("zero failedCount must have no failureDetails");
+  }
+  if (summary.failedCount > 0 && details.length === 0) {
+    throw new RangeError("positive failedCount requires failureDetails");
+  }
+  if (details.length > summary.failedCount) {
+    throw new RangeError("summary.failureDetails cannot exceed failedCount");
+  }
 }
 
 function normalizeThumbnailSummary(summary: ThumbnailCacheSummary): ThumbnailCacheSummary {
-  const hasAuthoritativeDetails = Array.isArray(summary.failureDetails);
+  const details = Array.isArray(summary.failureDetails) ? summary.failureDetails : [];
+  const hasConsistentFailureSnapshot =
+    (summary.failedCount === 0 && details.length === 0) ||
+    (summary.failedCount > 0 && details.length > 0 && details.length <= summary.failedCount);
   return {
     ...summary,
-    // Legacy summaries predate failure diagnostics. Do not preserve a clickable
-    // count that can only open an unrelated current-session log view.
-    failedCount: hasAuthoritativeDetails ? summary.failedCount : 0,
-    failureDetails: hasAuthoritativeDetails ? summary.failureDetails : []
+    // Legacy and pre-atomic summaries may carry a stale positive count with no
+    // matching details. Collapse both fields together rather than persisting a
+    // clickable count that cannot resolve to authoritative rows.
+    failedCount: hasConsistentFailureSnapshot ? summary.failedCount : 0,
+    failureDetails: hasConsistentFailureSnapshot ? details : []
   };
 }
 

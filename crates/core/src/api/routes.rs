@@ -19,9 +19,9 @@ use crate::db::{
     Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot,
     NotificationOrigin, PluginRecord, RootRecord, SearchQuery, TagError, TagRecord, TaskRecord,
     ThumbBlobRecord, ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult,
-    ThumbnailCacheRefreshMode, ThumbnailCacheScope, ThumbnailCacheStats, ThumbnailFailureRecord,
-    ThumbnailRecord, ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority, UserMetadataPatch,
-    UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
+    ThumbnailCacheRefreshMode, ThumbnailCacheScope, ThumbnailCacheSnapshot, ThumbnailCacheStats,
+    ThumbnailFailureRecord, ThumbnailRecord, ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority,
+    UserMetadataPatch, UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
 };
 use crate::fsops::{
     self, DeleteRequest, FileOperationRecord, FsOpsError, FsOpsErrorCode, MoveRequest,
@@ -284,6 +284,15 @@ struct ThumbnailCacheStatsResponse {
     pending_candidate_count: i64,
     total_blob_bytes: i64,
     active_bulk_task_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailCacheSnapshotResponse {
+    #[serde(flatten)]
+    stats: ThumbnailCacheStatsResponse,
+    failure_details: Vec<ThumbnailFailureRecord>,
+    failure_details_truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1005,7 +1014,7 @@ async fn get_thumbnail_blob(
 #[derive(Default)]
 struct ThumbnailCacheStatsSlot {
     computed_at: Option<Instant>,
-    value: Option<ThumbnailCacheStatsResponse>,
+    value: Option<ThumbnailCacheSnapshotResponse>,
 }
 
 type ThumbnailCacheStatsKey = (Option<i64>, Option<i64>, bool);
@@ -1029,7 +1038,7 @@ const THUMBNAIL_CACHE_STATS_TTL: Duration = Duration::from_millis(15000);
 async fn get_thumbnail_cache_stats(
     State(state): State<AppState>,
     Query(query): Query<ThumbnailCacheScopeQuery>,
-) -> ApiResult<Json<ThumbnailCacheStatsResponse>> {
+) -> ApiResult<Json<ThumbnailCacheSnapshotResponse>> {
     let scope = thumbnail_cache_scope(query);
     let key = (scope.root_id, scope.folder_id, scope.include_descendants);
     let slot = {
@@ -1052,16 +1061,16 @@ async fn get_thumbnail_cache_stats(
             return Ok(Json(value.clone()));
         }
     }
-    let stats = run_read_database(state, move |database| {
+    let snapshot = run_read_database(state, move |database| {
         database
-            .get_thumbnail_cache_stats(scope)
-            .map(thumbnail_cache_stats_response)
+            .get_thumbnail_cache_snapshot(scope, crate::thumbnails::GRID_320_PROFILE, 100)
+            .map(thumbnail_cache_snapshot_response)
             .map_err(CoreError::from)
     })
     .await?;
     guard.computed_at = Some(Instant::now());
-    guard.value = Some(stats.clone());
-    Ok(Json(stats))
+    guard.value = Some(snapshot.clone());
+    Ok(Json(snapshot))
 }
 
 async fn list_thumbnail_cache_failures(
@@ -2064,6 +2073,16 @@ fn thumbnail_cache_stats_response(stats: ThumbnailCacheStats) -> ThumbnailCacheS
         pending_candidate_count: stats.pending_candidate_count,
         total_blob_bytes: stats.total_blob_bytes,
         active_bulk_task_count: stats.active_bulk_task_count,
+    }
+}
+
+fn thumbnail_cache_snapshot_response(
+    snapshot: ThumbnailCacheSnapshot,
+) -> ThumbnailCacheSnapshotResponse {
+    ThumbnailCacheSnapshotResponse {
+        stats: thumbnail_cache_stats_response(snapshot.stats),
+        failure_details: snapshot.failure_details,
+        failure_details_truncated: snapshot.failure_details_truncated,
     }
 }
 
@@ -3230,6 +3249,11 @@ mod tests {
         assert_eq!(body["missingCount"], 1);
         assert_eq!(body["staleCount"], 1);
         assert_eq!(body["failedCount"], 1);
+        assert_eq!(body["failureDetails"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            body["failureDetails"][0]["relativePath"],
+            "Pictures cache-stats\\failed.jpg"
+        );
     }
 
     #[tokio::test]

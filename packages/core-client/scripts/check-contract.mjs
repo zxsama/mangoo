@@ -245,6 +245,7 @@ for (const name of [
   "MediaListResponse",
   "ThumbnailFailureRecord",
   "ThumbnailFailureListResponse",
+  "ThumbnailCacheSnapshotResponse",
   "ThumbnailAsset",
   "ThumbnailResponse",
   "TaskKind",
@@ -713,7 +714,7 @@ if (
   );
 }
 if (
-  !/getThumbnailCacheStats:\s*\(\s*params:\s*ThumbnailCacheScopeParams\s*=\s*\{\},\s*options:\s*CoreRequestOptions\s*=\s*\{\}\s*\)\s*=>\s*request<ThumbnailCacheStatsResponse>\(`\/thumbnails\/cache\/stats\$\{query\(params\)\}`,\s*\{[\s\S]*?requestPriority:\s*options\.requestPriority\s*\?\?\s*"metadata",[\s\S]*?signal:\s*options\.signal\s*\}\)/.test(
+  !/getThumbnailCacheStats:\s*\(\s*params:\s*ThumbnailCacheScopeParams\s*=\s*\{\},\s*options:\s*CoreRequestOptions\s*=\s*\{\}\s*\)\s*=>\s*request<ThumbnailCacheSnapshotResponse>\(`\/thumbnails\/cache\/stats\$\{query\(params\)\}`,\s*\{[\s\S]*?requestPriority:\s*options\.requestPriority\s*\?\?\s*"metadata",[\s\S]*?signal:\s*options\.signal\s*\}\)/.test(
     client
   )
 ) {

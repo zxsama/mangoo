@@ -45,8 +45,7 @@ export interface DesktopThumbnailCacheSummary {
   activeBulkTaskCount: number;
   totalCacheBytes: number | null;
   completionPercent: number | null;
-  /** Absent only in summaries persisted by releases predating failure drill-down. */
-  failureDetails?: ThumbnailFailureDetail[];
+  failureDetails: ThumbnailFailureDetail[];
 }
 
 export interface ThumbnailFailureDetail {
@@ -203,6 +202,15 @@ export interface MediaFocusRequest {
   readonly fileId: number;
   readonly folderId: number;
   readonly rootId: number;
+}
+
+export interface MediaFocusCommand extends MediaFocusRequest {
+  readonly requestId: string;
+}
+
+export interface MediaFocusCompletion {
+  readonly requestId: string;
+  readonly ok: boolean;
 }
 
 export type DesktopProcessLogFilter = ProcessLogFilter;

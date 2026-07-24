@@ -188,6 +188,8 @@ const fullBridge = {
     return () => ipcRenderer.removeListener("megle:library-load-phase", listener);
   },
   onFocusMedia: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.focusMediaRequested, cb),
+  completeMediaFocus: (completion) =>
+    ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.focusMediaCompleted, completion),
   notifications: notificationsBridge
 };
 const notificationWindowBridge = {

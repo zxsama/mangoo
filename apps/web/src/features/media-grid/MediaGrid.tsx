@@ -23,6 +23,10 @@ import { workbenchLayout } from "../../design/tokens";
 import type { LibraryGridPreferences } from "./gridPreferences";
 import type { LibraryLayoutMode } from "./layoutMode";
 import {
+  resolveMediaLocateVirtualIndex,
+  type MediaGridLocateRequest
+} from "../../app/mediaFocusWorkflow";
+import {
   buildLayoutGeometry,
   collectPlacementIndexesFromSegmentRange,
   collectScopedMediaInViewport,
@@ -159,12 +163,14 @@ interface MediaGridProps {
   mediaSlots?: Map<number, MediaRecord>;
   totalCount?: number;
   selectedMediaId: number | null;
+  locateRequest?: MediaGridLocateRequest | null;
   sidebarLayoutTransitionKey?: string;
   loading: boolean;
   loadingMore: boolean;
   onSelect: (mediaId: number) => void;
   onOpenPreview: (mediaId: number) => void;
   onLocateFolder: (folderId: number) => void;
+  onLocateRequestSettled?: (requestId: string, ok: boolean) => void;
   onRequestMediaWindow?: (startIndex: number, endIndex: number) => void;
   onRequestThumbnailStates: (mediaIds: number[], priority: ThumbnailRequestPriority) => void;
   scrollPositionKey?: string;
@@ -258,6 +264,7 @@ export function MediaGrid({
   mediaSlots,
   totalCount,
   selectedMediaId,
+  locateRequest,
   sidebarLayoutTransitionKey,
   loading,
   loadingMore,
@@ -265,6 +272,7 @@ export function MediaGrid({
   onRequestThumbnailStates,
   onOpenPreview,
   onLocateFolder,
+  onLocateRequestSettled,
   onSelect,
   scrollPositionKey,
   thumbnailStatesByMediaId,
@@ -277,6 +285,7 @@ export function MediaGrid({
   const restoringScrollRef = useRef(false);
   const lastRestoredScrollKeyRef = useRef<string | undefined>(undefined);
   const lastCenteredLayoutTransitionKeyRef = useRef(sidebarLayoutTransitionKey);
+  const lastSettledLocateRequestRef = useRef<string | null>(null);
   const [viewportSize, setViewportSize] = useState({ height: 0, width: 0 });
   const [scrollTop, setScrollTop] = useState(savedScrollTop);
 
@@ -683,6 +692,96 @@ export function MediaGrid({
     viewportSize.height,
     viewportSize.width,
     virtualRows,
+    windowedMedia
+  ]);
+
+  useLayoutEffect(() => {
+    if (
+      !locateRequest ||
+      loading ||
+      lastSettledLocateRequestRef.current === locateRequest.requestId
+    ) {
+      return;
+    }
+    const element = parentRef.current;
+    if (!element || element.clientHeight <= 0 || selectedMediaId !== locateRequest.mediaId) {
+      return;
+    }
+
+    let virtualSegmentIndex: number | undefined;
+    if (windowedMedia) {
+      const slotIndex = slotIndexById.get(locateRequest.mediaId);
+      if (slotIndex !== undefined) {
+        virtualSegmentIndex = resolveMediaLocateVirtualIndex({
+          mediaIndex: slotIndex,
+          columnCount: mediaWindow.columnCount,
+          mediaRowStartIndex: virtualSectionLayout.mediaRowStartIndex,
+          mediaRowCount: virtualSectionLayout.mediaRowCount
+        });
+      }
+    } else {
+      const placementIndex = layoutItemIndexById.get(locateRequest.mediaId);
+      const mediaSegmentIndex = placementIndex === undefined
+        ? undefined
+        : placementSegmentIndexByPlacementIndex.get(placementIndex);
+      if (mediaSegmentIndex !== undefined) {
+        virtualSegmentIndex = resolveMediaVirtualSegmentIndex(mediaSegmentIndex);
+      }
+    }
+
+    if (virtualSegmentIndex === undefined) {
+      lastSettledLocateRequestRef.current = locateRequest.requestId;
+      onLocateRequestSettled?.(locateRequest.requestId, false);
+      return;
+    }
+
+    let cancelled = false;
+    let frame = 0;
+    const settle = (ok: boolean) => {
+      if (cancelled) return;
+      lastSettledLocateRequestRef.current = locateRequest.requestId;
+      onLocateRequestSettled?.(locateRequest.requestId, ok);
+    };
+    const verifyVisible = (remainingFrames: number) => {
+      if (cancelled) return;
+      const tile = element.querySelector<HTMLElement>(
+        `[data-media-id="${locateRequest.mediaId}"]`
+      );
+      if (tile) {
+        const viewportRect = element.getBoundingClientRect();
+        const tileRect = tile.getBoundingClientRect();
+        if (tileRect.bottom > viewportRect.top && tileRect.top < viewportRect.bottom) {
+          settle(true);
+          return;
+        }
+      }
+      if (remainingFrames <= 0) {
+        settle(false);
+        return;
+      }
+      frame = window.requestAnimationFrame(() => verifyVisible(remainingFrames - 1));
+    };
+    frame = window.requestAnimationFrame(() => {
+      virtualRows.scrollToIndex(virtualSegmentIndex, { align: "center" });
+      frame = window.requestAnimationFrame(() => verifyVisible(3));
+    });
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frame);
+    };
+  }, [
+    layoutItemIndexById,
+    loading,
+    locateRequest,
+    mediaWindow.columnCount,
+    onLocateRequestSettled,
+    placementSegmentIndexByPlacementIndex,
+    resolveMediaVirtualSegmentIndex,
+    selectedMediaId,
+    slotIndexById,
+    virtualRows,
+    virtualSectionLayout.mediaRowCount,
+    virtualSectionLayout.mediaRowStartIndex,
     windowedMedia
   ]);
 

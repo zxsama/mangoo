@@ -230,14 +230,19 @@ function operationSummary(operation: DesktopNotificationOperation): string {
 export function thumbnailFailureLogIntent(
   summary: DesktopThumbnailCacheSummary
 ): NotificationWindowIntent | null {
-  return thumbnailFailureLogIntentForLibrary(summary.libraryId, summary.failedCount);
+  return thumbnailFailureLogIntentForLibrary(
+    summary.libraryId,
+    summary.failedCount,
+    summary.failureDetails.length
+  );
 }
 
 export function thumbnailFailureLogIntentForLibrary(
   libraryId: string | null | undefined,
-  failedCount: number
+  failedCount: number,
+  failureDetailCount: number
 ): NotificationWindowIntent | null {
-  if (!libraryId || failedCount <= 0) return null;
+  if (!libraryId || failedCount <= 0 || failureDetailCount <= 0) return null;
   return {
     page: "logs",
     logFilter: {
@@ -245,6 +250,16 @@ export function thumbnailFailureLogIntentForLibrary(
       libraryId
     }
   };
+}
+
+export function activateThumbnailFailureLogs(
+  summary: DesktopThumbnailCacheSummary,
+  onOpen: (intent: NotificationWindowIntent) => void
+): boolean {
+  const intent = thumbnailFailureLogIntent(summary);
+  if (!intent) return false;
+  onOpen(intent);
+  return true;
 }
 
 function buildThumbnailAggregate(

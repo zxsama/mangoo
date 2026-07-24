@@ -9,6 +9,7 @@ import type {
   TagRecord,
   TaskRecord,
   ThumbnailCacheRefreshMode,
+  ThumbnailCacheSnapshotResponse,
   ThumbnailCacheStatsResponse,
   ThumbnailResponse,
   UserMetadataRecord,
@@ -153,11 +154,12 @@ export interface LibraryState {
   lastScan: ScanSummary | null;
   diagnostics: DesktopDiagnostics | null;
   diagnosticsProbed: boolean;
-  thumbnailCacheStats: ThumbnailCacheStatsResponse | null;
+  thumbnailCacheStats: ThumbnailCacheSnapshotResponse | null;
   thumbnailCacheStatsLibraryId: string | null;
+  thumbnailCacheStatsLibraryName: string | null;
   thumbnailCacheStatsLoading: boolean;
   thumbnailCacheActionBusy: boolean;
-  refreshThumbnailCacheStats: () => Promise<ThumbnailCacheStatsResponse | null>;
+  refreshThumbnailCacheStats: () => Promise<ThumbnailCacheSnapshotResponse | null>;
   generateCurrentFolderThumbnailCache: () => Promise<void>;
   generateCurrentTreeThumbnailCache: () => Promise<void>;
   generateAllThumbnailCache: () => Promise<void>;
@@ -404,7 +406,8 @@ export function useLibraryData(
   const [diagnosticsProbed, setDiagnosticsProbed] = useState(false);
   const [thumbnailCacheStatsSnapshot, setThumbnailCacheStatsSnapshot] = useState<{
     libraryId: string | null;
-    stats: ThumbnailCacheStatsResponse;
+    libraryName: string | null;
+    stats: ThumbnailCacheSnapshotResponse;
   } | null>(null);
   const [thumbnailCacheStatsLoading, setThumbnailCacheStatsLoading] = useState(false);
   const [thumbnailCacheActionBusy, setThumbnailCacheActionBusy] = useState(false);
@@ -571,21 +574,16 @@ export function useLibraryData(
           signal: controller.signal
         }
       );
-      const failureDetails = stats.failedCount > 0
-        ? (await client.listThumbnailCacheFailures(100, {
-            requestPriority: "metadata",
-            signal: controller.signal
-          })).items
-        : [];
       if (
         thumbnailCacheStatsControllerRef.current === controller &&
         sameLibraryContext(requestLibraryContext, activeLibraryContextRef.current)
       ) {
         setThumbnailCacheStatsSnapshot({
           libraryId: requestLibraryContext?.libraryId ?? null,
+          libraryName: requestLibraryContext?.libraryName ?? null,
           stats
         });
-        void publishThumbnailCacheStats(stats, requestLibraryContext, Date.now(), failureDetails);
+        void publishThumbnailCacheStats(stats, requestLibraryContext, Date.now());
       }
       return stats;
     } catch (cause) {
@@ -3527,6 +3525,7 @@ export function useLibraryData(
     diagnosticsProbed,
     thumbnailCacheStats: thumbnailCacheStatsSnapshot?.stats ?? null,
     thumbnailCacheStatsLibraryId: thumbnailCacheStatsSnapshot?.libraryId ?? null,
+    thumbnailCacheStatsLibraryName: thumbnailCacheStatsSnapshot?.libraryName ?? null,
     thumbnailCacheStatsLoading,
     thumbnailCacheActionBusy,
     refreshThumbnailCacheStats,

@@ -47,6 +47,7 @@ import {
   parseNotificationAction,
   parseNotificationHistoryQuery,
   parseMediaFocusRequest,
+  parseMediaFocusCompletion,
   parseNotificationWindowIntent,
   parseProcessLogFilter,
   parseProcessLogSubscriptionId,
@@ -55,6 +56,7 @@ import {
   parseThumbnailCacheSummary,
   type NotificationIpcWindowRole
 } from "./notification-ipc.js";
+import { MediaFocusCoordinator } from "./media-focus-coordinator.js";
 import { runNotificationSafeCoreTransition } from "./notification-core-transition.js";
 import { NotificationRuntime } from "./notification-runtime.js";
 import { createNotificationService, type NotificationService } from "./notification-service.js";
@@ -71,6 +73,7 @@ import {
 import { SecondaryWindowOpeningCoordinator } from "./secondary-window-opening.js";
 
 let mainWindow: BrowserWindow | null = null;
+const mediaFocusCoordinator = new MediaFocusCoordinator();
 type SecondaryWindowRole = "settings" | "plugins" | "notifications";
 type SecondaryWindowConfig = {
   title: string;
@@ -657,7 +660,7 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.closeWindow, (event) => {
   return true;
 });
 
-ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMedia, (event, input: unknown) => {
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMedia, async (event, input: unknown) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.focusMedia);
   const request = parseMediaFocusRequest(input);
   const window = mainWindow;
@@ -665,8 +668,15 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMedia, (event, input: unknown) => 
   if (window.isMinimized()) window.restore();
   window.show();
   window.focus();
-  window.webContents.send(NOTIFICATION_IPC_CHANNELS.focusMediaRequested, request);
-  return true;
+  return mediaFocusCoordinator.request(request, (command) => {
+    if (window.isDestroyed()) throw new Error("main window closed before media focus delivery");
+    window.webContents.send(NOTIFICATION_IPC_CHANNELS.focusMediaRequested, command);
+  });
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMediaCompleted, (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.focusMediaCompleted);
+  return mediaFocusCoordinator.complete(parseMediaFocusCompletion(input));
 });
 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.compact, async (event) => {
@@ -1099,6 +1109,7 @@ async function createWindow(): Promise<void> {
   window.on("close", closeAllSecondaryWindows);
 
   window.on("closed", () => {
+    mediaFocusCoordinator.failAll();
     releaseIpcTargetLifecycle();
     if (activeWindowDrag?.windowId === window.id) {
       activeWindowDrag = null;
@@ -2185,6 +2196,9 @@ app
     const session = await ensureCoreReady();
     await maybeAutoAddRoot(session);
     await createWindow();
+    desktopLogger.structured("main", "info", "Megle desktop ready", {
+      eventKind: "startup_ready"
+    });
   })
   .catch(handleDesktopStartupFailure);
 

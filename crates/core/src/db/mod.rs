@@ -211,6 +211,13 @@ pub struct ThumbnailCacheStats {
     pub active_bulk_task_count: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ThumbnailCacheSnapshot {
+    pub stats: ThumbnailCacheStats,
+    pub failure_details: Vec<ThumbnailFailureRecord>,
+    pub failure_details_truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThumbnailFailureRecord {
@@ -4317,12 +4324,69 @@ impl Database {
         get_thumbnail_cache_stats_for_scope(self, scope)
     }
 
+    pub fn get_thumbnail_cache_snapshot(
+        &self,
+        scope: ThumbnailCacheScope,
+        profile: &str,
+        failure_limit: usize,
+    ) -> anyhow::Result<ThumbnailCacheSnapshot> {
+        self.get_thumbnail_cache_snapshot_with_hook(scope, profile, failure_limit, || {})
+    }
+
+    fn get_thumbnail_cache_snapshot_with_hook(
+        &self,
+        scope: ThumbnailCacheScope,
+        profile: &str,
+        failure_limit: usize,
+        after_stats: impl FnOnce(),
+    ) -> anyhow::Result<ThumbnailCacheSnapshot> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let stats = get_thumbnail_cache_stats_for_scope_on_connection(&transaction, scope)?;
+        after_stats();
+        let mut failure_details = thumbnail_failures_on_connection(
+            &transaction,
+            profile,
+            None,
+            scope,
+            failure_limit.saturating_add(1),
+        )?;
+        let failure_details_truncated = failure_details.len() > failure_limit;
+        failure_details.truncate(failure_limit);
+        transaction.commit()?;
+        Ok(ThumbnailCacheSnapshot {
+            stats,
+            failure_details,
+            failure_details_truncated,
+        })
+    }
+
+    #[cfg(test)]
+    fn get_thumbnail_cache_snapshot_with_hook_for_test(
+        &self,
+        scope: ThumbnailCacheScope,
+        profile: &str,
+        failure_limit: usize,
+        after_stats: impl FnOnce(),
+    ) -> anyhow::Result<ThumbnailCacheSnapshot> {
+        self.get_thumbnail_cache_snapshot_with_hook(scope, profile, failure_limit, after_stats)
+    }
+
     pub fn list_thumbnail_failures(
         &self,
         profile: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<ThumbnailFailureRecord>> {
-        thumbnail_failures(self, profile, None, limit)
+        thumbnail_failures(
+            self,
+            profile,
+            None,
+            ThumbnailCacheScope {
+                root_id: None,
+                folder_id: None,
+                include_descendants: false,
+            },
+            limit,
+        )
     }
 
     pub fn get_thumbnail_failure(
@@ -4330,9 +4394,19 @@ impl Database {
         file_id: i64,
         profile: &str,
     ) -> anyhow::Result<Option<ThumbnailFailureRecord>> {
-        Ok(thumbnail_failures(self, profile, Some(file_id), 1)?
-            .into_iter()
-            .next())
+        Ok(thumbnail_failures(
+            self,
+            profile,
+            Some(file_id),
+            ThumbnailCacheScope {
+                root_id: None,
+                folder_id: None,
+                include_descendants: false,
+            },
+            1,
+        )?
+        .into_iter()
+        .next())
     }
 
     #[cfg(test)]
@@ -8702,9 +8776,15 @@ fn get_thumbnail_cache_stats_for_scope(
     database: &Database,
     scope: ThumbnailCacheScope,
 ) -> anyhow::Result<ThumbnailCacheStats> {
+    get_thumbnail_cache_stats_for_scope_on_connection(&database.connection, scope)
+}
+
+fn get_thumbnail_cache_stats_for_scope_on_connection(
+    connection: &Connection,
+    scope: ThumbnailCacheScope,
+) -> anyhow::Result<ThumbnailCacheStats> {
     let (stats_sql, stats_params) = thumbnail_cache_stats_query(scope);
-    let (cached_count, missing_count, stale_count, failed_count, total_blob_bytes) = database
-        .connection
+    let (cached_count, missing_count, stale_count, failed_count, total_blob_bytes) = connection
         .query_row(&stats_sql, params_from_iter(stats_params), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -8716,11 +8796,9 @@ fn get_thumbnail_cache_stats_for_scope(
         })?;
     let (active_sql, active_params) = thumbnail_cache_active_bulk_task_count_query(scope);
     let active_bulk_task_count =
-        database
-            .connection
-            .query_row(&active_sql, params_from_iter(active_params), |row| {
-                row.get::<_, i64>(0)
-            })?;
+        connection.query_row(&active_sql, params_from_iter(active_params), |row| {
+            row.get::<_, i64>(0)
+        })?;
     Ok(ThumbnailCacheStats {
         cached_count,
         missing_count,
@@ -8736,11 +8814,37 @@ fn thumbnail_failures(
     database: &Database,
     profile: &str,
     file_id: Option<i64>,
+    scope: ThumbnailCacheScope,
     limit: usize,
 ) -> anyhow::Result<Vec<ThumbnailFailureRecord>> {
-    let mut statement = database.connection.prepare(
+    thumbnail_failures_on_connection(&database.connection, profile, file_id, scope, limit)
+}
+
+fn thumbnail_failures_on_connection(
+    connection: &Connection,
+    profile: &str,
+    file_id: Option<i64>,
+    scope: ThumbnailCacheScope,
+    limit: usize,
+) -> anyhow::Result<Vec<ThumbnailFailureRecord>> {
+    let mut parts = thumbnail_cache_scope_query_parts(scope);
+    parts.params.push(Value::Text(profile.to_string()));
+    let profile_parameter = parts.params.len();
+    parts
+        .params
+        .push(file_id.map(Value::Integer).unwrap_or(Value::Null));
+    let file_parameter = parts.params.len();
+    parts.params.push(Value::Integer(limit as i64));
+    let limit_parameter = parts.params.len();
+    let cte_prefix = if parts.prefix.is_empty() {
+        "WITH RECURSIVE".to_string()
+    } else {
+        format!("{},", parts.prefix)
+    };
+    let status_expression = thumbnail_cache_status_sql_expression();
+    let sql = format!(
         r#"
-        WITH RECURSIVE folder_paths(id, root_id, relative_path, depth) AS (
+        {cte_prefix} folder_paths(id, root_id, relative_path, depth) AS (
             SELECT folders.id, folders.root_id, '', 0
             FROM folders
             JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
@@ -8754,10 +8858,10 @@ fn thumbnail_failures(
                    folder_paths.depth + 1
             FROM folder_paths
             JOIN folders child
-              ON child.parent_id = folder_paths.id
+             ON child.parent_id = folder_paths.id
              AND child.root_id = folder_paths.root_id
              AND child.status = 'active'
-            WHERE folder_paths.depth + 1 < ?4
+            WHERE folder_paths.depth + 1 < {FOLDER_ANCESTOR_DEPTH_CAP}
         )
         SELECT files.id, files.folder_id, files.root_id,
                roots.display_name ||
@@ -8767,31 +8871,33 @@ fn thumbnail_failures(
                COALESCE(thumbs.failure_kind, 'unknown'),
                COALESCE(thumbs.error, 'thumbnail generation failed'),
                thumbs.updated_at
-        FROM thumbs
-        JOIN files ON files.id = thumbs.file_id AND files.status = 'active'
-        JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
+        FROM files
+        JOIN roots ON roots.id = files.root_id
+        JOIN media ON media.file_id = files.id
+        JOIN thumbs ON thumbs.file_id = files.id
+        LEFT JOIN thumb_blobs ON thumb_blobs.file_id = files.id AND thumb_blobs.profile = thumbs.profile
         JOIN folder_paths ON folder_paths.id = files.folder_id
-        WHERE thumbs.profile = ?1
-          AND thumbs.state = 'failed'
-          AND (?2 IS NULL OR files.id = ?2)
+        WHERE {where_clause}
+          AND thumbs.profile = ?{profile_parameter}
+          AND ({status_expression}) = 'failed'
+          AND (?{file_parameter} IS NULL OR files.id = ?{file_parameter})
         ORDER BY thumbs.updated_at DESC, files.id ASC
-        LIMIT ?3
+        LIMIT ?{limit_parameter}
         "#,
-    )?;
-    let rows = statement.query_map(
-        rusqlite::params![profile, file_id, limit as i64, FOLDER_ANCESTOR_DEPTH_CAP],
-        |row| {
-            Ok(ThumbnailFailureRecord {
-                file_id: row.get(0)?,
-                folder_id: row.get(1)?,
-                root_id: row.get(2)?,
-                relative_path: row.get(3)?,
-                failure_kind: row.get(4)?,
-                error: row.get(5)?,
-                updated_at: row.get::<_, i64>(6)?.saturating_mul(1_000),
-            })
-        },
-    )?;
+        where_clause = parts.where_clause
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(parts.params), |row| {
+        Ok(ThumbnailFailureRecord {
+            file_id: row.get(0)?,
+            folder_id: row.get(1)?,
+            root_id: row.get(2)?,
+            relative_path: row.get(3)?,
+            failure_kind: row.get(4)?,
+            error: row.get(5)?,
+            updated_at: row.get::<_, i64>(6)?.saturating_mul(1_000),
+        })
+    })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
 }
@@ -13452,6 +13558,137 @@ mod tests {
             "failure diagnostics expose Unix milliseconds for renderer dates"
         );
         assert!(!failures[0].relative_path.contains("D:/"));
+    }
+
+    #[test]
+    fn thumbnail_failure_snapshot_does_not_mix_count_and_details_across_a_writer_race() {
+        let db_dir = unique_db_temp_dir("thumbnail-failure-snapshot-race");
+        std::fs::create_dir_all(&db_dir).expect("create db dir");
+        let db_path = db_dir.join("megle.sqlite");
+        let reader = Database::open(&db_path).expect("open reader database");
+        reader.apply_migrations().expect("migrate reader database");
+        let (root_id, folder_id) = seed_thumbnail_cache_scope_fixture(&reader, "snapshot-race");
+        let file_id = seed_thumbnail_cache_candidate(
+            &reader,
+            root_id,
+            folder_id,
+            "race.jpg",
+            Some("race"),
+            "failed",
+            false,
+            None,
+            None,
+        );
+        let writer = Database::open(&db_path).expect("open writer database");
+        writer.apply_migrations().expect("migrate writer database");
+
+        let snapshot = reader
+            .get_thumbnail_cache_snapshot_with_hook_for_test(
+                ThumbnailCacheScope {
+                    root_id: None,
+                    folder_id: None,
+                    include_descendants: false,
+                },
+                crate::thumbnails::GRID_320_PROFILE,
+                100,
+                || {
+                    writer
+                        .connection
+                        .execute(
+                            "UPDATE thumbs SET state = 'queued', error = NULL, failure_kind = NULL WHERE file_id = ?1 AND profile = ?2",
+                            (file_id, crate::thumbnails::GRID_320_PROFILE),
+                        )
+                        .expect("commit concurrent thumbnail recovery");
+                },
+            )
+            .expect("read atomic failure snapshot");
+
+        assert_eq!(snapshot.stats.failed_count, 1);
+        assert_eq!(snapshot.failure_details.len(), 1);
+        assert_eq!(snapshot.failure_details[0].file_id, file_id);
+        let fresh = reader
+            .get_thumbnail_cache_snapshot(
+                ThumbnailCacheScope {
+                    root_id: None,
+                    folder_id: None,
+                    include_descendants: false,
+                },
+                crate::thumbnails::GRID_320_PROFILE,
+                100,
+            )
+            .expect("read recovered snapshot");
+        assert_eq!(fresh.stats.failed_count, 0);
+        assert!(fresh.failure_details.is_empty());
+
+        drop(writer);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(db_dir);
+    }
+
+    #[test]
+    fn thumbnail_failure_snapshot_does_not_mix_new_details_into_a_zero_count() {
+        let db_dir = unique_db_temp_dir("thumbnail-failure-snapshot-new-failure-race");
+        std::fs::create_dir_all(&db_dir).expect("create db dir");
+        let db_path = db_dir.join("megle.sqlite");
+        let reader = Database::open(&db_path).expect("open reader database");
+        reader.apply_migrations().expect("migrate reader database");
+        let (root_id, folder_id) =
+            seed_thumbnail_cache_scope_fixture(&reader, "snapshot-new-failure-race");
+        let file_id = seed_thumbnail_cache_candidate(
+            &reader,
+            root_id,
+            folder_id,
+            "race.jpg",
+            Some("race"),
+            "queued",
+            false,
+            None,
+            None,
+        );
+        let writer = Database::open(&db_path).expect("open writer database");
+        writer.apply_migrations().expect("migrate writer database");
+
+        let snapshot = reader
+            .get_thumbnail_cache_snapshot_with_hook_for_test(
+                ThumbnailCacheScope {
+                    root_id: None,
+                    folder_id: None,
+                    include_descendants: false,
+                },
+                crate::thumbnails::GRID_320_PROFILE,
+                100,
+                || {
+                    writer
+                        .connection
+                        .execute(
+                            "UPDATE thumbs SET state = 'failed', error = 'decode failed', failure_kind = 'permanent' WHERE file_id = ?1 AND profile = ?2",
+                            (file_id, crate::thumbnails::GRID_320_PROFILE),
+                        )
+                        .expect("commit concurrent thumbnail failure");
+                },
+            )
+            .expect("read atomic zero-failure snapshot");
+
+        assert_eq!(snapshot.stats.failed_count, 0);
+        assert!(snapshot.failure_details.is_empty());
+        let fresh = reader
+            .get_thumbnail_cache_snapshot(
+                ThumbnailCacheScope {
+                    root_id: None,
+                    folder_id: None,
+                    include_descendants: false,
+                },
+                crate::thumbnails::GRID_320_PROFILE,
+                100,
+            )
+            .expect("read new failure snapshot");
+        assert_eq!(fresh.stats.failed_count, 1);
+        assert_eq!(fresh.failure_details.len(), 1);
+        assert_eq!(fresh.failure_details[0].file_id, file_id);
+
+        drop(writer);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(db_dir);
     }
 
     #[test]
