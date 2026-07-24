@@ -687,26 +687,23 @@ if (
 }
 
 if (
-  !/const\s+uniformWindowLayoutMode\s*=\s*layoutMode\s*===\s*"grid"\s*\|\|\s*layoutMode\s*===\s*"list"/.test(mediaGrid) ||
-  !/const\s+justifiedLayoutMode\s*=\s*layoutMode\s*===\s*"adaptive"\s*\|\|\s*layoutMode\s*===\s*"waterfall"/.test(mediaGrid) ||
-  // The fixed-row uniform window serves grid/list, plus justified/masonry folders
-  // past JUSTIFIED_FULL_TOTAL_MAX_ITEMS (the O(totalCount) full-total layout would
-  // freeze the renderer at that scale). At or below the cap, adaptive/waterfall
-  // keep their justified full-total geometry.
-  !/mediaSlots\s*!==\s*undefined\s*&&\s*\n?\s*\(uniformWindowLayoutMode\s*\|\|\s*justifiedTooLargeForFullTotal\)/.test(mediaGrid)
+  !/resolveMediaGeometryStrategy\s*\(\s*\{[\s\S]*?itemCount:\s*mediaItemCount[\s\S]*?layoutMode/.test(mediaGrid) ||
+  !mediaGrid.includes("buildWindowedMediaGeometry") ||
+  !/const\s+\{\s*justifiedFullTotal,\s*windowedMedia\s*\}/.test(mediaGrid) ||
+  !/windowedMedia\s*\|\|\s*justifiedFullTotal\s*\?\s*EMPTY_MEDIA_ITEMS/.test(mediaGrid)
 ) {
-  fail("MediaGrid must gate the fixed-row uniform window on grid/list plus over-cap justified/masonry (uniformWindowLayoutMode || justifiedTooLargeForFullTotal); at-or-below-cap adaptive/waterfall use their own justified geometry");
+  fail("MediaGrid must preserve layout mode through the shared strategy: full-total adaptive/waterfall below the cap and bounded mode-specific geometry above it");
 }
 
 if (
-  !/const\s+justifiedFullTotal\s*=/.test(mediaGrid) ||
-  !/justifiedLayoutMode\s*&&/.test(mediaGrid) ||
+  !/const\s+\{\s*justifiedFullTotal,\s*windowedMedia\s*\}/.test(mediaGrid) ||
+  !/\.\.\.\(justifiedFullTotal\s*\?/.test(mediaGrid) ||
   !/getItemAt:\s*\(index[^)]*\)\s*=>\s*mediaSlots/.test(mediaGrid) ||
   !/totalCount:\s*mediaItemCount/.test(mediaGrid) ||
   !mediaGrid.includes("MediaTileSkeleton") ||
   !mediaGrid.includes("firstMissingMediaSlotIndex")
 ) {
-  fail("MediaGrid adaptive/waterfall must lay out over the full total (getItemAt/totalCount) with placeholder skeletons for unloaded slots; exact modes still use firstMissingMediaSlotIndex");
+  fail("MediaGrid full-total adaptive/waterfall must retain placeholder geometry below the cap, while exact modes retain firstMissingMediaSlotIndex");
 }
 
 if (!/--shell-left-width:\s*292px/.test(stylesForChecks) || !/--shell-right-width:\s*270px/.test(stylesForChecks)) {
