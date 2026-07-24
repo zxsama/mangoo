@@ -564,6 +564,91 @@ describe("notification store", () => {
     }
   });
 
+  it("reloads legacy inactive-library failure snapshots without weakening malformed-data handling", async () => {
+    const databasePath = testDatabasePath();
+    const seedStore = await createTestStore(databasePath);
+    try {
+      await seedStore.publishThumbnailSummary(thumbnailSummary(LIBRARY_A, 80));
+    } finally {
+      await seedStore.close();
+    }
+
+    const legacyTruncatedLibrary = LIBRARY_B;
+    const exactLibrary = { id: "library-c", name: "Library C" };
+    const malformedLibrary = { id: "library-d", name: "Library D" };
+    const details = (libraryId: string, count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        libraryId,
+        fileId: index + 1,
+        folderId: 7,
+        rootId: 3,
+        relativePath: `${libraryId}\\${index}.jpg`,
+        failureKind: "permanent",
+        error: "decode failed",
+        updatedAt: NOW + index
+      }));
+    const rawSummaries = [
+      {
+        ...thumbnailSummary(legacyTruncatedLibrary, 0),
+        failedCount: 101,
+        failureDetails: details(legacyTruncatedLibrary.id, 100)
+      },
+      {
+        ...thumbnailSummary(exactLibrary, 0),
+        failedCount: 2,
+        failureDetails: details(exactLibrary.id, 2)
+      },
+      {
+        ...thumbnailSummary(malformedLibrary, 0),
+        failedCount: 2,
+        failureDetails: details(malformedLibrary.id, 1)
+      }
+    ].map(({ failureDetailsTruncated: _omitted, ...summary }) => summary);
+
+    const inspection = new DatabaseSync(databasePath);
+    try {
+      const insert = inspection.prepare(
+        `INSERT INTO thumbnail_summaries (library_id, library_name, observed_at, payload_json)
+         VALUES (?, ?, ?, ?)`
+      );
+      for (const summary of rawSummaries) {
+        insert.run(
+          summary.libraryId,
+          summary.libraryName,
+          summary.observedAt,
+          JSON.stringify(summary)
+        );
+      }
+    } finally {
+      inspection.close();
+    }
+
+    const reloaded = await createTestStore(databasePath);
+    try {
+      const summaries = (await reloaded.compactSnapshot()).thumbnailSummaries;
+      assert.equal(summaries.find((item) => item.libraryId === LIBRARY_A.id)?.cachedCount, 80);
+
+      const legacyTruncated = summaries.find(
+        (item) => item.libraryId === legacyTruncatedLibrary.id
+      );
+      assert.equal(legacyTruncated?.failedCount, 101);
+      assert.equal(legacyTruncated?.failureDetails.length, 100);
+      assert.equal(legacyTruncated?.failureDetailsTruncated, true);
+
+      const exact = summaries.find((item) => item.libraryId === exactLibrary.id);
+      assert.equal(exact?.failedCount, 2);
+      assert.equal(exact?.failureDetails.length, 2);
+      assert.equal(exact?.failureDetailsTruncated, false);
+
+      const malformed = summaries.find((item) => item.libraryId === malformedLibrary.id);
+      assert.equal(malformed?.failedCount, 0);
+      assert.deepEqual(malformed?.failureDetails, []);
+      assert.equal(malformed?.failureDetailsTruncated, false);
+    } finally {
+      await reloaded.close();
+    }
+  });
+
   it("marks legacy imports idempotently per library", async () => {
     const store = await createTestStore();
     try {

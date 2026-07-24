@@ -243,7 +243,15 @@ function validateThumbnailSummary(summary: ThumbnailCacheSummary): void {
 
 function normalizeThumbnailSummary(summary: ThumbnailCacheSummary): ThumbnailCacheSummary {
   const details = Array.isArray(summary.failureDetails) ? summary.failureDetails : [];
-  const truncated = summary.failureDetailsTruncated === true;
+  const legacyTruncationFieldMissing = !Object.prototype.hasOwnProperty.call(
+    summary,
+    "failureDetailsTruncated"
+  );
+  const truncated =
+    summary.failureDetailsTruncated === true ||
+    (legacyTruncationFieldMissing &&
+      summary.failedCount > details.length &&
+      details.length === 100);
   const hasConsistentFailureSnapshot =
     (summary.failedCount === 0 && details.length === 0 && !truncated) ||
     (summary.failedCount > 0 && !truncated && details.length === summary.failedCount) ||
