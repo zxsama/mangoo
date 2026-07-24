@@ -222,6 +222,13 @@ export interface MediaFocusCompletion {
   readonly ok: boolean;
 }
 
+export type MediaFocusStage = "switching" | "locating";
+
+export interface MediaFocusStageUpdate {
+  readonly requestId: string;
+  readonly stage: MediaFocusStage;
+}
+
 export interface MediaFocusCancellation {
   readonly requestId: string;
 }

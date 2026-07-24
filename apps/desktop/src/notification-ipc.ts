@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import type {
   MediaFocusRequest,
   MediaFocusCompletion,
+  MediaFocusStageUpdate,
   NotificationWindowIntent,
   ProcessLogSubscriptionEvent,
   ProcessLogSubscriptionId,
@@ -31,6 +32,7 @@ export interface NotificationIpcChannels {
   readonly focusMediaRequested: string;
   readonly focusMediaCancelled: string;
   readonly focusMediaCompleted: string;
+  readonly focusMediaStage: string;
   readonly compact: string;
   readonly historyFacets: string;
   readonly history: string;
@@ -71,6 +73,7 @@ const CHANNEL_PERMISSIONS = new Map<string, ReadonlySet<NotificationIpcWindowRol
   [NOTIFICATION_IPC_CHANNELS.closeWindow, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.focusMedia, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.focusMediaCompleted, MAIN_WINDOW_ONLY],
+  [NOTIFICATION_IPC_CHANNELS.focusMediaStage, MAIN_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.compact, MAIN_AND_NOTIFICATION_ROLES],
   [NOTIFICATION_IPC_CHANNELS.historyFacets, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.history, NOTIFICATION_WINDOW_ONLY],
@@ -92,6 +95,7 @@ const OPERATION_ORIGINS = new Set(["user", "background", "recovery", "system"]);
 const LOG_SOURCES = new Set<ProcessLogSource>(["main", "core", "renderer"]);
 const LOG_LEVELS = new Set<ProcessLogLevel>(["trace", "debug", "info", "warn", "error"]);
 const LOG_EVENT_KINDS = new Set(["thumbnail_failure"] as const);
+const MEDIA_FOCUS_STAGES = new Set(["switching", "locating"] as const);
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
 export function canAccessNotificationIpc(
@@ -382,6 +386,14 @@ export function parseMediaFocusCompletion(value: unknown): MediaFocusCompletion 
   return {
     requestId: boundedString(input.requestId, "requestId", 256),
     ok: input.ok
+  };
+}
+
+export function parseMediaFocusStageUpdate(value: unknown): MediaFocusStageUpdate {
+  const input = record(value, "media focus stage update");
+  return {
+    requestId: boundedString(input.requestId, "requestId", 256),
+    stage: enumString(input.stage, "media focus stage", MEDIA_FOCUS_STAGES)
   };
 }
 

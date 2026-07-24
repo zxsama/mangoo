@@ -345,6 +345,7 @@ test("notifications preload exposes only notification, log, and common window ca
     "diagnostics",
     "listLibraries",
     "switchLibrary",
+    "updateMediaFocusStage",
     "createLibrary",
     "openLibrary",
     "removeLibraryFromList",
@@ -356,6 +357,7 @@ test("notifications preload exposes only notification, log, and common window ca
   const mainBridge = evaluatePreload("main").bridge;
   const settingsBridge = evaluatePreload("settings").bridge;
   assert.equal(typeof mainBridge.switchLibrary, "function");
+  assert.equal(typeof mainBridge.updateMediaFocusStage, "function");
   assert.equal(typeof mainBridge.shell, "object");
   assert.equal(typeof settingsBridge.switchLibrary, "function");
   assert.equal(typeof settingsBridge.shell, "object");

@@ -7,6 +7,7 @@ import {
   resolveMediaLocateVirtualIndex
 } from "../src/app/mediaFocusWorkflow.ts";
 import { runCancellableMediaFocusLocate } from "../src/core/mediaFocusLocateWorkflow.ts";
+import * as mediaFocusLocateWorkflow from "../src/core/mediaFocusLocateWorkflow.ts";
 import { buildLayoutGeometry } from "../src/features/media-grid/layoutGeometry.ts";
 
 const request = {
@@ -215,6 +216,49 @@ describe("media focus workflow", () => {
 
     assert.equal(await result, false);
     assert.deepEqual(calls, []);
+  });
+
+  it("enters switching before restart and never continues late after cancellation", async () => {
+    const runSwitch = Reflect.get(mediaFocusLocateWorkflow, "runCoordinatedMediaFocusSwitch");
+    assert.equal(typeof runSwitch, "function", "the renderer must coordinate irreversible switches");
+    const controller = new AbortController();
+    const calls: string[] = [];
+    let releaseSwitch = () => undefined;
+    const switching = new Promise<{ ok: boolean }>((resolve) => {
+      releaseSwitch = () => resolve({ ok: true });
+    });
+    const result = runSwitch({
+      libraryId: "library-b",
+      requestId: "focus-1",
+      signal: controller.signal,
+      switchLibrary: async () => {
+        calls.push("switch");
+        return switching;
+      },
+      updateStage: async (update: { stage: string }) => {
+        calls.push(`stage:${update.stage}`);
+        return true;
+      }
+    });
+    await Promise.resolve();
+    assert.deepEqual(calls, ["stage:switching", "switch"]);
+
+    controller.abort();
+    releaseSwitch();
+    assert.equal(await result, false);
+
+    calls.length = 0;
+    assert.equal(await runSwitch({
+      libraryId: "library-c",
+      requestId: "focus-2",
+      signal: new AbortController().signal,
+      switchLibrary: async () => {
+        calls.push("switch");
+        return { ok: true };
+      },
+      updateStage: async () => false
+    }), false);
+    assert.deepEqual(calls, [], "an obsolete request must not begin a restart");
   });
 });
 

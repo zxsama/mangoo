@@ -48,6 +48,7 @@ import {
   parseNotificationHistoryQuery,
   parseMediaFocusRequest,
   parseMediaFocusCompletion,
+  parseMediaFocusStageUpdate,
   parseNotificationWindowIntent,
   parseProcessLogFilter,
   parseProcessLogSubscriptionId,
@@ -705,6 +706,11 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMedia, async (event, input: unknow
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMediaCompleted, (event, input: unknown) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.focusMediaCompleted);
   return mediaFocusCoordinator.complete(parseMediaFocusCompletion(input));
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMediaStage, (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.focusMediaStage);
+  return mediaFocusCoordinator.updateStage(parseMediaFocusStageUpdate(input));
 });
 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.compact, async (event) => {

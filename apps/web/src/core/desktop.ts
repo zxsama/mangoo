@@ -5,6 +5,7 @@ import type {
   MediaFocusCancellation,
   MediaFocusCompletion,
   MediaFocusRequest,
+  MediaFocusStageUpdate,
   NotificationWindowIntent
 } from "@megle/notification-contract";
 
@@ -30,6 +31,7 @@ export type {
   MediaFocusCommand,
   MediaFocusCancellation,
   MediaFocusCompletion,
+  MediaFocusStageUpdate,
   NotificationWindowIntent,
   ThumbnailFailureDetail
 } from "@megle/notification-contract";
@@ -98,6 +100,7 @@ export interface MegleDesktopBridge {
   onFocusMedia?: (cb: (input: MediaFocusCommand) => void) => () => void;
   onFocusMediaCancelled?: (cb: (input: MediaFocusCancellation) => void) => () => void;
   completeMediaFocus?: (completion: MediaFocusCompletion) => Promise<boolean>;
+  updateMediaFocusStage?: (update: MediaFocusStageUpdate) => Promise<boolean>;
   notifications?: DesktopNotificationsBridge;
   windowControls?: DesktopWindowControls;
   shell?: DesktopShellActions;

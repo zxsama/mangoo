@@ -3,18 +3,25 @@ import type {
   MediaFocusCommand,
   MediaFocusCancellation,
   MediaFocusCompletion,
-  MediaFocusRequest
+  MediaFocusRequest,
+  MediaFocusStage,
+  MediaFocusStageUpdate
 } from "@megle/notification-contract";
 
 interface PendingMediaFocus {
   cancel: (cancellation: MediaFocusCancellation) => void;
+  command: MediaFocusCommand;
+  deliver: (command: MediaFocusCommand) => void;
   resolve: (ok: boolean) => void;
-  timeout: ReturnType<typeof setTimeout>;
+  stage: "queued" | "awaiting" | MediaFocusStage;
+  timeout: ReturnType<typeof setTimeout> | null;
 }
 
 export class MediaFocusCoordinator {
   private readonly pending = new Map<string, PendingMediaFocus>();
+  private readonly queue: string[] = [];
   private readonly timeoutMs: number;
+  private activeRequestId: string | null = null;
 
   constructor(options: { timeoutMs?: number } = {}) {
     this.timeoutMs = options.timeoutMs ?? 15_000;
@@ -27,25 +34,63 @@ export class MediaFocusCoordinator {
   ): Promise<boolean> {
     const requestId = randomUUID();
     return new Promise<boolean>((resolve) => {
-      const timeout = setTimeout(() => this.cancelAndSettle(requestId), this.timeoutMs);
-      this.pending.set(requestId, { cancel, resolve, timeout });
-      try {
-        deliver({ ...request, requestId });
-      } catch {
-        this.settle(requestId, false);
-      }
+      this.pending.set(requestId, {
+        cancel,
+        command: { ...request, requestId },
+        deliver,
+        resolve,
+        stage: "queued",
+        timeout: null
+      });
+      this.queue.push(requestId);
+      this.activateNext();
     });
   }
 
   complete(completion: MediaFocusCompletion): boolean {
+    if (completion.requestId !== this.activeRequestId) return false;
     return this.settle(completion.requestId, completion.ok);
   }
 
+  updateStage(update: MediaFocusStageUpdate): boolean {
+    if (update.requestId !== this.activeRequestId) return false;
+    const request = this.pending.get(update.requestId);
+    if (!request) return false;
+    if (update.stage === "switching") {
+      if (request.stage !== "awaiting" && request.stage !== "switching") return false;
+      request.stage = "switching";
+      this.clearRequestTimeout(request);
+      return true;
+    }
+    if (request.stage !== "awaiting" && request.stage !== "switching" && request.stage !== "locating") {
+      return false;
+    }
+    request.stage = "locating";
+    this.armRequestTimeout(update.requestId, request);
+    return true;
+  }
+
   failAll(): void {
-    for (const requestId of [...this.pending.keys()]) this.cancelAndSettle(requestId);
+    const activeRequestId = this.activeRequestId;
+    const requests = [...this.pending.entries()];
+    this.activeRequestId = null;
+    this.queue.length = 0;
+    this.pending.clear();
+    for (const [requestId, request] of requests) {
+      this.clearRequestTimeout(request);
+      if (requestId === activeRequestId) {
+        try {
+          request.cancel({ requestId });
+        } catch {
+          // Main is closing; cancellation remains best-effort.
+        }
+      }
+      request.resolve(false);
+    }
   }
 
   private cancelAndSettle(requestId: string): boolean {
+    if (requestId !== this.activeRequestId) return false;
     const request = this.pending.get(requestId);
     if (!request) return false;
     try {
@@ -60,8 +105,40 @@ export class MediaFocusCoordinator {
     const request = this.pending.get(requestId);
     if (!request) return false;
     this.pending.delete(requestId);
-    clearTimeout(request.timeout);
+    this.clearRequestTimeout(request);
+    const wasActive = this.activeRequestId === requestId;
+    if (wasActive) this.activeRequestId = null;
     request.resolve(ok);
+    if (wasActive) this.activateNext();
     return true;
+  }
+
+  private activateNext(): void {
+    if (this.activeRequestId !== null) return;
+    while (this.queue.length > 0) {
+      const requestId = this.queue.shift()!;
+      const request = this.pending.get(requestId);
+      if (!request) continue;
+      this.activeRequestId = requestId;
+      request.stage = "awaiting";
+      this.armRequestTimeout(requestId, request);
+      try {
+        request.deliver(request.command);
+      } catch {
+        this.settle(requestId, false);
+      }
+      return;
+    }
+  }
+
+  private armRequestTimeout(requestId: string, request: PendingMediaFocus): void {
+    this.clearRequestTimeout(request);
+    request.timeout = setTimeout(() => this.cancelAndSettle(requestId), this.timeoutMs);
+  }
+
+  private clearRequestTimeout(request: PendingMediaFocus): void {
+    if (request.timeout === null) return;
+    clearTimeout(request.timeout);
+    request.timeout = null;
   }
 }

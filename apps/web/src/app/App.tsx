@@ -79,6 +79,7 @@ import {
 } from "../features/preview/previewPreferences";
 import { subscribePreference } from "../core/preferenceSync";
 import { emitRendererStartupLog } from "../core/notificationReporting";
+import { runCoordinatedMediaFocusSwitch } from "../core/mediaFocusLocateWorkflow";
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
 import {
@@ -297,13 +298,19 @@ export function App() {
     if (activeLibraryId !== pendingMediaFocus.libraryId) {
       if (mediaFocusSwitchKeyRef.current === requestKey) return;
       mediaFocusSwitchKeyRef.current = requestKey;
-      void switchLibrary(pendingMediaFocus.libraryId)
-        .then((result) => {
+      const bridge = getDesktopBridge();
+      void runCoordinatedMediaFocusSwitch({
+        libraryId: pendingMediaFocus.libraryId,
+        requestId: requestKey,
+        signal,
+        switchLibrary,
+        updateStage: async (update) =>
+          (await bridge?.updateMediaFocusStage?.(update)) === true
+      })
+        .then((ok) => {
           if (signal.aborted || pendingMediaFocusRef.current?.requestId !== requestKey) return;
-          if (!result.ok) {
+          if (!ok) {
             completeMediaFocus(requestKey, false);
-          } else {
-            mediaFocusSwitchKeyRef.current = null;
           }
         })
         .catch(() => completeMediaFocus(requestKey, false));
@@ -313,21 +320,33 @@ export function App() {
     mediaFocusSwitchKeyRef.current = null;
     if (mediaFocusLocateKeyRef.current === requestKey) return;
     mediaFocusLocateKeyRef.current = requestKey;
-    void prepareMediaFocusNavigation(pendingMediaFocus, {
-      closePreview: handleClosePreview,
-      locateMedia: (command, locateSignal) =>
-        library.locateMedia(command, { signal: locateSignal })
-    }, signal).then((locateRequest) => {
-      if (signal.aborted || pendingMediaFocusRef.current?.requestId !== requestKey) return;
-      if (!locateRequest) {
-        completeMediaFocus(requestKey, false);
-        return;
-      }
-      pendingMediaFocusRef.current = null;
-      setPendingMediaFocus(null);
-      mediaGridLocateRequestRef.current = locateRequest;
-      setMediaGridLocateRequest(locateRequest);
-    }).catch(() => completeMediaFocus(requestKey, false));
+    const bridge = getDesktopBridge();
+    void Promise.resolve(
+      bridge?.updateMediaFocusStage?.({ requestId: requestKey, stage: "locating" }) ?? false
+    )
+      .then((accepted) => {
+        if (signal.aborted || pendingMediaFocusRef.current?.requestId !== requestKey) return;
+        if (!accepted) {
+          completeMediaFocus(requestKey, false);
+          return;
+        }
+        return prepareMediaFocusNavigation(pendingMediaFocus, {
+          closePreview: handleClosePreview,
+          locateMedia: (command, locateSignal) =>
+            library.locateMedia(command, { signal: locateSignal })
+        }, signal).then((locateRequest) => {
+          if (signal.aborted || pendingMediaFocusRef.current?.requestId !== requestKey) return;
+          if (!locateRequest) {
+            completeMediaFocus(requestKey, false);
+            return;
+          }
+          pendingMediaFocusRef.current = null;
+          setPendingMediaFocus(null);
+          mediaGridLocateRequestRef.current = locateRequest;
+          setMediaGridLocateRequest(locateRequest);
+        });
+      })
+      .catch(() => completeMediaFocus(requestKey, false));
   }, [
     activeLibraryId,
     completeMediaFocus,

@@ -8,6 +8,26 @@ export interface CancellableMediaFocusLocateStages {
   selectMedia: () => void;
 }
 
+export async function runCoordinatedMediaFocusSwitch({
+  libraryId,
+  requestId,
+  signal,
+  switchLibrary,
+  updateStage
+}: {
+  libraryId: string;
+  requestId: string;
+  signal: AbortSignal;
+  switchLibrary: (libraryId: string) => Promise<{ ok: boolean }>;
+  updateStage: (update: { requestId: string; stage: "switching" }) => Promise<boolean>;
+}): Promise<boolean> {
+  if (signal.aborted) return false;
+  const accepted = await updateStage({ requestId, stage: "switching" });
+  if (!accepted || signal.aborted) return false;
+  const result = await switchLibrary(libraryId);
+  return result.ok && !signal.aborted;
+}
+
 export async function runCancellableMediaFocusLocate(
   stages: CancellableMediaFocusLocateStages,
   signal: AbortSignal

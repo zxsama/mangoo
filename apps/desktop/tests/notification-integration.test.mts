@@ -51,6 +51,8 @@ test("notification IPC permissions isolate privileged history, action and log ac
   assert.equal(canAccess("settings", channels.focusMedia), false);
   assert.equal(canAccess("main", channels.focusMediaCompleted), true);
   assert.equal(canAccess("notifications", channels.focusMediaCompleted), false);
+  assert.equal(canAccess("main", channels.focusMediaStage), true);
+  assert.equal(canAccess("notifications", channels.focusMediaStage), false);
   assert.equal(canAccess("plugins", channels.rendererLogs), true);
   assert.equal(canAccess(null, channels.rendererLogs), false);
 });
@@ -76,6 +78,10 @@ test("notification launch intents and media focus requests are narrow and bounde
     ipcModule.parseMediaFocusCompletion({ requestId: "focus-1", ok: true }),
     { requestId: "focus-1", ok: true }
   );
+  assert.deepEqual(
+    ipcModule.parseMediaFocusStageUpdate({ requestId: "focus-1", stage: "switching" }),
+    { requestId: "focus-1", stage: "switching" }
+  );
   assert.throws(
     () => ipcModule.parseNotificationWindowIntent({ page: "history", logFilter: {} }),
     /intent/i
@@ -87,6 +93,10 @@ test("notification launch intents and media focus requests are narrow and bounde
   assert.throws(
     () => ipcModule.parseMediaFocusCompletion({ requestId: "focus-1", ok: "yes" }),
     /boolean/i
+  );
+  assert.throws(
+    () => ipcModule.parseMediaFocusStageUpdate({ requestId: "focus-1", stage: "done" }),
+    /stage/i
   );
   assert.throws(
     () => ipcModule.parseThumbnailCacheSummary({
@@ -601,7 +611,6 @@ test("preload bridge removes exact listeners and buffers log batches until snaps
     channels.focusMedia,
     { libraryId: "library-a", fileId: 42, folderId: 7, rootId: 3 }
   ]);
-
   const changed = () => undefined;
   const stopChanged = bridge.onChanged(changed);
   const changedListener = [...(listeners.get(channels.changed) ?? [])][0];

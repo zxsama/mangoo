@@ -191,6 +191,8 @@ const fullBridge = {
   onFocusMediaCancelled: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.focusMediaCancelled, cb),
   completeMediaFocus: (completion) =>
     ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.focusMediaCompleted, completion),
+  updateMediaFocusStage: (update) =>
+    ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.focusMediaStage, update),
   notifications: notificationsBridge
 };
 const notificationWindowBridge = {

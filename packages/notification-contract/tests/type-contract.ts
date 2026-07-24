@@ -4,6 +4,7 @@ import type {
   NotificationIpcBridge,
   MediaFocusCancellation,
   MediaFocusRequest,
+  MediaFocusStageUpdate,
   NotificationWindowIntent,
   ProcessLogLine,
   RendererErrorReport,
@@ -29,6 +30,7 @@ declare const rendererReport: RendererErrorReport;
 declare const intent: NotificationWindowIntent;
 declare const focus: MediaFocusRequest;
 declare const focusCancellation: MediaFocusCancellation;
+declare const focusStage: MediaFocusStageUpdate;
 declare const failure: ThumbnailFailureDetail;
 declare const thumbnailSummary: DesktopThumbnailCacheSummary;
 
@@ -44,6 +46,7 @@ void intent.logFilter.eventKind;
 void intent.failureSnapshot.truncated;
 void focus.fileId;
 void focusCancellation.requestId;
+void focusStage.stage;
 void failure.relativePath;
 void thumbnailSummary.failureDetailsUnavailable;
 void rendererErrorIdentityKey(rendererReport);
