@@ -25,6 +25,7 @@ import type {
   DesktopProcessLogPage,
   DesktopProcessLogSource,
   MediaFocusRequest,
+  ThumbnailFailureSnapshot,
   ThumbnailFailureDetail
 } from "@megle/notification-contract";
 import { copyText, getDesktopBridge } from "../../core/desktop";
@@ -40,6 +41,7 @@ import {
   createProcessLogPageRequestController,
   createProcessLogQueryToken,
   buildProcessLogRows,
+  thumbnailFailureTruncationMessage,
   type ProcessLogRow
 } from "./processLogModel";
 
@@ -48,6 +50,7 @@ const LOG_PAGE_SIZE = 200;
 
 interface ProcessLogViewProps {
   authoritativeFailures: readonly ThumbnailFailureDetail[];
+  failureSnapshot?: ThumbnailFailureSnapshot | null;
   clearLogs(): Promise<NotificationRequestResult<boolean>>;
   exportLogs(
     query: DesktopProcessLogFilter
@@ -64,6 +67,7 @@ interface ProcessLogViewProps {
 
 export function ProcessLogView({
   authoritativeFailures,
+  failureSnapshot,
   clearLogs,
   exportLogs,
   getLogPage,
@@ -115,6 +119,7 @@ export function ProcessLogView({
     () => buildProcessLogRows(lines, filteredAuthoritativeFailures),
     [filteredAuthoritativeFailures, lines]
   );
+  const failureTruncationMessage = thumbnailFailureTruncationMessage(failureSnapshot);
   const queryToken = useMemo(() => createProcessLogQueryToken(query), [query]);
   const [pageRequestController] = useState(() =>
     createProcessLogPageRequestController(queryToken)
@@ -382,6 +387,7 @@ export function ProcessLogView({
       {initialFilter?.eventKind === "thumbnail_failure" ? (
         <p className="notification-log-filter-state">
           缩略图失败 · {initialFilter.libraryId}
+          {failureTruncationMessage ? ` · ${failureTruncationMessage}` : ""}
         </p>
       ) : null}
 

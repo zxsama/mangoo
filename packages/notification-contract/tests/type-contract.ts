@@ -37,6 +37,7 @@ void bridge.getHistoryFacets;
 void bridge.exportLogs;
 void rendererReport.reportId;
 void intent.logFilter.eventKind;
+void intent.failureSnapshot.truncated;
 void focus.fileId;
 void failure.relativePath;
 void rendererErrorIdentityKey(rendererReport);

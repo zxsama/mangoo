@@ -1,6 +1,7 @@
 import { Bell } from "lucide-react";
 import { StrictMode, useCallback, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import type { ThumbnailFailureDetail } from "@megle/notification-contract";
 import "../../src/styles.css";
 import { LiquidGlassButton, LiquidGlassLayer } from "../../src/design/liquid-glass";
 import { NotificationPopover } from "../../src/features/notifications/NotificationPopover";
@@ -15,6 +16,23 @@ type FixtureState = "full" | "empty" | "degraded";
 const fixtureParameters = new URLSearchParams(window.location.search);
 const measurementMetrics = { anchorRectCalls: 0, popoverRectCalls: 0 };
 const nativeGetBoundingClientRect = Element.prototype.getBoundingClientRect;
+
+function fixtureFailureDetails(
+  libraryId: string,
+  count: number,
+  firstFileId: number
+): ThumbnailFailureDetail[] {
+  return Array.from({ length: count }, (_, index) => ({
+    libraryId,
+    fileId: firstFileId + index,
+    folderId: 7,
+    rootId: 3,
+    relativePath: `${libraryId}\\failure-${index + 1}.jpg`,
+    failureKind: "decode",
+    error: "decode failed",
+    updatedAt: Date.now() + index
+  }));
+}
 
 Element.prototype.getBoundingClientRect = function fixtureMeasurementRect() {
   if (this.matches('[data-titlebar-control="notifications"]')) {
@@ -119,16 +137,8 @@ function fullModel(): CompactNotificationModel {
           activeBulkTaskCount: 1,
           totalCacheBytes: 86 * 1024 * 1024,
           completionPercent: 82,
-          failureDetails: [{
-            libraryId: "artists",
-            fileId: 42,
-            folderId: 7,
-            rootId: 3,
-            relativePath: "Artists\\Portraits\\a.jpg",
-            failureKind: "decode",
-            error: "decode failed",
-            updatedAt: Date.now()
-          }]
+          failureDetails: fixtureFailureDetails("artists", 4, 42),
+          failureDetailsTruncated: false
         },
         {
           libraryId: "references",
@@ -143,16 +153,8 @@ function fullModel(): CompactNotificationModel {
           activeBulkTaskCount: 2,
           totalCacheBytes: 54 * 1024 * 1024,
           completionPercent: 63,
-          failureDetails: [{
-            libraryId: "references",
-            fileId: 84,
-            folderId: 12,
-            rootId: 5,
-            relativePath: "References\\Archive\\b.jpg",
-            failureKind: "decode",
-            error: "decode failed",
-            updatedAt: Date.now()
-          }]
+          failureDetails: fixtureFailureDetails("references", 9, 84),
+          failureDetailsTruncated: false
         }
       ],
       libraryCount: 2,

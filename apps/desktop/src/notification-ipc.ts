@@ -189,7 +189,10 @@ export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummar
       : boundedNumber(input.completionPercent, "completionPercent", 0, 100);
   const failedCount = boundedInteger(input.failedCount, "failedCount", 0, Number.MAX_SAFE_INTEGER);
   const failureDetails = parseThumbnailFailureDetails(input.failureDetails, libraryId);
-  validateThumbnailFailureSnapshot(failedCount, failureDetails);
+  if (typeof input.failureDetailsTruncated !== "boolean") {
+    throw new TypeError("failureDetailsTruncated must be a boolean");
+  }
+  validateThumbnailFailureSnapshot(failedCount, failureDetails, input.failureDetailsTruncated);
   return {
     libraryId,
     libraryName: boundedString(input.libraryName, "libraryName", 256),
@@ -213,13 +216,14 @@ export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummar
     ),
     totalCacheBytes,
     completionPercent,
-    failureDetails
+    failureDetails,
+    failureDetailsTruncated: input.failureDetailsTruncated
   };
 }
 
 function parseThumbnailFailureDetails(value: unknown, libraryId: string): ThumbnailCacheSummary["failureDetails"] {
   if (!Array.isArray(value)) throw new TypeError("failureDetails must be an array");
-  if (value.length > 200) throw new RangeError("failureDetails are limited to 200 entries");
+  if (value.length > 100) throw new RangeError("failureDetails are limited to 100 entries");
   return value.map((candidate, index) => {
     const input = record(candidate, `failureDetails ${index}`);
     const detailLibraryId = boundedString(input.libraryId, `failureDetails ${index} libraryId`, 256);
@@ -241,16 +245,23 @@ function parseThumbnailFailureDetails(value: unknown, libraryId: string): Thumbn
 
 function validateThumbnailFailureSnapshot(
   failedCount: number,
-  failureDetails: ThumbnailCacheSummary["failureDetails"]
+  failureDetails: ThumbnailCacheSummary["failureDetails"],
+  truncated: boolean
 ): void {
-  if (failedCount === 0 && failureDetails.length !== 0) {
-    throw new RangeError("zero failedCount must have no failureDetails");
+  if (failedCount === 0) {
+    if (failureDetails.length !== 0 || truncated) {
+      throw new RangeError("zero failedCount requires an empty untruncated failure snapshot");
+    }
+    return;
   }
-  if (failedCount > 0 && failureDetails.length === 0) {
-    throw new RangeError("positive failedCount requires failureDetails");
+  if (truncated) {
+    if (failureDetails.length !== 100 || failedCount <= failureDetails.length) {
+      throw new RangeError("truncated failureDetails must contain the first 100 of a larger total");
+    }
+    return;
   }
-  if (failureDetails.length > failedCount) {
-    throw new RangeError("failureDetails cannot exceed failedCount");
+  if (failureDetails.length !== failedCount) {
+    throw new RangeError("untruncated failureDetails must match failedCount");
   }
 }
 
@@ -302,11 +313,36 @@ export function parseNotificationWindowIntent(value: unknown): NotificationWindo
   if (logFilter.eventKind !== "thumbnail_failure" || !logFilter.libraryId) {
     throw new RangeError("notification window intent requires a thumbnail failure log filter");
   }
+  const failureSnapshot = record(input.failureSnapshot, "notification failure snapshot");
+  const totalCount = boundedInteger(
+    failureSnapshot.totalCount,
+    "notification failure snapshot totalCount",
+    1,
+    Number.MAX_SAFE_INTEGER
+  );
+  const visibleCount = boundedInteger(
+    failureSnapshot.visibleCount,
+    "notification failure snapshot visibleCount",
+    1,
+    100
+  );
+  if (typeof failureSnapshot.truncated !== "boolean") {
+    throw new TypeError("notification failure snapshot truncated must be a boolean");
+  }
+  const consistent = failureSnapshot.truncated
+    ? visibleCount === 100 && totalCount > visibleCount
+    : totalCount === visibleCount;
+  if (!consistent) throw new RangeError("notification failure snapshot is inconsistent");
   return {
     page: "logs",
     logFilter: {
       eventKind: "thumbnail_failure",
       libraryId: logFilter.libraryId
+    },
+    failureSnapshot: {
+      totalCount,
+      visibleCount,
+      truncated: failureSnapshot.truncated
     }
   };
 }

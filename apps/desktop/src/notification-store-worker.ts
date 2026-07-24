@@ -208,8 +208,9 @@ function validateThumbnailSummary(summary: ThumbnailCacheSummary): void {
     throw new RangeError("summary.completionPercent must be between 0 and 100 or null");
   }
   const details = summary.failureDetails ?? [];
-  if (!Array.isArray(details) || details.length > 200) {
-    throw new RangeError("summary.failureDetails must contain at most 200 entries");
+  const truncated = summary.failureDetailsTruncated === true;
+  if (!Array.isArray(details) || details.length > 100) {
+    throw new RangeError("summary.failureDetails must contain at most 100 entries");
   }
   for (const detail of details) {
     assertObject(detail, "thumbnail failure detail");
@@ -225,29 +226,36 @@ function validateThumbnailSummary(summary: ThumbnailCacheSummary): void {
     if (typeof detail.error !== "string") throw new TypeError("thumbnail failure detail.error must be a string");
     assertSafeInteger(detail.updatedAt, "thumbnail failure detail.updatedAt");
   }
-  if (summary.failedCount === 0 && details.length !== 0) {
-    throw new RangeError("zero failedCount must have no failureDetails");
+  if (summary.failedCount === 0 && (details.length !== 0 || truncated)) {
+    throw new RangeError("zero failedCount requires an empty untruncated failure snapshot");
   }
-  if (summary.failedCount > 0 && details.length === 0) {
-    throw new RangeError("positive failedCount requires failureDetails");
+  if (
+    summary.failedCount > 0 &&
+    truncated &&
+    (details.length !== 100 || summary.failedCount <= details.length)
+  ) {
+    throw new RangeError("truncated failureDetails must contain the first 100 of a larger total");
   }
-  if (details.length > summary.failedCount) {
-    throw new RangeError("summary.failureDetails cannot exceed failedCount");
+  if (summary.failedCount > 0 && !truncated && details.length !== summary.failedCount) {
+    throw new RangeError("untruncated failureDetails must match failedCount");
   }
 }
 
 function normalizeThumbnailSummary(summary: ThumbnailCacheSummary): ThumbnailCacheSummary {
   const details = Array.isArray(summary.failureDetails) ? summary.failureDetails : [];
+  const truncated = summary.failureDetailsTruncated === true;
   const hasConsistentFailureSnapshot =
-    (summary.failedCount === 0 && details.length === 0) ||
-    (summary.failedCount > 0 && details.length > 0 && details.length <= summary.failedCount);
+    (summary.failedCount === 0 && details.length === 0 && !truncated) ||
+    (summary.failedCount > 0 && !truncated && details.length === summary.failedCount) ||
+    (summary.failedCount > details.length && details.length === 100 && truncated);
   return {
     ...summary,
     // Legacy and pre-atomic summaries may carry a stale positive count with no
     // matching details. Collapse both fields together rather than persisting a
     // clickable count that cannot resolve to authoritative rows.
     failedCount: hasConsistentFailureSnapshot ? summary.failedCount : 0,
-    failureDetails: hasConsistentFailureSnapshot ? details : []
+    failureDetails: hasConsistentFailureSnapshot ? details : [],
+    failureDetailsTruncated: hasConsistentFailureSnapshot ? truncated : false
   };
 }
 

@@ -12,7 +12,10 @@ import {
   thumbnailFailureLogIntent,
   thumbnailFailureLogIntentForLibrary
 } from "../src/features/notifications/notificationModel.ts";
-import { buildProcessLogRows } from "../src/features/notifications/processLogModel.ts";
+import {
+  buildProcessLogRows,
+  thumbnailFailureTruncationMessage
+} from "../src/features/notifications/processLogModel.ts";
 
 function scan(id: string, summary: string, current: number, total: number | null): DesktopNotificationOperation {
   return {
@@ -48,6 +51,7 @@ function scan(id: string, summary: string, current: number, total: number | null
 }
 
 function summary(failedCount: number): DesktopThumbnailCacheSummary {
+  const visibleCount = Math.min(failedCount, 100);
   return {
     libraryId: "library-a",
     libraryName: "Artists",
@@ -61,16 +65,17 @@ function summary(failedCount: number): DesktopThumbnailCacheSummary {
     activeBulkTaskCount: 0,
     totalCacheBytes: 100,
     completionPercent: 83,
-    failureDetails: failedCount > 0 ? [{
+    failureDetails: Array.from({ length: visibleCount }, (_, index) => ({
       libraryId: "library-a",
-      fileId: 42,
+      fileId: 42 + index,
       folderId: 7,
       rootId: 3,
-      relativePath: "Artists\\Portraits\\a.jpg",
+      relativePath: `Artists\\Portraits\\${index}.jpg`,
       failureKind: "permanent",
       error: "decode failed",
-      updatedAt: 123
-    }] : []
+      updatedAt: 123 + index
+    })),
+    failureDetailsTruncated: failedCount > visibleCount
   };
 }
 
@@ -99,7 +104,8 @@ describe("notification drilldown", () => {
   it("makes only non-zero thumbnail failures actionable with a typed filter", () => {
     assert.deepEqual(thumbnailFailureLogIntent(summary(1)), {
       page: "logs",
-      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" },
+      failureSnapshot: { totalCount: 1, visibleCount: 1, truncated: false }
     });
     assert.equal(thumbnailFailureLogIntent(summary(0)), null);
     assert.equal(thumbnailFailureLogIntent({ ...summary(1), failureDetails: [] }), null);
@@ -111,17 +117,32 @@ describe("notification drilldown", () => {
     assert.equal(activateThumbnailFailureLogs(summary(0), (intent) => opened.push(intent)), false);
     assert.deepEqual(opened, [{
       page: "logs",
-      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" },
+      failureSnapshot: { totalCount: 1, visibleCount: 1, truncated: false }
     }]);
   });
 
   it("builds the Settings failure click intent only from a consistent detail snapshot", () => {
-    assert.deepEqual(thumbnailFailureLogIntentForLibrary("library-a", 2, 1), {
+    assert.deepEqual(thumbnailFailureLogIntentForLibrary("library-a", 2, 2, false), {
       page: "logs",
-      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" },
+      failureSnapshot: { totalCount: 2, visibleCount: 2, truncated: false }
     });
-    assert.equal(thumbnailFailureLogIntentForLibrary("library-a", 2, 0), null);
-    assert.equal(thumbnailFailureLogIntentForLibrary("library-a", 0, 0), null);
+    assert.equal(thumbnailFailureLogIntentForLibrary("library-a", 2, 1, false), null);
+    assert.equal(thumbnailFailureLogIntentForLibrary("library-a", 0, 0, false), null);
+  });
+
+  it("carries a 101+ truncation snapshot into logs and states the visible bound", () => {
+    const intent = thumbnailFailureLogIntent(summary(101));
+    assert.deepEqual(intent?.failureSnapshot, {
+      totalCount: 101,
+      visibleCount: 100,
+      truncated: true
+    });
+    assert.equal(
+      thumbnailFailureTruncationMessage(intent?.failureSnapshot),
+      "仅显示前 100 条失败记录，共 101 条。"
+    );
   });
 
   it("removes completed scan paths from the aggregate on the next snapshot", () => {
@@ -165,7 +186,8 @@ describe("notification drilldown", () => {
       }
     };
     const rows = buildProcessLogRows([current], summary(2).failureDetails ?? []);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0]?.kind, "log");
+    assert.equal(rows.length, 2);
+    assert.equal(rows.filter((row) => row.kind === "log").length, 1);
+    assert.equal(rows.filter((row) => row.kind === "failure").length, 1);
   });
 });

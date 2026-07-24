@@ -233,21 +233,31 @@ export function thumbnailFailureLogIntent(
   return thumbnailFailureLogIntentForLibrary(
     summary.libraryId,
     summary.failedCount,
-    summary.failureDetails.length
+    summary.failureDetails.length,
+    summary.failureDetailsTruncated
   );
 }
 
 export function thumbnailFailureLogIntentForLibrary(
   libraryId: string | null | undefined,
   failedCount: number,
-  failureDetailCount: number
+  failureDetailCount: number,
+  failureDetailsTruncated: boolean
 ): NotificationWindowIntent | null {
-  if (!libraryId || failedCount <= 0 || failureDetailCount <= 0) return null;
+  const consistent = failureDetailsTruncated
+    ? failedCount > failureDetailCount && failureDetailCount === 100
+    : failedCount === failureDetailCount;
+  if (!libraryId || failedCount <= 0 || failureDetailCount <= 0 || !consistent) return null;
   return {
     page: "logs",
     logFilter: {
       eventKind: "thumbnail_failure",
       libraryId
+    },
+    failureSnapshot: {
+      totalCount: failedCount,
+      visibleCount: failureDetailCount,
+      truncated: failureDetailsTruncated
     }
   };
 }

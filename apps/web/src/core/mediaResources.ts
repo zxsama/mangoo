@@ -1,6 +1,10 @@
 import type { CoreRequestPriority, MediaRecord, ThumbnailResponse } from "@megle/core-client";
 import { createCoreClient } from "./client";
 import {
+  mediaContentSignature as createMediaContentSignature,
+  normalizeMediaThumbnailState
+} from "./mediaContentSignature";
+import {
   readCachedThumbnailObjectUrl as readCachedThumbnailObjectUrlInternal,
   rememberThumbnailObjectUrl as rememberThumbnailObjectUrlInternal
 } from "./thumbnailObjectUrlCache";
@@ -496,19 +500,6 @@ export function previewPlaceholderDataUrl(mediaRecord: MediaRecord): string | nu
   return `data:${mediaType};base64,${bytesToBase64(bytes)}`;
 }
 
-function normalizeMediaThumbnailState(value: string | null | undefined): ThumbnailResponse["state"] {
-  if (
-    value === "pending" ||
-    value === "queued" ||
-    value === "ready" ||
-    value === "failed" ||
-    value === "skipped_small"
-  ) {
-    return value;
-  }
-  return "pending";
-}
-
 function thumbnailRequestKey(mediaRecord: MediaRecord): string {
   // Dedup by content identity only, not priority (see requestThumbnailBlob): the
   // same record polled at "visible" then "ahead" must share one in-flight state
@@ -862,12 +853,7 @@ function isAbortError(cause: unknown): boolean {
 }
 
 export function mediaContentSignature(mediaRecord: MediaRecord): string {
-  return [
-    mediaRecord.id,
-    mediaRecord.mtime,
-    mediaRecord.size,
-    normalizeMediaThumbnailState(mediaRecord.thumbnailState)
-  ].join(":");
+  return createMediaContentSignature(mediaRecord);
 }
 
 export function mediaFileContentSignature(mediaRecord: MediaRecord): string {

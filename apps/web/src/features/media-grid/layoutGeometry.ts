@@ -1,6 +1,6 @@
 import type { MediaRecord } from "@megle/core-client";
-import { mediaContentSignature } from "../../core/mediaResources";
-import type { LibraryLayoutMode } from "./layoutMode";
+import { mediaContentSignature } from "../../core/mediaContentSignature.ts";
+import type { LibraryLayoutMode } from "./layoutMode.ts";
 
 const LIST_ROW_HEIGHT_PX = 104;
 const LIST_FRAME_HEIGHT_PX = 90;

@@ -7,7 +7,8 @@ import type {
   DesktopNotificationOperation,
   DesktopProcessLogBatch,
   DesktopProcessLogFilter,
-  DesktopProcessLogLine
+  DesktopProcessLogLine,
+  ThumbnailFailureDetail
 } from "@megle/notification-contract";
 import { useOverlayScrollbars } from "../../src/app-shell/useOverlayScrollbars";
 import { LiquidGlassLayer, LiquidGlassSurface } from "../../src/design/liquid-glass";
@@ -27,6 +28,23 @@ interface FixtureMetrics {
   logSubscriptions: number;
   activeLogSubscriptions: number;
   logUnsubscriptions: number;
+}
+
+function fixtureFailureDetails(
+  libraryId: string,
+  count: number,
+  firstFileId: number
+): ThumbnailFailureDetail[] {
+  return Array.from({ length: count }, (_, index) => ({
+    libraryId,
+    fileId: firstFileId + index,
+    folderId: 7,
+    rootId: 3,
+    relativePath: `${libraryId}\\failure-${index + 1}.jpg`,
+    failureKind: "decode",
+    error: "decode failed",
+    updatedAt: now + index
+  }));
 }
 
 interface NotificationWindowFixtureController {
@@ -119,16 +137,8 @@ const compactSnapshot: DesktopNotificationCompactSnapshot = {
       activeBulkTaskCount: 1,
       totalCacheBytes: 86 * 1024 * 1024,
       completionPercent: 82,
-      failureDetails: [{
-        libraryId: "artists",
-        fileId: 42,
-        folderId: 7,
-        rootId: 3,
-        relativePath: "Artists\\Portraits\\a.jpg",
-        failureKind: "decode",
-        error: "decode failed",
-        updatedAt: now
-      }]
+      failureDetails: fixtureFailureDetails("artists", 4, 42),
+      failureDetailsTruncated: false
     },
     {
       libraryId: "references",
@@ -143,16 +153,8 @@ const compactSnapshot: DesktopNotificationCompactSnapshot = {
       activeBulkTaskCount: 2,
       totalCacheBytes: 54 * 1024 * 1024,
       completionPercent: 63,
-      failureDetails: [{
-        libraryId: "references",
-        fileId: 84,
-        folderId: 12,
-        rootId: 5,
-        relativePath: "References\\Archive\\b.jpg",
-        failureKind: "decode",
-        error: "decode failed",
-        updatedAt: now
-      }]
+      failureDetails: fixtureFailureDetails("references", 9, 84),
+      failureDetailsTruncated: false
     }
   ],
   latestImportantResults: [

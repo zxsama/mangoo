@@ -326,7 +326,8 @@ function ThumbnailsTab({
               const intent = thumbnailFailureLogIntentForLibrary(
                 library.thumbnailCacheStatsLibraryId,
                 failed,
-                stats?.failureDetails.length ?? 0
+                stats?.failureDetails.length ?? 0,
+                stats?.failureDetailsTruncated ?? false
               );
               if (!intent || !stats || !library.thumbnailCacheStatsLibraryId ||
                 !library.thumbnailCacheStatsLibraryName) return;

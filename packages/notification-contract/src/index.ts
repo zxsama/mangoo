@@ -46,6 +46,7 @@ export interface DesktopThumbnailCacheSummary {
   totalCacheBytes: number | null;
   completionPercent: number | null;
   failureDetails: ThumbnailFailureDetail[];
+  failureDetailsTruncated: boolean;
 }
 
 export interface ThumbnailFailureDetail {
@@ -195,6 +196,13 @@ export interface NotificationWindowIntent {
     readonly eventKind: "thumbnail_failure";
     readonly libraryId: string;
   };
+  readonly failureSnapshot: ThumbnailFailureSnapshot;
+}
+
+export interface ThumbnailFailureSnapshot {
+  readonly totalCount: number;
+  readonly visibleCount: number;
+  readonly truncated: boolean;
 }
 
 export interface MediaFocusRequest {

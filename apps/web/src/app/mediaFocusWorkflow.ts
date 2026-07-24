@@ -1,8 +1,41 @@
+import type { MediaRecord } from "@megle/core-client";
 import type { MediaFocusCommand } from "@megle/notification-contract";
+import type {
+  LayoutGeometry,
+  LayoutPlacement
+} from "../features/media-grid/layoutGeometry.ts";
 
 export interface MediaGridLocateRequest {
   requestId: string;
   mediaId: number;
+}
+
+export interface JustifiedMediaLocateTarget {
+  placement: LayoutPlacement;
+  placementIndex: number;
+  segmentIndex: number;
+}
+
+export function resolveJustifiedMediaLocateTarget(
+  geometry: LayoutGeometry,
+  mediaSlots: ReadonlyMap<number, MediaRecord>,
+  mediaId: number
+): JustifiedMediaLocateTarget | undefined {
+  let placementIndex: number | undefined;
+  for (const [index, item] of mediaSlots) {
+    if (item.id === mediaId) {
+      placementIndex = index;
+      break;
+    }
+  }
+  if (placementIndex === undefined) return undefined;
+  const placement = geometry.placements[placementIndex];
+  if (!placement || placement.item?.id !== mediaId) return undefined;
+  const segmentIndex = geometry.segments.findIndex((segment) =>
+    segment.itemIndexes.includes(placementIndex!)
+  );
+  if (segmentIndex < 0) return undefined;
+  return { placement, placementIndex, segmentIndex };
 }
 
 export async function prepareMediaFocusNavigation(

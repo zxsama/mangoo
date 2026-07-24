@@ -1,6 +1,10 @@
 import { Activity, History, ScrollText } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
-import type { DesktopProcessLogFilter, NotificationWindowIntent } from "@megle/notification-contract";
+import type {
+  DesktopProcessLogFilter,
+  NotificationWindowIntent,
+  ThumbnailFailureSnapshot
+} from "@megle/notification-contract";
 import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
 import { useOverlayScrollbars } from "../../app-shell/useOverlayScrollbars";
 import { useSecondaryWindowInterfaceStyle } from "../../app-shell/useSecondaryWindowInterfaceStyle";
@@ -24,10 +28,12 @@ export function NotificationWindow() {
   const notifications = useNotifications();
   const [page, setPage] = useState<NotificationPage>("status");
   const [logFilter, setLogFilter] = useState<DesktopProcessLogFilter | null>(null);
+  const [failureSnapshot, setFailureSnapshot] = useState<ThumbnailFailureSnapshot | null>(null);
   const [logIntentVersion, setLogIntentVersion] = useState(0);
 
   const applyIntent = useCallback((intent: NotificationWindowIntent) => {
     setLogFilter(intent.logFilter);
+    setFailureSnapshot(intent.failureSnapshot);
     setLogIntentVersion((version) => version + 1);
     setPage("logs");
   }, []);
@@ -43,6 +49,7 @@ export function NotificationWindow() {
 
   const selectPage = useCallback((nextPage: NotificationPage) => {
     setLogFilter(null);
+    setFailureSnapshot(null);
     setPage(nextPage);
   }, []);
 
@@ -157,6 +164,7 @@ export function NotificationWindow() {
               clearLogs={notifications.clearLogs}
               exportLogs={notifications.exportLogs}
               getLogPage={notifications.getLogPage}
+              failureSnapshot={failureSnapshot}
               initialFilter={logFilter ?? undefined}
               key={logIntentVersion}
               openLogSubscription={notifications.openLogSubscription}

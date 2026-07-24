@@ -189,7 +189,9 @@ function thumbnailSummary(
     pendingCount: 0,
     activeBulkTaskCount: 0,
     totalCacheBytes: cachedCount * 1_024,
-    completionPercent: cachedCount
+    completionPercent: cachedCount,
+    failureDetails: [],
+    failureDetailsTruncated: false
   };
 }
 
@@ -528,6 +530,35 @@ describe("notification store", () => {
           [LIBRARY_B.id, 40]
         ]
       );
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("round-trips the bounded first 100 details with the total failure count", async () => {
+    const store = await createTestStore();
+    try {
+      const failureDetails = Array.from({ length: 100 }, (_, index) => ({
+        libraryId: LIBRARY_A.id,
+        fileId: index + 1,
+        folderId: 7,
+        rootId: 3,
+        relativePath: `Artists\\${index}.jpg`,
+        failureKind: "permanent",
+        error: "decode failed",
+        updatedAt: NOW + index
+      }));
+      await store.publishThumbnailSummary({
+        ...thumbnailSummary(LIBRARY_A, 0),
+        failedCount: 101,
+        failureDetails,
+        failureDetailsTruncated: true
+      });
+
+      const persisted = (await store.compactSnapshot()).thumbnailSummaries[0];
+      assert.equal(persisted?.failedCount, 101);
+      assert.equal(persisted?.failureDetails.length, 100);
+      assert.equal(persisted?.failureDetailsTruncated, true);
     } finally {
       await store.close();
     }

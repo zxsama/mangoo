@@ -24,6 +24,7 @@ import type { LibraryGridPreferences } from "./gridPreferences";
 import type { LibraryLayoutMode } from "./layoutMode";
 import {
   resolveMediaLocateVirtualIndex,
+  resolveJustifiedMediaLocateTarget,
   type MediaGridLocateRequest
 } from "../../app/mediaFocusWorkflow";
 import {
@@ -32,7 +33,8 @@ import {
   collectScopedMediaInViewport,
   findDirectionalNeighborIndex,
   resolveScrollTopForPlacement,
-  type FolderCoverLayoutPlacement
+  type FolderCoverLayoutPlacement,
+  type LayoutPlacement
 } from "./layoutGeometry";
 
 const AHEAD_THUMBNAIL_ROW_COUNT = 4;
@@ -709,6 +711,7 @@ export function MediaGrid({
     }
 
     let virtualSegmentIndex: number | undefined;
+    let exactPlacement: LayoutPlacement | undefined;
     if (windowedMedia) {
       const slotIndex = slotIndexById.get(locateRequest.mediaId);
       if (slotIndex !== undefined) {
@@ -718,6 +721,16 @@ export function MediaGrid({
           mediaRowStartIndex: virtualSectionLayout.mediaRowStartIndex,
           mediaRowCount: virtualSectionLayout.mediaRowCount
         });
+      }
+    } else if (justifiedFullTotal && mediaSlots) {
+      const target = resolveJustifiedMediaLocateTarget(
+        layout,
+        mediaSlots,
+        locateRequest.mediaId
+      );
+      if (target && virtualSectionLayout.mediaRowStartIndex >= 0) {
+        exactPlacement = target.placement;
+        virtualSegmentIndex = virtualSectionLayout.mediaRowStartIndex + target.segmentIndex;
       }
     } else {
       const placementIndex = layoutItemIndexById.get(locateRequest.mediaId);
@@ -762,7 +775,18 @@ export function MediaGrid({
       frame = window.requestAnimationFrame(() => verifyVisible(remainingFrames - 1));
     };
     frame = window.requestAnimationFrame(() => {
-      virtualRows.scrollToIndex(virtualSegmentIndex, { align: "center" });
+      if (exactPlacement) {
+        const currentMediaScrollTop = Math.max(0, element.scrollTop - mediaOffset);
+        const targetMediaScrollTop = resolveScrollTopForPlacement(
+          exactPlacement,
+          element.clientHeight,
+          currentMediaScrollTop,
+          layout.totalSize
+        );
+        virtualRows.scrollToOffset(mediaOffset + targetMediaScrollTop);
+      } else {
+        virtualRows.scrollToIndex(virtualSegmentIndex, { align: "center" });
+      }
       frame = window.requestAnimationFrame(() => verifyVisible(3));
     });
     return () => {
@@ -771,9 +795,13 @@ export function MediaGrid({
     };
   }, [
     layoutItemIndexById,
+    justifiedFullTotal,
+    layout,
     loading,
     locateRequest,
     mediaWindow.columnCount,
+    mediaOffset,
+    mediaSlots,
     onLocateRequestSettled,
     placementSegmentIndexByPlacementIndex,
     resolveMediaVirtualSegmentIndex,

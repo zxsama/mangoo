@@ -86,6 +86,8 @@ function thumbnail(
   libraryId: string,
   overrides: Partial<DesktopThumbnailCacheSummary> = {}
 ): DesktopThumbnailCacheSummary {
+  const failedCount = overrides.failedCount ?? 1;
+  const visibleFailureCount = Math.min(failedCount, 100);
   return {
     libraryId,
     libraryName: libraryId === "library-a" ? "Artists" : "References",
@@ -94,11 +96,22 @@ function thumbnail(
     totalCandidateCount: 100,
     missingCount: 10,
     staleCount: 4,
-    failedCount: 1,
+    failedCount,
     pendingCount: 5,
     activeBulkTaskCount: 1,
     totalCacheBytes: 1024,
     completionPercent: 80,
+    failureDetails: Array.from({ length: visibleFailureCount }, (_, index) => ({
+      libraryId,
+      fileId: index + 1,
+      folderId: 1,
+      rootId: 1,
+      relativePath: `${index + 1}.jpg`,
+      failureKind: "decode",
+      error: "decode failed",
+      updatedAt: 500
+    })),
+    failureDetailsTruncated: failedCount > visibleFailureCount,
     ...overrides
   };
 }
@@ -575,7 +588,7 @@ describe("notification reporting", () => {
           cachedCount: 80,
           missingCount: 12,
           staleCount: 8,
-          failedCount: 2,
+          failedCount: 1,
           pendingCandidateCount: 20,
           totalBlobBytes: 1024,
           activeBulkTaskCount: 1,
@@ -588,7 +601,7 @@ describe("notification reporting", () => {
             error: "decode failed",
             updatedAt: 900
           }],
-          failureDetailsTruncated: true
+          failureDetailsTruncated: false
         },
         library,
         1000
@@ -605,7 +618,7 @@ describe("notification reporting", () => {
           totalCandidateCount: 100,
           missingCount: 12,
           staleCount: 8,
-          failedCount: 2,
+          failedCount: 1,
           pendingCount: 20,
           activeBulkTaskCount: 1,
           totalCacheBytes: 1024,
@@ -619,7 +632,8 @@ describe("notification reporting", () => {
             failureKind: "decode",
             error: "decode failed",
             updatedAt: 900
-          }]
+          }],
+          failureDetailsTruncated: false
         }
       ]);
     } finally {
@@ -699,6 +713,53 @@ describe("notification reporting", () => {
         totalBlobBytes: 1024,
         activeBulkTaskCount: 0,
         failureDetails: [],
+        failureDetailsTruncated: false
+      }, { libraryId: "lib-a", libraryName: "Artists" });
+
+      assert.equal(accepted, false);
+      assert.equal(publishCalls, 0);
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = previousWindow;
+      }
+    }
+  });
+
+  it("rejects a non-truncated failure count that does not match its authoritative details", async () => {
+    const previousWindow = (globalThis as { window?: unknown }).window;
+    let publishCalls = 0;
+    try {
+      (globalThis as { window?: unknown }).window = {
+        megleDesktop: {
+          windowRole: "main",
+          notifications: bridge({
+            publishThumbnailSummary: async () => {
+              publishCalls += 1;
+              return true;
+            }
+          })
+        }
+      };
+
+      const accepted = await publishThumbnailCacheStats({
+        cachedCount: 1,
+        missingCount: 0,
+        staleCount: 0,
+        failedCount: 2,
+        pendingCandidateCount: 0,
+        totalBlobBytes: 1024,
+        activeBulkTaskCount: 0,
+        failureDetails: [{
+          fileId: 42,
+          folderId: 7,
+          rootId: 3,
+          relativePath: "Artists\\Portraits\\a.jpg",
+          failureKind: "decode",
+          error: "decode failed",
+          updatedAt: 900
+        }],
         failureDetailsTruncated: false
       }, { libraryId: "lib-a", libraryName: "Artists" });
 

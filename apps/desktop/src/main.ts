@@ -71,9 +71,19 @@ import {
   type SecondaryWindowRevealState
 } from "./secondary-window-reveal.js";
 import { SecondaryWindowOpeningCoordinator } from "./secondary-window-opening.js";
+import {
+  createStartupLogEmitter,
+  type StartupLogEmitter
+} from "./startup-logging.js";
 
 let mainWindow: BrowserWindow | null = null;
 const mediaFocusCoordinator = new MediaFocusCoordinator();
+const emitMainStartupReady = createStartupLogEmitter(
+  desktopLogger,
+  "main",
+  "Megle desktop ready"
+);
+const rendererStartupEmitters = new WeakMap<WebContents, StartupLogEmitter>();
 type SecondaryWindowRole = "settings" | "plugins" | "notifications";
 type SecondaryWindowConfig = {
   title: string;
@@ -227,7 +237,17 @@ function libraryIdForDbPath(dbPath: string): string | null {
 }
 function coreLogHandlerForSession(session: CoreSession) {
   const libraryId = libraryIdForDbPath(session.dbPath);
+  const emitCoreStartupReady = createStartupLogEmitter(
+    desktopLogger,
+    "core",
+    "Megle Core ready",
+    libraryId ? { libraryId } : {}
+  );
   return (source: "core", level: Parameters<typeof desktopLogger.log>[1], message: string, metadata?: Readonly<Record<string, unknown>>) => {
+    if (level === "info" && message === "Megle Core ready" && metadata?.eventKind === "startup_ready") {
+      emitCoreStartupReady(metadata);
+      return;
+    }
     desktopLogger.structured(source, level, message, {
       ...(metadata ?? {}),
       ...(libraryId ? { libraryId } : {})
@@ -827,6 +847,23 @@ ipcMain.on(NOTIFICATION_IPC_CHANNELS.rendererLogs, (event, input: unknown) => {
   try {
     requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.rendererLogs);
     for (const entry of parseRendererLogEntries(input)) {
+      if (
+        entry.level === "info" &&
+        entry.message === "Megle renderer ready" &&
+        entry.metadata?.eventKind === "startup_ready"
+      ) {
+        let emitStartupReady = rendererStartupEmitters.get(event.sender);
+        if (!emitStartupReady) {
+          emitStartupReady = createStartupLogEmitter(
+            desktopLogger,
+            "renderer",
+            "Megle renderer ready"
+          );
+          rendererStartupEmitters.set(event.sender, emitStartupReady);
+        }
+        emitStartupReady(entry.metadata);
+        continue;
+      }
       if (entry.metadata) {
         desktopLogger.structured("renderer", entry.level, entry.message, entry.metadata);
       } else {
@@ -2196,9 +2233,7 @@ app
     const session = await ensureCoreReady();
     await maybeAutoAddRoot(session);
     await createWindow();
-    desktopLogger.structured("main", "info", "Megle desktop ready", {
-      eventKind: "startup_ready"
-    });
+    emitMainStartupReady();
   })
   .catch(handleDesktopStartupFailure);
 

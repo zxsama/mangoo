@@ -59,11 +59,13 @@ test("notification launch intents and media focus requests are narrow and bounde
   assert.deepEqual(
     ipcModule.parseNotificationWindowIntent({
       page: "logs",
-      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" },
+      failureSnapshot: { totalCount: 101, visibleCount: 100, truncated: true }
     }),
     {
       page: "logs",
-      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" },
+      failureSnapshot: { totalCount: 101, visibleCount: 100, truncated: true }
     }
   );
   assert.deepEqual(
@@ -100,9 +102,10 @@ test("notification launch intents and media focus requests are narrow and bounde
       activeBulkTaskCount: 0,
       totalCacheBytes: 1,
       completionPercent: 50,
-      failureDetails: []
+      failureDetails: [],
+      failureDetailsTruncated: false
     }),
-    /requires failureDetails/i
+    /failureDetails/i
   );
 });
 
@@ -159,7 +162,8 @@ test("notification IPC validators reject malformed or unbounded renderer payload
         activeBulkTaskCount: 0,
         totalCacheBytes: null,
         completionPercent: null,
-        failureDetails: []
+        failureDetails: [],
+        failureDetailsTruncated: false
       }),
     /cachedCount/i
   );

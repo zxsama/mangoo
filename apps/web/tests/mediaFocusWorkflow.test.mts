@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { MediaRecord } from "@megle/core-client";
 import {
   prepareMediaFocusNavigation,
+  resolveJustifiedMediaLocateTarget,
   resolveMediaLocateVirtualIndex
 } from "../src/app/mediaFocusWorkflow.ts";
+import { buildLayoutGeometry } from "../src/features/media-grid/layoutGeometry.ts";
 
 const request = {
   requestId: "focus-1",
@@ -21,6 +24,44 @@ describe("media focus workflow", () => {
       mediaRowStartIndex: 3,
       mediaRowCount: 200_000
     }), 180_003);
+  });
+
+  it("resolves adaptive and waterfall targets from the production full-total justified geometry", () => {
+    const targetIndex = 87;
+    const target: MediaRecord = {
+      id: 42,
+      rootId: 3,
+      folderId: 7,
+      name: "target.jpg",
+      ext: "jpg",
+      size: 1_024,
+      mtime: 100,
+      width: 1_920,
+      height: 1_080
+    };
+    const mediaSlots = new Map<number, MediaRecord>([[targetIndex, target]]);
+
+    for (const layoutMode of ["adaptive", "waterfall"] as const) {
+      const geometry = buildLayoutGeometry({
+        gap: 8,
+        items: [],
+        labelHeight: 36,
+        layoutMode,
+        viewportWidth: 960,
+        tileMinWidth: 180,
+        totalCount: 120,
+        getItemAt: (index) => mediaSlots.get(index),
+        estimatedRatio: 1
+      });
+      const resolved = resolveJustifiedMediaLocateTarget(geometry, mediaSlots, target.id);
+
+      assert.equal(resolved?.placementIndex, targetIndex);
+      assert.equal(resolved?.placement.item?.id, target.id);
+      assert.equal(
+        geometry.segments[resolved!.segmentIndex]?.itemIndexes.includes(targetIndex),
+        true
+      );
+    }
   });
 
   it("closes preview before navigation and returns an explicit grid locate request", async () => {

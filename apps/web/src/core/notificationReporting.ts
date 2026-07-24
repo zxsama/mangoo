@@ -221,11 +221,10 @@ export function publishThumbnailCacheStats(
   const libraryId = boundedString(context.libraryId, LIBRARY_ID_MAX_LENGTH);
   const libraryName = boundedString(context.libraryName, LIBRARY_NAME_MAX_LENGTH);
   if (!libraryId || !libraryName) return Promise.resolve(false);
-  if (
-    (stats.failedCount === 0 && stats.failureDetails.length > 0) ||
-    (stats.failedCount > 0 && stats.failureDetails.length === 0) ||
-    stats.failureDetails.length > stats.failedCount
-  ) {
+  const failureSnapshotConsistent = stats.failureDetailsTruncated
+    ? stats.failureDetails.length === 100 && stats.failedCount > stats.failureDetails.length
+    : stats.failedCount === stats.failureDetails.length;
+  if (!failureSnapshotConsistent) {
     return Promise.resolve(false);
   }
 
@@ -243,6 +242,7 @@ export function publishThumbnailCacheStats(
     activeBulkTaskCount: snapshot.activeBulkTaskCount,
     totalCacheBytes: stats.totalBlobBytes,
     completionPercent: snapshot.percent,
+    failureDetailsTruncated: stats.failureDetailsTruncated,
     failureDetails: stats.failureDetails.slice(0, 100).map((detail) => ({
       libraryId,
       ...detail

@@ -2,12 +2,20 @@ import type {
   DesktopProcessLogBatch,
   DesktopProcessLogFilter,
   DesktopProcessLogLine,
+  ThumbnailFailureSnapshot,
   ThumbnailFailureDetail
 } from "@megle/notification-contract";
 
 export type ProcessLogRow =
   | { kind: "log"; line: DesktopProcessLogLine }
   | { kind: "failure"; detail: ThumbnailFailureDetail };
+
+export function thumbnailFailureTruncationMessage(
+  snapshot: ThumbnailFailureSnapshot | null | undefined
+): string | null {
+  if (!snapshot?.truncated) return null;
+  return `仅显示前 ${snapshot.visibleCount.toLocaleString()} 条失败记录，共 ${snapshot.totalCount.toLocaleString()} 条。`;
+}
 
 export function buildProcessLogRows(
   logs: readonly DesktopProcessLogLine[],
