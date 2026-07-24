@@ -138,7 +138,8 @@ const compactSnapshot: DesktopNotificationCompactSnapshot = {
       totalCacheBytes: 86 * 1024 * 1024,
       completionPercent: 82,
       failureDetails: fixtureFailureDetails("artists", 4, 42),
-      failureDetailsTruncated: false
+      failureDetailsTruncated: false,
+      failureDetailsUnavailable: false
     },
     {
       libraryId: "references",
@@ -154,7 +155,8 @@ const compactSnapshot: DesktopNotificationCompactSnapshot = {
       totalCacheBytes: 54 * 1024 * 1024,
       completionPercent: 63,
       failureDetails: fixtureFailureDetails("references", 9, 84),
-      failureDetailsTruncated: false
+      failureDetailsTruncated: false,
+      failureDetailsUnavailable: false
     }
   ],
   latestImportantResults: [

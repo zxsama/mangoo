@@ -16,7 +16,10 @@ import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
-import { activateThumbnailFailureLogs } from "./notificationModel";
+import {
+  activateThumbnailFailureLogs,
+  thumbnailFailureDetailsUnavailableMessage
+} from "./notificationModel";
 import type { NotificationRequestResult } from "./useNotifications";
 import {
   beginNotificationAction,
@@ -302,6 +305,7 @@ function ThumbnailStatus({
   onOpenFailureLogs(intent: NotificationWindowIntent): void;
   summary: DesktopThumbnailCacheSummary;
 }) {
+  const unavailableMessage = thumbnailFailureDetailsUnavailableMessage(summary);
   const percent =
     summary.completionPercent ??
     (summary.totalCandidateCount > 0
@@ -329,7 +333,7 @@ function ThumbnailStatus({
         <div>
           <dt>失败</dt>
           <dd>
-            {summary.failedCount > 0 ? (
+            {summary.failedCount > 0 && !unavailableMessage ? (
               <button
                 className="notification-thumbnail-failure-action"
                 onClick={() => activateThumbnailFailureLogs(summary, onOpenFailureLogs)}
@@ -337,6 +341,10 @@ function ThumbnailStatus({
               >
                 {summary.failedCount.toLocaleString()}
               </button>
+            ) : summary.failedCount > 0 ? (
+              <span title={unavailableMessage ?? undefined}>
+                {summary.failedCount.toLocaleString()} · 详情不可用
+              </span>
             ) : "0"}
           </dd>
         </div>

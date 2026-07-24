@@ -191,7 +191,8 @@ function thumbnailSummary(
     totalCacheBytes: cachedCount * 1_024,
     completionPercent: cachedCount,
     failureDetails: [],
-    failureDetailsTruncated: false
+    failureDetailsTruncated: false,
+    failureDetailsUnavailable: false
   };
 }
 
@@ -552,7 +553,8 @@ describe("notification store", () => {
         ...thumbnailSummary(LIBRARY_A, 0),
         failedCount: 101,
         failureDetails,
-        failureDetailsTruncated: true
+        failureDetailsTruncated: true,
+        failureDetailsUnavailable: false
       });
 
       const persisted = (await store.compactSnapshot()).thumbnailSummaries[0];
@@ -576,6 +578,7 @@ describe("notification store", () => {
     const legacyTruncatedLibrary = LIBRARY_B;
     const exactLibrary = { id: "library-c", name: "Library C" };
     const malformedLibrary = { id: "library-d", name: "Library D" };
+    const trueLegacyLibrary = { id: "library-e", name: "Library E" };
     const details = (libraryId: string, count: number) =>
       Array.from({ length: count }, (_, index) => ({
         libraryId,
@@ -602,8 +605,17 @@ describe("notification store", () => {
         ...thumbnailSummary(malformedLibrary, 0),
         failedCount: 2,
         failureDetails: details(malformedLibrary.id, 1)
+      },
+      {
+        ...thumbnailSummary(trueLegacyLibrary, 0),
+        failedCount: 7
       }
-    ].map(({ failureDetailsTruncated: _omitted, ...summary }) => summary);
+    ].map(({
+      failureDetailsTruncated: _truncationOmitted,
+      failureDetailsUnavailable: _availabilityOmitted,
+      ...summary
+    }) => summary);
+    delete rawSummaries[3]?.failureDetails;
 
     const inspection = new DatabaseSync(databasePath);
     try {
@@ -644,6 +656,12 @@ describe("notification store", () => {
       assert.equal(malformed?.failedCount, 0);
       assert.deepEqual(malformed?.failureDetails, []);
       assert.equal(malformed?.failureDetailsTruncated, false);
+
+      const trueLegacy = summaries.find((item) => item.libraryId === trueLegacyLibrary.id);
+      assert.equal(trueLegacy?.failedCount, 7);
+      assert.deepEqual(trueLegacy?.failureDetails, []);
+      assert.equal(trueLegacy?.failureDetailsTruncated, false);
+      assert.equal(trueLegacy?.failureDetailsUnavailable, true);
     } finally {
       await reloaded.close();
     }

@@ -8,6 +8,7 @@ import type {
   RendererErrorReport,
   ProcessLogSubscriptionEvent,
   ProcessLogSubscriptionStart,
+  DesktopThumbnailCacheSummary,
   ThumbnailFailureDetail
 } from "../src/index.js";
 import {
@@ -27,6 +28,7 @@ declare const rendererReport: RendererErrorReport;
 declare const intent: NotificationWindowIntent;
 declare const focus: MediaFocusRequest;
 declare const failure: ThumbnailFailureDetail;
+declare const thumbnailSummary: DesktopThumbnailCacheSummary;
 
 void coreOperation;
 void traceLevel;
@@ -40,6 +42,7 @@ void intent.logFilter.eventKind;
 void intent.failureSnapshot.truncated;
 void focus.fileId;
 void failure.relativePath;
+void thumbnailSummary.failureDetailsUnavailable;
 void rendererErrorIdentityKey(rendererReport);
 void rendererErrorOperationId(rendererReport.libraryId, rendererReport);
 void legacyRendererErrorOperationId(rendererReport.libraryId, rendererReport);

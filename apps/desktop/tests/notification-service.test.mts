@@ -418,7 +418,8 @@ function thumbnailSummary(library = LIBRARY_A): ThumbnailCacheSummary {
     totalCacheBytes: 1_024,
     completionPercent: 80,
     failureDetails: [],
-    failureDetailsTruncated: false
+    failureDetailsTruncated: false,
+    failureDetailsUnavailable: false
   };
 }
 

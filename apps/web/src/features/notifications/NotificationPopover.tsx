@@ -22,7 +22,10 @@ import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
-import { activateThumbnailFailureLogs } from "./notificationModel";
+import {
+  activateThumbnailFailureLogs,
+  thumbnailFailureDetailsUnavailableMessage
+} from "./notificationModel";
 import { observeNotificationPopoverMeasurements } from "./notificationPopoverMeasurement";
 import { resolveNotificationPopoverPosition } from "./notificationPopoverPosition";
 import {
@@ -303,6 +306,7 @@ function ThumbnailSummaryRow({
   onOpenCenter: (intent?: NotificationWindowIntent) => void;
   summary: DesktopThumbnailCacheSummary;
 }) {
+  const unavailableMessage = thumbnailFailureDetailsUnavailableMessage(summary);
   const status = thumbnailStatusParts(summary).filter((part) => part.kind !== "failure");
   const libraryLabel = summary.libraryName || summary.libraryId;
   return (
@@ -342,7 +346,7 @@ function ThumbnailSummaryRow({
         <span className="notification-thumbnail-status">
           {status.length > 0 ? status.map((part) => part.label).join(" · ") : "已同步"}
         </span>
-        {summary.failedCount > 0 ? (
+        {summary.failedCount > 0 && !unavailableMessage ? (
           <button
             className="notification-thumbnail-failure-action"
             onClick={() => activateThumbnailFailureLogs(summary, onOpenCenter)}
@@ -350,6 +354,10 @@ function ThumbnailSummaryRow({
           >
             {summary.failedCount.toLocaleString()} 失败
           </button>
+        ) : summary.failedCount > 0 ? (
+          <span title={unavailableMessage ?? undefined}>
+            {summary.failedCount.toLocaleString()} 失败 · 详情不可用
+          </span>
         ) : null}
         {summary.totalCacheBytes == null ? null : <span>{formatBytes(summary.totalCacheBytes)}</span>}
       </div>

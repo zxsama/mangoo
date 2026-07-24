@@ -209,6 +209,10 @@ function validateThumbnailSummary(summary: ThumbnailCacheSummary): void {
   }
   const details = summary.failureDetails ?? [];
   const truncated = summary.failureDetailsTruncated === true;
+  const unavailable = summary.failureDetailsUnavailable === true;
+  if (typeof summary.failureDetailsUnavailable !== "boolean") {
+    throw new TypeError("summary.failureDetailsUnavailable must be a boolean");
+  }
   if (!Array.isArray(details) || details.length > 100) {
     throw new RangeError("summary.failureDetails must contain at most 100 entries");
   }
@@ -226,6 +230,12 @@ function validateThumbnailSummary(summary: ThumbnailCacheSummary): void {
     if (typeof detail.error !== "string") throw new TypeError("thumbnail failure detail.error must be a string");
     assertSafeInteger(detail.updatedAt, "thumbnail failure detail.updatedAt");
   }
+  if (unavailable) {
+    if (summary.failedCount <= 0 || details.length !== 0 || truncated) {
+      throw new RangeError("unavailable failure details require a positive count without detail rows");
+    }
+    return;
+  }
   if (summary.failedCount === 0 && (details.length !== 0 || truncated)) {
     throw new RangeError("zero failedCount requires an empty untruncated failure snapshot");
   }
@@ -242,28 +252,41 @@ function validateThumbnailSummary(summary: ThumbnailCacheSummary): void {
 }
 
 function normalizeThumbnailSummary(summary: ThumbnailCacheSummary): ThumbnailCacheSummary {
+  const detailsFieldMissing = !Object.prototype.hasOwnProperty.call(summary, "failureDetails");
   const details = Array.isArray(summary.failureDetails) ? summary.failureDetails : [];
   const legacyTruncationFieldMissing = !Object.prototype.hasOwnProperty.call(
     summary,
     "failureDetailsTruncated"
+  );
+  const legacyUnavailableFieldMissing = !Object.prototype.hasOwnProperty.call(
+    summary,
+    "failureDetailsUnavailable"
   );
   const truncated =
     summary.failureDetailsTruncated === true ||
     (legacyTruncationFieldMissing &&
       summary.failedCount > details.length &&
       details.length === 100);
+  const unavailable = summary.failureDetailsUnavailable === true ||
+    (detailsFieldMissing &&
+      legacyTruncationFieldMissing &&
+      legacyUnavailableFieldMissing &&
+      summary.failedCount > 0);
   const hasConsistentFailureSnapshot =
-    (summary.failedCount === 0 && details.length === 0 && !truncated) ||
-    (summary.failedCount > 0 && !truncated && details.length === summary.failedCount) ||
-    (summary.failedCount > details.length && details.length === 100 && truncated);
+    !unavailable && (
+      (summary.failedCount === 0 && details.length === 0 && !truncated) ||
+      (summary.failedCount > 0 && !truncated && details.length === summary.failedCount) ||
+      (summary.failedCount > details.length && details.length === 100 && truncated)
+    );
+  const hasUnavailableFailureSnapshot =
+    unavailable && summary.failedCount > 0 && details.length === 0 && !truncated;
+  const preserveFailureCount = hasConsistentFailureSnapshot || hasUnavailableFailureSnapshot;
   return {
     ...summary,
-    // Legacy and pre-atomic summaries may carry a stale positive count with no
-    // matching details. Collapse both fields together rather than persisting a
-    // clickable count that cannot resolve to authoritative rows.
-    failedCount: hasConsistentFailureSnapshot ? summary.failedCount : 0,
+    failedCount: preserveFailureCount ? summary.failedCount : 0,
     failureDetails: hasConsistentFailureSnapshot ? details : [],
-    failureDetailsTruncated: hasConsistentFailureSnapshot ? truncated : false
+    failureDetailsTruncated: hasConsistentFailureSnapshot ? truncated : false,
+    failureDetailsUnavailable: hasUnavailableFailureSnapshot
   };
 }
 

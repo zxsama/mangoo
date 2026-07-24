@@ -47,6 +47,7 @@ export interface DesktopThumbnailCacheSummary {
   completionPercent: number | null;
   failureDetails: ThumbnailFailureDetail[];
   failureDetailsTruncated: boolean;
+  failureDetailsUnavailable: boolean;
 }
 
 export interface ThumbnailFailureDetail {

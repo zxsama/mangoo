@@ -243,6 +243,7 @@ export function publishThumbnailCacheStats(
     totalCacheBytes: stats.totalBlobBytes,
     completionPercent: snapshot.percent,
     failureDetailsTruncated: stats.failureDetailsTruncated,
+    failureDetailsUnavailable: false,
     failureDetails: stats.failureDetails.slice(0, 100).map((detail) => ({
       libraryId,
       ...detail

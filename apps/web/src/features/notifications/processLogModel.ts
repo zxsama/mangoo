@@ -26,12 +26,23 @@ export function buildProcessLogRows(
   );
   const persistentRows = authoritativeFailures
     .filter((detail) => !currentFailureKeys.has(thumbnailFailureKey(detail.libraryId, detail.fileId)))
-    .sort((left, right) => right.updatedAt - left.updatedAt || left.fileId - right.fileId)
     .map((detail): ProcessLogRow => ({ kind: "failure", detail }));
   return [
     ...persistentRows,
     ...logs.map((line): ProcessLogRow => ({ kind: "log", line }))
-  ];
+  ].sort(compareProcessLogRows);
+}
+
+function compareProcessLogRows(left: ProcessLogRow, right: ProcessLogRow): number {
+  const leftTimestamp = left.kind === "log" ? left.line.timestamp : left.detail.updatedAt;
+  const rightTimestamp = right.kind === "log" ? right.line.timestamp : right.detail.updatedAt;
+  if (leftTimestamp !== rightTimestamp) return leftTimestamp - rightTimestamp;
+  if (left.kind === "log" && right.kind === "log") return left.line.sequence - right.line.sequence;
+  if (left.kind === "failure" && right.kind === "failure") {
+    return left.detail.libraryId.localeCompare(right.detail.libraryId) ||
+      left.detail.fileId - right.detail.fileId;
+  }
+  return left.kind === "failure" ? -1 : 1;
 }
 
 function thumbnailFailureKeyFromLog(line: DesktopProcessLogLine): string | null {

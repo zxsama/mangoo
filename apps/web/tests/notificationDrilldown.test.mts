@@ -9,6 +9,7 @@ import type {
 import {
   activateThumbnailFailureLogs,
   buildCompactNotificationModel,
+  thumbnailFailureDetailsUnavailableMessage,
   thumbnailFailureLogIntent,
   thumbnailFailureLogIntentForLibrary
 } from "../src/features/notifications/notificationModel.ts";
@@ -75,7 +76,8 @@ function summary(failedCount: number): DesktopThumbnailCacheSummary {
       error: "decode failed",
       updatedAt: 123 + index
     })),
-    failureDetailsTruncated: failedCount > visibleCount
+    failureDetailsTruncated: failedCount > visibleCount,
+    failureDetailsUnavailable: false
   };
 }
 
@@ -167,6 +169,40 @@ describe("notification drilldown", () => {
     assert.equal(none.active.length, 0);
   });
 
+  it("keeps one path row per active scan operation even when display paths match", () => {
+    const snapshot: DesktopNotificationCompactSnapshot = {
+      active: [
+        scan("task:7", "Artists\\Portraits", 20, 100),
+        scan("task:8", "Artists\\Portraits", 10, 50)
+      ],
+      thumbnailSummaries: [],
+      latestImportantResults: [],
+      hasRetryableFailure: false,
+      syncHealth: { state: "healthy", libraryId: "library-a", detail: null, updatedAt: 1 }
+    };
+
+    const aggregate = buildCompactNotificationModel(snapshot).active[0];
+    assert.deepEqual(aggregate?.paths, ["Artists\\Portraits", "Artists\\Portraits"]);
+    assert.equal(aggregate?.sourceOperations.length, 2);
+  });
+
+  it("preserves an honest inert state for legacy failure counts without details", () => {
+    const legacy = {
+      ...summary(0),
+      failedCount: 7,
+      failureDetails: [],
+      failureDetailsTruncated: false,
+      failureDetailsUnavailable: true
+    };
+
+    assert.equal(thumbnailFailureLogIntent(legacy), null);
+    assert.equal(activateThumbnailFailureLogs(legacy, () => assert.fail("must remain inert")), false);
+    assert.equal(
+      thumbnailFailureDetailsUnavailableMessage(legacy),
+      "旧记录未包含失败详情"
+    );
+  });
+
   it("merges authoritative persisted failures without duplicating current-session rows", () => {
     const current: DesktopProcessLogLine = {
       sequence: 9,
@@ -189,5 +225,22 @@ describe("notification drilldown", () => {
     assert.equal(rows.length, 2);
     assert.equal(rows.filter((row) => row.kind === "log").length, 1);
     assert.equal(rows.filter((row) => row.kind === "failure").length, 1);
+  });
+
+  it("chronologically merges persistent failures with live logs so follow lands newest", () => {
+    const logs: DesktopProcessLogLine[] = [
+      { sequence: 2, timestamp: 400, source: "main", level: "info", message: "newest" },
+      { sequence: 1, timestamp: 200, source: "main", level: "info", message: "middle" }
+    ];
+    const failures = [
+      { ...summary(2).failureDetails[0]!, fileId: 80, updatedAt: 300 },
+      { ...summary(2).failureDetails[1]!, fileId: 70, updatedAt: 100 }
+    ];
+
+    const rows = buildProcessLogRows(logs, failures);
+    assert.deepEqual(
+      rows.map((row) => row.kind === "log" ? row.line.timestamp : row.detail.updatedAt),
+      [100, 200, 300, 400]
+    );
   });
 });

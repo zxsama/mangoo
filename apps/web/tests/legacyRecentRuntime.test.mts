@@ -82,6 +82,11 @@ describe("legacy Recent runtime removal", () => {
     assert.doesNotMatch(navigationReloadSection, /reportLibraryFailure\([\s\S]*navigation-load-failed/);
   });
 
+  it("opens Settings failure details without republishing a stale local snapshot", () => {
+    assert.doesNotMatch(settingsPanelsSource, /publishThumbnailCacheStats/);
+    assert.match(settingsPanelsSource, /openNotificationsWindow\(intent\)/);
+  });
+
   it("propagates scan failures to backoff and handles every fire-and-forget task refresh", () => {
     const scanRefreshSection = source.slice(
       source.indexOf("const refreshCurrentScanView ="),

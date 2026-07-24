@@ -192,7 +192,15 @@ export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummar
   if (typeof input.failureDetailsTruncated !== "boolean") {
     throw new TypeError("failureDetailsTruncated must be a boolean");
   }
-  validateThumbnailFailureSnapshot(failedCount, failureDetails, input.failureDetailsTruncated);
+  if (typeof input.failureDetailsUnavailable !== "boolean") {
+    throw new TypeError("failureDetailsUnavailable must be a boolean");
+  }
+  validateThumbnailFailureSnapshot(
+    failedCount,
+    failureDetails,
+    input.failureDetailsTruncated,
+    input.failureDetailsUnavailable
+  );
   return {
     libraryId,
     libraryName: boundedString(input.libraryName, "libraryName", 256),
@@ -217,7 +225,8 @@ export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummar
     totalCacheBytes,
     completionPercent,
     failureDetails,
-    failureDetailsTruncated: input.failureDetailsTruncated
+    failureDetailsTruncated: input.failureDetailsTruncated,
+    failureDetailsUnavailable: input.failureDetailsUnavailable
   };
 }
 
@@ -246,8 +255,15 @@ function parseThumbnailFailureDetails(value: unknown, libraryId: string): Thumbn
 function validateThumbnailFailureSnapshot(
   failedCount: number,
   failureDetails: ThumbnailCacheSummary["failureDetails"],
-  truncated: boolean
+  truncated: boolean,
+  unavailable: boolean
 ): void {
+  if (unavailable) {
+    if (failedCount <= 0 || failureDetails.length !== 0 || truncated) {
+      throw new RangeError("unavailable failure details require a positive count without detail rows");
+    }
+    return;
+  }
   if (failedCount === 0) {
     if (failureDetails.length !== 0 || truncated) {
       throw new RangeError("zero failedCount requires an empty untruncated failure snapshot");

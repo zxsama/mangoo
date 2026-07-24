@@ -112,6 +112,7 @@ function thumbnail(
       updatedAt: 500
     })),
     failureDetailsTruncated: failedCount > visibleFailureCount,
+    failureDetailsUnavailable: false,
     ...overrides
   };
 }
@@ -601,7 +602,8 @@ describe("notification reporting", () => {
             error: "decode failed",
             updatedAt: 900
           }],
-          failureDetailsTruncated: false
+          failureDetailsTruncated: false,
+          failureDetailsUnavailable: false
         },
         library,
         1000
@@ -633,7 +635,8 @@ describe("notification reporting", () => {
             error: "decode failed",
             updatedAt: 900
           }],
-          failureDetailsTruncated: false
+          failureDetailsTruncated: false,
+          failureDetailsUnavailable: false
         }
       ]);
     } finally {
@@ -671,7 +674,8 @@ describe("notification reporting", () => {
           totalBlobBytes: 1024,
           activeBulkTaskCount: 0,
           failureDetails: [],
-          failureDetailsTruncated: false
+          failureDetailsTruncated: false,
+          failureDetailsUnavailable: false
         },
         { libraryId: "lib-a", libraryName: "Artists" },
         1000
@@ -713,7 +717,8 @@ describe("notification reporting", () => {
         totalBlobBytes: 1024,
         activeBulkTaskCount: 0,
         failureDetails: [],
-        failureDetailsTruncated: false
+        failureDetailsTruncated: false,
+        failureDetailsUnavailable: false
       }, { libraryId: "lib-a", libraryName: "Artists" });
 
       assert.equal(accepted, false);
@@ -760,7 +765,8 @@ describe("notification reporting", () => {
           error: "decode failed",
           updatedAt: 900
         }],
-        failureDetailsTruncated: false
+        failureDetailsTruncated: false,
+        failureDetailsUnavailable: false
       }, { libraryId: "lib-a", libraryName: "Artists" });
 
       assert.equal(accepted, false);

@@ -32,7 +32,6 @@ import {
   switchLibrary
 } from "../../core/desktop";
 import type { LibrarySummary } from "../../core/libraryTypes";
-import { publishThumbnailCacheStats } from "../../core/notificationReporting";
 import type { LibraryState } from "../../core/useLibraryData";
 import type { InterfaceStyleController } from "../../design/liquid-glass";
 import { thumbnailFailureLogIntentForLibrary } from "../notifications/notificationModel";
@@ -329,14 +328,7 @@ function ThumbnailsTab({
                 stats?.failureDetails.length ?? 0,
                 stats?.failureDetailsTruncated ?? false
               );
-              if (!intent || !stats || !library.thumbnailCacheStatsLibraryId ||
-                !library.thumbnailCacheStatsLibraryName) return;
-              void publishThumbnailCacheStats(stats, {
-                libraryId: library.thumbnailCacheStatsLibraryId,
-                libraryName: library.thumbnailCacheStatsLibraryName
-              }).then((published) => {
-                if (published) void openNotificationsWindow(intent);
-              });
+              if (intent) void openNotificationsWindow(intent);
             } : undefined}
             value={stats ? failed.toLocaleString() : "-"}
           />

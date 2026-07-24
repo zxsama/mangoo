@@ -215,7 +215,7 @@ function aggregateInteractiveFolderScans(
     updatedAt: Math.max(...scans.map((operation) => operation.updatedAt)),
     startedAt: Math.min(...scans.map((operation) => operation.startedAt)),
     sourceOperations: scans,
-    paths: [...new Set(scans.map(operationSummary).filter(Boolean))]
+    paths: scans.map(operationSummary).filter(Boolean)
   };
   return [
     ...operations.filter((operation) => operation.kind !== "interactive_folder_scan"),
@@ -234,7 +234,8 @@ export function thumbnailFailureLogIntent(
     summary.libraryId,
     summary.failedCount,
     summary.failureDetails.length,
-    summary.failureDetailsTruncated
+    summary.failureDetailsTruncated,
+    summary.failureDetailsUnavailable
   );
 }
 
@@ -242,8 +243,10 @@ export function thumbnailFailureLogIntentForLibrary(
   libraryId: string | null | undefined,
   failedCount: number,
   failureDetailCount: number,
-  failureDetailsTruncated: boolean
+  failureDetailsTruncated: boolean,
+  failureDetailsUnavailable = false
 ): NotificationWindowIntent | null {
+  if (failureDetailsUnavailable) return null;
   const consistent = failureDetailsTruncated
     ? failedCount > failureDetailCount && failureDetailCount === 100
     : failedCount === failureDetailCount;
@@ -260,6 +263,14 @@ export function thumbnailFailureLogIntentForLibrary(
       truncated: failureDetailsTruncated
     }
   };
+}
+
+export function thumbnailFailureDetailsUnavailableMessage(
+  summary: DesktopThumbnailCacheSummary
+): string | null {
+  return summary.failedCount > 0 && summary.failureDetailsUnavailable
+    ? "旧记录未包含失败详情"
+    : null;
 }
 
 export function activateThumbnailFailureLogs(

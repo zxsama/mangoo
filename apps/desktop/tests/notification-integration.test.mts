@@ -103,7 +103,8 @@ test("notification launch intents and media focus requests are narrow and bounde
       totalCacheBytes: 1,
       completionPercent: 50,
       failureDetails: [],
-      failureDetailsTruncated: false
+      failureDetailsTruncated: false,
+      failureDetailsUnavailable: false
     }),
     /failureDetails/i
   );
@@ -163,7 +164,8 @@ test("notification IPC validators reject malformed or unbounded renderer payload
         totalCacheBytes: null,
         completionPercent: null,
         failureDetails: [],
-        failureDetailsTruncated: false
+        failureDetailsTruncated: false,
+        failureDetailsUnavailable: false
       }),
     /cachedCount/i
   );
