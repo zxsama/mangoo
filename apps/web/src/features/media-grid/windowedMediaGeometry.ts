@@ -65,6 +65,45 @@ export interface WindowedMediaGeometry {
   itemIndexesInRange: (rangeStart: number, rangeEnd: number) => number[];
 }
 
+export interface WindowedMediaVirtualizationPlan {
+  mediaSegmentIndexes: number[];
+  spacerSize: number;
+  virtualizerCount: number;
+}
+
+export function buildWindowedMediaVirtualizationPlan({
+  geometry,
+  mediaOffset,
+  overscanSegments,
+  prefixVirtualRowCount,
+  scrollTop,
+  viewportHeight
+}: {
+  geometry: WindowedMediaGeometry;
+  mediaOffset: number;
+  overscanSegments: number;
+  prefixVirtualRowCount: number;
+  scrollTop: number;
+  viewportHeight: number;
+}): WindowedMediaVirtualizationPlan {
+  const rangeStart = Math.max(0, scrollTop - mediaOffset);
+  const rangeEnd = Math.min(
+    geometry.totalSize,
+    Math.max(rangeStart, scrollTop + Math.max(0, viewportHeight) - mediaOffset)
+  );
+  const visibleStart = firstIntersectingSegment(geometry, rangeStart);
+  const visibleEnd = firstSegmentStartingAtOrAfter(geometry, rangeEnd);
+  const overscan = Math.max(0, Math.floor(overscanSegments));
+  const start = Math.max(0, visibleStart - overscan);
+  const end = Math.min(geometry.segmentCount, Math.max(visibleStart, visibleEnd) + overscan);
+
+  return {
+    mediaSegmentIndexes: sequentialIndexes(start, end),
+    spacerSize: Math.max(0, mediaOffset) + geometry.totalSize,
+    virtualizerCount: Math.max(0, Math.floor(prefixVirtualRowCount))
+  };
+}
+
 export function buildWindowedMediaGeometry({
   count,
   gap,
@@ -485,6 +524,30 @@ function variableSegmentIndexes(
     indexes.push(...segment.itemIndexes);
   }
   return indexes;
+}
+
+function firstIntersectingSegment(geometry: WindowedMediaGeometry, offset: number) {
+  let low = 0;
+  let high = geometry.segmentCount;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    const segment = geometry.resolveSegment(middle)!;
+    if (segment.start + segment.size <= offset) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function firstSegmentStartingAtOrAfter(geometry: WindowedMediaGeometry, offset: number) {
+  let low = 0;
+  let high = geometry.segmentCount;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    const segment = geometry.resolveSegment(middle)!;
+    if (segment.start < offset) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 function periodicPrefix(pattern: readonly number[], patternSum: number, count: number) {

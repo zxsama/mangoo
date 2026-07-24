@@ -38,6 +38,7 @@ import {
 } from "./layoutGeometry";
 import {
   buildWindowedMediaGeometry,
+  buildWindowedMediaVirtualizationPlan,
   resolveMediaGeometryStrategy,
   stableWindowedAspectRatio,
   type WindowedMediaPlacement
@@ -530,8 +531,30 @@ export function MediaGrid({
     },
     [virtualSectionLayout]
   );
+  const mediaOverscanSegments = layoutMode === "waterfall" ? 10 : 8;
+  const windowedVirtualization = useMemo(
+    () => buildWindowedMediaVirtualizationPlan({
+      geometry: mediaWindow,
+      mediaOffset,
+      overscanSegments: mediaOverscanSegments,
+      prefixVirtualRowCount: virtualSectionLayout.mediaRowStartIndex,
+      scrollTop,
+      viewportHeight: Math.max(viewportSize.height, activeMediaEstimatedSegmentSize)
+    }),
+    [
+      activeMediaEstimatedSegmentSize,
+      mediaOffset,
+      mediaOverscanSegments,
+      mediaWindow,
+      scrollTop,
+      viewportSize.height,
+      virtualSectionLayout.mediaRowStartIndex
+    ]
+  );
   const virtualRows = useVirtualizer({
-    count: virtualSectionLayout.totalCount,
+    count: windowedMedia
+      ? windowedVirtualization.virtualizerCount
+      : virtualSectionLayout.totalCount,
     getScrollElement: () => parentRef.current,
     estimateSize: (index) => resolveVirtualSegment(index)?.size ?? activeMediaEstimatedSegmentSize,
     initialOffset: savedScrollTop,
@@ -541,7 +564,7 @@ export function MediaGrid({
     // Larger overscan means the working set stays mounted (already decoded), so
     // back-and-forth scrolling never re-decodes. Bounded (the virtualizer only
     // ever mounts viewport+overscan), so memory stays capped — not permanent.
-    overscan: layoutMode === "waterfall" ? 10 : 8,
+    overscan: mediaOverscanSegments,
   });
   const virtualItems = virtualRows.getVirtualItems();
 
@@ -565,10 +588,12 @@ export function MediaGrid({
     }
 
     let mediaSegmentIndex: number | undefined;
+    let windowedPlacement: WindowedMediaPlacement | undefined;
     if (windowedMedia) {
       const slotIndex = slotIndexById.get(selectedMediaId);
       if (slotIndex === undefined) return;
       mediaSegmentIndex = mediaWindow.segmentIndexForItem(slotIndex);
+      windowedPlacement = mediaWindow.resolvePlacement(slotIndex);
     } else {
       let placementIndex = layoutItemIndexById.get(selectedMediaId);
       if (placementIndex === undefined) {
@@ -585,7 +610,19 @@ export function MediaGrid({
     if (virtualSegmentIndex === undefined) return;
 
     const frame = window.requestAnimationFrame(() => {
-      virtualRows.scrollToIndex(virtualSegmentIndex, { align: "center" });
+      if (windowedMedia && windowedPlacement) {
+        const centeredMediaScrollTop = Math.max(
+          0,
+          Math.min(
+            Math.max(0, mediaWindow.totalSize - element.clientHeight),
+            windowedPlacement.top + windowedPlacement.frameHeight / 2 - element.clientHeight / 2
+          )
+        );
+        scrollPersistenceUnlockedRef.current = true;
+        element.scrollTop = mediaOffset + centeredMediaScrollTop;
+      } else {
+        virtualRows.scrollToIndex(virtualSegmentIndex, { align: "center" });
+      }
       lastCenteredLayoutTransitionKeyRef.current = sidebarLayoutTransitionKey;
     });
     return () => window.cancelAnimationFrame(frame);
@@ -594,6 +631,7 @@ export function MediaGrid({
     layoutItemIndexById,
     placementSegmentIndexByPlacementIndex,
     mediaWindow,
+    mediaOffset,
     resolveMediaVirtualSegmentIndex,
     selectedMediaId,
     sidebarLayoutTransitionKey,
@@ -692,9 +730,10 @@ export function MediaGrid({
           exactPlacement,
           element.clientHeight,
           currentMediaScrollTop,
-          layout.totalSize
+          windowedMedia ? mediaWindow.totalSize : layout.totalSize
         );
-        virtualRows.scrollToOffset(mediaOffset + targetMediaScrollTop);
+        scrollPersistenceUnlockedRef.current = true;
+        element.scrollTop = mediaOffset + targetMediaScrollTop;
       } else {
         virtualRows.scrollToIndex(virtualSegmentIndex, { align: "center" });
       }
@@ -1114,12 +1153,14 @@ export function MediaGrid({
     ]
   );
 
-  const renderedMediaSegmentIndexes = virtualItems
-    .map((item) => resolveVirtualSegment(item.index))
-    .filter((segment): segment is Extract<VirtualSegment, { type: "media-row" }> =>
-      segment?.type === "media-row"
-    )
-    .map((segment) => segment.mediaSegmentIndex);
+  const renderedMediaSegmentIndexes = windowedMedia
+    ? windowedVirtualization.mediaSegmentIndexes
+    : virtualItems
+        .map((item) => resolveVirtualSegment(item.index))
+        .filter((segment): segment is Extract<VirtualSegment, { type: "media-row" }> =>
+          segment?.type === "media-row"
+        )
+        .map((segment) => segment.mediaSegmentIndex);
   const renderedPlacementIndexes =
     !windowedMedia && renderedMediaSegmentIndexes.length > 0
       ? collectPlacementIndexesFromSegmentRange(
@@ -1346,13 +1387,6 @@ export function MediaGrid({
       );
     }
 
-    const segmentIndex = mediaWindow.segmentIndexForItem(clampedIndex);
-    const virtualSegmentIndex = segmentIndex === undefined
-      ? undefined
-      : resolveMediaVirtualSegmentIndex(segmentIndex);
-    if (virtualSegmentIndex !== undefined) {
-      virtualRows.scrollToIndex(virtualSegmentIndex, { align: "auto" });
-    }
     const element = parentRef.current;
     if (!element) {
       return;
@@ -1409,7 +1443,14 @@ export function MediaGrid({
       tabIndex={0}
       onKeyDown={handleKeyDown}
     >
-      <div className="virtual-grid-spacer" style={{ height: virtualRows.getTotalSize() }}>
+      <div
+        className="virtual-grid-spacer"
+        style={{
+          height: windowedMedia
+            ? windowedVirtualization.spacerSize
+            : virtualRows.getTotalSize()
+        }}
+      >
         {folderSectionVisible && virtualItems.some((item) => resolveVirtualSegment(item.index)?.type === "folder-header") ? (
           <div
             className="virtual-grid-section-header virtual-grid-folder-header"

@@ -1,10 +1,31 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 
 import {
   buildWindowedMediaGeometry,
   resolveMediaGeometryStrategy
 } from "../src/features/media-grid/windowedMediaGeometry.ts";
+import * as windowedMediaGeometry from "../src/features/media-grid/windowedMediaGeometry.ts";
+
+type WindowedVirtualizationPlanBuilder = (input: {
+  geometry: ReturnType<typeof buildWindowedMediaGeometry>;
+  mediaOffset: number;
+  overscanSegments: number;
+  prefixVirtualRowCount: number;
+  scrollTop: number;
+  viewportHeight: number;
+}) => {
+  mediaSegmentIndexes: number[];
+  spacerSize: number;
+  virtualizerCount: number;
+};
+
+function virtualizationPlanBuilder(): WindowedVirtualizationPlanBuilder {
+  const builder = Reflect.get(windowedMediaGeometry, "buildWindowedMediaVirtualizationPlan");
+  assert.equal(typeof builder, "function", "the production windowed virtualization plan must exist");
+  return builder as WindowedVirtualizationPlanBuilder;
+}
 
 describe("windowed adaptive and waterfall geometry", () => {
   it("selects the bounded production branch above the justified full-total cap", () => {
@@ -85,5 +106,101 @@ describe("windowed adaptive and waterfall geometry", () => {
       assert.ok(visible.includes(targetIndex));
       assert.ok(visible.length < 200, "one viewport must not expand into an unbounded item set");
     }
+  });
+
+  it("keeps a million-item production virtual range bounded outside TanStack measurements", () => {
+    const buildPlan = virtualizationPlanBuilder();
+    for (const layoutMode of ["adaptive", "waterfall"] as const) {
+      const geometry = buildWindowedMediaGeometry({
+        count: 1_000_000,
+        gap: 8,
+        labelHeight: 36,
+        layoutMode,
+        tileMinWidth: 180,
+        viewportWidth: 960
+      });
+      const deepPlacement = geometry.resolvePlacement(900_004);
+      assert.ok(deepPlacement);
+
+      const startedAt = performance.now();
+      const plan = buildPlan({
+        geometry,
+        mediaOffset: 72,
+        overscanSegments: 10,
+        prefixVirtualRowCount: 3,
+        scrollTop: 72 + deepPlacement.top,
+        viewportHeight: 800
+      });
+      const durationMs = performance.now() - startedAt;
+
+      assert.equal(plan.virtualizerCount, 3, "TanStack may measure only the bounded prefix rows");
+      assert.equal(plan.spacerSize, 72 + geometry.totalSize);
+      assert.ok(plan.mediaSegmentIndexes.length > 0);
+      assert.ok(plan.mediaSegmentIndexes.length < 64, "rendered media segments must stay viewport-bounded");
+      assert.ok(durationMs < 50, `${layoutMode} virtual range took ${durationMs}ms`);
+    }
+  });
+
+  it("recomputes a deep range when content width changes without changing columns", () => {
+    const buildPlan = virtualizationPlanBuilder();
+    for (const layoutMode of ["adaptive", "waterfall"] as const) {
+      const geometry960 = buildWindowedMediaGeometry({
+        count: 1_000_000,
+        gap: 8,
+        labelHeight: 36,
+        layoutMode,
+        tileMinWidth: 180,
+        viewportWidth: 960
+      });
+      const geometry1000 = buildWindowedMediaGeometry({
+        count: 1_000_000,
+        gap: 8,
+        labelHeight: 36,
+        layoutMode,
+        tileMinWidth: 180,
+        viewportWidth: 1000
+      });
+      assert.equal(geometry960.columnCount, geometry1000.columnCount);
+      assert.notEqual(geometry960.totalSize, geometry1000.totalSize);
+
+      const deepStart = Math.floor(geometry1000.totalSize * 0.9);
+      const plan = buildPlan({
+        geometry: geometry1000,
+        mediaOffset: 64,
+        overscanSegments: 8,
+        prefixVirtualRowCount: 2,
+        scrollTop: 64 + deepStart,
+        viewportHeight: 900
+      });
+      assert.equal(plan.spacerSize, 64 + geometry1000.totalSize);
+      assert.ok(plan.mediaSegmentIndexes.length > 0);
+
+      const first = geometry1000.resolveSegment(plan.mediaSegmentIndexes[0]!);
+      const last = geometry1000.resolveSegment(plan.mediaSegmentIndexes.at(-1)!);
+      assert.ok(first && last);
+      assert.ok(first.start <= deepStart, "overscan must begin no later than the visible deep viewport");
+      assert.ok(
+        last.start + last.size >= deepStart + 900,
+        "overscan must continue through the visible deep viewport"
+      );
+      for (let index = 1; index < plan.mediaSegmentIndexes.length; index += 1) {
+        assert.equal(
+          plan.mediaSegmentIndexes[index],
+          plan.mediaSegmentIndexes[index - 1]! + 1,
+          "resized deep ranges must not contain blank segment gaps"
+        );
+      }
+    }
+  });
+
+  it("routes the production MediaGrid windowed branch around TanStack media measurements", async () => {
+    const source = await readFile(
+      new URL("../src/features/media-grid/MediaGrid.tsx", import.meta.url),
+      "utf8"
+    );
+    assert.match(source, /buildWindowedMediaVirtualizationPlan/);
+    assert.match(source, /count:\s*windowedMedia\s*\?\s*windowedVirtualization\.virtualizerCount/);
+    assert.match(source, /windowedMedia\s*\?\s*windowedVirtualization\.mediaSegmentIndexes/);
+    assert.match(source, /windowedMedia\s*\?\s*windowedVirtualization\.spacerSize/);
   });
 });
