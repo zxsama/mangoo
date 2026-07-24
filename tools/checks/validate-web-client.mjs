@@ -150,6 +150,10 @@ const notificationPopoverMeasurement = existsSync(path.join(root, notificationPo
   : "";
 const notificationModel = read("apps/web/src/features/notifications/notificationModel.ts");
 const notificationModelTests = read("apps/web/tests/notificationModel.test.mts");
+const processLogModel = read("apps/web/src/features/notifications/processLogModel.ts");
+const processLogView = read("apps/web/src/features/notifications/ProcessLogView.tsx");
+const notificationWindow = read("apps/web/src/features/notifications/NotificationWindow.tsx");
+const settingsPanels = read("apps/web/src/features/settings/settingsPanels.tsx");
 const notificationVisualFixturePath =
   "apps/web/tests/fixtures/notificationPopoverVisualFixture.tsx";
 const notificationVisualFixture = existsSync(path.join(root, notificationVisualFixturePath))
@@ -1985,6 +1989,35 @@ for (const retiredState of [
 for (const value of ["NotificationPopover", "useNotifications", "openNotificationsWindow"]) {
   if (!app.includes(value) && !shellOverlayHost.includes(value)) {
     fail(`compact notification integration missing ${value}`);
+  }
+}
+for (const value of [
+  "aggregateInteractiveFolderScans",
+  "sourceOperations",
+  "paths",
+  "thumbnailFailureLogIntentForLibrary"
+]) {
+  if (!notificationModel.includes(value)) {
+    fail(`notification presentation model missing ${value}`);
+  }
+}
+for (const value of ["buildProcessLogRows", "ThumbnailFailureDetail", "libraryId", "eventKind"]) {
+  if (!processLogModel.includes(value)) {
+    fail(`process log failure model missing ${value}`);
+  }
+}
+for (const value of ["onNotificationWindowIntent", "authoritativeFailures", "initialFilter"]) {
+  if (!notificationWindow.includes(value) && !processLogView.includes(value)) {
+    fail(`notification failure drill-down UI missing ${value}`);
+  }
+}
+if (!settingsPanels.includes("thumbnailFailureLogIntentForLibrary") ||
+    !settingsPanels.includes("openNotificationsWindow(intent)")) {
+  fail("Settings thumbnail failures must open the typed filtered notification log view");
+}
+for (const value of ["locateMedia", "getMediaPosition", "revealFolderPath"]) {
+  if (!useLibraryData.includes(value)) {
+    fail(`media focus navigation missing ${value}`);
   }
 }
 if (/selectPreviewNeighbor/.test(useShortcuts) || /library\.media\.findIndex/.test(useShortcuts)) {

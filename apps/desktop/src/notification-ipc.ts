@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type {
+  MediaFocusRequest,
+  NotificationWindowIntent,
   ProcessLogSubscriptionEvent,
   ProcessLogSubscriptionId,
   ProcessLogSubscriptionStart,
@@ -22,7 +24,10 @@ import type {
 
 export interface NotificationIpcChannels {
   readonly openWindow: string;
+  readonly windowIntent: string;
   readonly closeWindow: string;
+  readonly focusMedia: string;
+  readonly focusMediaRequested: string;
   readonly compact: string;
   readonly historyFacets: string;
   readonly history: string;
@@ -55,17 +60,20 @@ const ALL_RENDERER_ROLES = new Set<NotificationIpcWindowRole>([
 const MAIN_AND_NOTIFICATION_ROLES = new Set<NotificationIpcWindowRole>(["main", "notifications"]);
 const NOTIFICATION_WINDOW_ONLY = new Set<NotificationIpcWindowRole>(["notifications"]);
 const MAIN_WINDOW_ONLY = new Set<NotificationIpcWindowRole>(["main"]);
+const NOTIFICATION_LAUNCHERS = new Set<NotificationIpcWindowRole>(["main", "settings"]);
+const THUMBNAIL_SUMMARY_PUBLISHERS = new Set<NotificationIpcWindowRole>(["main", "settings"]);
 
 const CHANNEL_PERMISSIONS = new Map<string, ReadonlySet<NotificationIpcWindowRole>>([
-  [NOTIFICATION_IPC_CHANNELS.openWindow, MAIN_WINDOW_ONLY],
+  [NOTIFICATION_IPC_CHANNELS.openWindow, NOTIFICATION_LAUNCHERS],
   [NOTIFICATION_IPC_CHANNELS.closeWindow, NOTIFICATION_WINDOW_ONLY],
+  [NOTIFICATION_IPC_CHANNELS.focusMedia, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.compact, MAIN_AND_NOTIFICATION_ROLES],
   [NOTIFICATION_IPC_CHANNELS.historyFacets, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.history, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.cancel, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.retry, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.reportError, ALL_RENDERER_ROLES],
-  [NOTIFICATION_IPC_CHANNELS.thumbnailSummary, MAIN_WINDOW_ONLY],
+  [NOTIFICATION_IPC_CHANNELS.thumbnailSummary, THUMBNAIL_SUMMARY_PUBLISHERS],
   [NOTIFICATION_IPC_CHANNELS.logsPage, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.logsExport, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.logsSubscribe, NOTIFICATION_WINDOW_ONLY],
@@ -79,6 +87,7 @@ const OPERATION_CATEGORIES = new Set(["task", "file_operation", "error", "thumbn
 const OPERATION_ORIGINS = new Set(["user", "background", "recovery", "system"]);
 const LOG_SOURCES = new Set<ProcessLogSource>(["main", "core", "renderer"]);
 const LOG_LEVELS = new Set<ProcessLogLevel>(["trace", "debug", "info", "warn", "error"]);
+const LOG_EVENT_KINDS = new Set(["thumbnail_failure"] as const);
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
 export function canAccessNotificationIpc(
@@ -166,6 +175,7 @@ export function parseRendererErrorReport(value: unknown): RendererErrorReport {
 
 export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummary {
   const input = record(value, "thumbnail summary");
+  const libraryId = boundedString(input.libraryId, "libraryId", 256);
   const totalCacheBytes =
     input.totalCacheBytes === null || input.totalCacheBytes === undefined
       ? null
@@ -175,7 +185,7 @@ export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummar
       ? null
       : boundedNumber(input.completionPercent, "completionPercent", 0, 100);
   return {
-    libraryId: boundedString(input.libraryId, "libraryId", 256),
+    libraryId,
     libraryName: boundedString(input.libraryName, "libraryName", 256),
     observedAt: boundedInteger(input.observedAt, "observedAt", 0, Number.MAX_SAFE_INTEGER),
     cachedCount: boundedInteger(input.cachedCount, "cachedCount", 0, Number.MAX_SAFE_INTEGER),
@@ -196,8 +206,32 @@ export function parseThumbnailCacheSummary(value: unknown): ThumbnailCacheSummar
       Number.MAX_SAFE_INTEGER
     ),
     totalCacheBytes,
-    completionPercent
+    completionPercent,
+    failureDetails: parseThumbnailFailureDetails(input.failureDetails, libraryId)
   };
+}
+
+function parseThumbnailFailureDetails(value: unknown, libraryId: string): NonNullable<ThumbnailCacheSummary["failureDetails"]> {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new TypeError("failureDetails must be an array");
+  if (value.length > 200) throw new RangeError("failureDetails are limited to 200 entries");
+  return value.map((candidate, index) => {
+    const input = record(candidate, `failureDetails ${index}`);
+    const detailLibraryId = boundedString(input.libraryId, `failureDetails ${index} libraryId`, 256);
+    if (detailLibraryId !== libraryId) {
+      throw new RangeError(`failureDetails ${index} libraryId must match the summary library`);
+    }
+    return {
+      libraryId: detailLibraryId,
+      fileId: boundedInteger(input.fileId, `failureDetails ${index} fileId`, 1, Number.MAX_SAFE_INTEGER),
+      folderId: boundedInteger(input.folderId, `failureDetails ${index} folderId`, 1, Number.MAX_SAFE_INTEGER),
+      rootId: boundedInteger(input.rootId, `failureDetails ${index} rootId`, 1, Number.MAX_SAFE_INTEGER),
+      relativePath: boundedString(input.relativePath, `failureDetails ${index} relativePath`, 2_048),
+      failureKind: boundedString(input.failureKind, `failureDetails ${index} failureKind`, 128),
+      error: boundedString(input.error, `failureDetails ${index} error`, 8_000, true),
+      updatedAt: boundedInteger(input.updatedAt, `failureDetails ${index} updatedAt`, 0, Number.MAX_SAFE_INTEGER)
+    };
+  });
 }
 
 export function parseProcessLogFilter(value: unknown): ProcessLogFilter {
@@ -213,6 +247,12 @@ export function parseProcessLogFilter(value: unknown): ProcessLogFilter {
     filter.levels = boundedStringArray(input.levels, "levels", LOG_LEVELS, 5) as ProcessLogFilter["levels"];
   }
   if (input.search !== undefined) filter.search = boundedString(input.search, "search", 500, true);
+  if (input.eventKind !== undefined) {
+    filter.eventKind = enumString(input.eventKind, "eventKind", LOG_EVENT_KINDS);
+  }
+  if (input.libraryId !== undefined) {
+    filter.libraryId = boundedString(input.libraryId, "libraryId", 256);
+  }
   if (input.afterSequence !== undefined) {
     filter.afterSequence = boundedInteger(
       input.afterSequence,
@@ -231,6 +271,34 @@ export function parseProcessLogFilter(value: unknown): ProcessLogFilter {
   }
   if (input.limit !== undefined) filter.limit = boundedInteger(input.limit, "limit", 1, 200);
   return filter;
+}
+
+export function parseNotificationWindowIntent(value: unknown): NotificationWindowIntent {
+  const input = record(value, "notification window intent");
+  if (input.page !== "logs") {
+    throw new RangeError("notification window intent page must be logs");
+  }
+  const logFilter = parseProcessLogFilter(input.logFilter);
+  if (logFilter.eventKind !== "thumbnail_failure" || !logFilter.libraryId) {
+    throw new RangeError("notification window intent requires a thumbnail failure log filter");
+  }
+  return {
+    page: "logs",
+    logFilter: {
+      eventKind: "thumbnail_failure",
+      libraryId: logFilter.libraryId
+    }
+  };
+}
+
+export function parseMediaFocusRequest(value: unknown): MediaFocusRequest {
+  const input = record(value, "media focus request");
+  return {
+    libraryId: boundedString(input.libraryId, "libraryId", 256),
+    fileId: boundedInteger(input.fileId, "fileId", 1, Number.MAX_SAFE_INTEGER),
+    folderId: boundedInteger(input.folderId, "folderId", 1, Number.MAX_SAFE_INTEGER),
+    rootId: boundedInteger(input.rootId, "rootId", 1, Number.MAX_SAFE_INTEGER)
+  };
 }
 
 export function parseRendererLogEntries(value: unknown): RendererLogEntryInput[] {

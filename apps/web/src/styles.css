@@ -3231,7 +3231,8 @@ button:disabled {
 .notification-status-dot {
   position: absolute;
   top: 4px;
-  right: 4px;
+  left: 50%;
+  transform: translateX(-50%);
   width: 5px;
   height: 5px;
   border-radius: 999px;
@@ -3450,6 +3451,40 @@ button:disabled {
   gap: 3px 9px;
   color: var(--text-muted);
   font-size: 9.5px;
+}
+
+.notification-thumbnail-failure-action,
+.settings-stat-action {
+  margin: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  background: transparent;
+  border: 0;
+}
+
+.notification-thumbnail-failure-action {
+  color: rgba(226, 174, 146, 0.88);
+}
+
+.notification-scan-paths {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.notification-scan-paths span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notification-scan-paths.compact {
+  max-height: 45px;
+  overflow: hidden;
 }
 
 .notification-result-row {
@@ -4743,6 +4778,11 @@ button:disabled {
   color: #f4f7f9;
 }
 
+.settings-stat-action {
+  color: #f4f7f9;
+  font-weight: 600;
+}
+
 /* Inline action buttons (control-style, matching the shell) */
 .settings-action-row {
   display: flex;
@@ -5756,6 +5796,15 @@ button:disabled {
   font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   font-size: 10.5px;
   line-height: 1.4;
+  text-align: left;
+  background: transparent;
+  border: 0;
+}
+
+.notification-log-filter-state {
+  margin: -3px 0 2px;
+  color: var(--text-muted);
+  font-size: 10.5px;
 }
 
 .notification-log-line.level-warn {

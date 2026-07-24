@@ -15,6 +15,7 @@ import { DesktopLogger } from "../src/desktop-logger.ts";
 import {
   attachCoreProcessLifecycle,
   createCoreOutputLineSplitter,
+  parseCoreProcessLogLine,
   stopCoreProcessesBeforeReplacement,
   type CoreProcessHandle
 } from "../src/core-process.ts";
@@ -59,6 +60,30 @@ test("supports source, level, sequence and text filters", () => {
   assert.deepEqual(buffer.snapshot({ search: "SCAN" }).map((line) => line.sequence), [2, 4]);
   assert.deepEqual(buffer.snapshot({ afterSequence: 1, beforeSequence: 4 }).map((line) => line.sequence), [2, 3]);
   assert.equal(buffer.snapshot({})[0]?.timestamp, 1234);
+});
+
+test("filters structured process logs by event kind and library id", () => {
+  const buffer = new ProcessLogBuffer({ now: () => 1234 });
+  buffer.append("core", "error", "thumbnail generation failed", {
+    eventKind: "thumbnail_failure",
+    libraryId: "library-a",
+    fileId: 42
+  });
+  buffer.append("core", "error", "thumbnail generation failed", {
+    eventKind: "thumbnail_failure",
+    libraryId: "library-b",
+    fileId: 43
+  });
+  buffer.append("core", "error", "unrelated failure", {
+    eventKind: "scan_failure",
+    libraryId: "library-a"
+  });
+
+  assert.deepEqual(
+    buffer.snapshot({ eventKind: "thumbnail_failure", libraryId: "library-a" })
+      .map((line) => line.metadata?.fileId),
+    [42]
+  );
 });
 
 test("provides bounded pages and preserves the cursor for the next page", () => {
@@ -509,6 +534,25 @@ test("logger preserves the original console sink without monkey-patching it", as
   assert.deepEqual(buffer.snapshot({ source: "main" })[0]?.metadata?.argument2, { count: 2 });
 });
 
+test("structured logger keeps filter metadata at the top level", async () => {
+  const buffer = new ProcessLogBuffer();
+  const logger = new DesktopLogger({ buffer, console: { error: () => undefined } });
+
+  logger.structured("core", "error", "thumbnail generation failed", {
+    eventKind: "thumbnail_failure",
+    libraryId: "library-a",
+    fileId: 42
+  });
+  await logger.flush();
+
+  assert.deepEqual(buffer.snapshot({ eventKind: "thumbnail_failure", libraryId: "library-a" })[0]?.metadata, {
+    eventKind: "thumbnail_failure",
+    libraryId: "library-a",
+    fileId: 42
+  });
+  assert.equal(buffer.snapshot({ eventKind: "thumbnail_failure", libraryId: "library-b" }).length, 0);
+});
+
 test("logger binds original console methods and drops reentrant console forwarding", async () => {
   const output: unknown[][] = [];
   let logger: DesktopLogger;
@@ -597,6 +641,45 @@ test("splits Core stdout and stderr chunks without losing partial lines", () => 
 
   assert.deepEqual(stdout, ["first", "second", "中😀"]);
   assert.deepEqual(stderr, ["警告"]);
+});
+
+test("parses structured Core tracing JSON and preserves legacy text", () => {
+  const structured = parseCoreProcessLogLine(
+    JSON.stringify({
+      timestamp: "2026-07-24T12:00:00.000Z",
+      level: "ERROR",
+      fields: {
+        message: "thumbnail generation failed",
+        event_kind: "thumbnail_failure",
+        file_id: 42,
+        folder_id: 7,
+        root_id: 3,
+        relative_path: "Artists\\Portraits\\a.jpg",
+        failure_kind: "permanent",
+        error: "decode failed"
+      },
+      target: "megle_core::tasks"
+    }),
+    "warn"
+  );
+  assert.deepEqual(structured, {
+    level: "error",
+    message: "thumbnail generation failed",
+    metadata: {
+      eventKind: "thumbnail_failure",
+      fileId: 42,
+      folderId: 7,
+      rootId: 3,
+      relativePath: "Artists\\Portraits\\a.jpg",
+      failureKind: "permanent",
+      error: "decode failed",
+      target: "megle_core::tasks"
+    }
+  });
+  assert.deepEqual(parseCoreProcessLogLine("legacy warning", "warn"), {
+    level: "warn",
+    message: "legacy warning"
+  });
 });
 
 test("bounds a 6MB Core line before newline and emits one explicit truncation", () => {

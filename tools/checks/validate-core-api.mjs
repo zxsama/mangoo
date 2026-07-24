@@ -75,7 +75,9 @@ const expectedAxumRoutes = [
   "/api/folders/:folder_id/ancestors",
   "/api/media",
   "/api/media/:file_id",
+  "/api/media/:file_id/position",
   "/api/media/:file_id/thumbnail",
+  "/api/thumbnails/cache/failures",
   "/api/media/:file_id/preview",
   "/api/media/:file_id/metadata",
   "/api/media/:file_id/tags",
@@ -673,11 +675,24 @@ if (previewBody.includes("StatusCode::ACCEPTED")) {
 }
 for (const value of [
   '"/api/thumbnails/cache/stats"',
+  '"/api/thumbnails/cache/failures"',
   '"/api/thumbnails/cache/clear"',
   '"/api/tasks/thumbnail-cache"'
 ]) {
   if (!routesRs.includes(value)) {
     fail(`PHASE1_API_PATHS must include ${value}`);
+  }
+}
+const thumbnailFailureBody = functionBody("list_thumbnail_cache_failures");
+for (const value of ["list_thumbnail_failures", "truncated", "limit + 1"]) {
+  if (!thumbnailFailureBody.includes(value)) {
+    fail(`GET /api/thumbnails/cache/failures implementation missing ${value}`);
+  }
+}
+const mediaPositionBody = functionBody("get_media_position");
+for (const value of ["media_position", "MediaPositionResponse", "not_found"]) {
+  if (!mediaPositionBody.includes(value)) {
+    fail(`GET /api/media/{fileId}/position implementation missing ${value}`);
   }
 }
 const thumbnailCacheStatsBody = functionBody("get_thumbnail_cache_stats");

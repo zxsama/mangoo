@@ -21,6 +21,7 @@ import {
   createLibrary,
   deleteLibraryFile,
   listLibraries,
+  openNotificationsWindow,
   openLibrary,
   pickLibraryFile,
   pickNativeFolder,
@@ -33,6 +34,7 @@ import {
 import type { LibrarySummary } from "../../core/libraryTypes";
 import type { LibraryState } from "../../core/useLibraryData";
 import type { InterfaceStyleController } from "../../design/liquid-glass";
+import { thumbnailFailureLogIntentForLibrary } from "../notifications/notificationModel";
 import { LibraryGlyph, LibraryIconPicker } from "../library/libraryGlyph";
 import {
   LIBRARY_GRID_PREFERENCE_LIMITS,
@@ -317,7 +319,17 @@ function ThumbnailsTab({
         <dl className="settings-stat-grid">
           <StatCell label="已缓存" value={stats ? cached.toLocaleString() : "-"} />
           <StatCell label="待生成 / 过期" value={stats ? remaining.toLocaleString() : "-"} />
-          <StatCell label="失败" value={stats ? failed.toLocaleString() : "-"} />
+          <StatCell
+            label="失败"
+            onActivate={failed > 0 ? () => {
+              const intent = thumbnailFailureLogIntentForLibrary(
+                library.thumbnailCacheStatsLibraryId,
+                failed
+              );
+              if (intent) void openNotificationsWindow(intent);
+            } : undefined}
+            value={stats ? failed.toLocaleString() : "-"}
+          />
           <StatCell label="活动任务" value={stats ? activeBulk.toLocaleString() : "-"} />
           <StatCell
             label="数据库占用"
@@ -408,11 +420,25 @@ function RadioOption({
   );
 }
 
-function StatCell({ label, value }: { label: string; value: string }) {
+function StatCell({
+  label,
+  onActivate,
+  value
+}: {
+  label: string;
+  onActivate?: () => void;
+  value: string;
+}) {
   return (
     <div className="settings-stat-cell">
       <dt>{label}</dt>
-      <dd>{value}</dd>
+      <dd>
+        {onActivate ? (
+          <button className="settings-stat-action" onClick={onActivate} type="button">
+            {value}
+          </button>
+        ) : value}
+      </dd>
     </div>
   );
 }

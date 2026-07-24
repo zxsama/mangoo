@@ -1,5 +1,9 @@
 import type { LibrarySummary, LibraryLoadPhase } from "./libraryTypes";
-import type { DesktopNotificationsBridge } from "@megle/notification-contract";
+import type {
+  DesktopNotificationsBridge,
+  MediaFocusRequest,
+  NotificationWindowIntent
+} from "@megle/notification-contract";
 
 export type {
   DesktopNotificationCategory,
@@ -18,7 +22,10 @@ export type {
   DesktopProcessLogPage,
   DesktopProcessLogSource,
   DesktopRendererErrorReport,
-  DesktopThumbnailCacheSummary
+  DesktopThumbnailCacheSummary,
+  MediaFocusRequest,
+  NotificationWindowIntent,
+  ThumbnailFailureDetail
 } from "@megle/notification-contract";
 
 export type DesktopSecondaryWindowRole = "settings" | "plugins" | "notifications";
@@ -78,8 +85,11 @@ export interface MegleDesktopBridge {
   closeSettingsWindow?: () => Promise<boolean>;
   openPluginsWindow?: () => Promise<boolean>;
   closePluginsWindow?: () => Promise<boolean>;
-  openNotificationsWindow?: () => Promise<boolean>;
+  openNotificationsWindow?: (intent?: NotificationWindowIntent) => Promise<boolean>;
   closeNotificationsWindow?: () => Promise<boolean>;
+  onNotificationWindowIntent?: (cb: (intent: NotificationWindowIntent) => void) => () => void;
+  focusMedia?: (input: MediaFocusRequest) => Promise<boolean>;
+  onFocusMedia?: (cb: (input: MediaFocusRequest) => void) => () => void;
   notifications?: DesktopNotificationsBridge;
   windowControls?: DesktopWindowControls;
   shell?: DesktopShellActions;
@@ -146,9 +156,9 @@ export async function openPluginsWindow(): Promise<boolean> {
   return opened !== null;
 }
 
-export async function openNotificationsWindow(): Promise<boolean> {
+export async function openNotificationsWindow(intent?: NotificationWindowIntent): Promise<boolean> {
   const desktopOpen = getDesktopBridge()?.openNotificationsWindow;
-  if (desktopOpen) return desktopOpen();
+  if (desktopOpen) return desktopOpen(intent);
 
   const notificationsUrl = new URL(window.location.href);
   notificationsUrl.hash = "/notifications";

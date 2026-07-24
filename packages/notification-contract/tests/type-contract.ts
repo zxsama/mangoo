@@ -2,10 +2,13 @@ import type { NotificationOperationSnapshot } from "@megle/core-client/generated
 import type {
   DesktopNotificationOperation,
   NotificationIpcBridge,
+  MediaFocusRequest,
+  NotificationWindowIntent,
   ProcessLogLine,
   RendererErrorReport,
   ProcessLogSubscriptionEvent,
-  ProcessLogSubscriptionStart
+  ProcessLogSubscriptionStart,
+  ThumbnailFailureDetail
 } from "../src/index.js";
 import {
   legacyRendererErrorOperationId,
@@ -21,6 +24,9 @@ declare const start: ProcessLogSubscriptionStart;
 declare const event: ProcessLogSubscriptionEvent;
 declare const bridge: NotificationIpcBridge;
 declare const rendererReport: RendererErrorReport;
+declare const intent: NotificationWindowIntent;
+declare const focus: MediaFocusRequest;
+declare const failure: ThumbnailFailureDetail;
 
 void coreOperation;
 void traceLevel;
@@ -30,6 +36,9 @@ void bridge.snapshotAndSubscribeLogs;
 void bridge.getHistoryFacets;
 void bridge.exportLogs;
 void rendererReport.reportId;
+void intent.logFilter.eventKind;
+void focus.fileId;
+void failure.relativePath;
 void rendererErrorIdentityKey(rendererReport);
 void rendererErrorOperationId(rendererReport.libraryId, rendererReport);
 void legacyRendererErrorOperationId(rendererReport.libraryId, rendererReport);

@@ -46,6 +46,8 @@ import {
   assertNotificationIpcAccess,
   parseNotificationAction,
   parseNotificationHistoryQuery,
+  parseMediaFocusRequest,
+  parseNotificationWindowIntent,
   parseProcessLogFilter,
   parseProcessLogSubscriptionId,
   parseRendererErrorReport,
@@ -215,6 +217,19 @@ function userDataDir(): string {
 function getRegistry(): libraryRegistry.LibraryRegistry {
   if (!cachedRegistry) cachedRegistry = libraryRegistry.loadRegistry(userDataDir());
   return cachedRegistry;
+}
+function libraryIdForDbPath(dbPath: string): string | null {
+  const resolved = path.resolve(dbPath);
+  return getRegistry().libraries.find((library) => path.resolve(library.dbPath) === resolved)?.id ?? null;
+}
+function coreLogHandlerForSession(session: CoreSession) {
+  const libraryId = libraryIdForDbPath(session.dbPath);
+  return (source: "core", level: Parameters<typeof desktopLogger.log>[1], message: string, metadata?: Readonly<Record<string, unknown>>) => {
+    desktopLogger.structured(source, level, message, {
+      ...(metadata ?? {}),
+      ...(libraryId ? { libraryId } : {})
+    });
+  };
 }
 function persistRegistry(next: libraryRegistry.LibraryRegistry): void {
   cachedRegistry = next;
@@ -625,15 +640,32 @@ ipcMain.handle("megle:close-plugins-window", (event) => {
   return true;
 });
 
-ipcMain.handle(NOTIFICATION_IPC_CHANNELS.openWindow, async (event) => {
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.openWindow, async (event, input: unknown) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.openWindow);
+  const intent = input == null ? null : parseNotificationWindowIntent(input);
   await openSecondaryWindow("notifications");
+  const window = secondaryWindows.notifications;
+  if (intent && window && !window.isDestroyed()) {
+    window.webContents.send(NOTIFICATION_IPC_CHANNELS.windowIntent, intent);
+  }
   return true;
 });
 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.closeWindow, (event) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.closeWindow);
   closeSecondaryWindow("notifications");
+  return true;
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMedia, (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.focusMedia);
+  const request = parseMediaFocusRequest(input);
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) return false;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+  window.webContents.send(NOTIFICATION_IPC_CHANNELS.focusMediaRequested, request);
   return true;
 });
 
@@ -786,7 +818,7 @@ ipcMain.on(NOTIFICATION_IPC_CHANNELS.rendererLogs, (event, input: unknown) => {
     requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.rendererLogs);
     for (const entry of parseRendererLogEntries(input)) {
       if (entry.metadata) {
-        desktopLogger.log("renderer", entry.level, entry.message, entry.metadata);
+        desktopLogger.structured("renderer", entry.level, entry.message, entry.metadata);
       } else {
         desktopLogger.log("renderer", entry.level, entry.message);
       }
@@ -1516,9 +1548,7 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
         if (reusable) return reusable;
         throw new LifecycleCancelledError("Tracked Core changed before startup");
       }
-      pendingProcess = startCoreProcess(session, (source, level, message) => {
-        desktopLogger.log(source, level, message);
-      });
+      pendingProcess = startCoreProcess(session, coreLogHandlerForSession(session));
       pendingCoreProcess = pendingProcess;
       await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
       assertCurrentCoreGeneration(generation, signal);
@@ -1651,9 +1681,7 @@ async function restartCoreForLibrary(
         }
       },
       startHealthyCore: async () => {
-        handle = startCoreProcess(session, (source, level, message) => {
-          desktopLogger.log(source, level, message);
-        });
+        handle = startCoreProcess(session, coreLogHandlerForSession(session));
         pendingCoreProcess = handle;
         pushLibraryPhase("opening-library");
         await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);

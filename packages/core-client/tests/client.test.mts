@@ -718,6 +718,30 @@ describe("createCoreClient", () => {
     assert.equal(recorded[0].signal, controller.signal);
   });
 
+  test("lists bounded thumbnail failure diagnostics", async () => {
+    mockFetch({ items: [], truncated: false });
+    const controller = new AbortController();
+    await client().listThumbnailCacheFailures(75, { signal: controller.signal });
+    assert.equal(recorded[0].method, "GET");
+    assert.equal(recorded[0].url, `${BASE_URL}/thumbnails/cache/failures?limit=75`);
+    assert.equal(recorded[0].signal, controller.signal);
+  });
+
+  test("gets the media position in a scoped sorted folder", async () => {
+    mockFetch({ index: 123 });
+    const result = await client().getMediaPosition(42, {
+      rootId: 3,
+      folderId: 7,
+      includeDescendants: true,
+      sort: "name_asc"
+    });
+    assert.equal(result.index, 123);
+    assert.equal(
+      recorded[0].url,
+      `${BASE_URL}/media/42/position?rootId=3&folderId=7&includeDescendants=true&sort=name_asc`
+    );
+  });
+
   test("enqueueThumbnailCache serializes refresh mode and forwards abort signal", async () => {
     mockFetch({
       acceptedCount: 2,

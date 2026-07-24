@@ -60,6 +60,24 @@ export class DesktopLogger {
     }
   }
 
+  structured(
+    source: ProcessLogSource,
+    level: ProcessLogLevel,
+    message: string,
+    metadata?: ProcessLogMetadata
+  ): void {
+    if (this.logging) return;
+    this.logging = true;
+    try {
+      this.writeConsole(level, metadata ? [message, metadata] : [message]);
+      if (!this.closed) this.buffer.append(source, level, message, metadata);
+    } catch {
+      // Structured diagnostics must remain best-effort.
+    } finally {
+      this.logging = false;
+    }
+  }
+
   trace(source: ProcessLogSource, ...args: unknown[]): void {
     this.log(source, "trace", ...args);
   }

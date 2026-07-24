@@ -1,5 +1,6 @@
 import { Activity, History, ScrollText } from "lucide-react";
-import { useCallback, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
+import type { DesktopProcessLogFilter, NotificationWindowIntent } from "@megle/notification-contract";
 import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
 import { useOverlayScrollbars } from "../../app-shell/useOverlayScrollbars";
 import { useSecondaryWindowInterfaceStyle } from "../../app-shell/useSecondaryWindowInterfaceStyle";
@@ -22,6 +23,28 @@ export function NotificationWindow() {
   useOverlayScrollbars();
   const notifications = useNotifications();
   const [page, setPage] = useState<NotificationPage>("status");
+  const [logFilter, setLogFilter] = useState<DesktopProcessLogFilter | null>(null);
+  const [logIntentVersion, setLogIntentVersion] = useState(0);
+
+  const applyIntent = useCallback((intent: NotificationWindowIntent) => {
+    setLogFilter(intent.logFilter);
+    setLogIntentVersion((version) => version + 1);
+    setPage("logs");
+  }, []);
+
+  useEffect(() => getDesktopBridge()?.onNotificationWindowIntent?.(applyIntent), [applyIntent]);
+
+  const authoritativeFailures = useMemo(() => {
+    if (logFilter?.eventKind !== "thumbnail_failure" || !logFilter.libraryId) return [];
+    return notifications.compact.thumbnail.summaries
+      .find((summary) => summary.libraryId === logFilter.libraryId)
+      ?.failureDetails ?? [];
+  }, [logFilter, notifications.compact.thumbnail.summaries]);
+
+  const selectPage = useCallback((nextPage: NotificationPage) => {
+    setLogFilter(null);
+    setPage(nextPage);
+  }, []);
 
   const handleClose = useCallback(async () => {
     const bridge = getDesktopBridge();
@@ -51,7 +74,7 @@ export function NotificationWindow() {
     if (nextIndex === null) return;
     event.preventDefault();
     const nextPage = PAGES[nextIndex];
-    setPage(nextPage.id);
+    selectPage(nextPage.id);
     document.getElementById(`notification-tab-${nextPage.id}`)?.focus();
   };
 
@@ -73,7 +96,7 @@ export function NotificationWindow() {
               className={`notification-window-tab${page === id ? " active" : ""}`}
               id={`notification-tab-${id}`}
               key={id}
-              onClick={() => setPage(id)}
+              onClick={() => selectPage(id)}
               onKeyDown={handleTabKeyDown}
               role="tab"
               tabIndex={page === id ? 0 : -1}
@@ -98,6 +121,7 @@ export function NotificationWindow() {
             <NotificationStatusView
               cancel={notifications.cancel}
               model={notifications.compact}
+              onOpenFailureLogs={applyIntent}
               refreshCompact={notifications.refreshCompact}
             />
           </section>
@@ -129,9 +153,12 @@ export function NotificationWindow() {
             role="tabpanel"
           >
             <ProcessLogView
+              authoritativeFailures={authoritativeFailures}
               clearLogs={notifications.clearLogs}
               exportLogs={notifications.exportLogs}
               getLogPage={notifications.getLogPage}
+              initialFilter={logFilter ?? undefined}
+              key={logIntentVersion}
               openLogSubscription={notifications.openLogSubscription}
             />
           </section>

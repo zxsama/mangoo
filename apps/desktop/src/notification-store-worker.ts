@@ -207,6 +207,35 @@ function validateThumbnailSummary(summary: ThumbnailCacheSummary): void {
   ) {
     throw new RangeError("summary.completionPercent must be between 0 and 100 or null");
   }
+  const details = summary.failureDetails ?? [];
+  if (!Array.isArray(details) || details.length > 200) {
+    throw new RangeError("summary.failureDetails must contain at most 200 entries");
+  }
+  for (const detail of details) {
+    assertObject(detail, "thumbnail failure detail");
+    assertString(detail.libraryId, "thumbnail failure detail.libraryId");
+    if (detail.libraryId !== summary.libraryId) {
+      throw new RangeError("thumbnail failure detail library must match summary library");
+    }
+    assertSafeInteger(detail.fileId, "thumbnail failure detail.fileId", 1);
+    assertSafeInteger(detail.folderId, "thumbnail failure detail.folderId", 1);
+    assertSafeInteger(detail.rootId, "thumbnail failure detail.rootId", 1);
+    assertString(detail.relativePath, "thumbnail failure detail.relativePath");
+    assertString(detail.failureKind, "thumbnail failure detail.failureKind");
+    if (typeof detail.error !== "string") throw new TypeError("thumbnail failure detail.error must be a string");
+    assertSafeInteger(detail.updatedAt, "thumbnail failure detail.updatedAt");
+  }
+}
+
+function normalizeThumbnailSummary(summary: ThumbnailCacheSummary): ThumbnailCacheSummary {
+  const hasAuthoritativeDetails = Array.isArray(summary.failureDetails);
+  return {
+    ...summary,
+    // Legacy summaries predate failure diagnostics. Do not preserve a clickable
+    // count that can only open an unrelated current-session log view.
+    failedCount: hasAuthoritativeDetails ? summary.failedCount : 0,
+    failureDetails: hasAuthoritativeDetails ? summary.failureDetails : []
+  };
 }
 
 function readSchemaVersion(database: DatabaseSync): number {
@@ -627,7 +656,9 @@ class NotificationStoreDatabase {
       });
     return {
       active: active.map(rowToOperation),
-      thumbnailSummaries: thumbnailRows.map((row) => JSON.parse(row.payload_json) as ThumbnailCacheSummary),
+      thumbnailSummaries: thumbnailRows.map((row) =>
+        normalizeThumbnailSummary(JSON.parse(row.payload_json) as ThumbnailCacheSummary)
+      ),
       latestImportantResults: latestImportantResults.map(rowToOperation),
       retryableFailures
     };

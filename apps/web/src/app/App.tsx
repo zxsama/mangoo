@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FolderRecord, MediaRecord, RootRecord } from "@megle/core-client";
+import type { MediaFocusRequest, NotificationWindowIntent } from "@megle/notification-contract";
 import { AppShell } from "../app-shell/AppShell";
 import { useOverlayScrollbars } from "../app-shell/useOverlayScrollbars";
 import {
@@ -33,6 +34,7 @@ import {
   openPluginsWindow,
   openPath,
   revealPath,
+  switchLibrary,
   subscribeLibraryPhase
 } from "../core/desktop";
 import { type LibraryLoadPhase } from "../core/libraryTypes";
@@ -126,6 +128,9 @@ export function App() {
   const [activeLibraryName, setActiveLibraryName] = useState<string>("Library");
   const [activeLibraryIcon, setActiveLibraryIcon] = useState<string | undefined>(undefined);
   const [activeLibraryColor, setActiveLibraryColor] = useState<string | undefined>(undefined);
+  const [pendingMediaFocus, setPendingMediaFocus] = useState<MediaFocusRequest | null>(null);
+  const mediaFocusSwitchKeyRef = useRef<string | null>(null);
+  const mediaFocusLocateKeyRef = useRef<string | null>(null);
   const hasLoadedActiveLibraryNameRef = useRef(false);
   const library = useLibraryData({
     activeLibraryId,
@@ -202,6 +207,36 @@ export function App() {
     previewNavigationLockedRef.current = false;
     setPreviewViewCommands(null);
   }, []);
+
+  useEffect(() => getDesktopBridge()?.onFocusMedia?.(setPendingMediaFocus), []);
+
+  useEffect(() => {
+    if (!pendingMediaFocus) return;
+    const requestKey = `${pendingMediaFocus.libraryId}:${pendingMediaFocus.fileId}`;
+    if (activeLibraryId !== pendingMediaFocus.libraryId) {
+      if (mediaFocusSwitchKeyRef.current === requestKey) return;
+      mediaFocusSwitchKeyRef.current = requestKey;
+      void switchLibrary(pendingMediaFocus.libraryId).then((result) => {
+        if (!result.ok) {
+          setPendingMediaFocus((current) =>
+            current && `${current.libraryId}:${current.fileId}` === requestKey ? null : current
+          );
+        }
+      });
+      return;
+    }
+    if (libraryPhase !== "ready" || library.loading) return;
+    mediaFocusSwitchKeyRef.current = null;
+    if (mediaFocusLocateKeyRef.current === requestKey) return;
+    mediaFocusLocateKeyRef.current = requestKey;
+    handleClosePreview();
+    void library.locateMedia(pendingMediaFocus).then(() => {
+      mediaFocusLocateKeyRef.current = null;
+      setPendingMediaFocus((current) =>
+        current && `${current.libraryId}:${current.fileId}` === requestKey ? null : current
+      );
+    });
+  }, [activeLibraryId, handleClosePreview, library, libraryPhase, pendingMediaFocus]);
 
   const toggleSidebars = useCallback(() => {
     setSidebarsHidden((current) => !current);
@@ -388,9 +423,9 @@ export function App() {
     toggleCompactPopover("notifications");
   }, [toggleCompactPopover]);
 
-  const handleOpenNotificationCenter = useCallback(() => {
+  const handleOpenNotificationCenter = useCallback((intent?: NotificationWindowIntent) => {
     setActiveCompactPopover(null);
-    void openNotificationsWindow();
+    void openNotificationsWindow(intent);
   }, []);
 
   const shellRightActions = (

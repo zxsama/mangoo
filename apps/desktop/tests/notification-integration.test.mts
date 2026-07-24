@@ -44,9 +44,38 @@ test("notification IPC permissions isolate privileged history, action and log ac
   assert.equal(canAccess("notifications", channels.logsExport), true);
   assert.equal(canAccess("main", channels.logsExport), false);
   assert.equal(canAccess("main", channels.thumbnailSummary), true);
+  assert.equal(canAccess("settings", channels.thumbnailSummary), true);
   assert.equal(canAccess("notifications", channels.thumbnailSummary), false);
+  assert.equal(canAccess("settings", channels.openWindow), true);
+  assert.equal(canAccess("notifications", channels.focusMedia), true);
+  assert.equal(canAccess("settings", channels.focusMedia), false);
   assert.equal(canAccess("plugins", channels.rendererLogs), true);
   assert.equal(canAccess(null, channels.rendererLogs), false);
+});
+
+test("notification launch intents and media focus requests are narrow and bounded", () => {
+  assert.deepEqual(
+    ipcModule.parseNotificationWindowIntent({
+      page: "logs",
+      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+    }),
+    {
+      page: "logs",
+      logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+    }
+  );
+  assert.deepEqual(
+    ipcModule.parseMediaFocusRequest({ libraryId: "library-a", fileId: 42, folderId: 7, rootId: 3 }),
+    { libraryId: "library-a", fileId: 42, folderId: 7, rootId: 3 }
+  );
+  assert.throws(
+    () => ipcModule.parseNotificationWindowIntent({ page: "history", logFilter: {} }),
+    /intent/i
+  );
+  assert.throws(
+    () => ipcModule.parseMediaFocusRequest({ libraryId: "library-a", fileId: 0, folderId: 7, rootId: 3 }),
+    /fileId/i
+  );
 });
 
 test("notification IPC validators reject malformed or unbounded renderer payloads", () => {
@@ -458,10 +487,12 @@ test("preload bridge removes exact listeners and buffers log batches until snaps
   const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
   const removed: Array<[string, (...args: unknown[]) => void]> = [];
   const sent: Array<[string, ...unknown[]]> = [];
+  const invoked: Array<[string, ...unknown[]]> = [];
   let exposed: Record<string, unknown> | null = null;
   let resolveLogSnapshot: ((value: unknown) => void) | null = null;
   const ipcRenderer = {
-    invoke(channel: string) {
+    invoke(channel: string, ...args: unknown[]) {
+      invoked.push([channel, ...args]);
       if (channel === channels.logsSubscribe) {
         return new Promise((resolve) => {
           resolveLogSnapshot = resolve;
@@ -513,6 +544,28 @@ test("preload bridge removes exact listeners and buffers log batches until snaps
   };
   assert.equal(typeof bridge.onChanged, "function");
   assert.equal(typeof bridge.snapshotAndSubscribeLogs, "function");
+
+  const windowBridge = exposed as {
+    focusMedia(input: unknown): Promise<boolean>;
+    onNotificationWindowIntent(cb: (value: unknown) => void): () => void;
+  };
+  const intent = {
+    page: "logs",
+    logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" }
+  };
+  const intentListener = [...(listeners.get(channels.windowIntent) ?? [])][0];
+  assert.ok(intentListener, "notification launch intent listener must exist before React mounts");
+  intentListener({}, intent);
+  const deliveredIntents: unknown[] = [];
+  const stopIntents = windowBridge.onNotificationWindowIntent((value) => deliveredIntents.push(value));
+  await Promise.resolve();
+  assert.deepEqual(JSON.parse(JSON.stringify(deliveredIntents)), [intent]);
+  stopIntents();
+  await windowBridge.focusMedia({ libraryId: "library-a", fileId: 42, folderId: 7, rootId: 3 });
+  assert.deepEqual(invoked.at(-1), [
+    channels.focusMedia,
+    { libraryId: "library-a", fileId: 42, folderId: 7, rootId: 3 }
+  ]);
 
   const changed = () => undefined;
   const stopChanged = bridge.onChanged(changed);

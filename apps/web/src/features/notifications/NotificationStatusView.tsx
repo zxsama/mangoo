@@ -8,11 +8,15 @@ import {
   Square
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { DesktopThumbnailCacheSummary } from "@megle/notification-contract";
+import type {
+  DesktopThumbnailCacheSummary,
+  NotificationWindowIntent
+} from "@megle/notification-contract";
 import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
+import { thumbnailFailureLogIntent } from "./notificationModel";
 import type { NotificationRequestResult } from "./useNotifications";
 import {
   beginNotificationAction,
@@ -29,10 +33,12 @@ type NotificationAction = (
 export function NotificationStatusView({
   cancel,
   model,
+  onOpenFailureLogs,
   refreshCompact
 }: {
   cancel: NotificationAction;
   model: CompactNotificationModel;
+  onOpenFailureLogs(intent: NotificationWindowIntent): void;
   refreshCompact(): Promise<NotificationRequestResult<boolean>>;
 }) {
   const [actionStates, setActionStates] = useState<NotificationActionStates>(() => new Map());
@@ -117,15 +123,23 @@ export function NotificationStatusView({
                     );
                     if (!started.started) return;
                     commitActionStates(started.states);
-                    const result = await cancel(operation.libraryId, operation.operationId);
+                    const cancellable = operation.sourceOperations.filter(
+                      (sourceOperation) => sourceOperation.cancellable
+                    );
+                    const results = await Promise.all(
+                      cancellable.map((sourceOperation) =>
+                        cancel(sourceOperation.libraryId, sourceOperation.operationId)
+                      )
+                    );
                     await refreshCompact();
+                    const failure = results.find((result) => !result.ok);
                     commitActionStates(
                       settleNotificationAction(
                         actionStatesRef.current,
                         actionKey,
                         "cancel",
                         requestId,
-                        result.ok ? null : result.message || "取消未完成"
+                        failure ? failure.message || "部分扫描未能取消" : null
                       )
                     );
                   }}
@@ -150,7 +164,11 @@ export function NotificationStatusView({
           />
           <div className="notification-thumbnail-grid">
             {model.thumbnail.summaries.map((summary) => (
-              <ThumbnailStatus key={summary.libraryId} summary={summary} />
+              <ThumbnailStatus
+                key={summary.libraryId}
+                onOpenFailureLogs={onOpenFailureLogs}
+                summary={summary}
+              />
             ))}
           </div>
         </section>
@@ -242,6 +260,11 @@ function ActiveOperation({
         <span>{operation.phase || operation.progress.label}</span>
         {operation.progress.determinate ? <strong>{operation.progress.percent}%</strong> : null}
       </div>
+      {operation.paths.length > 0 ? (
+        <div className="notification-scan-paths">
+          {operation.paths.map((path) => <span key={path} title={path}>{path}</span>)}
+        </div>
+      ) : null}
       <div
         aria-label={operation.progress.label}
         aria-valuemax={operation.progress.determinate ? 100 : undefined}
@@ -272,7 +295,13 @@ function ActiveOperation({
   );
 }
 
-function ThumbnailStatus({ summary }: { summary: DesktopThumbnailCacheSummary }) {
+function ThumbnailStatus({
+  onOpenFailureLogs,
+  summary
+}: {
+  onOpenFailureLogs(intent: NotificationWindowIntent): void;
+  summary: DesktopThumbnailCacheSummary;
+}) {
   const percent =
     summary.completionPercent ??
     (summary.totalCandidateCount > 0
@@ -297,7 +326,23 @@ function ThumbnailStatus({ summary }: { summary: DesktopThumbnailCacheSummary })
       <dl className="notification-window-thumbnail-metrics">
         <div><dt>已缓存</dt><dd>{summary.cachedCount.toLocaleString()}</dd></div>
         <div><dt>待处理</dt><dd>{summary.pendingCount.toLocaleString()}</dd></div>
-        <div><dt>失败</dt><dd>{summary.failedCount.toLocaleString()}</dd></div>
+        <div>
+          <dt>失败</dt>
+          <dd>
+            {summary.failedCount > 0 ? (
+              <button
+                className="notification-thumbnail-failure-action"
+                onClick={() => {
+                  const intent = thumbnailFailureLogIntent(summary);
+                  if (intent) onOpenFailureLogs(intent);
+                }}
+                type="button"
+              >
+                {summary.failedCount.toLocaleString()}
+              </button>
+            ) : "0"}
+          </dd>
+        </div>
       </dl>
     </article>
   );

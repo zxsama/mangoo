@@ -1,4 +1,4 @@
-import type { ThumbnailCacheStatsResponse } from "@megle/core-client";
+import type { ThumbnailCacheStatsResponse, ThumbnailFailureRecord } from "@megle/core-client";
 import {
   rendererErrorIdentityKey,
   type DesktopRendererErrorReport,
@@ -181,13 +181,14 @@ export function retryLibraryErrorReport(cause: unknown): Promise<boolean> {
 export function publishThumbnailCacheStats(
   stats: ThumbnailCacheStatsResponse,
   context: NotificationLibraryContext | null | undefined,
-  observedAt = Date.now()
+  observedAt = Date.now(),
+  failureDetails: readonly ThumbnailFailureRecord[] = []
 ): Promise<boolean> {
   const bridge = desktopBridge();
   const notifications = bridge?.notifications;
   if (
     !bridge ||
-    (bridge.windowRole !== undefined && bridge.windowRole !== "main") ||
+    (bridge.windowRole !== undefined && bridge.windowRole !== "main" && bridge.windowRole !== "settings") ||
     !notifications?.publishThumbnailSummary ||
     !context
   ) {
@@ -210,7 +211,11 @@ export function publishThumbnailCacheStats(
     pendingCount: stats.pendingCandidateCount,
     activeBulkTaskCount: snapshot.activeBulkTaskCount,
     totalCacheBytes: stats.totalBlobBytes,
-    completionPercent: snapshot.percent
+    completionPercent: snapshot.percent,
+    failureDetails: failureDetails.slice(0, 200).map((detail) => ({
+      libraryId,
+      ...detail
+    }))
   };
   return Promise.resolve()
     .then(() => notifications.publishThumbnailSummary(summary))

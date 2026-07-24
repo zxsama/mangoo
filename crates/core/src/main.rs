@@ -17,8 +17,20 @@ use axum::http::HeaderValue;
 
 use crate::api::BasicAuthCredentials;
 
+fn initialize_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    initialize_tracing();
     let db_path = std::env::var("MEGLE_DB_PATH")
         .ok()
         .filter(|s| !s.is_empty())

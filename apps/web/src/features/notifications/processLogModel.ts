@@ -1,8 +1,43 @@
 import type {
   DesktopProcessLogBatch,
   DesktopProcessLogFilter,
-  DesktopProcessLogLine
+  DesktopProcessLogLine,
+  ThumbnailFailureDetail
 } from "@megle/notification-contract";
+
+export type ProcessLogRow =
+  | { kind: "log"; line: DesktopProcessLogLine }
+  | { kind: "failure"; detail: ThumbnailFailureDetail };
+
+export function buildProcessLogRows(
+  logs: readonly DesktopProcessLogLine[],
+  authoritativeFailures: readonly ThumbnailFailureDetail[]
+): ProcessLogRow[] {
+  const currentFailureKeys = new Set(
+    logs.map(thumbnailFailureKeyFromLog).filter((key): key is string => key !== null)
+  );
+  const persistentRows = authoritativeFailures
+    .filter((detail) => !currentFailureKeys.has(thumbnailFailureKey(detail.libraryId, detail.fileId)))
+    .sort((left, right) => right.updatedAt - left.updatedAt || left.fileId - right.fileId)
+    .map((detail): ProcessLogRow => ({ kind: "failure", detail }));
+  return [
+    ...persistentRows,
+    ...logs.map((line): ProcessLogRow => ({ kind: "log", line }))
+  ];
+}
+
+function thumbnailFailureKeyFromLog(line: DesktopProcessLogLine): string | null {
+  if (line.metadata?.eventKind !== "thumbnail_failure") return null;
+  const libraryId = line.metadata.libraryId;
+  const fileId = line.metadata.fileId;
+  return typeof libraryId === "string" && typeof fileId === "number"
+    ? thumbnailFailureKey(libraryId, fileId)
+    : null;
+}
+
+function thumbnailFailureKey(libraryId: string, fileId: number): string {
+  return `${libraryId}\u0000${fileId}`;
+}
 
 export const MAX_PAUSED_LOG_LINES = 1_000;
 
@@ -38,6 +73,8 @@ export function processLogFilterIdentity(filter: DesktopProcessLogFilter): strin
     level: filter.level ?? null,
     levels: [...(filter.levels ?? [])].sort(),
     search: filter.search?.trim() ?? "",
+    eventKind: filter.eventKind ?? null,
+    libraryId: filter.libraryId ?? null,
     afterSequence: filter.afterSequence ?? null,
     beforeSequence: filter.beforeSequence ?? null,
     limit: filter.limit ?? null

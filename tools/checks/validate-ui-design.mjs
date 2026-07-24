@@ -286,6 +286,17 @@ for (const selector of [
     fail(`${selector} must use the local readable glass tint instead of relying on a full-window backing plate`);
   }
 }
+const notificationDotCss = cssBlocksForExactSelector(stylesForChecks, ".notification-status-dot").join("\n");
+if (!/left:\s*50%/.test(notificationDotCss) ||
+    !/transform:\s*translateX\(-50%\)/.test(notificationDotCss) ||
+    /right:\s*\d/.test(notificationDotCss)) {
+  fail("notification status dot must stay horizontally centered over the Bell icon");
+}
+for (const selector of [".notification-scan-paths", ".notification-thumbnail-failure-action"]) {
+  if (cssBlocksForExactSelector(stylesForChecks, selector).length === 0) {
+    fail(`notification drill-down style missing ${selector}`);
+  }
+}
 for (const requiredSharedSelector of [
   ".shell-right-actions .titlebar-icon-button,",
   ".shell-right-actions .titlebar-icon-button::after,",

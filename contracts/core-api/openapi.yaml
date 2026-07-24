@@ -171,6 +171,38 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /media/{fileId}/position:
+    get:
+      operationId: getMediaPosition
+      parameters:
+        - $ref: "#/components/parameters/fileId"
+        - in: query
+          name: rootId
+          schema: { type: integer }
+        - in: query
+          name: folderId
+          schema: { type: integer }
+        - in: query
+          name: includeDescendants
+          schema: { type: boolean, default: false }
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: [mtime_desc, mtime_asc, name_asc, name_desc]
+      responses:
+        "200":
+          description: Zero-based position in the requested media scope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaPositionResponse"
+        "404":
+          description: Media item not found in the requested scope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /media/{fileId}/thumbnail:
     get:
       operationId: getThumbnail
@@ -262,6 +294,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ThumbnailCacheStatsResponse"
+  /thumbnails/cache/failures:
+    get:
+      operationId: listThumbnailCacheFailures
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 100
+      responses:
+        "200":
+          description: Bounded authoritative thumbnail failure details for the active library.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ThumbnailFailureListResponse"
   /thumbnails/cache/clear:
     post:
       operationId: clearThumbnailCache
@@ -1668,6 +1719,39 @@ components:
         activeBulkTaskCount:
           type: integer
           minimum: 0
+    ThumbnailFailureRecord:
+      type: object
+      required: [fileId, folderId, rootId, relativePath, failureKind, error, updatedAt]
+      properties:
+        fileId:
+          type: integer
+          minimum: 1
+        folderId:
+          type: integer
+          minimum: 1
+        rootId:
+          type: integer
+          minimum: 1
+        relativePath:
+          type: string
+        failureKind:
+          type: string
+        error:
+          type: string
+        updatedAt:
+          type: integer
+          minimum: 0
+    ThumbnailFailureListResponse:
+      type: object
+      required: [items, truncated]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/ThumbnailFailureRecord"
+        truncated:
+          type: boolean
     ThumbnailCacheEnqueueResponse:
       allOf:
         - $ref: "#/components/schemas/ThumbnailCacheStatsResponse"
@@ -2005,3 +2089,10 @@ components:
       properties:
         deleted:
           type: boolean
+    MediaPositionResponse:
+      type: object
+      required: [index]
+      properties:
+        index:
+          type: integer
+          minimum: 0

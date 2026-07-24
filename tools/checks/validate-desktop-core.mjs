@@ -262,6 +262,9 @@ if (!notificationStore.includes('"notifications.sqlite"')) {
 }
 
 for (const value of [
+  "windowIntent",
+  "focusMedia",
+  "focusMediaRequested",
   "compact",
   "history",
   "cancel",
@@ -288,6 +291,8 @@ for (const value of [
   "parseRendererErrorReport",
   "parseThumbnailCacheSummary",
   "parseProcessLogFilter",
+  "parseNotificationWindowIntent",
+  "parseMediaFocusRequest",
   "parseRendererLogEntries",
   "LatestValueBroadcastQueue",
   "ProcessLogIpcSubscriptions"
@@ -377,6 +382,26 @@ if (preload.includes("onLogs:") ||
     !preload.includes("logsUnsubscribe, id") ||
     !preload.includes('windowRole === "notifications"')) {
   fail("preload must use one tokenized log protocol and a role-scoped notifications bridge");
+}
+for (const value of [
+  "subscribeNotificationWindowIntent",
+  "onNotificationWindowIntent",
+  "onFocusMedia",
+  "focusMedia"
+]) {
+  if (!preload.includes(value)) {
+    fail(`notification drill-down preload bridge missing ${value}`);
+  }
+}
+for (const value of [
+  "NOTIFICATION_IPC_CHANNELS.windowIntent",
+  "NOTIFICATION_IPC_CHANNELS.focusMedia",
+  "NOTIFICATION_IPC_CHANNELS.focusMediaRequested",
+  "coreLogHandlerForSession"
+]) {
+  if (!main.includes(value)) {
+    fail(`notification drill-down Main integration missing ${value}`);
+  }
 }
 for (const value of [
   "canAccessDesktopIpc",

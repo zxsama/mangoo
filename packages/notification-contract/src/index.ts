@@ -45,6 +45,19 @@ export interface DesktopThumbnailCacheSummary {
   activeBulkTaskCount: number;
   totalCacheBytes: number | null;
   completionPercent: number | null;
+  /** Absent only in summaries persisted by releases predating failure drill-down. */
+  failureDetails?: ThumbnailFailureDetail[];
+}
+
+export interface ThumbnailFailureDetail {
+  libraryId: string;
+  fileId: number;
+  folderId: number;
+  rootId: number;
+  relativePath: string;
+  failureKind: string;
+  error: string;
+  updatedAt: number;
 }
 
 export type ThumbnailCacheSummary = DesktopThumbnailCacheSummary;
@@ -170,9 +183,26 @@ export interface ProcessLogFilter {
   readonly level?: ProcessLogLevel;
   readonly levels?: readonly ProcessLogLevel[];
   readonly search?: string;
+  readonly eventKind?: "thumbnail_failure";
+  readonly libraryId?: string;
   readonly afterSequence?: number;
   readonly beforeSequence?: number;
   readonly limit?: number;
+}
+
+export interface NotificationWindowIntent {
+  readonly page: "logs";
+  readonly logFilter: {
+    readonly eventKind: "thumbnail_failure";
+    readonly libraryId: string;
+  };
+}
+
+export interface MediaFocusRequest {
+  readonly libraryId: string;
+  readonly fileId: number;
+  readonly folderId: number;
+  readonly rootId: number;
 }
 
 export type DesktopProcessLogFilter = ProcessLogFilter;

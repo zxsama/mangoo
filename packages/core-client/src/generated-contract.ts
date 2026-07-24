@@ -71,6 +71,21 @@ export interface ThumbnailCacheStatsResponse {
   activeBulkTaskCount: number;
 }
 
+export interface ThumbnailFailureRecord {
+  fileId: number;
+  folderId: number;
+  rootId: number;
+  relativePath: string;
+  failureKind: string;
+  error: string;
+  updatedAt: number;
+}
+
+export interface ThumbnailFailureListResponse {
+  items: ThumbnailFailureRecord[];
+  truncated: boolean;
+}
+
 export interface ThumbnailCacheEnqueueResponse extends ThumbnailCacheStatsResponse {
   acceptedCount: number;
   nextCursor?: number;
@@ -217,6 +232,10 @@ export interface MediaRecord {
   favorite?: boolean;
   note?: string | null;
   tagIds?: number[];
+}
+
+export interface MediaPositionResponse {
+  index: number;
 }
 
 export interface TagRecord {

@@ -9,6 +9,7 @@ import type {
   ThumbnailCacheScopeParams,
   ThumbnailCacheTaskRequest,
   ThumbnailCacheStatsResponse,
+  ThumbnailFailureListResponse,
   DeleteRequest,
   DeleteTagResponse,
   FileOperationListResponse,
@@ -22,6 +23,7 @@ import type {
   ListFolderChildrenParams,
   ListMediaParams,
   MediaRecord,
+  MediaPositionResponse,
   MoveRequest,
   NotificationOutboxAckRequest,
   NotificationOutboxAckResponse,
@@ -260,6 +262,14 @@ export function createCoreClient(config: CoreClientConfig) {
         requestPriority: options.requestPriority ?? "metadata",
         signal: options.signal
       }),
+    listThumbnailCacheFailures: (
+      limit = 100,
+      options: CoreRequestOptions = {}
+    ) =>
+      request<ThumbnailFailureListResponse>(`/thumbnails/cache/failures${query({ limit })}`, {
+        requestPriority: options.requestPriority ?? "metadata",
+        signal: options.signal
+      }),
     enqueueThumbnailCache: (
       input: ThumbnailCacheTaskRequest,
       options: CoreRequestOptions = {}
@@ -313,6 +323,14 @@ export function createCoreClient(config: CoreClientConfig) {
       }),
     getMedia: (fileId: number) =>
       request<MediaRecord>(`/media/${fileId}`, { requestPriority: "interactive" }),
+    getMediaPosition: (
+      fileId: number,
+      params: Pick<ListMediaParams, "rootId" | "folderId" | "includeDescendants" | "sort">,
+      options: CoreRequestOptions = {}
+    ) => request<MediaPositionResponse>(`/media/${fileId}/position${query(params)}`, {
+      requestPriority: options.requestPriority ?? "navigation",
+      signal: options.signal
+    }),
     getThumbnail: (
       fileId: number,
       target: "grid_320" = "grid_320",

@@ -211,6 +211,18 @@ pub struct ThumbnailCacheStats {
     pub active_bulk_task_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbnailFailureRecord {
+    pub file_id: i64,
+    pub folder_id: i64,
+    pub root_id: i64,
+    pub relative_path: String,
+    pub failure_kind: String,
+    pub error: String,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ThumbnailCacheEnqueueResult {
     pub accepted_count: usize,
@@ -830,7 +842,7 @@ impl Database {
                 .to_owned(),
             ),
             title: descriptor.title.to_owned(),
-            summary: task.root_id.map(|root_id| format!("Root {root_id}")),
+            summary: task_notification_summary_in_transaction(transaction, &task)?,
             task_id: Some(task.id),
             root_id: task.root_id,
             folder_id: task.folder_id,
@@ -3488,6 +3500,98 @@ impl Database {
         })
     }
 
+    pub fn media_position(
+        &self,
+        file_id: i64,
+        query: &MediaPageQuery,
+    ) -> anyhow::Result<Option<i64>> {
+        let Some(target) = self.get_media(file_id)? else {
+            return Ok(None);
+        };
+        if query
+            .root_id
+            .is_some_and(|root_id| root_id != target.root_id)
+        {
+            return Ok(None);
+        }
+        if let Some(folder_id) = query.folder_id {
+            let in_scope = if query.include_descendants {
+                self.list_folder_ancestors(target.folder_id)?
+                    .is_some_and(|path| path.iter().any(|folder| folder.id == folder_id))
+            } else {
+                target.folder_id == folder_id
+            };
+            if !in_scope {
+                return Ok(None);
+            }
+        }
+
+        let sort = normalize_media_sort(&query.sort);
+        let mut predicates = vec!["files.status = 'active'".to_string()];
+        let mut parameters: Vec<Value> = Vec::new();
+        if let Some(root_id) = query.root_id {
+            predicates.push("files.root_id = ?".to_string());
+            parameters.push(Value::Integer(root_id));
+        }
+        if let Some(folder_id) = query.folder_id {
+            if query.include_descendants {
+                predicates.push(
+                    r#"files.folder_id IN (
+                        WITH RECURSIVE descendant_folders(id) AS (
+                            SELECT id FROM folders WHERE id = ?
+                            UNION ALL
+                            SELECT folders.id FROM folders
+                            JOIN descendant_folders ON folders.parent_id = descendant_folders.id
+                        )
+                        SELECT id FROM descendant_folders
+                    )"#
+                    .to_string(),
+                );
+            } else {
+                predicates.push("files.folder_id = ?".to_string());
+            }
+            parameters.push(Value::Integer(folder_id));
+        }
+        match sort {
+            "name_asc" => {
+                predicates
+                    .push("(files.name < ? OR (files.name = ? AND files.id < ?))".to_string());
+                parameters.push(Value::Text(target.name.clone()));
+                parameters.push(Value::Text(target.name.clone()));
+                parameters.push(Value::Integer(target.id));
+            }
+            "name_desc" => {
+                predicates
+                    .push("(files.name > ? OR (files.name = ? AND files.id > ?))".to_string());
+                parameters.push(Value::Text(target.name.clone()));
+                parameters.push(Value::Text(target.name.clone()));
+                parameters.push(Value::Integer(target.id));
+            }
+            "mtime_asc" => {
+                predicates
+                    .push("(files.mtime < ? OR (files.mtime = ? AND files.id < ?))".to_string());
+                parameters.push(Value::Integer(target.mtime));
+                parameters.push(Value::Integer(target.mtime));
+                parameters.push(Value::Integer(target.id));
+            }
+            _ => {
+                predicates
+                    .push("(files.mtime > ? OR (files.mtime = ? AND files.id > ?))".to_string());
+                parameters.push(Value::Integer(target.mtime));
+                parameters.push(Value::Integer(target.mtime));
+                parameters.push(Value::Integer(target.id));
+            }
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM files CROSS JOIN roots ON roots.id = files.root_id AND roots.enabled = 1 WHERE {}",
+            predicates.join(" AND ")
+        );
+        let index = self
+            .connection
+            .query_row(&sql, params_from_iter(parameters), |row| row.get(0))?;
+        Ok(Some(index))
+    }
+
     fn list_descendant_media_page(
         &self,
         query: MediaPageQuery,
@@ -4211,6 +4315,24 @@ impl Database {
         scope: ThumbnailCacheScope,
     ) -> anyhow::Result<ThumbnailCacheStats> {
         get_thumbnail_cache_stats_for_scope(self, scope)
+    }
+
+    pub fn list_thumbnail_failures(
+        &self,
+        profile: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ThumbnailFailureRecord>> {
+        thumbnail_failures(self, profile, None, limit)
+    }
+
+    pub fn get_thumbnail_failure(
+        &self,
+        file_id: i64,
+        profile: &str,
+    ) -> anyhow::Result<Option<ThumbnailFailureRecord>> {
+        Ok(thumbnail_failures(self, profile, Some(file_id), 1)?
+            .into_iter()
+            .next())
     }
 
     #[cfg(test)]
@@ -8610,6 +8732,70 @@ fn get_thumbnail_cache_stats_for_scope(
     })
 }
 
+fn thumbnail_failures(
+    database: &Database,
+    profile: &str,
+    file_id: Option<i64>,
+    limit: usize,
+) -> anyhow::Result<Vec<ThumbnailFailureRecord>> {
+    let mut statement = database.connection.prepare(
+        r#"
+        WITH RECURSIVE folder_paths(id, root_id, relative_path, depth) AS (
+            SELECT folders.id, folders.root_id, '', 0
+            FROM folders
+            JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
+            WHERE folders.parent_id IS NULL AND folders.status = 'active'
+            UNION ALL
+            SELECT child.id, child.root_id,
+                   CASE
+                     WHEN folder_paths.relative_path = '' THEN child.name
+                     ELSE folder_paths.relative_path || '\' || child.name
+                   END,
+                   folder_paths.depth + 1
+            FROM folder_paths
+            JOIN folders child
+              ON child.parent_id = folder_paths.id
+             AND child.root_id = folder_paths.root_id
+             AND child.status = 'active'
+            WHERE folder_paths.depth + 1 < ?4
+        )
+        SELECT files.id, files.folder_id, files.root_id,
+               roots.display_name ||
+                 CASE WHEN folder_paths.relative_path = '' THEN ''
+                      ELSE '\' || folder_paths.relative_path END ||
+                 '\' || files.name,
+               COALESCE(thumbs.failure_kind, 'unknown'),
+               COALESCE(thumbs.error, 'thumbnail generation failed'),
+               thumbs.updated_at
+        FROM thumbs
+        JOIN files ON files.id = thumbs.file_id AND files.status = 'active'
+        JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
+        JOIN folder_paths ON folder_paths.id = files.folder_id
+        WHERE thumbs.profile = ?1
+          AND thumbs.state = 'failed'
+          AND (?2 IS NULL OR files.id = ?2)
+        ORDER BY thumbs.updated_at DESC, files.id ASC
+        LIMIT ?3
+        "#,
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![profile, file_id, limit as i64, FOLDER_ANCESTOR_DEPTH_CAP],
+        |row| {
+            Ok(ThumbnailFailureRecord {
+                file_id: row.get(0)?,
+                folder_id: row.get(1)?,
+                root_id: row.get(2)?,
+                relative_path: row.get(3)?,
+                failure_kind: row.get(4)?,
+                error: row.get(5)?,
+                updated_at: row.get::<_, i64>(6)?.saturating_mul(1_000),
+            })
+        },
+    )?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 fn build_thumbnail_cache_stats_for_file_ids(
     database: &Database,
     file_ids: &[i64],
@@ -8701,6 +8887,58 @@ fn task_record_in_transaction(
         )
         .optional()?
         .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))
+}
+
+fn task_notification_summary_in_transaction(
+    transaction: &Transaction<'_>,
+    task: &TaskRecord,
+) -> anyhow::Result<Option<String>> {
+    let Some(root_id) = task.root_id else {
+        return Ok(None);
+    };
+    let root_name = transaction
+        .query_row(
+            "SELECT display_name FROM roots WHERE id = ?1",
+            [root_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(root_name) = root_name else {
+        return Ok(None);
+    };
+    if task.kind != "interactive_folder_scan" {
+        return Ok(Some(root_name));
+    }
+    let Some(mut folder_id) = task.folder_id else {
+        return Ok(Some(root_name));
+    };
+    let mut names = Vec::new();
+    for _ in 0..FOLDER_ANCESTOR_DEPTH_CAP {
+        let folder = transaction
+            .query_row(
+                "SELECT parent_id, name FROM folders WHERE id = ?1 AND root_id = ?2",
+                (folder_id, root_id),
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((parent_id, name)) = folder else {
+            return Ok(Some(root_name));
+        };
+        let Some(parent_id) = parent_id else {
+            names.reverse();
+            return Ok(Some(
+                std::iter::once(root_name)
+                    .chain(names)
+                    .collect::<Vec<_>>()
+                    .join("\\"),
+            ));
+        };
+        if !name.is_empty() {
+            names.push(name);
+        }
+        folder_id = parent_id;
+    }
+    anyhow::bail!("folder notification path exceeded ancestor depth cap")
 }
 
 fn task_notification_origin_in_transaction(
@@ -13067,6 +13305,153 @@ mod tests {
         assert_eq!(failed.error_code.as_deref(), Some("failed"));
         assert_eq!(cancelled.status, "cancelled");
         assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn scan_notification_summaries_use_library_relative_paths() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/private/Artists".to_string(),
+                display_name: "Artists".to_string(),
+            })
+            .expect("add root");
+        let root_folder = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "summary-root".to_string(),
+                mtime: Some(1),
+            })
+            .expect("root folder");
+        let portraits = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: Some(root_folder),
+                name: "Portraits".to_string(),
+                path_hash: "summary-portraits".to_string(),
+                mtime: Some(2),
+            })
+            .expect("portraits folder");
+        let concept = database
+            .upsert_folder(FolderUpsert {
+                root_id,
+                parent_id: Some(portraits),
+                name: "Concept".to_string(),
+                path_hash: "summary-concept".to_string(),
+                mtime: Some(3),
+            })
+            .expect("concept folder");
+        let root_task = database.create_root_scan_task(root_id).expect("root scan");
+        let folder_task = database
+            .create_interactive_folder_scan_task(concept)
+            .expect("folder scan");
+        let heads = database
+            .notification_heads_for_test()
+            .expect("notification heads");
+        assert_eq!(
+            heads
+                .iter()
+                .find(|item| item.task_id == Some(root_task))
+                .and_then(|item| item.summary.as_deref()),
+            Some("Artists")
+        );
+        assert_eq!(
+            heads
+                .iter()
+                .find(|item| item.task_id == Some(folder_task))
+                .and_then(|item| item.summary.as_deref()),
+            Some("Artists\\Portraits\\Concept")
+        );
+        assert!(heads.iter().all(|item| !item
+            .summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("D:/")));
+    }
+
+    #[test]
+    fn media_position_matches_list_sort_and_scope() {
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_media_page_fixture(&database);
+        let mut file_ids = Vec::new();
+        for (name, mtime) in [("c.jpg", 30), ("a.jpg", 10), ("b.jpg", 20)] {
+            file_ids.push(
+                database
+                    .upsert_file(FileUpsert {
+                        root_id,
+                        folder_id,
+                        name: name.to_string(),
+                        ext: ".jpg".to_string(),
+                        size: 10,
+                        mtime,
+                        ctime: None,
+                        file_key: Some(format!("position-{name}")),
+                    })
+                    .expect("insert media"),
+            );
+        }
+        let query = MediaPageQuery {
+            root_id: Some(root_id),
+            folder_id: Some(folder_id),
+            include_descendants: false,
+            limit: 10,
+            offset: Some(0),
+            cursor: None,
+            sort: "name_asc".to_string(),
+            kind: None,
+        };
+        let page = database
+            .list_media_page(query.clone())
+            .expect("list sorted media");
+        for file_id in [file_ids[2], file_ids[0]] {
+            let expected = page
+                .items
+                .iter()
+                .position(|item| item.id == file_id)
+                .map(|index| index as i64);
+            assert_eq!(database.media_position(file_id, &query).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn thumbnail_failure_details_are_bounded_and_library_relative() {
+        let database = migrated_database();
+        let (root_id, folder_id) = seed_thumbnail_cache_scope_fixture(&database, "failure-details");
+        let file_id = seed_thumbnail_cache_candidate(
+            &database,
+            root_id,
+            folder_id,
+            "broken.jpg",
+            Some("broken"),
+            "failed",
+            false,
+            None,
+            None,
+        );
+        database
+            .connection
+            .execute(
+                "UPDATE thumbs SET failure_kind = 'permanent' WHERE file_id = ?1 AND profile = ?2",
+                (file_id, crate::thumbnails::GRID_320_PROFILE),
+            )
+            .expect("classify failure");
+        let failures = database
+            .list_thumbnail_failures(crate::thumbnails::GRID_320_PROFILE, 1)
+            .expect("list failures");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].file_id, file_id);
+        assert_eq!(failures[0].failure_kind, "permanent");
+        assert_eq!(
+            failures[0].relative_path,
+            "Pictures failure-details\\broken.jpg"
+        );
+        assert!(
+            failures[0].updated_at >= 1_000_000_000_000,
+            "failure diagnostics expose Unix milliseconds for renderer dates"
+        );
+        assert!(!failures[0].relative_path.contains("D:/"));
     }
 
     #[test]

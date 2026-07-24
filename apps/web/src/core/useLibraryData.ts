@@ -14,6 +14,7 @@ import type {
   UserMetadataRecord,
   UserMetadataUpdate
 } from "@megle/core-client";
+import type { MediaFocusRequest } from "@megle/notification-contract";
 import { CoreApiError } from "@megle/core-client";
 import { createCoreClient } from "./client";
 import { readDesktopDiagnostics, subscribeLibraryPhase, type DesktopDiagnostics } from "./desktop";
@@ -184,6 +185,7 @@ export interface LibraryState {
   toggleFolderExpanded: (folderId: number) => void;
   requestFolderChildren: (folderId: number) => Promise<FolderRecord[]>;
   revealFolderPath: (folderId: number) => Promise<FolderRecord[]>;
+  locateMedia: (request: MediaFocusRequest) => Promise<boolean>;
   requestThumbnailStates: (mediaIds: number[], priority: ThumbnailRequestPriority) => void;
   requestMediaWindow: (startIndex: number, endIndex: number) => void;
   loadMoreFolderChildren: (folderId: number) => Promise<void>;
@@ -519,6 +521,7 @@ export function useLibraryData(
   searchStateRef.current = searchState;
   const debouncedQRef = useRef(debouncedQ);
   debouncedQRef.current = debouncedQ;
+  const skipNextFilterReloadRef = useRef(false);
   selectedRootIdRef.current = selectedRootId;
   selectedFolderIdRef.current = selectedFolderId;
   selectedMediaIdRef.current = selectedMediaId;
@@ -568,6 +571,12 @@ export function useLibraryData(
           signal: controller.signal
         }
       );
+      const failureDetails = stats.failedCount > 0
+        ? (await client.listThumbnailCacheFailures(100, {
+            requestPriority: "metadata",
+            signal: controller.signal
+          })).items
+        : [];
       if (
         thumbnailCacheStatsControllerRef.current === controller &&
         sameLibraryContext(requestLibraryContext, activeLibraryContextRef.current)
@@ -576,7 +585,7 @@ export function useLibraryData(
           libraryId: requestLibraryContext?.libraryId ?? null,
           stats
         });
-        void publishThumbnailCacheStats(stats, requestLibraryContext);
+        void publishThumbnailCacheStats(stats, requestLibraryContext, Date.now(), failureDetails);
       }
       return stats;
     } catch (cause) {
@@ -2091,6 +2100,61 @@ export function useLibraryData(
     reportLibraryFailure
   ]);
 
+  const locateMedia = useCallback(async (request: MediaFocusRequest): Promise<boolean> => {
+    if (options.activeLibraryId && request.libraryId !== options.activeLibraryId) return false;
+    try {
+      const target = await client.getMedia(request.fileId);
+      if (
+        target.id !== request.fileId ||
+        target.rootId !== request.rootId ||
+        target.folderId !== request.folderId
+      ) {
+        return false;
+      }
+      const sort = listMediaSort(searchStateRef.current.sort);
+      const includeDescendants = showChildFolderContentsRef.current;
+      const { index } = await client.getMediaPosition(request.fileId, {
+        rootId: request.rootId,
+        folderId: request.folderId,
+        includeDescendants,
+        sort
+      });
+
+      if (searchActiveRef.current) skipNextFilterReloadRef.current = true;
+      const nextSearchState: SearchState = {
+        q: "",
+        kind: undefined,
+        minRating: undefined,
+        favorite: undefined,
+        tagIds: [],
+        sort: searchStateRef.current.sort
+      };
+      searchStateRef.current = nextSearchState;
+      debouncedQRef.current = "";
+      searchActiveRef.current = false;
+      setSearchState(nextSearchState);
+      setDebouncedQ("");
+
+      await loadLibrary({ rootId: request.rootId, folderId: request.folderId });
+      const path = await revealFolderPath(request.folderId);
+      if (path.length === 0) return false;
+      const windowStart = Math.max(0, index - Math.floor(INITIAL_MEDIA_WINDOW_LIMIT / 2));
+      await loadMediaWindow({
+        rootId: request.rootId,
+        folderId: request.folderId,
+        includeDescendants,
+        offset: windowStart,
+        limit: INITIAL_MEDIA_WINDOW_LIMIT,
+        requestGeneration: mediaPageGeneration.current
+      });
+      setSelectedFolderInfoState(null);
+      selectMedia(request.fileId);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [client, loadLibrary, loadMediaWindow, options.activeLibraryId, revealFolderPath]);
+
   useEffect(() => {
     void loadLibrary();
   }, [loadLibrary]);
@@ -2167,6 +2231,10 @@ export function useLibraryData(
 
   // Reload media when filters/sort/debounced-q change
   useEffect(() => {
+    if (skipNextFilterReloadRef.current) {
+      skipNextFilterReloadRef.current = false;
+      return;
+    }
     void loadLibrary();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -3511,6 +3579,7 @@ export function useLibraryData(
     requestMediaWindow,
     requestFolderChildren: loadFolderChildren,
     revealFolderPath,
+    locateMedia,
     toggleFolderExpanded: (folderId: number) => {
       const reportingAttempt = createReportingAttempt();
       setExpandedFolderIds((current) => {

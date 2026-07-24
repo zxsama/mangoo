@@ -376,10 +376,17 @@ function sameNotificationOperationPayload(
 function cloneCompactSnapshot(snapshot: NotificationCompactSnapshot): NotificationCompactSnapshot {
   return {
     active: snapshot.active.map((item) => ({ ...item })),
-    thumbnailSummaries: snapshot.thumbnailSummaries.map((item) => ({ ...item })),
+    thumbnailSummaries: snapshot.thumbnailSummaries.map(cloneThumbnailSummary),
     latestImportantResults: snapshot.latestImportantResults.map((item) => ({ ...item })),
     hasRetryableFailure: snapshot.hasRetryableFailure,
     syncHealth: { ...snapshot.syncHealth }
+  };
+}
+
+function cloneThumbnailSummary(summary: ThumbnailCacheSummary): ThumbnailCacheSummary {
+  return {
+    ...summary,
+    failureDetails: (summary.failureDetails ?? []).map((detail) => ({ ...detail }))
   };
 }
 
@@ -1897,7 +1904,7 @@ export class NotificationService {
     const existing = this.fallbackThumbnails.get(summary.libraryId);
     if (existing && summary.observedAt < existing.observedAt) return false;
     this.fallbackThumbnails.delete(summary.libraryId);
-    this.fallbackThumbnails.set(summary.libraryId, summary);
+    this.fallbackThumbnails.set(summary.libraryId, cloneThumbnailSummary(summary));
     this.touchFallbackRecord(fallbackThumbnailKey(summary.libraryId));
     return this.fallbackThumbnails.has(summary.libraryId);
   }

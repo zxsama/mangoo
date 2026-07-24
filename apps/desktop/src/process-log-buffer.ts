@@ -609,6 +609,8 @@ function matchesFilter(line: ProcessLogLine, filter: ProcessLogFilter): boolean 
   if (filter.sources && !filter.sources.includes(line.source)) return false;
   if (filter.level && line.level !== filter.level) return false;
   if (filter.levels && !filter.levels.includes(line.level)) return false;
+  if (filter.eventKind && line.metadata?.eventKind !== filter.eventKind) return false;
+  if (filter.libraryId && line.metadata?.libraryId !== filter.libraryId) return false;
   if (filter.afterSequence !== undefined && line.sequence <= filter.afterSequence) return false;
   if (filter.beforeSequence !== undefined && line.sequence >= filter.beforeSequence) return false;
   if (filter.search && !line.message.toLocaleLowerCase().includes(filter.search.toLocaleLowerCase())) return false;

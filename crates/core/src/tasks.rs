@@ -788,7 +788,9 @@ fn handle_task_error_for_attempt(
     match database.get_task(task_id) {
         Ok(Some(task)) if task.kind == "thumbnail" => {
             if let Some(file_id) = task.file_id {
-                let auxiliary_result = if error_message.contains(THUMBNAIL_SOURCE_CHANGED_ERROR) {
+                let source_changed = error_message.contains(THUMBNAIL_SOURCE_CHANGED_ERROR);
+                let failure_kind = crate::thumbnails::classify_thumbnail_failure(&error_message);
+                let auxiliary_result = if source_changed {
                     database.reset_thumbnail_after_stale_source_for_task_attempt(
                         file_id,
                         GRID_320_PROFILE,
@@ -797,25 +799,47 @@ fn handle_task_error_for_attempt(
                         attempt_generation,
                     )
                 } else {
-                    let failure_kind =
-                        crate::thumbnails::classify_thumbnail_failure(&error_message).as_str();
                     database.publish_thumbnail_failure_for_attempted_source_for_task_attempt(
                         file_id,
                         GRID_320_PROFILE,
                         task.thumbnail_source_fingerprint.as_deref(),
                         &error_message,
-                        failure_kind,
+                        failure_kind.as_str(),
                         task_id,
                         attempt_generation,
                     )
                 };
-                if let Err(database_error) = auxiliary_result {
-                    tracing::warn!(
-                        task_id,
-                        attempt_generation,
-                        %database_error,
-                        "failed to update thumbnail failure state while handling worker error"
-                    );
+                match auxiliary_result {
+                    Ok(true) if !source_changed => {
+                        match database.get_thumbnail_failure(file_id, GRID_320_PROFILE) {
+                            Ok(Some(detail)) => tracing::error!(
+                                event_kind = "thumbnail_failure",
+                                file_id = detail.file_id,
+                                folder_id = detail.folder_id,
+                                root_id = detail.root_id,
+                                relative_path = %detail.relative_path,
+                                failure_kind = %detail.failure_kind,
+                                error = %detail.error,
+                                "thumbnail generation failed"
+                            ),
+                            Ok(None) => {}
+                            Err(database_error) => tracing::warn!(
+                                task_id,
+                                attempt_generation,
+                                %database_error,
+                                "failed to resolve thumbnail failure detail"
+                            ),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(database_error) => {
+                        tracing::warn!(
+                            task_id,
+                            attempt_generation,
+                            %database_error,
+                            "failed to update thumbnail failure state while handling worker error"
+                        );
+                    }
                 }
             }
         }

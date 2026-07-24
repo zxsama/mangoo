@@ -19,9 +19,9 @@ use crate::db::{
     Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot,
     NotificationOrigin, PluginRecord, RootRecord, SearchQuery, TagError, TagRecord, TaskRecord,
     ThumbBlobRecord, ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult,
-    ThumbnailCacheRefreshMode, ThumbnailCacheScope, ThumbnailCacheStats, ThumbnailRecord,
-    ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority, UserMetadataPatch, UserMetadataRecord,
-    THUMBNAIL_BULK_PRIORITY,
+    ThumbnailCacheRefreshMode, ThumbnailCacheScope, ThumbnailCacheStats, ThumbnailFailureRecord,
+    ThumbnailRecord, ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority, UserMetadataPatch,
+    UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
 };
 use crate::fsops::{
     self, DeleteRequest, FileOperationRecord, FsOpsError, FsOpsErrorCode, MoveRequest,
@@ -89,9 +89,11 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/folders/{folderId}/ancestors",
     "/api/media",
     "/api/media/{fileId}",
+    "/api/media/{fileId}/position",
     "/api/media/{fileId}/thumbnail",
     "/api/media/{fileId}/thumbnail/blob",
     "/api/thumbnails/cache/stats",
+    "/api/thumbnails/cache/failures",
     "/api/thumbnails/cache/clear",
     "/api/thumbnails/cache/cancel-bulk",
     "/api/media/{fileId}/preview",
@@ -234,6 +236,11 @@ struct ListMediaQuery {
     kind: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct MediaPositionResponse {
+    index: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ThumbnailQuery {
     priority: Option<String>,
@@ -277,6 +284,19 @@ struct ThumbnailCacheStatsResponse {
     pending_candidate_count: i64,
     total_blob_bytes: i64,
     active_bulk_task_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailFailureQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailFailureListResponse {
+    items: Vec<ThumbnailFailureRecord>,
+    truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -511,6 +531,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/media", get(list_media))
         .route("/api/media/:file_id", get(get_media))
+        .route("/api/media/:file_id/position", get(get_media_position))
         .route("/api/media/:file_id/thumbnail", get(get_thumbnail))
         .route(
             "/api/media/:file_id/thumbnail/blob",
@@ -519,6 +540,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/thumbnails/cache/stats",
             get(get_thumbnail_cache_stats),
+        )
+        .route(
+            "/api/thumbnails/cache/failures",
+            get(list_thumbnail_cache_failures),
         )
         .route("/api/thumbnails/cache/clear", post(clear_thumbnail_cache))
         .route(
@@ -842,6 +867,32 @@ async fn get_media(
     Ok(Json(item))
 }
 
+async fn get_media_position(
+    State(state): State<AppState>,
+    Path(file_id): Path<i64>,
+    Query(query): Query<ListMediaQuery>,
+) -> ApiResult<Json<MediaPositionResponse>> {
+    let sort = parse_media_sort(query.sort.as_deref())?.to_string();
+    let media_query = MediaPageQuery {
+        root_id: query.root_id,
+        folder_id: query.folder_id,
+        include_descendants: query.include_descendants.unwrap_or(false),
+        limit: 1,
+        offset: None,
+        cursor: None,
+        sort,
+        kind: None,
+    };
+    let index = run_read_database(state, move |database| {
+        database
+            .media_position(file_id, &media_query)
+            .map_err(CoreError::from)
+    })
+    .await?
+    .ok_or_else(|| CoreError::not_found(format!("media item not found in scope: {file_id}")))?;
+    Ok(Json(MediaPositionResponse { index }))
+}
+
 async fn get_thumbnail(
     State(state): State<AppState>,
     Path(file_id): Path<i64>,
@@ -1011,6 +1062,27 @@ async fn get_thumbnail_cache_stats(
     guard.computed_at = Some(Instant::now());
     guard.value = Some(stats.clone());
     Ok(Json(stats))
+}
+
+async fn list_thumbnail_cache_failures(
+    State(state): State<AppState>,
+    Query(query): Query<ThumbnailFailureQuery>,
+) -> ApiResult<Json<ThumbnailFailureListResponse>> {
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=200).contains(&limit) {
+        return Err(CoreError::bad_request(
+            "thumbnail failure limit must be between 1 and 200".to_string(),
+        ));
+    }
+    run_read_database(state, move |database| {
+        let mut items = database
+            .list_thumbnail_failures(crate::thumbnails::GRID_320_PROFILE, limit + 1)
+            .map_err(CoreError::from)?;
+        let truncated = items.len() > limit;
+        items.truncate(limit);
+        Ok(Json(ThumbnailFailureListResponse { items, truncated }))
+    })
+    .await
 }
 
 async fn enqueue_thumbnail_cache(

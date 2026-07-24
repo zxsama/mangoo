@@ -16,6 +16,27 @@ function subscribe(channel, cb) {
   return () => ipcRenderer.removeListener(channel, listener);
 }
 
+let pendingNotificationWindowIntent = null;
+const notificationWindowIntentSubscribers = new Set();
+ipcRenderer.on(NOTIFICATION_IPC_CHANNELS.windowIntent, (_event, intent) => {
+  if (notificationWindowIntentSubscribers.size === 0) {
+    pendingNotificationWindowIntent = intent;
+    return;
+  }
+  pendingNotificationWindowIntent = null;
+  for (const subscriber of notificationWindowIntentSubscribers) subscriber(intent);
+});
+
+function subscribeNotificationWindowIntent(cb) {
+  notificationWindowIntentSubscribers.add(cb);
+  if (pendingNotificationWindowIntent !== null) {
+    const intent = pendingNotificationWindowIntent;
+    pendingNotificationWindowIntent = null;
+    cb(intent);
+  }
+  return () => notificationWindowIntentSubscribers.delete(cb);
+}
+
 const MAX_QUEUED_LOG_LINES = 5000;
 
 function mergeQueuedLogBatch(previous, next) {
@@ -143,7 +164,7 @@ const fullBridge = {
   closeSettingsWindow: () => ipcRenderer.invoke("megle:close-settings-window"),
   openPluginsWindow: () => ipcRenderer.invoke("megle:open-plugins-window"),
   closePluginsWindow: () => ipcRenderer.invoke("megle:close-plugins-window"),
-  openNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.openWindow),
+  openNotificationsWindow: (intent) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.openWindow, intent),
   closeNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.closeWindow),
   shell: {
     revealPath: (path) => ipcRenderer.invoke("megle:shell-reveal-path", path),
@@ -166,11 +187,14 @@ const fullBridge = {
     ipcRenderer.on("megle:library-load-phase", listener);
     return () => ipcRenderer.removeListener("megle:library-load-phase", listener);
   },
+  onFocusMedia: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.focusMediaRequested, cb),
   notifications: notificationsBridge
 };
 const notificationWindowBridge = {
   ...commonWindowBridge,
   closeNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.closeWindow),
+  onNotificationWindowIntent: subscribeNotificationWindowIntent,
+  focusMedia: (input) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.focusMedia, input),
   notifications: notificationsBridge
 };
 const roleBridge = windowRole === "notifications"

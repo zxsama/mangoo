@@ -11,6 +11,7 @@ import {
 } from "../features/file-ops/useFileOps";
 import { NotificationPopover } from "../features/notifications/NotificationPopover";
 import type { CompactNotificationModel } from "../features/notifications/notificationModel";
+import type { NotificationWindowIntent } from "@megle/notification-contract";
 import type { LibraryState } from "../core/useLibraryData";
 
 export interface ShellContextMenuState {
@@ -27,7 +28,7 @@ interface ShellOverlayHostProps {
   notificationModel: CompactNotificationModel;
   notificationsOpen: boolean;
   onCloseContextMenu: () => void;
-  onOpenNotificationCenter: () => void;
+  onOpenNotificationCenter: (intent?: NotificationWindowIntent) => void;
 }
 
 export function ShellOverlayHost({

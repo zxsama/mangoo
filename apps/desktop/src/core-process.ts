@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CoreSession } from "./core-session.js";
-import type { ProcessLogLevel } from "./process-log-buffer.js";
+import type { ProcessLogLevel, ProcessLogMetadata } from "./process-log-buffer.js";
 import { LifecycleCancelledError, throwIfLifecycleAborted } from "./core-lifecycle-queue.js";
 
 export interface CoreProcessHandle {
@@ -15,9 +15,65 @@ export interface CoreProcessHandle {
 
 export type CoreProcessLogHandler = (
   source: "core",
-  level: Extract<ProcessLogLevel, "info" | "warn" | "error">,
-  message: string
+  level: ProcessLogLevel,
+  message: string,
+  metadata?: ProcessLogMetadata
 ) => void;
+
+export interface ParsedCoreProcessLogLine {
+  level: ProcessLogLevel;
+  message: string;
+  metadata?: ProcessLogMetadata;
+}
+
+const CORE_LOG_LEVELS = new Set<ProcessLogLevel>(["trace", "debug", "info", "warn", "error"]);
+const CORE_METADATA_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  event_kind: "eventKind",
+  file_id: "fileId",
+  folder_id: "folderId",
+  root_id: "rootId",
+  relative_path: "relativePath",
+  failure_kind: "failureKind"
+});
+
+export function parseCoreProcessLogLine(
+  line: string,
+  fallbackLevel: Extract<ProcessLogLevel, "info" | "warn" | "error">
+): ParsedCoreProcessLogLine {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return { level: fallbackLevel, message: line };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { level: fallbackLevel, message: line };
+  }
+  const record = parsed as Record<string, unknown>;
+  const rawLevel = typeof record.level === "string" ? record.level.toLowerCase() : "";
+  const fields = record.fields;
+  if (
+    !CORE_LOG_LEVELS.has(rawLevel as ProcessLogLevel) ||
+    !fields ||
+    typeof fields !== "object" ||
+    Array.isArray(fields) ||
+    typeof (fields as Record<string, unknown>).message !== "string"
+  ) {
+    return { level: fallbackLevel, message: line };
+  }
+  const fieldRecord = fields as Record<string, unknown>;
+  const metadata: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(fieldRecord)) {
+    if (key === "message") continue;
+    metadata[CORE_METADATA_KEYS[key] ?? key] = value;
+  }
+  if (typeof record.target === "string") metadata.target = record.target;
+  return {
+    level: rawLevel as ParsedCoreProcessLogLine["level"],
+    message: fieldRecord.message as string,
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {})
+  };
+}
 
 export interface CoreProcessLifecycle {
   readonly waitForExit: Promise<void>;
@@ -152,8 +208,14 @@ export function attachCoreProcessLifecycle(
   onLog: CoreProcessLogHandler = defaultCoreProcessLogHandler,
   options: CoreProcessLifecycleOptions = {}
 ): CoreProcessLifecycle {
-  const stdoutSplitter = createCoreOutputLineSplitter((line) => emitCoreLog(onLog, "info", line));
-  const stderrSplitter = createCoreOutputLineSplitter((line) => emitCoreLog(onLog, "warn", line));
+  const stdoutSplitter = createCoreOutputLineSplitter((line) => {
+    const parsed = parseCoreProcessLogLine(line, "info");
+    emitCoreLog(onLog, parsed.level, parsed.message, parsed.metadata);
+  });
+  const stderrSplitter = createCoreOutputLineSplitter((line) => {
+    const parsed = parseCoreProcessLogLine(line, "warn");
+    emitCoreLog(onLog, parsed.level, parsed.message, parsed.metadata);
+  });
   const platform = options.platform ?? process.platform;
   const gracefulTimeoutMs = options.gracefulTimeoutMs ?? CORE_GRACEFUL_STOP_TIMEOUT_MS;
   const forceTimeoutMs = options.forceTimeoutMs ?? CORE_FORCE_STOP_TIMEOUT_MS;
@@ -329,21 +391,23 @@ async function waitForCoreEvent(event: Promise<void>, timeoutMs: number): Promis
 
 function defaultCoreProcessLogHandler(
   _source: "core",
-  level: Extract<ProcessLogLevel, "info" | "warn" | "error">,
-  message: string
+  level: ProcessLogLevel,
+  message: string,
+  _metadata?: ProcessLogMetadata
 ): void {
-  const method = level === "info" ? "log" : level;
+  const method = level === "info" ? "log" : level === "trace" ? "debug" : level;
   const sink = console[method] ?? console.log;
   sink(`[core ${level}] ${message}`);
 }
 
 function emitCoreLog(
   onLog: CoreProcessLogHandler,
-  level: Extract<ProcessLogLevel, "info" | "warn" | "error">,
-  message: string
+  level: ProcessLogLevel,
+  message: string,
+  metadata?: ProcessLogMetadata
 ): void {
   try {
-    onLog("core", level, message);
+    onLog("core", level, message, metadata);
   } catch {
     // A log sink must not affect Core process lifecycle.
   }

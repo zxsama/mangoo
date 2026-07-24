@@ -325,6 +325,7 @@ function NotificationWindowVisualFixture() {
                 <NotificationStatusView
                   cancel={async () => ({ ok: true, message: null })}
                   model={buildCompactNotificationModel(compactSnapshot)}
+                  onOpenFailureLogs={() => undefined}
                   refreshCompact={async () => ({ ok: true, value: true })}
                 />
               ) : null}
@@ -351,6 +352,7 @@ function NotificationWindowVisualFixture() {
               ) : null}
               {page === "logs" ? (
                 <ProcessLogView
+                  authoritativeFailures={[]}
                   clearLogs={async () => ({ ok: true, value: true })}
                   exportLogs={async () => ({
                     ok: true,

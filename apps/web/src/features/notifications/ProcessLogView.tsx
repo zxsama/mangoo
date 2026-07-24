@@ -23,9 +23,11 @@ import type {
   DesktopProcessLogLevel,
   DesktopProcessLogLine,
   DesktopProcessLogPage,
-  DesktopProcessLogSource
+  DesktopProcessLogSource,
+  MediaFocusRequest,
+  ThumbnailFailureDetail
 } from "@megle/notification-contract";
-import { copyText } from "../../core/desktop";
+import { copyText, getDesktopBridge } from "../../core/desktop";
 import type {
   NotificationRequestResult,
   OpenNotificationLogSubscription
@@ -36,13 +38,16 @@ import {
   coalescePausedProcessLogBuffer,
   createPausedProcessLogBuffer,
   createProcessLogPageRequestController,
-  createProcessLogQueryToken
+  createProcessLogQueryToken,
+  buildProcessLogRows,
+  type ProcessLogRow
 } from "./processLogModel";
 
 const MAX_RENDERED_LOG_LINES = 5_000;
 const LOG_PAGE_SIZE = 200;
 
 interface ProcessLogViewProps {
+  authoritativeFailures: readonly ThumbnailFailureDetail[];
   clearLogs(): Promise<NotificationRequestResult<boolean>>;
   exportLogs(
     query: DesktopProcessLogFilter
@@ -54,12 +59,15 @@ interface ProcessLogViewProps {
     query: DesktopProcessLogFilter,
     listener: (batch: DesktopProcessLogBatch) => void
   ): Promise<NotificationRequestResult<OpenNotificationLogSubscription>>;
+  initialFilter?: DesktopProcessLogFilter;
 }
 
 export function ProcessLogView({
+  authoritativeFailures,
   clearLogs,
   exportLogs,
   getLogPage,
+  initialFilter,
   openLogSubscription
 }: ProcessLogViewProps) {
   const [source, setSource] = useState<DesktopProcessLogSource | "">("");
@@ -82,12 +90,30 @@ export function ProcessLogView({
 
   const query = useMemo<DesktopProcessLogFilter>(
     () => ({
+      ...(initialFilter?.eventKind ? { eventKind: initialFilter.eventKind } : {}),
+      ...(initialFilter?.libraryId ? { libraryId: initialFilter.libraryId } : {}),
       ...(source ? { source } : {}),
       ...(level ? { level } : {}),
       ...(deferredSearch ? { search: deferredSearch } : {}),
       limit: LOG_PAGE_SIZE
     }),
-    [deferredSearch, level, source]
+    [deferredSearch, initialFilter?.eventKind, initialFilter?.libraryId, level, source]
+  );
+  const filteredAuthoritativeFailures = useMemo(() => {
+    if (initialFilter?.eventKind !== "thumbnail_failure") return [];
+    if (source && source !== "core") return [];
+    if (level && level !== "error") return [];
+    const normalizedSearch = deferredSearch.toLocaleLowerCase();
+    return authoritativeFailures.filter((detail) =>
+      (!initialFilter.libraryId || detail.libraryId === initialFilter.libraryId) &&
+      (!normalizedSearch || `${detail.relativePath} ${detail.failureKind} ${detail.error}`
+        .toLocaleLowerCase()
+        .includes(normalizedSearch))
+    );
+  }, [authoritativeFailures, deferredSearch, initialFilter?.eventKind, initialFilter?.libraryId, level, source]);
+  const rows = useMemo(
+    () => buildProcessLogRows(lines, filteredAuthoritativeFailures),
+    [filteredAuthoritativeFailures, lines]
   );
   const queryToken = useMemo(() => createProcessLogQueryToken(query), [query]);
   const [pageRequestController] = useState(() =>
@@ -157,17 +183,17 @@ export function ProcessLogView({
   }, [paused]);
 
   const virtualizer = useVirtualizer({
-    count: lines.length,
+    count: rows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 25,
     overscan: 12,
-    getItemKey: (index) => lines[index]?.sequence ?? index
+    getItemKey: (index) => processLogRowKey(rows[index], index)
   });
 
   useEffect(() => {
-    if (!follow || paused || lines.length === 0) return;
-    virtualizer.scrollToIndex(lines.length - 1, { align: "end" });
-  }, [follow, lines.length, paused, virtualizer]);
+    if (!follow || paused || rows.length === 0) return;
+    virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
+  }, [follow, paused, rows.length, virtualizer]);
 
   const togglePause = () => {
     if (!paused) {
@@ -196,9 +222,9 @@ export function ProcessLogView({
         : "";
     const visibleText = virtualizer
       .getVirtualItems()
-      .map((item) => lines[item.index])
-      .filter((line): line is DesktopProcessLogLine => Boolean(line))
-      .map(formatLogLine)
+      .map((item) => rows[item.index])
+      .filter((row): row is ProcessLogRow => Boolean(row))
+      .map(formatProcessLogRow)
       .join("\n");
     const text = selected || visibleText;
     if (!text) {
@@ -271,11 +297,24 @@ export function ProcessLogView({
     }
   };
 
+  const handleFocusMedia = async (row: ProcessLogRow) => {
+    const request = mediaFocusRequest(row);
+    if (!request) return;
+    const focusMedia = getDesktopBridge()?.focusMedia;
+    if (!focusMedia) {
+      setActionMessage("当前环境无法定位媒体");
+      return;
+    }
+    setActionMessage((await focusMedia(request)) ? "已在主窗口定位媒体" : "媒体定位失败");
+  };
+
   return (
     <div className="notification-view notification-process-log-view">
       <header className="notification-view-heading notification-log-heading">
         <div>
-          <span className="notification-view-eyebrow">CURRENT SESSION</span>
+          <span className="notification-view-eyebrow">
+            {initialFilter?.eventKind === "thumbnail_failure" ? "FAILURE DIAGNOSTICS" : "CURRENT SESSION"}
+          </span>
           <h1>进程日志</h1>
         </div>
         <div className="notification-log-live-state">
@@ -340,6 +379,11 @@ export function ProcessLogView({
         </p>
       ) : null}
       {error ? <p className="notification-inline-error" role="alert">{error}</p> : null}
+      {initialFilter?.eventKind === "thumbnail_failure" ? (
+        <p className="notification-log-filter-state">
+          缩略图失败 · {initialFilter.libraryId}
+        </p>
+      ) : null}
 
       <div
         aria-busy={loading}
@@ -353,25 +397,34 @@ export function ProcessLogView({
         ref={scrollRef}
         role="log"
       >
-        {lines.length === 0 && !loading ? (
+        {rows.length === 0 && !loading ? (
           <div className="notification-list-empty">当前筛选条件下没有日志。</div>
         ) : (
           <div className="notification-virtual-space" style={{ height: virtualizer.getTotalSize() }}>
             {virtualizer.getVirtualItems().map((virtualRow) => {
-              const line = lines[virtualRow.index];
-              return (
-                <div
-                  className={`notification-log-line level-${line.level}`}
-                  data-index={virtualRow.index}
+              const row = rows[virtualRow.index];
+              if (!row) return null;
+              const request = mediaFocusRequest(row);
+              const content = processLogRowContent(row);
+              const common = {
+                className: `notification-log-line level-${content.level}${request ? " actionable" : ""}`,
+                "data-index": virtualRow.index,
+                ref: virtualizer.measureElement,
+                style: { transform: `translateY(${virtualRow.start}px)` } as CSSProperties
+              };
+              return request ? (
+                <button
+                  {...common}
                   key={virtualRow.key}
-                  ref={virtualizer.measureElement}
-                  style={{ transform: `translateY(${virtualRow.start}px)` } as CSSProperties}
+                  onClick={() => void handleFocusMedia(row)}
+                  title={`在主窗口定位 ${content.path ?? "媒体"}`}
+                  type="button"
                 >
-                  <span className="notification-log-sequence">{line.sequence}</span>
-                  <time dateTime={new Date(line.timestamp).toISOString()}>{formatLogTime(line.timestamp)}</time>
-                  <span className="notification-log-source">{line.source}</span>
-                  <span className="notification-log-level">{line.level}</span>
-                  <span className="notification-log-message">{line.message}{formatMetadata(line)}</span>
+                  <LogRowContent content={content} />
+                </button>
+              ) : (
+                <div {...common} key={virtualRow.key}>
+                  <LogRowContent content={content} />
                 </div>
               );
             })}
@@ -379,7 +432,7 @@ export function ProcessLogView({
         )}
       </div>
       <footer className="notification-log-footer">
-        <span>{lines.length.toLocaleString()} / {MAX_RENDERED_LOG_LINES.toLocaleString()} 行上限</span>
+        <span>{rows.length.toLocaleString()} 行 · 会话日志上限 {MAX_RENDERED_LOG_LINES.toLocaleString()}</span>
         {hasOlder ? (
           <button
             className="notification-text-action"
@@ -405,6 +458,96 @@ function mergeLogLines(
   return [...bySequence.values()]
     .sort((left, right) => left.sequence - right.sequence)
     .slice(-MAX_RENDERED_LOG_LINES);
+}
+
+interface LogRowContentValue {
+  sequence: string | number;
+  timestamp: number;
+  source: string;
+  level: DesktopProcessLogLevel;
+  message: string;
+  metadata: string;
+  path?: string;
+}
+
+function LogRowContent({ content }: { content: LogRowContentValue }) {
+  return (
+    <>
+      <span className="notification-log-sequence">{content.sequence}</span>
+      <time dateTime={new Date(content.timestamp).toISOString()}>{formatLogTime(content.timestamp)}</time>
+      <span className="notification-log-source">{content.source}</span>
+      <span className="notification-log-level">{content.level}</span>
+      <span className="notification-log-message">{content.message}{content.metadata}</span>
+    </>
+  );
+}
+
+function processLogRowContent(row: ProcessLogRow): LogRowContentValue {
+  if (row.kind === "log") {
+    return {
+      sequence: row.line.sequence,
+      timestamp: row.line.timestamp,
+      source: row.line.source,
+      level: row.line.level,
+      message: row.line.message,
+      metadata: formatMetadata(row.line),
+      path: typeof row.line.metadata?.relativePath === "string"
+        ? row.line.metadata.relativePath
+        : undefined
+    };
+  }
+  return {
+    sequence: "saved",
+    timestamp: row.detail.updatedAt,
+    source: "core",
+    level: "error",
+    message: `${row.detail.relativePath} · ${row.detail.error}`,
+    metadata: ` ${safeJson({ failureKind: row.detail.failureKind })}`,
+    path: row.detail.relativePath
+  };
+}
+
+function processLogRowKey(row: ProcessLogRow | undefined, index: number): string | number {
+  if (!row) return index;
+  return row.kind === "log"
+    ? `log:${row.line.sequence}`
+    : `failure:${row.detail.libraryId}:${row.detail.fileId}`;
+}
+
+function mediaFocusRequest(row: ProcessLogRow): MediaFocusRequest | null {
+  if (row.kind === "failure") {
+    return {
+      libraryId: row.detail.libraryId,
+      fileId: row.detail.fileId,
+      folderId: row.detail.folderId,
+      rootId: row.detail.rootId
+    };
+  }
+  const metadata = row.line.metadata;
+  if (metadata?.eventKind !== "thumbnail_failure") return null;
+  if (
+    typeof metadata.libraryId !== "string" ||
+    !positiveSafeInteger(metadata.fileId) ||
+    !positiveSafeInteger(metadata.folderId) ||
+    !positiveSafeInteger(metadata.rootId)
+  ) {
+    return null;
+  }
+  return {
+    libraryId: metadata.libraryId,
+    fileId: metadata.fileId,
+    folderId: metadata.folderId,
+    rootId: metadata.rootId
+  };
+}
+
+function positiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function formatProcessLogRow(row: ProcessLogRow): string {
+  if (row.kind === "log") return formatLogLine(row.line);
+  return `${new Date(row.detail.updatedAt).toISOString()} [core/error] ${row.detail.relativePath} ${row.detail.error}`;
 }
 
 function formatLogLine(line: DesktopProcessLogLine): string {

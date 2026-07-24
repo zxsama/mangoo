@@ -241,7 +241,10 @@ for (const name of [
   "FolderRecord",
   "FolderListResponse",
   "MediaRecord",
+  "MediaPositionResponse",
   "MediaListResponse",
+  "ThumbnailFailureRecord",
+  "ThumbnailFailureListResponse",
   "ThumbnailAsset",
   "ThumbnailResponse",
   "TaskKind",
@@ -288,6 +291,8 @@ assertInterfaceMatchesSchema("ThumbnailPriorityScopeSyncRequest");
 assertInterfaceMatchesSchema("RootRecord");
 assertInterfaceMatchesSchema("FolderRecord");
 assertInterfaceMatchesSchema("MediaRecord");
+assertInterfaceMatchesSchema("MediaPositionResponse");
+assertInterfaceMatchesSchema("ThumbnailFailureRecord");
 assertInterfaceMatchesSchema("ThumbnailAsset");
 assertInterfaceMatchesSchema("ThumbnailResponse");
 assertInterfaceMatchesSchema("TaskRecord");
@@ -372,6 +377,9 @@ assertOperationParameters("listFolderChildren", ["folderId", "limit", "cursor", 
 assertOperationParameters("listFolderAncestors", ["folderId"]);
 assertOperationParameters("listMedia", ["rootId", "folderId", "limit", "offset", "cursor", "sort", "kind"]);
 assertOperationParameters("getMedia", ["fileId"]);
+assertOperationParameters("getMediaPosition", ["fileId", "rootId", "folderId", "includeDescendants", "sort"]);
+assertOperationRoute("getMediaPosition", "get", "/media/{fileId}/position");
+assertOperationParameters("listThumbnailCacheFailures", ["limit"]);
 assertOperationParameters("getThumbnail", ["fileId", "target", "priority"]);
 assertOperationParameters("getThumbnailBlob", ["fileId", "target"]);
 operation("syncThumbnailPriorityScope");
@@ -416,8 +424,10 @@ for (const method of [
   "listFolderAncestors",
   "listMedia",
   "getMedia",
+  "getMediaPosition",
   "getThumbnail",
   "getThumbnailBlob",
+  "listThumbnailCacheFailures",
   "getPreviewBlob",
   "listTasks",
   "cancelTask",

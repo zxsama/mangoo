@@ -598,7 +598,8 @@ describe("notification reporting", () => {
           pendingCount: 20,
           activeBulkTaskCount: 1,
           totalCacheBytes: 1024,
-          completionPercent: 80
+          completionPercent: 80,
+          failureDetails: []
         }
       ]);
     } finally {
@@ -610,7 +611,7 @@ describe("notification reporting", () => {
     }
   });
 
-  it("does not publish thumbnail summaries from a non-main renderer role", async () => {
+  it("publishes authoritative thumbnail summaries from the Settings renderer", async () => {
     const previousWindow = (globalThis as { window?: unknown }).window;
     let publishCalls = 0;
     try {
@@ -640,8 +641,8 @@ describe("notification reporting", () => {
         1000
       );
 
-      assert.equal(accepted, false);
-      assert.equal(publishCalls, 0);
+      assert.equal(accepted, true);
+      assert.equal(publishCalls, 1);
     } finally {
       if (previousWindow === undefined) {
         delete (globalThis as { window?: unknown }).window;

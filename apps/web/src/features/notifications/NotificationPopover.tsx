@@ -13,12 +13,16 @@ import {
   type ReactNode
 } from "react";
 import { createPortal } from "react-dom";
-import type { DesktopThumbnailCacheSummary } from "@megle/notification-contract";
+import type {
+  DesktopThumbnailCacheSummary,
+  NotificationWindowIntent
+} from "@megle/notification-contract";
 import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
+import { thumbnailFailureLogIntent } from "./notificationModel";
 import { observeNotificationPopoverMeasurements } from "./notificationPopoverMeasurement";
 import { resolveNotificationPopoverPosition } from "./notificationPopoverPosition";
 import {
@@ -29,7 +33,7 @@ import {
 interface NotificationPopoverProps {
   anchor: HTMLElement;
   model: CompactNotificationModel;
-  onOpenCenter: () => void;
+  onOpenCenter: (intent?: NotificationWindowIntent) => void;
 }
 
 export function NotificationPopover({
@@ -117,7 +121,11 @@ export function NotificationPopover({
               data-notification-thumbnail-library-count={model.thumbnail.libraryCount}
             >
               {model.thumbnail.summaries.map((summary) => (
-                <ThumbnailSummaryRow key={summary.libraryId} summary={summary} />
+                <ThumbnailSummaryRow
+                  key={summary.libraryId}
+                  onOpenCenter={onOpenCenter}
+                  summary={summary}
+                />
               ))}
             </div>
           </NotificationSection>
@@ -165,7 +173,7 @@ export function NotificationPopover({
       <footer className="notification-popover-footer">
         <LiquidGlassButton
           className="notification-open-center"
-          onClick={onOpenCenter}
+          onClick={() => onOpenCenter()}
           tone="control"
           type="button"
         >
@@ -252,6 +260,14 @@ function OperationProgress({ operation }: { operation: NotificationOperationView
   const presentation = activeOperationPresentation(operation);
   return (
     <>
+      {operation.paths.length > 0 ? (
+        <div className="notification-scan-paths compact">
+          {operation.paths.slice(0, 3).map((path) => (
+            <span key={path} title={path}>{path}</span>
+          ))}
+          {operation.paths.length > 3 ? <span>+{operation.paths.length - 3}</span> : null}
+        </div>
+      ) : null}
       <div
         aria-label={`${operation.title}进度`}
         aria-valuemax={progress.determinate ? 100 : undefined}
@@ -280,8 +296,14 @@ function OperationProgress({ operation }: { operation: NotificationOperationView
   );
 }
 
-function ThumbnailSummaryRow({ summary }: { summary: DesktopThumbnailCacheSummary }) {
-  const status = thumbnailStatusParts(summary);
+function ThumbnailSummaryRow({
+  onOpenCenter,
+  summary
+}: {
+  onOpenCenter: (intent?: NotificationWindowIntent) => void;
+  summary: DesktopThumbnailCacheSummary;
+}) {
+  const status = thumbnailStatusParts(summary).filter((part) => part.kind !== "failure");
   const libraryLabel = summary.libraryName || summary.libraryId;
   return (
     <div
@@ -318,22 +340,34 @@ function ThumbnailSummaryRow({ summary }: { summary: DesktopThumbnailCacheSummar
           {summary.cachedCount.toLocaleString()} / {summary.totalCandidateCount.toLocaleString()} 已缓存
         </span>
         <span className="notification-thumbnail-status">
-          {status.length > 0 ? status.join(" · ") : "已同步"}
+          {status.length > 0 ? status.map((part) => part.label).join(" · ") : "已同步"}
         </span>
+        {summary.failedCount > 0 ? (
+          <button
+            className="notification-thumbnail-failure-action"
+            onClick={() => {
+              const intent = thumbnailFailureLogIntent(summary);
+              if (intent) onOpenCenter(intent);
+            }}
+            type="button"
+          >
+            {summary.failedCount.toLocaleString()} 失败
+          </button>
+        ) : null}
         {summary.totalCacheBytes == null ? null : <span>{formatBytes(summary.totalCacheBytes)}</span>}
       </div>
     </div>
   );
 }
 
-function thumbnailStatusParts(summary: DesktopThumbnailCacheSummary): string[] {
+function thumbnailStatusParts(summary: DesktopThumbnailCacheSummary): Array<{ kind: string; label: string }> {
   return [
-    summary.pendingCount > 0 ? `${summary.pendingCount.toLocaleString()} 待处理` : null,
-    summary.failedCount > 0 ? `${summary.failedCount.toLocaleString()} 失败` : null,
-    summary.staleCount > 0 ? `${summary.staleCount.toLocaleString()} 过期` : null,
-    summary.missingCount > 0 ? `${summary.missingCount.toLocaleString()} 缺失` : null,
-    summary.activeBulkTaskCount > 0 ? `${summary.activeBulkTaskCount.toLocaleString()} 批处理` : null
-  ].filter((value): value is string => value !== null);
+    summary.pendingCount > 0 ? { kind: "pending", label: `${summary.pendingCount.toLocaleString()} 待处理` } : null,
+    summary.failedCount > 0 ? { kind: "failure", label: `${summary.failedCount.toLocaleString()} 失败` } : null,
+    summary.staleCount > 0 ? { kind: "stale", label: `${summary.staleCount.toLocaleString()} 过期` } : null,
+    summary.missingCount > 0 ? { kind: "missing", label: `${summary.missingCount.toLocaleString()} 缺失` } : null,
+    summary.activeBulkTaskCount > 0 ? { kind: "bulk", label: `${summary.activeBulkTaskCount.toLocaleString()} 批处理` } : null
+  ].filter((value): value is { kind: string; label: string } => value !== null);
 }
 
 function progressStyle(percent: number): CSSProperties {

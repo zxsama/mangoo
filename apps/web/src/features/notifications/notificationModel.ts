@@ -3,7 +3,8 @@ import type {
   DesktopNotificationHistoryPage,
   DesktopNotificationOperation,
   DesktopProcessLogBatch,
-  DesktopThumbnailCacheSummary
+  DesktopThumbnailCacheSummary,
+  NotificationWindowIntent
 } from "@megle/notification-contract";
 
 export type NotificationIndicator = "idle" | "active" | "failure";
@@ -17,6 +18,8 @@ export interface ProgressViewModel {
 export type NotificationOperationViewModel = DesktopNotificationOperation & {
   libraryLabel: string;
   progress: ProgressViewModel;
+  sourceOperations: DesktopNotificationOperation[];
+  paths: string[];
 };
 
 export interface ThumbnailAggregateViewModel {
@@ -96,9 +99,10 @@ export function processLogGapSequence(batch: DesktopProcessLogBatch): number | n
 export function buildCompactNotificationModel(
   snapshot: DesktopNotificationCompactSnapshot
 ): CompactNotificationModel {
-  const active = deduplicateOperations(snapshot.active)
+  const activeOperations = deduplicateOperations(snapshot.active)
     .filter((operation) => ACTIVE_STATUSES.has(operation.status))
-    .sort(compareActiveOperations)
+    .sort(compareActiveOperations);
+  const active = aggregateInteractiveFolderScans(activeOperations)
     .map(operationViewModel);
   const results = deduplicateOperations(snapshot.latestImportantResults)
     .filter(
@@ -163,10 +167,83 @@ export function mergeNotificationHistoryPages(
 function operationViewModel(
   operation: DesktopNotificationOperation
 ): NotificationOperationViewModel {
+  const presentation = operation as DesktopNotificationOperation & {
+    sourceOperations?: DesktopNotificationOperation[];
+    paths?: string[];
+  };
   return {
     ...operation,
     libraryLabel: operation.libraryName || operation.libraryId,
-    progress: progressView(operation)
+    progress: progressView(operation),
+    sourceOperations: presentation.sourceOperations ?? [operation],
+    paths: presentation.paths ?? (
+      operation.kind === "interactive_folder_scan" && operationSummary(operation)
+        ? [operationSummary(operation)]
+        : []
+    )
+  };
+}
+
+function aggregateInteractiveFolderScans(
+  operations: readonly DesktopNotificationOperation[]
+): DesktopNotificationOperation[] {
+  const scans = operations
+    .filter((operation) => operation.kind === "interactive_folder_scan")
+    .sort((left, right) =>
+      operationSummary(left).localeCompare(operationSummary(right)) || compareActiveOperations(left, right)
+    );
+  if (scans.length <= 1) return [...operations];
+  const currentValue = scans.reduce((total, operation) => total + operation.currentValue, 0);
+  const determinate = scans.every(
+    (operation) => operation.totalValue !== null && operation.totalValue > 0
+  );
+  const totalValue = determinate
+    ? scans.reduce((total, operation) => total + (operation.totalValue ?? 0), 0)
+    : null;
+  const libraries = new Map(scans.map((operation) => [operation.libraryId, operation.libraryName]));
+  const base = scans[0]!;
+  const aggregate = {
+    ...base,
+    operationId: "presentation:interactive-folder-scans",
+    libraryId: libraries.size === 1 ? base.libraryId : "presentation:multiple-libraries",
+    libraryName: libraries.size === 1 ? base.libraryName : `${libraries.size} 个资源库`,
+    title: "Scan folders",
+    summary: `${scans.length} folders`,
+    currentValue,
+    totalValue,
+    cancellable: scans.some((operation) => operation.cancellable),
+    updatedAt: Math.max(...scans.map((operation) => operation.updatedAt)),
+    startedAt: Math.min(...scans.map((operation) => operation.startedAt)),
+    sourceOperations: scans,
+    paths: [...new Set(scans.map(operationSummary).filter(Boolean))]
+  };
+  return [
+    ...operations.filter((operation) => operation.kind !== "interactive_folder_scan"),
+    aggregate
+  ].sort(compareActiveOperations);
+}
+
+function operationSummary(operation: DesktopNotificationOperation): string {
+  return operation.summary?.trim() ?? "";
+}
+
+export function thumbnailFailureLogIntent(
+  summary: DesktopThumbnailCacheSummary
+): NotificationWindowIntent | null {
+  return thumbnailFailureLogIntentForLibrary(summary.libraryId, summary.failedCount);
+}
+
+export function thumbnailFailureLogIntentForLibrary(
+  libraryId: string | null | undefined,
+  failedCount: number
+): NotificationWindowIntent | null {
+  if (!libraryId || failedCount <= 0) return null;
+  return {
+    page: "logs",
+    logFilter: {
+      eventKind: "thumbnail_failure",
+      libraryId
+    }
   };
 }
 
