@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 import type {
   DesktopNotificationCompactSnapshot,
@@ -98,7 +99,20 @@ describe("notification drilldown", () => {
 
     assert.equal(model.active.length, 2);
     const aggregate = model.active.find((item) => item.kind === "interactive_folder_scan");
-    assert.deepEqual(aggregate?.paths, ["Artists\\Archive", "Artists\\Portraits"]);
+    assert.deepEqual(aggregate?.scanPaths, [
+      {
+        key: "library-a\u0000task:8",
+        libraryId: "library-a",
+        operationId: "task:8",
+        path: "Artists\\Archive"
+      },
+      {
+        key: "library-a\u0000task:7",
+        libraryId: "library-a",
+        operationId: "task:7",
+        path: "Artists\\Portraits"
+      }
+    ]);
     assert.deepEqual(aggregate?.sourceOperations.map((item) => item.operationId), ["task:8", "task:7"]);
     assert.deepEqual(aggregate?.progress, { determinate: true, percent: 20, label: "30 / 150" });
   });
@@ -164,8 +178,8 @@ describe("notification drilldown", () => {
     ]));
     const none = buildCompactNotificationModel(compact([]));
 
-    assert.deepEqual(both.active[0]?.paths, ["Artists\\Archive", "Artists\\Portraits"]);
-    assert.deepEqual(one.active[0]?.paths, ["Artists\\Archive"]);
+    assert.deepEqual(both.active[0]?.scanPaths.map((row) => row.operationId), ["task:8", "task:7"]);
+    assert.deepEqual(one.active[0]?.scanPaths.map((row) => row.operationId), ["task:8"]);
     assert.equal(none.active.length, 0);
   });
 
@@ -182,8 +196,26 @@ describe("notification drilldown", () => {
     };
 
     const aggregate = buildCompactNotificationModel(snapshot).active[0];
-    assert.deepEqual(aggregate?.paths, ["Artists\\Portraits", "Artists\\Portraits"]);
+    assert.deepEqual(aggregate?.scanPaths.map((row) => row.path), [
+      "Artists\\Portraits",
+      "Artists\\Portraits"
+    ]);
+    assert.deepEqual(aggregate?.scanPaths.map((row) => row.key), [
+      "library-a\u0000task:7",
+      "library-a\u0000task:8"
+    ]);
     assert.equal(aggregate?.sourceOperations.length, 2);
+  });
+
+  it("renders stable operation identities in both scan path surfaces", async () => {
+    const [statusSource, popoverSource] = await Promise.all([
+      readFile(new URL("../src/features/notifications/NotificationStatusView.tsx", import.meta.url), "utf8"),
+      readFile(new URL("../src/features/notifications/NotificationPopover.tsx", import.meta.url), "utf8")
+    ]);
+    for (const source of [statusSource, popoverSource]) {
+      assert.match(source, /operation\.scanPaths/);
+      assert.match(source, /key=\{row\.key\}/);
+    }
   });
 
   it("preserves an honest inert state for legacy failure counts without details", () => {

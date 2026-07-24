@@ -101,7 +101,7 @@ function operation(
     libraryLabel: "Artists",
     progress: { determinate: true, percent: 42, label: "42 / 100" },
     sourceOperations: [],
-    paths: [],
+    scanPaths: [],
     ...overrides
   };
 }

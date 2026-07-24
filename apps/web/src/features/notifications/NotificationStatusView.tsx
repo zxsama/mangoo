@@ -263,9 +263,11 @@ function ActiveOperation({
         <span>{operation.phase || operation.progress.label}</span>
         {operation.progress.determinate ? <strong>{operation.progress.percent}%</strong> : null}
       </div>
-      {operation.paths.length > 0 ? (
+      {operation.scanPaths.length > 0 ? (
         <div className="notification-scan-paths">
-          {operation.paths.map((path) => <span key={path} title={path}>{path}</span>)}
+          {operation.scanPaths.map((row) => (
+            <span key={row.key} title={row.path}>{row.path}</span>
+          ))}
         </div>
       ) : null}
       <div

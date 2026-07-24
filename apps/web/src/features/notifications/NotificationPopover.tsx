@@ -263,12 +263,12 @@ function OperationProgress({ operation }: { operation: NotificationOperationView
   const presentation = activeOperationPresentation(operation);
   return (
     <>
-      {operation.paths.length > 0 ? (
+      {operation.scanPaths.length > 0 ? (
         <div className="notification-scan-paths compact">
-          {operation.paths.slice(0, 3).map((path) => (
-            <span key={path} title={path}>{path}</span>
+          {operation.scanPaths.slice(0, 3).map((row) => (
+            <span key={row.key} title={row.path}>{row.path}</span>
           ))}
-          {operation.paths.length > 3 ? <span>+{operation.paths.length - 3}</span> : null}
+          {operation.scanPaths.length > 3 ? <span>+{operation.scanPaths.length - 3}</span> : null}
         </div>
       ) : null}
       <div

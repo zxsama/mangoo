@@ -15,11 +15,18 @@ export interface ProgressViewModel {
   label: string;
 }
 
+export interface NotificationScanPathViewModel {
+  key: string;
+  libraryId: string;
+  operationId: string;
+  path: string;
+}
+
 export type NotificationOperationViewModel = DesktopNotificationOperation & {
   libraryLabel: string;
   progress: ProgressViewModel;
   sourceOperations: DesktopNotificationOperation[];
-  paths: string[];
+  scanPaths: NotificationScanPathViewModel[];
 };
 
 export interface ThumbnailAggregateViewModel {
@@ -169,16 +176,16 @@ function operationViewModel(
 ): NotificationOperationViewModel {
   const presentation = operation as DesktopNotificationOperation & {
     sourceOperations?: DesktopNotificationOperation[];
-    paths?: string[];
+    scanPaths?: NotificationScanPathViewModel[];
   };
   return {
     ...operation,
     libraryLabel: operation.libraryName || operation.libraryId,
     progress: progressView(operation),
     sourceOperations: presentation.sourceOperations ?? [operation],
-    paths: presentation.paths ?? (
-      operation.kind === "interactive_folder_scan" && operationSummary(operation)
-        ? [operationSummary(operation)]
+    scanPaths: presentation.scanPaths ?? (
+      operation.kind === "interactive_folder_scan"
+        ? scanPathViewModel(operation)
         : []
     )
   };
@@ -215,7 +222,7 @@ function aggregateInteractiveFolderScans(
     updatedAt: Math.max(...scans.map((operation) => operation.updatedAt)),
     startedAt: Math.min(...scans.map((operation) => operation.startedAt)),
     sourceOperations: scans,
-    paths: scans.map(operationSummary).filter(Boolean)
+    scanPaths: scans.flatMap(scanPathViewModel)
   };
   return [
     ...operations.filter((operation) => operation.kind !== "interactive_folder_scan"),
@@ -225,6 +232,19 @@ function aggregateInteractiveFolderScans(
 
 function operationSummary(operation: DesktopNotificationOperation): string {
   return operation.summary?.trim() ?? "";
+}
+
+function scanPathViewModel(
+  operation: DesktopNotificationOperation
+): NotificationScanPathViewModel[] {
+  const path = operationSummary(operation);
+  if (!path) return [];
+  return [{
+    key: `${operation.libraryId}\u0000${operation.operationId}`,
+    libraryId: operation.libraryId,
+    operationId: operation.operationId,
+    path
+  }];
 }
 
 export function thumbnailFailureLogIntent(
