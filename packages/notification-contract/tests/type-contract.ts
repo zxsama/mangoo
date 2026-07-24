@@ -2,6 +2,7 @@ import type { NotificationOperationSnapshot } from "@megle/core-client/generated
 import type {
   DesktopNotificationOperation,
   NotificationIpcBridge,
+  MediaFocusCancellation,
   MediaFocusRequest,
   NotificationWindowIntent,
   ProcessLogLine,
@@ -27,6 +28,7 @@ declare const bridge: NotificationIpcBridge;
 declare const rendererReport: RendererErrorReport;
 declare const intent: NotificationWindowIntent;
 declare const focus: MediaFocusRequest;
+declare const focusCancellation: MediaFocusCancellation;
 declare const failure: ThumbnailFailureDetail;
 declare const thumbnailSummary: DesktopThumbnailCacheSummary;
 
@@ -41,6 +43,7 @@ void rendererReport.reportId;
 void intent.logFilter.eventKind;
 void intent.failureSnapshot.truncated;
 void focus.fileId;
+void focusCancellation.requestId;
 void failure.relativePath;
 void thumbnailSummary.failureDetailsUnavailable;
 void rendererErrorIdentityKey(rendererReport);

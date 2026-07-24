@@ -688,10 +688,18 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMedia, async (event, input: unknow
   if (window.isMinimized()) window.restore();
   window.show();
   window.focus();
-  return mediaFocusCoordinator.request(request, (command) => {
-    if (window.isDestroyed()) throw new Error("main window closed before media focus delivery");
-    window.webContents.send(NOTIFICATION_IPC_CHANNELS.focusMediaRequested, command);
-  });
+  return mediaFocusCoordinator.request(
+    request,
+    (command) => {
+      if (window.isDestroyed()) throw new Error("main window closed before media focus delivery");
+      window.webContents.send(NOTIFICATION_IPC_CHANNELS.focusMediaRequested, command);
+    },
+    (cancellation) => {
+      if (!window.isDestroyed()) {
+        window.webContents.send(NOTIFICATION_IPC_CHANNELS.focusMediaCancelled, cancellation);
+      }
+    }
+  );
 });
 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.focusMediaCompleted, (event, input: unknown) => {

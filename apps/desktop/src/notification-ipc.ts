@@ -29,6 +29,7 @@ export interface NotificationIpcChannels {
   readonly closeWindow: string;
   readonly focusMedia: string;
   readonly focusMediaRequested: string;
+  readonly focusMediaCancelled: string;
   readonly focusMediaCompleted: string;
   readonly compact: string;
   readonly historyFacets: string;

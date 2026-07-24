@@ -6,6 +6,7 @@ import {
   resolveJustifiedMediaLocateTarget,
   resolveMediaLocateVirtualIndex
 } from "../src/app/mediaFocusWorkflow.ts";
+import { runCancellableMediaFocusLocate } from "../src/core/mediaFocusLocateWorkflow.ts";
 import { buildLayoutGeometry } from "../src/features/media-grid/layoutGeometry.ts";
 
 const request = {
@@ -149,6 +150,71 @@ describe("media focus workflow", () => {
       { ...request, requestId: "focus-2" },
       dependencies
     ), { requestId: "focus-2", mediaId: 42 });
+  });
+
+  it("does not emit a grid scroll request when cancellation wins a late locate", async () => {
+    const controller = new AbortController();
+    let resolveLocate: (value: boolean) => void = () => undefined;
+    const locate = new Promise<boolean>((resolve) => { resolveLocate = resolve; });
+    let previewOpen = true;
+    const result = prepareMediaFocusNavigation(request, {
+      closePreview: () => { previewOpen = false; },
+      locateMedia: async () => locate
+    }, controller.signal);
+
+    controller.abort();
+    resolveLocate(true);
+    assert.equal(await result, null);
+    assert.equal(previewOpen, false);
+  });
+
+  it("stops late locate work after cancellation and lets a new generation retry", async () => {
+    const controller = new AbortController();
+    let releaseLoad = () => undefined;
+    const loading = new Promise<void>((resolve) => { releaseLoad = resolve; });
+    let markLoadStarted = () => undefined;
+    const loadStarted = new Promise<void>((resolve) => { markLoadStarted = resolve; });
+    const calls: string[] = [];
+    const stages = {
+      resolveTarget: async () => { calls.push("target"); return true; },
+      resolvePosition: async () => { calls.push("position"); return 900_004; },
+      resetFilters: () => { calls.push("filters"); },
+      loadLibrary: async () => { calls.push("load"); markLoadStarted(); await loading; },
+      revealFolderPath: async () => { calls.push("reveal"); return true; },
+      loadMediaWindow: async () => { calls.push("window"); },
+      selectMedia: () => { calls.push("select"); }
+    };
+    const first = runCancellableMediaFocusLocate(stages, controller.signal);
+    await loadStarted;
+    controller.abort();
+    releaseLoad();
+
+    assert.equal(await first, false);
+    assert.deepEqual(calls, ["target", "position", "filters", "load"]);
+
+    calls.length = 0;
+    assert.equal(await runCancellableMediaFocusLocate(stages, new AbortController().signal), true);
+    assert.deepEqual(calls, ["target", "position", "filters", "load", "reveal", "window", "select"]);
+  });
+
+  it("does not reset filters when cancellation wins the position lookup race", async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    const result = runCancellableMediaFocusLocate({
+      resolveTarget: async () => true,
+      resolvePosition: async () => {
+        controller.abort();
+        return 12;
+      },
+      resetFilters: () => { calls.push("filters"); },
+      loadLibrary: async () => undefined,
+      revealFolderPath: async () => true,
+      loadMediaWindow: async () => undefined,
+      selectMedia: () => { calls.push("select"); }
+    }, controller.signal);
+
+    assert.equal(await result, false);
+    assert.deepEqual(calls, []);
   });
 });
 

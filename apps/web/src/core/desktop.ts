@@ -2,6 +2,7 @@ import type { LibrarySummary, LibraryLoadPhase } from "./libraryTypes";
 import type {
   DesktopNotificationsBridge,
   MediaFocusCommand,
+  MediaFocusCancellation,
   MediaFocusCompletion,
   MediaFocusRequest,
   NotificationWindowIntent
@@ -27,6 +28,7 @@ export type {
   DesktopThumbnailCacheSummary,
   MediaFocusRequest,
   MediaFocusCommand,
+  MediaFocusCancellation,
   MediaFocusCompletion,
   NotificationWindowIntent,
   ThumbnailFailureDetail
@@ -94,6 +96,7 @@ export interface MegleDesktopBridge {
   onNotificationWindowIntent?: (cb: (intent: NotificationWindowIntent) => void) => () => void;
   focusMedia?: (input: MediaFocusRequest) => Promise<boolean>;
   onFocusMedia?: (cb: (input: MediaFocusCommand) => void) => () => void;
+  onFocusMediaCancelled?: (cb: (input: MediaFocusCancellation) => void) => () => void;
   completeMediaFocus?: (completion: MediaFocusCompletion) => Promise<boolean>;
   notifications?: DesktopNotificationsBridge;
   windowControls?: DesktopWindowControls;

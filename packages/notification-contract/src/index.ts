@@ -222,6 +222,10 @@ export interface MediaFocusCompletion {
   readonly ok: boolean;
 }
 
+export interface MediaFocusCancellation {
+  readonly requestId: string;
+}
+
 export type DesktopProcessLogFilter = ProcessLogFilter;
 
 export interface ProcessLogPage {

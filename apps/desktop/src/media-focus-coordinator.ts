@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type {
   MediaFocusCommand,
+  MediaFocusCancellation,
   MediaFocusCompletion,
   MediaFocusRequest
 } from "@megle/notification-contract";
 
 interface PendingMediaFocus {
+  cancel: (cancellation: MediaFocusCancellation) => void;
   resolve: (ok: boolean) => void;
   timeout: ReturnType<typeof setTimeout>;
 }
@@ -20,12 +22,13 @@ export class MediaFocusCoordinator {
 
   request(
     request: MediaFocusRequest,
-    deliver: (command: MediaFocusCommand) => void
+    deliver: (command: MediaFocusCommand) => void,
+    cancel: (cancellation: MediaFocusCancellation) => void = () => undefined
   ): Promise<boolean> {
     const requestId = randomUUID();
     return new Promise<boolean>((resolve) => {
-      const timeout = setTimeout(() => this.settle(requestId, false), this.timeoutMs);
-      this.pending.set(requestId, { resolve, timeout });
+      const timeout = setTimeout(() => this.cancelAndSettle(requestId), this.timeoutMs);
+      this.pending.set(requestId, { cancel, resolve, timeout });
       try {
         deliver({ ...request, requestId });
       } catch {
@@ -39,7 +42,18 @@ export class MediaFocusCoordinator {
   }
 
   failAll(): void {
-    for (const requestId of [...this.pending.keys()]) this.settle(requestId, false);
+    for (const requestId of [...this.pending.keys()]) this.cancelAndSettle(requestId);
+  }
+
+  private cancelAndSettle(requestId: string): boolean {
+    const request = this.pending.get(requestId);
+    if (!request) return false;
+    try {
+      request.cancel({ requestId });
+    } catch {
+      // Cancellation is best-effort; the requester must still be released.
+    }
+    return this.settle(requestId, false);
   }
 
   private settle(requestId: string, ok: boolean): boolean {

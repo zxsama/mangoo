@@ -138,6 +138,10 @@ export function App() {
   const [activeLibraryColor, setActiveLibraryColor] = useState<string | undefined>(undefined);
   const [pendingMediaFocus, setPendingMediaFocus] = useState<MediaFocusCommand | null>(null);
   const pendingMediaFocusRef = useRef<MediaFocusCommand | null>(null);
+  const mediaFocusAbortRef = useRef<{
+    requestId: string;
+    controller: AbortController;
+  } | null>(null);
   const [mediaGridLocateRequest, setMediaGridLocateRequest] =
     useState<MediaGridLocateRequest | null>(null);
   const mediaGridLocateRequestRef = useRef<MediaGridLocateRequest | null>(null);
@@ -220,9 +224,11 @@ export function App() {
     setPreviewViewCommands(null);
   }, []);
 
-  const completeMediaFocus = useCallback((requestId: string, ok: boolean) => {
-    const bridge = getDesktopBridge();
-    void bridge?.completeMediaFocus?.({ requestId, ok });
+  const clearMediaFocusState = useCallback((requestId: string) => {
+    if (mediaFocusAbortRef.current?.requestId === requestId) {
+      mediaFocusAbortRef.current.controller.abort();
+      mediaFocusAbortRef.current = null;
+    }
     if (pendingMediaFocusRef.current?.requestId === requestId) {
       pendingMediaFocusRef.current = null;
       setPendingMediaFocus(null);
@@ -237,9 +243,21 @@ export function App() {
     if (mediaFocusLocateKeyRef.current === requestId) mediaFocusLocateKeyRef.current = null;
   }, []);
 
+  const completeMediaFocus = useCallback((requestId: string, ok: boolean) => {
+    const bridge = getDesktopBridge();
+    void bridge?.completeMediaFocus?.({ requestId, ok });
+    clearMediaFocusState(requestId);
+  }, [clearMediaFocusState]);
+
   useEffect(() => {
     const bridge = getDesktopBridge();
     return bridge?.onFocusMedia?.((command) => {
+      if (
+        mediaFocusAbortRef.current &&
+        mediaFocusAbortRef.current.requestId !== command.requestId
+      ) {
+        mediaFocusAbortRef.current.controller.abort();
+      }
       const previous = pendingMediaFocusRef.current;
       if (previous && previous.requestId !== command.requestId) {
         void bridge.completeMediaFocus?.({ requestId: previous.requestId, ok: false });
@@ -249,6 +267,10 @@ export function App() {
         void bridge.completeMediaFocus?.({ requestId: previousLocate.requestId, ok: false });
       }
       pendingMediaFocusRef.current = command;
+      mediaFocusAbortRef.current = {
+        requestId: command.requestId,
+        controller: new AbortController()
+      };
       mediaGridLocateRequestRef.current = null;
       mediaFocusSwitchKeyRef.current = null;
       mediaFocusLocateKeyRef.current = null;
@@ -258,14 +280,26 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const bridge = getDesktopBridge();
+    return bridge?.onFocusMediaCancelled?.(({ requestId }) => {
+      if (mediaFocusAbortRef.current?.requestId !== requestId) return;
+      clearMediaFocusState(requestId);
+    });
+  }, [clearMediaFocusState]);
+
+  useEffect(() => {
     if (!pendingMediaFocus) return;
     const requestKey = pendingMediaFocus.requestId;
+    const signal = mediaFocusAbortRef.current?.requestId === requestKey
+      ? mediaFocusAbortRef.current.controller.signal
+      : null;
+    if (!signal || signal.aborted) return;
     if (activeLibraryId !== pendingMediaFocus.libraryId) {
       if (mediaFocusSwitchKeyRef.current === requestKey) return;
       mediaFocusSwitchKeyRef.current = requestKey;
       void switchLibrary(pendingMediaFocus.libraryId)
         .then((result) => {
-          if (pendingMediaFocusRef.current?.requestId !== requestKey) return;
+          if (signal.aborted || pendingMediaFocusRef.current?.requestId !== requestKey) return;
           if (!result.ok) {
             completeMediaFocus(requestKey, false);
           } else {
@@ -281,9 +315,10 @@ export function App() {
     mediaFocusLocateKeyRef.current = requestKey;
     void prepareMediaFocusNavigation(pendingMediaFocus, {
       closePreview: handleClosePreview,
-      locateMedia: library.locateMedia
-    }).then((locateRequest) => {
-      if (pendingMediaFocusRef.current?.requestId !== requestKey) return;
+      locateMedia: (command, locateSignal) =>
+        library.locateMedia(command, { signal: locateSignal })
+    }, signal).then((locateRequest) => {
+      if (signal.aborted || pendingMediaFocusRef.current?.requestId !== requestKey) return;
       if (!locateRequest) {
         completeMediaFocus(requestKey, false);
         return;

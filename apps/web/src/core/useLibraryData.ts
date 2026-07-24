@@ -36,6 +36,7 @@ import {
   shouldRequestThumbnailState
 } from "./mediaResources";
 import { runThumbnailCacheEnqueueBatches } from "./thumbnailCacheEnqueue";
+import { runCancellableMediaFocusLocate } from "./mediaFocusLocateWorkflow";
 import { decideRootScanRefresh } from "./scanRefresh";
 import {
   createLibraryErrorReportAttempt,
@@ -187,7 +188,7 @@ export interface LibraryState {
   toggleFolderExpanded: (folderId: number) => void;
   requestFolderChildren: (folderId: number) => Promise<FolderRecord[]>;
   revealFolderPath: (folderId: number) => Promise<FolderRecord[]>;
-  locateMedia: (request: MediaFocusRequest) => Promise<boolean>;
+  locateMedia: (request: MediaFocusRequest, options?: { signal?: AbortSignal }) => Promise<boolean>;
   requestThumbnailStates: (mediaIds: number[], priority: ThumbnailRequestPriority) => void;
   requestMediaWindow: (startIndex: number, endIndex: number) => void;
   loadMoreFolderChildren: (folderId: number) => Promise<void>;
@@ -220,6 +221,8 @@ type ScanRefreshSelectionToken = {
 type LibrarySelectionScope = {
   rootId?: number | null;
   folderId?: number | null;
+  selectFirst?: boolean;
+  signal?: AbortSignal;
 };
 
 type FolderNavigationEntry = {
@@ -1185,7 +1188,8 @@ export function useLibraryData(
   ]);
 
   const loadFolderChildren = useCallback(
-    async (folderId: number, options: { force?: boolean } = {}) => {
+    async (folderId: number, options: { force?: boolean; signal?: AbortSignal } = {}) => {
+      if (options.signal?.aborted) return [];
       const force = options.force ?? false;
       const cachedChildren = folderChildrenByParentRef.current[folderId];
       if (!force && cachedChildren !== undefined) {
@@ -1207,6 +1211,8 @@ export function useLibraryData(
         folderChildInitialRequestsRef.current.delete(folderId);
       }
       const controller = new AbortController();
+      const abortForScope = () => controller.abort();
+      options.signal?.addEventListener("abort", abortForScope, { once: true });
       folderChildControllersRef.current.set(requestKey, controller);
       setLoadingFolderIds((current) => new Set(current).add(folderId));
       const reportingAttempt = createReportingAttempt();
@@ -1219,6 +1225,7 @@ export function useLibraryData(
         }, {
           signal: controller.signal
         });
+        if (options.signal?.aborted) return [];
         let nextChildrenByParent = {
           ...folderChildrenByParentRef.current,
           [folderId]: page.items
@@ -1258,6 +1265,7 @@ export function useLibraryData(
           );
         })
         .finally(() => {
+          options.signal?.removeEventListener("abort", abortForScope);
           if (folderChildControllersRef.current.get(requestKey) === controller) {
             folderChildControllersRef.current.delete(requestKey);
           }
@@ -1278,8 +1286,12 @@ export function useLibraryData(
   );
 
   const revealFolderPath = useCallback(
-    async (folderId: number): Promise<FolderRecord[]> => {
+    async (
+      folderId: number,
+      options: { force?: boolean; signal?: AbortSignal } = {}
+    ): Promise<FolderRecord[]> => {
       const reportingAttempt = createReportingAttempt();
+      if (options.signal?.aborted) return [];
       const cachedPath = folderAncestorPathCacheRef.current.get(folderId);
       if (cachedPath) {
         const mergedChildren = mergeFolderAncestorPath(
@@ -1292,18 +1304,25 @@ export function useLibraryData(
         return cachedPath;
       }
 
+      if (options.force) {
+        folderAncestorControllersRef.current.get(folderId)?.abort();
+        folderAncestorRequestsRef.current.delete(folderId);
+      }
       const existingRequest = folderAncestorRequestsRef.current.get(folderId);
       if (existingRequest) {
         return existingRequest;
       }
 
       const controller = new AbortController();
+      const abortForScope = () => controller.abort();
+      options.signal?.addEventListener("abort", abortForScope, { once: true });
       folderAncestorControllersRef.current.set(folderId, controller);
       const rawRequest = (async () => {
         const response = await client.listFolderAncestors(folderId, {
           requestPriority: "navigation",
           signal: controller.signal
         });
+        if (options.signal?.aborted) return [];
         const path = response.items;
         if (path.length === 0 || path[path.length - 1]?.id !== folderId) {
           throw new Error(`Invalid folder ancestor path for ${folderId}`);
@@ -1337,6 +1356,7 @@ export function useLibraryData(
           );
         })
         .finally(() => {
+          options.signal?.removeEventListener("abort", abortForScope);
           if (folderAncestorControllersRef.current.get(folderId) === controller) {
             folderAncestorControllersRef.current.delete(folderId);
           }
@@ -1522,7 +1542,9 @@ export function useLibraryData(
   );
 
   const loadRoots = useCallback(async (scope?: LibrarySelectionScope) => {
+    scope?.signal?.throwIfAborted();
     const response = await client.listRoots();
+    scope?.signal?.throwIfAborted();
     setRoots(response.items);
     const requestedRootId =
       scope && "rootId" in scope ? scope.rootId ?? null : selectedRootIdRef.current;
@@ -1663,9 +1685,10 @@ export function useLibraryData(
       limit: number;
       requestGeneration: number;
       selectFirst?: boolean;
+      signal?: AbortSignal;
     }) => {
       const reportingAttempt = createReportingAttempt();
-      if (scope.requestGeneration !== mediaPageGeneration.current) {
+      if (scope.signal?.aborted || scope.requestGeneration !== mediaPageGeneration.current) {
         return;
       }
       const offset = Math.max(0, scope.offset);
@@ -1693,6 +1716,8 @@ export function useLibraryData(
 
       inFlightMediaPageKeys.current.add(requestKey);
       const controller = new AbortController();
+      const abortForScope = () => controller.abort();
+      scope.signal?.addEventListener("abort", abortForScope, { once: true });
       mediaPageControllersRef.current.set(requestKey, controller);
       setLoadingMoreMedia(true);
       try {
@@ -1708,7 +1733,7 @@ export function useLibraryData(
           rootId: scope.rootId,
           signal: controller.signal
         });
-        if (scope.requestGeneration !== mediaPageGeneration.current) {
+        if (scope.signal?.aborted || scope.requestGeneration !== mediaPageGeneration.current) {
           return;
         }
         const totalCount = Math.max(
@@ -1752,6 +1777,7 @@ export function useLibraryData(
           );
         }
       } finally {
+        scope.signal?.removeEventListener("abort", abortForScope);
         if (mediaPageControllersRef.current.get(requestKey) === controller) {
           mediaPageControllersRef.current.delete(requestKey);
         }
@@ -2020,6 +2046,7 @@ export function useLibraryData(
   ]);
 
   const loadLibrary = useCallback(async (scope?: LibrarySelectionScope) => {
+    if (scope?.signal?.aborted) return;
     const reportingAttempt = createReportingAttempt();
     const requestGeneration = ++mediaPageGeneration.current;
     abortStaleMediaPageRequests();
@@ -2029,6 +2056,7 @@ export function useLibraryData(
     setLoading(true);
     try {
       const result = await loadRoots(scope);
+      if (scope?.signal?.aborted) return;
       const root =
         result.roots.find((item) => item.id === selectedRootIdRef.current) ?? result.selectedRoot;
       const folderId =
@@ -2042,13 +2070,19 @@ export function useLibraryData(
       // GET /api/tasks can be slow mid-scan.
       if (folderId) {
         setExpandedFolderIds((current) => new Set(current).add(folderId));
-        await loadFolderChildren(folderId);
+        await loadFolderChildren(folderId, {
+          force: Boolean(scope?.signal),
+          signal: scope?.signal
+        });
+        if (scope?.signal?.aborted) return;
       } else {
         setFolderChildrenByParent({});
         setFolderDescendantsByParent({});
         setFolderChildNextCursorByParent({});
       }
-      void loadTasksSafely("task-sync", "library", "library-task-load-failed");
+      if (!scope?.signal?.aborted) {
+        void loadTasksSafely("task-sync", "library", "library-task-load-failed");
+      }
 
       if (root) {
         const folderFilter = folderId !== null && folderId !== undefined ? folderId : undefined;
@@ -2065,7 +2099,8 @@ export function useLibraryData(
           offset: 0,
           limit: INITIAL_MEDIA_WINDOW_LIMIT,
           requestGeneration,
-          selectFirst: true
+          selectFirst: scope?.selectFirst ?? true,
+          signal: scope?.signal
         });
       } else {
         setMedia([]);
@@ -2077,6 +2112,7 @@ export function useLibraryData(
         selectMedia(null);
       }
     } catch (cause) {
+      if (scope?.signal?.aborted || isAbortError(cause)) return;
       void reportLibraryFailure(
         cause,
         "library-load",
@@ -2085,7 +2121,7 @@ export function useLibraryData(
         reportingAttempt
       );
     } finally {
-      setLoading(false);
+      if (requestGeneration === mediaPageGeneration.current) setLoading(false);
     }
   }, [
     loadMediaWindow,
@@ -2098,56 +2134,76 @@ export function useLibraryData(
     reportLibraryFailure
   ]);
 
-  const locateMedia = useCallback(async (request: MediaFocusRequest): Promise<boolean> => {
+  const locateMedia = useCallback(async (
+    request: MediaFocusRequest,
+    locateOptions: { signal?: AbortSignal } = {}
+  ): Promise<boolean> => {
     if (options.activeLibraryId && request.libraryId !== options.activeLibraryId) return false;
+    const signal = locateOptions.signal ?? new AbortController().signal;
+    if (signal.aborted) return false;
     try {
-      const target = await client.getMedia(request.fileId);
-      if (
-        target.id !== request.fileId ||
-        target.rootId !== request.rootId ||
-        target.folderId !== request.folderId
-      ) {
-        return false;
-      }
       const sort = listMediaSort(searchStateRef.current.sort);
       const includeDescendants = showChildFolderContentsRef.current;
-      const { index } = await client.getMediaPosition(request.fileId, {
-        rootId: request.rootId,
-        folderId: request.folderId,
-        includeDescendants,
-        sort
-      });
-
-      if (searchActiveRef.current) skipNextFilterReloadRef.current = true;
-      const nextSearchState: SearchState = {
-        q: "",
-        kind: undefined,
-        minRating: undefined,
-        favorite: undefined,
-        tagIds: [],
-        sort: searchStateRef.current.sort
-      };
-      searchStateRef.current = nextSearchState;
-      debouncedQRef.current = "";
-      searchActiveRef.current = false;
-      setSearchState(nextSearchState);
-      setDebouncedQ("");
-
-      await loadLibrary({ rootId: request.rootId, folderId: request.folderId });
-      const path = await revealFolderPath(request.folderId);
-      if (path.length === 0) return false;
-      const windowStart = Math.max(0, index - Math.floor(INITIAL_MEDIA_WINDOW_LIMIT / 2));
-      await loadMediaWindow({
-        rootId: request.rootId,
-        folderId: request.folderId,
-        includeDescendants,
-        offset: windowStart,
-        limit: INITIAL_MEDIA_WINDOW_LIMIT,
-        requestGeneration: mediaPageGeneration.current
-      });
-      setSelectedFolderInfoState(null);
-      selectMedia(request.fileId);
-      return true;
+      return await runCancellableMediaFocusLocate({
+        resolveTarget: async () => {
+          const target = await client.getMedia(request.fileId);
+          return target.id === request.fileId &&
+            target.rootId === request.rootId &&
+            target.folderId === request.folderId;
+        },
+        resolvePosition: async () => {
+          const { index } = await client.getMediaPosition(request.fileId, {
+            rootId: request.rootId,
+            folderId: request.folderId,
+            includeDescendants,
+            sort
+          });
+          return index;
+        },
+        resetFilters: () => {
+          if (searchActiveRef.current) skipNextFilterReloadRef.current = true;
+          const nextSearchState: SearchState = {
+            q: "",
+            kind: undefined,
+            minRating: undefined,
+            favorite: undefined,
+            tagIds: [],
+            sort: searchStateRef.current.sort
+          };
+          searchStateRef.current = nextSearchState;
+          debouncedQRef.current = "";
+          searchActiveRef.current = false;
+          setSearchState(nextSearchState);
+          setDebouncedQ("");
+        },
+        loadLibrary: () => loadLibrary({
+          rootId: request.rootId,
+          folderId: request.folderId,
+          selectFirst: false,
+          signal
+        }),
+        revealFolderPath: async () =>
+          (await revealFolderPath(request.folderId, { force: true, signal })).length > 0,
+        loadMediaWindow: async (index) => {
+          const windowStart = Math.max(
+            0,
+            index - Math.floor(INITIAL_MEDIA_WINDOW_LIMIT / 2)
+          );
+          await loadMediaWindow({
+            rootId: request.rootId,
+            folderId: request.folderId,
+            includeDescendants,
+            offset: windowStart,
+            limit: INITIAL_MEDIA_WINDOW_LIMIT,
+            requestGeneration: mediaPageGeneration.current,
+            signal
+          });
+        },
+        selectMedia: () => {
+          setSelectedFolderInfoState(null);
+          selectMedia(request.fileId);
+        }
+      }, signal);
     } catch {
       return false;
     }

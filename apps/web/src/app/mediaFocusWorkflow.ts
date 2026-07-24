@@ -42,11 +42,13 @@ export async function prepareMediaFocusNavigation(
   command: MediaFocusCommand,
   dependencies: {
     closePreview: () => void;
-    locateMedia: (command: MediaFocusCommand) => Promise<boolean>;
-  }
+    locateMedia: (command: MediaFocusCommand, signal: AbortSignal) => Promise<boolean>;
+  },
+  signal: AbortSignal = new AbortController().signal
 ): Promise<MediaGridLocateRequest | null> {
+  if (signal.aborted) return null;
   dependencies.closePreview();
-  if (!(await dependencies.locateMedia(command))) return null;
+  if (!(await dependencies.locateMedia(command, signal)) || signal.aborted) return null;
   return { requestId: command.requestId, mediaId: command.fileId };
 }
 

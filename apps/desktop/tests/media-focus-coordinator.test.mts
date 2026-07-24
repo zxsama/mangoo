@@ -32,4 +32,28 @@ describe("media focus coordinator", () => {
     assert.equal(coordinator.complete({ requestId: delivered[1]!.requestId, ok: true }), true);
     assert.equal(await second, true);
   });
+
+  it("cancels timed-out Main work, rejects late acknowledgement, and permits retry", async () => {
+    const delivered: Array<{ requestId: string }> = [];
+    const cancelled: Array<{ requestId: string }> = [];
+    const coordinator = new MediaFocusCoordinator({ timeoutMs: 5 });
+    const first = coordinator.request(
+      request,
+      (command) => delivered.push(command),
+      (cancellation) => cancelled.push(cancellation)
+    );
+
+    assert.equal(await first, false);
+    assert.deepEqual(cancelled, [{ requestId: delivered[0]!.requestId }]);
+    assert.equal(coordinator.complete({ requestId: delivered[0]!.requestId, ok: true }), false);
+
+    const second = coordinator.request(
+      request,
+      (command) => delivered.push(command),
+      (cancellation) => cancelled.push(cancellation)
+    );
+    assert.equal(coordinator.complete({ requestId: delivered[1]!.requestId, ok: true }), true);
+    assert.equal(await second, true);
+    assert.equal(cancelled.length, 1);
+  });
 });
