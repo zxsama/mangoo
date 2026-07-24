@@ -37,7 +37,7 @@ Run from the repository root.
 - `npm run check:core-client`: validate `@megle/core-client` contract alignment, typecheck, and tests.
 - `npm run check:desktop`: desktop boundary validation and TypeScript typecheck.
 - `npm run check:web`: web boundary validation and TypeScript typecheck.
-- `npm run check:ui-design`: Liquid Glass / desktop shell / UI design guardrails.
+- `npm run check:ui-design`: acrylic/frosted-glass / desktop shell / UI design guardrails.
 - `npm run check:schema`: apply migrations to a temporary SQLite DB and verify schema/indexes.
 - `npm run check:rust`: `cargo fmt --all --check` and `cargo test --workspace` when Rust is available.
 
@@ -71,9 +71,9 @@ The approved UI direction is documented in `docs/superpowers/specs/2026-05-16-me
 - Preserve the Eagle-like information architecture while keeping Megle visually distinct.
 - Keep the Library workspace aligned with the Eagle-inspired browsing model now present in the app: titlebar layout switching, subfolder strip + content split in the center pane, and preview-toolbar parity for layout controls.
 - Library layout modes are first-class product behavior. Treat `adaptive`, `waterfall`, `grid`, and `list` as a shared contract across App state, titlebar controls, MediaGrid geometry, scroll restoration, keyboard navigation, and visible/ahead thumbnail priority logic.
-- Use one Liquid Glass design language across Library, Settings, Plugins, Tasks, menus, dialogs, context menus, inspectors, and desktop chrome.
+- Use one layered acrylic frosted-glass design language across Library, Settings, Plugins, Tasks, menus, dialogs, context menus, inspectors, and desktop chrome.
 - Windows desktop must use real behind-window transparency/acrylic where required; do not fake it with a full-window renderer backing plate.
-- Liquid Glass belongs on chrome, control, floating, and overlay layers. Media grids, preview canvases, and heavy content surfaces should remain sharp and stable.
+- Acrylic and frosted-glass materials belong on chrome, control, floating, and overlay layers. Media grids, preview canvases, and heavy content surfaces should remain sharp and stable.
 - All interactive elements share ONE hover highlight: a single cursor-centred circular glow driven globally by `apps/web/src/design/liquid-glass/LiquidGlassSurface.tsx` (`updateInteractiveAffordancePointers`), styled on `[data-interactive-pointer-target]::before/::after` in `styles.css`, with params in `features/settings/interfaceStyle.ts`. Never add a per-element `:hover` border/background or a second glow subsystem. Opt an element out with `data-pointer-glow="off"`. Selection/active state uses a background fill, not a border ring. See CLAUDE.md → "Unified Pointer-Highlight System" for the full contract (the mask-composite corner-AA limitation and the O(near-cursor) driver design are documented there).
 - Popup and dialog work must use the shared glass popup surface conventions rather than ad hoc transparency. Titlebar menus, task drawers, recent-op drawers, and modal surfaces should sit above shell chrome with blur, fill, and z-index behavior that stays consistent across the app.
 - Shell, pointer highlight, titlebar drag, acrylic, rounded-corner, and dialog material changes must be guarded by `npm run check:ui-design` and the desktop visual regression harness.
@@ -141,7 +141,7 @@ PRs or review notes should include scope, touched subsystems, verification comma
 
 - Read nearby code, contracts, and validation scripts before editing.
 - Preserve user changes already present in the worktree; do not revert unrelated dirty files.
-- Prefer global primitives and validators over local one-off CSS/logic patches, especially for Liquid Glass, shell, titlebar, dialog, and pointer-highlight work.
+- Prefer global primitives and validators over local one-off CSS/logic patches, especially for acrylic/frosted-glass materials, shell, titlebar, dialog, and pointer-highlight work.
 - Do not claim success without fresh verification evidence. If checks are skipped or blocked, say so directly.
 - When subagent workflow is explicitly requested, use one subagent at a time unless the user explicitly allows parallel dispatch.
 - For desktop acrylic/interface work, treat `npm run check:ui-design`, `npm run check:web`, `npm run check:desktop`, and the OS-backdrop visual harness as the expected verification set.

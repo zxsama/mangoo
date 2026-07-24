@@ -98,7 +98,7 @@ Use Tailwind CSS for styling tokens and layout utilities.
 
 Use Lucide for icons.
 
-Liquid glass visual rule:
+Acrylic frosted-glass visual rule:
 
 - Apply blur/translucency to toolbar, sidebar, popovers, and settings.
 - Do not place large `backdrop-filter` layers behind the media grid.

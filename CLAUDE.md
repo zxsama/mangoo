@@ -87,7 +87,7 @@ When adding an API path, plugin capability, table, or index, update the contract
 
 ### Approved UI Direction
 
-UI must follow `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md`: Eagle-like information architecture, frameless Electron chrome, layered liquid glass design system, dense dark content stage. One design language across all screens, menus, dialogs, inspectors, settings, plugins, and the notification center. Liquid glass lives on chrome and control layers only — the media grid, preview canvas, and other heavy content surfaces stay dark and stable. Implementation stack: Radix UI primitives + Tailwind CSS + Lucide. Don't grow `apps/web/src/styles.css` into the permanent design system; introduce shared `design-tokens` and `ui` package boundaries instead. The reusable app shell covers Library, Settings, Plugins, and the unified notification surface before per-feature polish.
+UI must follow `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md`: Eagle-like information architecture, frameless Electron chrome, layered acrylic frosted-glass design system, dense dark content stage. One design language applies across all screens, menus, dialogs, inspectors, settings, plugins, and the notification center. Acrylic and frosted-glass materials live on chrome and control layers only — the media grid, preview canvas, and other heavy content surfaces stay dark and stable. Implementation stack: Radix UI primitives + Tailwind CSS + Lucide. Don't grow `apps/web/src/styles.css` into the permanent design system; introduce shared `design-tokens` and `ui` package boundaries instead. The reusable app shell covers Library, Settings, Plugins, and the unified notification surface before per-feature polish.
 
 ### Unified Pointer-Highlight System
 
@@ -151,7 +151,7 @@ These are enforced by checks or called out in `docs/project-structure.md`:
 - `docs/project-structure.md` — directory ownership and what not to create yet.
 - `docs/testing-strategy.md` — current test layers and the gates required before feature work.
 - `docs/final-solution.md` — locked product rules (Windows first, no managed library, recycle-bin default, plugin-ready).
-- `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md` — approved UI design spec.
+- `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md` — approved acrylic frosted-glass UI design spec.
 - `docs/superpowers/plans/2026-05-16-megle-ui-foundation.md` — UI foundation implementation plan.
 - `docs/superpowers/plans/2026-05-16-megle-complete-product-plan.md` — master execution order spanning UI foundation through release hardening.
 

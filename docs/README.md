@@ -62,7 +62,7 @@ The current plan is component-based. We are not forking an existing image-manage
 15. [Testing Strategy](testing-strategy.md)
    - Fast checks, schema validation, and future test gates.
 
-16. [UI Layered Liquid Glass Design](superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md)
+16. [UI Layered Acrylic Frosted Glass Design](superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md)
    - Approved UI direction, shell model, component rules, and performance constraints.
 
 17. [UI Foundation Implementation Plan](superpowers/plans/2026-05-16-megle-ui-foundation.md)
@@ -108,7 +108,7 @@ grid only rendered placeholder text instead of `<img>` elements. The Core API no
 See [`release-checklist.md` §2.1](release-checklist.md) for the automated CDP-driven
 smoke test that catches these issues end-to-end.
 
-The approved UI direction is layered liquid glass with a shared desktop app shell. The
+The approved UI direction is layered acrylic frosted glass with a shared desktop app shell. The
 foundation track lives in `docs/superpowers/plans/2026-05-16-megle-ui-foundation.md`. The
 full-product execution order lives in
 `docs/superpowers/plans/2026-05-16-megle-complete-product-plan.md`.

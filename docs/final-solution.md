@@ -304,7 +304,7 @@ Interaction:
 
 Visual:
 
-- restrained liquid glass on chrome, not media grid
+- restrained acrylic/frosted glass on chrome, not media grid
 - dense asset-management UI
 - stable dimensions for grid tiles
 - no layout shift from thumbnail loading

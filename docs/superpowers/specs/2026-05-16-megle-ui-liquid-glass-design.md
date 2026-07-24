@@ -1,4 +1,4 @@
-# Megle UI Layered Liquid Glass Design
+# Megle UI Layered Acrylic Frosted Glass Design
 
 Updated: 2026-05-16
 
@@ -12,7 +12,7 @@ Megle 是一个 Windows-first 的本地媒体浏览与管理工具。它索引�
 - 主界面使用 React + TypeScript。
 - Core 使用 Rust，UI 只通过 Core API 访问数据。
 - UI 交互参考 Eagle 的高效率资产管理工作流。
-- UI 风格采用液态玻璃，但不能破坏高密度媒体浏览性能。
+- UI 风格采用分层亚克力毛玻璃设计（Layered Acrylic / Frosted Glass），但不能破坏高密度媒体浏览性能。
 - 首版是 Windows 桌面版，但后续需要复用同一套 React UI 支撑 Web/Docker 部署。
 
 本设计文档在此基础上，定义 Megle 的统一 UI 设计方向、组件语法和实现路线。
@@ -22,7 +22,7 @@ Megle 是一个 Windows-first 的本地媒体浏览与管理工具。它索引�
 Megle 的 UI 必须同时满足 5 个目标：
 
 1. 保留接近 Eagle 的高密度资产管理效率。
-2. 整个应用的界面、菜单和交互使用同一套液态玻璃设计语言。
+2. 整个应用的界面、菜单和交互使用同一套分层亚克力毛玻璃设计语言。
 3. 玻璃效果只增强导航和控制层，不干扰媒体内容本身。
 4. 所有页面共享同一套桌面工作台壳层，而不是各页单独设计。
 5. 风格系统必须可工程化，能够拆成 tokens、primitives 和 product components。
@@ -39,13 +39,13 @@ Megle 的 UI 必须同时满足 5 个目标：
 
 采用：
 
-`Eagle-like information architecture + Frameless Electron desktop chrome + Layered Liquid Glass design system + Dense dark content stage`
+`Eagle-like information architecture + Frameless Electron desktop chrome + Layered Acrylic / Frosted Glass design system + Dense dark content stage`
 
 这意味着：
 
 - 信息架构参考高效率本地资产管理工具。
 - Electron 使用自绘无边框窗口，不保留原生 Windows 标题栏和系统菜单外观。
-- 整个应用属于同一套 Liquid Glass 语言，但按层级控制玻璃强度。
+- 整个应用属于同一套分层玻璃材质语言，但按层级控制亚克力与毛玻璃强度。
 - 媒体网格、预览画布、列表内容区属于稳定深色工作台，不覆盖大面积 blur。
 
 ## 5. 核心原则
@@ -57,7 +57,7 @@ Megle 统一的是语言，不是把所有区域变成同一种材质。
 - 控制层：窗口 chrome、工具栏、侧栏、检视器、菜单、右键菜单、弹层、命令面板、设置页、插件页、任务页。
 - 内容层：媒体网格、缩略图墙、预览画布、列表主体、日志主体。
 
-控制层使用液态玻璃材质。内容层使用高对比、低噪声、深色工作台材质。
+控制层使用亚克力毛玻璃材质。内容层使用高对比、低噪声、深色工作台材质。
 
 ### 5.2 内容优先
 
@@ -80,7 +80,7 @@ Megle 统一的是语言，不是把所有区域变成同一种材质。
 
 ### 5.4 性能是硬约束
 
-液态玻璃只能建立在已验证的性能底线上：
+亚克力与毛玻璃效果只能建立在已验证的性能底线上：
 
 - 不能对媒体网格区域施加持续大面积 `backdrop-filter`。
 - 不能让预览切换依赖高成本动画。
@@ -248,7 +248,7 @@ Megle 使用专业工具导向而不是营销页面导向的排版：
 
 ### 9.5 动效
 
-液态玻璃的“液态”主要通过控制层运动表达：
+亚克力毛玻璃材质的动态感主要通过控制层运动表达：
 
 - 菜单、Popover、Dialog 使用短距离漂浮进入
 - Inspector 展开与收起使用轻微黏性动画

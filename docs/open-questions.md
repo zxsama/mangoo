@@ -10,7 +10,7 @@
 2. 删除行为默认进回收站。
    - 建议默认删除到回收站，永久删除作为高级操作。
 
-3. UI 方向采用 layered liquid glass system。
+3. UI 方向采用分层亚克力毛玻璃设计（Layered Acrylic / Frosted Glass）。
    - 使用 frameless Electron desktop chrome。
    - 所有界面、菜单和交互使用统一设计语言。
    - 玻璃主要用于 chrome 和控制层，不覆盖媒体网格和预览内容层。
