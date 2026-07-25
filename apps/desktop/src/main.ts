@@ -1743,17 +1743,67 @@ async function restartCoreForLibrary(
         }
       },
       startHealthyCore: async () => {
-        handle = startCoreProcess(session, coreLogHandlerForSession(session));
-        pendingCoreProcess = handle;
-        pushLibraryPhase("opening-library");
-        await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
-        assertCurrentCoreGeneration(generation, signal);
-        if (coreProcess && coreProcess !== handle) {
-          throw new LifecycleCancelledError(
-            "A newer Core process was committed before library restart completed"
-          );
+        // Bounded spawn-retry, mirroring cold-start `startCoreSession`. A single
+        // spawn occasionally fails to become healthy (e.g. the just-stopped old
+        // Core's socket lingers and the new Core loses the bind race, exiting
+        // before it serves). Cold start silently recovers from this via retry;
+        // the switch path used to do a single attempt, so one lost race surfaced
+        // as a hard "Core did not become healthy" switch failure. Retrying here
+        // makes a library switch as robust as a cold start.
+        const maxAttempts = shouldRetryAutoCoreStartup() ? AUTO_CORE_STARTUP_MAX_ATTEMPTS : 1;
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          assertCurrentCoreGeneration(generation, signal);
+          handle = startCoreProcess(session, coreLogHandlerForSession(session));
+          pendingCoreProcess = handle;
+          if (attempt === 1) pushLibraryPhase("opening-library");
+          try {
+            await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
+            assertCurrentCoreGeneration(generation, signal);
+            if (coreProcess && coreProcess !== handle) {
+              throw new LifecycleCancelledError(
+                "A newer Core process was committed before library restart completed"
+              );
+            }
+            if (attempt > 1) {
+              desktopLogger.info(
+                "main",
+                `[megle] library Core became healthy on attempt ${attempt}/${maxAttempts}`
+              );
+            }
+            return session;
+          } catch (error) {
+            // A lifecycle cancel (newer generation / shutdown) is terminal — do
+            // not retry, the switch has been superseded.
+            if (signal.aborted || !coreLifecycleQueue.isCurrentGeneration(generation)) {
+              throw error;
+            }
+            lastError = error;
+            // Stop the unhealthy candidate and free its port before respawning.
+            try {
+              await stopPendingCoreProcess();
+            } catch (stopError) {
+              // The dead child may still own the bind port; without freeing it a
+              // respawn would just lose the bind again. Surface the original
+              // failure rather than spinning.
+              desktopLogger.warn(
+                "main",
+                "[megle] unhealthy candidate Core cleanup failed during switch retry:",
+                stopError
+              );
+              throw error;
+            }
+            if (attempt < maxAttempts) {
+              desktopLogger.warn(
+                "main",
+                `[megle] library Core health attempt ${attempt}/${maxAttempts} failed; retrying:`,
+                error
+              );
+              await waitForPortFree(base.bindAddress, signal);
+            }
+          }
         }
-        return session;
+        throw lastError ?? new Error("library Core did not become healthy");
       },
       commitActiveLibrary: async (healthySession) => {
         await commitActiveLibrary(healthySession);
