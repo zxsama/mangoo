@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import {
   activateLibraryIfCurrent,
   addLibrary,
-  removeLibrary,
+  removeLibraryIfInactive,
   renameLibrary,
   setLibraryIcon,
   type LibraryRegistry
@@ -23,11 +23,18 @@ function registry(): LibraryRegistry {
   };
 }
 
+function removeInactive(registryValue: LibraryRegistry, id: string): LibraryRegistry {
+  const result = removeLibraryIfInactive(registryValue, id);
+  assert.equal(result.ok, true);
+  if (!result.ok) throw new Error(`Expected ${id} to be inactive`);
+  return result.registry;
+}
+
 describe("conditional active library mutation", () => {
   it("commits a switch on the latest registry without losing rename, icon, add or remove updates", () => {
     let latest = renameLibrary(registry(), "target", "Renamed target");
     latest = setLibraryIcon(latest, "target", "folder-heart", "#d98268");
-    latest = removeLibrary(latest, "removed");
+    latest = removeInactive(latest, "removed");
     const added = addLibrary(latest, {
       name: "Concurrent add",
       dbPath: "D:\\Libraries\\added.sqlite",
@@ -54,7 +61,7 @@ describe("conditional active library mutation", () => {
   });
 
   it("does not resurrect a target removed or deleted during a switch", () => {
-    const latest = removeLibrary(registry(), "target");
+    const latest = removeInactive(registry(), "target");
     const result = activateLibraryIfCurrent(latest, {
       id: "target",
       dbPath: targetPath,
@@ -89,7 +96,7 @@ describe("conditional active library mutation", () => {
 
   it("restores a still-registered previous library without losing concurrent target removal and add", () => {
     const renamedPrevious = renameLibrary(registry(), "previous", "Renamed previous");
-    const withoutTarget = removeLibrary(renamedPrevious, "target");
+    const withoutTarget = removeInactive(renamedPrevious, "target");
     const added = addLibrary(withoutTarget, {
       name: "Concurrent add",
       dbPath: "D:\\Libraries\\added.sqlite",
@@ -110,7 +117,10 @@ describe("conditional active library mutation", () => {
   });
 
   it("returns an explicit conflict when the previous library was removed before recovery commit", () => {
-    const latest = removeLibrary(registry(), "previous");
+    const latest = removeInactive(
+      { ...registry(), activeLibraryId: "target" },
+      "previous"
+    );
     const result = activateLibraryIfCurrent(latest, {
       id: "previous",
       dbPath: previousPath,

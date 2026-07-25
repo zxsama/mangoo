@@ -26,6 +26,14 @@ export type ActivateLibraryResult =
       registry: LibraryRegistry;
     };
 
+export type RemoveLibraryResult =
+  | { ok: true; registry: LibraryRegistry; entry: LibraryEntry }
+  | {
+      ok: false;
+      reason: "missing" | "active";
+      registry: LibraryRegistry;
+    };
+
 const EMPTY: LibraryRegistry = { activeLibraryId: null, libraries: [] };
 
 export function registryFilePath(userDataDir: string): string {
@@ -77,10 +85,22 @@ export function addLibrary(
   };
 }
 
-export function removeLibrary(registry: LibraryRegistry, id: string): LibraryRegistry {
+export function removeLibraryIfInactive(
+  registry: LibraryRegistry,
+  id: string
+): RemoveLibraryResult {
+  const entry = registry.libraries.find((library) => library.id === id);
+  if (!entry) return { ok: false, reason: "missing", registry };
+  if (registry.activeLibraryId === id) {
+    return { ok: false, reason: "active", registry };
+  }
   return {
-    activeLibraryId: registry.activeLibraryId === id ? null : registry.activeLibraryId,
-    libraries: registry.libraries.filter((l) => l.id !== id)
+    ok: true,
+    registry: {
+      ...registry,
+      libraries: registry.libraries.filter((library) => library.id !== id)
+    },
+    entry
   };
 }
 

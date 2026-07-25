@@ -114,7 +114,7 @@ export interface MegleDesktopBridge {
   ) => Promise<{ ok: boolean; error?: string }>;
   createLibrary?: (input: { name: string; dbPath: string }) => Promise<{ ok: boolean; library?: LibrarySummary; error?: string }>;
   openLibrary?: (dbPath: string) => Promise<{ ok: boolean; library?: LibrarySummary; error?: string }>;
-  removeLibraryFromList?: (libraryId: string) => Promise<{ ok: boolean }>;
+  removeLibraryFromList?: (libraryId: string) => Promise<{ ok: boolean; error?: string }>;
   renameLibrary?: (libraryId: string, name: string) => Promise<{ ok: boolean }>;
   setLibraryIcon?: (libraryId: string, icon: string, color: string) => Promise<{ ok: boolean }>;
   deleteLibraryFile?: (libraryId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -284,8 +284,13 @@ export async function openLibrary(
 ): Promise<{ ok: boolean; library?: LibrarySummary; error?: string }> {
   return (await getDesktopBridge()?.openLibrary?.(dbPath)) ?? { ok: false, error: "no desktop bridge" };
 }
-export async function removeLibraryFromList(libraryId: string): Promise<{ ok: boolean }> {
-  return (await getDesktopBridge()?.removeLibraryFromList?.(libraryId)) ?? { ok: false };
+export async function removeLibraryFromList(
+  libraryId: string
+): Promise<{ ok: boolean; error?: string }> {
+  return (await getDesktopBridge()?.removeLibraryFromList?.(libraryId)) ?? {
+    ok: false,
+    error: "no desktop bridge"
+  };
 }
 export async function renameLibraryEntry(libraryId: string, name: string): Promise<{ ok: boolean }> {
   return (await getDesktopBridge()?.renameLibrary?.(libraryId, name)) ?? { ok: false };

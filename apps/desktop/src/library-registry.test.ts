@@ -4,7 +4,13 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  loadRegistry, saveRegistry, addLibrary, removeLibrary, setActive, renameLibrary, type LibraryRegistry
+  loadRegistry,
+  saveRegistry,
+  addLibrary,
+  removeLibraryIfInactive,
+  setActive,
+  renameLibrary,
+  type LibraryRegistry
 } from "./library-registry.ts";
 
 function tmpDir(): string {
@@ -49,13 +55,12 @@ test("setActive sets id and bumps lastOpenedAt", () => {
   assert.equal(reg.libraries[0].lastOpenedAt, 5000);
 });
 
-test("removeLibrary clears active id when removing the active library", () => {
+test("removeLibraryIfInactive rejects the active library", () => {
   let reg: LibraryRegistry = { activeLibraryId: null, libraries: [] };
   const added = addLibrary(reg, { name: "A", dbPath: "C:/a.sqlite", now: 1 });
   reg = setActive(added.registry, added.entry.id, 2);
-  reg = removeLibrary(reg, added.entry.id);
-  assert.equal(reg.activeLibraryId, null);
-  assert.equal(reg.libraries.length, 0);
+  const result = removeLibraryIfInactive(reg, added.entry.id);
+  assert.deepEqual(result, { ok: false, reason: "active", registry: reg });
 });
 
 test("renameLibrary changes the name only", () => {

@@ -458,6 +458,24 @@ test("shutdown stop failure restores live notifications and a later retry can fi
   assert.equal(stopAttempts, 2);
 });
 
+test("every library deletion IPC uses the same latest-registry active guard", () => {
+  const root = fileURLToPath(new URL("../../..", import.meta.url));
+  const main = readFileSync(`${root}/apps/desktop/src/main.ts`, "utf8");
+  const removeHandler = main.slice(
+    main.indexOf('ipcMain.handle("megle:remove-library-from-list"'),
+    main.indexOf('ipcMain.handle("megle:rename-library"')
+  );
+  const deleteHandler = main.slice(
+    main.indexOf('ipcMain.handle("megle:delete-library-file"'),
+    main.indexOf('ipcMain.handle("megle:pick-library-file"')
+  );
+
+  assert.match(main, /function removeLibraryFromCurrentRegistry\(/);
+  assert.match(removeHandler, /removeLibraryFromCurrentRegistry\(libraryId\)/);
+  assert.match(deleteHandler, /removeLibraryFromCurrentRegistry\(libraryId,/);
+  assert.doesNotMatch(main, /libraryRegistry\.removeLibrary\(/);
+});
+
 test("hardening source contract uses shared DTOs, sender authorization, and failed-window cleanup", () => {
   const root = fileURLToPath(new URL("../../..", import.meta.url));
   const read = (relativePath: string) => readFileSync(`${root}/${relativePath}`, "utf8");

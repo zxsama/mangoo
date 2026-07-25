@@ -696,7 +696,8 @@ function LibrariesTab({ library }: { library: LibraryState }) {
 
   async function onRemove(l: LibrarySummary) {
     if (l.active) return;
-    await removeLibraryFromList(l.id);
+    const res = await removeLibraryFromList(l.id);
+    if (!res.ok) setError(res.error ?? "移除失败");
     reload();
   }
 

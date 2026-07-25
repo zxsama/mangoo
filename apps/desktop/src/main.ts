@@ -270,6 +270,29 @@ function persistRegistry(next: libraryRegistry.LibraryRegistry): void {
   cachedRegistry = next;
   libraryRegistry.saveRegistry(userDataDir(), next);
 }
+type LibraryRemovalIpcResult = { ok: boolean; error?: string };
+function removeLibraryFromCurrentRegistry(
+  libraryId: string,
+  beforePersist?: (entry: libraryRegistry.LibraryEntry) => void
+): LibraryRemovalIpcResult {
+  const removal = libraryRegistry.removeLibraryIfInactive(getRegistry(), libraryId);
+  if (!removal.ok) {
+    return {
+      ok: false,
+      error:
+        removal.reason === "active"
+          ? "cannot remove the active library"
+          : "library not found"
+    };
+  }
+  try {
+    beforePersist?.(removal.entry);
+    persistRegistry(removal.registry);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error) };
+  }
+}
 function pushLibraryPhase(phase: DesktopLibraryLoadPhase): void {
   libraryLoadState.publish(phase);
   // Secondary windows share the same Core URL/token. Broadcast restart phases
@@ -1095,8 +1118,7 @@ ipcMain.handle("megle:open-library", async (event, dbPath: string) => {
 
 ipcMain.handle("megle:remove-library-from-list", (event, libraryId: string) => {
   requireDesktopIpcAccess(event, "megle:remove-library-from-list");
-  persistRegistry(libraryRegistry.removeLibrary(getRegistry(), libraryId));
-  return { ok: true };
+  return removeLibraryFromCurrentRegistry(libraryId);
 });
 
 ipcMain.handle("megle:rename-library", (event, libraryId: string, name: string) => {
@@ -1117,24 +1139,14 @@ ipcMain.handle("megle:set-library-icon", (event, libraryId: string, icon: string
 // the action. The renderer performs its own second confirmation before calling.
 ipcMain.handle("megle:delete-library-file", (event, libraryId: string) => {
   requireDesktopIpcAccess(event, "megle:delete-library-file");
-  const reg = getRegistry();
-  const target = reg.libraries.find((l) => l.id === libraryId);
-  if (!target) return { ok: false, error: "library not found" };
-  if (reg.activeLibraryId === libraryId) {
-    return { ok: false, error: "cannot delete the active library" };
-  }
-  try {
+  return removeLibraryFromCurrentRegistry(libraryId, (target) => {
     for (const suffix of ["", "-wal", "-shm"]) {
       const filePath = target.dbPath + suffix;
       if (fsSync.existsSync(filePath)) {
         fsSync.rmSync(filePath, { force: true });
       }
     }
-    persistRegistry(libraryRegistry.removeLibrary(reg, libraryId));
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: String(error) };
-  }
+  });
 });
 
 ipcMain.handle("megle:pick-library-file", async (event) => {

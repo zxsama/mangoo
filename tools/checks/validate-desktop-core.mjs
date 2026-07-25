@@ -692,6 +692,38 @@ for (const value of [
     fail(`library registry missing latest-state conditional activation: ${value}`);
   }
 }
+for (const value of [
+  "RemoveLibraryResult",
+  "removeLibraryIfInactive",
+  'reason: "missing" | "active"',
+  "registry.activeLibraryId === id"
+]) {
+  if (!libraryRegistry.includes(value)) {
+    fail(`library registry missing active-library removal guard: ${value}`);
+  }
+}
+if (/export function removeLibrary\(/.test(libraryRegistry)) {
+  fail("library registry must not export an unguarded removal bypass");
+}
+const currentRegistryRemovalBody = functionBody(
+  main,
+  "function removeLibraryFromCurrentRegistry("
+);
+if (
+  !currentRegistryRemovalBody ||
+  !currentRegistryRemovalBody.includes("removeLibraryIfInactive(getRegistry(), libraryId)") ||
+  !currentRegistryRemovalBody.includes("persistRegistry(removal.registry)")
+) {
+  fail("desktop library deletion must guard and persist one latest-registry snapshot");
+}
+for (const value of [
+  "return removeLibraryFromCurrentRegistry(libraryId);",
+  "return removeLibraryFromCurrentRegistry(libraryId, (target) => {"
+]) {
+  if (!main.includes(value)) {
+    fail(`desktop library deletion entry point bypasses the shared active guard: ${value}`);
+  }
+}
 for (const value of ["publish(phase", "snapshot()", "this.current = phase"]) {
   if (!libraryLoadState.includes(value)) {
     fail(`desktop library phase state must persist recovery errors across renderer reload: ${value}`);
