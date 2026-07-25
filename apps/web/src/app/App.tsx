@@ -34,6 +34,7 @@ import {
   openPluginsWindow,
   openPath,
   revealPath,
+  retryLibraryLoad,
   switchLibrary,
   subscribeLibraryPhase
 } from "../core/desktop";
@@ -887,7 +888,7 @@ export function App() {
             {renderCenterPane()}
             <LibraryLoadingOverlay
               phase={libraryPhase}
-              onRetry={() => window.location.reload()}
+              onRetry={() => void retryLibraryLoad()}
               onSwitchLibrary={() => setSwitcherOpen(true)}
             />
           </>

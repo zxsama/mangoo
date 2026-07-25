@@ -173,6 +173,8 @@ const fullBridge = {
   },
   listLibraries: () => ipcRenderer.invoke("megle:list-libraries"),
   getActiveLibraryId: () => ipcRenderer.invoke("megle:get-active-library-id"),
+  getLibraryPhase: () => ipcRenderer.invoke("megle:get-library-load-phase"),
+  retryLibraryLoad: () => ipcRenderer.invoke("megle:retry-library-load"),
   switchLibrary: (libraryId, mediaFocusRequestId) =>
     ipcRenderer.invoke("megle:switch-library", libraryId, mediaFocusRequestId),
   createLibrary: (input) => ipcRenderer.invoke("megle:create-library", input),

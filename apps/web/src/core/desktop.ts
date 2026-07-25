@@ -106,6 +106,8 @@ export interface MegleDesktopBridge {
   shell?: DesktopShellActions;
   listLibraries?: () => Promise<LibrarySummary[]>;
   getActiveLibraryId?: () => Promise<string | null>;
+  getLibraryPhase?: () => Promise<LibraryLoadPhase>;
+  retryLibraryLoad?: () => Promise<{ ok: boolean; error?: string }>;
   switchLibrary?: (
     libraryId: string,
     mediaFocusRequestId?: string
@@ -300,6 +302,30 @@ export async function pickLibraryFile(): Promise<string | null> {
 export async function pickNewLibraryPath(defaultName?: string): Promise<string | null> {
   return (await getDesktopBridge()?.pickNewLibraryPath?.(defaultName)) ?? null;
 }
+export async function retryLibraryLoad(): Promise<boolean> {
+  try {
+    return (await getDesktopBridge()?.retryLibraryLoad?.())?.ok ?? false;
+  } catch {
+    return false;
+  }
+}
 export function subscribeLibraryPhase(cb: (phase: LibraryLoadPhase) => void): () => void {
-  return getDesktopBridge()?.onLibraryPhase?.(cb) ?? (() => undefined);
+  const bridge = getDesktopBridge();
+  if (!bridge) return () => undefined;
+  let disposed = false;
+  let observedLivePhase = false;
+  const unsubscribe = bridge.onLibraryPhase?.((phase) => {
+    if (disposed) return;
+    observedLivePhase = true;
+    cb(phase);
+  }) ?? (() => undefined);
+  void bridge.getLibraryPhase?.()
+    .then((phase) => {
+      if (!disposed && !observedLivePhase) cb(phase);
+    })
+    .catch(() => undefined);
+  return () => {
+    disposed = true;
+    unsubscribe();
+  };
 }

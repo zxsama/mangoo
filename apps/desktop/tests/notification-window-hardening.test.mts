@@ -357,6 +357,8 @@ test("notifications preload exposes only notification, log, and common window ca
   const mainBridge = evaluatePreload("main").bridge;
   const settingsBridge = evaluatePreload("settings").bridge;
   assert.equal(typeof mainBridge.switchLibrary, "function");
+  assert.equal(typeof mainBridge.getLibraryPhase, "function");
+  assert.equal(typeof mainBridge.retryLibraryLoad, "function");
   assert.equal(typeof mainBridge.updateMediaFocusStage, "function");
   assert.equal(typeof mainBridge.shell, "object");
   assert.equal(typeof settingsBridge.switchLibrary, "function");
@@ -369,6 +371,7 @@ test("notifications preload exposes only notification, log, and common window ca
 test("Main role permissions reject notification senders for library and shell IPC", () => {
   assert.ok(permissionsModule, "desktop IPC role permissions must exist");
   for (const channel of [
+    "megle:retry-library-load",
     "megle:switch-library",
     "megle:create-library",
     "megle:open-library",

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  CoreSwitchRecoveryError,
   runCoreSwitchTransaction,
   startHealthyCoreWithRetry,
   type CoreSwitchPhase
@@ -63,6 +64,7 @@ function createHarness(cancelAt: CoreSwitchPhase | "during-detach" | "during-sto
   };
 
   return {
+    cancel,
     events,
     options,
     snapshot: () => ({ core, notifications, pending, registry })
@@ -74,15 +76,17 @@ describe("Core switch transaction cancellation", () => {
     "during-detach",
     "previous-detached",
     "during-stop",
-    "previous-stopped",
-    "target-started",
-    "target-attached"
+    "previous-stopped"
   ] as const) {
     it(`restores a healthy consistent previous library when cancelled at ${cancelAt}`, async () => {
       const harness = createHarness(cancelAt);
       const result = await runCoreSwitchTransaction(harness.options);
 
-      assert.deepEqual(result, { cancelled: true, session: "previous" });
+      assert.deepEqual(result, {
+        cancelled: true,
+        outcome: "previous",
+        session: "previous"
+      });
       assert.deepEqual(harness.snapshot(), {
         core: "previous",
         notifications: "previous",
@@ -93,9 +97,29 @@ describe("Core switch transaction cancellation", () => {
       const retry = createHarness(null);
       assert.deepEqual(await runCoreSwitchTransaction(retry.options), {
         cancelled: false,
+        outcome: "target",
         session: "target"
       });
       assert.deepEqual(retry.snapshot(), {
+        core: "target",
+        notifications: "target",
+        pending: null,
+        registry: "target"
+      });
+    });
+  }
+
+  for (const cancelAt of ["target-started", "target-attached"] as const) {
+    it(`keeps the only healthy target as a coherent fallback when cancelled at ${cancelAt}`, async () => {
+      const harness = createHarness(cancelAt);
+      const result = await runCoreSwitchTransaction(harness.options);
+
+      assert.deepEqual(result, {
+        cancelled: true,
+        outcome: "target-fallback",
+        session: "target"
+      });
+      assert.deepEqual(harness.snapshot(), {
         core: "target",
         notifications: "target",
         pending: null,
@@ -163,6 +187,106 @@ describe("Core switch transaction cancellation", () => {
       notifications: "previous",
       pending: null,
       registry: "previous"
+    });
+  });
+
+  it("returns a recovered cancellation outcome when target startup fails after cancellation", async () => {
+    const harness = createHarness(null);
+    const options = {
+      ...harness.options,
+      startTargetCore: async () => {
+        harness.cancel();
+        throw new Error("target health check failed after cancellation");
+      }
+    };
+
+    assert.deepEqual(await runCoreSwitchTransaction(options), {
+      cancelled: true,
+      outcome: "previous",
+      session: "previous"
+    });
+    assert.deepEqual(harness.snapshot(), {
+      core: "previous",
+      notifications: "previous",
+      pending: null,
+      registry: "previous"
+    });
+  });
+
+  for (const failure of ["start", "health"] as const) {
+    it(`surfaces an independent recovery ${failure} failure after cancellation`, async () => {
+      const harness = createHarness("previous-stopped");
+      const options = {
+        ...harness.options,
+        recoverPreviousCore: async () => {
+          throw new Error(`previous ${failure} failed`);
+        }
+      };
+
+      await assert.rejects(runCoreSwitchTransaction(options), (error: unknown) => {
+        assert.ok(error instanceof CoreSwitchRecoveryError);
+        assert.equal(error.recoveryStage, "start-or-health");
+        assert.equal(error.systemHealthy, false);
+        assert.match(error.message, new RegExp(`previous ${failure} failed`));
+        return true;
+      });
+    });
+  }
+
+  it("surfaces an independent recovery notification detach failure after cancellation", async () => {
+    const harness = createHarness("previous-stopped");
+    let detachCalls = 0;
+    const options = {
+      ...harness.options,
+      detachNotifications: async () => {
+        detachCalls += 1;
+        if (detachCalls > 1) throw new Error("recovery notification detach failed");
+      }
+    };
+
+    await assert.rejects(runCoreSwitchTransaction(options), (error: unknown) => {
+      assert.ok(error instanceof CoreSwitchRecoveryError);
+      assert.equal(error.recoveryStage, "notification-detach");
+      assert.equal(error.systemHealthy, false);
+      assert.match(error.message, /recovery notification detach failed/);
+      return true;
+    });
+  });
+
+  it("surfaces an independent recovery commit failure after cancellation", async () => {
+    const harness = createHarness("previous-stopped");
+    const options = {
+      ...harness.options,
+      commitPreviousCore: async () => {
+        throw new Error("previous commit failed");
+      }
+    };
+
+    await assert.rejects(runCoreSwitchTransaction(options), (error: unknown) => {
+      assert.ok(error instanceof CoreSwitchRecoveryError);
+      assert.equal(error.recoveryStage, "commit");
+      assert.equal(error.systemHealthy, false);
+      assert.match(error.message, /previous commit failed/);
+      return true;
+    });
+  });
+
+  it("surfaces recovery notification failure while retaining the healthy committed Core", async () => {
+    const harness = createHarness("previous-stopped");
+    const options = {
+      ...harness.options,
+      attachNotifications: async (session: LibraryId) => {
+        if (session === "previous") throw new Error("previous notification attach failed");
+      }
+    };
+
+    await assert.rejects(runCoreSwitchTransaction(options), (error: unknown) => {
+      assert.ok(error instanceof CoreSwitchRecoveryError);
+      assert.equal(error.recoveryStage, "notification-attach");
+      assert.equal(error.systemHealthy, true);
+      assert.equal(error.healthySession, "previous");
+      assert.match(error.message, /previous notification attach failed/);
+      return true;
     });
   });
 });

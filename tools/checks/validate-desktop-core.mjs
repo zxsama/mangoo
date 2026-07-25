@@ -49,6 +49,9 @@ const main = read("apps/desktop/src/main.ts");
 const session = read("apps/desktop/src/core-session.ts");
 const processFile = read("apps/desktop/src/core-process.ts");
 const lifecycleQueue = read("apps/desktop/src/core-lifecycle-queue.ts");
+const coreSwitchTransaction = read("apps/desktop/src/core-switch-transaction.ts");
+const libraryLoadState = read("apps/desktop/src/library-load-state.ts");
+const libraryRegistry = read("apps/desktop/src/library-registry.ts");
 const preload = read("apps/desktop/src/preload.cjs");
 const notificationIpc = readOptional("apps/desktop/src/notification-ipc.ts");
 const notificationRuntime = readOptional("apps/desktop/src/notification-runtime.ts");
@@ -414,6 +417,7 @@ for (const value of [
   }
 }
 for (const channel of [
+  "megle:retry-library-load",
   "megle:switch-library",
   "megle:create-library",
   "megle:remove-library-from-list",
@@ -654,6 +658,53 @@ if (!restartCoreForLibraryBody) {
   }
   if (restartCoreForLibraryBody.includes("coreSession = null")) {
     fail("desktop main must retain the last-known coreSession while a library candidate is unhealthy");
+  }
+  if (restartCoreForLibraryBody.includes("persistRegistry(previousRegistry)")) {
+    fail("desktop library recovery must not restore a stale whole-registry snapshot");
+  }
+  for (const value of [
+    "CoreSwitchRecoveryError",
+    "activateCurrentRegistryLibrary(target)",
+    "activateCurrentRegistryLibrary({"
+  ]) {
+    if (!restartCoreForLibraryBody.includes(value)) {
+      fail(`desktop library recovery missing transactional consistency guard: ${value}`);
+    }
+  }
+}
+for (const value of [
+  "CoreSwitchRecoveryError",
+  'outcome: "target-fallback"',
+  'recoveryStage: CoreSwitchRecoveryStage',
+  "systemHealthy"
+]) {
+  if (!coreSwitchTransaction.includes(value)) {
+    fail(`Core switch transaction missing independent recovery outcome: ${value}`);
+  }
+}
+for (const value of [
+  "activateLibraryIfCurrent",
+  'reason: "missing" | "db-path-changed"',
+  "path.resolve(entry.dbPath)",
+  "setActive(registry, expected.id, expected.now)"
+]) {
+  if (!libraryRegistry.includes(value)) {
+    fail(`library registry missing latest-state conditional activation: ${value}`);
+  }
+}
+for (const value of ["publish(phase", "snapshot()", "this.current = phase"]) {
+  if (!libraryLoadState.includes(value)) {
+    fail(`desktop library phase state must persist recovery errors across renderer reload: ${value}`);
+  }
+}
+for (const value of [
+  'ipcMain.handle("megle:get-library-load-phase"',
+  'ipcMain.handle("megle:retry-library-load"',
+  "await ensureCoreReady()",
+  "attachNotificationServiceForSession(currentSession, generation, signal)"
+]) {
+  if (!main.includes(value)) {
+    fail(`desktop library retry/reload recovery missing ${value}`);
   }
 }
 const commitStartedCoreBody = functionBody(main, "async function commitStartedCore(");

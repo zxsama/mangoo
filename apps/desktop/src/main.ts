@@ -36,11 +36,16 @@ import {
   throwIfLifecycleAborted
 } from "./core-lifecycle-queue.js";
 import {
+  CoreSwitchRecoveryError,
   runCoreSwitchTransaction,
   startHealthyCoreWithRetry,
   type CoreSwitchTransactionResult
 } from "./core-switch-transaction.js";
 import * as libraryRegistry from "./library-registry.js";
+import {
+  LibraryLoadState,
+  type DesktopLibraryLoadPhase
+} from "./library-load-state.js";
 import { sessionForDbPath } from "./core-session.js";
 import {
   LatestValueBroadcastQueue,
@@ -160,6 +165,7 @@ let coreSession: CoreSession | null = null;
 let pendingCoreSession: CoreSession | null = null;
 let coreReadyPromise: Promise<CoreSession> | null = null;
 let cachedRegistry: libraryRegistry.LibraryRegistry | null = null;
+const libraryLoadState = new LibraryLoadState();
 let cachedFfmpegAvailable: boolean | null = null;
 let persisted = false;
 let shutdownFinalized = false;
@@ -264,7 +270,8 @@ function persistRegistry(next: libraryRegistry.LibraryRegistry): void {
   cachedRegistry = next;
   libraryRegistry.saveRegistry(userDataDir(), next);
 }
-function pushLibraryPhase(phase: unknown): void {
+function pushLibraryPhase(phase: DesktopLibraryLoadPhase): void {
+  libraryLoadState.publish(phase);
   // Secondary windows share the same Core URL/token. Broadcast restart phases
   // to every renderer so settings/plugin requests do not remain on stale state.
   for (const win of [mainWindow, ...Object.values(secondaryWindows)]) {
@@ -938,6 +945,33 @@ ipcMain.handle("megle:get-active-library-id", (event) => {
   requireDesktopIpcAccess(event, "megle:get-active-library-id");
   return getRegistry().activeLibraryId;
 });
+ipcMain.handle("megle:get-library-load-phase", (event) => {
+  requireDesktopIpcAccess(event, "megle:get-library-load-phase");
+  return libraryLoadState.snapshot();
+});
+ipcMain.handle("megle:retry-library-load", async (event) => {
+  requireDesktopIpcAccess(event, "megle:retry-library-load");
+  try {
+    const recoveredSession = await ensureCoreReady();
+    await coreLifecycleQueue.enqueue(async (signal) => {
+      const currentSession = await currentHealthyCoreSession(signal);
+      if (!currentSession || currentSession !== recoveredSession) {
+        throw new LifecycleCancelledError(
+          "Core session changed before library recovery completed"
+        );
+      }
+      const generation = coreLifecycleQueue.currentGeneration;
+      await attachNotificationServiceForSession(currentSession, generation, signal);
+    });
+    pushLibraryPhase("loading-media");
+    return { ok: true };
+  } catch (error) {
+    const message = `Library retry failed: ${String(error)}`;
+    desktopLogger.error("main", "[megle] library retry failed:", error);
+    pushLibraryPhase({ kind: "error", message });
+    return { ok: false, error: message };
+  }
+});
 
 ipcMain.handle("megle:switch-library", async (
   event,
@@ -974,9 +1008,12 @@ ipcMain.handle("megle:switch-library", async (
       const target = reg.libraries.find((l) => l.id === libraryId);
       if (!target) return { ok: false, error: "library not found" };
       if (!fsSync.existsSync(target.dbPath)) return { ok: false, error: "library file missing" };
-      const switchResult = await restartCoreForLibrary(target.dbPath, signal, generation, () => {
-        persistRegistry(libraryRegistry.setActive(reg, libraryId, Date.now()));
-      }, operationCancelled);
+      const switchResult = await restartCoreForLibrary(
+        { id: target.id, dbPath: target.dbPath },
+        signal,
+        generation,
+        operationCancelled
+      );
       pushLibraryPhase("loading-media"); // renderer takes over from here
       if (switchResult.cancelled) {
         return { ok: false, error: "media focus operation was cancelled" };
@@ -984,7 +1021,11 @@ ipcMain.handle("megle:switch-library", async (
       return { ok: true };
     }, { signal: operationSignal, activeCancellation: "defer" });
   } catch (error) {
-    if (!(error instanceof LifecycleCancelledError) && !operationSignal?.aborted) {
+    if (
+      !(error instanceof CoreSwitchRecoveryError) &&
+      !(error instanceof LifecycleCancelledError) &&
+      !operationSignal?.aborted
+    ) {
       pushLibraryPhase({ kind: "error", message: String(error) });
     }
     return { ok: false, error: String(error) };
@@ -1009,9 +1050,11 @@ ipcMain.handle("megle:create-library", async (event, input: { name: string; dbPa
       // Keep the candidate discoverable while its Core is starting, but do
       // not change activeLibraryId until health succeeds.
       persistRegistry(added.registry);
-      await restartCoreForLibrary(added.entry.dbPath, signal, generation, () => {
-        persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
-      });
+      await restartCoreForLibrary(
+        { id: added.entry.id, dbPath: added.entry.dbPath },
+        signal,
+        generation
+      );
       pushLibraryPhase("loading-media");
       const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
       return { ok: true, library: summary };
@@ -1035,9 +1078,11 @@ ipcMain.handle("megle:open-library", async (event, dbPath: string) => {
       // Keep the candidate discoverable while its Core is starting, but do
       // not change activeLibraryId until health succeeds.
       persistRegistry(added.registry);
-      await restartCoreForLibrary(added.entry.dbPath, signal, generation, () => {
-        persistRegistry(libraryRegistry.setActive(getRegistry(), added.entry.id, Date.now()));
-      });
+      await restartCoreForLibrary(
+        { id: added.entry.id, dbPath: added.entry.dbPath },
+        signal,
+        generation
+      );
       pushLibraryPhase("loading-media");
       const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
       return { ok: true, library: summary };
@@ -1835,21 +1880,50 @@ async function commitStartedCore(
   pendingCoreSession = null;
 }
 
+type LibrarySwitchIdentity = {
+  id: string;
+  dbPath: string;
+};
+
+function activateCurrentRegistryLibrary(identity: LibrarySwitchIdentity): void {
+  const result = libraryRegistry.activateLibraryIfCurrent(getRegistry(), {
+    ...identity,
+    now: Date.now()
+  });
+  if (!result.ok) {
+    throw new Error(
+      result.reason === "missing"
+        ? `Library ${identity.id} was removed during the switch`
+        : `Library ${identity.id} changed database path during the switch`
+    );
+  }
+  persistRegistry(result.registry);
+}
+
 async function restartCoreForLibrary(
-  dbPath: string,
+  target: LibrarySwitchIdentity,
   signal: AbortSignal,
   generation: number,
-  commitActiveLibrary: (session: CoreSession) => void | Promise<void>,
   operationCancelled?: () => boolean
 ): Promise<CoreSwitchTransactionResult<CoreSession>> {
   const assertLifecycleCurrent = () => assertCurrentCoreGeneration(generation, signal);
   assertLifecycleCurrent();
   pushLibraryPhase("starting-core");
-  const previousRegistry = getRegistry();
+  const registryAtStart = getRegistry();
   const previousSession = coreProcess && coreSession ? coreSession : null;
+  const previousLibrary = previousSession
+    ? registryAtStart.libraries.find(
+        (library) =>
+          library.id === registryAtStart.activeLibraryId &&
+          path.resolve(library.dbPath) === path.resolve(previousSession.dbPath)
+      ) ?? null
+    : null;
+  const previousIdentity = previousLibrary
+    ? { id: previousLibrary.id, dbPath: previousLibrary.dbPath }
+    : null;
   const base = coreSession ?? pendingCoreSession ?? (await createCoreSession());
   assertLifecycleCurrent();
-  const targetSession = sessionForDbPath(base, dbPath, pendingCoreSession);
+  const targetSession = sessionForDbPath(base, target.dbPath, pendingCoreSession);
   let targetReplacement: StartedCoreReplacement | null = null;
   let recoveredReplacement: StartedCoreReplacement | null = null;
   try {
@@ -1883,12 +1957,12 @@ async function restartCoreForLibrary(
         if (!targetReplacement || targetReplacement.session !== healthySession) {
           throw new LifecycleCancelledError("Healthy target Core was lost before commit");
         }
-        await commitStartedCore(targetReplacement, signal, generation, () =>
-          commitActiveLibrary(healthySession)
-        );
+        await commitStartedCore(targetReplacement, signal, generation, () => {
+          activateCurrentRegistryLibrary(target);
+        });
       },
       recoverPreviousCore: async () => {
-        if (!previousSession) {
+        if (!previousSession || !previousIdentity) {
           throw new Error("No previous Core session is available for switch recovery");
         }
         await stopDesktopCoreProcesses();
@@ -1905,11 +1979,17 @@ async function restartCoreForLibrary(
         return previousSession;
       },
       commitPreviousCore: async (restoredSession) => {
+        if (!previousIdentity) {
+          throw new Error("Previous library was not registered when recovery began");
+        }
         if (!recoveredReplacement || recoveredReplacement.session !== restoredSession) {
           throw new LifecycleCancelledError("Recovered previous Core was lost before commit");
         }
         await commitStartedCore(recoveredReplacement, signal, generation, () => {
-          persistRegistry(previousRegistry);
+          activateCurrentRegistryLibrary({
+            id: previousIdentity.id,
+            dbPath: previousIdentity.dbPath
+          });
         });
       }
     });
@@ -1921,7 +2001,19 @@ async function restartCoreForLibrary(
         desktopLogger.warn("main", "[megle] pending Core cleanup failed after library switch; retaining process:", stopError);
       }
     }
-    if (!signal.aborted && !(operationCancelled?.() ?? false)) {
+    if (error instanceof CoreSwitchRecoveryError) {
+      desktopLogger.error(
+        "main",
+        "[megle] library Core recovery failed after switch cancellation or failure:",
+        error
+      );
+      pushLibraryPhase({
+        kind: "error",
+        message: error.systemHealthy
+          ? `Library recovery is incomplete: ${error.message}. Retry or switch library.`
+          : `Library recovery failed and Core is unavailable: ${error.message}. Retry or switch library.`
+      });
+    } else if (!signal.aborted && !(operationCancelled?.() ?? false)) {
       desktopLogger.error("main", "[megle] library Core replacement failed; retaining session metadata for retry:", error);
     }
     throw error;

@@ -15,8 +15,43 @@ export type CoreSwitchPhase =
 
 export type CoreSwitchTransactionResult<TSession> = {
   cancelled: boolean;
+  outcome: "target" | "previous" | "target-fallback";
   session: TSession;
 };
+
+export type CoreSwitchRecoveryStage =
+  | "notification-detach"
+  | "start-or-health"
+  | "commit"
+  | "notification-attach";
+
+export class CoreSwitchRecoveryError extends Error {
+  readonly recoveryStage: CoreSwitchRecoveryStage;
+  readonly systemHealthy: boolean;
+  readonly healthySession: unknown | null;
+  readonly operationError: unknown;
+  readonly recoveryError: unknown;
+
+  constructor(options: {
+    recoveryStage: CoreSwitchRecoveryStage;
+    systemHealthy: boolean;
+    healthySession?: unknown | null;
+    operationError: unknown;
+    recoveryError: unknown;
+  }) {
+    const recoveryMessage =
+      options.recoveryError instanceof Error
+        ? options.recoveryError.message
+        : String(options.recoveryError);
+    super(`Library switch recovery failed during ${options.recoveryStage}: ${recoveryMessage}`);
+    this.name = "CoreSwitchRecoveryError";
+    this.recoveryStage = options.recoveryStage;
+    this.systemHealthy = options.systemHealthy;
+    this.healthySession = options.healthySession ?? null;
+    this.operationError = options.operationError;
+    this.recoveryError = options.recoveryError;
+  }
+}
 
 export interface CoreSwitchTransactionOptions<TSession> {
   previousSession: TSession | null;
@@ -67,38 +102,113 @@ export async function runCoreSwitchTransaction<TSession>(
   let destructive = false;
   let notificationsMayBeDetached = false;
   let recoveryAttempted = false;
+  let targetSession: TSession | null = null;
+  let targetCommitted = false;
+  let targetNotificationsAttached = false;
 
   const enter = (phase: CoreSwitchPhase) => {
     options.onPhase?.(phase);
   };
-  const restorePrevious = async (): Promise<TSession> => {
+  const recoveryFailure = (
+    recoveryStage: CoreSwitchRecoveryStage,
+    operationError: unknown,
+    recoveryError: unknown,
+    systemHealthy = false,
+    healthySession: TSession | null = null
+  ): CoreSwitchRecoveryError =>
+    new CoreSwitchRecoveryError({
+      recoveryStage,
+      systemHealthy,
+      healthySession,
+      operationError,
+      recoveryError
+    });
+  const restorePrevious = async (operationError: unknown): Promise<TSession> => {
     const previousSession = options.previousSession;
     if (previousSession === null) {
-      throw new Error("Core switch cannot recover without a previous session");
+      throw recoveryFailure(
+        "start-or-health",
+        operationError,
+        new Error("Core switch cannot recover without a previous session")
+      );
     }
     recoveryAttempted = true;
     options.assertLifecycleCurrent();
     let restoredSession: TSession = previousSession as TSession;
     if (destructive) {
       enter("recovering-previous");
-      await options.detachNotifications();
+      try {
+        await options.detachNotifications();
+      } catch (error) {
+        throw recoveryFailure("notification-detach", operationError, error);
+      }
       options.assertLifecycleCurrent();
-      restoredSession = await options.recoverPreviousCore();
+      try {
+        restoredSession = await options.recoverPreviousCore();
+      } catch (error) {
+        throw recoveryFailure("start-or-health", operationError, error);
+      }
       options.assertLifecycleCurrent();
-      await options.commitPreviousCore(restoredSession);
+      try {
+        await options.commitPreviousCore(restoredSession);
+      } catch (error) {
+        throw recoveryFailure("commit", operationError, error);
+      }
       options.assertLifecycleCurrent();
     }
-    await options.attachNotifications(restoredSession);
+    try {
+      await options.attachNotifications(restoredSession);
+    } catch (error) {
+      throw recoveryFailure(
+        "notification-attach",
+        operationError,
+        error,
+        true,
+        restoredSession
+      );
+    }
     options.assertLifecycleCurrent();
     enter("previous-recovered");
     return restoredSession;
   };
+  const keepHealthyTarget = async (
+    operationError: unknown
+  ): Promise<CoreSwitchTransactionResult<TSession>> => {
+    if (targetSession === null) {
+      const restoredSession = await restorePrevious(operationError);
+      return { cancelled: true, outcome: "previous", session: restoredSession };
+    }
+    if (!targetCommitted) {
+      try {
+        await options.commitTargetCore(targetSession);
+        targetCommitted = true;
+      } catch (error) {
+        const restoredSession = await restorePrevious(error);
+        return { cancelled: true, outcome: "previous", session: restoredSession };
+      }
+    }
+    if (!targetNotificationsAttached) {
+      try {
+        await options.attachNotifications(targetSession);
+        targetNotificationsAttached = true;
+      } catch (error) {
+        throw recoveryFailure(
+          "notification-attach",
+          operationError,
+          error,
+          true,
+          targetSession
+        );
+      }
+    }
+    return { cancelled: true, outcome: "target-fallback", session: targetSession };
+  };
   const cancelAtSafeBoundary = async (): Promise<CoreSwitchTransactionResult<TSession> | null> => {
     if (!options.isCancellationRequested() || options.previousSession === null) return null;
     if (!destructive && !notificationsMayBeDetached) {
-      return { cancelled: true, session: options.previousSession };
+      return { cancelled: true, outcome: "previous", session: options.previousSession };
     }
-    return { cancelled: true, session: await restorePrevious() };
+    return keepHealthyTarget(new Error("Library switch operation was cancelled"));
   };
 
   enter("initial");
@@ -124,7 +234,7 @@ export async function runCoreSwitchTransaction<TSession>(
     if (cancelledAfterStop) return cancelledAfterStop;
 
     enter("starting-target");
-    const targetSession = await options.startTargetCore();
+    targetSession = await options.startTargetCore();
     options.assertLifecycleCurrent();
     enter("target-started");
     const cancelledAfterStart = await cancelAtSafeBoundary();
@@ -132,31 +242,34 @@ export async function runCoreSwitchTransaction<TSession>(
 
     enter("committing-target");
     await options.commitTargetCore(targetSession);
+    targetCommitted = true;
     options.assertLifecycleCurrent();
     enter("target-committed");
     const cancelledAfterCommit = await cancelAtSafeBoundary();
     if (cancelledAfterCommit) return cancelledAfterCommit;
 
     enter("attaching-target");
-    await options.attachNotifications(targetSession);
+    try {
+      await options.attachNotifications(targetSession);
+      targetNotificationsAttached = true;
+    } catch (error) {
+      throw recoveryFailure("notification-attach", error, error, true, targetSession);
+    }
     options.assertLifecycleCurrent();
     enter("target-attached");
     const cancelledAfterAttach = await cancelAtSafeBoundary();
     if (cancelledAfterAttach) return cancelledAfterAttach;
-    return { cancelled: false, session: targetSession };
+    return { cancelled: false, outcome: "target", session: targetSession };
   } catch (error) {
+    if (error instanceof CoreSwitchRecoveryError) throw error;
     if (
       options.previousSession !== null &&
       !recoveryAttempted &&
       (destructive || notificationsMayBeDetached)
     ) {
-      try {
-        await restorePrevious();
-      } catch (recoveryError) {
-        throw new AggregateError(
-          [error, recoveryError],
-          "Core switch failed and the previous library could not be restored"
-        );
+      const restoredSession = await restorePrevious(error);
+      if (options.isCancellationRequested()) {
+        return { cancelled: true, outcome: "previous", session: restoredSession };
       }
     }
     throw error;

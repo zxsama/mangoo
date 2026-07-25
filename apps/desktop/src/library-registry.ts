@@ -18,6 +18,14 @@ export interface LibraryRegistry {
   libraries: LibraryEntry[];
 }
 
+export type ActivateLibraryResult =
+  | { ok: true; registry: LibraryRegistry; entry: LibraryEntry }
+  | {
+      ok: false;
+      reason: "missing" | "db-path-changed";
+      registry: LibraryRegistry;
+    };
+
 const EMPTY: LibraryRegistry = { activeLibraryId: null, libraries: [] };
 
 export function registryFilePath(userDataDir: string): string {
@@ -80,6 +88,23 @@ export function setActive(registry: LibraryRegistry, id: string, now: number): L
   return {
     activeLibraryId: id,
     libraries: registry.libraries.map((l) => (l.id === id ? { ...l, lastOpenedAt: now } : l))
+  };
+}
+
+export function activateLibraryIfCurrent(
+  registry: LibraryRegistry,
+  expected: { id: string; dbPath: string; now: number }
+): ActivateLibraryResult {
+  const entry = registry.libraries.find((library) => library.id === expected.id);
+  if (!entry) return { ok: false, reason: "missing", registry };
+  if (path.resolve(entry.dbPath) !== path.resolve(expected.dbPath)) {
+    return { ok: false, reason: "db-path-changed", registry };
+  }
+  const next = setActive(registry, expected.id, expected.now);
+  return {
+    ok: true,
+    registry: next,
+    entry: next.libraries.find((library) => library.id === expected.id) ?? entry
   };
 }
 
