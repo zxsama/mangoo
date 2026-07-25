@@ -40,7 +40,9 @@ import {
   buildWindowedMediaGeometry,
   buildWindowedMediaVirtualizationPlan,
   resolveMediaGeometryStrategy,
+  resolveWindowedMediaScrollCoordinates,
   stableWindowedAspectRatio,
+  windowedPhysicalScrollTopForLogicalMediaScroll,
   type WindowedMediaPlacement
 } from "./windowedMediaGeometry.ts";
 
@@ -619,7 +621,12 @@ export function MediaGrid({
           )
         );
         scrollPersistenceUnlockedRef.current = true;
-        element.scrollTop = mediaOffset + centeredMediaScrollTop;
+        element.scrollTop = windowedPhysicalScrollTopForLogicalMediaScroll({
+          geometry: mediaWindow,
+          logicalMediaScrollTop: centeredMediaScrollTop,
+          mediaOffset,
+          viewportHeight: element.clientHeight
+        });
       } else {
         virtualRows.scrollToIndex(virtualSegmentIndex, { align: "center" });
       }
@@ -725,7 +732,14 @@ export function MediaGrid({
     };
     frame = window.requestAnimationFrame(() => {
       if (exactPlacement) {
-        const currentMediaScrollTop = Math.max(0, element.scrollTop - mediaOffset);
+        const currentMediaScrollTop = windowedMedia
+          ? resolveWindowedMediaScrollCoordinates({
+              geometry: mediaWindow,
+              mediaOffset,
+              scrollTop: element.scrollTop,
+              viewportHeight: element.clientHeight
+            }).logicalMediaScrollTop
+          : Math.max(0, element.scrollTop - mediaOffset);
         const targetMediaScrollTop = resolveScrollTopForPlacement(
           exactPlacement,
           element.clientHeight,
@@ -733,7 +747,14 @@ export function MediaGrid({
           windowedMedia ? mediaWindow.totalSize : layout.totalSize
         );
         scrollPersistenceUnlockedRef.current = true;
-        element.scrollTop = mediaOffset + targetMediaScrollTop;
+        element.scrollTop = windowedMedia
+          ? windowedPhysicalScrollTopForLogicalMediaScroll({
+              geometry: mediaWindow,
+              logicalMediaScrollTop: targetMediaScrollTop,
+              mediaOffset,
+              viewportHeight: element.clientHeight
+            })
+          : mediaOffset + targetMediaScrollTop;
       } else {
         virtualRows.scrollToIndex(virtualSegmentIndex, { align: "center" });
       }
@@ -825,10 +846,12 @@ export function MediaGrid({
     };
   }, [folderSection?.itemCount, mediaItemCount, savedScrollTop, scrollPositionKey]);
 
-  const mediaScrollTop = Math.max(0, scrollTop - mediaOffset);
+  const mediaScrollTop = windowedMedia
+    ? windowedVirtualization.logicalMediaScrollTop
+    : Math.max(0, scrollTop - mediaOffset);
   const visibleRangeEnd = Math.max(
     0,
-    scrollTop + Math.max(viewportSize.height, activeMediaEstimatedSegmentSize) - mediaOffset
+    mediaScrollTop + Math.max(viewportSize.height, activeMediaEstimatedSegmentSize)
   );
   const visibleMediaWindow = useMemo(() => {
     if (!windowedMedia) return null;
@@ -1393,12 +1416,24 @@ export function MediaGrid({
     }
     const placement = mediaWindow.resolvePlacement(clampedIndex);
     if (!placement) return;
-    const nextScrollTop = mediaOffset + resolveScrollTopForPlacement(
+    const currentMediaScrollTop = resolveWindowedMediaScrollCoordinates({
+      geometry: mediaWindow,
+      mediaOffset,
+      scrollTop: element.scrollTop,
+      viewportHeight: element.clientHeight
+    }).logicalMediaScrollTop;
+    const logicalScrollTop = resolveScrollTopForPlacement(
       placement,
       element.clientHeight,
-      Math.max(0, element.scrollTop - mediaOffset),
+      currentMediaScrollTop,
       mediaWindow.totalSize
     );
+    const nextScrollTop = windowedPhysicalScrollTopForLogicalMediaScroll({
+      geometry: mediaWindow,
+      logicalMediaScrollTop: logicalScrollTop,
+      mediaOffset,
+      viewportHeight: element.clientHeight
+    });
     if (nextScrollTop !== element.scrollTop) {
       scrollPersistenceUnlockedRef.current = true;
       element.scrollTop = nextScrollTop;
@@ -1551,7 +1586,7 @@ export function MediaGrid({
                 height: placement.height,
                 left: placement.left,
                 position: "absolute",
-                top: mediaOffset + placement.top,
+                top: windowedVirtualization.mediaRenderOffset + placement.top,
                 width: placement.width
               }}
             >

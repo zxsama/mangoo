@@ -10,6 +10,10 @@ const WATERFALL_BAND_SCALE = 0.9;
 const RATIO_PATTERN = [0.72, 1.08, 1.42, 0.86, 1.76, 1.18, 0.64, 1.55] as const;
 const WINDOWED_MEDIA_COUNT_THRESHOLD = 1_000;
 const JUSTIFIED_FULL_TOTAL_MAX_ITEMS = 20_000;
+// Chromium stops growing CSS layout boxes at roughly 33.5 million pixels.
+// Stay comfortably below that ceiling and map the full logical media height
+// onto this bounded physical scroll range instead of clamping away the tail.
+export const WINDOWED_MEDIA_PHYSICAL_SPACER_LIMIT_PX = 16_000_000;
 
 export function resolveMediaGeometryStrategy({
   hasMediaSlots,
@@ -66,9 +70,77 @@ export interface WindowedMediaGeometry {
 }
 
 export interface WindowedMediaVirtualizationPlan {
+  logicalMediaScrollTop: number;
+  mediaRenderOffset: number;
   mediaSegmentIndexes: number[];
   spacerSize: number;
   virtualizerCount: number;
+}
+
+export interface WindowedMediaScrollCoordinates {
+  logicalMediaScrollTop: number;
+  mediaRenderOffset: number;
+  physicalMediaScrollTop: number;
+  spacerSize: number;
+}
+
+export function resolveWindowedMediaScrollCoordinates({
+  geometry,
+  mediaOffset,
+  scrollTop,
+  viewportHeight
+}: {
+  geometry: WindowedMediaGeometry;
+  mediaOffset: number;
+  scrollTop: number;
+  viewportHeight: number;
+}): WindowedMediaScrollCoordinates {
+  const offset = Math.max(0, mediaOffset);
+  const viewport = Math.max(0, viewportHeight);
+  const physicalMediaExtent = Math.min(
+    geometry.totalSize,
+    Math.max(0, WINDOWED_MEDIA_PHYSICAL_SPACER_LIMIT_PX - offset)
+  );
+  const spacerSize = offset + physicalMediaExtent;
+  const physicalRange = Math.max(0, physicalMediaExtent - viewport);
+  const logicalRange = Math.max(0, geometry.totalSize - viewport);
+  const physicalMediaScrollTop = clamp(scrollTop - offset, 0, physicalRange);
+  const logicalMediaScrollTop = physicalRange > 0
+    ? physicalMediaScrollTop * logicalRange / physicalRange
+    : 0;
+
+  return {
+    logicalMediaScrollTop,
+    // Keep tile dimensions and local distances unscaled. Only their absolute
+    // origin is rebased into the browser-safe physical coordinate window.
+    mediaRenderOffset: offset + physicalMediaScrollTop - logicalMediaScrollTop,
+    physicalMediaScrollTop,
+    spacerSize
+  };
+}
+
+export function windowedPhysicalScrollTopForLogicalMediaScroll({
+  geometry,
+  logicalMediaScrollTop,
+  mediaOffset,
+  viewportHeight
+}: {
+  geometry: WindowedMediaGeometry;
+  logicalMediaScrollTop: number;
+  mediaOffset: number;
+  viewportHeight: number;
+}): number {
+  const offset = Math.max(0, mediaOffset);
+  const viewport = Math.max(0, viewportHeight);
+  const physicalMediaExtent = Math.min(
+    geometry.totalSize,
+    Math.max(0, WINDOWED_MEDIA_PHYSICAL_SPACER_LIMIT_PX - offset)
+  );
+  const physicalRange = Math.max(0, physicalMediaExtent - viewport);
+  const logicalRange = Math.max(0, geometry.totalSize - viewport);
+  const logical = clamp(logicalMediaScrollTop, 0, logicalRange);
+  const physical = logicalRange > 0 ? logical * physicalRange / logicalRange : 0;
+  return offset + physical;
 }
 
 export function buildWindowedMediaVirtualizationPlan({
@@ -86,10 +158,16 @@ export function buildWindowedMediaVirtualizationPlan({
   scrollTop: number;
   viewportHeight: number;
 }): WindowedMediaVirtualizationPlan {
-  const rangeStart = Math.max(0, scrollTop - mediaOffset);
+  const coordinates = resolveWindowedMediaScrollCoordinates({
+    geometry,
+    mediaOffset,
+    scrollTop,
+    viewportHeight
+  });
+  const rangeStart = coordinates.logicalMediaScrollTop;
   const rangeEnd = Math.min(
     geometry.totalSize,
-    Math.max(rangeStart, scrollTop + Math.max(0, viewportHeight) - mediaOffset)
+    rangeStart + Math.max(0, viewportHeight)
   );
   const visibleStart = firstIntersectingSegment(geometry, rangeStart);
   const visibleEnd = firstSegmentStartingAtOrAfter(geometry, rangeEnd);
@@ -98,8 +176,10 @@ export function buildWindowedMediaVirtualizationPlan({
   const end = Math.min(geometry.segmentCount, Math.max(visibleStart, visibleEnd) + overscan);
 
   return {
+    logicalMediaScrollTop: coordinates.logicalMediaScrollTop,
+    mediaRenderOffset: coordinates.mediaRenderOffset,
     mediaSegmentIndexes: sequentialIndexes(start, end),
-    spacerSize: Math.max(0, mediaOffset) + geometry.totalSize,
+    spacerSize: coordinates.spacerSize,
     virtualizerCount: Math.max(0, Math.floor(prefixVirtualRowCount))
   };
 }

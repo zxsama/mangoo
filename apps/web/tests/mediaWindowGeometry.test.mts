@@ -4,7 +4,9 @@ import { describe, it } from "node:test";
 
 import {
   buildWindowedMediaGeometry,
-  resolveMediaGeometryStrategy
+  resolveMediaGeometryStrategy,
+  windowedPhysicalScrollTopForLogicalMediaScroll,
+  WINDOWED_MEDIA_PHYSICAL_SPACER_LIMIT_PX
 } from "../src/features/media-grid/windowedMediaGeometry.ts";
 import * as windowedMediaGeometry from "../src/features/media-grid/windowedMediaGeometry.ts";
 
@@ -16,10 +18,32 @@ type WindowedVirtualizationPlanBuilder = (input: {
   scrollTop: number;
   viewportHeight: number;
 }) => {
+  logicalMediaScrollTop: number;
+  mediaRenderOffset: number;
   mediaSegmentIndexes: number[];
   spacerSize: number;
   virtualizerCount: number;
 };
+
+const SAFE_BROWSER_SPACER_PX = WINDOWED_MEDIA_PHYSICAL_SPACER_LIMIT_PX;
+
+function compressedScrollTopForLogicalPosition(input: {
+  logicalMediaScrollTop: number;
+  mediaOffset: number;
+  logicalTotalSize: number;
+  viewportHeight: number;
+}) {
+  const physicalMediaExtent = Math.min(
+    input.logicalTotalSize,
+    SAFE_BROWSER_SPACER_PX - input.mediaOffset
+  );
+  const physicalRange = Math.max(0, physicalMediaExtent - input.viewportHeight);
+  const logicalRange = Math.max(0, input.logicalTotalSize - input.viewportHeight);
+  const progress = logicalRange === 0
+    ? 0
+    : Math.max(0, Math.min(1, input.logicalMediaScrollTop / logicalRange));
+  return input.mediaOffset + progress * physicalRange;
+}
 
 function virtualizationPlanBuilder(): WindowedVirtualizationPlanBuilder {
   const builder = Reflect.get(windowedMediaGeometry, "buildWindowedMediaVirtualizationPlan");
@@ -123,21 +147,87 @@ describe("windowed adaptive and waterfall geometry", () => {
       assert.ok(deepPlacement);
 
       const startedAt = performance.now();
+      const viewportHeight = 800;
       const plan = buildPlan({
         geometry,
         mediaOffset: 72,
         overscanSegments: 10,
         prefixVirtualRowCount: 3,
-        scrollTop: 72 + deepPlacement.top,
-        viewportHeight: 800
+        scrollTop: windowedPhysicalScrollTopForLogicalMediaScroll({
+          geometry,
+          logicalMediaScrollTop: deepPlacement.top,
+          mediaOffset: 72,
+          viewportHeight
+        }),
+        viewportHeight
       });
       const durationMs = performance.now() - startedAt;
 
       assert.equal(plan.virtualizerCount, 3, "TanStack may measure only the bounded prefix rows");
-      assert.equal(plan.spacerSize, 72 + geometry.totalSize);
+      assert.equal(plan.spacerSize, Math.min(72 + geometry.totalSize, SAFE_BROWSER_SPACER_PX));
       assert.ok(plan.mediaSegmentIndexes.length > 0);
       assert.ok(plan.mediaSegmentIndexes.length < 64, "rendered media segments must stay viewport-bounded");
       assert.ok(durationMs < 50, `${layoutMode} virtual range took ${durationMs}ms`);
+    }
+  });
+
+  it("keeps the first, middle, and tail reachable below the browser layout-height ceiling", () => {
+    const buildPlan = virtualizationPlanBuilder();
+    for (const layoutMode of ["adaptive", "waterfall"] as const) {
+      for (const viewport of [
+        { height: 640, width: 760 },
+        { height: 1080, width: 1000 }
+      ]) {
+        const geometry = buildWindowedMediaGeometry({
+          count: 1_000_000,
+          gap: 8,
+          labelHeight: 36,
+          layoutMode,
+          tileMinWidth: 180,
+          viewportWidth: viewport.width
+        });
+        assert.ok(
+          geometry.totalSize > 33_554_428,
+          `${layoutMode}/${viewport.width} must exercise Chromium's oversized-layout branch`
+        );
+
+        const mediaOffset = 72;
+        for (const targetIndex of [0, 500_000, 999_999]) {
+          const placement = geometry.resolvePlacement(targetIndex);
+          const targetSegment = geometry.segmentIndexForItem(targetIndex);
+          assert.ok(placement && targetSegment !== undefined);
+          const logicalMediaScrollTop = Math.max(
+            0,
+            Math.min(
+              geometry.totalSize - viewport.height,
+              placement.top + placement.frameHeight / 2 - viewport.height / 2
+            )
+          );
+          const physicalScrollTop = compressedScrollTopForLogicalPosition({
+            logicalMediaScrollTop,
+            logicalTotalSize: geometry.totalSize,
+            mediaOffset,
+            viewportHeight: viewport.height
+          });
+          const plan = buildPlan({
+            geometry,
+            mediaOffset,
+            overscanSegments: 10,
+            prefixVirtualRowCount: 3,
+            scrollTop: physicalScrollTop,
+            viewportHeight: viewport.height
+          });
+
+          assert.ok(plan.spacerSize <= SAFE_BROWSER_SPACER_PX);
+          assert.ok(plan.mediaSegmentIndexes.includes(targetSegment));
+          assert.ok(plan.mediaSegmentIndexes.length < 64, "the physical range must stay O(viewport)");
+          assert.ok(Number.isFinite(plan.logicalMediaScrollTop));
+          assert.ok(Number.isFinite(plan.mediaRenderOffset));
+          const renderedTop = plan.mediaRenderOffset + placement.top;
+          assert.ok(renderedTop + placement.height > physicalScrollTop);
+          assert.ok(renderedTop < physicalScrollTop + viewport.height);
+        }
+      }
     }
   });
 
@@ -164,15 +254,21 @@ describe("windowed adaptive and waterfall geometry", () => {
       assert.notEqual(geometry960.totalSize, geometry1000.totalSize);
 
       const deepStart = Math.floor(geometry1000.totalSize * 0.9);
+      const viewportHeight = 900;
       const plan = buildPlan({
         geometry: geometry1000,
         mediaOffset: 64,
         overscanSegments: 8,
         prefixVirtualRowCount: 2,
-        scrollTop: 64 + deepStart,
-        viewportHeight: 900
+        scrollTop: windowedPhysicalScrollTopForLogicalMediaScroll({
+          geometry: geometry1000,
+          logicalMediaScrollTop: deepStart,
+          mediaOffset: 64,
+          viewportHeight
+        }),
+        viewportHeight
       });
-      assert.equal(plan.spacerSize, 64 + geometry1000.totalSize);
+      assert.equal(plan.spacerSize, Math.min(64 + geometry1000.totalSize, SAFE_BROWSER_SPACER_PX));
       assert.ok(plan.mediaSegmentIndexes.length > 0);
 
       const first = geometry1000.resolveSegment(plan.mediaSegmentIndexes[0]!);
@@ -202,5 +298,7 @@ describe("windowed adaptive and waterfall geometry", () => {
     assert.match(source, /count:\s*windowedMedia\s*\?\s*windowedVirtualization\.virtualizerCount/);
     assert.match(source, /windowedMedia\s*\?\s*windowedVirtualization\.mediaSegmentIndexes/);
     assert.match(source, /windowedMedia\s*\?\s*windowedVirtualization\.spacerSize/);
+    assert.match(source, /top:\s*windowedVirtualization\.mediaRenderOffset\s*\+\s*placement\.top/);
+    assert.match(source, /windowedPhysicalScrollTopForLogicalMediaScroll/);
   });
 });
