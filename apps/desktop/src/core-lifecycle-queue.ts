@@ -1,6 +1,7 @@
 export type CoreLifecycleTask<T> = (signal: AbortSignal) => T | Promise<T>;
 export type CoreLifecycleEnqueueOptions = {
   readonly signal?: AbortSignal;
+  readonly activeCancellation?: "abort" | "defer";
 };
 
 export class LifecycleCancelledError extends Error {
@@ -105,13 +106,15 @@ export class CoreLifecycleQueue {
       const externalSignal = options.signal;
       if (externalSignal) {
         const abort = () => {
-          item.controller.abort(externalSignal.reason);
           const queuedIndex = this.pending.indexOf(item as QueueItem<unknown>);
           if (queuedIndex >= 0) {
+            item.controller.abort(externalSignal.reason);
             this.pending.splice(queuedIndex, 1);
             item.detachExternalAbort();
             item.reject(new LifecycleCancelledError("Core lifecycle operation externally cancelled"));
             this.drain();
+          } else if (options.activeCancellation !== "defer") {
+            item.controller.abort(externalSignal.reason);
           }
         };
         externalSignal.addEventListener("abort", abort, { once: true });

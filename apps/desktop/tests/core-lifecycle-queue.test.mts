@@ -135,6 +135,27 @@ test("active external cancellation blocks late commit and keeps retry serialized
   assert.equal(maxActiveSwitches, 1);
 });
 
+test("deferred active cancellation leaves the lifecycle signal alive until transaction recovery", async () => {
+  const queue = new CoreLifecycleQueue();
+  const operation = new AbortController();
+  const started = deferred();
+  const recovery = deferred();
+  let lifecycleAborted = false;
+
+  const switching = queue.enqueue(async (signal) => {
+    started.resolve();
+    await recovery.promise;
+    lifecycleAborted = signal.aborted;
+    return "recovered";
+  }, { signal: operation.signal, activeCancellation: "defer" });
+  await started.promise;
+  operation.abort(new DOMException("focus obsolete", "AbortError"));
+  recovery.resolve();
+
+  assert.equal(await switching, "recovered");
+  assert.equal(lifecycleAborted, false);
+});
+
 test("queued secondary open rechecks a completed switch and reuses its only child", async () => {
   const queue = new CoreLifecycleQueue();
   const switchStarted = deferred();

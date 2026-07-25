@@ -613,14 +613,12 @@ if (!/run\(\s*findCargoCommand\(\)\s*,\s*\[\s*"build"\s*,\s*"-p"\s*,\s*"megle-co
 }
 
 // Core is started from exactly two call sites: the initial cold-start/retry
-// loop in startCoreSession, and the library-switch restart routine in
-// restartCoreForLibrary (which stops the old process and reuses the same
-// bind address + session token per spec Decision 6). Any other count means a
-// stray/duplicate startup path snuck in.
+// loop and the shared healthy-replacement helper used by target and recovery
+// transactions. Any other count means a stray/duplicate startup path snuck in.
 const startCoreCalls = [...main.matchAll(/\bstartCoreProcess\(/g)].length;
 if (startCoreCalls !== 2) {
   fail(
-    `desktop main must start Core from exactly two call sites (startCoreSession + restartCoreForLibrary); found ${startCoreCalls} calls`
+    `desktop main must start Core from exactly two call sites (cold start + healthy replacement); found ${startCoreCalls} calls`
   );
 }
 if (processFile.includes('process.stdout.write("[core stdout] ")') || processFile.includes('process.stderr.write("[core stderr] ")')) {
@@ -637,8 +635,11 @@ const restartCoreForLibraryBody = functionBody(
 if (!restartCoreForLibraryBody) {
   fail("desktop main must expose restartCoreForLibrary to restart Core for a library switch");
 } else {
-  if (!restartCoreForLibraryBody.includes("startCoreProcess(")) {
-    fail("desktop main restartCoreForLibrary must start a new Core process for the target library");
+  if (!restartCoreForLibraryBody.includes("runCoreSwitchTransaction(")) {
+    fail("desktop main restartCoreForLibrary must use the recoverable Core switch transaction");
+  }
+  if (!restartCoreForLibraryBody.includes("startHealthyReplacementCore(")) {
+    fail("desktop main restartCoreForLibrary must start target and recovery Core processes through the healthy replacement helper");
   }
   if (!restartCoreForLibraryBody.includes("waitForPortFree(")) {
     fail("desktop main restartCoreForLibrary must wait for the old Core's port to free before rebinding");
@@ -646,7 +647,7 @@ if (!restartCoreForLibraryBody) {
   if (!restartCoreForLibraryBody.includes("sessionForDbPath(")) {
     fail("desktop main restartCoreForLibrary must reuse the existing bind address/session token via sessionForDbPath");
   }
-  for (const value of ["pendingCoreSession", "assertCurrentCoreGeneration(generation, signal)", "pendingCoreSession = null"]) {
+  for (const value of ["pendingCoreSession", "assertCurrentCoreGeneration(generation, signal)"]) {
     if (!restartCoreForLibraryBody.includes(value)) {
       fail(`desktop main restartCoreForLibrary must preserve candidate session lifecycle state: ${value}`);
     }
@@ -654,13 +655,23 @@ if (!restartCoreForLibraryBody) {
   if (restartCoreForLibraryBody.includes("coreSession = null")) {
     fail("desktop main must retain the last-known coreSession while a library candidate is unhealthy");
   }
-  const processCommitIndex = restartCoreForLibraryBody.indexOf("coreProcess = handle");
-  const generationFenceIndex = restartCoreForLibraryBody.lastIndexOf(
+}
+const commitStartedCoreBody = functionBody(main, "async function commitStartedCore(");
+if (!commitStartedCoreBody) {
+  fail("desktop main must centralize Core handle/session commits");
+} else {
+  for (const value of ["coreProcess = replacement.handle", "pendingCoreProcess = null", "pendingCoreSession = null"]) {
+    if (!commitStartedCoreBody.includes(value)) {
+      fail(`desktop Core commit helper must atomically publish replacement state: ${value}`);
+    }
+  }
+  const processCommitIndex = commitStartedCoreBody.indexOf("coreProcess = replacement.handle");
+  const generationFenceIndex = commitStartedCoreBody.lastIndexOf(
     "assertCurrentCoreGeneration(generation, signal)",
     processCommitIndex
   );
   if (processCommitIndex === -1 || generationFenceIndex === -1) {
-    fail("desktop library restart must compare lifecycle generation before committing its Core handle");
+    fail("desktop Core commit helper must compare lifecycle generation before committing its handle");
   }
 }
 if (!main.includes("ensureCoreReady")) {

@@ -35,6 +35,11 @@ import {
   LifecycleCancelledError,
   throwIfLifecycleAborted
 } from "./core-lifecycle-queue.js";
+import {
+  runCoreSwitchTransaction,
+  startHealthyCoreWithRetry,
+  type CoreSwitchTransactionResult
+} from "./core-switch-transaction.js";
 import * as libraryRegistry from "./library-registry.js";
 import { sessionForDbPath } from "./core-session.js";
 import {
@@ -957,24 +962,27 @@ ipcMain.handle("megle:switch-library", async (
   }
   try {
     return await coreLifecycleQueue.enqueue(async (signal) => {
-      const refreshOperation = () => {
-        if (operationId && !mediaFocusCoordinator.refreshSwitching(operationId)) {
-          throw new LifecycleCancelledError("Media focus library switch is no longer active");
-        }
+      const operationCancelled = () => {
+        if (!operationId) return false;
+        return Boolean(
+          operationSignal?.aborted ||
+            !mediaFocusCoordinator.refreshSwitching(operationId)
+        );
       };
-      refreshOperation();
       const generation = coreLifecycleQueue.beginGeneration();
       const reg = getRegistry();
       const target = reg.libraries.find((l) => l.id === libraryId);
       if (!target) return { ok: false, error: "library not found" };
       if (!fsSync.existsSync(target.dbPath)) return { ok: false, error: "library file missing" };
-      await restartCoreForLibrary(target.dbPath, signal, generation, () => {
+      const switchResult = await restartCoreForLibrary(target.dbPath, signal, generation, () => {
         persistRegistry(libraryRegistry.setActive(reg, libraryId, Date.now()));
-      }, refreshOperation);
-      refreshOperation();
+      }, operationCancelled);
       pushLibraryPhase("loading-media"); // renderer takes over from here
+      if (switchResult.cancelled) {
+        return { ok: false, error: "media focus operation was cancelled" };
+      }
       return { ok: true };
-    }, { signal: operationSignal });
+    }, { signal: operationSignal, activeCancellation: "defer" });
   } catch (error) {
     if (!(error instanceof LifecycleCancelledError) && !operationSignal?.aborted) {
       pushLibraryPhase({ kind: "error", message: String(error) });
@@ -1750,129 +1758,170 @@ async function stopDesktopCoreProcesses(): Promise<void> {
   );
 }
 
+type StartedCoreReplacement = {
+  handle: CoreProcessHandle;
+  session: CoreSession;
+};
+
+async function startHealthyReplacementCore(
+  session: CoreSession,
+  signal: AbortSignal,
+  generation: number,
+  label: "target" | "recovery"
+): Promise<StartedCoreReplacement> {
+  const maxAttempts = shouldRetryAutoCoreStartup() ? AUTO_CORE_STARTUP_MAX_ATTEMPTS : 1;
+  let attemptHandle: CoreProcessHandle | null = null;
+  return startHealthyCoreWithRetry({
+    maxAttempts,
+    assertLifecycleCurrent: () => assertCurrentCoreGeneration(generation, signal),
+    start: async (attempt) => {
+      assertCurrentCoreGeneration(generation, signal);
+      attemptHandle = startCoreProcess(session, coreLogHandlerForSession(session));
+      pendingCoreProcess = attemptHandle;
+      pendingCoreSession = session;
+      if (attempt === 1) pushLibraryPhase("opening-library");
+      await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
+      assertCurrentCoreGeneration(generation, signal);
+      if (coreProcess && coreProcess !== attemptHandle) {
+        throw new LifecycleCancelledError(
+          "A newer Core process was committed before library replacement completed"
+        );
+      }
+      if (attempt > 1) {
+        desktopLogger.info(
+          "main",
+          `[megle] ${label} library Core became healthy on attempt ${attempt}/${maxAttempts}`
+        );
+      }
+      return { handle: attemptHandle, session };
+    },
+    cleanupFailedAttempt: async () => {
+      if (attemptHandle && pendingCoreProcess === attemptHandle) {
+        await stopPendingCoreProcess();
+      }
+      attemptHandle = null;
+      if (!signal.aborted && coreLifecycleQueue.isCurrentGeneration(generation)) {
+        await waitForPortFree(session.bindAddress, signal);
+      }
+    },
+    onRetry: (attempt, error) => {
+      desktopLogger.warn(
+        "main",
+        `[megle] ${label} library Core health attempt ${attempt}/${maxAttempts} failed; retrying:`,
+        error
+      );
+    }
+  });
+}
+
+async function commitStartedCore(
+  replacement: StartedCoreReplacement,
+  signal: AbortSignal,
+  generation: number,
+  commitRegistry: () => void | Promise<void>
+): Promise<void> {
+  assertCurrentCoreGeneration(generation, signal);
+  if (pendingCoreProcess !== replacement.handle) {
+    throw new LifecycleCancelledError("Candidate Core changed before library commit");
+  }
+  await commitRegistry();
+  assertCurrentCoreGeneration(generation, signal);
+  if (pendingCoreProcess !== replacement.handle) {
+    throw new LifecycleCancelledError("Candidate Core changed while committing the library");
+  }
+  coreProcess = replacement.handle;
+  pendingCoreProcess = null;
+  coreSession = replacement.session;
+  pendingCoreSession = null;
+}
+
 async function restartCoreForLibrary(
   dbPath: string,
   signal: AbortSignal,
   generation: number,
   commitActiveLibrary: (session: CoreSession) => void | Promise<void>,
-  refreshOperation?: () => void
-): Promise<CoreSession> {
-  const assertCurrent = () => {
-    assertCurrentCoreGeneration(generation, signal);
-    refreshOperation?.();
-    assertCurrentCoreGeneration(generation, signal);
-  };
-  assertCurrent();
+  operationCancelled?: () => boolean
+): Promise<CoreSwitchTransactionResult<CoreSession>> {
+  const assertLifecycleCurrent = () => assertCurrentCoreGeneration(generation, signal);
+  assertLifecycleCurrent();
   pushLibraryPhase("starting-core");
+  const previousRegistry = getRegistry();
+  const previousSession = coreProcess && coreSession ? coreSession : null;
   const base = coreSession ?? pendingCoreSession ?? (await createCoreSession());
-  assertCurrent();
-  const session = sessionForDbPath(base, dbPath, pendingCoreSession);
-  // Keep both the last-known renderer session and the candidate session until
-  // the replacement Core is healthy. The renderer keeps using baseUrl/token
-  // throughout this transaction, while the candidate is reusable on retry.
-  pendingCoreSession = session;
-  let handle: CoreProcessHandle | null = null;
+  assertLifecycleCurrent();
+  const targetSession = sessionForDbPath(base, dbPath, pendingCoreSession);
+  let targetReplacement: StartedCoreReplacement | null = null;
+  let recoveredReplacement: StartedCoreReplacement | null = null;
   try {
-    return await runNotificationSafeCoreTransition({
-      assertCurrent,
+    return await runCoreSwitchTransaction({
+      previousSession,
+      assertLifecycleCurrent,
+      isCancellationRequested: () => operationCancelled?.() ?? false,
       detachNotifications: detachNotificationServiceForCoreReplacement,
-      stopOldCore: async () => {
-        // Stop a failed pending Core before the active Core and wait for the port to free up.
+      attachNotifications: (session) =>
+        attachNotificationServiceForSession(session, generation, signal),
+      stopCurrentCore: async () => {
         await stopDesktopCoreProcesses();
-        assertCurrent();
+        assertLifecycleCurrent();
         await waitForPortFree(base.bindAddress, signal);
-        assertCurrent();
+        assertLifecycleCurrent();
         if (coreProcess) {
           throw new LifecycleCancelledError("Tracked Core changed before library restart");
         }
       },
-      startHealthyCore: async () => {
-        // Bounded spawn-retry, mirroring cold-start `startCoreSession`. A single
-        // spawn occasionally fails to become healthy (e.g. the just-stopped old
-        // Core's socket lingers and the new Core loses the bind race, exiting
-        // before it serves). Cold start silently recovers from this via retry;
-        // the switch path used to do a single attempt, so one lost race surfaced
-        // as a hard "Core did not become healthy" switch failure. Retrying here
-        // makes a library switch as robust as a cold start.
-        const maxAttempts = shouldRetryAutoCoreStartup() ? AUTO_CORE_STARTUP_MAX_ATTEMPTS : 1;
-        let lastError: unknown;
-        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-          assertCurrent();
-          handle = startCoreProcess(session, coreLogHandlerForSession(session));
-          pendingCoreProcess = handle;
-          if (attempt === 1) pushLibraryPhase("opening-library");
-          try {
-            await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
-            assertCurrent();
-            if (coreProcess && coreProcess !== handle) {
-              throw new LifecycleCancelledError(
-                "A newer Core process was committed before library restart completed"
-              );
-            }
-            if (attempt > 1) {
-              desktopLogger.info(
-                "main",
-                `[megle] library Core became healthy on attempt ${attempt}/${maxAttempts}`
-              );
-            }
-            return session;
-          } catch (error) {
-            // A lifecycle cancel (newer generation / shutdown) is terminal — do
-            // not retry, the switch has been superseded.
-            if (signal.aborted || !coreLifecycleQueue.isCurrentGeneration(generation)) {
-              throw error;
-            }
-            lastError = error;
-            // Stop the unhealthy candidate and free its port before respawning.
-            try {
-              await stopPendingCoreProcess();
-            } catch (stopError) {
-              // The dead child may still own the bind port; without freeing it a
-              // respawn would just lose the bind again. Surface the original
-              // failure rather than spinning.
-              desktopLogger.warn(
-                "main",
-                "[megle] unhealthy candidate Core cleanup failed during switch retry:",
-                stopError
-              );
-              throw error;
-            }
-            if (attempt < maxAttempts) {
-              desktopLogger.warn(
-                "main",
-                `[megle] library Core health attempt ${attempt}/${maxAttempts} failed; retrying:`,
-                error
-              );
-              await waitForPortFree(base.bindAddress, signal);
-            }
-          }
-        }
-        throw lastError ?? new Error("library Core did not become healthy");
+      startTargetCore: async () => {
+        pendingCoreSession = targetSession;
+        targetReplacement = await startHealthyReplacementCore(
+          targetSession,
+          signal,
+          generation,
+          "target"
+        );
+        return targetSession;
       },
-      commitActiveLibrary: async (healthySession) => {
-        assertCurrent();
-        await commitActiveLibrary(healthySession);
-        assertCurrent();
-        if (!handle || pendingCoreProcess !== handle) {
-          throw new LifecycleCancelledError("Candidate Core changed before library commit");
+      commitTargetCore: async (healthySession) => {
+        if (!targetReplacement || targetReplacement.session !== healthySession) {
+          throw new LifecycleCancelledError("Healthy target Core was lost before commit");
         }
-        coreProcess = handle;
-        pendingCoreProcess = null;
-        coreSession = healthySession;
-        pendingCoreSession = null;
+        await commitStartedCore(targetReplacement, signal, generation, () =>
+          commitActiveLibrary(healthySession)
+        );
       },
-      attachNotifications: (healthySession) =>
-        attachNotificationServiceForSession(healthySession, generation, signal)
+      recoverPreviousCore: async () => {
+        if (!previousSession) {
+          throw new Error("No previous Core session is available for switch recovery");
+        }
+        await stopDesktopCoreProcesses();
+        assertLifecycleCurrent();
+        await waitForPortFree(base.bindAddress, signal);
+        assertLifecycleCurrent();
+        pendingCoreSession = previousSession;
+        recoveredReplacement = await startHealthyReplacementCore(
+          previousSession,
+          signal,
+          generation,
+          "recovery"
+        );
+        return previousSession;
+      },
+      commitPreviousCore: async (restoredSession) => {
+        if (!recoveredReplacement || recoveredReplacement.session !== restoredSession) {
+          throw new LifecycleCancelledError("Recovered previous Core was lost before commit");
+        }
+        await commitStartedCore(recoveredReplacement, signal, generation, () => {
+          persistRegistry(previousRegistry);
+        });
+      }
     });
   } catch (error) {
-    if (handle && pendingCoreProcess === handle) {
+    if (pendingCoreProcess) {
       try {
         await stopPendingCoreProcess();
       } catch (stopError) {
         desktopLogger.warn("main", "[megle] pending Core cleanup failed after library switch; retaining process:", stopError);
       }
     }
-    if (!signal.aborted) {
+    if (!signal.aborted && !(operationCancelled?.() ?? false)) {
       desktopLogger.error("main", "[megle] library Core replacement failed; retaining session metadata for retry:", error);
     }
     throw error;
