@@ -16,8 +16,6 @@ export {
   clearThumbnailObjectUrlCache,
   configureThumbnailCache,
   DEFAULT_THUMBNAIL_CACHE_LIMIT_BYTES,
-  readCachedThumbnailObjectUrl,
-  rememberThumbnailObjectUrl,
   THUMBNAIL_OBJECT_URL_CACHE_MIN_ENTRIES,
   thumbnailObjectUrlCache
 } from "./thumbnailObjectUrlCache";
@@ -33,6 +31,10 @@ type CachedOriginalPreviewEntry = {
   mediaSignature: string;
   blob: Blob;
 };
+export type OriginalFallbackObjectUrlToken = Readonly<{
+  cacheKey: string;
+  epoch: number;
+}>;
 type SharedRequest<T> = {
   request: Promise<T>;
   controller: AbortController;
@@ -64,6 +66,8 @@ export const inFlightThumbnailBlobRequests = new Map<string, SharedRequest<Blob>
 export const originalPreviewBlobCache = new Map<number, CachedOriginalPreviewEntry>();
 export const inFlightOriginalPreviewRequests = new Map<string, SharedRequest<Blob>>();
 export const DEFAULT_ORIGINAL_PREVIEW_BUFFER_LIMIT_BYTES = 1200 * 1024 * 1024;
+const ORIGINAL_FALLBACK_OBJECT_URL_CACHE_LIMIT = 128;
+const originalFallbackObjectUrlCache = new Map<string, string>();
 const MAX_FOREGROUND_RESOURCE_REQUESTS = 12;
 const MAX_INTERACTIVE_FOREGROUND_RESOURCE_REQUESTS = 2;
 // Off-screen prefetch (one screen above/below the viewport) is "ahead" priority.
@@ -118,6 +122,7 @@ export function resetMediaCachesForLibrarySwitch(): void {
   originalPreviewBlobCache.clear();
   originalPreviewBlobCacheBytes = 0;
   clearThumbnailObjectUrlCacheInternal();
+  clearOriginalFallbackObjectUrlCache();
 }
 const foregroundResourceRequestQueue: QueuedForegroundResourceRequest[] = [];
 
@@ -223,6 +228,94 @@ export function thumbnailObjectUrlCacheKey(
   return `${mediaCacheEpoch}:${fileId}:${GRID_THUMBNAIL_TARGET}:${versionKey ?? mediaSignature}`;
 }
 
+export function readCachedThumbnailObjectUrl(cacheKey: string): string | null {
+  if (!isCurrentMediaCacheKey(cacheKey)) return null;
+  return readCachedThumbnailObjectUrlInternal(cacheKey);
+}
+
+export function rememberThumbnailObjectUrl(
+  cacheKey: string,
+  objectUrl: string,
+  byteSize: number
+): boolean {
+  if (!isCurrentMediaCacheKey(cacheKey)) return false;
+  return rememberThumbnailObjectUrlInternal(cacheKey, objectUrl, byteSize);
+}
+
+export function captureOriginalFallbackObjectUrlToken(
+  mediaRecordOrSignature: MediaRecord | string
+): OriginalFallbackObjectUrlToken {
+  const epoch = mediaCacheEpoch;
+  const mediaSignature =
+    typeof mediaRecordOrSignature === "string"
+      ? mediaRecordOrSignature
+      : mediaFileContentSignature(mediaRecordOrSignature);
+  return {
+    cacheKey: `${epoch}:original:${mediaSignature}`,
+    epoch
+  };
+}
+
+export function readCachedOriginalFallbackObjectUrl(
+  token: OriginalFallbackObjectUrlToken
+): string | null {
+  if (token.epoch !== mediaCacheEpoch) return null;
+  const objectUrl = originalFallbackObjectUrlCache.get(token.cacheKey);
+  if (!objectUrl) return null;
+  originalFallbackObjectUrlCache.delete(token.cacheKey);
+  originalFallbackObjectUrlCache.set(token.cacheKey, objectUrl);
+  return objectUrl;
+}
+
+export function createOriginalFallbackObjectUrl(
+  token: OriginalFallbackObjectUrlToken,
+  blob: Blob
+): string | null {
+  const objectUrl = URL.createObjectURL(blob);
+  if (token.epoch !== mediaCacheEpoch) {
+    URL.revokeObjectURL(objectUrl);
+    return null;
+  }
+
+  const existing = originalFallbackObjectUrlCache.get(token.cacheKey);
+  if (existing) {
+    URL.revokeObjectURL(objectUrl);
+    originalFallbackObjectUrlCache.delete(token.cacheKey);
+    originalFallbackObjectUrlCache.set(token.cacheKey, existing);
+    return existing;
+  }
+
+  originalFallbackObjectUrlCache.set(token.cacheKey, objectUrl);
+  while (originalFallbackObjectUrlCache.size > ORIGINAL_FALLBACK_OBJECT_URL_CACHE_LIMIT) {
+    const firstKey = originalFallbackObjectUrlCache.keys().next().value;
+    if (firstKey === undefined) break;
+    const staleObjectUrl = originalFallbackObjectUrlCache.get(firstKey);
+    originalFallbackObjectUrlCache.delete(firstKey);
+    if (staleObjectUrl) URL.revokeObjectURL(staleObjectUrl);
+  }
+  return objectUrl;
+}
+
+export function discardOriginalFallbackObjectUrl(
+  token: OriginalFallbackObjectUrlToken,
+  expectedObjectUrl: string
+): void {
+  if (originalFallbackObjectUrlCache.get(token.cacheKey) !== expectedObjectUrl) return;
+  originalFallbackObjectUrlCache.delete(token.cacheKey);
+  URL.revokeObjectURL(expectedObjectUrl);
+}
+
+function clearOriginalFallbackObjectUrlCache(): void {
+  for (const objectUrl of originalFallbackObjectUrlCache.values()) {
+    URL.revokeObjectURL(objectUrl);
+  }
+  originalFallbackObjectUrlCache.clear();
+}
+
+function isCurrentMediaCacheKey(cacheKey: string): boolean {
+  return cacheKey.startsWith(`${mediaCacheEpoch}:`);
+}
+
 /// Prefetch a ready thumbnail's WebP bytes into the decoded object-URL cache so
 /// a tile that later scrolls into view renders instantly — no blob fetch, no
 /// decode, no placeholder flash or fade-in at mount. This is the "ahead"
@@ -251,7 +344,7 @@ export function prefetchThumbnailBlob(
   }
   const contentSignature = mediaFileContentSignature(mediaRecord);
   const cacheKey = thumbnailObjectUrlCacheKey(mediaRecord.id, contentSignature, null);
-  if (readCachedThumbnailObjectUrlInternal(cacheKey)) {
+  if (readCachedThumbnailObjectUrl(cacheKey)) {
     return;
   }
   const resourcePriority = options.resourcePriority ?? "ahead";
@@ -264,7 +357,7 @@ export function prefetchThumbnailBlob(
       // Re-check under the async boundary: the tile may have mounted and cached
       // it, or the media content may have changed. Only cache a still-missing,
       // still-valid entry.
-      if (readCachedThumbnailObjectUrlInternal(cacheKey)) {
+      if (readCachedThumbnailObjectUrl(cacheKey)) {
         return;
       }
       const objectUrl = URL.createObjectURL(blob);
@@ -272,7 +365,7 @@ export function prefetchThumbnailBlob(
       // mount instead of decoding on the main thread mid-scroll.
       void preloadImageObjectUrl(objectUrl)
         .then(() => {
-          if (!rememberThumbnailObjectUrlInternal(cacheKey, objectUrl, blob.size)) {
+          if (!rememberThumbnailObjectUrl(cacheKey, objectUrl, blob.size)) {
             URL.revokeObjectURL(objectUrl);
           }
         })

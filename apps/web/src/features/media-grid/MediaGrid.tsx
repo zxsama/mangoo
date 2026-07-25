@@ -6,12 +6,16 @@ import type { MediaRecord, ThumbnailResponse } from "@megle/core-client";
 import { FolderLocationIcon } from "../library/FolderLocationIcon";
 import { MediaLoadingIndicator, MediaLoadingRing } from "../loading/MediaLoadingRing";
 import {
+  captureOriginalFallbackObjectUrlToken,
+  createOriginalFallbackObjectUrl,
+  discardOriginalFallbackObjectUrl,
   mediaContentSignature,
   mediaFileContentSignature,
   preloadImageObjectUrl,
   previewPlaceholderDataUrl,
   prefetchOriginalPreview,
   prefetchThumbnailBlob,
+  readCachedOriginalFallbackObjectUrl,
   readCachedThumbnailObjectUrl,
   rememberThumbnailObjectUrl,
   requestOriginalPreviewBlob,
@@ -57,7 +61,6 @@ const AHEAD_THUMBNAIL_REPOLL_MS = 1000;
 const AHEAD_PRIORITY_ITEM_LIMIT = 48;
 const RECENT_VISIBLE_THUMBNAIL_STICKY_ITEM_LIMIT = 1024;
 const RECENT_VISIBLE_THUMBNAIL_STICKY_MS = 10 * 60_000;
-const ORIGINAL_FALLBACK_OBJECT_URL_CACHE_LIMIT = 128;
 const SECTION_HEADER_HEIGHT = 32;
 const CONTENT_HEADER_TOP_GAP = 24;
 const CONTENT_SECTION_HEADER_HEIGHT = SECTION_HEADER_HEIGHT + CONTENT_HEADER_TOP_GAP;
@@ -75,7 +78,6 @@ const ORIGINAL_FALLBACK_IMAGE_EXTENSIONS = new Set([
   "webp"
 ]);
 const scrollPositionByKey = new Map<string, number>();
-const originalFallbackObjectUrlCache = new Map<string, string>();
 const EMPTY_MEDIA_ITEMS: MediaRecord[] = [];
 type MediaGridCssVariables = CSSProperties & {
   "--library-tile-label-gap": string;
@@ -2215,22 +2217,6 @@ function PlaceholderThumbnail({
   );
 }
 
-function rememberOriginalFallbackObjectUrl(cacheKey: string, objectUrl: string) {
-  const existing = originalFallbackObjectUrlCache.get(cacheKey);
-  if (existing && existing !== objectUrl) {
-    URL.revokeObjectURL(existing);
-  }
-  originalFallbackObjectUrlCache.delete(cacheKey);
-  originalFallbackObjectUrlCache.set(cacheKey, objectUrl);
-  while (originalFallbackObjectUrlCache.size > ORIGINAL_FALLBACK_OBJECT_URL_CACHE_LIMIT) {
-    const firstKey = originalFallbackObjectUrlCache.keys().next().value;
-    if (!firstKey) break;
-    const staleObjectUrl = originalFallbackObjectUrlCache.get(firstKey);
-    originalFallbackObjectUrlCache.delete(firstKey);
-    if (staleObjectUrl) URL.revokeObjectURL(staleObjectUrl);
-  }
-}
-
 function OriginalFallbackThumbnail({
   alt,
   className,
@@ -2248,14 +2234,16 @@ function OriginalFallbackThumbnail({
   resourcePriority: "preview" | "visible" | "fallback";
   style: CSSProperties;
 }) {
-  const cacheKey = `original:${mediaFileContentSignature(item)}`;
+  const fallbackToken = captureOriginalFallbackObjectUrlToken(item);
+  const cacheKey = fallbackToken.cacheKey;
   const [src, setSrc] = useState<string | null>(
-    () => originalFallbackObjectUrlCache.get(cacheKey) ?? null
+    () => readCachedOriginalFallbackObjectUrl(fallbackToken)
   );
   const [error, setError] = useState(false);
   const [retryToken, setRetryToken] = useState(0);
   const itemRef = useRef(item);
   const objectUrlRef = useRef<string | null>(src);
+  const renderedEpochRef = useRef(fallbackToken.epoch);
   itemRef.current = item;
   // Fade in only when the image was NOT already available at mount. During a scan
   // most visible tiles render through this original-decode fallback (the WebP
@@ -2266,12 +2254,20 @@ function OriginalFallbackThumbnail({
   const shouldFadeInRef = useRef(src === null);
 
   useEffect(() => {
-    const cachedObjectUrl = originalFallbackObjectUrlCache.get(cacheKey);
+    const libraryEpochChanged = renderedEpochRef.current !== fallbackToken.epoch;
+    renderedEpochRef.current = fallbackToken.epoch;
+    const cachedObjectUrl = readCachedOriginalFallbackObjectUrl(fallbackToken);
     if (cachedObjectUrl) {
       objectUrlRef.current = cachedObjectUrl;
       setSrc(cachedObjectUrl);
       setError(false);
       return undefined;
+    }
+
+    if (libraryEpochChanged) {
+      objectUrlRef.current = null;
+      setSrc(() => null);
+      shouldFadeInRef.current = true;
     }
 
     let revoked = false;
@@ -2288,19 +2284,18 @@ function OriginalFallbackThumbnail({
       signal: controller.signal
     })
       .then((blob) => {
-        objectUrl = URL.createObjectURL(blob);
-        const nextObjectUrl = objectUrl;
         if (revoked) {
-          URL.revokeObjectURL(nextObjectUrl);
           return;
         }
+        objectUrl = createOriginalFallbackObjectUrl(fallbackToken, blob);
+        if (!objectUrl) return;
+        const nextObjectUrl = objectUrl;
 
         const commitObjectUrl = () => {
           if (revoked) {
             return;
           }
           objectUrlRef.current = nextObjectUrl;
-          rememberOriginalFallbackObjectUrl(cacheKey, nextObjectUrl);
           setSrc(nextObjectUrl);
         };
 
@@ -2310,7 +2305,7 @@ function OriginalFallbackThumbnail({
             if (revoked || objectUrlRef.current !== nextObjectUrl) {
               return;
             }
-            originalFallbackObjectUrlCache.delete(cacheKey);
+            discardOriginalFallbackObjectUrl(fallbackToken, nextObjectUrl);
             setError(true);
           });
           return;
@@ -2324,18 +2319,12 @@ function OriginalFallbackThumbnail({
             if (revoked) {
               return;
             }
-            if (objectUrl && objectUrlRef.current !== objectUrl) {
-              URL.revokeObjectURL(objectUrl);
-              objectUrl = null;
-            }
+            discardOriginalFallbackObjectUrl(fallbackToken, nextObjectUrl);
+            objectUrl = null;
             setError(true);
           });
       })
       .catch((cause) => {
-        if (objectUrl && objectUrlRef.current !== objectUrl) {
-          URL.revokeObjectURL(objectUrl);
-          objectUrl = null;
-        }
         if (revoked) {
           return;
         }
@@ -2352,9 +2341,6 @@ function OriginalFallbackThumbnail({
       revoked = true;
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       controller.abort();
-      if (objectUrl && objectUrlRef.current !== objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
     };
   }, [cacheKey, requestPriority, resourcePriority, retryToken]);
 
@@ -2432,9 +2418,10 @@ function ReadyThumbnail({
   // while scrolling a cold-start aggregated view. Seed the initial src from the
   // original-fallback object URL the tile was already displaying so the decoded
   // WebP is swapped in only once it is ready (via the decode-before-commit path
-  // below). The bridge URL is owned by originalFallbackObjectUrlCache and is
-  // never assigned to `objectUrl`, so this component never revokes it.
-  const originalBridgeUrl = originalFallbackObjectUrlCache.get(`original:${contentSignature}`) ?? null;
+  // below). The bridge URL is owned by the library-scoped mediaResources cache
+  // and is never assigned to `objectUrl`, so this component never revokes it.
+  const originalBridgeToken = captureOriginalFallbackObjectUrlToken(contentSignature);
+  const originalBridgeUrl = readCachedOriginalFallbackObjectUrl(originalBridgeToken);
   const [src, setSrc] = useState<string | null>(
     () => readCachedThumbnailObjectUrl(cacheKey) ?? originalBridgeUrl
   );
@@ -2442,19 +2429,31 @@ function ReadyThumbnail({
   const [retryToken, setRetryToken] = useState(0);
   const objectUrlRef = useRef<string | null>(src);
   const cacheOwnsObjectUrlRef = useRef(src !== null);
+  const renderedEpochRef = useRef(originalBridgeToken.epoch);
   // Fade in only when the image was NOT already available at mount. A tile that
   // scrolls back into view with its object URL still cached renders instantly
   // (no fade, no placeholder re-flash); a freshly fetched thumbnail fades in.
   const shouldFadeInRef = useRef(src === null);
 
   useEffect(() => {
-    const cachedObjectUrl = readCachedThumbnailObjectUrl(cacheKey);
+    const libraryEpochChanged = renderedEpochRef.current !== originalBridgeToken.epoch;
+    renderedEpochRef.current = originalBridgeToken.epoch;
+    const cachedObjectUrl =
+      readCachedThumbnailObjectUrl(cacheKey) ??
+      readCachedOriginalFallbackObjectUrl(originalBridgeToken);
     if (cachedObjectUrl) {
       objectUrlRef.current = cachedObjectUrl;
       cacheOwnsObjectUrlRef.current = true;
       setSrc(cachedObjectUrl);
       setError(false);
       return undefined;
+    }
+
+    if (libraryEpochChanged) {
+      objectUrlRef.current = null;
+      cacheOwnsObjectUrlRef.current = false;
+      setSrc(() => null);
+      shouldFadeInRef.current = true;
     }
 
     let revoked = false;
@@ -2590,7 +2589,7 @@ function ReadyThumbnail({
     // reload 1-2x as its state settled during a scan. A genuine content change
     // bumps mtime/size -> cacheKey, which re-runs this effect correctly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cacheKey, fileId, retryToken]);
+  }, [cacheKey, fileId, originalBridgeToken.cacheKey, retryToken]);
 
   if (error && !src) {
     return (

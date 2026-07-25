@@ -1382,9 +1382,8 @@ if (
   fail("mediaResources original preview requests must be keyed by stable file signatures (+ library epoch), not thumbnail state signatures");
 }
 if (
-  !/const\s+cacheKey\s*=\s*`original:\$\{mediaFileContentSignature\(item\)\}`/.test(
-    mediaGrid
-  ) ||
+  !/captureOriginalFallbackObjectUrlToken\(item\)/.test(mediaGrid) ||
+  !/readCachedOriginalFallbackObjectUrl\(fallbackToken\)/.test(mediaGrid) ||
   !/const\s+originalVersionKey\s*=\s*mediaFileContentSignature\(media\);/.test(mediaPreview) ||
   !/`folder-cover:\$\{mediaFileContentSignature\(coverMediaItem\)\}`/.test(subfolderStrip)
 ) {

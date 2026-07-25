@@ -10,9 +10,15 @@ register("./resolve-source-imports.mjs", import.meta.url);
 };
 
 const {
+  captureOriginalFallbackObjectUrlToken,
+  createOriginalFallbackObjectUrl,
   originalPreviewBlobCache,
+  readCachedOriginalFallbackObjectUrl,
+  readCachedThumbnailObjectUrl,
+  rememberThumbnailObjectUrl,
   requestOriginalPreviewBlob,
-  resetMediaCachesForLibrarySwitch
+  resetMediaCachesForLibrarySwitch,
+  thumbnailObjectUrlCacheKey
 } = await import("../src/core/mediaResources.ts");
 
 function deferred<T>() {
@@ -39,6 +45,46 @@ function media(id: number): MediaRecord {
 }
 
 describe("media resource library isolation", () => {
+  it("revokes fallback object URLs and rejects a late same-signature old-library write", () => {
+    const originalCreateObjectUrl = URL.createObjectURL;
+    const originalRevokeObjectUrl = URL.revokeObjectURL;
+    const revoked: string[] = [];
+    let nextObjectUrl = 1;
+    URL.createObjectURL = (() => `blob:media-${nextObjectUrl++}`) as typeof URL.createObjectURL;
+    URL.revokeObjectURL = ((objectUrl: string) => {
+      revoked.push(objectUrl);
+    }) as typeof URL.revokeObjectURL;
+
+    try {
+      resetMediaCachesForLibrarySwitch();
+      const oldToken = captureOriginalFallbackObjectUrlToken(media(7));
+      const oldThumbnailKey = thumbnailObjectUrlCacheKey(7, "7:100:8", null);
+      const oldObjectUrl = createOriginalFallbackObjectUrl(oldToken, new Blob(["old"]));
+      assert.equal(oldObjectUrl, "blob:media-1");
+      assert.equal(readCachedOriginalFallbackObjectUrl(oldToken), oldObjectUrl);
+
+      resetMediaCachesForLibrarySwitch();
+      assert.deepEqual(revoked, ["blob:media-1"], "switch teardown must synchronously revoke old URLs");
+
+      const newToken = captureOriginalFallbackObjectUrlToken(media(7));
+      assert.equal(readCachedOriginalFallbackObjectUrl(oldToken), null);
+      assert.equal(readCachedOriginalFallbackObjectUrl(newToken), null);
+      const newObjectUrl = createOriginalFallbackObjectUrl(newToken, new Blob(["new"]));
+      assert.equal(newObjectUrl, "blob:media-2");
+
+      const lateOldObjectUrl = createOriginalFallbackObjectUrl(oldToken, new Blob(["late-old"]));
+      assert.equal(lateOldObjectUrl, null);
+      assert.deepEqual(revoked, ["blob:media-1", "blob:media-3"]);
+      assert.equal(readCachedOriginalFallbackObjectUrl(newToken), newObjectUrl);
+      assert.equal(rememberThumbnailObjectUrl(oldThumbnailKey, "blob:late-thumbnail", 10), false);
+      assert.equal(readCachedThumbnailObjectUrl(oldThumbnailKey), null);
+    } finally {
+      resetMediaCachesForLibrarySwitch();
+      URL.createObjectURL = originalCreateObjectUrl;
+      URL.revokeObjectURL = originalRevokeObjectUrl;
+    }
+  });
+
   it("aborts and rejects an old-library original that finishes after the new cache is populated", async () => {
     const originalFetch = globalThis.fetch;
     const oldResponse = deferred<Response>();
