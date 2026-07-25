@@ -64,6 +64,77 @@ test("serializes concurrent Core child/session operations", async () => {
   assert.equal(maxActiveChildren, 1);
 });
 
+test("an externally cancelled queued operation never starts and a retry still runs", async () => {
+  const queue = new CoreLifecycleQueue();
+  const blocker = deferred();
+  const blockerStarted = deferred();
+  const cancelled = new AbortController();
+  const events: string[] = [];
+
+  const first = queue.enqueue(async () => {
+    events.push("blocker-start");
+    blockerStarted.resolve();
+    await blocker.promise;
+  });
+  await blockerStarted.promise;
+  const stale = queue.enqueue(async () => {
+    events.push("stale-start");
+  }, { signal: cancelled.signal });
+  cancelled.abort(new DOMException("focus timed out", "AbortError"));
+  blocker.resolve();
+  await first;
+  await assert.rejects(stale, LifecycleCancelledError);
+
+  const retry = queue.enqueue(async () => {
+    events.push("retry-start");
+    return "retry-ok";
+  });
+  assert.equal(await retry, "retry-ok");
+  assert.deepEqual(events, ["blocker-start", "retry-start"]);
+});
+
+test("active external cancellation blocks late commit and keeps retry serialized", async () => {
+  const queue = new CoreLifecycleQueue();
+  const staleStarted = deferred();
+  const staleBoundary = deferred();
+  const cancelled = new AbortController();
+  const events: string[] = [];
+  let activeSwitches = 0;
+  let maxActiveSwitches = 0;
+
+  const stale = queue.enqueue(async (signal) => {
+    activeSwitches += 1;
+    maxActiveSwitches = Math.max(maxActiveSwitches, activeSwitches);
+    events.push("stale-start");
+    staleStarted.resolve();
+    await staleBoundary.promise;
+    try {
+      if (signal.aborted) throw new LifecycleCancelledError("stale media focus switch");
+      events.push("stale-publish");
+    } finally {
+      activeSwitches -= 1;
+    }
+  }, { signal: cancelled.signal });
+  await staleStarted.promise;
+  cancelled.abort(new DOMException("renderer reloaded", "AbortError"));
+
+  const retry = queue.enqueue(async () => {
+    activeSwitches += 1;
+    maxActiveSwitches = Math.max(maxActiveSwitches, activeSwitches);
+    events.push("retry-start");
+    activeSwitches -= 1;
+    return "retry-ok";
+  });
+  await Promise.resolve();
+  assert.deepEqual(events, ["stale-start"], "retry must wait for stale lifecycle cleanup");
+
+  staleBoundary.resolve();
+  await assert.rejects(stale, LifecycleCancelledError);
+  assert.equal(await retry, "retry-ok");
+  assert.deepEqual(events, ["stale-start", "retry-start"]);
+  assert.equal(maxActiveSwitches, 1);
+});
+
 test("queued secondary open rechecks a completed switch and reuses its only child", async () => {
   const queue = new CoreLifecycleQueue();
   const switchStarted = deferred();

@@ -934,10 +934,35 @@ ipcMain.handle("megle:get-active-library-id", (event) => {
   return getRegistry().activeLibraryId;
 });
 
-ipcMain.handle("megle:switch-library", async (event, libraryId: string) => {
+ipcMain.handle("megle:switch-library", async (
+  event,
+  libraryId: string,
+  mediaFocusRequestId?: unknown
+) => {
   requireDesktopIpcAccess(event, "megle:switch-library");
+  if (
+    mediaFocusRequestId !== undefined &&
+    (typeof mediaFocusRequestId !== "string" ||
+      mediaFocusRequestId.length === 0 ||
+      mediaFocusRequestId.length > 128)
+  ) {
+    return { ok: false, error: "invalid media focus operation" };
+  }
+  const operationId = mediaFocusRequestId;
+  const operationSignal = operationId
+    ? mediaFocusCoordinator.operationSignal(operationId) ?? undefined
+    : undefined;
+  if (operationId && !operationSignal) {
+    return { ok: false, error: "media focus operation is no longer active" };
+  }
   try {
     return await coreLifecycleQueue.enqueue(async (signal) => {
+      const refreshOperation = () => {
+        if (operationId && !mediaFocusCoordinator.refreshSwitching(operationId)) {
+          throw new LifecycleCancelledError("Media focus library switch is no longer active");
+        }
+      };
+      refreshOperation();
       const generation = coreLifecycleQueue.beginGeneration();
       const reg = getRegistry();
       const target = reg.libraries.find((l) => l.id === libraryId);
@@ -945,12 +970,15 @@ ipcMain.handle("megle:switch-library", async (event, libraryId: string) => {
       if (!fsSync.existsSync(target.dbPath)) return { ok: false, error: "library file missing" };
       await restartCoreForLibrary(target.dbPath, signal, generation, () => {
         persistRegistry(libraryRegistry.setActive(reg, libraryId, Date.now()));
-      });
+      }, refreshOperation);
+      refreshOperation();
       pushLibraryPhase("loading-media"); // renderer takes over from here
       return { ok: true };
-    });
+    }, { signal: operationSignal });
   } catch (error) {
-    pushLibraryPhase({ kind: "error", message: String(error) });
+    if (!(error instanceof LifecycleCancelledError) && !operationSignal?.aborted) {
+      pushLibraryPhase({ kind: "error", message: String(error) });
+    }
     return { ok: false, error: String(error) };
   }
 });
@@ -1726,12 +1754,18 @@ async function restartCoreForLibrary(
   dbPath: string,
   signal: AbortSignal,
   generation: number,
-  commitActiveLibrary: (session: CoreSession) => void | Promise<void>
+  commitActiveLibrary: (session: CoreSession) => void | Promise<void>,
+  refreshOperation?: () => void
 ): Promise<CoreSession> {
-  assertCurrentCoreGeneration(generation, signal);
+  const assertCurrent = () => {
+    assertCurrentCoreGeneration(generation, signal);
+    refreshOperation?.();
+    assertCurrentCoreGeneration(generation, signal);
+  };
+  assertCurrent();
   pushLibraryPhase("starting-core");
   const base = coreSession ?? pendingCoreSession ?? (await createCoreSession());
-  assertCurrentCoreGeneration(generation, signal);
+  assertCurrent();
   const session = sessionForDbPath(base, dbPath, pendingCoreSession);
   // Keep both the last-known renderer session and the candidate session until
   // the replacement Core is healthy. The renderer keeps using baseUrl/token
@@ -1740,14 +1774,14 @@ async function restartCoreForLibrary(
   let handle: CoreProcessHandle | null = null;
   try {
     return await runNotificationSafeCoreTransition({
-      assertCurrent: () => assertCurrentCoreGeneration(generation, signal),
+      assertCurrent,
       detachNotifications: detachNotificationServiceForCoreReplacement,
       stopOldCore: async () => {
         // Stop a failed pending Core before the active Core and wait for the port to free up.
         await stopDesktopCoreProcesses();
-        assertCurrentCoreGeneration(generation, signal);
+        assertCurrent();
         await waitForPortFree(base.bindAddress, signal);
-        assertCurrentCoreGeneration(generation, signal);
+        assertCurrent();
         if (coreProcess) {
           throw new LifecycleCancelledError("Tracked Core changed before library restart");
         }
@@ -1763,13 +1797,13 @@ async function restartCoreForLibrary(
         const maxAttempts = shouldRetryAutoCoreStartup() ? AUTO_CORE_STARTUP_MAX_ATTEMPTS : 1;
         let lastError: unknown;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-          assertCurrentCoreGeneration(generation, signal);
+          assertCurrent();
           handle = startCoreProcess(session, coreLogHandlerForSession(session));
           pendingCoreProcess = handle;
           if (attempt === 1) pushLibraryPhase("opening-library");
           try {
             await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
-            assertCurrentCoreGeneration(generation, signal);
+            assertCurrent();
             if (coreProcess && coreProcess !== handle) {
               throw new LifecycleCancelledError(
                 "A newer Core process was committed before library restart completed"
@@ -1816,8 +1850,9 @@ async function restartCoreForLibrary(
         throw lastError ?? new Error("library Core did not become healthy");
       },
       commitActiveLibrary: async (healthySession) => {
+        assertCurrent();
         await commitActiveLibrary(healthySession);
-        assertCurrentCoreGeneration(generation, signal);
+        assertCurrent();
         if (!handle || pendingCoreProcess !== handle) {
           throw new LifecycleCancelledError("Candidate Core changed before library commit");
         }

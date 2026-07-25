@@ -223,6 +223,7 @@ describe("media focus workflow", () => {
     assert.equal(typeof runSwitch, "function", "the renderer must coordinate irreversible switches");
     const controller = new AbortController();
     const calls: string[] = [];
+    const switchArguments: unknown[][] = [];
     let releaseSwitch = () => undefined;
     const switching = new Promise<{ ok: boolean }>((resolve) => {
       releaseSwitch = () => resolve({ ok: true });
@@ -231,8 +232,9 @@ describe("media focus workflow", () => {
       libraryId: "library-b",
       requestId: "focus-1",
       signal: controller.signal,
-      switchLibrary: async () => {
+      switchLibrary: async (...args: unknown[]) => {
         calls.push("switch");
+        switchArguments.push(args);
         return switching;
       },
       updateStage: async (update: { stage: string }) => {
@@ -242,6 +244,7 @@ describe("media focus workflow", () => {
     });
     await Promise.resolve();
     assert.deepEqual(calls, ["stage:switching", "switch"]);
+    assert.deepEqual(switchArguments, [["library-b", "focus-1"]]);
 
     controller.abort();
     releaseSwitch();

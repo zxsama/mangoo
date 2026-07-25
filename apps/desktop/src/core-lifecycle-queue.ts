@@ -1,4 +1,7 @@
 export type CoreLifecycleTask<T> = (signal: AbortSignal) => T | Promise<T>;
+export type CoreLifecycleEnqueueOptions = {
+  readonly signal?: AbortSignal;
+};
 
 export class LifecycleCancelledError extends Error {
   constructor(message = "Core lifecycle operation cancelled") {
@@ -17,6 +20,7 @@ export class LifecycleClosedError extends Error {
 type QueueItem<T> = {
   readonly task: CoreLifecycleTask<T>;
   readonly controller: AbortController;
+  readonly detachExternalAbort: () => void;
   readonly resolve: (value: T | PromiseLike<T>) => void;
   readonly reject: (reason?: unknown) => void;
 };
@@ -29,11 +33,11 @@ export class CoreLifecycleQueue {
   private shutdownAttempt: Promise<unknown> | null = null;
   private generation = 0;
 
-  enqueue<T>(task: CoreLifecycleTask<T>): Promise<T> {
+  enqueue<T>(task: CoreLifecycleTask<T>, options: CoreLifecycleEnqueueOptions = {}): Promise<T> {
     if (this.shutdownRequested || this.closed) {
       return Promise.reject(new LifecycleClosedError());
     }
-    return this.enqueueInternal(task);
+    return this.enqueueInternal(task, options);
   }
 
   shutdown<T>(task: CoreLifecycleTask<T>): Promise<T> {
@@ -48,6 +52,7 @@ export class CoreLifecycleQueue {
     this.shutdownRequested = true;
     for (const item of this.pending.splice(0)) {
       item.controller.abort();
+      item.detachExternalAbort();
       item.reject(new LifecycleCancelledError("Core lifecycle operation cancelled by shutdown"));
     }
     this.active?.controller.abort();
@@ -81,14 +86,38 @@ export class CoreLifecycleQueue {
     return !this.shutdownRequested && !this.closed && generation === this.generation;
   }
 
-  private enqueueInternal<T>(task: CoreLifecycleTask<T>): Promise<T> {
+  private enqueueInternal<T>(
+    task: CoreLifecycleTask<T>,
+    options: CoreLifecycleEnqueueOptions = {}
+  ): Promise<T> {
+    if (options.signal?.aborted) {
+      return Promise.reject(new LifecycleCancelledError("Core lifecycle operation was already cancelled"));
+    }
     return new Promise<T>((resolve, reject) => {
-      this.pending.push({
+      let detachExternalAbort: () => void = () => undefined;
+      const item: QueueItem<T> = {
         task,
         controller: new AbortController(),
+        detachExternalAbort: () => detachExternalAbort(),
         resolve: (value) => resolve(value as T),
         reject
-      });
+      };
+      const externalSignal = options.signal;
+      if (externalSignal) {
+        const abort = () => {
+          item.controller.abort(externalSignal.reason);
+          const queuedIndex = this.pending.indexOf(item as QueueItem<unknown>);
+          if (queuedIndex >= 0) {
+            this.pending.splice(queuedIndex, 1);
+            item.detachExternalAbort();
+            item.reject(new LifecycleCancelledError("Core lifecycle operation externally cancelled"));
+            this.drain();
+          }
+        };
+        externalSignal.addEventListener("abort", abort, { once: true });
+        detachExternalAbort = () => externalSignal.removeEventListener("abort", abort);
+      }
+      this.pending.push(item as QueueItem<unknown>);
       this.drain();
     });
   }
@@ -97,11 +126,18 @@ export class CoreLifecycleQueue {
     if (this.active || this.pending.length === 0) return;
     const item = this.pending.shift();
     if (!item) return;
+    if (item.controller.signal.aborted) {
+      item.detachExternalAbort();
+      item.reject(new LifecycleCancelledError("Core lifecycle operation cancelled before start"));
+      this.drain();
+      return;
+    }
     this.active = item;
     Promise.resolve()
       .then(() => item.task(item.controller.signal))
       .then(item.resolve, item.reject)
       .finally(() => {
+        item.detachExternalAbort();
         if (this.active === item) this.active = null;
         this.drain();
       });

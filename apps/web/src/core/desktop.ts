@@ -106,7 +106,10 @@ export interface MegleDesktopBridge {
   shell?: DesktopShellActions;
   listLibraries?: () => Promise<LibrarySummary[]>;
   getActiveLibraryId?: () => Promise<string | null>;
-  switchLibrary?: (libraryId: string) => Promise<{ ok: boolean; error?: string }>;
+  switchLibrary?: (
+    libraryId: string,
+    mediaFocusRequestId?: string
+  ) => Promise<{ ok: boolean; error?: string }>;
   createLibrary?: (input: { name: string; dbPath: string }) => Promise<{ ok: boolean; library?: LibrarySummary; error?: string }>;
   openLibrary?: (dbPath: string) => Promise<{ ok: boolean; library?: LibrarySummary; error?: string }>;
   removeLibraryFromList?: (libraryId: string) => Promise<{ ok: boolean }>;
@@ -260,8 +263,14 @@ export async function listLibraries(): Promise<LibrarySummary[]> {
 export async function getActiveLibraryId(): Promise<string | null> {
   return (await getDesktopBridge()?.getActiveLibraryId?.()) ?? null;
 }
-export async function switchLibrary(libraryId: string): Promise<{ ok: boolean; error?: string }> {
-  return (await getDesktopBridge()?.switchLibrary?.(libraryId)) ?? { ok: false, error: "no desktop bridge" };
+export async function switchLibrary(
+  libraryId: string,
+  mediaFocusRequestId?: string
+): Promise<{ ok: boolean; error?: string }> {
+  return (await getDesktopBridge()?.switchLibrary?.(libraryId, mediaFocusRequestId)) ?? {
+    ok: false,
+    error: "no desktop bridge"
+  };
 }
 export async function createLibrary(
   input: { name: string; dbPath: string }

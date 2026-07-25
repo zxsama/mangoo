@@ -11,6 +11,7 @@ import type {
 interface PendingMediaFocus {
   cancel: (cancellation: MediaFocusCancellation) => void;
   command: MediaFocusCommand;
+  controller: AbortController;
   deliver: (command: MediaFocusCommand) => void;
   resolve: (ok: boolean) => void;
   stage: "queued" | "awaiting" | MediaFocusStage;
@@ -42,6 +43,7 @@ export class MediaFocusCoordinator {
       this.pending.set(requestId, {
         cancel,
         command: { ...request, requestId },
+        controller: new AbortController(),
         deliver,
         resolve,
         stage: "queued",
@@ -55,6 +57,21 @@ export class MediaFocusCoordinator {
   complete(completion: MediaFocusCompletion): boolean {
     if (completion.requestId !== this.activeRequestId) return false;
     return this.settle(completion.requestId, completion.ok);
+  }
+
+  operationSignal(requestId: string): AbortSignal | null {
+    if (requestId !== this.activeRequestId) return null;
+    const request = this.pending.get(requestId);
+    if (!request || request.stage !== "switching" || request.controller.signal.aborted) return null;
+    return request.controller.signal;
+  }
+
+  refreshSwitching(requestId: string): boolean {
+    if (requestId !== this.activeRequestId) return false;
+    const request = this.pending.get(requestId);
+    if (!request || request.stage !== "switching" || request.controller.signal.aborted) return false;
+    this.armRequestTimeout(requestId, request, this.switchingTimeoutMs);
+    return true;
   }
 
   updateStage(update: MediaFocusStageUpdate): boolean {
@@ -83,6 +100,7 @@ export class MediaFocusCoordinator {
     this.pending.clear();
     for (const [requestId, request] of requests) {
       this.clearRequestTimeout(request);
+      request.controller.abort(new DOMException("Main renderer unavailable", "AbortError"));
       if (requestId === activeRequestId) {
         try {
           request.cancel({ requestId });
@@ -111,6 +129,9 @@ export class MediaFocusCoordinator {
     if (!request) return false;
     this.pending.delete(requestId);
     this.clearRequestTimeout(request);
+    if (!ok) {
+      request.controller.abort(new DOMException("Media focus operation cancelled", "AbortError"));
+    }
     const wasActive = this.activeRequestId === requestId;
     if (wasActive) this.activeRequestId = null;
     request.resolve(ok);

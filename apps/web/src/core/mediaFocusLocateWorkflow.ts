@@ -18,13 +18,13 @@ export async function runCoordinatedMediaFocusSwitch({
   libraryId: string;
   requestId: string;
   signal: AbortSignal;
-  switchLibrary: (libraryId: string) => Promise<{ ok: boolean }>;
+  switchLibrary: (libraryId: string, mediaFocusRequestId?: string) => Promise<{ ok: boolean }>;
   updateStage: (update: { requestId: string; stage: "switching" }) => Promise<boolean>;
 }): Promise<boolean> {
   if (signal.aborted) return false;
   const accepted = await updateStage({ requestId, stage: "switching" });
   if (!accepted || signal.aborted) return false;
-  const result = await switchLibrary(libraryId);
+  const result = await switchLibrary(libraryId, requestId);
   return result.ok && !signal.aborted;
 }
 
