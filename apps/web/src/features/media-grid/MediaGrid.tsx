@@ -6,6 +6,7 @@ import type { MediaRecord, ThumbnailResponse } from "@megle/core-client";
 import { FolderLocationIcon } from "../library/FolderLocationIcon";
 import { MediaLoadingIndicator, MediaLoadingRing } from "../loading/MediaLoadingRing";
 import {
+  adoptThumbnailObjectUrl,
   captureOriginalFallbackObjectUrlToken,
   createOriginalFallbackObjectUrl,
   discardOriginalFallbackObjectUrl,
@@ -17,7 +18,6 @@ import {
   prefetchThumbnailBlob,
   readCachedOriginalFallbackObjectUrl,
   readCachedThumbnailObjectUrl,
-  rememberThumbnailObjectUrl,
   requestOriginalPreviewBlob,
   requestThumbnailBlob,
   thumbnailObjectUrlCacheKey,
@@ -2485,51 +2485,33 @@ function ReadyThumbnail({
           // mid-fetch discarded its result, so scrolling back re-fetched. The
           // cache owns the URL's lifetime (LRU + count floor); we only revoke
           // our redundant URL if the cache already holds one for this content.
-          const owns = rememberThumbnailObjectUrl(cacheKey, nextObjectUrl, blob.size);
-          if (!owns) {
-            URL.revokeObjectURL(nextObjectUrl);
-          }
-          objectUrl = null; // cache (or revoke) owns it; cleanup must not touch it
+          adoptThumbnailObjectUrl(cacheKey, nextObjectUrl, blob.size);
+          objectUrl = null; // the cache helper consumed it; cleanup must not touch it
           return;
         }
 
-        const commitObjectUrl = () => {
+        const commitObjectUrl = (): string | null => {
           if (revoked) {
-            return;
+            return null;
           }
-          const owns = rememberThumbnailObjectUrl(cacheKey, nextObjectUrl, blob.size);
-          if (owns) {
-            // The cache adopted OUR url — display and own it.
-            objectUrlRef.current = nextObjectUrl;
-            cacheOwnsObjectUrlRef.current = true;
-            setSrc(nextObjectUrl);
-            return;
-          }
-          // The cache already holds a URL for this content (a racing tile or the
-          // ahead-prefetch cached it first). Adopt the DURABLE cached url, revoke
-          // our now-redundant one immediately, and display the cached one. This
-          // stops the fast-scroll churn where a tile displayed its own url,
-          // revoked it on unmount, and re-fetched on scroll-back: now the tile
-          // always ends up pointing at the single cached url that outlives it.
-          const cached = readCachedThumbnailObjectUrl(cacheKey);
-          if (cached && cached !== nextObjectUrl) {
-            URL.revokeObjectURL(nextObjectUrl);
-            objectUrl = null;
-            objectUrlRef.current = cached;
-            cacheOwnsObjectUrlRef.current = true; // cache owns it; we never revoke it
-            setSrc(cached);
-            return;
-          }
-          // Fallback (cache empty despite reject — shouldn't happen): keep ours.
-          objectUrlRef.current = nextObjectUrl;
+          const adoptedObjectUrl = adoptThumbnailObjectUrl(
+            cacheKey,
+            nextObjectUrl,
+            blob.size
+          );
+          objectUrl = null; // adopted or revoked; effect cleanup must not revoke it again
+          if (!adoptedObjectUrl) return null;
+          objectUrlRef.current = adoptedObjectUrl;
           cacheOwnsObjectUrlRef.current = true;
-          setSrc(nextObjectUrl);
+          setSrc(adoptedObjectUrl);
+          return adoptedObjectUrl;
         };
 
         if (!objectUrlRef.current) {
-          commitObjectUrl();
-          void preloadImageObjectUrl(nextObjectUrl).catch(() => {
-            if (revoked || objectUrlRef.current !== nextObjectUrl) {
+          const committedObjectUrl = commitObjectUrl();
+          if (!committedObjectUrl) return;
+          void preloadImageObjectUrl(committedObjectUrl).catch(() => {
+            if (revoked || objectUrlRef.current !== committedObjectUrl) {
               return;
             }
             setError(true);

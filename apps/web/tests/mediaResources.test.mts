@@ -10,6 +10,7 @@ register("./resolve-source-imports.mjs", import.meta.url);
 };
 
 const {
+  adoptThumbnailObjectUrl,
   captureOriginalFallbackObjectUrlToken,
   createOriginalFallbackObjectUrl,
   originalPreviewBlobCache,
@@ -45,6 +46,40 @@ function media(id: number): MediaRecord {
 }
 
 describe("media resource library isolation", () => {
+  it("consumes a late stale thumbnail URL exactly once without publishing it", () => {
+    const originalRevokeObjectUrl = URL.revokeObjectURL;
+    const revoked: string[] = [];
+    URL.revokeObjectURL = ((objectUrl: string) => {
+      revoked.push(objectUrl);
+    }) as typeof URL.revokeObjectURL;
+
+    try {
+      resetMediaCachesForLibrarySwitch();
+      const oldKey = thumbnailObjectUrlCacheKey(7, "7:100:8", null);
+
+      resetMediaCachesForLibrarySwitch();
+      const displayedLateUrl = adoptThumbnailObjectUrl(oldKey, "blob:late-old", 10);
+      assert.equal(displayedLateUrl, null, "a stale candidate must never become the image src");
+      assert.deepEqual(revoked, ["blob:late-old"]);
+
+      const newKey = thumbnailObjectUrlCacheKey(7, "7:100:8", null);
+      const displayedNewUrl = adoptThumbnailObjectUrl(newKey, "blob:new", 10);
+      assert.equal(displayedNewUrl, "blob:new");
+      assert.equal(readCachedThumbnailObjectUrl(newKey), "blob:new");
+      assert.deepEqual(revoked, ["blob:late-old"]);
+
+      resetMediaCachesForLibrarySwitch();
+      assert.deepEqual(
+        revoked,
+        ["blob:late-old", "blob:new"],
+        "the consumed stale candidate and cached current URL must each be revoked once"
+      );
+    } finally {
+      resetMediaCachesForLibrarySwitch();
+      URL.revokeObjectURL = originalRevokeObjectUrl;
+    }
+  });
+
   it("revokes fallback object URLs and rejects a late same-signature old-library write", () => {
     const originalCreateObjectUrl = URL.createObjectURL;
     const originalRevokeObjectUrl = URL.revokeObjectURL;

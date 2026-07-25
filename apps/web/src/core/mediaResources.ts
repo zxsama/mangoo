@@ -242,6 +242,24 @@ export function rememberThumbnailObjectUrl(
   return rememberThumbnailObjectUrlInternal(cacheKey, objectUrl, byteSize);
 }
 
+// Consumes a newly-created thumbnail object URL. A current-epoch candidate is
+// either adopted by the shared cache or replaced by the cache's racing URL;
+// a stale-epoch candidate is revoked immediately and is never publishable.
+export function adoptThumbnailObjectUrl(
+  cacheKey: string,
+  candidateObjectUrl: string,
+  byteSize: number
+): string | null {
+  if (rememberThumbnailObjectUrl(cacheKey, candidateObjectUrl, byteSize)) {
+    return candidateObjectUrl;
+  }
+
+  const cachedObjectUrl = readCachedThumbnailObjectUrl(cacheKey);
+  if (cachedObjectUrl === candidateObjectUrl) return cachedObjectUrl;
+  URL.revokeObjectURL(candidateObjectUrl);
+  return cachedObjectUrl;
+}
+
 export function captureOriginalFallbackObjectUrlToken(
   mediaRecordOrSignature: MediaRecord | string
 ): OriginalFallbackObjectUrlToken {

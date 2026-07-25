@@ -923,7 +923,7 @@ if (
 if (
   !/thumbnailObjectUrlCache/.test(mediaResources) ||
   !/readCachedThumbnailObjectUrl/.test(mediaGrid) ||
-  !/rememberThumbnailObjectUrl/.test(mediaGrid)
+  !/adoptThumbnailObjectUrl/.test(mediaGrid)
 ) {
   fail("ReadyThumbnail must reuse cached object URLs so remounted virtual tiles do not flash blank");
 }
@@ -933,7 +933,10 @@ if (/function\s+ReadyPreviewMedia[\s\S]*?setSrc\(null\);/.test(mediaPreview)) {
 if (!/useLayoutEffect/.test(centralPreviewStage) || !/fitLongEdgeScaleForMedia/.test(centralPreviewStage)) {
   fail("Central preview must compute fit scale from media dimensions before the first preview paint to avoid size flicker");
 }
-if (!/preloadImageObjectUrl/.test(mediaGrid) || !/preloadImageObjectUrl[\s\S]*?then\(\(\)\s*=>\s*\{[\s\S]*?setSrc\((?:objectUrl|nextObjectUrl)\)/.test(mediaGrid)) {
+if (
+  !/preloadImageObjectUrl/.test(mediaGrid) ||
+  !/preloadImageObjectUrl\(nextObjectUrl\)[\s\S]*?then\(\(\)\s*=>\s*\{[\s\S]*?commitObjectUrl\(\)/.test(mediaGrid)
+) {
   fail("ReadyThumbnail must decode refreshed image blobs before swapping the visible thumbnail src");
 }
 if (
