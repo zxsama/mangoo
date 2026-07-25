@@ -22,6 +22,23 @@ export type RemoveRootRedirect =
   // The open view did NOT reference the removed root: leave navigation as-is.
   | { kind: "keep" };
 
+export function prepareRootRemoval<T extends { id: number; rootFolderId: number | null }>(
+  roots: ReadonlyArray<T>,
+  removedRootId: number
+): {
+  nextRoots: T[];
+  survivingRoots: Array<{ id: number; rootFolderId: number | null }>;
+} {
+  const nextRoots = roots.filter((root) => root.id !== removedRootId);
+  return {
+    nextRoots,
+    survivingRoots: nextRoots.map((root) => ({
+      id: root.id,
+      rootFolderId: root.rootFolderId
+    }))
+  };
+}
+
 // Whether the inspector's highlighted folder must be cleared (its root is gone),
 // independent of the main redirect decision.
 export function shouldClearInspectedFolder(input: RemoveRootRedirectInput): boolean {

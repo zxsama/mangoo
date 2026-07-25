@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import {
-  decideRemoveRootRedirect,
-  shouldClearInspectedFolder
-} from "../src/core/removeRootRedirect.ts";
+import * as rootRemoval from "../src/core/removeRootRedirect.ts";
+
+const { decideRemoveRootRedirect, shouldClearInspectedFolder } = rootRemoval;
 
 describe("decideRemoveRootRedirect", () => {
   it("redirects the open view to the first surviving root when the open root is removed", () => {
@@ -57,6 +56,38 @@ describe("decideRemoveRootRedirect", () => {
       survivingRoots: [{ id: 1, rootFolderId: null }]
     });
     assert.deepEqual(r, { kind: "redirect", rootId: 1, folderId: null });
+  });
+
+  it("derives survivors from the committed snapshot before a deferred state update runs", () => {
+    const prepareRootRemoval = Reflect.get(rootRemoval, "prepareRootRemoval");
+    assert.equal(typeof prepareRootRemoval, "function");
+    const current = [
+      { id: 2, rootFolderId: 200, displayName: "removed" },
+      { id: 3, rootFolderId: 300, displayName: "survivor" }
+    ];
+    let rendered = current;
+    let applyDeferred: (() => void) | null = null;
+    const prepared = prepareRootRemoval(current, 2) as {
+      nextRoots: typeof current;
+      survivingRoots: Array<{ id: number; rootFolderId: number | null }>;
+    };
+    const deferStateCommit = (next: typeof current) => {
+      applyDeferred = () => { rendered = next; };
+    };
+    deferStateCommit(prepared.nextRoots);
+
+    assert.equal(rendered, current, "the simulated React state update has not committed yet");
+    assert.deepEqual(
+      decideRemoveRootRedirect({
+        removedRootId: 2,
+        selectedRootId: 2,
+        inspectedFolderRootId: null,
+        survivingRoots: prepared.survivingRoots
+      }),
+      { kind: "redirect", rootId: 3, folderId: 300 }
+    );
+    applyDeferred?.();
+    assert.deepEqual(rendered, [current[1]]);
   });
 });
 

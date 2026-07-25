@@ -39,7 +39,7 @@ import {
 import { runThumbnailCacheEnqueueBatches } from "./thumbnailCacheEnqueue";
 import { runCancellableMediaFocusLocate } from "./mediaFocusLocateWorkflow";
 import { decideRootScanRefresh } from "./scanRefresh";
-import { decideRemoveRootRedirect } from "./removeRootRedirect";
+import { decideRemoveRootRedirect, prepareRootRemoval } from "./removeRootRedirect";
 import {
   createLibraryErrorReportAttempt,
   publishThumbnailCacheStats,
@@ -320,6 +320,12 @@ export function useLibraryData(
   const scanRefreshActiveRootIdRef = useRef<number | null>(null);
   const scanRefreshSelectionVersionRef = useRef(0);
   const [roots, setRoots] = useState<RootRecord[]>([]);
+  const rootsRef = useRef(roots);
+  rootsRef.current = roots;
+  const replaceRoots = useCallback((next: RootRecord[]) => {
+    rootsRef.current = next;
+    setRoots(next);
+  }, []);
   const [folderChildrenByParent, setFolderChildrenByParent] = useState<Record<number, FolderRecord[]>>(
     {}
   );
@@ -1569,7 +1575,7 @@ export function useLibraryData(
     scope?.signal?.throwIfAborted();
     const response = await client.listRoots();
     scope?.signal?.throwIfAborted();
-    setRoots(response.items);
+    replaceRoots(response.items);
     const requestedRootId =
       scope && "rootId" in scope ? scope.rootId ?? null : selectedRootIdRef.current;
     const nextRootId = requestedRootId ?? response.items[0]?.id ?? null;
@@ -1586,7 +1592,7 @@ export function useLibraryData(
       nextRootId === null ? null : { rootId: nextRootId, folderId: nextFolderId }
     );
     return { roots: response.items, selectedRoot: nextRoot ?? null, selectedFolderId: nextFolderId };
-  }, [client, initializeFolderNavigationHistory]);
+  }, [client, initializeFolderNavigationHistory, replaceRoots]);
 
   // Refresh only the roots LIST (for status / lastScanAt display), WITHOUT
   // re-driving selection or navigation history. The 800ms scan refresh used the
@@ -1595,9 +1601,9 @@ export function useLibraryData(
   // in-flight refresh snapped the selection/expansion back to the old folder.
   const refreshRootsList = useCallback(async () => {
     const response = await client.listRoots();
-    setRoots(response.items);
+    replaceRoots(response.items);
     return response.items;
-  }, [client]);
+  }, [client, replaceRoots]);
 
   const loadTasks = useCallback(async () => {
     if (loadTasksRequestRef.current) {
@@ -2254,7 +2260,7 @@ export function useLibraryData(
         selectedFolderIdRef.current = null;
         selectRoot(null);
         selectFolder(null);
-        setRoots([]);
+        replaceRoots([]);
         return;
       }
       if (phase === "opening-library") {
@@ -2280,7 +2286,7 @@ export function useLibraryData(
       setSwitching(false);
     });
     return unsubscribe;
-  }, [loadLibrary]);
+  }, [loadLibrary, replaceRoots]);
 
   useEffect(() => {
     seenThumbnailPersistActiveRef.current = true;
@@ -2978,15 +2984,11 @@ export function useLibraryData(
   const removeRoot = useCallback(
     async (rootId: number) => {
       const reportingAttempt = createReportingAttempt();
-      // Optimistic: drop the root from the sidebar immediately, and capture the
-      // survivors (post-removal, in display order) so we can redirect the center
-      // view off the deleted folder in the same tick.
-      let survivingRoots: Array<{ id: number; rootFolderId: number | null }> = [];
-      setRoots((current) => {
-        const next = current.filter((root) => root.id !== rootId);
-        survivingRoots = next.map((root) => ({ id: root.id, rootFolderId: root.rootFolderId }));
-        return next;
-      });
+      // Derive navigation from the latest committed snapshot before scheduling
+      // React state. Functional updaters may run later, so values assigned from
+      // inside one cannot safely drive the redirect below.
+      const { nextRoots, survivingRoots } = prepareRootRemoval(rootsRef.current, rootId);
+      replaceRoots(nextRoots);
 
       // If the inspector was highlighting a folder from the removed root, clear
       // it (its cover fetch would reference a now-removed root) — independent of
@@ -3039,6 +3041,7 @@ export function useLibraryData(
       createReportingAttempt,
       prepareNavigationMediaReload,
       refreshRootsList,
+      replaceRoots,
       reportLibraryFailure,
       selectLibraryFolder
     ]
