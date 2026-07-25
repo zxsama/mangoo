@@ -1131,6 +1131,7 @@ async function createWindow(): Promise<void> {
     (_event, errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
       if (!isMainFrame) return;
       desktopLogger.error("renderer", "Main renderer failed to load", { errorCode });
+      mediaFocusCoordinator.failAll();
       void revealMainWindowForLaunchFailure(window, `did-fail-load:${errorCode}`);
     }
   );
@@ -1139,8 +1140,17 @@ async function createWindow(): Promise<void> {
       reason: details.reason,
       exitCode: details.exitCode
     });
+    mediaFocusCoordinator.failAll();
     void revealMainWindowForLaunchFailure(window, `render-process-gone:${details.reason}`);
   });
+  window.webContents.on(
+    "did-start-navigation",
+    (_event, _url, isInPlace, isMainFrame) => {
+      if (isMainFrame && !isInPlace) {
+        mediaFocusCoordinator.failAll();
+      }
+    }
+  );
 
   // Persist on move/resize so a forced shutdown loses at most
   // PERSIST_DEBOUNCE_MS of window state. The `before-quit` handler still

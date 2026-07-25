@@ -57,20 +57,18 @@ describe("media focus coordinator", () => {
     assert.equal(cancelled.length, 1);
   });
 
-  it("suspends timeout during an irreversible switch and serializes the next request", async () => {
+  it("bounds the switching stage, cancels late work, and advances a queued retry", async () => {
     const delivered: Array<{ requestId: string; libraryId: string }> = [];
     const cancelled: Array<{ requestId: string }> = [];
-    const coordinator = new MediaFocusCoordinator({ timeoutMs: 5 });
+    const coordinator = new MediaFocusCoordinator({ timeoutMs: 1_000, switchingTimeoutMs: 10 });
     const updateStage = Reflect.get(coordinator, "updateStage");
     assert.equal(typeof updateStage, "function", "the coordinator must accept explicit focus stages");
 
-    let firstSettled = false;
     const first = coordinator.request(
       { ...request, libraryId: "library-b" },
       (command) => delivered.push(command),
       (cancellation) => cancelled.push(cancellation)
     );
-    void first.then(() => { firstSettled = true; });
     const firstId = delivered[0]!.requestId;
     assert.equal(updateStage.call(coordinator, { requestId: firstId, stage: "switching" }), true);
 
@@ -79,16 +77,40 @@ describe("media focus coordinator", () => {
       (command) => delivered.push(command),
       (cancellation) => cancelled.push(cancellation)
     );
-    await new Promise((resolve) => setTimeout(resolve, 15));
-    assert.equal(firstSettled, false, "switching must not become a retryable timeout");
-    assert.equal(delivered.length, 1, "a retry must not overlap an irreversible switch");
-    assert.deepEqual(cancelled, []);
-
-    assert.equal(updateStage.call(coordinator, { requestId: firstId, stage: "locating" }), true);
-    assert.equal(coordinator.complete({ requestId: firstId, ok: true }), true);
-    assert.equal(await first, true);
-    assert.equal(delivered.length, 2, "the queued request starts only after switch completion");
+    const firstOutcome = await Promise.race([
+      first,
+      new Promise<"still-pending">((resolve) => setTimeout(() => resolve("still-pending"), 30))
+    ]);
+    assert.equal(firstOutcome, false, "switching must have a bounded renderer watchdog");
+    assert.deepEqual(cancelled, [{ requestId: firstId }]);
+    assert.equal(coordinator.complete({ requestId: firstId, ok: true }), false);
+    assert.equal(delivered.length, 2, "the next request must not remain blocked by a dead renderer");
     assert.equal(coordinator.complete({ requestId: delivered[1]!.requestId, ok: true }), true);
     assert.equal(await second, true);
+  });
+
+  it("settles a switching crash and permits a clean post-reload retry", async () => {
+    const delivered: Array<{ requestId: string }> = [];
+    const cancelled: Array<{ requestId: string }> = [];
+    const coordinator = new MediaFocusCoordinator({ timeoutMs: 1_000 });
+    const first = coordinator.request(
+      request,
+      (command) => delivered.push(command),
+      (cancellation) => cancelled.push(cancellation)
+    );
+    const firstId = delivered[0]!.requestId;
+    assert.equal(coordinator.updateStage({ requestId: firstId, stage: "switching" }), true);
+    const queued = coordinator.request(request, (command) => delivered.push(command));
+
+    coordinator.failAll();
+    assert.equal(await first, false);
+    assert.equal(await queued, false);
+    assert.deepEqual(cancelled, [{ requestId: firstId }]);
+
+    const retry = coordinator.request(request, (command) => delivered.push(command));
+    const retryId = delivered.at(-1)!.requestId;
+    assert.notEqual(retryId, firstId);
+    assert.equal(coordinator.complete({ requestId: retryId, ok: true }), true);
+    assert.equal(await retry, true);
   });
 });

@@ -20,11 +20,16 @@ interface PendingMediaFocus {
 export class MediaFocusCoordinator {
   private readonly pending = new Map<string, PendingMediaFocus>();
   private readonly queue: string[] = [];
+  private readonly switchingTimeoutMs: number;
   private readonly timeoutMs: number;
   private activeRequestId: string | null = null;
 
-  constructor(options: { timeoutMs?: number } = {}) {
+  constructor(options: { switchingTimeoutMs?: number; timeoutMs?: number } = {}) {
     this.timeoutMs = options.timeoutMs ?? 15_000;
+    // A healthy cross-library switch can include three 12s Core health
+    // attempts. Keep that irreversible lifecycle serialized in Main while
+    // still bounding a renderer that disappears before its locating ACK.
+    this.switchingTimeoutMs = options.switchingTimeoutMs ?? 60_000;
   }
 
   request(
@@ -59,7 +64,7 @@ export class MediaFocusCoordinator {
     if (update.stage === "switching") {
       if (request.stage !== "awaiting" && request.stage !== "switching") return false;
       request.stage = "switching";
-      this.clearRequestTimeout(request);
+      this.armRequestTimeout(update.requestId, request, this.switchingTimeoutMs);
       return true;
     }
     if (request.stage !== "awaiting" && request.stage !== "switching" && request.stage !== "locating") {
@@ -131,9 +136,13 @@ export class MediaFocusCoordinator {
     }
   }
 
-  private armRequestTimeout(requestId: string, request: PendingMediaFocus): void {
+  private armRequestTimeout(
+    requestId: string,
+    request: PendingMediaFocus,
+    timeoutMs = this.timeoutMs
+  ): void {
     this.clearRequestTimeout(request);
-    request.timeout = setTimeout(() => this.cancelAndSettle(requestId), this.timeoutMs);
+    request.timeout = setTimeout(() => this.cancelAndSettle(requestId), timeoutMs);
   }
 
   private clearRequestTimeout(request: PendingMediaFocus): void {

@@ -488,6 +488,21 @@ test("hardening source contract uses shared DTOs, sender authorization, and fail
   assert.match(main, /did-fail-load[\s\S]*destroyFailedSecondaryWindow/);
   assert.match(
     main,
+    /did-start-navigation[\s\S]{0,500}mediaFocusCoordinator\.failAll\(\)/,
+    "a main-frame reload must settle pending media focus requests"
+  );
+  assert.match(
+    main,
+    /Main renderer failed to load[\s\S]{0,300}mediaFocusCoordinator\.failAll\(\)/,
+    "a main renderer load failure must settle pending media focus requests"
+  );
+  assert.match(
+    main,
+    /Main renderer process gone[\s\S]{0,300}mediaFocusCoordinator\.failAll\(\)/,
+    "a main renderer crash must settle pending media focus requests"
+  );
+  assert.match(
+    main,
     /ipcMain\.handle\(NOTIFICATION_IPC_CHANNELS\.compact, async \(event\) => \{\s*requireNotificationIpcAccess\([^;]+;\s*notificationBroadcastTargets\.register\(event\.sender\);\s*const service = await ensureNotificationService\(\)/
   );
   assert.match(main, /notificationIpcTargetLifecycle\.track\(window\.webContents\)/);
