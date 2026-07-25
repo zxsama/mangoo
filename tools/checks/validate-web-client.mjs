@@ -139,6 +139,10 @@ const windowedMediaGeometry = read(
 );
 const main = read("apps/web/src/main.tsx");
 const app = read("apps/web/src/app/App.tsx");
+const previewPrefetchWindowPath = "apps/web/src/app/previewPrefetchWindow.ts";
+const previewPrefetchWindow = existsSync(path.join(root, previewPrefetchWindowPath))
+  ? read(previewPrefetchWindowPath)
+  : "";
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const shellOverlayHost = read("apps/web/src/app-shell/ShellOverlayHost.tsx");
 const notificationPopoverPath =
@@ -1371,11 +1375,11 @@ if (
   !/const\s+mediaSignature\s*=\s*mediaFileContentSignature\(mediaRecord\);/.test(
     mediaResources
   ) ||
-  !/function\s+originalPreviewRequestKey\(mediaRecord:\s*MediaRecord\):\s*string\s*\{\s*return\s+\[mediaFileContentSignature\(mediaRecord\),\s*"original"\]\.join\(":\"\);\s*\}/.test(
+  !/function\s+originalPreviewRequestKey\(mediaRecord:\s*MediaRecord\):\s*string\s*\{\s*return\s+\[mediaCacheEpoch,\s*mediaFileContentSignature\(mediaRecord\),\s*"original"\]\.join\(":\"\);\s*\}/.test(
     mediaResources
   )
 ) {
-  fail("mediaResources original preview requests must be keyed by stable file signatures, not thumbnail state signatures");
+  fail("mediaResources original preview requests must be keyed by stable file signatures (+ library epoch), not thumbnail state signatures");
 }
 if (
   !/const\s+cacheKey\s*=\s*`original:\$\{mediaFileContentSignature\(item\)\}`/.test(
@@ -1736,11 +1740,16 @@ if (
 }
 if (
   !/buildPreviewPrefetchWindow/.test(app) ||
-  !/selectedIndex\s*\+\s*offset/.test(app) ||
   !/previewBufferLimitMbToBytes/.test(app) ||
-  !/prefetchOriginalPreview\(neighbor/.test(app)
+  !/prefetchOriginalPreview\(neighbor/.test(app) ||
+  // The window builder lives in a dedicated, unit-tested module and must warm
+  // BOTH directions around the selected item (forward + backward), image-only.
+  !/export function buildPreviewPrefetchWindow/.test(previewPrefetchWindow) ||
+  !/selectedIndex\s*\+\s*distance/.test(previewPrefetchWindow) ||
+  !/selectedIndex\s*-\s*distance/.test(previewPrefetchWindow) ||
+  !/kind\s*!==\s*"image"/.test(previewPrefetchWindow)
 ) {
-  fail("Central preview must prefetch subsequent images up to the configured preview buffer budget");
+  fail("Central preview must prefetch neighbor images (both directions) up to the configured preview buffer budget");
 }
 if (/\},\s*\[media,\s*source,\s*versionKey\]\);/.test(mediaPreview)) {
   fail("MediaPreview original-media effect must not reset shared-preview loading for unchanged media object identity churn");
@@ -1891,11 +1900,12 @@ if (
   fail("Global preview shortcuts must route through App preview navigation locking instead of selecting neighbors directly");
 }
 if (
-  !/MAX_PREVIEW_PREFETCH_CANDIDATES/.test(app) ||
+  !/MAX_PREVIEW_PREFETCH_CANDIDATES/.test(previewPrefetchWindow) ||
   !/previewBufferLimitMbToBytes/.test(app) ||
-  !/buildPreviewPrefetchWindow[\s\S]*selectedIndex\s*\+\s*offset/.test(app)
+  !/buildPreviewPrefetchWindow[\s\S]*bufferBytes/.test(previewPrefetchWindow) ||
+  !/windowItems\.length\s*<\s*MAX_PREVIEW_PREFETCH_CANDIDATES/.test(previewPrefetchWindow)
 ) {
-  fail("App must keep center original preview prefetch bounded by buffer budget and max candidate count");
+  fail("Preview prefetch window must stay bounded by buffer budget and max candidate count");
 }
 if (!shortcutBindings.includes("toggleSidebars") || !shortcutBindings.includes('defaultBinding: "Tab"')) {
   fail("shortcut bindings must expose editable Tab binding for toggling both sidebars");

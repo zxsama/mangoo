@@ -20,8 +20,18 @@ export function LibraryLoadingOverlay({
   if (phase === "ready") return null;
   const error = isErrorPhase(phase);
   const mediaLoading = phase === "loading-media";
+  // During the actual teardown/restart window (starting-core / opening-library /
+  // error) the old library's Core is gone and its content must not show — cover
+  // the stage with an opaque backdrop so only the loading/switch UI is visible.
+  // `loading-media` overlays content that is already being repopulated for the
+  // correct library, so it stays a light, non-blocking progress card.
+  const solidBackdrop = !mediaLoading;
   return (
-    <div className="library-loading-overlay" aria-live="polite" aria-busy={!error}>
+    <div
+      className={`library-loading-overlay${solidBackdrop ? " library-loading-overlay--solid" : ""}`}
+      aria-live="polite"
+      aria-busy={!error}
+    >
       <LiquidGlassSurface
         as="div"
         className={`library-loading-card${mediaLoading ? " library-loading-card--progress" : ""}`}

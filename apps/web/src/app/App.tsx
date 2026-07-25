@@ -82,6 +82,7 @@ import { emitRendererStartupLog } from "../core/notificationReporting";
 import { runCoordinatedMediaFocusSwitch } from "../core/mediaFocusLocateWorkflow";
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
+import { buildPreviewPrefetchWindow } from "./previewPrefetchWindow";
 import {
   prepareMediaFocusNavigation,
   type MediaGridLocateRequest
@@ -95,8 +96,6 @@ const DEFAULT_PREVIEW_VIEW_STATE: PreviewViewState = {
   mode: "fit-long-edge",
   scale: 1
 };
-const PREVIEW_PREFETCH_UNKNOWN_MEDIA_BYTES = 32 * 1024 * 1024;
-const MAX_PREVIEW_PREFETCH_CANDIDATES = 512;
 const LIBRARY_LAYOUT_STORAGE_KEY = "megle.library.layout-mode";
 
 export function App() {
@@ -803,6 +802,13 @@ export function App() {
   }
 
   function renderCenterPane() {
+    // During a library switch, render nothing in the center: the
+    // `.workbench-column-center` already IS a frosted-glass surface, so leaving
+    // it empty shows that existing glass (no stale grid, no OnboardingHero
+    // flash) — do NOT stack another blurred overlay on top of it.
+    if (library.switching) {
+      return null;
+    }
     return library.roots.length === 0 && !library.loading ? (
       <OnboardingHero
         rootCount={library.roots.length}
@@ -905,40 +911,6 @@ function previewBufferLimitMbToBytes(limitMb: number): number {
 
 function thumbnailCacheLimitMbToBytes(limitMb: number): number {
   return Math.max(0, Math.round(limitMb * 1024 * 1024));
-}
-
-function buildPreviewPrefetchWindow(
-  media: MediaRecord[],
-  selectedIndex: number,
-  bufferBytes: number
-): MediaRecord[] {
-  if (bufferBytes <= 0) {
-    return [];
-  }
-
-  const windowItems: MediaRecord[] = [];
-  let estimatedBytes = 0;
-  for (
-    let offset = 1;
-    selectedIndex + offset < media.length && windowItems.length < MAX_PREVIEW_PREFETCH_CANDIDATES;
-    offset += 1
-  ) {
-    const neighbor = media[selectedIndex + offset];
-    if (!neighbor || neighbor.kind !== "image") {
-      continue;
-    }
-    const neighborBytes =
-      neighbor.size > 0 ? neighbor.size : PREVIEW_PREFETCH_UNKNOWN_MEDIA_BYTES;
-    if (windowItems.length > 0 && estimatedBytes + neighborBytes > bufferBytes) {
-      break;
-    }
-    windowItems.push(neighbor);
-    estimatedBytes += neighborBytes;
-    if (estimatedBytes >= bufferBytes) {
-      break;
-    }
-  }
-  return windowItems;
 }
 
 function readStoredLibraryLayoutMode(): LibraryLayoutMode {

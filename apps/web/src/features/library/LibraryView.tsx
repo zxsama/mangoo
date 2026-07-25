@@ -496,6 +496,7 @@ export function LibraryInspectorPane({
       selectedFolderCoverMedia={selectedFolderCoverMedia}
       selectedMedia={selectedMedia}
       showPreviewImage={!previewOpen}
+      suppressEmptyState={library.switching}
       thumbnail={selectedMedia ? library.thumbnailStatesByMediaId[selectedMedia.id] : undefined}
       selectedFolderCoverThumbnail={
         selectedFolderCover ? library.thumbnailStatesByMediaId[selectedFolderCover.id] : undefined

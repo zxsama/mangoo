@@ -32,12 +32,14 @@ import {
   pickPreferredThumbnailResponse,
   readCachedThumbnailStates,
   requestThumbnailState,
+  resetMediaCachesForLibrarySwitch,
   type ThumbnailRequestPriority,
   shouldRequestThumbnailState
 } from "./mediaResources";
 import { runThumbnailCacheEnqueueBatches } from "./thumbnailCacheEnqueue";
 import { runCancellableMediaFocusLocate } from "./mediaFocusLocateWorkflow";
 import { decideRootScanRefresh } from "./scanRefresh";
+import { decideRemoveRootRedirect } from "./removeRootRedirect";
 import {
   createLibraryErrorReportAttempt,
   publishThumbnailCacheStats,
@@ -141,6 +143,7 @@ export interface LibraryState {
   loadingFolderDescendantIds: Set<number>;
   loadingMoreFolderIds: Set<number>;
   loading: boolean;
+  switching: boolean;
   loadingMoreMedia: boolean;
   mediaHasMore: boolean;
   thumbnailStatesByMediaId: Record<number, ThumbnailResponse>;
@@ -290,6 +293,7 @@ export function useLibraryData(
   const seenThumbnailPersistActiveRef = useRef(true);
   const loadTasksRequestRef = useRef<Promise<TaskRecord[]> | null>(null);
   const libraryRequestGenerationRef = useRef(0);
+  const prepareNavigationMediaReloadRef = useRef<(() => void) | null>(null);
   const interactiveFolderScanControllerRef = useRef<AbortController | null>(null);
   const thumbnailPriorityScopeSyncControllerRef = useRef<AbortController | null>(null);
   const thumbnailCacheStatsControllerRef = useRef<AbortController | null>(null);
@@ -387,6 +391,10 @@ export function useLibraryData(
   const thumbnailPriorityScopeSyncTrailingPendingRef = useRef(false);
   const pendingInteractiveScanRequestRef = useRef<PendingInteractiveScanRequest | null>(null);
   const [loading, setLoading] = useState(true);
+  // True during a library switch's teardown window (starting-core /
+  // opening-library), so transient empty states (no roots / no selection) can be
+  // suppressed instead of flashing "No roots"/"No selection" placeholder text.
+  const [switching, setSwitching] = useState(false);
   const [loadingMoreMedia, setLoadingMoreMedia] = useState(false);
   const [addingRoot, setAddingRoot] = useState(false);
   const [rescanningRootIds, setRescanningRootIds] = useState<Set<number>>(() => new Set());
@@ -2231,8 +2239,33 @@ export function useLibraryData(
 
   useEffect(() => {
     const unsubscribe = subscribeLibraryPhase((phase) => {
+      if (phase === "starting-core") {
+        // A library switch has BEGUN (Core is being restarted). Tear the old
+        // library's view down immediately — before the new Core is even healthy
+        // — so no stale content lingers and no old-library thumbnail can bleed
+        // into the new library (which reuses the same fileId integers). Bumping
+        // the media-cache epoch invalidates every thumbnail/preview cache + any
+        // still-in-flight (unabortable) thumbnail fetch in one shot.
+        libraryRequestGenerationRef.current += 1;
+        setSwitching(true);
+        resetMediaCachesForLibrarySwitch();
+        prepareNavigationMediaReloadRef.current?.();
+        selectedRootIdRef.current = null;
+        selectedFolderIdRef.current = null;
+        selectRoot(null);
+        selectFolder(null);
+        setRoots([]);
+        return;
+      }
+      if (phase === "opening-library") {
+        // Still mid-teardown (new Core opening) — keep the switch state so the
+        // sidebars stay clean.
+        setSwitching(true);
+        return;
+      }
       if (phase === "loading-media") {
         libraryRequestGenerationRef.current += 1;
+        setSwitching(false);
         activeLibraryContextRef.current = null;
         thumbnailCacheStatsControllerRef.current?.abort();
         thumbnailCacheStatsControllerRef.current = null;
@@ -2240,7 +2273,11 @@ export function useLibraryData(
         setThumbnailCacheStatsLoading(false);
         loadTasksRequestRef.current = null;
         void loadLibrary({ rootId: null, folderId: null });
+        return;
       }
+      // "ready" or an error phase: the switch settled — clear the switch state so
+      // empty-state placeholders show normally again for a genuinely empty library.
+      setSwitching(false);
     });
     return unsubscribe;
   }, [loadLibrary]);
@@ -2802,6 +2839,10 @@ export function useLibraryData(
     thumbnailPriorityScopeRef.current = emptyThumbnailPriorityScope();
     thumbnailPriorityScopeSyncKeyRef.current = null;
   }, [abortStaleFolderRequests, abortStaleMediaPageRequests]);
+  // Latest-value ref so the library-phase subscriber effect (declared earlier)
+  // can invoke the current prepareNavigationMediaReload without a use-before-
+  // assignment cycle.
+  prepareNavigationMediaReloadRef.current = prepareNavigationMediaReload;
 
   const selectLibraryFolder = useCallback(
     (entry: FolderNavigationEntry, options?: { recordHistory?: boolean }) => {
@@ -2937,11 +2978,46 @@ export function useLibraryData(
   const removeRoot = useCallback(
     async (rootId: number) => {
       const reportingAttempt = createReportingAttempt();
-      // Optimistic: drop the root from the sidebar immediately.
-      setRoots((current) => current.filter((root) => root.id !== rootId));
-      if (selectedRootIdRef.current === rootId) {
+      // Optimistic: drop the root from the sidebar immediately, and capture the
+      // survivors (post-removal, in display order) so we can redirect the center
+      // view off the deleted folder in the same tick.
+      let survivingRoots: Array<{ id: number; rootFolderId: number | null }> = [];
+      setRoots((current) => {
+        const next = current.filter((root) => root.id !== rootId);
+        survivingRoots = next.map((root) => ({ id: root.id, rootFolderId: root.rootFolderId }));
+        return next;
+      });
+
+      // If the inspector was highlighting a folder from the removed root, clear
+      // it (its cover fetch would reference a now-removed root) — independent of
+      // whether that root was the one open in the center.
+      setSelectedFolderInfoState((current) =>
+        current && current.rootId === rootId ? null : current
+      );
+
+      // Redirect (or blank) the center view when the OPEN root is the removed one,
+      // so the deleted folder stops rendering. selectLibraryFolder reuses the
+      // normal navigation reset (clears media/selection) + reloads.
+      const redirect = decideRemoveRootRedirect({
+        removedRootId: rootId,
+        selectedRootId: selectedRootIdRef.current,
+        inspectedFolderRootId: null, // inspector handled above
+        survivingRoots
+      });
+      if (redirect.kind === "redirect") {
+        selectLibraryFolder(
+          { rootId: redirect.rootId, folderId: redirect.folderId },
+          { recordHistory: false }
+        );
+      } else if (redirect.kind === "blank") {
+        // Nothing left to show: clear selection + media so the center goes blank.
+        prepareNavigationMediaReload();
+        selectedRootIdRef.current = null;
+        selectedFolderIdRef.current = null;
         selectRoot(null);
+        selectFolder(null);
       }
+
       try {
         await client.removeRoot(rootId);
         // Purge runs in the background; resync the lightweight roots list so any
@@ -2958,7 +3034,14 @@ export function useLibraryData(
         await refreshRootsList();
       }
     },
-    [client, createReportingAttempt, refreshRootsList, reportLibraryFailure]
+    [
+      client,
+      createReportingAttempt,
+      prepareNavigationMediaReload,
+      refreshRootsList,
+      reportLibraryFailure,
+      selectLibraryFolder
+    ]
   );
 
   const setQ = useCallback((q: string) => {
@@ -3581,6 +3664,7 @@ export function useLibraryData(
     loadingFolderDescendantIds,
     loadingMoreFolderIds,
     loading,
+    switching,
     loadingMoreMedia,
     mediaHasMore,
     thumbnailStatesByMediaId: freshThumbnailStatesByMediaId,

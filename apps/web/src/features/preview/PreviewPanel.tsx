@@ -11,6 +11,9 @@ interface PreviewPanelProps {
   selectedMedia: MediaRecord | null;
   thumbnail?: ThumbnailResponse;
   showPreviewImage?: boolean;
+  // Suppress the "No selection" placeholder (e.g. during a library switch, when
+  // the transient empty state should read as blank, not as a real empty panel).
+  suppressEmptyState?: boolean;
   children?: ReactNode;
 }
 
@@ -20,6 +23,7 @@ export function PreviewPanel({
   selectedFolderCoverThumbnail,
   selectedMedia,
   showPreviewImage = true,
+  suppressEmptyState = false,
   thumbnail,
   children
 }: PreviewPanelProps) {
@@ -88,7 +92,9 @@ export function PreviewPanel({
           </dl>
         </>
       ) : (
-        <div className="empty-panel">No selection</div>
+        suppressEmptyState ? null : (
+          <div className="empty-panel">No selection</div>
+        )
       )}
     </aside>
   );

@@ -7889,6 +7889,19 @@ button:disabled {
   z-index: 5;
   pointer-events: none;
 }
+/* Teardown/restart window (starting-core / opening-library / error): cover the
+   stage with an opaque dark backdrop so the old library's content is hidden and
+   only the loading/switch UI shows. Captures pointer events so stale content
+   below cannot be interacted with mid-switch. */
+/* Teardown/restart window (starting-core / opening-library / error): the center
+   pane renders no content during a switch (App.renderCenterPane returns null), so
+   the `.workbench-column-center`'s own frosted-glass surface already shows behind
+   the loading card. This overlay only needs to host the card and block stray
+   pointer input — it must NOT add its own background/backdrop-filter, or it would
+   stack a SECOND blur on top of the center's existing glass. */
+.library-loading-overlay--solid {
+  pointer-events: auto;
+}
 .library-loading-card {
   display: flex;
   flex-direction: column;

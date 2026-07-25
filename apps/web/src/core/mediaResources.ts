@@ -5,6 +5,7 @@ import {
   normalizeMediaThumbnailState
 } from "./mediaContentSignature";
 import {
+  clearThumbnailObjectUrlCache as clearThumbnailObjectUrlCacheInternal,
   readCachedThumbnailObjectUrl as readCachedThumbnailObjectUrlInternal,
   rememberThumbnailObjectUrl as rememberThumbnailObjectUrlInternal
 } from "./thumbnailObjectUrlCache";
@@ -90,6 +91,34 @@ let activeAheadForegroundResourceRequests = 0;
 let activeFallbackForegroundResourceRequests = 0;
 let originalPreviewBlobCacheBytes = 0;
 let originalPreviewBlobCacheLimitBytes = DEFAULT_ORIGINAL_PREVIEW_BUFFER_LIMIT_BYTES;
+// Monotonic per-library epoch. Every switch to a different library bumps this,
+// and it is baked into every string cache/dedup key below. A fresh .sqlite
+// reuses the same fileId integers (1, 2, 3, ...), so a cache/in-flight entry
+// keyed by fileId alone would be served for the NEW library's same-id file —
+// the cross-library "串图" bleed. Threading the epoch guarantees old-library
+// keys can never match new-library lookups. Bumping (vs only clearing) also
+// neutralises in-flight thumbnail fetches that deliberately run without an
+// AbortSignal: they resolve into a now-dead epoch key that nothing reads.
+let mediaCacheEpoch = 0;
+
+export function mediaCacheEpochToken(): number {
+  return mediaCacheEpoch;
+}
+
+// Invalidate ALL media/thumbnail/preview caches for a library switch: bump the
+// epoch (so any straggler in-flight request resolves into a dead key) and clear
+// the number-keyed caches (which carry no epoch in their key). Call this the
+// instant a switch begins ("starting-core"), before the new Core is healthy.
+export function resetMediaCachesForLibrarySwitch(): void {
+  mediaCacheEpoch += 1;
+  thumbnailResourceCache.clear();
+  inFlightThumbnailRequests.clear();
+  inFlightThumbnailBlobRequests.clear();
+  originalPreviewBlobCache.clear();
+  inFlightOriginalPreviewRequests.clear();
+  originalPreviewBlobCacheBytes = 0;
+  clearThumbnailObjectUrlCacheInternal();
+}
 const foregroundResourceRequestQueue: QueuedForegroundResourceRequest[] = [];
 
 export async function requestThumbnailState(
@@ -160,7 +189,7 @@ export async function requestThumbnailBlob(
   // key fetched the same blob 2-3x under scroll churn (the residual "reload"
   // flashes). Coalescing on file+target means the first in-flight request is
   // reused; the version stays in the actual URL only as an HTTP cache-buster.
-  const requestKey = [fileId, GRID_THUMBNAIL_TARGET].join(":");
+  const requestKey = [mediaCacheEpoch, fileId, GRID_THUMBNAIL_TARGET].join(":");
   const inFlight = inFlightThumbnailBlobRequests.get(requestKey);
   if (inFlight && !inFlight.controller.signal.aborted) {
     return withSharedAbortSignal(inFlight, options.signal);
@@ -191,7 +220,7 @@ export function thumbnailObjectUrlCacheKey(
   mediaSignature: string,
   versionKey: number | null
 ): string {
-  return `${fileId}:${GRID_THUMBNAIL_TARGET}:${versionKey ?? mediaSignature}`;
+  return `${mediaCacheEpoch}:${fileId}:${GRID_THUMBNAIL_TARGET}:${versionKey ?? mediaSignature}`;
 }
 
 /// Prefetch a ready thumbnail's WebP bytes into the decoded object-URL cache so
@@ -504,7 +533,7 @@ function thumbnailRequestKey(mediaRecord: MediaRecord): string {
   // Dedup by content identity only, not priority (see requestThumbnailBlob): the
   // same record polled at "visible" then "ahead" must share one in-flight state
   // request, not fire two.
-  return [mediaContentSignature(mediaRecord), GRID_THUMBNAIL_TARGET].join(":");
+  return [mediaCacheEpoch, mediaContentSignature(mediaRecord), GRID_THUMBNAIL_TARGET].join(":");
 }
 
 function thumbnailStateSchedulerPriority(
@@ -514,7 +543,7 @@ function thumbnailStateSchedulerPriority(
 }
 
 function originalPreviewRequestKey(mediaRecord: MediaRecord): string {
-  return [mediaFileContentSignature(mediaRecord), "original"].join(":");
+  return [mediaCacheEpoch, mediaFileContentSignature(mediaRecord), "original"].join(":");
 }
 
 function rememberOriginalPreviewBlob(

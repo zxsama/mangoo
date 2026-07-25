@@ -188,7 +188,9 @@ export function LibrarySidebar({
             highlightedFolderId={highlightedFolderId}
           />
         ))}
-        {library.roots.length === 0 ? <div className="empty-panel">No roots</div> : null}
+        {library.roots.length === 0 && !library.switching ? (
+          <div className="empty-panel">No roots</div>
+        ) : null}
       </div>
     </aside>
   );
