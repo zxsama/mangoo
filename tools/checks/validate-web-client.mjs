@@ -569,7 +569,7 @@ if (
   fail("requestThumbnailBlob must forward shared AbortController and promoted priority to the thumbnail blob fetch");
 }
 if (
-  !/scheduleForegroundResourceRequest\(\s*resourcePriority,\s*\(signal\)\s*=>\s*fetchOriginalPreviewBlob\(mediaRecord,\s*mediaSignature,\s*signal,\s*coreRequestPriority\),\s*controller\s*\)/.test(
+  !/scheduleForegroundResourceRequest\(\s*resourcePriority,\s*\(signal\)\s*=>\s*fetchOriginalPreviewBlob\(\s*mediaRecord,\s*mediaSignature,\s*requestEpoch,\s*signal,\s*coreRequestPriority\s*\),\s*controller\s*\)/.test(
     mediaResources
   )
 ) {
@@ -1567,12 +1567,18 @@ if (
   /return\s+fetchOriginalPreviewBlob\(mediaRecord,\s*mediaSignature,\s*options\.signal\)/.test(
     mediaResources
   ) ||
-  !/const\s+request\s*=\s*scheduleForegroundResourceRequest\(\s*resourcePriority,\s*\(signal\)\s*=>\s*fetchOriginalPreviewBlob\(mediaRecord,\s*mediaSignature,\s*signal,\s*coreRequestPriority\),\s*controller\s*\)\.finally/.test(
+  !/const\s+request\s*=\s*scheduleForegroundResourceRequest\(\s*resourcePriority,\s*\(signal\)\s*=>\s*fetchOriginalPreviewBlob\(\s*mediaRecord,\s*mediaSignature,\s*requestEpoch,\s*signal,\s*coreRequestPriority\s*\),\s*controller\s*\)\.finally/.test(
     mediaResources
   ) ||
   !/return\s+withSharedAbortSignal\(entry,\s*options\.signal\);/.test(mediaResources)
 ) {
   fail("mediaResources original preview requests must coalesce abortable consumers through shared in-flight fetches");
+}
+if (
+  !/abortSharedRequests\(inFlightOriginalPreviewRequests\)/.test(mediaResources) ||
+  !/requestEpoch\s*===\s*mediaCacheEpoch/.test(mediaResources)
+) {
+  fail("library switches must abort old original requests and reject stale-epoch cache writes");
 }
 if (
   /return\s+fetchThumbnailBlob\(fileId,\s*versionKey,\s*options\.signal\)/.test(

@@ -111,11 +111,11 @@ export function mediaCacheEpochToken(): number {
 // instant a switch begins ("starting-core"), before the new Core is healthy.
 export function resetMediaCachesForLibrarySwitch(): void {
   mediaCacheEpoch += 1;
+  abortSharedRequests(inFlightThumbnailRequests);
+  abortSharedRequests(inFlightThumbnailBlobRequests);
+  abortSharedRequests(inFlightOriginalPreviewRequests);
   thumbnailResourceCache.clear();
-  inFlightThumbnailRequests.clear();
-  inFlightThumbnailBlobRequests.clear();
   originalPreviewBlobCache.clear();
-  inFlightOriginalPreviewRequests.clear();
   originalPreviewBlobCacheBytes = 0;
   clearThumbnailObjectUrlCacheInternal();
 }
@@ -354,9 +354,16 @@ export function requestOriginalPreviewBlob(
   }
 
   const controller = new AbortController();
+  const requestEpoch = mediaCacheEpoch;
   const request = scheduleForegroundResourceRequest(
     resourcePriority,
-    (signal) => fetchOriginalPreviewBlob(mediaRecord, mediaSignature, signal, coreRequestPriority),
+    (signal) => fetchOriginalPreviewBlob(
+      mediaRecord,
+      mediaSignature,
+      requestEpoch,
+      signal,
+      coreRequestPriority
+    ),
     controller
   ).finally(() => {
     if (inFlightOriginalPreviewRequests.get(requestKey)?.request === request) {
@@ -385,7 +392,6 @@ export function prefetchOriginalPreview(
     if (isAbortError(cause)) {
       return;
     }
-    deleteOriginalPreviewCacheEntry(mediaRecord.id);
   });
 }
 
@@ -560,6 +566,13 @@ function rememberOriginalPreviewBlob(
   });
   originalPreviewBlobCacheBytes += byteSize;
   pruneOriginalPreviewCache();
+}
+
+function abortSharedRequests<T>(requests: Map<string, SharedRequest<T>>): void {
+  for (const request of requests.values()) {
+    request.controller.abort();
+  }
+  requests.clear();
 }
 
 function deleteOriginalPreviewCacheEntry(fileId: number): void {
@@ -779,6 +792,7 @@ function fetchThumbnailState(
 function fetchOriginalPreviewBlob(
   mediaRecord: MediaRecord,
   mediaSignature: string,
+  requestEpoch: number,
   signal: AbortSignal | undefined,
   coreRequestPriority: CoreRequestPriority
 ): Promise<Blob> {
@@ -789,7 +803,9 @@ function fetchOriginalPreviewBlob(
       version: mediaSignature
     })
     .then((blob) => {
-      rememberOriginalPreviewBlob(mediaRecord, mediaSignature, blob);
+      if (requestEpoch === mediaCacheEpoch) {
+        rememberOriginalPreviewBlob(mediaRecord, mediaSignature, blob);
+      }
       return blob;
     });
 }
