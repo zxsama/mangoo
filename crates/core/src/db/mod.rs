@@ -1522,6 +1522,7 @@ impl Database {
         Ok(updated != 0)
     }
 
+    #[cfg(test)]
     pub fn create_root_scan_task(&self, root_id: i64) -> anyhow::Result<i64> {
         self.create_root_scan_task_with_origin(root_id, NotificationOrigin::Background)
     }
@@ -1637,6 +1638,7 @@ impl Database {
 
     /// All roots currently mid-purge (used by startup recovery). Uses the
     /// partial index `idx_roots_pending_delete`.
+    #[cfg(test)]
     pub fn roots_pending_delete_ids(&self) -> anyhow::Result<Vec<i64>> {
         let mut stmt = self
             .connection
@@ -2011,6 +2013,7 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
     pub fn create_interactive_folder_scan_task(&self, folder_id: i64) -> anyhow::Result<i64> {
         self.create_interactive_folder_scan_task_with_origin(
             folder_id,

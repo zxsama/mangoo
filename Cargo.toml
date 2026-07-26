@@ -42,5 +42,3 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3
-[profile.dev.package.jpeg-decoder]
-opt-level = 3
