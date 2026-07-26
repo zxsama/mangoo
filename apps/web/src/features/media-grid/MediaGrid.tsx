@@ -2475,6 +2475,19 @@ function ReadyThumbnail({
       // against setState after unmount.
     })
       .then((blob) => {
+        // Another tile or ahead prefetch may have populated the shared cache
+        // while this request was in flight. Adopt that durable URL before
+        // creating a redundant blob URL that would be revoked immediately.
+        const racedCachedObjectUrl = readCachedThumbnailObjectUrl(cacheKey);
+        if (racedCachedObjectUrl) {
+          if (!revoked) {
+            objectUrlRef.current = racedCachedObjectUrl;
+            cacheOwnsObjectUrlRef.current = true;
+            setSrc(racedCachedObjectUrl);
+          }
+          return;
+        }
+
         objectUrl = URL.createObjectURL(blob);
         const nextObjectUrl = objectUrl;
         if (revoked) {
