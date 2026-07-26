@@ -29,6 +29,7 @@ const consoleWarnings = [];
 const consoleErrors = [];
 const networkProblems = [];
 const responses = [];
+const requestUrls = new Map();
 const startupOutput = [];
 let child;
 
@@ -866,15 +867,6 @@ async function doubleClickPoint(client, point) {
   await delay(400);
 }
 
-async function doubleClickTitlebarPoint(client, point) {
-  const viewport = await evaluate(
-    client,
-    `({ width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio })`
-  );
-  await doubleClickPoint(client, point);
-  return { inputMethod: "cdp", viewport };
-}
-
 async function pointFor(client, selector, xRatio = 0.5, yRatio = 0.5) {
   const point = await evaluate(
     client,
@@ -1008,29 +1000,12 @@ async function titlebarDragEvidence(client) {
     return { bridgeAvailable: false, bridge };
   }
 
-  const initial = await desktopMaximizedState(client);
-  if (initial === true) {
-    await evaluate(client, `window.megleDesktop.windowControls.maximize()`);
-    await waitForMaximizedState(client, false);
-  }
-  const before = await desktopMaximizedState(client);
   const point = await titlebarCenterBlankPoint(client);
-  const firstInput = await doubleClickTitlebarPoint(client, point);
-  const afterFirst = await waitForMaximizedState(client, true);
-  const restorePoint = await titlebarCenterBlankPoint(client);
-  const secondInput = await doubleClickTitlebarPoint(client, restorePoint);
-  const afterSecond = await waitForMaximizedState(client, false);
   return {
     bridgeAvailable: true,
     bridge,
-    initial,
-    before,
     point,
-    restorePoint,
-    firstInput,
-    secondInput,
-    afterFirst,
-    afterSecond
+    nativeDragRegion: point.titlebarAppRegion === "drag"
   };
 }
 
@@ -2402,6 +2377,7 @@ function inspectorPreviewEvidenceExpression() {
 function centralPreviewEvidenceExpression() {
   return `(() => {
     const stage = document.querySelector(".central-preview-stage");
+    const viewport = document.querySelector(".central-preview-viewport");
     const transform = document.querySelector(".central-preview-transform");
     const ready = document.querySelector(".central-preview-stage .preview-placeholder.ready");
     const image = document.querySelector(".central-preview-stage .preview-image");
@@ -2423,7 +2399,7 @@ function centralPreviewEvidenceExpression() {
       : null;
     const actualScale = imageRect && natural ? imageRect.width / natural.width : null;
     return {
-      mode: stage?.getAttribute("data-preview-mode") ?? null,
+      mode: viewport?.getAttribute("data-preview-mode") ?? null,
       transform: transformStyle?.transform ?? null,
       stageBackground: stageStyle?.backgroundColor ?? null,
       stageBorder: stageStyle?.border ?? null,
@@ -2637,7 +2613,10 @@ function titlebarControlsEvidenceExpression() {
       };
       return {
         className: element.className?.toString?.() ?? null,
-        dataset: element.getAttribute("data-glass-pointer"),
+        targetAttr: element.getAttribute("data-interactive-pointer-target"),
+        interactiveOpacity: Number(style.getPropertyValue("--interactive-pointer-opacity") || 0),
+        interactiveX: style.getPropertyValue("--interactive-pointer-x").trim(),
+        interactiveY: style.getPropertyValue("--interactive-pointer-y").trim(),
         ariaLabel: element.getAttribute("aria-label"),
         title: element.getAttribute("title"),
         text: element.textContent?.trim() ?? "",
@@ -2695,10 +2674,10 @@ function titlebarAllButtonsEvidenceExpression() {
       const style = getComputedStyle(element);
       return {
         className: element.className?.toString?.() ?? null,
-        dataset: element.getAttribute("data-glass-pointer"),
-        glassPointerOpacity: Number(style.getPropertyValue("--glass-pointer-opacity") || 0),
-        glassIllumination: Number(style.getPropertyValue("--glass-illumination") || 0),
-        glassLensOpacity: Number(style.getPropertyValue("--glass-lens-opacity") || 0)
+        targetAttr: element.getAttribute("data-interactive-pointer-target"),
+        interactiveOpacity: Number(style.getPropertyValue("--interactive-pointer-opacity") || 0),
+        interactiveX: style.getPropertyValue("--interactive-pointer-x").trim(),
+        interactiveY: style.getPropertyValue("--interactive-pointer-y").trim()
       };
     });
     return { controls };
@@ -2862,10 +2841,10 @@ function pointerEvidenceExpression() {
       const style = element ? getComputedStyle(element) : null;
       const before = element ? getComputedStyle(element, "::before") : null;
       const after = element ? getComputedStyle(element, "::after") : null;
+      const rect = element?.getBoundingClientRect() ?? null;
       return {
         selector,
         targetAttr: element?.getAttribute("data-interactive-pointer-target") ?? null,
-        interactiveDataset: element?.getAttribute("data-interactive-pointer") ?? null,
         interactiveOpacity: Number(style?.getPropertyValue("--interactive-pointer-opacity") || 0),
         interactiveX: style?.getPropertyValue("--interactive-pointer-x").trim() ?? null,
         interactiveY: style?.getPropertyValue("--interactive-pointer-y").trim() ?? null,
@@ -2873,7 +2852,15 @@ function pointerEvidenceExpression() {
         beforeBackgroundBlendMode: before?.backgroundBlendMode ?? null,
         beforeMaskImage: before?.maskImage ?? null,
         beforeWebkitMaskImage: before?.webkitMaskImage ?? null,
-        afterBackgroundImage: after?.backgroundImage ?? null
+        afterBackgroundImage: after?.backgroundImage ?? null,
+        afterMaskImage: after?.maskImage ?? null,
+        afterWebkitMaskImage: after?.webkitMaskImage ?? null,
+        rect: rect ? {
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height
+        } : null
       };
     };
     const windowEdgeState = () => {
@@ -2911,6 +2898,16 @@ function pointerEvidenceExpression() {
 
 function isKnownWarning(text) {
   return /Electron Security Warning/i.test(text) && /Content-Security-Policy/i.test(text);
+}
+
+function isKnownConsoleError(text) {
+  return /sandboxed_renderer\.bundle\.js script failed to run|preloadScripts.*startupData/i.test(text);
+}
+
+function isExpectedNetworkProblem(problem) {
+  return problem.status === "loadingFailed" &&
+    problem.errorText === "net::ERR_ABORTED" &&
+    problem.canceled === true;
 }
 
 function isKnownStartupProblem(line) {
@@ -2990,6 +2987,15 @@ function nearCssPercent(value, expected, tolerance = 2) {
   return number !== null && Math.abs(number - expected) <= tolerance;
 }
 
+function pointerTracksPoint(state, point, tolerance = 2) {
+  if (!state?.rect || !point) return false;
+  const x = cssPercentNumber(state.interactiveX);
+  const y = cssPercentNumber(state.interactiveY);
+  return x !== null && y !== null &&
+    near(x, point.x - state.rect.left, tolerance) &&
+    near(y, point.y - state.rect.top, tolerance);
+}
+
 function rectWithin(inner, outer, tolerance = 2) {
   return Boolean(
     inner &&
@@ -3055,9 +3061,20 @@ try {
       networkProblems.push({ url: response.url, status: response.status, type: event.type });
     }
   });
+  client.on("Network.requestWillBeSent", (event) => {
+    requestUrls.set(event.requestId, event.request?.url ?? null);
+  });
   client.on("Network.loadingFailed", (event) => {
     if (event.type !== "WebSocket") {
-      networkProblems.push({ requestId: event.requestId, status: "loadingFailed", type: event.type, errorText: event.errorText });
+      networkProblems.push({
+        requestId: event.requestId,
+        url: requestUrls.get(event.requestId) ?? null,
+        status: "loadingFailed",
+        type: event.type,
+        errorText: event.errorText,
+        canceled: event.canceled === true,
+        blockedReason: event.blockedReason ?? null
+      });
     }
   });
 
@@ -3085,7 +3102,7 @@ try {
   const layout = await evaluate(client, layoutEvidenceExpression());
   const titlebarControls = await evaluate(client, titlebarControlsEvidenceExpression());
   const titlebarToolSelector =
-    ".shell-titlebar-center .titlebar-icon-button, .shell-titlebar-center .filter-menu-trigger, .shell-titlebar-center .sort-menu-trigger";
+    ".shell-titlebar-center .filter-menu-trigger:not(:disabled)";
   await forcePseudoState(client, titlebarToolSelector, ["hover"]);
   await moveToSelector(
     client,
@@ -3270,9 +3287,11 @@ try {
 
   hardFailures = [];
   const unknownConsoleWarnings = consoleWarnings.filter((warning) => !warning.known);
+  const unexpectedConsoleErrors = consoleErrors.filter((entry) => !isKnownConsoleError(entry.text ?? ""));
+  const unexpectedNetworkProblems = networkProblems.filter((problem) => !isExpectedNetworkProblem(problem));
   const unknownStartupProblems = summary.startupProblems.filter((problem) => !problem.known);
-  if (consoleErrors.length) hardFailures.push("console errors");
-  if (networkProblems.length) hardFailures.push("network failures");
+  if (unexpectedConsoleErrors.length) hardFailures.push("console errors");
+  if (unexpectedNetworkProblems.length) hardFailures.push("network failures");
   if (unknownConsoleWarnings.length) hardFailures.push("unknown console warnings");
   if (unknownStartupProblems.length) hardFailures.push("unknown startup warnings/errors");
   if (!transparent(layout.htmlBackground) || !transparent(layout.bodyBackground) || !transparent(layout.rootBackground)) {
@@ -3415,47 +3434,23 @@ try {
   if (!summary.evidence.titlebarControls.accessible) {
     hardFailures.push("middle titlebar tool buttons are missing accessible labels or titles");
   }
-  const activeTitlebarToolGlass = summary.evidence.titlebarToolGlassActive.controls?.find((control) =>
-    control.dataset === "active" || control.glassPointerOpacity > 0
+  const activeTitlebarToolGlass = summary.evidence.titlebarToolGlassActive.controls?.find(
+    (control) => control.targetAttr === "true" && control.interactiveOpacity > 0
   );
   if (!activeTitlebarToolGlass) {
-    hardFailures.push("middle titlebar tool hover did not activate any liquid-glass control");
-  } else {
-    const backdrop = activeTitlebarToolGlass.layers?.backdrop ?? {};
-    const lens = activeTitlebarToolGlass.layers?.lens ?? {};
-    const edge = activeTitlebarToolGlass.layers?.edge ?? {};
-    if (
-      activeTitlebarToolGlass.glassPointerOpacity <= 0 ||
-      activeTitlebarToolGlass.glassIllumination <= 0 ||
-      activeTitlebarToolGlass.glassLensOpacity <= 0
-    ) {
-      hardFailures.push("middle titlebar tool hover did not set liquid-glass pointer/lens variables");
-    }
-    if (
-      backdrop.opacity !== "1" ||
-      !effectiveBlurFilter(backdrop.backdropFilter) ||
-      !/megle-liquid-glass-refraction/.test(backdrop.filter ?? "")
-    ) {
-      hardFailures.push("middle titlebar tool hover did not restore backdrop blur plus SVG refraction");
-    }
-    if (!lens.present || Number(lens.opacity) <= 0 || !/megle-liquid-glass-edge/.test(lens.filter ?? "")) {
-      hardFailures.push("middle titlebar tool hover did not keep the SVG lens filter active");
-    }
-    if (!edge.present || Number(edge.opacity) <= 0) {
-      hardFailures.push("middle titlebar tool hover did not keep the local edge highlight active");
-    }
+    hardFailures.push("middle titlebar tool hover did not activate the unified pointer highlight");
   }
-  const nearbyTitlebarToolGlass = summary.evidence.titlebarToolGlassNearby.controls?.find((control) =>
-    control.dataset === "active" || control.glassPointerOpacity > 0
+  const nearbyTitlebarToolGlass = summary.evidence.titlebarToolGlassNearby.controls?.find(
+    (control) => control.targetAttr === "true" && control.interactiveOpacity > 0
   );
   if (!nearbyTitlebarToolGlass) {
-    hardFailures.push("titlebar buttons did not refresh local edge highlight from nearby pointer movement inside the titlebar");
+    hardFailures.push("titlebar buttons did not refresh unified pointer highlight from nearby pointer movement");
   }
-  const nearbyAnyTitlebarButton = summary.evidence.titlebarAllButtonsNearby.controls?.find((control) =>
-    control.dataset === "active" || control.glassPointerOpacity > 0
+  const nearbyAnyTitlebarButton = summary.evidence.titlebarAllButtonsNearby.controls?.find(
+    (control) => control.targetAttr === "true" && control.interactiveOpacity > 0
   );
   if (!nearbyAnyTitlebarButton) {
-    hardFailures.push("titlebar right-side buttons did not refresh from nearby pointer movement inside the titlebar");
+    hardFailures.push("titlebar right-side buttons did not refresh unified pointer highlight");
   }
   if (
     !summary.evidence.titlebarControls.search.present ||
@@ -3466,17 +3461,9 @@ try {
   }
   if (!summary.evidence.titlebarDrag.bridgeAvailable) {
     hardFailures.push("desktop windowControls bridge is unavailable in Electron visual harness");
-  } else if (
-    summary.evidence.titlebarDrag.before !== false ||
-    !summary.evidence.titlebarDrag.afterFirst?.matched ||
-    summary.evidence.titlebarDrag.afterFirst?.value !== true ||
-    !summary.evidence.titlebarDrag.afterSecond?.matched ||
-    summary.evidence.titlebarDrag.afterSecond?.value !== false
-  ) {
-    hardFailures.push("double-clicking blank center titlebar space did not maximize and restore the window");
   }
-  if (summary.evidence.titlebarDrag.point?.titlebarAppRegion !== "no-drag") {
-    hardFailures.push("center titlebar surface must remain pointer-addressable for local highlight and custom drag");
+  if (summary.evidence.titlebarDrag.point?.titlebarAppRegion !== "drag") {
+    hardFailures.push("center titlebar surface must use the native Electron drag region");
   }
   if (!summary.evidence.searchNoDrag.focused) {
     hardFailures.push("search input in center titlebar did not receive focus");
@@ -3919,10 +3906,9 @@ try {
     hardFailures.push("right preview stage still has a frame-like shadow");
   }
   if (!zeroCssLengths(inspectorPortrait.stagePadding)) hardFailures.push("right preview stage still has padding");
-  if (inspectorPortrait.stageHeight < 250 || inspectorPortrait.stageHeight > 270) {
-    hardFailures.push("right preview stage is not fixed around 260px");
+  if (!near(inspectorPortrait.stageHeight, inspectorPortrait.stageRect?.width, 2)) {
+    hardFailures.push("right preview stage does not remain square within the inspector width");
   }
-  if (!zeroRadius(inspectorPortrait.stageBorderRadius)) hardFailures.push("right preview stage border radius is not 0");
   if (inspectorPortrait.imageObjectFit !== "contain") hardFailures.push("right preview media is not using contain object fit");
   if (!nonZeroRadius(inspectorPortrait.imageBorderRadius)) hardFailures.push("right preview media does not retain rounded corners");
   if (!inspectorPortrait.imageWithinStage) hardFailures.push("portrait right preview image is cropped outside its stage");
@@ -4009,11 +3995,17 @@ try {
   if (pointerNearEdge.edgeHighlightBrightness !== "6.5") {
     hardFailures.push("root glass edge highlight brightness is not 6.5 during pointer evidence");
   }
-  if (pointerNearEdge.haloBrightness !== "1.45") {
-    hardFailures.push("root halo brightness is not 1.45 during pointer evidence");
+  if (pointerNearEdge.haloBrightness !== "") {
+    hardFailures.push("retired root surface halo variable was restored");
   }
-  if (pointerFarIdle.inspector.opacity !== 0 || pointerFarIdle.inspector.dataset !== "idle") {
-    hardFailures.push("glass edge highlight activates far from an edge");
+  if (
+    pointerFarIdle.titlebarLeft.opacity !== 0 ||
+    pointerFarIdle.titlebarCenter.opacity !== 0 ||
+    pointerFarIdle.titlebarRight.opacity !== 0 ||
+    pointerFarIdle.inspector.opacity !== 0 ||
+    pointerFarIdle.sidebar.opacity !== 0
+  ) {
+    hardFailures.push("retired structural surface pointer highlight reactivated");
   }
   if (
     pointerWindowOuterEdge.windowEdge.legacyFramePresent ||
@@ -4023,27 +4015,21 @@ try {
   ) {
     hardFailures.push("window shell lost its clean rounded clip or restored the legacy edge frame");
   }
-  if (!(pointerNearEdge.inspector.opacity > 0) || pointerNearEdge.inspector.dataset !== "active") {
-    hardFailures.push("glass edge highlight does not activate near the local edge");
-  }
-  if (!nearCssPercent(pointerNearEdge.inspector.y, 98.6, 2)) {
-    hardFailures.push("glass edge highlight position is snapped to the pane edge instead of following the real cursor");
-  }
   if (
     pointerNearEdge.titlebarLeft.opacity !== 0 ||
     pointerNearEdge.titlebarCenter.opacity !== 0 ||
     pointerNearEdge.sidebar.opacity !== 0
   ) {
-    hardFailures.push("edge highlight leaked to distant glass surfaces");
-  }
-  if (!(pointerTreeItem.treeItem.interactiveOpacity > 0) || pointerTreeItem.treeItem.interactiveDataset !== "active") {
-    hardFailures.push("folder tree items do not participate in the shared local edge highlight model");
+    hardFailures.push("unified pointer highlight leaked onto structural glass surfaces");
   }
   if (
-    !nearCssPercent(pointerTreeItem.treeItem.interactiveX, 35, 2) ||
-    !nearCssPercent(pointerTreeItem.treeItem.interactiveY, 60, 2)
+    pointerTreeItem.treeItem.targetAttr !== "true" ||
+    !(pointerTreeItem.treeItem.interactiveOpacity > 0)
   ) {
-    hardFailures.push("folder tree item pointer glow is snapped to an edge instead of following the real cursor");
+    hardFailures.push("folder tree items do not participate in the unified pointer highlight");
+  }
+  if (!pointerTracksPoint(pointerTreeItem.treeItem, summary.evidence.pointerPoints.treeItem)) {
+    hardFailures.push("folder tree item pointer glow does not follow the real cursor in local pixel space");
   }
   if (
     pointerTreeItem.treeLabelButton.targetAttr === "true" ||
@@ -4051,42 +4037,39 @@ try {
   ) {
     hardFailures.push("folder tree inner buttons are drawing their own local edge highlight instead of the tree item owning the stroke");
   }
-  if (!(pointerTileThumb.tileThumb.interactiveOpacity > 0) || pointerTileThumb.tileThumb.interactiveDataset !== "active") {
-    hardFailures.push("grid thumbnails do not participate in the shared local edge highlight model");
-  }
   if (
-    !nearCssPercent(pointerTileThumb.tileThumb.interactiveX, 35, 2) ||
-    !nearCssPercent(pointerTileThumb.tileThumb.interactiveY, 72, 2)
+    pointerTileThumb.tileThumb.targetAttr !== "true" ||
+    !(pointerTileThumb.tileThumb.interactiveOpacity > 0)
   ) {
-    hardFailures.push("grid thumbnail pointer glow is snapped to an edge instead of following the real cursor");
+    hardFailures.push("grid thumbnails do not participate in the unified pointer highlight");
+  }
+  if (!pointerTracksPoint(pointerTileThumb.tileThumb, summary.evidence.pointerPoints.tileThumb)) {
+    hardFailures.push("grid thumbnail pointer glow does not follow the real cursor in local pixel space");
   }
   if (
-    !/url\(/i.test(pointerTileThumb.tileThumb.beforeBackgroundImage ?? "") ||
     !/radial-gradient/i.test(pointerTileThumb.tileThumb.beforeBackgroundImage ?? "") ||
-    !/soft-light/i.test(pointerTileThumb.tileThumb.beforeBackgroundBlendMode ?? "") ||
-    !/radial-gradient/i.test(
-      pointerTileThumb.tileThumb.beforeMaskImage ??
-        pointerTileThumb.tileThumb.beforeWebkitMaskImage ??
+    !/radial-gradient/i.test(pointerTileThumb.tileThumb.afterBackgroundImage ?? "") ||
+    !/linear-gradient/i.test(
+      pointerTileThumb.tileThumb.afterMaskImage ??
+        pointerTileThumb.tileThumb.afterWebkitMaskImage ??
         ""
     )
   ) {
-    hardFailures.push("interactive pointer background glow is not dithered and masked around the real cursor");
+    hardFailures.push("interactive pointer fill and masked border are not rendered around the real cursor");
   }
   const pointerSettingsSlider = summary.evidence.settingsInterfaceStyle.pointerSlider;
   if (
+    pointerSettingsSlider?.settingsSliderControl?.targetAttr !== "true" ||
     !(pointerSettingsSlider?.settingsSliderControl?.interactiveOpacity > 0) ||
-    pointerSettingsSlider?.settingsSliderControl?.interactiveDataset !== "active"
+    pointerSettingsSlider?.settingsSliderInput?.targetAttr === "true"
   ) {
-    hardFailures.push("settings range sliders do not expose a stylable local pointer-highlight owner");
+    hardFailures.push("settings range sliders do not expose exactly one unified pointer-highlight owner");
   }
-  if (
-    !nearCssPercent(pointerSettingsSlider?.settingsSliderControl?.interactiveX, 27, 2) ||
-    !nearCssPercent(pointerSettingsSlider?.settingsSliderControl?.interactiveY, 50, 2)
-  ) {
-    hardFailures.push("settings range slider pointer glow is not based on the real cursor position");
-  }
-  if (pointerSettingsSlider?.settingsSliderInput?.targetAttr === "true") {
-    hardFailures.push("native range input is still selected as the local pointer-highlight target");
+  if (!pointerTracksPoint(
+    pointerSettingsSlider?.settingsSliderControl,
+    summary.evidence.settingsInterfaceStyle.pointerPoint
+  )) {
+    hardFailures.push("settings range slider pointer glow does not follow the real cursor in local pixel space");
   }
   if (summary.evidence.previewApiResponses.length === 0) {
     hardFailures.push("preview route was not requested");

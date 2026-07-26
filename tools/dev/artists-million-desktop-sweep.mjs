@@ -32,6 +32,9 @@ const waitForThumbnailTaskDrainAfterSweep =
 const warmSeenFileIdsPath = process.env.MEGLE_ARTISTS_SWEEP_WARM_FILE_IDS_PATH ?? "";
 const FETCH_REPORT_LIMIT = 20;
 const TILE_READY_SELECTOR = ".tile-thumb-ready, .tile-thumb-image, .tile-thumb-failed, img";
+const MEDIA_TILE_SELECTOR = '.media-tile[role="button"][data-media-id]';
+const INDEXED_MEDIA_PAGE_LIMIT = 200;
+const DEV_APP_STOP_TIMEOUT_MS = 10_000;
 const REQUIRED_LAYOUT_CLASSES = [
   "virtual-grid--adaptive",
   "virtual-grid--waterfall",
@@ -50,6 +53,8 @@ const failures = [];
 const consoleErrors = [];
 const networkProblems = [];
 const startupOutput = [];
+const indexedMediaFolderIdsByRoot = new Map();
+const folderAncestorIdsByFolder = new Map();
 let thumbnailCacheStatsBefore = null;
 let thumbnailCacheStatsAfter = null;
 let child;
@@ -133,8 +138,19 @@ async function stopDevApp() {
         stdio: "ignore",
         windowsHide: true
       });
-      killer.on("error", () => resolve());
-      killer.on("exit", () => resolve());
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve();
+      };
+      const timeout = setTimeout(() => {
+        killer.kill();
+        finish();
+      }, DEV_APP_STOP_TIMEOUT_MS);
+      killer.on("error", finish);
+      killer.on("exit", finish);
     });
     return;
   }
@@ -432,6 +448,7 @@ class CdpClient {
     this.ws = new WebSocket(wsUrl);
     this.nextId = 1;
     this.pending = new Map();
+    this.requestUrls = new Map();
     this.ready = new Promise((resolve, reject) => {
       this.ws.once("open", resolve);
       this.ws.once("error", reject);
@@ -449,13 +466,21 @@ class CdpClient {
       else pending.resolve(message.result ?? {});
       return;
     }
-    if (message.method === "Runtime.exceptionThrown") {
+    if (message.method === "Network.requestWillBeSent") {
+      this.requestUrls.set(message.params.requestId, message.params.request?.url ?? null);
+    } else if (message.method === "Network.loadingFinished") {
+      this.requestUrls.delete(message.params.requestId);
+    } else if (message.method === "Runtime.exceptionThrown") {
       consoleErrors.push(message.params?.exceptionDetails?.exception?.description ?? JSON.stringify(message.params));
     } else if (message.method === "Log.entryAdded") {
       const entry = message.params?.entry;
       if (entry?.level === "error") consoleErrors.push(entry.text);
     } else if (message.method === "Network.loadingFailed") {
-      networkProblems.push(message.params);
+      networkProblems.push({
+        ...message.params,
+        url: this.requestUrls.get(message.params.requestId) ?? null
+      });
+      this.requestUrls.delete(message.params.requestId);
     }
   }
 
@@ -658,7 +683,7 @@ async function installInstrumentation(client) {
           }));
         const longTasks = state.longTasks.slice(opStart.longTaskIndex);
         const grid = document.querySelector(".virtual-grid");
-        const visibleTiles = [...document.querySelectorAll("button.media-tile")].filter((tile) => {
+        const visibleTiles = [...document.querySelectorAll(${JSON.stringify(MEDIA_TILE_SELECTOR)})].filter((tile) => {
           const rect = tile.getBoundingClientRect();
           return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
         });
@@ -705,7 +730,7 @@ async function installInstrumentation(client) {
           dom: {
             treeItems: document.querySelectorAll(".tree-item").length,
             subfolderCards: document.querySelectorAll(".subfolder-card").length,
-            mediaTiles: document.querySelectorAll("button.media-tile").length,
+            mediaTiles: document.querySelectorAll(${JSON.stringify(MEDIA_TILE_SELECTOR)}).length,
             visibleTiles: visibleTiles.length,
             visibleMediaIds,
             visibleReadyThumbs: visibleReadyThumbs.length,
@@ -775,6 +800,10 @@ function summarizeFetches(fetches) {
 
 function maxElapsed(items) {
   return items.length > 0 ? Math.round(Math.max(...items.map((item) => item.elapsedMs))) : 0;
+}
+
+function isExpectedCanceledNetworkProblem(problem) {
+  return problem.errorText === "net::ERR_ABORTED" && problem.canceled === true;
 }
 
 function operationThreshold(label) {
@@ -985,7 +1014,7 @@ function visibleReadyExpression() {
     const tileReadySelector = ${JSON.stringify(TILE_READY_SELECTOR)};
     const pendingMediaPageFetches = (window.__artistsSweep?.fetches ?? []).filter((item) => item.pending && item.url.includes("/api/media?"));
     const grid = document.querySelector(".virtual-grid");
-    const tiles = [...document.querySelectorAll("button.media-tile")].filter((tile) => {
+    const tiles = [...document.querySelectorAll(${JSON.stringify(MEDIA_TILE_SELECTOR)})].filter((tile) => {
       const rect = tile.getBoundingClientRect();
       return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
     });
@@ -1145,7 +1174,7 @@ async function visibleMediaStatus(client) {
     `(() => {
       const now = performance.now();
       const pendingMediaPageFetches = (window.__artistsSweep?.fetches ?? []).filter((item) => item.pending && item.url.includes("/api/media?"));
-      const visibleTiles = [...document.querySelectorAll("button.media-tile")].filter((tile) => {
+      const visibleTiles = [...document.querySelectorAll(${JSON.stringify(MEDIA_TILE_SELECTOR)})].filter((tile) => {
         const rect = tile.getBoundingClientRect();
         return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
       });
@@ -1154,7 +1183,7 @@ async function visibleMediaStatus(client) {
       return {
         visibleMediaTiles: visibleTiles.length,
         visibleReadyThumbs: visibleReady.length,
-        mediaTiles: document.querySelectorAll("button.media-tile").length,
+        mediaTiles: document.querySelectorAll(${JSON.stringify(MEDIA_TILE_SELECTOR)}).length,
         subfolderCards: document.querySelectorAll(".subfolder-card").length,
         scrollTop: grid instanceof HTMLElement ? grid.scrollTop : 0,
         scrollHeight: grid instanceof HTMLElement ? grid.scrollHeight : 0,
@@ -1206,46 +1235,199 @@ async function ensureVisibleMediaTiles(client, seed) {
   if (status.ok) return { ok: true, source: "current-recursive-off", recursiveOff, status };
 
   const rootResult = await selectArtistsRoot(client);
-  const recursiveOn = await setRecursiveChildContents(client, true);
-  const rootVisible = await scrollUntilVisibleMedia(client, seed, {
-    maxAttempts: 4,
-    timeoutMs: 1800
-  });
-  if (rootVisible.ok) {
-    return { ok: true, source: "artists-root-recursive", rootResult, recursiveOn, visible: rootVisible };
+  if (!rootResult?.ok || !rootResult.rootId || !rootResult.rootFolderId) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: "Artists root is unavailable for indexed media selection",
+      rootResult
+    };
   }
-
-  const sampledFolders = [];
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    const clicked = await clickDistantTreeFolder(
-      client,
-      seed + attempt * 11,
-      attempt % 2 === 0 ? 1800 + attempt * 600 : -900 - attempt * 300
-    );
-    const visible = await waitForAnyVisibleMedia(client, 3200);
-    sampledFolders.push({ clicked, visible });
-    if (visible.ok) {
-      return {
-        ok: true,
-        source: "sampled-tree-folder",
-        rootResult,
-        recursiveOn,
-        rootVisible,
-        sampledFolders
-      };
-    }
+  const indexedFolder = await selectIndexedMediaFolder(client, rootResult, seed);
+  if (indexedFolder.ok) {
+    return { ok: true, source: "indexed-media-folder", recursiveOff, rootResult, indexedFolder };
   }
 
   return {
-    ok: true,
+    ok: false,
     skipped: true,
-    reason: "unable to find visible media tiles in sampled folders",
+    reason: "unable to select an indexed folder containing media",
+    recursiveOff,
     rootResult,
-    recursiveOn,
-    rootVisible,
-    sampledFolders,
+    indexedFolder,
     lastStatus: await visibleMediaStatus(client)
   };
+}
+
+async function loadIndexedMediaFolderIds(client, rootId, rootFolderId) {
+  const cacheKey = String(rootId);
+  const cached = indexedMediaFolderIdsByRoot.get(cacheKey);
+  if (cached?.length) return cached;
+
+  const query = new URLSearchParams({
+    rootId: String(rootId),
+    folderId: String(rootFolderId),
+    includeDescendants: "true",
+    limit: String(INDEXED_MEDIA_PAGE_LIMIT),
+    offset: "0",
+    sort: "mtime_desc"
+  });
+  const page = await desktopApiJson(client, `/media?${query}`);
+  const folderIds = [
+    ...new Set(
+      (Array.isArray(page?.items) ? page.items : [])
+        .map((item) => Number(item?.folderId))
+        .filter((folderId) => Number.isInteger(folderId) && folderId > 0)
+    )
+  ];
+  if (folderIds.length) indexedMediaFolderIdsByRoot.set(cacheKey, folderIds);
+  return folderIds;
+}
+
+async function loadFolderAncestorIds(client, folderId) {
+  const cacheKey = String(folderId);
+  const cached = folderAncestorIdsByFolder.get(cacheKey);
+  if (cached?.length) return cached;
+
+  const page = await desktopApiJson(client, `/folders/${folderId}/ancestors`);
+  const ancestorIds = (Array.isArray(page?.items) ? page.items : [])
+    .map((item) => Number(item?.id))
+    .filter((ancestorId) => Number.isInteger(ancestorId) && ancestorId > 0);
+  if (ancestorIds.length) folderAncestorIdsByFolder.set(cacheKey, ancestorIds);
+  return ancestorIds;
+}
+
+async function waitForTreeFolderItem(client, folderId, timeoutMs = 2500) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await evaluate(
+      client,
+      `(() => {
+        const item = document.querySelector('.tree-item[data-folder-id="${folderId}"]');
+        if (!(item instanceof HTMLElement)) return { ok: false, reason: "not rendered" };
+        const label = item.querySelector(".tree-label");
+        return {
+          ok: label instanceof HTMLElement,
+          reason: label instanceof HTMLElement ? null : "label missing",
+          text: label?.textContent?.trim() ?? "",
+          expanded: item.getAttribute("aria-expanded") === "true"
+        };
+      })()`
+    );
+    if (last?.ok) return last;
+    await delay(100);
+  }
+  return { ...(last ?? {}), ok: false, folderId, reason: last?.reason ?? "not rendered" };
+}
+
+async function expandAndSelectTreeFolder(client, folderId) {
+  const ancestorIds = await loadFolderAncestorIds(client, folderId);
+  if (!ancestorIds.length || ancestorIds.at(-1) !== folderId) {
+    return { ok: false, reason: "invalid folder ancestor path", folderId, ancestorIds };
+  }
+
+  const steps = [];
+  for (let index = 0; index < ancestorIds.length; index += 1) {
+    const ancestorId = ancestorIds[index];
+    const rendered = await waitForTreeFolderItem(client, ancestorId);
+    if (!rendered.ok) {
+      return { ok: false, reason: "folder path is not rendered", folderId, ancestorIds, steps, rendered };
+    }
+    const step = await evaluate(
+      client,
+      `(() => {
+        const item = document.querySelector('.tree-item[data-folder-id="${ancestorId}"]');
+        const label = item?.querySelector(".tree-label");
+        if (!(item instanceof HTMLElement) || !(label instanceof HTMLElement)) {
+          return { ok: false, reason: "tree folder disappeared" };
+        }
+        item.scrollIntoView({ block: "nearest", inline: "nearest" });
+        const shouldExpand = ${index < ancestorIds.length - 1};
+        const disclosure = item.querySelector(".tree-disclosure");
+        const expanded = item.getAttribute("aria-expanded") === "true";
+        if (shouldExpand && !expanded && disclosure instanceof HTMLButtonElement && !disclosure.disabled) {
+          disclosure.click();
+        }
+        if (!shouldExpand) label.click();
+        return {
+          ok: true,
+          folderId: ${ancestorId},
+          text: label.textContent?.trim() ?? "",
+          expanded,
+          clickedDisclosure: shouldExpand && !expanded,
+          selected: !shouldExpand
+        };
+      })()`
+    );
+    steps.push(step);
+    if (!step?.ok) return { ok: false, reason: step?.reason ?? "tree path step failed", folderId, ancestorIds, steps };
+    if (step.clickedDisclosure) await delay(180);
+  }
+
+  const selected = await waitFor(
+    client,
+    `document.querySelector('.tree-item.selected')?.getAttribute('data-folder-id') === ${JSON.stringify(String(folderId))}`,
+    4_000,
+    `indexed media folder ${folderId} selected`
+  );
+  return { ok: Boolean(selected), folderId, ancestorIds, steps };
+}
+
+async function selectIndexedMediaFolder(client, rootResult, seed) {
+  const folderIds = await loadIndexedMediaFolderIds(
+    client,
+    Number(rootResult.rootId),
+    Number(rootResult.rootFolderId)
+  );
+  if (!folderIds.length) {
+    return { ok: false, reason: "Core returned no indexed media folders", folderIds };
+  }
+
+  const attempts = [];
+  const maxAttempts = Math.min(folderIds.length, 4);
+  for (let index = 0; index < maxAttempts; index += 1) {
+    const folderId = folderIds[(seed + index) % folderIds.length];
+    try {
+      const selected = await expandAndSelectTreeFolder(client, folderId);
+      const visible = selected.ok
+        ? await waitForIndexedFolderVisibleMedia(client)
+        : { ok: false, reason: selected.reason };
+      attempts.push({ folderId, selected, visible });
+      if (visible.ok) return { ok: true, folderId, folderIds, attempts };
+    } catch (error) {
+      attempts.push({ folderId, error: String(error) });
+    }
+  }
+  return { ok: false, reason: "indexed media folders did not produce visible media", folderIds, attempts };
+}
+
+async function waitForIndexedFolderVisibleMedia(client) {
+  const attempts = [];
+  let visible = await waitForAnyVisibleMedia(client, 2500);
+  attempts.push({ stage: "initial", visible });
+  if (visible.ok) return { ...visible, attempts };
+
+  if (visible.mediaTiles > 0) {
+    const scroll = await scrollGridToRatio(client, 1);
+    visible = await waitForAnyVisibleMedia(client, 2500);
+    attempts.push({ stage: "existing-media-bottom", scroll, visible });
+    if (visible.ok) return { ...visible, attempts };
+  }
+
+  if (visible.pendingMediaPageRequests > 0) {
+    visible = await waitForAnyVisibleMedia(client, 4500);
+    attempts.push({ stage: "media-page-drain", visible });
+    if (visible.ok) return { ...visible, attempts };
+    if (visible.mediaTiles > 0) {
+      const scroll = await scrollGridToRatio(client, 1);
+      visible = await waitForAnyVisibleMedia(client, 2500);
+      attempts.push({ stage: "loaded-media-bottom", scroll, visible });
+      if (visible.ok) return { ...visible, attempts };
+    }
+  }
+
+  return { ...visible, ok: false, attempts };
 }
 
 async function scrollTree(client, amount) {
@@ -1876,7 +2058,7 @@ async function clickVisibleTile(client, offset, timeoutMs = 700) {
     last = await evaluate(
       client,
       `(() => {
-        const tiles = [...document.querySelectorAll("button.media-tile")].filter((tile) => {
+        const tiles = [...document.querySelectorAll(${JSON.stringify(MEDIA_TILE_SELECTOR)})].filter((tile) => {
           const rect = tile.getBoundingClientRect();
           return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
         });
@@ -1903,7 +2085,7 @@ async function openVisibleTilePreview(client, offset) {
   const result = await evaluate(
     client,
     `(() => {
-      const tiles = [...document.querySelectorAll("button.media-tile")].filter((tile) => {
+      const tiles = [...document.querySelectorAll(${JSON.stringify(MEDIA_TILE_SELECTOR)})].filter((tile) => {
         const rect = tile.getBoundingClientRect();
         return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
       });
@@ -1920,25 +2102,28 @@ async function openVisibleTilePreview(client, offset) {
 }
 
 async function openPreviewFromAvailableMedia(client, seed) {
-  const attempts = [];
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const mediaReady = await ensureVisibleMediaTiles(client, seed + attempt * 7);
-    if (!mediaReady.ok || mediaReady.skipped) {
-      attempts.push({ mediaReady });
-      continue;
-    }
-    await delay(160);
-    const opened = await openVisibleTilePreview(client, seed + attempt);
-    attempts.push({ mediaReady, opened });
-    if (opened?.ok !== false) {
-      return { ok: true, mediaReady, opened, attempts };
-    }
+  const mediaReady = await ensureVisibleMediaTiles(client, seed);
+  if (!mediaReady.ok || mediaReady.skipped) return mediaReady;
+
+  await delay(160);
+  const firstOpen = await openVisibleTilePreview(client, seed);
+  if (firstOpen?.ok !== false) {
+    return { ok: true, mediaReady, opened: firstOpen, attempts: [firstOpen] };
   }
+
+  const visibleRetry = await waitForAnyVisibleMedia(client, 1200);
+  const secondOpen = visibleRetry.ok ? await openVisibleTilePreview(client, seed + 1) : null;
+  if (secondOpen?.ok !== false && secondOpen !== null) {
+    return { ok: true, mediaReady, opened: secondOpen, attempts: [firstOpen, secondOpen] };
+  }
+
   return {
     ok: false,
     skipped: true,
-    reason: "unable to open preview from sampled visible media",
-    attempts
+    reason: "unable to open preview from indexed visible media",
+    mediaReady,
+    visibleRetry,
+    attempts: [firstOpen, secondOpen].filter(Boolean)
   };
 }
 
@@ -2012,13 +2197,13 @@ async function runSweep(client) {
   await runOperation(client, "root initial display: first folders or media", async () => {
     await waitFor(
       client,
-      `document.querySelectorAll(".subfolder-card").length > 0 || document.querySelectorAll("button.media-tile").length > 0`,
+      `document.querySelectorAll(".subfolder-card").length > 0 || document.querySelectorAll(${JSON.stringify(MEDIA_TILE_SELECTOR)}).length > 0`,
       300_000,
       "first browsable content"
     );
     return await evaluate(client, `({
       subfolderCards: document.querySelectorAll(".subfolder-card").length,
-      mediaTiles: document.querySelectorAll("button.media-tile").length
+      mediaTiles: document.querySelectorAll(${JSON.stringify(MEDIA_TILE_SELECTOR)}).length
     })`);
   }, { waitVisible: true, visibleTimeoutMs: 2500 });
 
@@ -2592,6 +2777,15 @@ try {
   const slowOperations = operationRecords.filter((record) => record.slow);
   if (failOnSlow && slowOperations.length > 0) {
     failures.push(...slowOperations);
+  }
+  const unexpectedNetworkProblems = networkProblems.filter(
+    (problem) => !isExpectedCanceledNetworkProblem(problem)
+  );
+  if (consoleErrors.length > 0) {
+    failures.push(`console errors: ${consoleErrors.length}`);
+  }
+  if (unexpectedNetworkProblems.length > 0) {
+    failures.push(`unexpected network failures: ${unexpectedNetworkProblems.length}`);
   }
   const summary = buildSummary(failures.length === 0);
   await writeFile(summaryPath, JSON.stringify(summary, null, 2));
