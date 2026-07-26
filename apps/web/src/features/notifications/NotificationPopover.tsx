@@ -24,7 +24,8 @@ import type {
 } from "./notificationModel";
 import {
   activateThumbnailFailureLogs,
-  thumbnailFailureDetailsUnavailableMessage
+  thumbnailFailureDetailsUnavailableMessage,
+  thumbnailStatusParts
 } from "./notificationModel";
 import { observeNotificationPopoverMeasurements } from "./notificationPopoverMeasurement";
 import { resolveNotificationPopoverPosition } from "./notificationPopoverPosition";
@@ -307,7 +308,7 @@ function ThumbnailSummaryRow({
   summary: DesktopThumbnailCacheSummary;
 }) {
   const unavailableMessage = thumbnailFailureDetailsUnavailableMessage(summary);
-  const status = thumbnailStatusParts(summary).filter((part) => part.kind !== "failure");
+  const status = thumbnailStatusParts(summary);
   const libraryLabel = summary.libraryName || summary.libraryId;
   return (
     <div
@@ -344,35 +345,29 @@ function ThumbnailSummaryRow({
           {summary.cachedCount.toLocaleString()} / {summary.totalCandidateCount.toLocaleString()} 已缓存
         </span>
         <span className="notification-thumbnail-status">
-          {status.length > 0 ? status.map((part) => part.label).join(" · ") : "已同步"}
+          {status.length > 0
+            ? status.map((part, index) => (
+                <span key={part.kind}>
+                  {index > 0 ? " · " : null}
+                  {part.kind !== "failure" ? part.label : unavailableMessage ? (
+                    <span title={unavailableMessage}>{part.label} · 详情不可用</span>
+                  ) : (
+                    <button
+                      className="notification-thumbnail-failure-action"
+                      onClick={() => activateThumbnailFailureLogs(summary, onOpenCenter)}
+                      type="button"
+                    >
+                      {part.label}
+                    </button>
+                  )}
+                </span>
+              ))
+            : "已同步"}
         </span>
-        {summary.failedCount > 0 && !unavailableMessage ? (
-          <button
-            className="notification-thumbnail-failure-action"
-            onClick={() => activateThumbnailFailureLogs(summary, onOpenCenter)}
-            type="button"
-          >
-            {summary.failedCount.toLocaleString()} 失败
-          </button>
-        ) : summary.failedCount > 0 ? (
-          <span title={unavailableMessage ?? undefined}>
-            {summary.failedCount.toLocaleString()} 失败 · 详情不可用
-          </span>
-        ) : null}
         {summary.totalCacheBytes == null ? null : <span>{formatBytes(summary.totalCacheBytes)}</span>}
       </div>
     </div>
   );
-}
-
-function thumbnailStatusParts(summary: DesktopThumbnailCacheSummary): Array<{ kind: string; label: string }> {
-  return [
-    summary.pendingCount > 0 ? { kind: "pending", label: `${summary.pendingCount.toLocaleString()} 待处理` } : null,
-    summary.failedCount > 0 ? { kind: "failure", label: `${summary.failedCount.toLocaleString()} 失败` } : null,
-    summary.staleCount > 0 ? { kind: "stale", label: `${summary.staleCount.toLocaleString()} 过期` } : null,
-    summary.missingCount > 0 ? { kind: "missing", label: `${summary.missingCount.toLocaleString()} 缺失` } : null,
-    summary.activeBulkTaskCount > 0 ? { kind: "bulk", label: `${summary.activeBulkTaskCount.toLocaleString()} 批处理` } : null
-  ].filter((value): value is { kind: string; label: string } => value !== null);
 }
 
 function progressStyle(percent: number): CSSProperties {

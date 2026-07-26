@@ -14,7 +14,8 @@ import {
   mergeNotificationHistoryPages,
   notificationIndicator,
   processLogGapSequence,
-  progressView
+  progressView,
+  thumbnailStatusParts
 } from "../src/features/notifications/notificationModel.ts";
 import { createNotificationStore } from "../src/features/notifications/useNotifications.ts";
 import {
@@ -811,6 +812,25 @@ describe("notification reporting", () => {
 });
 
 describe("notification selectors", () => {
+  it("keeps a thumbnail failure in the single ordered status sequence", () => {
+    assert.deepEqual(
+      thumbnailStatusParts(thumbnail("library-a", {
+        pendingCount: 5,
+        failedCount: 2,
+        staleCount: 4,
+        missingCount: 7,
+        activeBulkTaskCount: 1
+      })),
+      [
+        { kind: "pending", label: "5 待处理" },
+        { kind: "failure", label: "2 失败" },
+        { kind: "stale", label: "4 过期" },
+        { kind: "missing", label: "7 缺失" },
+        { kind: "bulk", label: "1 批处理" }
+      ]
+    );
+  });
+
   it("reports only Desktop-declared log gaps, not filtered sequence jumps", () => {
     assert.equal(
       processLogGapSequence({

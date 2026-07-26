@@ -4317,6 +4317,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn get_thumbnail_cache_stats(
         &self,
         scope: ThumbnailCacheScope,
@@ -8760,6 +8761,7 @@ fn thumbnail_cache_entry_matches_refresh_mode(
     }
 }
 
+#[cfg(test)]
 fn get_thumbnail_cache_stats_for_scope(
     database: &Database,
     scope: ThumbnailCacheScope,

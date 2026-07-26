@@ -99,6 +99,28 @@ export function notificationIndicator(input: {
   return input.active ? "active" : "idle";
 }
 
+export function thumbnailStatusParts(
+  summary: DesktopThumbnailCacheSummary
+): Array<{ kind: string; label: string }> {
+  return [
+    summary.pendingCount > 0
+      ? { kind: "pending", label: `${summary.pendingCount.toLocaleString()} 待处理` }
+      : null,
+    summary.failedCount > 0
+      ? { kind: "failure", label: `${summary.failedCount.toLocaleString()} 失败` }
+      : null,
+    summary.staleCount > 0
+      ? { kind: "stale", label: `${summary.staleCount.toLocaleString()} 过期` }
+      : null,
+    summary.missingCount > 0
+      ? { kind: "missing", label: `${summary.missingCount.toLocaleString()} 缺失` }
+      : null,
+    summary.activeBulkTaskCount > 0
+      ? { kind: "bulk", label: `${summary.activeBulkTaskCount.toLocaleString()} 批处理` }
+      : null
+  ].filter((value): value is { kind: string; label: string } => value !== null);
+}
+
 export function processLogGapSequence(batch: DesktopProcessLogBatch): number | null {
   return batch.droppedBeforeSequence;
 }
