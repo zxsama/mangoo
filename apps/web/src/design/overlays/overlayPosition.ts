@@ -1,14 +1,16 @@
-import type {
-  OverlayPlacement,
-  OverlayPositionResult,
-  OverlayRect,
-  OverlaySize,
-  OverlayViewport,
-  OverlayVirtualAnchor
-} from "./overlayTypes";
+import {
+  NESTED_OVERLAY_OFFSET_PX,
+  ROOT_OVERLAY_OFFSET_PX,
+  type OverlayAnchor,
+  type OverlayPlacement,
+  type OverlayPositionResult,
+  type OverlayRect,
+  type OverlaySize,
+  type OverlayViewport,
+  type OverlayVirtualAnchor
+} from "./overlayTypes.ts";
 
-const ROOT_OVERLAY_OFFSET_PX = 6;
-const NESTED_OVERLAY_OFFSET_PX = 4;
+const pointOverlayAnchors = new WeakSet<OverlayVirtualAnchor>();
 
 export interface ResolveOverlayPositionInput {
   trigger: OverlayRect;
@@ -19,16 +21,36 @@ export interface ResolveOverlayPositionInput {
   gutter: number;
 }
 
-export function clampOverlayWidth(
-  requestedWidth: number | undefined,
-  maxWidth: number
-): number | undefined {
-  if (requestedWidth === undefined) return undefined;
-  return Math.min(Math.max(0, requestedWidth), Math.max(0, maxWidth));
+export interface ResolveOverlayWidthInput {
+  measuredWidth: number;
+  preferredWidth?: number;
+  minWidth?: number;
+  maxWidth?: number;
+  viewportWidth: number;
+  gutter: number;
 }
 
-export function resolveOverlayOffset(offset: number | undefined, nested: boolean): number {
-  return offset ?? (nested ? NESTED_OVERLAY_OFFSET_PX : ROOT_OVERLAY_OFFSET_PX);
+function resolveOverlayMaxWidth({
+  maxWidth,
+  viewportWidth,
+  gutter
+}: Pick<ResolveOverlayWidthInput, "maxWidth" | "viewportWidth" | "gutter">): number {
+  const safeViewportWidth = Math.max(0, viewportWidth - gutter * 2);
+  return Math.min(safeViewportWidth, Math.max(0, maxWidth ?? safeViewportWidth));
+}
+
+export function resolveOverlayWidth(input: ResolveOverlayWidthInput): number {
+  const maxWidth = resolveOverlayMaxWidth(input);
+  const minWidth = Math.min(Math.max(0, input.minWidth ?? 0), maxWidth);
+  const requestedWidth = Math.max(0, input.preferredWidth ?? input.measuredWidth);
+  return Math.min(Math.max(requestedWidth, minWidth), maxWidth);
+}
+
+export function resolveOverlayAnchorOffset(anchor: OverlayAnchor, nested: boolean): number {
+  if (nested) return NESTED_OVERLAY_OFFSET_PX;
+  return pointOverlayAnchors.has(anchor as OverlayVirtualAnchor)
+    ? 0
+    : ROOT_OVERLAY_OFFSET_PX;
 }
 
 export function pointOverlayAnchor(x: number, y: number): OverlayVirtualAnchor {
@@ -40,7 +62,52 @@ export function pointOverlayAnchor(x: number, y: number): OverlayVirtualAnchor {
     width: 0,
     height: 0
   };
-  return { getBoundingClientRect: () => value };
+  const anchor = { getBoundingClientRect: () => value };
+  pointOverlayAnchors.add(anchor);
+  return anchor;
+}
+
+export interface ResolveAnchoredOverlayLayoutInput {
+  trigger: OverlayRect;
+  overlay: { measuredWidth: number; height: number };
+  viewport: OverlayViewport;
+  preferredPlacement: OverlayPlacement;
+  preferredWidth?: number;
+  minWidth?: number;
+  maxWidth?: number;
+  offset: number;
+  gutter: number;
+}
+
+export interface AnchoredOverlayLayoutResult extends OverlayPositionResult {
+  width: number;
+}
+
+export function resolveAnchoredOverlayLayout(
+  input: ResolveAnchoredOverlayLayoutInput
+): AnchoredOverlayLayoutResult {
+  const widthInput = {
+    measuredWidth: input.overlay.measuredWidth,
+    preferredWidth: input.preferredWidth,
+    minWidth: input.minWidth,
+    maxWidth: input.maxWidth,
+    viewportWidth: input.viewport.width,
+    gutter: input.gutter
+  };
+  const width = resolveOverlayWidth(widthInput);
+  const position = resolveOverlayPosition({
+    trigger: input.trigger,
+    overlay: { width, height: input.overlay.height },
+    viewport: input.viewport,
+    preferredPlacement: input.preferredPlacement,
+    offset: input.offset,
+    gutter: input.gutter
+  });
+  return {
+    ...position,
+    maxWidth: resolveOverlayMaxWidth(widthInput),
+    width
+  };
 }
 
 export function resolveOverlayPosition(

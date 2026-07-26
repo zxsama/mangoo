@@ -46,7 +46,11 @@ export function pushOverlayLayer(
     ? state.layers.filter((_, index) => index !== existingIndex)
     : state.layers;
   if (layer.kind === "root") {
-    if (layer.parentId !== undefined || otherLayers.some((item) => item.kind === "root")) {
+    if (
+      layer.parentId !== undefined ||
+      (existingIndex < 0 && otherLayers.length > 0) ||
+      otherLayers.some((item) => item.kind === "root")
+    ) {
       return state;
     }
   } else if (layer.kind === "nested") {

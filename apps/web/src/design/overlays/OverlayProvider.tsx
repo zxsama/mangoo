@@ -21,7 +21,7 @@ import {
 } from "./overlayStack";
 import {
   bindOverlayDismissalListeners,
-  canRestoreOverlayFocus,
+  resolveOverlayFocusRestoreTarget,
   shouldDismissOverlayLayer,
   shouldRestoreOverlayFocus,
   type OverlayDismissReason
@@ -40,14 +40,8 @@ function targetBelongsToLayer(layer: OverlayLayerRegistration, target: EventTarg
 }
 
 function restoreLayerFocus(layer: OverlayLayerRegistration, reason: OverlayDismissReason): void {
-  const { trigger } = layer;
-  if (
-    trigger &&
-    shouldRestoreOverlayFocus(layer, reason) &&
-    canRestoreOverlayFocus(trigger)
-  ) {
-    trigger.focus();
-  }
+  if (!shouldRestoreOverlayFocus(layer, reason)) return;
+  resolveOverlayFocusRestoreTarget(layer.trigger, null)?.focus();
 }
 
 export function OverlayProvider({ children }: { children: ReactNode }) {

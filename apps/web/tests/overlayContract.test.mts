@@ -9,6 +9,8 @@ describe("shared overlay source contract", () => {
   const settingsWindowSource = read("src/features/settings/SettingsWindow.tsx");
   const pluginsWindowSource = read("src/features/plugins/PluginsWindow.tsx");
   const overlayCss = read("src/design/overlays/overlay.css");
+  const anchoredOverlaySource = read("src/design/overlays/AnchoredOverlay.tsx");
+  const overlayPositionSource = read("src/design/overlays/overlayPosition.ts");
   const overlaySourceBundle = [
     "overlayTypes.ts",
     "overlayPosition.ts",
@@ -38,6 +40,20 @@ describe("shared overlay source contract", () => {
     assert.match(overlayCss, /var\(--glass-dialog-fill\)/);
     assert.match(overlayCss, /var\(--glass-center-stroke\)/);
     assert.doesNotMatch(overlaySourceBundle, /fetch\s*\(|node:fs|@radix|@floating-ui/);
+  });
+
+  it("preserves the locked anchor API and one rendered width path", () => {
+    assert.doesNotMatch(
+      anchoredOverlaySource,
+      /interface AnchoredOverlayProps\s*{[\s\S]*?\boffset\?:[\s\S]*?}/
+    );
+    assert.match(anchoredOverlaySource, /width:\s*layout\?\.width/);
+    assert.match(
+      overlayPositionSource,
+      /ROOT_OVERLAY_OFFSET_PX,[\s\S]*?from "\.\/overlayTypes\.ts"/
+    );
+    assert.doesNotMatch(overlayPositionSource, /const ROOT_OVERLAY_OFFSET_PX/);
+    assert.doesNotMatch(overlayPositionSource, /const NESTED_OVERLAY_OFFSET_PX/);
   });
 
   it("uses translation and opacity presence motion without scale", () => {

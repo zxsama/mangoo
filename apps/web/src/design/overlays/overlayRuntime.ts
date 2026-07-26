@@ -49,6 +49,14 @@ export function canRestoreOverlayFocus(target: OverlayFocusTargetState): boolean
     target.getAttribute("aria-disabled")?.toLocaleLowerCase() !== "true";
 }
 
+export function resolveOverlayFocusRestoreTarget<T extends OverlayFocusTargetState>(
+  requested: T | null | undefined,
+  fallback: T | null | undefined
+): T | null {
+  if (requested && canRestoreOverlayFocus(requested)) return requested;
+  return fallback && canRestoreOverlayFocus(fallback) ? fallback : null;
+}
+
 export interface BindOverlayDismissalListenersInput {
   documentTarget: EventTarget;
   windowTarget: EventTarget;

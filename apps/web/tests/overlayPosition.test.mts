@@ -7,8 +7,33 @@ const {
   resolveOverlayPosition
 } = overlayPosition;
 const positioningApi = overlayPosition as typeof overlayPosition & {
-  clampOverlayWidth: (requestedWidth: number | undefined, maxWidth: number) => number | undefined;
-  resolveOverlayOffset: (offset: number | undefined, nested: boolean) => number;
+  resolveAnchoredOverlayLayout: (input: {
+    trigger: ReturnType<typeof rect>;
+    overlay: { measuredWidth: number; height: number };
+    viewport: { width: number; height: number };
+    preferredPlacement: "bottom-start";
+    preferredWidth?: number;
+    minWidth?: number;
+    maxWidth?: number;
+    offset: number;
+    gutter: number;
+  }) => {
+    left: number;
+    maxWidth: number;
+    width: number;
+  };
+  resolveOverlayAnchorOffset: (
+    anchor: { getBoundingClientRect: () => ReturnType<typeof rect> },
+    nested: boolean
+  ) => number;
+  resolveOverlayWidth: (input: {
+    measuredWidth: number;
+    preferredWidth?: number;
+    minWidth?: number;
+    maxWidth?: number;
+    viewportWidth: number;
+    gutter: number;
+  }) => number;
 };
 
 const rect = (left: number, top: number, width: number, height: number) => ({
@@ -95,25 +120,49 @@ describe("resolveOverlayPosition", () => {
     assert.deepEqual(pointOverlayAnchor(44, 66).getBoundingClientRect(), rect(44, 66, 0, 0));
   });
 
-  it("clamps requested width so a large minimum cannot breach the viewport gutter", () => {
-    assert.equal(typeof positioningApi.clampOverlayWidth, "function");
-    assert.equal(positioningApi.clampOverlayWidth(500, 296), 296);
-    assert.equal(positioningApi.clampOverlayWidth(240, 296), 240);
-    assert.equal(positioningApi.clampOverlayWidth(undefined, 296), undefined);
+  it("uses one effective width for constraints and geometry", () => {
+    assert.equal(typeof positioningApi.resolveOverlayWidth, "function");
+    assert.equal(positioningApi.resolveOverlayWidth({
+      measuredWidth: 180,
+      preferredWidth: 100,
+      minWidth: 300,
+      maxWidth: 500,
+      viewportWidth: 320,
+      gutter: 12
+    }), 296);
+
+    assert.equal(typeof positioningApi.resolveAnchoredOverlayLayout, "function");
+    const layout = positioningApi.resolveAnchoredOverlayLayout({
+      trigger: rect(300, 20, 20, 20),
+      overlay: { measuredWidth: 180, height: 80 },
+      viewport: { width: 320, height: 240 },
+      preferredPlacement: "bottom-start",
+      preferredWidth: 100,
+      minWidth: 300,
+      maxWidth: 500,
+      offset: 6,
+      gutter: 12
+    });
+    assert.equal(layout.width, 296);
+    assert.equal(layout.maxWidth, 296);
+    assert.equal(layout.left, 12);
   });
 
-  it("keeps button defaults while allowing an explicit zero point offset", () => {
-    assert.equal(typeof positioningApi.resolveOverlayOffset, "function");
-    assert.equal(positioningApi.resolveOverlayOffset(undefined, false), 6);
-    assert.equal(positioningApi.resolveOverlayOffset(undefined, true), 4);
-    assert.equal(positioningApi.resolveOverlayOffset(0, false), 0);
+  it("infers point, root element, and nested offsets from anchor kind", () => {
+    assert.equal(typeof positioningApi.resolveOverlayAnchorOffset, "function");
+    const point = pointOverlayAnchor(44, 66);
+    const elementAnchor = { getBoundingClientRect: () => rect(100, 20, 28, 28) };
+    assert.equal(positioningApi.resolveOverlayAnchorOffset(point, false), 0);
+    assert.equal(positioningApi.resolveOverlayAnchorOffset(elementAnchor, false), 6);
+    assert.equal(positioningApi.resolveOverlayAnchorOffset(elementAnchor, true), 4);
+    assert.equal(positioningApi.resolveOverlayAnchorOffset(point, true), 4);
 
     const result = resolveOverlayPosition({
-      trigger: pointOverlayAnchor(44, 66).getBoundingClientRect(),
+      trigger: point.getBoundingClientRect(),
       overlay: { width: 120, height: 80 },
       viewport: { width: 800, height: 600 },
       preferredPlacement: "bottom-start",
-      offset: positioningApi.resolveOverlayOffset(0, false),
+      offset: positioningApi.resolveOverlayAnchorOffset(point, false),
       gutter: 12
     });
     assert.equal(result.left, 44);

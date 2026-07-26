@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 interface OverlayRuntimeApi {
@@ -13,6 +14,11 @@ interface OverlayRuntimeApi {
     matches: (selector: string) => boolean;
     getAttribute: (name: string) => string | null;
   }): boolean;
+  resolveOverlayFocusRestoreTarget<T extends {
+    isConnected: boolean;
+    matches: (selector: string) => boolean;
+    getAttribute: (name: string) => string | null;
+  }>(requested: T | null, fallback: T | null): T | null;
   shouldDismissOverlayLayer(
     layer: ReturnType<typeof layer>,
     reason: string,
@@ -63,6 +69,11 @@ const focusTarget = ({
   getAttribute: (name: string) => name === "aria-disabled" && ariaDisabled ? "true" : null
 });
 
+const dialogSource = readFileSync(
+  new URL("../src/design/overlays/OverlayDialog.tsx", import.meta.url),
+  "utf8"
+);
+
 describe("shared overlay focus and dismissal behavior", () => {
   it("honors top-layer dismissal flags and modal focus ownership", async () => {
     const runtime = await loadRuntime();
@@ -88,6 +99,36 @@ describe("shared overlay focus and dismissal behavior", () => {
     assert.equal(runtime.canRestoreOverlayFocus(focusTarget({ isConnected: false })), false);
     assert.equal(runtime.canRestoreOverlayFocus(focusTarget({ nativeDisabled: true })), false);
     assert.equal(runtime.canRestoreOverlayFocus(focusTarget({ ariaDisabled: true })), false);
+  });
+
+  it("falls back when a requested modal restore target is disabled", async () => {
+    const runtime = await loadRuntime();
+    assert.equal(typeof runtime.resolveOverlayFocusRestoreTarget, "function");
+    const fallback = focusTarget();
+    const requested = focusTarget();
+    assert.equal(runtime.resolveOverlayFocusRestoreTarget(requested, fallback), requested);
+    assert.equal(runtime.resolveOverlayFocusRestoreTarget(null, fallback), fallback);
+    assert.equal(runtime.resolveOverlayFocusRestoreTarget(
+      focusTarget({ nativeDisabled: true }),
+      fallback
+    ), fallback);
+    assert.equal(runtime.resolveOverlayFocusRestoreTarget(
+      focusTarget({ ariaDisabled: true }),
+      fallback
+    ), fallback);
+    assert.equal(runtime.resolveOverlayFocusRestoreTarget(
+      focusTarget({ isConnected: false }),
+      fallback
+    ), fallback);
+    assert.equal(runtime.resolveOverlayFocusRestoreTarget(
+      focusTarget({ nativeDisabled: true }),
+      focusTarget({ ariaDisabled: true })
+    ), null);
+  });
+
+  it("keeps modal keyboard containment in the shared focus trap", () => {
+    assert.match(dialogSource, /useOverlayFocusTrap\(/);
+    assert.doesNotMatch(dialogSource, /document\.addEventListener\(["']keydown["']/);
   });
 
   it("delivers dismissal events once and removes every listener", async () => {

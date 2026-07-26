@@ -1,4 +1,5 @@
 import { useEffect, type RefObject } from "react";
+import { resolveOverlayFocusRestoreTarget } from "./overlayRuntime";
 
 const TABBABLE_SELECTOR =
   'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
@@ -77,12 +78,7 @@ export function useOverlayFocusTrap(
     return () => {
       document.removeEventListener("keydown", handleKey, true);
       const requestedRestore = restoreFocusRef?.current ?? null;
-      const restoreTarget = requestedRestore?.isConnected
-        ? requestedRestore
-        : previousFocus?.isConnected
-          ? previousFocus
-          : null;
-      restoreTarget?.focus();
+      resolveOverlayFocusRestoreTarget(requestedRestore, previousFocus)?.focus();
     };
   }, [containerRef, initialFocusRef, open, restoreFocusRef]);
 }

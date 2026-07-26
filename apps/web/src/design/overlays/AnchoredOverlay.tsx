@@ -10,16 +10,15 @@ import { createPortal } from "react-dom";
 import { useOverlayStack } from "./OverlayProvider";
 import { OverlaySurface } from "./OverlaySurface";
 import {
-  clampOverlayWidth,
-  resolveOverlayOffset,
-  resolveOverlayPosition
+  resolveAnchoredOverlayLayout,
+  resolveOverlayAnchorOffset,
+  type AnchoredOverlayLayoutResult
 } from "./overlayPosition";
 import {
   OVERLAY_VIEWPORT_GUTTER_PX,
   type AnchoredOverlayStyle,
   type OverlayAnchor,
   type OverlayPlacement,
-  type OverlayPositionResult,
   type OverlayRootId
 } from "./overlayTypes";
 import { useOverlayPresence } from "./useOverlayPresence";
@@ -31,7 +30,6 @@ export interface AnchoredOverlayProps {
   className?: string;
   id: string;
   minWidth?: number;
-  offset?: number;
   onDismiss: () => void;
   open: boolean;
   parentId?: string;
@@ -43,9 +41,9 @@ export interface AnchoredOverlayProps {
   surfaceRole?: "popover" | "nested";
 }
 
-function positionUnchanged(
-  current: OverlayPositionResult | null,
-  next: OverlayPositionResult
+function layoutUnchanged(
+  current: AnchoredOverlayLayoutResult | null,
+  next: AnchoredOverlayLayoutResult
 ): boolean {
   return Boolean(
     current &&
@@ -53,7 +51,8 @@ function positionUnchanged(
     current.top === next.top &&
     current.maxWidth === next.maxWidth &&
     current.maxHeight === next.maxHeight &&
-    current.placement === next.placement
+    current.placement === next.placement &&
+    current.width === next.width
   );
 }
 
@@ -64,7 +63,6 @@ export function AnchoredOverlay({
   className,
   id,
   minWidth,
-  offset,
   onDismiss,
   open,
   parentId,
@@ -77,7 +75,7 @@ export function AnchoredOverlay({
 }: AnchoredOverlayProps): ReactPortal | null {
   const surfaceRef = useRef<HTMLElement | null>(null);
   const retainedAnchorRef = useRef<OverlayAnchor | null>(anchor);
-  const [position, setPosition] = useState<OverlayPositionResult | null>(null);
+  const [layout, setLayout] = useState<AnchoredOverlayLayoutResult | null>(null);
   const { openRoot, registerLayer } = useOverlayStack();
   const resolvedSurfaceRole = surfaceRole ?? (parentId ? "nested" : "popover");
   const kind = resolvedSurfaceRole === "nested" ? "nested" : "root";
@@ -88,7 +86,7 @@ export function AnchoredOverlay({
   useLayoutEffect(() => {
     surfaceRef.current = presence.present ? document.getElementById(id) : null;
     if (!presence.present) {
-      setPosition(null);
+      setLayout(null);
       retainedAnchorRef.current = null;
     }
     return () => {
@@ -148,23 +146,22 @@ export function AnchoredOverlay({
       const triggerRect = anchor.getBoundingClientRect();
       const surfaceRect = surface.getBoundingClientRect();
       const viewport = { width: window.innerWidth, height: window.innerHeight };
-      const maxViewportWidth = Math.max(
+      const viewportMaxWidth = Math.max(
         0,
         viewport.width - OVERLAY_VIEWPORT_GUTTER_PX * 2
       );
-      const requestedWidth = preferredWidth ?? Math.max(surfaceRect.width, minWidth ?? 0);
-      const next = resolveOverlayPosition({
+      const next = resolveAnchoredOverlayLayout({
         trigger: triggerRect,
-        overlay: {
-          width: clampOverlayWidth(requestedWidth, maxViewportWidth) ?? surfaceRect.width,
-          height: surfaceRect.height
-        },
+        overlay: { measuredWidth: surfaceRect.width, height: surfaceRect.height },
         viewport,
         preferredPlacement: placement,
-        offset: resolveOverlayOffset(offset, kind === "nested"),
+        preferredWidth,
+        minWidth,
+        maxWidth: viewportMaxWidth,
+        offset: resolveOverlayAnchorOffset(anchor, kind === "nested"),
         gutter: OVERLAY_VIEWPORT_GUTTER_PX
       });
-      setPosition((current) => positionUnchanged(current, next) ? current : next);
+      setLayout((current) => layoutUnchanged(current, next) ? current : next);
     };
     const scheduleMeasure = () => {
       if (frame) cancelAnimationFrame(frame);
@@ -186,23 +183,21 @@ export function AnchoredOverlay({
       window.removeEventListener("resize", scheduleMeasure);
       window.removeEventListener("scroll", scheduleMeasure, true);
     };
-  }, [anchor, kind, minWidth, offset, open, placement, preferredWidth]);
+  }, [anchor, kind, minWidth, open, placement, preferredWidth]);
 
   if (!presence.present || !renderedAnchor) return null;
 
   const fallbackMaxWidth = Math.max(0, window.innerWidth - OVERLAY_VIEWPORT_GUTTER_PX * 2);
   const fallbackMaxHeight = Math.max(0, window.innerHeight - OVERLAY_VIEWPORT_GUTTER_PX * 2);
-  const maxWidth = position?.maxWidth ?? fallbackMaxWidth;
   const style: AnchoredOverlayStyle = {
     position: "fixed",
-    left: position?.left ?? 0,
-    top: position?.top ?? 0,
-    maxWidth,
-    maxHeight: position?.maxHeight ?? fallbackMaxHeight,
-    minWidth: clampOverlayWidth(minWidth, maxWidth),
+    left: layout?.left ?? 0,
+    top: layout?.top ?? 0,
+    maxWidth: layout?.maxWidth ?? fallbackMaxWidth,
+    maxHeight: layout?.maxHeight ?? fallbackMaxHeight,
     overflowY: "auto",
-    width: clampOverlayWidth(preferredWidth, maxWidth),
-    visibility: position ? "visible" : "hidden"
+    width: layout?.width,
+    visibility: layout ? "visible" : "hidden"
   };
 
   return createPortal(
@@ -211,7 +206,7 @@ export function AnchoredOverlay({
       aria-hidden={!open || undefined}
       className={className}
       data-overlay-layer-kind={kind}
-      data-overlay-placement={position?.placement ?? placement}
+      data-overlay-placement={layout?.placement ?? placement}
       data-overlay-state={presence.phase}
       id={id}
       role={role}

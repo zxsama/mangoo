@@ -41,6 +41,14 @@ const stackApi = overlayStack as typeof overlayStack & {
   ) => ReturnType<typeof createOverlayStackState>;
 };
 
+const assertRootLayerInvariant = (state: ReturnType<typeof createOverlayStackState>) => {
+  const rootIndexes = state.layers
+    .map((item, index) => item.kind === "root" ? index : -1)
+    .filter((index) => index >= 0);
+  assert.ok(rootIndexes.length <= 1);
+  if (rootIndexes.length === 1) assert.equal(rootIndexes[0], 0);
+};
+
 describe("overlay stack", () => {
   it("replaces the active root when another titlebar overlay opens", () => {
     let state = openOverlayRoot(createOverlayStackState(), "filter");
@@ -101,6 +109,34 @@ describe("overlay stack", () => {
 
     state = pushOverlayLayer(state, layer("wrong-root", "filter", "nested", "library-root"));
     assert.equal(state, original);
+  });
+
+  it("rejects descendants before their root registration", () => {
+    const state = openOverlayRoot(createOverlayStackState(), "library");
+    assert.equal(
+      pushOverlayLayer(state, layer("nested", "library", "nested", "library-root")),
+      state
+    );
+    assert.equal(
+      pushOverlayLayer(state, layer("modal", "library", "modal", "library-root")),
+      state
+    );
+    assertRootLayerInvariant(state);
+  });
+
+  it("never lets a late root become topmost above an existing layer", () => {
+    let state = openOverlayRoot(createOverlayStackState(), "library");
+    state = pushOverlayLayer(state, {
+      ...layer("standalone-modal", "library", "modal"),
+      dismissOnWindowBlur: false
+    });
+    assertRootLayerInvariant(state);
+    const modalOnly = state;
+
+    state = pushOverlayLayer(state, layer("library-root", "library", "root"));
+    assert.equal(state, modalOnly);
+    assert.equal(topOverlayLayer(state)?.id, "standalone-modal");
+    assertRootLayerInvariant(state);
   });
 
   it("rejects modal layers owned by a different active root", () => {
