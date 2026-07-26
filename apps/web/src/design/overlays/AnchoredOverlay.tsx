@@ -9,6 +9,7 @@ import {
 import { createPortal } from "react-dom";
 import { useOverlayStack } from "./OverlayProvider";
 import { OverlaySurface } from "./OverlaySurface";
+import { measureOverlayIntrinsicWidth } from "./overlayMeasurement";
 import {
   resolveAnchoredOverlayLayout,
   resolveOverlayAnchorOffset,
@@ -144,6 +145,7 @@ export function AnchoredOverlay({
     const measure = () => {
       frame = 0;
       const triggerRect = anchor.getBoundingClientRect();
+      const intrinsicWidth = measureOverlayIntrinsicWidth(surface);
       const surfaceRect = surface.getBoundingClientRect();
       const viewport = { width: window.innerWidth, height: window.innerHeight };
       const viewportMaxWidth = Math.max(
@@ -152,7 +154,7 @@ export function AnchoredOverlay({
       );
       const next = resolveAnchoredOverlayLayout({
         trigger: triggerRect,
-        overlay: { measuredWidth: surfaceRect.width, height: surfaceRect.height },
+        overlay: { measuredWidth: intrinsicWidth, height: surfaceRect.height },
         viewport,
         preferredPlacement: placement,
         preferredWidth,

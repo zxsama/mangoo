@@ -13,6 +13,7 @@ describe("shared overlay source contract", () => {
   const overlayPositionSource = read("src/design/overlays/overlayPosition.ts");
   const overlaySourceBundle = [
     "overlayTypes.ts",
+    "overlayMeasurement.ts",
     "overlayPosition.ts",
     "overlayStack.ts",
     "overlayRuntime.ts",
@@ -47,6 +48,7 @@ describe("shared overlay source contract", () => {
       anchoredOverlaySource,
       /interface AnchoredOverlayProps\s*{[\s\S]*?\boffset\?:[\s\S]*?}/
     );
+    assert.match(anchoredOverlaySource, /measureOverlayIntrinsicWidth\(surface\)/);
     assert.match(anchoredOverlaySource, /width:\s*layout\?\.width/);
     assert.match(
       overlayPositionSource,
