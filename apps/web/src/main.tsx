@@ -2,7 +2,9 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { getDesktopBridge, notifyDesktopShellReady } from "./core/desktop";
 import { applyInterfaceStyleVariables, readInterfaceStyle } from "./design/liquid-glass";
+import { OverlayProvider } from "./design/overlays";
 import "./styles.css";
+import "./design/overlays/overlay.css";
 
 // Apply persisted material variables before any role-specific dynamic import or
 // first paint. Hooks keep them current after mount; this closes the blank default
@@ -48,7 +50,9 @@ if (isNotificationsWindow) {
   void import("./app/App").then(({ App }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>
-        <App />
+        <OverlayProvider>
+          <App />
+        </OverlayProvider>
       </React.StrictMode>
     );
     preloadSecondaryWindowRenderers();

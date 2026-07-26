@@ -645,6 +645,7 @@ assertStructuredReadmeCapabilityContracts();
 const requiredDirs = [
   "apps/desktop/src",
   "apps/web/src",
+  "apps/web/src/design/overlays",
   "contracts/core-api",
   "contracts/plugins",
   "crates/core/src",
@@ -675,6 +676,7 @@ const requiredFiles = [
   "apps/web/src/core/client.ts",
   "apps/web/src/core/types.ts",
   "apps/web/src/core/useLibraryData.ts",
+  "apps/web/src/design/overlays/index.ts",
   "apps/web/src/features/notifications/NotificationHistoryView.tsx",
   "apps/web/src/features/notifications/NotificationPopover.tsx",
   "apps/web/src/features/notifications/NotificationStatusView.tsx",

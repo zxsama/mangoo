@@ -8,6 +8,7 @@ Megle uses a contract-first monorepo so the desktop shell, reusable Web UI, Rust
 apps/
   desktop/          Electron shell and Windows desktop adapter.
   web/              React UI reused by desktop and future Web/Docker.
+    src/design/overlays/ Shared overlay geometry, stack, focus, material, menu, dialog, and field primitives.
 contracts/
   core-api/         HTTP API contract shared by UI, desktop, Core, and tests.
   plugins/          Plugin manifest and permission contracts.

@@ -1,0 +1,90 @@
+.overlay-surface {
+  --glass-fill: var(--glass-dialog-fill);
+  --glass-blur-current: var(--glass-dialog-blur);
+  --glass-border-current: var(--glass-center-stroke);
+  color: var(--text-soft);
+  border-radius: var(--radius-overlay);
+  box-shadow: var(--glass-shadow);
+}
+
+[data-overlay-layer-kind="root"] {
+  z-index: 120;
+}
+
+[data-overlay-layer-kind="nested"] {
+  z-index: 130;
+}
+
+[data-overlay-layer-kind="modal"] {
+  z-index: 140;
+}
+
+.overlay-surface-popover,
+.overlay-surface-nested {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.018)),
+    var(--glass-dialog-fill);
+}
+
+.overlay-surface-nested {
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.04)),
+    var(--glass-dialog-fill);
+  box-shadow: var(--glass-shadow-tight);
+}
+
+.overlay-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--dialog-backdrop-dim);
+  -webkit-backdrop-filter: blur(var(--dialog-blur)) saturate(var(--glass-center-saturation));
+  backdrop-filter: blur(var(--dialog-blur)) saturate(var(--glass-center-saturation));
+}
+
+[data-overlay-menu-item="true"]:focus-visible,
+.overlay-field-control:focus-within {
+  outline: 2px solid var(--interactive-focus);
+  outline-offset: -2px;
+}
+
+@keyframes overlay-root-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.985);
+  }
+}
+
+@keyframes overlay-nested-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-3px) scale(0.99);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .overlay-surface-popover[data-overlay-state="opening"] {
+    animation: overlay-root-enter 140ms ease-out both;
+  }
+  .overlay-surface-nested[data-overlay-state="opening"] {
+    animation: overlay-nested-enter 110ms ease-out both;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .overlay-surface,
+  .overlay-modal-backdrop {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .overlay-surface {
+    background: rgba(18, 24, 30, 0.98);
+  }
+}
+
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .overlay-surface {
+    background: rgba(18, 24, 30, 0.98);
+  }
+}
