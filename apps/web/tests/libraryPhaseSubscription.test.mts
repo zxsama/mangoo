@@ -56,6 +56,49 @@ it("does not overwrite a live phase with an older reload snapshot", async () => 
   assert.deepEqual(observed, ["loading-media"]);
 });
 
+it("replays loading-media when Core became ready before the renderer subscribed", async () => {
+  const phaseBeforeSubscribe: LibraryLoadPhase = "loading-media";
+  (globalThis as typeof globalThis & { window: unknown }).window = {
+    megleDesktop: {
+      onLibraryPhase: () => () => undefined,
+      getLibraryPhase: async () => phaseBeforeSubscribe
+    }
+  };
+  const { subscribeLibraryPhase } = await import("../src/core/desktop.ts?phase-before-subscribe");
+  const observed: LibraryLoadPhase[] = [];
+
+  subscribeLibraryPhase((phase) => observed.push(phase));
+  await Promise.resolve();
+
+  assert.deepEqual(observed, ["loading-media"]);
+});
+
+it("replays the current loading phase again after a renderer reload", async () => {
+  let snapshotReads = 0;
+  (globalThis as typeof globalThis & { window: unknown }).window = {
+    megleDesktop: {
+      onLibraryPhase: () => () => undefined,
+      getLibraryPhase: async () => {
+        snapshotReads += 1;
+        return "loading-media" as const;
+      }
+    }
+  };
+  const { subscribeLibraryPhase } = await import("../src/core/desktop.ts?phase-reload");
+  const firstRenderer: LibraryLoadPhase[] = [];
+  const secondRenderer: LibraryLoadPhase[] = [];
+
+  const unsubscribeFirst = subscribeLibraryPhase((phase) => firstRenderer.push(phase));
+  await Promise.resolve();
+  unsubscribeFirst();
+  subscribeLibraryPhase((phase) => secondRenderer.push(phase));
+  await Promise.resolve();
+
+  assert.equal(snapshotReads, 2);
+  assert.deepEqual(firstRenderer, ["loading-media"]);
+  assert.deepEqual(secondRenderer, ["loading-media"]);
+});
+
 it("keeps the live subscription usable when the reload snapshot request fails", async () => {
   let listener: ((phase: LibraryLoadPhase) => void) | null = null;
   (globalThis as typeof globalThis & { window: unknown }).window = {

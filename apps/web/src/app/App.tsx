@@ -435,10 +435,9 @@ export function App() {
   useEffect(() => {
     if (!library.loading && library.roots.length >= 0) {
       // Data settled (roots resolved, even if empty) → the loading overlay can
-      // clear. Advance to "ready" from ANY non-error, non-ready phase: on a library
-      // switch this comes from "loading-media", but on COLD START no phase event is
-      // ever pushed (the initial Core boot uses the normal startup path, not the
-      // switch path), so the phase would otherwise stay stuck at "starting-core".
+      // clear. Desktop cold start and library switches replay "loading-media";
+      // browser-only use has no Desktop phase producer and settles from its initial
+      // phase here as well.
       setLibraryPhase((p) =>
         p === "ready" || (typeof p === "object" && p.kind === "error") ? p : "ready"
       );

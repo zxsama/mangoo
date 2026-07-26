@@ -44,6 +44,7 @@ import {
 import * as libraryRegistry from "./library-registry.js";
 import {
   LibraryLoadState,
+  prepareColdLibraryStartup,
   type DesktopLibraryLoadPhase
 } from "./library-load-state.js";
 import { sessionForDbPath } from "./core-session.js";
@@ -2492,8 +2493,11 @@ app
     void ensureNotificationService().catch((error) => {
       desktopLogger.warn("main", "[megle] notification service startup degraded:", error);
     });
-    const session = await ensureCoreReady();
-    await maybeAutoAddRoot(session);
+    await prepareColdLibraryStartup({
+      ensureCoreReady,
+      prepareLibrary: maybeAutoAddRoot,
+      publishPhase: pushLibraryPhase
+    });
     await createWindow();
     emitMainStartupReady();
   })
