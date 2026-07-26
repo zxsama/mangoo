@@ -13,6 +13,10 @@ describe("shared overlay source contract", () => {
     "overlayTypes.ts",
     "overlayPosition.ts",
     "overlayStack.ts",
+    "overlayRuntime.ts",
+    "overlayMenuNavigation.ts",
+    "overlayPresence.ts",
+    "useOverlayPresence.ts",
     "OverlayProvider.tsx",
     "OverlaySurface.tsx",
     "AnchoredOverlay.tsx",
@@ -34,5 +38,28 @@ describe("shared overlay source contract", () => {
     assert.match(overlayCss, /var\(--glass-dialog-fill\)/);
     assert.match(overlayCss, /var\(--glass-center-stroke\)/);
     assert.doesNotMatch(overlaySourceBundle, /fetch\s*\(|node:fs|@radix|@floating-ui/);
+  });
+
+  it("uses translation and opacity presence motion without scale", () => {
+    assert.doesNotMatch(overlayCss, /scale\s*\(/);
+    assert.match(
+      overlayCss,
+      /overlay-surface-popover\[data-overlay-state="opening"\][\s\S]*?140ms/
+    );
+    assert.match(
+      overlayCss,
+      /overlay-surface-popover\[data-overlay-state="closing"\][\s\S]*?140ms/
+    );
+    assert.match(
+      overlayCss,
+      /overlay-surface-nested\[data-overlay-state="opening"\][\s\S]*?110ms/
+    );
+    assert.match(
+      overlayCss,
+      /overlay-surface-nested\[data-overlay-state="closing"\][\s\S]*?110ms/
+    );
+    assert.match(overlayCss, /overlay-modal-backdrop\[data-overlay-state="opening"\]/);
+    assert.match(overlayCss, /overlay-modal-backdrop\[data-overlay-state="closing"\]/);
+    assert.match(overlayCss, /prefers-reduced-motion:\s*reduce[\s\S]*?animation:\s*none/);
   });
 });

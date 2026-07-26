@@ -9,14 +9,23 @@ import {
   type ReactNode
 } from "react";
 import {
+  closeTransientOverlayLayers,
   closeOverlayRoot,
   createOverlayStackState,
   openOverlayRoot,
   popOverlayLayer,
   pushOverlayLayer,
   topOverlayLayer,
+  unregisterOverlayLayer,
   type OverlayStackState
 } from "./overlayStack";
+import {
+  bindOverlayDismissalListeners,
+  canRestoreOverlayFocus,
+  shouldDismissOverlayLayer,
+  shouldRestoreOverlayFocus,
+  type OverlayDismissReason
+} from "./overlayRuntime";
 import type {
   OverlayLayerRegistration,
   OverlayRootId,
@@ -30,9 +39,14 @@ function targetBelongsToLayer(layer: OverlayLayerRegistration, target: EventTarg
   return Boolean(layer.surface?.contains(target) || layer.trigger?.contains(target));
 }
 
-function restoreLayerFocus(layer: OverlayLayerRegistration): void {
-  if (layer.restoreFocus && layer.trigger?.isConnected) {
-    layer.trigger?.focus();
+function restoreLayerFocus(layer: OverlayLayerRegistration, reason: OverlayDismissReason): void {
+  const { trigger } = layer;
+  if (
+    trigger &&
+    shouldRestoreOverlayFocus(layer, reason) &&
+    canRestoreOverlayFocus(trigger)
+  ) {
+    trigger.focus();
   }
 }
 
@@ -45,7 +59,10 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     setState(next);
   }, []);
 
-  const dismissLayer = useCallback((layer: OverlayLayerRegistration): boolean => {
+  const dismissLayer = useCallback((
+    layer: OverlayLayerRegistration,
+    reason: OverlayDismissReason
+  ): boolean => {
     const current = stateRef.current;
     if (!current.layers.some((item) => item.id === layer.id)) return false;
 
@@ -55,7 +72,7 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
       next = closeOverlayRoot(next);
     }
     commitState(next);
-    restoreLayerFocus(layer);
+    restoreLayerFocus(layer, reason);
     return true;
   }, [commitState]);
 
@@ -70,7 +87,10 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     commitState(openOverlayRoot(current, rootId));
   }, [commitState]);
 
-  const closeRoot = useCallback((rootId?: OverlayRootId) => {
+  const closeRootFamily = useCallback((
+    rootId: OverlayRootId | undefined,
+    reason: OverlayDismissReason
+  ) => {
     const current = stateRef.current;
     if (
       current.activeRootId === null ||
@@ -84,31 +104,45 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
       layer.onDismiss();
     }
     commitState(closeOverlayRoot(current, rootId));
-    if (rootLayer) restoreLayerFocus(rootLayer);
+    if (rootLayer) restoreLayerFocus(rootLayer, reason);
   }, [commitState]);
+
+  const closeRoot = useCallback((rootId?: OverlayRootId) => {
+    closeRootFamily(rootId, "programmatic");
+  }, [closeRootFamily]);
 
   const registerLayer = useCallback((layer: OverlayLayerRegistration) => {
     let next = stateRef.current;
     if (next.activeRootId === null) {
+      if (layer.kind === "nested") {
+        layer.onDismiss();
+        return () => undefined;
+      }
       next = openOverlayRoot(next, layer.rootId);
     }
-    commitState(pushOverlayLayer(next, layer));
+    const registeredState = pushOverlayLayer(next, layer);
+    if (registeredState === next) {
+      layer.onDismiss();
+      return () => undefined;
+    }
+    commitState(registeredState);
 
     return () => {
-      const current = stateRef.current;
-      const registered = current.layers.find((item) => item.id === layer.id);
-      if (!registered) return;
-      let cleaned = popOverlayLayer(current, layer.id);
-      if (cleaned.layers.length === 0) {
-        cleaned = closeOverlayRoot(cleaned);
-      }
-      commitState(cleaned);
+      queueMicrotask(() => {
+        const current = stateRef.current;
+        let cleaned = unregisterOverlayLayer(current, layer);
+        if (cleaned === current) return;
+        if (cleaned.layers.length === 0) {
+          cleaned = closeOverlayRoot(cleaned);
+        }
+        commitState(cleaned);
+      });
     };
   }, [commitState]);
 
   const dismissTop = useCallback((): boolean => {
     const layer = topOverlayLayer(stateRef.current);
-    return layer ? dismissLayer(layer) : false;
+    return layer ? dismissLayer(layer, "programmatic") : false;
   }, [dismissLayer]);
 
   const hasLayers = state.layers.length > 0;
@@ -116,58 +150,35 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!hasLayers) return;
 
-    const handlePointerDown = (event: PointerEvent) => {
-      const layer = topOverlayLayer(stateRef.current);
-      if (
-        layer?.dismissOnOutsidePointer &&
-        !targetBelongsToLayer(layer, event.target)
-      ) {
-        dismissLayer(layer);
+    return bindOverlayDismissalListeners({
+      documentTarget: document,
+      windowTarget: window,
+      getVisibilityState: () => document.visibilityState,
+      onDismissRequest: (reason, event) => {
+        const current = stateRef.current;
+        const layer = topOverlayLayer(current);
+        if (!layer) return false;
+
+        if (
+          reason === "window-blur" ||
+          reason === "pagehide" ||
+          reason === "visibility-hidden"
+        ) {
+          const transientLayers = current.layers.filter((item) => item.dismissOnWindowBlur);
+          if (transientLayers.length === 0) return false;
+          for (const transientLayer of [...transientLayers].reverse()) {
+            transientLayer.onDismiss();
+          }
+          commitState(closeTransientOverlayLayers(current));
+          return true;
+        }
+
+        const targetBelongs = targetBelongsToLayer(layer, event.target);
+        if (!shouldDismissOverlayLayer(layer, reason, targetBelongs)) return false;
+        return dismissLayer(layer, reason);
       }
-    };
-
-    const handleFocusIn = (event: FocusEvent) => {
-      const layer = topOverlayLayer(stateRef.current);
-      if (
-        layer &&
-        layer.kind !== "modal" &&
-        layer.dismissOnFocusOutside &&
-        !targetBelongsToLayer(layer, event.target)
-      ) {
-        dismissLayer(layer);
-      }
-    };
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      const layer = topOverlayLayer(stateRef.current);
-      if (layer?.dismissOnEscape && dismissLayer(layer)) {
-        event.preventDefault();
-        event.stopPropagation();
-      }
-    };
-
-    const handleWindowDeparture = () => {
-      const layer = topOverlayLayer(stateRef.current);
-      if (layer?.dismissOnWindowBlur) {
-        closeRoot(stateRef.current.activeRootId ?? undefined);
-      }
-    };
-
-    document.addEventListener("pointerdown", handlePointerDown, true);
-    document.addEventListener("focusin", handleFocusIn, true);
-    document.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("blur", handleWindowDeparture);
-    window.addEventListener("pagehide", handleWindowDeparture);
-
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown, true);
-      document.removeEventListener("focusin", handleFocusIn, true);
-      document.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("blur", handleWindowDeparture);
-      window.removeEventListener("pagehide", handleWindowDeparture);
-    };
-  }, [closeRoot, dismissLayer, hasLayers]);
+    });
+  }, [commitState, dismissLayer, hasLayers]);
 
   const api = useMemo<OverlayStackApi>(() => ({
     activeRootId: state.activeRootId,

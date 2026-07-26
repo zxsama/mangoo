@@ -1,11 +1,19 @@
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   type ButtonHTMLAttributes,
+  type FocusEvent,
   type HTMLAttributes,
   type KeyboardEvent,
   type ReactNode
 } from "react";
+import { useOverlayStack } from "./OverlayProvider";
+import {
+  findOverlayMenuTypeaheadMatch,
+  overlayMenuTabIndexes,
+  resolveOverlayMenuKey
+} from "./overlayMenuNavigation";
 
 const ENABLED_MENU_ITEM_SELECTOR =
   '[data-overlay-menu-item="true"]:not(:disabled):not([aria-disabled="true"])';
@@ -37,22 +45,39 @@ export function OverlayMenuList({
   autoFocus = true,
   children,
   className,
+  onFocusCapture,
   onKeyDown,
   role = "menu",
   ...props
 }: OverlayMenuListProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const typeaheadRef = useRef("");
+  const typeaheadTimerRef = useRef<number | null>(null);
+  const { dismissTop } = useOverlayStack();
 
-  useEffect(() => {
-    if (!autoFocus) return;
+  const activateRovingItem = (items: HTMLButtonElement[], index: number, focus: boolean) => {
+    const tabIndexes = overlayMenuTabIndexes(items.length, index);
+    items.forEach((item, itemIndex) => {
+      item.tabIndex = tabIndexes[itemIndex] ?? -1;
+    });
+    if (focus) items[index]?.focus();
+  };
+
+  useLayoutEffect(() => {
     const container = containerRef.current;
     if (!container) return;
     const items = enabledMenuItems(container);
-    const preferred = items.find((item) =>
+    const preferredIndex = items.findIndex((item) =>
       item.dataset.selected === "true" || item.getAttribute("aria-checked") === "true"
     );
-    (preferred ?? items[0])?.focus();
+    activateRovingItem(items, preferredIndex >= 0 ? preferredIndex : 0, autoFocus);
   }, [autoFocus]);
+
+  useEffect(() => () => {
+    if (typeaheadTimerRef.current !== null) {
+      window.clearTimeout(typeaheadTimerRef.current);
+    }
+  }, []);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     onKeyDown?.(event);
@@ -64,26 +89,57 @@ export function OverlayMenuList({
     if (items.length === 0) return;
 
     const activeIndex = items.indexOf(document.activeElement as HTMLButtonElement);
-    let nextIndex: number | null = null;
+    const activeItem = items[activeIndex] ?? items[0];
+    const action = resolveOverlayMenuKey({
+      key: event.key,
+      activeIndex,
+      itemCount: items.length,
+      activeHasSubmenu: activeItem?.dataset.submenu === "true",
+      nested: container.closest('[data-overlay-layer-kind="nested"]') !== null
+    });
 
-    if (event.key === "ArrowDown") {
-      nextIndex = activeIndex < 0 ? 0 : (activeIndex + 1) % items.length;
-    } else if (event.key === "ArrowUp") {
-      nextIndex = activeIndex < 0 ? items.length - 1 : (activeIndex - 1 + items.length) % items.length;
-    } else if (event.key === "Home") {
-      nextIndex = 0;
-    } else if (event.key === "End") {
-      nextIndex = items.length - 1;
-    } else if (event.key === "Enter" || event.key === " ") {
+    if (action.type === "focus") {
       event.preventDefault();
-      (items[activeIndex] ?? items[0]).click();
-      return;
-    } else {
+      activateRovingItem(items, action.index, true);
       return;
     }
+    if (action.type === "activate" || action.type === "open-submenu") {
+      event.preventDefault();
+      activeItem?.click();
+      return;
+    }
+    if (action.type === "close-submenu") {
+      if (dismissTop()) event.preventDefault();
+      return;
+    }
+    if (event.key.length !== 1 || event.altKey || event.ctrlKey || event.metaKey) return;
 
+    typeaheadRef.current += event.key.toLocaleLowerCase();
+    if (typeaheadTimerRef.current !== null) {
+      window.clearTimeout(typeaheadTimerRef.current);
+    }
+    typeaheadTimerRef.current = window.setTimeout(() => {
+      typeaheadRef.current = "";
+      typeaheadTimerRef.current = null;
+    }, 500);
+    const nextIndex = findOverlayMenuTypeaheadMatch(
+      items.map((item) => item.textContent ?? ""),
+      typeaheadRef.current,
+      activeIndex
+    );
+    if (nextIndex === null) return;
     event.preventDefault();
-    items[nextIndex]?.focus();
+    activateRovingItem(items, nextIndex, true);
+  };
+
+  const handleFocusCapture = (event: FocusEvent<HTMLDivElement>) => {
+    onFocusCapture?.(event);
+    if (event.defaultPrevented) return;
+    const container = containerRef.current;
+    if (!container || !(event.target instanceof HTMLButtonElement)) return;
+    const items = enabledMenuItems(container);
+    const activeIndex = items.indexOf(event.target);
+    if (activeIndex >= 0) activateRovingItem(items, activeIndex, false);
   };
 
   return (
@@ -91,6 +147,7 @@ export function OverlayMenuList({
       {...props}
       aria-label={ariaLabel}
       className={`overlay-menu-list${className ? ` ${className}` : ""}`}
+      onFocusCapture={handleFocusCapture}
       onKeyDown={handleKeyDown}
       ref={containerRef}
       role={role}
@@ -112,28 +169,30 @@ export function OverlayMenuItem({
   selected = false,
   shortcut,
   submenu = false,
+  tabIndex = -1,
   type = "button",
   ...props
 }: OverlayMenuItemProps) {
   const resolvedRole = role ?? (checked === undefined ? "menuitem" : "menuitemcheckbox");
   const ariaDisabled = props["aria-disabled"];
+  const isDisabled = disabled || ariaDisabled === true || ariaDisabled === "true";
 
   return (
     <button
       {...props}
       aria-checked={checked}
       aria-disabled={ariaDisabled}
+      aria-haspopup={submenu ? "menu" : props["aria-haspopup"]}
       aria-selected={selected || undefined}
       className={`overlay-menu-item${className ? ` ${className}` : ""}`}
       data-danger={danger || undefined}
-      data-interactive-pointer-target={
-        !disabled && ariaDisabled !== true && ariaDisabled !== "true" ? "true" : undefined
-      }
+      data-interactive-pointer-target={!isDisabled ? "true" : undefined}
       data-overlay-menu-item="true"
       data-selected={selected || undefined}
       data-submenu={submenu || undefined}
       disabled={disabled}
       role={resolvedRole}
+      tabIndex={isDisabled ? -1 : tabIndex}
       type={type}
     >
       {icon ? <span className="overlay-menu-item-icon" aria-hidden="true">{icon}</span> : null}

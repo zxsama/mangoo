@@ -52,14 +52,54 @@
 @keyframes overlay-root-enter {
   from {
     opacity: 0;
-    transform: translateY(-4px) scale(0.985);
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes overlay-root-exit {
+  to {
+    opacity: 0;
+    transform: translateY(-4px);
   }
 }
 
 @keyframes overlay-nested-enter {
   from {
     opacity: 0;
-    transform: translateX(-3px) scale(0.99);
+    transform: translateX(-3px);
+  }
+}
+
+@keyframes overlay-nested-exit {
+  to {
+    opacity: 0;
+    transform: translateX(-3px);
+  }
+}
+
+@keyframes overlay-modal-backdrop-enter {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes overlay-modal-backdrop-exit {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes overlay-modal-surface-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@keyframes overlay-modal-surface-exit {
+  to {
+    opacity: 0;
+    transform: translateY(4px);
   }
 }
 
@@ -67,8 +107,39 @@
   .overlay-surface-popover[data-overlay-state="opening"] {
     animation: overlay-root-enter 140ms ease-out both;
   }
+  .overlay-surface-popover[data-overlay-state="closing"] {
+    animation: overlay-root-exit 140ms ease-in both;
+    pointer-events: none;
+  }
   .overlay-surface-nested[data-overlay-state="opening"] {
     animation: overlay-nested-enter 110ms ease-out both;
+  }
+  .overlay-surface-nested[data-overlay-state="closing"] {
+    animation: overlay-nested-exit 110ms ease-in both;
+    pointer-events: none;
+  }
+  .overlay-modal-backdrop[data-overlay-state="opening"] {
+    animation: overlay-modal-backdrop-enter 160ms ease-out both;
+  }
+  .overlay-modal-backdrop[data-overlay-state="closing"] {
+    animation: overlay-modal-backdrop-exit 160ms ease-in both;
+    pointer-events: none;
+  }
+  .overlay-modal-surface[data-overlay-state="opening"] {
+    animation: overlay-modal-surface-enter 160ms ease-out both;
+  }
+  .overlay-modal-surface[data-overlay-state="closing"] {
+    animation: overlay-modal-surface-exit 160ms ease-in both;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .overlay-surface-popover,
+  .overlay-surface-nested,
+  .overlay-modal-backdrop,
+  .overlay-modal-surface {
+    animation: none;
+    transform: none;
   }
 }
 

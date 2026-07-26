@@ -1,32 +1,134 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
-const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
+interface OverlayRuntimeApi {
+  bindOverlayDismissalListeners(input: {
+    documentTarget: EventTarget;
+    windowTarget: EventTarget;
+    getVisibilityState: () => DocumentVisibilityState;
+    onDismissRequest: (reason: string, event: Event) => boolean;
+  }): () => void;
+  canRestoreOverlayFocus(input: {
+    isConnected: boolean;
+    matches: (selector: string) => boolean;
+    getAttribute: (name: string) => string | null;
+  }): boolean;
+  shouldDismissOverlayLayer(
+    layer: ReturnType<typeof layer>,
+    reason: string,
+    targetBelongsToLayer?: boolean
+  ): boolean;
+  shouldRestoreOverlayFocus(layer: ReturnType<typeof layer>, reason: string): boolean;
+}
 
-describe("shared overlay focus contract", () => {
-  const provider = read("src/design/overlays/OverlayProvider.tsx");
-  const menu = read("src/design/overlays/OverlayMenu.tsx");
-  const dialog = read("src/design/overlays/OverlayDialog.tsx");
+const loadRuntime = async (): Promise<OverlayRuntimeApi> => {
+  try {
+    return await import("../src/design/overlays/overlayRuntime.ts") as OverlayRuntimeApi;
+  } catch (error) {
+    assert.fail(`overlay runtime seam is unavailable: ${String(error)}`);
+  }
+};
 
-  it("restores only a connected trigger requested by the dismissed layer", () => {
-    assert.match(provider, /restoreFocus/);
-    assert.match(provider, /trigger\?\.isConnected|trigger\.isConnected/);
-    assert.match(provider, /trigger\?\.focus\(|trigger\.focus\(/);
-    assert.match(provider, /focusin/);
+const layer = (kind: "root" | "nested" | "modal" = "root") => ({
+  id: "layer",
+  rootId: "library" as const,
+  kind,
+  trigger: null,
+  surface: null,
+  dismissOnEscape: true,
+  dismissOnFocusOutside: true,
+  dismissOnOutsidePointer: true,
+  dismissOnWindowBlur: true,
+  restoreFocus: true,
+  onDismiss: () => undefined
+});
+
+const keyboardEvent = (key: string) => {
+  const event = new Event("keydown", { cancelable: true });
+  Object.defineProperty(event, "key", { value: key });
+  return event;
+};
+
+const focusTarget = ({
+  ariaDisabled = false,
+  isConnected = true,
+  nativeDisabled = false
+}: {
+  ariaDisabled?: boolean;
+  isConnected?: boolean;
+  nativeDisabled?: boolean;
+} = {}) => ({
+  isConnected,
+  matches: (selector: string) => selector === ":disabled" && nativeDisabled,
+  getAttribute: (name: string) => name === "aria-disabled" && ariaDisabled ? "true" : null
+});
+
+describe("shared overlay focus and dismissal behavior", () => {
+  it("honors top-layer dismissal flags and modal focus ownership", async () => {
+    const runtime = await loadRuntime();
+    const root = layer();
+    assert.equal(runtime.shouldDismissOverlayLayer(root, "escape"), true);
+    assert.equal(runtime.shouldDismissOverlayLayer(root, "outside-pointer", false), true);
+    assert.equal(runtime.shouldDismissOverlayLayer(root, "outside-pointer", true), false);
+    assert.equal(runtime.shouldDismissOverlayLayer(root, "focus-outside", false), true);
+    assert.equal(runtime.shouldDismissOverlayLayer(layer("modal"), "focus-outside", false), false);
+    assert.equal(runtime.shouldDismissOverlayLayer({ ...root, dismissOnEscape: false }, "escape"), false);
   });
 
-  it("keeps one menu keyboard implementation", () => {
-    for (const key of ["ArrowUp", "ArrowDown", "Home", "End", "Enter"]) {
-      assert.match(menu, new RegExp(JSON.stringify(key).slice(1, -1)));
-    }
-    assert.match(menu, /["'] ["']/);
-    assert.match(menu, /data-overlay-menu-item/);
-    assert.match(menu, /disabled|aria-disabled/);
+  it("lets Tab continue outside without restoring the trigger", async () => {
+    const runtime = await loadRuntime();
+    assert.equal(runtime.shouldRestoreOverlayFocus(layer(), "focus-outside"), false);
+    assert.equal(runtime.shouldRestoreOverlayFocus(layer(), "escape"), true);
+    assert.equal(runtime.shouldRestoreOverlayFocus({ ...layer(), restoreFocus: false }, "escape"), false);
   });
 
-  it("reuses the existing modal focus trap", () => {
-    assert.match(dialog, /useOverlayFocusTrap/);
-    assert.doesNotMatch(dialog, /document\.addEventListener\(["']keydown["']/);
+  it("restores focus only to connected enabled triggers", async () => {
+    const runtime = await loadRuntime();
+    assert.equal(runtime.canRestoreOverlayFocus(focusTarget()), true);
+    assert.equal(runtime.canRestoreOverlayFocus(focusTarget({ isConnected: false })), false);
+    assert.equal(runtime.canRestoreOverlayFocus(focusTarget({ nativeDisabled: true })), false);
+    assert.equal(runtime.canRestoreOverlayFocus(focusTarget({ ariaDisabled: true })), false);
+  });
+
+  it("delivers dismissal events once and removes every listener", async () => {
+    const runtime = await loadRuntime();
+    const documentTarget = new EventTarget();
+    const windowTarget = new EventTarget();
+    const reasons: string[] = [];
+    let visibilityState: DocumentVisibilityState = "visible";
+    const cleanup = runtime.bindOverlayDismissalListeners({
+      documentTarget,
+      windowTarget,
+      getVisibilityState: () => visibilityState,
+      onDismissRequest: (reason) => {
+        reasons.push(reason);
+        return true;
+      }
+    });
+
+    const escape = keyboardEvent("Escape");
+    documentTarget.dispatchEvent(escape);
+    documentTarget.dispatchEvent(new Event("pointerdown"));
+    documentTarget.dispatchEvent(new Event("focusin"));
+    windowTarget.dispatchEvent(new Event("blur"));
+    windowTarget.dispatchEvent(new Event("pagehide"));
+    documentTarget.dispatchEvent(new Event("visibilitychange"));
+    visibilityState = "hidden";
+    documentTarget.dispatchEvent(new Event("visibilitychange"));
+
+    assert.equal(escape.defaultPrevented, true);
+    assert.deepEqual(reasons, [
+      "escape",
+      "outside-pointer",
+      "focus-outside",
+      "window-blur",
+      "pagehide",
+      "visibility-hidden"
+    ]);
+
+    cleanup();
+    documentTarget.dispatchEvent(keyboardEvent("Escape"));
+    windowTarget.dispatchEvent(new Event("blur"));
+    assert.equal(reasons.length, 6);
   });
 });

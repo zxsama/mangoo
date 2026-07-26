@@ -11,6 +11,7 @@ import { useOverlayStack } from "./OverlayProvider";
 import { OverlaySurface } from "./OverlaySurface";
 import type { OverlayHeaderContent, OverlayRootId } from "./overlayTypes";
 import { useOverlayFocusTrap } from "./useOverlayFocusTrap";
+import { useOverlayPresence } from "./useOverlayPresence";
 
 export interface ModalSurfaceProps {
   ariaDescribedBy?: string;
@@ -43,13 +44,14 @@ export function ModalSurface({
 }: ModalSurfaceProps) {
   const containerRef = useRef<HTMLElement | null>(null);
   const { registerLayer } = useOverlayStack();
+  const presence = useOverlayPresence(open, "modal");
 
   useLayoutEffect(() => {
-    containerRef.current = open ? document.getElementById(id) : null;
+    containerRef.current = presence.present ? document.getElementById(id) : null;
     return () => {
       containerRef.current = null;
     };
-  }, [id, open]);
+  }, [id, presence.present]);
 
   useOverlayFocusTrap(open, containerRef, { initialFocusRef, restoreFocusRef });
 
@@ -70,13 +72,14 @@ export function ModalSurface({
     });
   }, [busy, id, onDismiss, open, registerLayer, restoreFocusRef, rootId]);
 
-  if (!open) return null;
+  if (!presence.present) return null;
 
   return createPortal(
     <div
       className="overlay-modal-backdrop"
+      aria-hidden={!open || undefined}
       data-overlay-layer-kind="modal"
-      data-overlay-state="opening"
+      data-overlay-state={presence.phase}
     >
       <OverlaySurface
         aria-busy={busy || undefined}
@@ -85,6 +88,7 @@ export function ModalSurface({
         aria-modal="true"
         className={`overlay-modal-surface${className ? ` ${className}` : ""}`}
         data-overlay-layer-kind="modal"
+        data-overlay-state={presence.phase}
         id={id}
         role={role}
         surfaceRole="modal"

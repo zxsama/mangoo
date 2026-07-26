@@ -7,6 +7,9 @@ import type {
   OverlayVirtualAnchor
 } from "./overlayTypes";
 
+const ROOT_OVERLAY_OFFSET_PX = 6;
+const NESTED_OVERLAY_OFFSET_PX = 4;
+
 export interface ResolveOverlayPositionInput {
   trigger: OverlayRect;
   overlay: OverlaySize;
@@ -14,6 +17,18 @@ export interface ResolveOverlayPositionInput {
   preferredPlacement: OverlayPlacement;
   offset: number;
   gutter: number;
+}
+
+export function clampOverlayWidth(
+  requestedWidth: number | undefined,
+  maxWidth: number
+): number | undefined {
+  if (requestedWidth === undefined) return undefined;
+  return Math.min(Math.max(0, requestedWidth), Math.max(0, maxWidth));
+}
+
+export function resolveOverlayOffset(offset: number | undefined, nested: boolean): number {
+  return offset ?? (nested ? NESTED_OVERLAY_OFFSET_PX : ROOT_OVERLAY_OFFSET_PX);
 }
 
 export function pointOverlayAnchor(x: number, y: number): OverlayVirtualAnchor {
@@ -68,7 +83,14 @@ export function resolveOverlayPosition(
     Math.max(gutter, rawLeft),
     Math.max(gutter, viewport.width - gutter - Math.min(overlay.width, maxWidth))
   );
-  const top = Math.max(gutter, rawTop);
+  const isSidePlacement = placement === "left-start" || placement === "right-start";
+  const sideOverlayHeight = Math.min(overlay.height, Math.max(0, viewport.height - gutter * 2));
+  const top = isSidePlacement
+    ? Math.min(
+        Math.max(gutter, rawTop),
+        Math.max(gutter, viewport.height - gutter - sideOverlayHeight)
+      )
+    : Math.max(gutter, rawTop);
   const maxHeight = Math.max(
     0,
     placement.startsWith("top")
