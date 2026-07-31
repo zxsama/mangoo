@@ -13,6 +13,8 @@ describe("titlebar overlay migration", () => {
   const layout = read("src/features/library/LayoutMenu.tsx");
   const search = read("src/features/library/SearchBar.tsx");
   const overlayField = read("src/design/overlays/OverlayField.tsx");
+  const overlayFixture = read("tests/fixtures/overlayLifecycleFixture.tsx");
+  const shellOverlayHost = read("src/app-shell/ShellOverlayHost.tsx");
   const styles = read("src/styles.css");
   const webValidator = readRepo("tools/checks/validate-web-client.mjs");
   const uiValidator = readRepo("tools/checks/validate-ui-design.mjs");
@@ -39,10 +41,14 @@ describe("titlebar overlay migration", () => {
 
   it("keeps validators aligned with the shared titlebar overlay contract", () => {
     assert.match(webValidator, /for \(const rootId of \["notifications", "filter", "sort", "layout"\]\)/);
+    assert.match(webValidator, /const shellNotificationOverlay = read\("apps\/web\/src\/app-shell\/useShellNotificationOverlay\.ts"\)/);
+    assert.match(webValidator, /rootId === "notifications" \? shellNotificationOverlay : app/);
     assert.match(webValidator, /CompactPopover/);
     assert.match(uiValidator, /const layoutMenu = read\("apps\/web\/src\/features\/library\/LayoutMenu\.tsx"\)/);
     assert.match(uiValidator, /const overlayField = read\("apps\/web\/src\/design\/overlays\/OverlayField\.tsx"\)/);
     assert.match(uiValidator, /const overlayStyles = read\("apps\/web\/src\/design\/overlays\/overlay\.css"\)/);
+    assert.match(uiValidator, /const shellNotificationOverlay = read\("apps\/web\/src\/app-shell\/useShellNotificationOverlay\.ts"\)/);
+    assert.match(uiValidator, /rootId === "notifications" \? shellNotificationOverlay : app/);
     for (const value of ["AnchoredOverlay", "OverlayMenuList", "OverlayMenuItem", "OverlayField"]) {
       assert.match(uiValidator, new RegExp(value));
     }
@@ -51,5 +57,19 @@ describe("titlebar overlay migration", () => {
     assert.doesNotMatch(uiValidator, /compact popover coordination contract/);
     assert.doesNotMatch(uiValidator, /titlebar search must keep exactly one outer outline rule/);
     assert.doesNotMatch(uiValidator, /titlebar search must suppress the inner glass backdrop/);
+  });
+
+  it("exercises the production notification titlebar wiring", () => {
+    assert.match(app, /useShellNotificationOverlay/);
+    assert.match(shellOverlayHost, /export function ShellNotificationOverlay/);
+    assert.match(overlayFixture, /ShellRightActions/);
+    assert.match(overlayFixture, /ShellNotificationOverlay/);
+    assert.doesNotMatch(overlayFixture, /event\.detail\s*===\s*0|autoFocusRef/);
+    assert.doesNotMatch(overlayFixture, /<NotificationPopover/);
+  });
+
+  it("checks local search hover rules in both shared stylesheets", () => {
+    assert.match(uiValidator, /\["styles\.css", stylesForChecks\]/);
+    assert.match(uiValidator, /\["overlay\.css", overlayStyles\]/);
   });
 });

@@ -32,6 +32,31 @@ interface ShellOverlayHostProps {
   onOpenNotificationCenter: (intent?: NotificationWindowIntent) => void;
 }
 
+export interface ShellNotificationOverlayProps {
+  notificationAnchor: HTMLElement | null;
+  notificationAutoFocus: boolean;
+  notificationModel: CompactNotificationModel;
+  notificationsOpen: boolean;
+  onOpenNotificationCenter: (intent?: NotificationWindowIntent) => void;
+}
+
+export function ShellNotificationOverlay({
+  notificationAnchor,
+  notificationAutoFocus,
+  notificationModel,
+  notificationsOpen,
+  onOpenNotificationCenter
+}: ShellNotificationOverlayProps) {
+  return notificationsOpen && notificationAnchor ? (
+    <NotificationPopover
+      anchor={notificationAnchor}
+      autoFocus={notificationAutoFocus}
+      model={notificationModel}
+      onOpenCenter={onOpenNotificationCenter}
+    />
+  ) : null;
+}
+
 export function ShellOverlayHost({
   contextMenu,
   fileOps,
@@ -49,14 +74,13 @@ export function ShellOverlayHost({
 
   return (
     <>
-      {notificationsOpen && notificationAnchor ? (
-        <NotificationPopover
-          anchor={notificationAnchor}
-          autoFocus={notificationAutoFocus}
-          model={notificationModel}
-          onOpenCenter={onOpenNotificationCenter}
-        />
-      ) : null}
+      <ShellNotificationOverlay
+        notificationAnchor={notificationAnchor}
+        notificationAutoFocus={notificationAutoFocus}
+        notificationModel={notificationModel}
+        notificationsOpen={notificationsOpen}
+        onOpenNotificationCenter={onOpenNotificationCenter}
+      />
 
       {contextMenu ? (
         <ContextMenu

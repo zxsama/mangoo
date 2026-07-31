@@ -41,6 +41,7 @@ const secondaryWindowInterfaceStyle = read("apps/web/src/app-shell/useSecondaryW
 const overlayScrollbars = readOptional("apps/web/src/app-shell/useOverlayScrollbars.ts") ?? "";
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const shellOverlayHost = readOptional("apps/web/src/app-shell/ShellOverlayHost.tsx");
+const shellNotificationOverlay = read("apps/web/src/app-shell/useShellNotificationOverlay.ts");
 const webIndex = read("apps/web/index.html");
 const webFaviconSvg = readOptional("apps/web/public/favicon.svg");
 const windowChrome = read("apps/web/src/features/window-chrome/WindowChrome.tsx");
@@ -510,12 +511,17 @@ if (searchBar.includes('data-pointer-glow="off"')) {
 if (liquidGlassSurface.includes("candidate.closest('[data-titlebar-search=\"true\"]')")) {
   fail("interactive affordance discovery must not exclude the entire titlebar search subtree");
 }
-for (const selector of [
-  ".search-bar-clear:hover",
-  '.search-bar[data-titlebar-search="true"]:hover'
+for (const [stylesheet, source] of [
+  ["styles.css", stylesForChecks],
+  ["overlay.css", overlayStyles]
 ]) {
-  if (stylesForChecks.includes(selector)) {
-    fail(`titlebar search must not define a feature-local hover treatment: ${selector}`);
+  for (const selector of [
+    ".search-bar-clear:hover",
+    '.search-bar[data-titlebar-search="true"]:hover'
+  ]) {
+    if (source.includes(selector)) {
+      fail(`${stylesheet} must not define a feature-local titlebar search hover: ${selector}`);
+    }
   }
 }
 
@@ -1477,7 +1483,8 @@ for (const value of ["useOverlayStack", "OverlayRootId", "setRootOpen"]) {
   }
 }
 for (const rootId of ["notifications", "filter", "sort", "layout"]) {
-  if (!app.includes(`isRootOpen("${rootId}")`)) {
+  const source = rootId === "notifications" ? shellNotificationOverlay : app;
+  if (!source.includes(`isRootOpen("${rootId}")`)) {
     fail(`shared titlebar overlay coordination missing root ${rootId}`);
   }
 }

@@ -93,6 +93,7 @@ interface OverlayLifecycleResult {
     keyboardTriggerFocused: boolean;
     mouseOpenFocus: string;
     outsidePointerClosed: boolean;
+    productionWiringMounted: boolean;
     switchClosed: boolean;
     tabEnteredContent: boolean;
     tabKeptOpen: boolean;
@@ -304,13 +305,14 @@ describe("mounted overlay lifecycle", () => {
       activeRootAfterSwitch: "filter",
       blurClosed: true,
       escapeClosed: true,
-      escapeFocus: "notification-root-trigger",
+      escapeFocus: "notifications",
       keyboardAutoFocused: true,
       keyboardActiveRoot: "notifications",
       keyboardOpened: true,
       keyboardTriggerFocused: true,
-      mouseOpenFocus: "notification-root-trigger",
+      mouseOpenFocus: "notifications",
       outsidePointerClosed: true,
+      productionWiringMounted: true,
       switchClosed: true,
       tabEnteredContent: true,
       tabKeptOpen: true

@@ -145,6 +145,7 @@ const previewPrefetchWindow = existsSync(path.join(root, previewPrefetchWindowPa
   : "";
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const shellOverlayHost = read("apps/web/src/app-shell/ShellOverlayHost.tsx");
+const shellNotificationOverlay = read("apps/web/src/app-shell/useShellNotificationOverlay.ts");
 const notificationPopoverPath =
   "apps/web/src/features/notifications/NotificationPopover.tsx";
 const notificationPopover = existsSync(path.join(root, notificationPopoverPath))
@@ -271,13 +272,26 @@ for (const value of [
 }
 for (const [label, source, values] of [
   [
-    "App notification anchor state",
+    "App notification wiring boundary",
     app,
     [
+      "useShellNotificationOverlay",
       "notificationAnchor",
-      "setNotificationAnchor",
-      "notificationButtonRef={setNotificationAnchor}",
+      "notificationButtonRef={notificationButtonRef}",
       "notificationAnchor={notificationAnchor}"
+    ]
+  ],
+  [
+    "Shell notification overlay wiring",
+    shellNotificationOverlay,
+    [
+      "setNotificationAnchor",
+      "notificationAutoFocusRef",
+      'isRootOpen("notifications")',
+      'openRoot("notifications")',
+      'closeRoot("notifications")',
+      "onToggleNotifications",
+      "closeNotifications"
     ]
   ],
   [
@@ -2002,8 +2016,9 @@ for (const value of ["useOverlayStack", "OverlayRootId", "setRootOpen"]) {
   }
 }
 for (const rootId of ["notifications", "filter", "sort", "layout"]) {
-  if (!app.includes(`isRootOpen("${rootId}")`)) {
-    fail(`App must coordinate the ${rootId} titlebar root through useOverlayStack`);
+  const source = rootId === "notifications" ? shellNotificationOverlay : app;
+  if (!source.includes(`isRootOpen("${rootId}")`)) {
+    fail(`application wiring must coordinate the ${rootId} titlebar root through useOverlayStack`);
   }
 }
 for (const retiredOverlayState of [

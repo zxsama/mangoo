@@ -3,6 +3,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type ComponentType,
   type ReactElement
 } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -17,12 +18,13 @@ import {
   type OverlayStackApi
 } from "../../src/design/overlays";
 import { LiquidGlassLayer } from "../../src/design/liquid-glass";
+import * as ShellOverlayHostModule from "../../src/app-shell/ShellOverlayHost";
+import { ShellRightActions } from "../../src/app-shell/ShellTopBar";
 import { FilterMenu } from "../../src/features/library/FilterMenu";
 import { LayoutMenu } from "../../src/features/library/LayoutMenu";
 import type { LibraryLayoutMode } from "../../src/features/media-grid/layoutMode";
 import { SearchBar } from "../../src/features/library/SearchBar";
 import { SortMenu, type SortOption } from "../../src/features/library/SortMenu";
-import { NotificationPopover } from "../../src/features/notifications/NotificationPopover";
 import type { CompactNotificationModel } from "../../src/features/notifications/notificationModel";
 import "../../src/design/overlays/overlay.css";
 
@@ -134,6 +136,7 @@ interface OverlayLifecycleResult {
     keyboardTriggerFocused: boolean;
     mouseOpenFocus: string;
     outsidePointerClosed: boolean;
+    productionWiringMounted: boolean;
     switchClosed: boolean;
     tabEnteredContent: boolean;
     tabKeptOpen: boolean;
@@ -1133,9 +1136,48 @@ const emptyNotificationModel: CompactNotificationModel = {
   healthDetail: null
 };
 
-function NotificationRootLifecycleScenario({ control }: { control: ScenarioControl }) {
-  const [anchor, setAnchor] = useState<HTMLButtonElement | null>(null);
-  const autoFocusRef = useRef(false);
+interface ShellNotificationWiring {
+  closeNotifications: () => void;
+  notificationAnchor: HTMLButtonElement | null;
+  notificationAutoFocus: boolean;
+  notificationButtonRef: (element: HTMLButtonElement | null) => void;
+  notificationsOpen: boolean;
+  onToggleNotifications: (autoFocus: boolean) => void;
+}
+
+interface ShellNotificationOverlayProps {
+  notificationAnchor: HTMLElement | null;
+  notificationAutoFocus: boolean;
+  notificationModel: CompactNotificationModel;
+  notificationsOpen: boolean;
+  onOpenNotificationCenter: () => void;
+}
+
+type ShellNotificationWiringHook = () => ShellNotificationWiring;
+type ShellNotificationOverlayComponent = ComponentType<ShellNotificationOverlayProps>;
+
+const ShellNotificationOverlay = (
+  ShellOverlayHostModule as typeof ShellOverlayHostModule & {
+    ShellNotificationOverlay?: ShellNotificationOverlayComponent;
+  }
+).ShellNotificationOverlay;
+
+async function loadShellNotificationWiringHook(): Promise<ShellNotificationWiringHook | null> {
+  const modulePath = "/src/app-shell/useShellNotificationOverlay.ts";
+  const module = await import(/* @vite-ignore */ modulePath).catch(() => null) as null | {
+    useShellNotificationOverlay?: ShellNotificationWiringHook;
+  };
+  return module?.useShellNotificationOverlay ?? null;
+}
+
+function NotificationRootLifecycleScenario({
+  control,
+  useNotificationWiring
+}: {
+  control: ScenarioControl;
+  useNotificationWiring: ShellNotificationWiringHook;
+}) {
+  const wiring = useNotificationWiring();
   const overlays = useOverlayStack();
   control.api = overlays;
   control.openRoot = () => overlays.openRoot("notifications");
@@ -1143,23 +1185,20 @@ function NotificationRootLifecycleScenario({ control }: { control: ScenarioContr
   return (
     <>
       <button id="notification-root-before">Before</button>
-      <button
-        id="notification-root-trigger"
-        onClick={(event) => {
-          autoFocusRef.current = event.detail === 0;
-          overlays.openRoot("notifications");
-        }}
-        ref={setAnchor}
-      >
-        Notifications
-      </button>
+      <ShellRightActions
+        notificationButtonRef={wiring.notificationButtonRef}
+        notificationIndicator="idle"
+        notificationsOpen={wiring.notificationsOpen}
+        onToggleNotifications={wiring.onToggleNotifications}
+      />
       <button id="notification-root-outside">Outside</button>
-      {overlays.isRootOpen("notifications") && anchor ? (
-        <NotificationPopover
-          anchor={anchor}
-          autoFocus={autoFocusRef.current}
-          model={emptyNotificationModel}
-          onOpenCenter={() => undefined}
+      {ShellNotificationOverlay ? (
+        <ShellNotificationOverlay
+          notificationAnchor={wiring.notificationAnchor}
+          notificationAutoFocus={wiring.notificationAutoFocus}
+          notificationModel={emptyNotificationModel}
+          notificationsOpen={wiring.notificationsOpen}
+          onOpenNotificationCenter={() => undefined}
         />
       ) : null}
     </>
@@ -1167,14 +1206,36 @@ function NotificationRootLifecycleScenario({ control }: { control: ScenarioContr
 }
 
 async function runNotificationRootLifecycleScenario() {
+  const useNotificationWiring = await loadShellNotificationWiringHook();
+  if (!useNotificationWiring || !ShellNotificationOverlay) {
+    return {
+      activeRootAfterSwitch: null,
+      blurClosed: false,
+      escapeClosed: false,
+      escapeFocus: "",
+      keyboardAutoFocused: false,
+      keyboardActiveRoot: null,
+      keyboardOpened: false,
+      keyboardTriggerFocused: false,
+      mouseOpenFocus: "",
+      outsidePointerClosed: false,
+      productionWiringMounted: false,
+      switchClosed: false,
+      tabEnteredContent: false,
+      tabKeptOpen: false
+    };
+  }
   const control: ScenarioControl = { api: null };
   const mounted = await mountScenario(
     <OverlayProvider>
-      <NotificationRootLifecycleScenario control={control} />
+      <NotificationRootLifecycleScenario
+        control={control}
+        useNotificationWiring={useNotificationWiring}
+      />
     </OverlayProvider>
   );
   const before = await waitForSelector("#notification-root-before");
-  const trigger = await waitForSelector("#notification-root-trigger");
+  const trigger = await waitForSelector('[data-compact-popover-trigger="notifications"]');
   const outside = await waitForSelector("#notification-root-outside");
   if (
     !(before instanceof HTMLButtonElement) ||
@@ -1195,7 +1256,8 @@ async function runNotificationRootLifecycleScenario() {
   };
 
   await openNotificationByMouse();
-  const mouseOpenFocus = (document.activeElement as HTMLElement | null)?.id ?? "";
+  const mouseOpenFocus = (document.activeElement as HTMLElement | null)?.dataset
+    .compactPopoverTrigger ?? "";
   await requestNativeKey("Tab");
   await settle(20);
   const tabEnteredContent = document.activeElement?.classList.contains("notification-open-center") ?? false;
@@ -1217,7 +1279,8 @@ async function runNotificationRootLifecycleScenario() {
     await settle(20);
   }
   const escapeClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
-  const escapeFocus = (document.activeElement as HTMLElement | null)?.id ?? "";
+  const escapeFocus = (document.activeElement as HTMLElement | null)?.dataset
+    .compactPopoverTrigger ?? "";
   await resetNotification();
 
   await openNotificationByMouse();
@@ -1250,6 +1313,7 @@ async function runNotificationRootLifecycleScenario() {
     keyboardTriggerFocused,
     mouseOpenFocus,
     outsidePointerClosed,
+    productionWiringMounted: true,
     switchClosed,
     tabEnteredContent,
     tabKeptOpen

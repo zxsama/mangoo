@@ -13,6 +13,7 @@ import type { FolderRecord, MediaRecord, RootRecord } from "@megle/core-client";
 import type { MediaFocusCommand, NotificationWindowIntent } from "@megle/notification-contract";
 import { AppShell } from "../app-shell/AppShell";
 import { useOverlayScrollbars } from "../app-shell/useOverlayScrollbars";
+import { useShellNotificationOverlay } from "../app-shell/useShellNotificationOverlay";
 import {
   ShellOverlayHost,
   type ShellContextMenuState
@@ -109,8 +110,14 @@ export function App() {
   const [menu, setMenu] = useState<ShellContextMenuState | null>(null);
   const notifications = useNotifications();
   const notificationModel = notifications.compact;
-  const [notificationAnchor, setNotificationAnchor] = useState<HTMLButtonElement | null>(null);
-  const notificationAutoFocusRef = useRef(false);
+  const {
+    closeNotifications,
+    notificationAnchor,
+    notificationAutoFocus,
+    notificationButtonRef,
+    notificationsOpen,
+    onToggleNotifications
+  } = useShellNotificationOverlay();
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewDisplayedMediaId, setPreviewDisplayedMediaId] = useState<number | null>(null);
   const previewNavigationLockedRef = useRef(false);
@@ -468,7 +475,6 @@ export function App() {
 
   const closeMenu = useCallback(() => setMenu(null), []);
 
-  const notificationsOpen = overlays.isRootOpen("notifications");
   const filterMenuOpen = overlays.isRootOpen("filter");
   const sortMenuOpen = overlays.isRootOpen("sort");
   const layoutMenuOpen = overlays.isRootOpen("layout");
@@ -502,19 +508,14 @@ export function App() {
     [setRootOpen]
   );
 
-  const onToggleNotifications = useCallback((autoFocus: boolean) => {
-    notificationAutoFocusRef.current = !notificationsOpen && autoFocus;
-    setRootOpen("notifications", !notificationsOpen);
-  }, [notificationsOpen, setRootOpen]);
-
   const handleOpenNotificationCenter = useCallback((intent?: NotificationWindowIntent) => {
-    setRootOpen("notifications", false);
+    closeNotifications();
     void openNotificationsWindow(intent);
-  }, [setRootOpen]);
+  }, [closeNotifications]);
 
   const shellRightActions = (
     <ShellRightActions
-      notificationButtonRef={setNotificationAnchor}
+      notificationButtonRef={notificationButtonRef}
       notificationIndicator={notificationModel.indicator}
       notificationsOpen={notificationsOpen}
       onToggleNotifications={onToggleNotifications}
@@ -815,7 +816,7 @@ export function App() {
           fileOps={fileOps}
           library={library}
           notificationAnchor={notificationAnchor}
-          notificationAutoFocus={notificationAutoFocusRef.current}
+          notificationAutoFocus={notificationAutoFocus}
           notificationModel={notificationModel}
           notificationsOpen={notificationsOpen}
           onCloseContextMenu={closeMenu}
