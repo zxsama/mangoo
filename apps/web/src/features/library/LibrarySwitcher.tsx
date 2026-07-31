@@ -21,6 +21,8 @@ import {
   OverlayDialogHeader,
   OverlayMenuItem,
   OverlayMenuList,
+  OVERLAY_VIEWPORT_GUTTER_PX,
+  pointOverlayAnchor,
 } from "../../design/overlays";
 import {
   DEFAULT_LIBRARY_COLOR,
@@ -28,6 +30,11 @@ import {
   LibraryGlyph,
   LibraryIconPicker,
 } from "./libraryGlyph";
+
+const LIBRARY_SWITCHER_FALLBACK_ANCHOR = pointOverlayAnchor(
+  OVERLAY_VIEWPORT_GUTTER_PX,
+  OVERLAY_VIEWPORT_GUTTER_PX,
+);
 
 export interface LibrarySwitcherProps {
   anchor: HTMLElement | null;
@@ -52,6 +59,7 @@ export function LibrarySwitcher({
     null,
   );
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const removeTriggerRef = useRef<HTMLButtonElement>(null);
 
   const reload = () => void listLibraries().then(setLibs);
   useEffect(() => {
@@ -222,6 +230,7 @@ export function LibrarySwitcher({
                 setRemoveMenuAnchor(nextOpen ? event.currentTarget : null);
                 setRemoveMenuLibraryId(nextOpen ? l.id : null);
               }}
+              ref={l.active ? removeTriggerRef : undefined}
               type="button"
             >
               <FolderMinus aria-hidden="true" size={14} />
@@ -281,7 +290,7 @@ export function LibrarySwitcher({
   return (
     <>
       <AnchoredOverlay
-        anchor={anchor}
+        anchor={anchor ?? LIBRARY_SWITCHER_FALLBACK_ANCHOR}
         ariaLabel="资源库"
         className="library-switcher"
         id="library-root"
@@ -306,6 +315,7 @@ export function LibrarySwitcher({
         initialFocusRef={cancelRef}
         onDismiss={() => setConfirmRemove(null)}
         open={confirmRemove !== null}
+        restoreFocusRef={removeTriggerRef}
         role="alertdialog"
         rootId="library"
       >
