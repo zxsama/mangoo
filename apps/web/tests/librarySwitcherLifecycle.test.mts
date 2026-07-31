@@ -43,11 +43,13 @@ interface LibrarySwitcherLifecycleResult {
   adapterRemoveFailure: {
     actionEnabled: boolean;
     busyCleared: boolean;
-    contractReturnedFailure: boolean;
+    contractResult: boolean | "rejected";
     deleteCalls: number;
     modalStayedOpen: boolean;
     reports: number;
   };
+  adapterRemoveFailureWithRefreshFailure: LibrarySwitcherLifecycleResult["adapterRemoveFailure"];
+  adapterRemoveSuccessWithRefreshFailure: LibrarySwitcherLifecycleResult["adapterRemoveFailure"];
   iconMenu: {
     checkedItems: number;
     focusedRadioItem: boolean;
@@ -201,9 +203,31 @@ describe("mounted LibrarySwitcher lifecycle", () => {
     assert.deepEqual(result.adapterRemoveFailure, {
       actionEnabled: true,
       busyCleared: true,
-      contractReturnedFailure: true,
+      contractResult: false,
       deleteCalls: 1,
       modalStayedOpen: true,
+      reports: 1,
+    });
+  });
+
+  it("keeps DELETE failure stable when reconciliation also fails", () => {
+    assert.deepEqual(result.adapterRemoveFailureWithRefreshFailure, {
+      actionEnabled: true,
+      busyCleared: true,
+      contractResult: false,
+      deleteCalls: 1,
+      modalStayedOpen: true,
+      reports: 1,
+    });
+  });
+
+  it("keeps DELETE success stable when reconciliation fails", () => {
+    assert.deepEqual(result.adapterRemoveSuccessWithRefreshFailure, {
+      actionEnabled: true,
+      busyCleared: true,
+      contractResult: true,
+      deleteCalls: 1,
+      modalStayedOpen: false,
       reports: 1,
     });
   });

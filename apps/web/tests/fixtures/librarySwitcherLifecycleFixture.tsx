@@ -64,11 +64,13 @@ interface LibrarySwitcherLifecycleResult {
   adapterRemoveFailure?: {
     actionEnabled: boolean;
     busyCleared: boolean;
-    contractReturnedFailure: boolean;
+    contractResult: boolean | "rejected";
     deleteCalls: number;
     modalStayedOpen: boolean;
     reports: number;
   };
+  adapterRemoveFailureWithRefreshFailure?: LibrarySwitcherLifecycleResult["adapterRemoveFailure"];
+  adapterRemoveSuccessWithRefreshFailure?: LibrarySwitcherLifecycleResult["adapterRemoveFailure"];
   iconMenu?: {
     checkedItems: number;
     focusedRadioItem: boolean;
@@ -363,9 +365,14 @@ function HookBackedLibrarySwitcherScenario({
   const observedLibrary: LibraryState = {
     ...library,
     removeRoot: async (rootId) => {
-      const result = await library.removeRoot(rootId);
-      adapterControl.removeResult = result;
-      return result;
+      try {
+        const result = await library.removeRoot(rootId);
+        adapterControl.removeResult = result;
+        return result;
+      } catch (cause) {
+        adapterControl.removeResult = "rejected";
+        throw cause;
+      }
     },
   };
   return <ProductionLibrarySwitcherScenario control={control} library={observedLibrary} />;
@@ -589,7 +596,13 @@ async function runPendingRemoveScenario() {
   return result;
 }
 
-async function runAdapterRemoveFailureScenario() {
+async function runAdapterRemoveScenario({
+  deleteFails,
+  refreshFails,
+}: {
+  deleteFails: boolean;
+  refreshFails: boolean;
+}) {
   const originalFetch = window.fetch;
   const coreUrl = "http://library-adapter.fixture/api";
   let deleteCalls = 0;
@@ -622,9 +635,14 @@ async function runAdapterRemoveFailureScenario() {
     if (!url.href.startsWith(coreUrl)) return originalFetch(input, init);
     if (method === "DELETE" && url.pathname === "/api/roots/7") {
       deleteCalls += 1;
-      return jsonResponse({ code: "remove-failed", message: "Core remove failed" }, 500);
+      return deleteFails
+        ? jsonResponse({ code: "remove-failed", message: "Core remove failed" }, 500)
+        : jsonResponse({ accepted: true, rootId: 7, taskId: 11 });
     }
     if (method === "GET" && url.pathname === "/api/roots") {
+      if (refreshFails && deleteCalls > 0) {
+        return jsonResponse({ code: "refresh-failed", message: "Core refresh failed" }, 500);
+      }
       return jsonResponse({ items: [root], nextCursor: null, totalCount: 1 });
     }
     return jsonResponse({ items: [], nextCursor: null, totalCount: 0 });
@@ -665,15 +683,15 @@ async function runAdapterRemoveFailureScenario() {
     const removeButton = await findButton("移除", modal);
     await requestNativeClick(removeButton);
     await waitFor(
-      () => adapterControl.removeResult !== "pending" && reports === 1,
-      "useLibraryData remove failure result",
+      () => adapterControl.removeResult !== "pending",
+      "useLibraryData remove result",
     );
-    await settle(30);
+    await settle(60);
     const recoveredModal = document.getElementById("library-remove-confirm");
     return {
       actionEnabled: !removeButton.disabled,
       busyCleared: recoveredModal?.getAttribute("aria-busy") !== "true",
-      contractReturnedFailure: adapterControl.removeResult === false,
+      contractResult: adapterControl.removeResult as boolean | "rejected",
       deleteCalls,
       modalStayedOpen: recoveredModal?.dataset.overlayState === "open",
       reports,
@@ -899,7 +917,18 @@ async function run(): Promise<void> {
       loadingSourceFocus: await runLoadingSourceFocusScenario(),
       focusRestore: await runFocusRestoreScenario(),
       pendingRemove: await runPendingRemoveScenario(),
-      adapterRemoveFailure: await runAdapterRemoveFailureScenario(),
+      adapterRemoveFailure: await runAdapterRemoveScenario({
+        deleteFails: true,
+        refreshFails: false,
+      }),
+      adapterRemoveFailureWithRefreshFailure: await runAdapterRemoveScenario({
+        deleteFails: true,
+        refreshFails: true,
+      }),
+      adapterRemoveSuccessWithRefreshFailure: await runAdapterRemoveScenario({
+        deleteFails: false,
+        refreshFails: true,
+      }),
       iconMenu: await runIconMenuScenario(),
       requestOwnership: await runRequestOwnershipScenario(),
       mutationFailures: await runMutationFailureScenario(),

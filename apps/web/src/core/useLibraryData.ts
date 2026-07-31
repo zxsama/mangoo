@@ -3020,9 +3020,11 @@ export function useLibraryData(
         selectFolder(null);
       }
 
+      let deleteSucceeded = true;
       try {
         await client.removeRoot(rootId);
       } catch (cause) {
+        deleteSucceeded = false;
         await reportLibraryFailure(
           cause,
           "root-action",
@@ -3030,13 +3032,21 @@ export function useLibraryData(
           "remove-failed",
           reportingAttempt
         );
-        await refreshRootsList();
-        return false;
       }
-      // Purge runs in the background; resync the lightweight roots list so any
-      // server-side correction reconciles (without a full loadLibrary reflow).
-      await refreshRootsList();
-      return true;
+      try {
+        // Purge runs in the background; resync the lightweight roots list so any
+        // server-side correction reconciles (without a full loadLibrary reflow).
+        await refreshRootsList();
+      } catch (cause) {
+        await reportLibraryFailure(
+          cause,
+          "root-load",
+          "library",
+          "refresh-failed",
+          reportingAttempt
+        );
+      }
+      return deleteSucceeded;
     },
     [
       client,
