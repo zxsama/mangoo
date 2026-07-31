@@ -199,7 +199,7 @@ export interface LibraryState {
   loadMoreFolderChildren: (folderId: number) => Promise<void>;
   loadMoreMedia: () => Promise<void>;
   rescanRoot: (rootId: number) => Promise<void>;
-  removeRoot: (rootId: number) => Promise<void>;
+  removeRoot: (rootId: number) => Promise<boolean>;
   refresh: () => Promise<void>;
   addRoot: (path: string) => Promise<void>;
   setQ: (q: string) => void;
@@ -3022,11 +3022,8 @@ export function useLibraryData(
 
       try {
         await client.removeRoot(rootId);
-        // Purge runs in the background; resync the lightweight roots list so any
-        // server-side correction reconciles (without a full loadLibrary reflow).
-        await refreshRootsList();
       } catch (cause) {
-        void reportLibraryFailure(
+        await reportLibraryFailure(
           cause,
           "root-action",
           `root:${rootId}`,
@@ -3034,7 +3031,12 @@ export function useLibraryData(
           reportingAttempt
         );
         await refreshRootsList();
+        return false;
       }
+      // Purge runs in the background; resync the lightweight roots list so any
+      // server-side correction reconciles (without a full loadLibrary reflow).
+      await refreshRootsList();
+      return true;
     },
     [
       client,

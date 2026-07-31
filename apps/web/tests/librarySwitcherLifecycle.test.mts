@@ -40,6 +40,14 @@ interface LibrarySwitcherLifecycleResult {
     reports: number;
     unhandledRejections: number;
   };
+  adapterRemoveFailure: {
+    actionEnabled: boolean;
+    busyCleared: boolean;
+    contractReturnedFailure: boolean;
+    deleteCalls: number;
+    modalStayedOpen: boolean;
+    reports: number;
+  };
   iconMenu: {
     checkedItems: number;
     focusedRadioItem: boolean;
@@ -186,6 +194,17 @@ describe("mounted LibrarySwitcher lifecycle", () => {
       recovered: true,
       reports: 1,
       unhandledRejections: 0,
+    });
+  });
+
+  it("keeps the modal retryable when the real useLibraryData adapter reports Core failure", () => {
+    assert.deepEqual(result.adapterRemoveFailure, {
+      actionEnabled: true,
+      busyCleared: true,
+      contractReturnedFailure: true,
+      deleteCalls: 1,
+      modalStayedOpen: true,
+      reports: 1,
     });
   });
 

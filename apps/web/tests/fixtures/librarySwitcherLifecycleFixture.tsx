@@ -7,7 +7,7 @@ import {
 import { createRoot, type Root } from "react-dom/client";
 import type { MegleDesktopBridge } from "../../src/core/desktop";
 import type { LibrarySummary } from "../../src/core/libraryTypes";
-import type { LibraryState } from "../../src/core/useLibraryData";
+import { useLibraryData, type LibraryState } from "../../src/core/useLibraryData";
 import { ShellTitlebarPrimaryActions } from "../../src/app-shell/ShellTopBar";
 import {
   OverlayProvider,
@@ -61,6 +61,14 @@ interface LibrarySwitcherLifecycleResult {
     reports: number;
     unhandledRejections: number;
   };
+  adapterRemoveFailure?: {
+    actionEnabled: boolean;
+    busyCleared: boolean;
+    contractReturnedFailure: boolean;
+    deleteCalls: number;
+    modalStayedOpen: boolean;
+    reports: number;
+  };
   iconMenu?: {
     checkedItems: number;
     focusedRadioItem: boolean;
@@ -91,6 +99,11 @@ interface MountedScenario {
 
 interface ScenarioControl {
   api: OverlayStackApi | null;
+}
+
+interface AdapterRemoveControl {
+  removeResult: unknown;
+  rootCount: number;
 }
 
 interface Deferred<T> {
@@ -147,7 +160,7 @@ function createLibraryState(overrides: Partial<LibraryState> = {}): LibraryState
   return {
     roots: [{ displayName: "Pictures", id: 7 }],
     addRoot: async () => undefined,
-    removeRoot: async () => undefined,
+    removeRoot: async () => true,
     ...overrides,
   } as unknown as LibraryState;
 }
@@ -334,6 +347,30 @@ function ProductionLibrarySwitcherScenario({
   );
 }
 
+function HookBackedLibrarySwitcherScenario({
+  adapterControl,
+  control,
+}: {
+  adapterControl: AdapterRemoveControl;
+  control: ScenarioControl;
+}) {
+  const library = useLibraryData({
+    activeLibraryId: ACTIVE_LIBRARY.id,
+    activeLibraryName: ACTIVE_LIBRARY.name,
+    persistentThumbnailCacheAutoRefresh: false,
+  });
+  adapterControl.rootCount = library.roots.length;
+  const observedLibrary: LibraryState = {
+    ...library,
+    removeRoot: async (rootId) => {
+      const result = await library.removeRoot(rootId);
+      adapterControl.removeResult = result;
+      return result;
+    },
+  };
+  return <ProductionLibrarySwitcherScenario control={control} library={observedLibrary} />;
+}
+
 async function openFromTitlebar(): Promise<HTMLButtonElement> {
   const trigger = await findElement('[data-titlebar-control="library-switcher"]');
   if (!(trigger instanceof HTMLButtonElement)) throw new Error("Library trigger is not a button");
@@ -465,7 +502,7 @@ async function runFocusRestoreScenario() {
 }
 
 async function runPendingRemoveScenario() {
-  const removeRequest = deferred<void>();
+  const removeRequest = deferred<boolean>();
   let removeCalls = 0;
   let reports = 0;
   let unhandledRejections = 0;
@@ -550,6 +587,101 @@ async function runPendingRemoveScenario() {
   window.removeEventListener("unhandledrejection", handleUnhandled);
   await unmountScenario(mounted);
   return result;
+}
+
+async function runAdapterRemoveFailureScenario() {
+  const originalFetch = window.fetch;
+  const coreUrl = "http://library-adapter.fixture/api";
+  let deleteCalls = 0;
+  let reports = 0;
+  const root = {
+    createdAt: 1,
+    displayName: "Pictures",
+    enabled: true,
+    id: 7,
+    lastScanAt: null,
+    mediaCount: 0,
+    path: "C:\\Fixture\\Pictures",
+    reachable: true,
+    rootFolderId: null,
+  };
+  const jsonResponse = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+      headers: { "content-type": "application/json" },
+      status,
+    });
+  window.fetch = (async (input, init) => {
+    const requestUrl =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+    const url = new URL(requestUrl);
+    if (!url.href.startsWith(coreUrl)) return originalFetch(input, init);
+    if (method === "DELETE" && url.pathname === "/api/roots/7") {
+      deleteCalls += 1;
+      return jsonResponse({ code: "remove-failed", message: "Core remove failed" }, 500);
+    }
+    if (method === "GET" && url.pathname === "/api/roots") {
+      return jsonResponse({ items: [root], nextCursor: null, totalCount: 1 });
+    }
+    return jsonResponse({ items: [], nextCursor: null, totalCount: 0 });
+  }) as typeof window.fetch;
+  installBridge({
+    coreUrl,
+    notifications: {
+      reportError: async () => {
+        reports += 1;
+        return true;
+      },
+    } as unknown as MegleDesktopBridge["notifications"],
+    sessionToken: "fixture-token",
+  });
+  const adapterControl: AdapterRemoveControl = {
+    removeResult: "pending",
+    rootCount: 0,
+  };
+  const control: ScenarioControl = { api: null };
+  let mounted: MountedScenario | null = null;
+  try {
+    mounted = await mountScenario(
+      <OverlayProvider>
+        <HookBackedLibrarySwitcherScenario
+          adapterControl={adapterControl}
+          control={control}
+        />
+      </OverlayProvider>,
+    );
+    await waitFor(() => adapterControl.rootCount === 1, "useLibraryData roots");
+    await openFromTitlebar();
+    await requestNativeClick(await findElement('button[aria-label="Remove folder"]'));
+    const removeMenu = await findOpenSurface("library-remove-folders");
+    if (!removeMenu) throw new Error("Adapter remove-folder menu did not open");
+    await requestNativeClick(await findButton("Pictures", removeMenu));
+    const modal = await findOpenLayer("library-remove-confirm");
+    if (!modal) throw new Error("Adapter remove confirmation did not open");
+    const removeButton = await findButton("移除", modal);
+    await requestNativeClick(removeButton);
+    await waitFor(
+      () => adapterControl.removeResult !== "pending" && reports === 1,
+      "useLibraryData remove failure result",
+    );
+    await settle(30);
+    const recoveredModal = document.getElementById("library-remove-confirm");
+    return {
+      actionEnabled: !removeButton.disabled,
+      busyCleared: recoveredModal?.getAttribute("aria-busy") !== "true",
+      contractReturnedFailure: adapterControl.removeResult === false,
+      deleteCalls,
+      modalStayedOpen: recoveredModal?.dataset.overlayState === "open",
+      reports,
+    };
+  } finally {
+    if (mounted) await unmountScenario(mounted);
+    window.fetch = originalFetch;
+  }
 }
 
 async function runIconMenuScenario() {
@@ -767,6 +899,7 @@ async function run(): Promise<void> {
       loadingSourceFocus: await runLoadingSourceFocusScenario(),
       focusRestore: await runFocusRestoreScenario(),
       pendingRemove: await runPendingRemoveScenario(),
+      adapterRemoveFailure: await runAdapterRemoveFailureScenario(),
       iconMenu: await runIconMenuScenario(),
       requestOwnership: await runRequestOwnershipScenario(),
       mutationFailures: await runMutationFailureScenario(),

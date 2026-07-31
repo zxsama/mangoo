@@ -220,11 +220,15 @@ export function LibrarySwitcher({
     const target = interaction.remove;
     removePendingRef.current = session;
     dispatch({ type: "begin-remove" });
-    const succeeded = await runMutation(
+    let removalSucceeded = false;
+    const requestSucceeded = await runMutation(
       "library-remove-root",
       String(target.rootId),
-      () => library.removeRoot(target.rootId),
+      async () => {
+        removalSucceeded = await library.removeRoot(target.rootId);
+      },
     );
+    const succeeded = requestSucceeded && removalSucceeded;
     if (removePendingRef.current === session) removePendingRef.current = null;
     if (!ownsSession(session)) return;
     if (!succeeded) {
