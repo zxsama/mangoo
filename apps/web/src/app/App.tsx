@@ -46,6 +46,7 @@ import {
 } from "../core/mediaResources";
 import { useLibraryData, type LibraryState } from "../core/useLibraryData";
 import { LiquidGlassLayer, useInterfaceStyle } from "../design/liquid-glass";
+import { useOverlayStack, type OverlayRootId } from "../design/overlays";
 import { type ContextMenuItem } from "../features/file-ops/ContextMenu";
 import {
   useFileOpsController,
@@ -89,7 +90,6 @@ import {
   type MediaGridLocateRequest
 } from "./mediaFocusWorkflow";
 
-type CompactPopover = "notifications" | "filter" | "sort" | null;
 type PreviewViewState = { mode: "fit-long-edge" | "actual"; scale: number };
 type PreviewViewCommands = { reset: () => void; toggleActualSize: () => void };
 
@@ -101,13 +101,12 @@ const LIBRARY_LAYOUT_STORAGE_KEY = "megle.library.layout-mode";
 
 export function App() {
   useOverlayScrollbars();
+  const overlays = useOverlayStack();
   useEffect(() => {
     emitRendererStartupLog();
   }, []);
   const interfaceStyle = useInterfaceStyle();
   const [menu, setMenu] = useState<ShellContextMenuState | null>(null);
-  const [activeCompactPopover, setActiveCompactPopover] =
-    useState<CompactPopover>(null);
   const notifications = useNotifications();
   const notificationModel = notifications.compact;
   const [notificationAnchor, setNotificationAnchor] = useState<HTMLButtonElement | null>(null);
@@ -468,87 +467,48 @@ export function App() {
 
   const closeMenu = useCallback(() => setMenu(null), []);
 
-  useEffect(() => {
-    if (!activeCompactPopover) return;
+  const notificationsOpen = overlays.isRootOpen("notifications");
+  const filterMenuOpen = overlays.isRootOpen("filter");
+  const sortMenuOpen = overlays.isRootOpen("sort");
+  const layoutMenuOpen = overlays.isRootOpen("layout");
 
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      setActiveCompactPopover(null);
-    }
-
-    function handlePointerDown(event: PointerEvent) {
-      const target = event.target;
-      if (!(target instanceof Element)) return;
-      if (
-        target.closest(
-          "[data-compact-popover-root], [data-compact-popover-trigger]"
-        )
-      ) {
-        return;
-      }
-      setActiveCompactPopover(null);
-    }
-
-    function handleWindowInactive() {
-      setActiveCompactPopover(null);
-    }
-
-    function handleVisibilityChange() {
-      if (document.visibilityState !== "visible") handleWindowInactive();
-    }
-
-    document.addEventListener("keydown", handleKeyDown);
-    document.addEventListener("pointerdown", handlePointerDown, true);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("blur", handleWindowInactive);
-    window.addEventListener("pagehide", handleWindowInactive);
-    return () => {
-      document.removeEventListener("keydown", handleKeyDown);
-      document.removeEventListener("pointerdown", handlePointerDown, true);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("blur", handleWindowInactive);
-      window.removeEventListener("pagehide", handleWindowInactive);
-    };
-  }, [activeCompactPopover]);
-
-  const setCompactPopover = useCallback((next: CompactPopover) => {
-    setActiveCompactPopover(next);
-  }, []);
-
-  const toggleCompactPopover = useCallback(
-    (next: Exclude<CompactPopover, null>) => {
-      setActiveCompactPopover((current) => (current === next ? null : next));
+  const setRootOpen = useCallback(
+    (rootId: OverlayRootId, open: boolean) => {
+      if (open) overlays.openRoot(rootId);
+      else overlays.closeRoot(rootId);
     },
-    []
+    [overlays]
   );
 
   const setFilterOpen = useCallback(
     (open: boolean) => {
-      setCompactPopover(open ? "filter" : null);
+      setRootOpen("filter", open);
     },
-    [setCompactPopover]
+    [setRootOpen]
   );
 
   const setSortOpen = useCallback(
     (open: boolean) => {
-      setCompactPopover(open ? "sort" : null);
+      setRootOpen("sort", open);
     },
-    [setCompactPopover]
+    [setRootOpen]
   );
 
-  const notificationsOpen = activeCompactPopover === "notifications";
-  const filterMenuOpen = activeCompactPopover === "filter";
-  const sortMenuOpen = activeCompactPopover === "sort";
+  const setLayoutOpen = useCallback(
+    (open: boolean) => {
+      setRootOpen("layout", open);
+    },
+    [setRootOpen]
+  );
 
   const onToggleNotifications = useCallback(() => {
-    toggleCompactPopover("notifications");
-  }, [toggleCompactPopover]);
+    setRootOpen("notifications", !notificationsOpen);
+  }, [notificationsOpen, setRootOpen]);
 
   const handleOpenNotificationCenter = useCallback((intent?: NotificationWindowIntent) => {
-    setActiveCompactPopover(null);
+    setRootOpen("notifications", false);
     void openNotificationsWindow(intent);
-  }, []);
+  }, [setRootOpen]);
 
   const shellRightActions = (
     <ShellRightActions
@@ -745,11 +705,13 @@ export function App() {
         filterOpen={filterMenuOpen}
         kind={library.searchState.kind}
         layoutMode={layoutMode}
+        layoutOpen={layoutMenuOpen}
         mediaCount={Math.max(library.mediaTotalCount, library.media.length)}
         minRating={library.searchState.minRating}
         onClearFilters={library.clearFilters}
         onFilterOpenChange={setFilterOpen}
         onLayoutModeChange={setLayoutMode}
+        onLayoutOpenChange={setLayoutOpen}
         onNavigateFolderBack={library.navigateFolderBack}
         onNavigateFolderForward={library.navigateFolderForward}
         onSetKind={library.setKind}

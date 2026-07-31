@@ -47,7 +47,9 @@ const windowChrome = read("apps/web/src/features/window-chrome/WindowChrome.tsx"
 const liquidGlassSurface = read("apps/web/src/design/liquid-glass/LiquidGlassSurface.tsx");
 const liquidGlassIndex = read("apps/web/src/design/liquid-glass/index.ts");
 const sortMenu = read("apps/web/src/features/library/SortMenu.tsx");
+const layoutMenu = read("apps/web/src/features/library/LayoutMenu.tsx");
 const searchBar = read("apps/web/src/features/library/SearchBar.tsx");
+const overlayStyles = read("apps/web/src/design/overlays/overlay.css");
 const inspectorMetadata = read("apps/web/src/features/preview/InspectorMetadata.tsx");
 const renameDialog = read("apps/web/src/features/file-ops/RenameDialog.tsx");
 const moveDialog = read("apps/web/src/features/file-ops/MoveDialog.tsx");
@@ -484,8 +486,10 @@ if (
 }
 
 for (const [source, value, message] of [
-  [searchBar, "outlineOnly", "search bar must opt into the outline-only liquid-glass mode"],
-  [searchBar, "interactiveBackground={false}", "search bar must disable inner local glass halo/background fill"],
+  [searchBar, "OverlayField", "titlebar search must use the shared OverlayField primitive"],
+  [searchBar, 'data-pointer-glow="off"', "titlebar search must opt out of the shared pointer glow"],
+  [searchBar, 'onChange("")', "titlebar search clear action must synchronously clear the query"],
+  [searchBar, "inputRef.current?.focus()", "titlebar search clear action must synchronously restore input focus"],
   [windowChrome, "data-titlebar-control", "window chrome buttons must participate in the shared titlebar pointer plane"],
   [liquidGlassSurface, "outlineOnly", "liquid glass surface must expose an outline-only mode for the titlebar search rule"],
   [liquidGlassSurface, "interactiveBackground", "liquid glass surface must support disabling local interactive background halo"],
@@ -1437,7 +1441,8 @@ if (!filterMenu) {
 } else {
   for (const value of [
     "SlidersHorizontal",
-    "filter-menu-popover",
+    "AnchoredOverlay",
+    "OverlayMenuList",
     "Kind",
     "Rating",
     "Favorite",
@@ -1450,49 +1455,106 @@ if (!filterMenu) {
   }
 }
 
-for (const value of [
-  'type CompactPopover = "notifications" | "filter" | "sort" | null',
-  "activeCompactPopover",
-  "Escape",
-  "pointerdown",
-  "data-compact-popover-root",
-  "filterMenuOpen",
-  "sortMenuOpen"
-]) {
+for (const value of ["useOverlayStack", "OverlayRootId", "setRootOpen"]) {
   if (!app.includes(value)) {
-    fail(`compact popover coordination contract missing ${value}`);
+    fail(`shared titlebar overlay coordination contract missing ${value}`);
+  }
+}
+for (const rootId of ["notifications", "filter", "sort", "layout"]) {
+  if (!app.includes(`isRootOpen("${rootId}")`)) {
+    fail(`shared titlebar overlay coordination missing root ${rootId}`);
+  }
+}
+for (const retiredValue of [
+  "type CompactPopover",
+  "activeCompactPopover",
+  "setCompactPopover",
+  "toggleCompactPopover"
+]) {
+  if (app.includes(retiredValue)) {
+    fail(`shared titlebar overlay coordination must retire ${retiredValue}`);
   }
 }
 
-for (const [label, source, values] of [
-  [
-    "filter menu",
-    filterMenu ?? "",
-    ["data-compact-popover-root", "filter-menu-popover", "floating-popover", "LiquidGlassSurface", 'tone="elevated"']
-  ],
-  [
-    "sort menu",
-    sortMenu,
-    ["data-compact-popover-root", "sort-menu-popover", "floating-popover", "LiquidGlassSurface", 'tone="elevated"']
-  ],
-  [
-    "notification popover",
-    notificationPopover,
-    [
-      'data-compact-popover-root="notifications"',
-      "notification-popover",
-      "popup-surface",
-      "floating-popover",
-      "LiquidGlassSurface",
-      'tone="elevated"'
-    ]
-  ]
+for (const [label, source, rootId, overlayId, preferredWidth] of [
+  ["filter menu", filterMenu ?? "", "filter", "filter-root", 320],
+  ["sort menu", sortMenu, "sort", "sort-root", 180],
+  ["layout menu", layoutMenu, "layout", "layout-root", 180]
 ]) {
-  for (const value of values) {
+  for (const value of [
+    "AnchoredOverlay",
+    "OverlayMenuList",
+    "OverlayMenuItem",
+    "open: boolean",
+    "onOpenChange: (open: boolean) => void",
+    `id="${overlayId}"`,
+    `rootId="${rootId}"`,
+    'placement="bottom-start"',
+    `preferredWidth={${preferredWidth}}`
+  ]) {
     if (!source.includes(value)) {
-      fail(`${label} compact popover contract missing ${value}`);
+      fail(`${label} shared anchored overlay contract missing ${value}`);
     }
   }
+  if (/createPortal|LiquidGlassSurface/.test(source)) {
+    fail(`${label} must not retain feature-local portal or popup surface code`);
+  }
+}
+if (!filterMenu?.includes('role="menuitemcheckbox"') || !filterMenu.includes("aria-checked")) {
+  fail("filter menu checkbox items must expose menuitemcheckbox and aria-checked");
+}
+if (filterMenu?.includes("aria-pressed")) {
+  fail("filter menu checkbox items must not use aria-pressed");
+}
+for (const [label, source] of [
+  ["sort menu", sortMenu],
+  ["layout menu", layoutMenu]
+]) {
+  for (const value of ['role="option"', "aria-selected", "selected={selected}"]) {
+    if (!source.includes(value)) {
+      fail(`${label} selected option contract missing ${value}`);
+    }
+  }
+}
+if (/AnchoredOverlay|createPortal|LiquidGlassSurface/.test(searchBar)) {
+  fail("titlebar search must remain inline without a result popover or feature-local glass surface");
+}
+
+for (const value of [
+  'data-compact-popover-root="notifications"',
+  "notification-popover",
+  "popup-surface",
+  "floating-popover",
+  "LiquidGlassSurface",
+  'tone="elevated"'
+]) {
+  if (!notificationPopover.includes(value)) {
+    fail(`notification popover compact popover contract missing ${value}`);
+  }
+}
+
+const titlebarOverlaySection =
+  overlayStyles.match(/\/\* Titlebar overlays \*\/([\s\S]*?)(?=\n@keyframes overlay-root-enter)/)?.[1] ?? "";
+if (!titlebarOverlaySection) {
+  fail("shared overlay stylesheet must define the Titlebar overlays section");
+}
+for (const value of [
+  ".overlay-titlebar-popover",
+  ".filter-menu-root",
+  ".sort-menu-options",
+  ".layout-menu-options",
+  '.search-bar[data-titlebar-search="true"]',
+  "--radius-control",
+  "--radius-tight",
+  "--glass-center-fill",
+  "--text-"
+]) {
+  if (!titlebarOverlaySection.includes(value)) {
+    fail(`shared titlebar overlay styles missing ${value}`);
+  }
+}
+if (/\b(?:backdrop-filter|box-shadow|z-index)\s*:/.test(titlebarOverlaySection)) {
+  fail("shared titlebar overlay styles must not define local blur, shadow, or stacking systems");
 }
 for (const value of [
   "data-notification-window-fixture",
@@ -1582,7 +1644,7 @@ for (const selector of [
   }
 }
 
-for (const selector of [".floating-popover", ".filter-menu-popover", ".sort-menu-popover"]) {
+for (const selector of [".floating-popover"]) {
   const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
   if (blocks.length === 0) {
     fail(`compact popover material selector missing ${selector}`);

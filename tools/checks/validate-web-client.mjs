@@ -1996,8 +1996,25 @@ if (popoverOrder.some((index) => index < 0) || popoverOrder.some((index, i) => i
 if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopover)) {
   fail("compact notification popover must stay read-only without cancel/retry actions");
 }
-if (!app.includes('type CompactPopover = "notifications" | "filter" | "sort" | null')) {
-  fail("App must coordinate notifications with the shared compact-popover state");
+for (const value of ["useOverlayStack", "OverlayRootId", "setRootOpen"]) {
+  if (!app.includes(value)) {
+    fail(`App shared titlebar overlay contract missing ${value}`);
+  }
+}
+for (const rootId of ["notifications", "filter", "sort", "layout"]) {
+  if (!app.includes(`isRootOpen("${rootId}")`)) {
+    fail(`App must coordinate the ${rootId} titlebar root through useOverlayStack`);
+  }
+}
+for (const retiredOverlayState of [
+  "type CompactPopover",
+  "activeCompactPopover",
+  "setCompactPopover",
+  "toggleCompactPopover"
+]) {
+  if (app.includes(retiredOverlayState)) {
+    fail(`App must retire feature-local titlebar overlay state: ${retiredOverlayState}`);
+  }
 }
 for (const retiredState of [
   ["recent", "OpsOpen"].join(""),

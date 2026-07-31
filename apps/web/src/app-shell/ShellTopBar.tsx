@@ -36,9 +36,11 @@ interface LibraryTitlebarToolbarProps {
   mediaCount: number;
   minRating: FilterMenuProps["minRating"];
   layoutMode: LibraryLayoutMode;
+  layoutOpen: boolean;
   onClearFilters: FilterMenuProps["onClear"];
   onFilterOpenChange: (open: boolean) => void;
   onLayoutModeChange: (mode: LibraryLayoutMode) => void;
+  onLayoutOpenChange: (open: boolean) => void;
   onNavigateFolderBack: () => void;
   onNavigateFolderForward: () => void;
   primaryActions?: ReactNode;
@@ -206,11 +208,13 @@ export function LibraryTitlebarToolbar({
   filterOpen,
   kind,
   layoutMode,
+  layoutOpen,
   mediaCount,
   minRating,
   onClearFilters,
   onFilterOpenChange,
   onLayoutModeChange,
+  onLayoutOpenChange,
   onNavigateFolderBack,
   onNavigateFolderForward,
   primaryActions,
@@ -292,7 +296,9 @@ export function LibraryTitlebarToolbar({
         </div>
         <LayoutMenu
           iconOnly
+          open={layoutOpen}
           onChange={onLayoutModeChange}
+          onOpenChange={onLayoutOpenChange}
           titlebarControlId="library-layout"
           value={layoutMode}
         />

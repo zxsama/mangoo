@@ -1,9 +1,11 @@
 import { ArrowDownUp } from "lucide-react";
-import type { KeyboardEvent } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
-import { useAnchoredPopoverStyle } from "./anchoredPopover";
+import { useRef } from "react";
+import {
+  AnchoredOverlay,
+  OverlayMenuItem,
+  OverlayMenuList
+} from "../../design/overlays";
+import { LiquidGlassButton } from "../../design/liquid-glass";
 
 export type SortOption =
   | "mtime_desc"
@@ -15,10 +17,10 @@ export type SortOption =
 
 interface SortMenuProps {
   iconOnly?: boolean;
-  open?: boolean;
+  open: boolean;
   value: SortOption;
   onChange: (sort: SortOption) => void;
-  onOpenChange?: (open: boolean) => void;
+  onOpenChange: (open: boolean) => void;
 }
 
 const SORT_OPTIONS: Array<{ value: SortOption; label: string }> = [
@@ -31,98 +33,22 @@ const SORT_OPTIONS: Array<{ value: SortOption; label: string }> = [
 ];
 
 const SORT_LABEL: Record<SortOption, string> = Object.fromEntries(
-  SORT_OPTIONS.map((o) => [o.value, o.label])
+  SORT_OPTIONS.map((option) => [option.value, option.label])
 ) as Record<SortOption, string>;
 
 export function SortMenu({
   iconOnly = false,
-  open: controlledOpen,
+  open,
   value,
   onChange,
   onOpenChange
 }: SortMenuProps) {
-  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
-  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const isControlled = controlledOpen !== undefined;
-  const open = controlledOpen ?? uncontrolledOpen;
   const selectedLabel = SORT_LABEL[value];
-  const popoverStyle = useAnchoredPopoverStyle(open, buttonRef, {
-    minWidth: 180
-  });
-
-  const setOpen = useCallback(
-    (nextOpen: boolean) => {
-      if (isControlled) {
-        onOpenChange?.(nextOpen);
-        return;
-      }
-      setUncontrolledOpen(nextOpen);
-    },
-    [isControlled, onOpenChange]
-  );
-
-  const closeAndReturnFocus = useCallback(() => {
-    setOpen(false);
-    buttonRef.current?.focus();
-  }, [setOpen]);
 
   function handleSelect(sort: SortOption) {
     onChange(sort);
-    closeAndReturnFocus();
-  }
-
-  // Focus the active option when the menu opens for keyboard users.
-  useEffect(() => {
-    if (!open) return;
-    const initialIndex = Math.max(
-      SORT_OPTIONS.findIndex((option) => option.value === value),
-      0
-    );
-    const button = optionRefs.current[initialIndex];
-    button?.focus();
-  }, [open, value]);
-
-  // Close on Escape (returns focus to trigger).
-  useEffect(() => {
-    if (!open) return;
-    function handleDocumentKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        closeAndReturnFocus();
-      }
-    }
-    document.addEventListener("keydown", handleDocumentKeyDown, true);
-    return () => document.removeEventListener("keydown", handleDocumentKeyDown, true);
-  }, [closeAndReturnFocus, open]);
-
-  function focusOptionAt(index: number) {
-    if (SORT_OPTIONS.length === 0) return;
-    const wrapped = ((index % SORT_OPTIONS.length) + SORT_OPTIONS.length) % SORT_OPTIONS.length;
-    optionRefs.current[wrapped]?.focus();
-  }
-
-  function handleOptionKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      focusOptionAt(index + 1);
-      return;
-    }
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      focusOptionAt(index - 1);
-      return;
-    }
-    if (event.key === "Home") {
-      event.preventDefault();
-      focusOptionAt(0);
-      return;
-    }
-    if (event.key === "End") {
-      event.preventDefault();
-      focusOptionAt(SORT_OPTIONS.length - 1);
-    }
+    onOpenChange(false);
   }
 
   return (
@@ -136,10 +62,8 @@ export function SortMenu({
         className={`sort-menu-trigger${iconOnly ? " sort-menu-trigger-icon-only" : ""}${
           open ? " sort-menu-trigger-open" : ""
         }`}
-        data-compact-popover="sort"
-        data-compact-popover-trigger="sort"
         data-titlebar-control="library-sort"
-        onClick={() => setOpen(!open)}
+        onClick={() => onOpenChange(!open)}
         title={`Sort: ${selectedLabel}`}
         tone="control"
         type="button"
@@ -148,48 +72,40 @@ export function SortMenu({
         {iconOnly ? null : <span>{selectedLabel}</span>}
       </LiquidGlassButton>
 
-      {open && typeof document !== "undefined"
-        ? createPortal(
-            <>
-              {!isControlled ? (
-                <div
-                  aria-hidden="true"
-                  className="sort-menu-backdrop"
-                  onClick={() => closeAndReturnFocus()}
-                />
-              ) : null}
-              <LiquidGlassSurface
-                as="div"
-                className="floating-popover sort-menu-list sort-menu-popover popup-surface"
-                data-compact-popover="sort"
-                data-compact-popover-root="sort"
-                interactive
-                role="listbox"
-                aria-label="Sort options"
-                style={popoverStyle}
-                tone="elevated"
+      <AnchoredOverlay
+        anchor={buttonRef.current}
+        ariaLabel="Sort options"
+        className="overlay-titlebar-popover sort-menu-root"
+        id="sort-root"
+        onDismiss={() => onOpenChange(false)}
+        open={open}
+        placement="bottom-start"
+        preferredWidth={180}
+        restoreFocusTarget={buttonRef.current}
+        role="listbox"
+        rootId="sort"
+      >
+        <OverlayMenuList
+          ariaLabel="Sort options"
+          className="overlay-titlebar-menu sort-menu-options"
+          role="listbox"
+        >
+          {SORT_OPTIONS.map((option) => {
+            const selected = value === option.value;
+            return (
+              <OverlayMenuItem
+                aria-selected={selected}
+                key={option.value}
+                onClick={() => handleSelect(option.value)}
+                role="option"
+                selected={selected}
               >
-                {SORT_OPTIONS.map((option, index) => (
-                  <button
-                    ref={(element) => {
-                      optionRefs.current[index] = element;
-                    }}
-                    aria-selected={value === option.value}
-                    className={`sort-menu-item${value === option.value ? " sort-menu-item-active" : ""}`}
-                    key={option.value}
-                    onClick={() => handleSelect(option.value)}
-                    onKeyDown={(event) => handleOptionKeyDown(event, index)}
-                    role="option"
-                    type="button"
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </LiquidGlassSurface>
-            </>,
-            document.body
-          )
-        : null}
+                {option.label}
+              </OverlayMenuItem>
+            );
+          })}
+        </OverlayMenuList>
+      </AnchoredOverlay>
     </div>
   );
 }

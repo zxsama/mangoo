@@ -1,6 +1,6 @@
 import { Search, X } from "lucide-react";
 import { useRef } from "react";
-import { LiquidGlassSurface } from "../../design/liquid-glass";
+import { OverlayField } from "../../design/overlays";
 
 interface SearchBarProps {
   value: string;
@@ -10,41 +10,37 @@ interface SearchBarProps {
 
 export function SearchBar({ value, onChange, placeholder = "Search library…" }: SearchBarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const clearButton = value ? (
+    <button
+      aria-label="Clear search"
+      className="search-bar-clear"
+      onClick={() => {
+        onChange("");
+        inputRef.current?.focus();
+      }}
+      type="button"
+    >
+      <X aria-hidden="true" size={13} />
+    </button>
+  ) : undefined;
 
   return (
-    <LiquidGlassSurface
-      as="div"
+    <div
       className="search-bar no-drag"
       data-titlebar-control="library-search"
       data-titlebar-search="true"
-      interactive
-      interactiveBackground={false}
-      outlineOnly
-      tone="control"
     >
-      <Search aria-hidden="true" className="search-bar-icon" size={15} />
-      <input
-        ref={inputRef}
+      <OverlayField
         aria-label="Search library"
-        className="search-bar-input"
-        onChange={(e) => onChange(e.target.value)}
+        data-pointer-glow="off"
+        inputRef={inputRef}
+        leadingIcon={<Search aria-hidden="true" size={15} />}
+        onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
+        trailingAction={clearButton}
         type="search"
         value={value}
       />
-      {value ? (
-        <button
-          aria-label="Clear search"
-          className="search-bar-clear"
-          onClick={() => {
-            onChange("");
-            inputRef.current?.focus();
-          }}
-          type="button"
-        >
-          <X size={13} />
-        </button>
-      ) : null}
-    </LiquidGlassSurface>
+    </div>
   );
 }
