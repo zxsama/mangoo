@@ -139,7 +139,8 @@ export function App() {
     readStoredPreviewPreferences()
   );
   const [libraryPhase, setLibraryPhase] = useState<LibraryLoadPhase>("starting-core");
-  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [librarySwitcherAnchor, setLibrarySwitcherAnchor] =
+    useState<HTMLButtonElement | null>(null);
   const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
   const [activeLibraryName, setActiveLibraryName] = useState<string>("Library");
   const [activeLibraryIcon, setActiveLibraryIcon] = useState<string | undefined>(undefined);
@@ -478,6 +479,7 @@ export function App() {
   const filterMenuOpen = overlays.isRootOpen("filter");
   const sortMenuOpen = overlays.isRootOpen("sort");
   const layoutMenuOpen = overlays.isRootOpen("layout");
+  const librarySwitcherOpen = overlays.isRootOpen("library");
 
   const setRootOpen = useCallback(
     (rootId: OverlayRootId, open: boolean) => {
@@ -486,6 +488,13 @@ export function App() {
     },
     [overlays]
   );
+
+  const openLibrarySwitcher = useCallback(() => {
+    setRootOpen("library", true);
+  }, [setRootOpen]);
+  const closeLibrarySwitcher = useCallback(() => {
+    setRootOpen("library", false);
+  }, [setRootOpen]);
 
   const setFilterOpen = useCallback(
     (open: boolean) => {
@@ -745,7 +754,8 @@ export function App() {
         activeLibraryColor={activeLibraryColor}
         activeLibraryIcon={activeLibraryIcon}
         activeLibraryName={activeLibraryName}
-        onOpenLibrarySwitcher={() => setSwitcherOpen(true)}
+        librarySwitcherButtonRef={setLibrarySwitcherAnchor}
+        onOpenLibrarySwitcher={openLibrarySwitcher}
         onOpenPlugins={handleOpenPlugins}
         onOpenSettings={handleOpenSettings}
         onLocateFolder={locateCurrentFolder}
@@ -823,9 +833,10 @@ export function App() {
           onOpenNotificationCenter={handleOpenNotificationCenter}
         />
         <LibrarySwitcher
-          open={switcherOpen}
-          onClose={() => setSwitcherOpen(false)}
+          anchor={librarySwitcherAnchor}
           library={library}
+          onClose={closeLibrarySwitcher}
+          open={librarySwitcherOpen}
         />
       </>
     );
@@ -854,7 +865,7 @@ export function App() {
             <LibraryLoadingOverlay
               phase={libraryPhase}
               onRetry={() => void retryLibraryLoad()}
-              onSwitchLibrary={() => setSwitcherOpen(true)}
+              onSwitchLibrary={openLibrarySwitcher}
             />
           </>
         }

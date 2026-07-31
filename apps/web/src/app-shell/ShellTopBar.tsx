@@ -11,6 +11,7 @@ import {
   Package,
   Settings
 } from "lucide-react";
+import type * as React from "react";
 import type { ComponentProps, ReactNode, RefCallback } from "react";
 import { LiquidGlassButton } from "../design/liquid-glass";
 import { FilterMenu } from "../features/library/FilterMenu";
@@ -115,6 +116,7 @@ export function ShellTitlebarPrimaryActions({
   activeLibraryColor,
   activeLibraryIcon,
   activeLibraryName,
+  librarySwitcherButtonRef,
   sidebarsHidden,
   onOpenLibrarySwitcher,
   onOpenPlugins,
@@ -125,6 +127,7 @@ export function ShellTitlebarPrimaryActions({
   activeLibraryColor?: string;
   activeLibraryIcon?: string;
   activeLibraryName: string;
+  librarySwitcherButtonRef?: React.Ref<HTMLButtonElement>;
   sidebarsHidden: boolean;
   onOpenLibrarySwitcher: () => void;
   onOpenPlugins: () => void;
@@ -142,6 +145,7 @@ export function ShellTitlebarPrimaryActions({
         className="shell-library-switcher-button no-drag"
         data-titlebar-control="library-switcher"
         onClick={onOpenLibrarySwitcher}
+        ref={librarySwitcherButtonRef}
         title="Switch library"
         tone="control"
         type="button"

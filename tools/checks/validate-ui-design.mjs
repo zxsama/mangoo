@@ -1560,7 +1560,9 @@ for (const value of [
 }
 
 const titlebarOverlaySection =
-  overlayStyles.match(/\/\* Titlebar overlays \*\/([\s\S]*?)(?=\n@keyframes overlay-root-enter)/)?.[1] ?? "";
+  overlayStyles.match(
+    /\/\* Titlebar overlays \*\/([\s\S]*?)(?=\n\/\* Library switcher \*\/|\n@keyframes overlay-root-enter)/,
+  )?.[1] ?? "";
 if (!titlebarOverlaySection) {
   fail("shared overlay stylesheet must define the Titlebar overlays section");
 }

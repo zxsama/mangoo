@@ -1,41 +1,57 @@
-import { useEffect, useState } from "react";
-import { Check, FolderPlus, FolderMinus, Search, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Check, FolderMinus, FolderPlus, Search, X } from "lucide-react";
 import {
-  listLibraries,
-  switchLibrary,
   createLibrary,
+  listLibraries,
   openLibrary,
   pickLibraryFile,
-  pickNewLibraryPath,
   pickNativeFolder,
+  pickNewLibraryPath,
   setLibraryIcon,
+  switchLibrary,
 } from "../../core/desktop";
 import type { LibrarySummary } from "../../core/libraryTypes";
-import type { LibraryState } from "../../core/useLibraryData";
 import { REMOVE_ROOT_CONFIRM } from "../../core/removeRootConfirm";
+import type { LibraryState } from "../../core/useLibraryData";
+import { LiquidGlassButton } from "../../design/liquid-glass";
 import {
+  AnchoredOverlay,
+  ModalSurface,
+  OverlayDialogActions,
+  OverlayDialogHeader,
+  OverlayMenuItem,
+  OverlayMenuList,
+} from "../../design/overlays";
+import {
+  DEFAULT_LIBRARY_COLOR,
+  DEFAULT_LIBRARY_ICON,
   LibraryGlyph,
   LibraryIconPicker,
-  DEFAULT_LIBRARY_ICON,
-  DEFAULT_LIBRARY_COLOR,
 } from "./libraryGlyph";
 
-export function LibrarySwitcher({
-  open,
-  onClose,
-  library,
-}: {
-  open: boolean;
-  onClose: () => void;
+export interface LibrarySwitcherProps {
+  anchor: HTMLElement | null;
   library: LibraryState;
-}) {
+  onClose: () => void;
+  open: boolean;
+}
+
+export function LibrarySwitcher({
+  anchor,
+  library,
+  onClose,
+  open,
+}: LibrarySwitcherProps) {
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [query, setQuery] = useState("");
   const [removeMenuLibraryId, setRemoveMenuLibraryId] = useState<string | null>(null);
+  const [removeMenuAnchor, setRemoveMenuAnchor] = useState<HTMLButtonElement | null>(null);
   const [iconMenuLibraryId, setIconMenuLibraryId] = useState<string | null>(null);
+  const [iconMenuAnchor, setIconMenuAnchor] = useState<HTMLButtonElement | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<{ rootId: number; name: string } | null>(
-    null
+    null,
   );
+  const cancelRef = useRef<HTMLButtonElement>(null);
 
   const reload = () => void listLibraries().then(setLibs);
   useEffect(() => {
@@ -43,11 +59,12 @@ export function LibrarySwitcher({
       reload();
     } else {
       setRemoveMenuLibraryId(null);
+      setRemoveMenuAnchor(null);
       setIconMenuLibraryId(null);
+      setIconMenuAnchor(null);
       setConfirmRemove(null);
     }
   }, [open]);
-  if (!open) return null;
 
   const filtered = libs.filter(
     (l) =>
@@ -95,166 +112,227 @@ export function LibrarySwitcher({
     reload();
   }
 
-  return (
-    <>
-      <div className="library-switcher-backdrop" onClick={onClose}>
-        <div
-          className="library-switcher"
-          role="dialog"
-          aria-label="资源库"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="library-switcher-search">
-            <Search size={14} aria-hidden="true" />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="搜索…"
+  const searchField = (
+    <div className="library-switcher-search">
+      <Search size={14} aria-hidden="true" />
+      <input
+        aria-label="搜索资源库"
+        onChange={(event) => setQuery(event.target.value)}
+        placeholder="搜索…"
+        value={query}
+      />
+    </div>
+  );
+
+  const closeButton = (
+    <button
+      aria-label="Close"
+      className="library-switcher-close"
+      data-interactive-pointer-target="true"
+      onClick={onClose}
+      type="button"
+    >
+      <X aria-hidden="true" size={14} />
+    </button>
+  );
+
+  const libraryRows = filtered.map((l) => {
+    const icon = l.icon ?? DEFAULT_LIBRARY_ICON;
+    const color = l.color ?? DEFAULT_LIBRARY_COLOR;
+    const iconMenuOpen = iconMenuLibraryId === l.id;
+    const removeMenuOpen = l.active && removeMenuLibraryId === l.id;
+    return (
+      <li
+        className={`library-switcher-row${l.active ? " active" : ""}${l.available ? "" : " unavailable"}`}
+        key={l.id}
+      >
+        <div className="library-switcher-icon-anchor">
+          <button
+            aria-controls={`library-icon-${l.id}`}
+            aria-expanded={iconMenuOpen}
+            aria-haspopup="menu"
+            aria-label="更改图标"
+            className="library-switcher-icon"
+            data-interactive-pointer-target="true"
+            onClick={(event) => {
+              const nextOpen = iconMenuLibraryId !== l.id;
+              setIconMenuAnchor(nextOpen ? event.currentTarget : null);
+              setIconMenuLibraryId(nextOpen ? l.id : null);
+            }}
+            type="button"
+          >
+            <LibraryGlyph icon={l.icon} color={l.color} size={16} />
+          </button>
+          <AnchoredOverlay
+            anchor={iconMenuAnchor}
+            ariaLabel="选择资源库图标"
+            id={`library-icon-${l.id}`}
+            onDismiss={() => {
+              setIconMenuLibraryId(null);
+              setIconMenuAnchor(null);
+            }}
+            open={iconMenuOpen}
+            parentId="library-root"
+            placement="right-start"
+            preferredWidth={208}
+            role="menu"
+            rootId="library"
+            surfaceRole="nested"
+          >
+            <LibraryIconPicker
+              color={color}
+              icon={icon}
+              onPick={(nextIcon, nextColor) => void applyIcon(l, nextIcon, nextColor)}
+              presentation="overlay"
             />
-            <button type="button" aria-label="Close" onClick={onClose}>
-              <X size={14} />
+          </AnchoredOverlay>
+        </div>
+        <button
+          className="library-switcher-main"
+          data-interactive-pointer-target={!l.active && l.available ? "true" : undefined}
+          onClick={() => onSwitch(l)}
+          type="button"
+        >
+          <span className="library-switcher-name">{l.name}</span>
+          <span className="library-switcher-path">{l.dbPath}</span>
+        </button>
+        {l.active ? (
+          <Check aria-hidden="true" className="library-switcher-check" size={14} />
+        ) : null}
+        <div className="library-switcher-actions">
+          <button
+            aria-label="Add folder"
+            data-interactive-pointer-target={l.active ? "true" : undefined}
+            disabled={!l.active}
+            onClick={onAddFolder}
+            type="button"
+          >
+            <FolderPlus aria-hidden="true" size={14} />
+          </button>
+          <div className="library-switcher-remove-menu-anchor">
+            <button
+              aria-controls="library-remove-folders"
+              aria-expanded={removeMenuOpen}
+              aria-haspopup="menu"
+              aria-label="Remove folder"
+              data-interactive-pointer-target={l.active ? "true" : undefined}
+              disabled={!l.active}
+              onClick={(event) => {
+                const nextOpen = removeMenuLibraryId !== l.id;
+                setRemoveMenuAnchor(nextOpen ? event.currentTarget : null);
+                setRemoveMenuLibraryId(nextOpen ? l.id : null);
+              }}
+              type="button"
+            >
+              <FolderMinus aria-hidden="true" size={14} />
             </button>
-          </div>
-          <ul className="library-switcher-list">
-            {filtered.map((l) => {
-              const icon = l.icon ?? DEFAULT_LIBRARY_ICON;
-              const color = l.color ?? DEFAULT_LIBRARY_COLOR;
-              return (
-                <li
-                  key={l.id}
-                  className={`library-switcher-row${l.active ? " active" : ""}${l.available ? "" : " unavailable"}`}
-                >
-                  <div className="library-switcher-icon-anchor">
-                    <button
-                      type="button"
-                      className="library-switcher-icon"
-                      aria-label="更改图标"
+            <AnchoredOverlay
+              anchor={removeMenuAnchor}
+              ariaLabel="移除文件夹"
+              id="library-remove-folders"
+              onDismiss={() => {
+                setRemoveMenuLibraryId(null);
+                setRemoveMenuAnchor(null);
+              }}
+              open={removeMenuOpen}
+              parentId="library-root"
+              placement="right-start"
+              preferredWidth={220}
+              role="menu"
+              rootId="library"
+              surfaceRole="nested"
+            >
+              <OverlayMenuList ariaLabel="移除文件夹" className="library-switcher-remove-menu">
+                {library.roots.length === 0 ? (
+                  <div className="library-switcher-remove-menu-empty">No folders</div>
+                ) : (
+                  library.roots.map((root) => (
+                    <OverlayMenuItem
+                      className="library-switcher-remove-menu-item"
+                      icon={<FolderMinus size={12} />}
+                      key={root.id}
                       onClick={() =>
-                        setIconMenuLibraryId((current) => (current === l.id ? null : l.id))
+                        setConfirmRemove({ rootId: root.id, name: root.displayName })
                       }
                     >
-                      <LibraryGlyph icon={l.icon} color={l.color} size={16} />
-                    </button>
-                    {iconMenuLibraryId === l.id ? (
-                      <LibraryIconPicker
-                        icon={icon}
-                        color={color}
-                        onPick={(nextIcon, nextColor) => void applyIcon(l, nextIcon, nextColor)}
-                      />
-                    ) : null}
-                  </div>
-                  <button
-                    type="button"
-                    className="library-switcher-main"
-                    onClick={() => onSwitch(l)}
-                  >
-                    <span className="library-switcher-name">{l.name}</span>
-                    <span className="library-switcher-path">{l.dbPath}</span>
-                  </button>
-                  {l.active ? (
-                    <Check
-                      size={14}
-                      className="library-switcher-check"
-                      aria-hidden="true"
-                    />
-                  ) : null}
-                  <div className="library-switcher-actions">
-                    <button
-                      type="button"
-                      aria-label="Add folder"
-                      disabled={!l.active}
-                      onClick={onAddFolder}
-                    >
-                      <FolderPlus size={14} />
-                    </button>
-                    <div className="library-switcher-remove-menu-anchor">
-                      <button
-                        type="button"
-                        aria-label="Remove folder"
-                        disabled={!l.active}
-                        onClick={() =>
-                          setRemoveMenuLibraryId((current) => (current === l.id ? null : l.id))
-                        }
-                      >
-                        <FolderMinus size={14} />
-                      </button>
-                      {l.active && removeMenuLibraryId === l.id ? (
-                        <ul className="library-switcher-remove-menu">
-                          {library.roots.length === 0 ? (
-                            <li className="library-switcher-remove-menu-empty">No folders</li>
-                          ) : (
-                            library.roots.map((root) => (
-                              <li key={root.id}>
-                                <button
-                                  type="button"
-                                  className="library-switcher-remove-menu-item"
-                                  onClick={() =>
-                                    setConfirmRemove({ rootId: root.id, name: root.displayName })
-                                  }
-                                >
-                                  <span>{root.displayName}</span>
-                                  <FolderMinus size={12} aria-hidden="true" />
-                                </button>
-                              </li>
-                            ))
-                          )}
-                        </ul>
-                      ) : null}
-                    </div>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-          <div className="library-switcher-footer">
-            <button type="button" onClick={onCreate}>
-              创建资源库…
-            </button>
-            <button type="button" onClick={onOpen}>
-              打开其它资源库…
-            </button>
+                      {root.displayName}
+                    </OverlayMenuItem>
+                  ))
+                )}
+              </OverlayMenuList>
+            </AnchoredOverlay>
           </div>
         </div>
-      </div>
-      {confirmRemove ? (
-        <div
-          className="library-switcher-confirm-backdrop"
-          onClick={() => setConfirmRemove(null)}
-        >
-          <div
-            className="library-switcher-confirm"
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="library-switcher-confirm-title"
-            onClick={(e) => e.stopPropagation()}
+      </li>
+    );
+  });
+
+  const footerActions = (
+    <>
+      <button data-interactive-pointer-target="true" onClick={onCreate} type="button">
+        创建资源库…
+      </button>
+      <button data-interactive-pointer-target="true" onClick={onOpen} type="button">
+        打开其它资源库…
+      </button>
+    </>
+  );
+
+  return (
+    <>
+      <AnchoredOverlay
+        anchor={anchor}
+        ariaLabel="资源库"
+        className="library-switcher"
+        id="library-root"
+        onDismiss={onClose}
+        open={open}
+        placement="bottom-start"
+        preferredWidth={460}
+        role="dialog"
+        rootId="library"
+      >
+        <div className="library-switcher-header">
+          {searchField}
+          {closeButton}
+        </div>
+        <ul className="library-switcher-list">{libraryRows}</ul>
+        <footer className="library-switcher-footer">{footerActions}</footer>
+      </AnchoredOverlay>
+      <ModalSurface
+        ariaDescribedBy="library-remove-confirm-description"
+        ariaLabelledBy="library-remove-confirm-title"
+        id="library-remove-confirm"
+        initialFocusRef={cancelRef}
+        onDismiss={() => setConfirmRemove(null)}
+        open={confirmRemove !== null}
+        role="alertdialog"
+        rootId="library"
+      >
+        <OverlayDialogHeader
+          description={REMOVE_ROOT_CONFIRM.body}
+          descriptionId="library-remove-confirm-description"
+          title={confirmRemove ? REMOVE_ROOT_CONFIRM.title(confirmRemove.name) : ""}
+          titleId="library-remove-confirm-title"
+        />
+        <OverlayDialogActions>
+          <button
+            data-interactive-pointer-target="true"
+            onClick={() => setConfirmRemove(null)}
+            ref={cancelRef}
+            type="button"
           >
-            <h3 id="library-switcher-confirm-title" className="library-switcher-confirm-title">
-              {REMOVE_ROOT_CONFIRM.title(confirmRemove.name)}
-            </h3>
-            <div className="library-switcher-confirm-body">
-              {REMOVE_ROOT_CONFIRM.body.split("\n").map((line, index) => (
-                <p key={index}>{line}</p>
-              ))}
-            </div>
-            <div className="library-switcher-confirm-actions">
-              <button
-                type="button"
-                className="library-switcher-confirm-cancel"
-                onClick={() => setConfirmRemove(null)}
-              >
-                {REMOVE_ROOT_CONFIRM.cancelLabel}
-              </button>
-              <button
-                type="button"
-                className="library-switcher-confirm-remove"
-                onClick={() => void confirmRootRemoval()}
-              >
-                {REMOVE_ROOT_CONFIRM.confirmLabel}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+            取消
+          </button>
+          <LiquidGlassButton
+            onClick={() => void confirmRootRemoval()}
+            tone="danger"
+            type="button"
+          >
+            移除
+          </LiquidGlassButton>
+        </OverlayDialogActions>
+      </ModalSurface>
     </>
   );
 }

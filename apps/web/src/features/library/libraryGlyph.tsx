@@ -86,22 +86,27 @@ export function LibraryGlyph({
 // the same preset set identically. `onPick` receives the full (icon, color)
 // pair each click — icons keep the current color, swatches keep the current
 // icon — so the parent just persists it.
+export interface LibraryIconPickerProps {
+  color?: string;
+  icon?: string;
+  onPick: (icon: string, color: string) => void;
+  presentation?: "embedded" | "overlay";
+}
+
 export function LibraryIconPicker({
   icon,
   color,
-  onPick
-}: {
-  icon?: string;
-  color?: string;
-  onPick: (icon: string, color: string) => void;
-}) {
+  onPick,
+  presentation = "embedded"
+}: LibraryIconPickerProps) {
   const currentIcon = icon ?? DEFAULT_LIBRARY_ICON;
   const currentColor = color ?? DEFAULT_LIBRARY_COLOR;
   return (
-    <div className="library-icon-picker">
+    <div className={`library-icon-picker library-icon-picker--${presentation}`}>
       <div className="library-icon-picker-grid">
         {LIBRARY_ICONS.map(({ key }) => (
           <button
+            data-interactive-pointer-target={presentation === "overlay" ? "true" : undefined}
             key={key}
             type="button"
             className={`library-icon-picker-cell${key === currentIcon ? " selected" : ""}`}
@@ -115,6 +120,7 @@ export function LibraryIconPicker({
       <div className="library-icon-picker-colors">
         {LIBRARY_COLORS.map((c) => (
           <button
+            data-interactive-pointer-target={presentation === "overlay" ? "true" : undefined}
             key={c}
             type="button"
             className={`library-icon-picker-swatch${c === currentColor ? " selected" : ""}`}
