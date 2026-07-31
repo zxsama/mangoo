@@ -60,13 +60,15 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     const current = stateRef.current;
     if (!current.layers.some((item) => item.id === layer.id)) return false;
 
-    layer.onDismiss();
     let next = popOverlayLayer(current, layer.id);
     if (next.layers.length === 0) {
       next = closeOverlayRoot(next);
     }
     commitState(next);
-    restoreLayerFocus(layer, reason);
+    layer.onDismiss();
+    if (stateRef.current === next) {
+      restoreLayerFocus(layer, reason);
+    }
     return true;
   }, [commitState]);
 
@@ -75,10 +77,10 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     if (current.activeRootId === rootId) return;
 
     const previousLayers = [...current.layers].reverse();
+    commitState(openOverlayRoot(current, rootId));
     for (const layer of previousLayers) {
       layer.onDismiss();
     }
-    commitState(openOverlayRoot(current, rootId));
   }, [commitState]);
 
   const closeRootFamily = useCallback((
@@ -94,11 +96,14 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     }
 
     const rootLayer = current.layers.find((layer) => layer.kind === "root") ?? null;
+    const next = closeOverlayRoot(current, rootId);
+    commitState(next);
     for (const layer of [...current.layers].reverse()) {
       layer.onDismiss();
     }
-    commitState(closeOverlayRoot(current, rootId));
-    if (rootLayer) restoreLayerFocus(rootLayer, reason);
+    if (rootLayer && stateRef.current === next) {
+      restoreLayerFocus(rootLayer, reason);
+    }
   }, [commitState]);
 
   const closeRoot = useCallback((rootId?: OverlayRootId) => {
@@ -130,6 +135,7 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
           cleaned = closeOverlayRoot(cleaned);
         }
         commitState(cleaned);
+        restoreLayerFocus(layer, "programmatic");
       });
     };
   }, [commitState]);
@@ -160,10 +166,10 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
         ) {
           const transientLayers = current.layers.filter((item) => item.dismissOnWindowBlur);
           if (transientLayers.length === 0) return false;
+          commitState(closeTransientOverlayLayers(current));
           for (const transientLayer of [...transientLayers].reverse()) {
             transientLayer.onDismiss();
           }
-          commitState(closeTransientOverlayLayers(current));
           return true;
         }
 

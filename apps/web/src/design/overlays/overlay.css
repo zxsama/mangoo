@@ -21,9 +21,16 @@
 
 .overlay-surface-popover,
 .overlay-surface-nested {
+  overflow: hidden;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.018)),
     var(--glass-dialog-fill);
+}
+
+.overlay-scroll-viewport {
+  max-width: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .overlay-surface-nested {

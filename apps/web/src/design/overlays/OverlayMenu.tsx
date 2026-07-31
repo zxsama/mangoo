@@ -24,6 +24,46 @@ function enabledMenuItems(container: HTMLElement): HTMLButtonElement[] {
   );
 }
 
+function allMenuItems(container: HTMLElement): HTMLButtonElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLButtonElement>('[data-overlay-menu-item="true"]')
+  );
+}
+
+function preferredMenuItemIndex(items: HTMLButtonElement[]): number {
+  return items.findIndex((item) =>
+    item.dataset.selected === "true" || item.getAttribute("aria-checked") === "true"
+  );
+}
+
+function synchronizeRovingItems(
+  container: HTMLElement,
+  previousRovingItem: HTMLButtonElement | null,
+  focus: boolean
+): HTMLButtonElement | null {
+  const items = enabledMenuItems(container);
+  const activeIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+  const previousIndex = items.indexOf(previousRovingItem as HTMLButtonElement);
+  const preferredIndex = preferredMenuItemIndex(items);
+  const nextIndex = activeIndex >= 0
+    ? activeIndex
+    : previousIndex >= 0
+      ? previousIndex
+      : preferredIndex >= 0
+        ? preferredIndex
+        : 0;
+  const tabIndexes = overlayMenuTabIndexes(items.length, nextIndex);
+  allMenuItems(container).forEach((item) => {
+    item.tabIndex = -1;
+  });
+  items.forEach((item, itemIndex) => {
+    item.tabIndex = tabIndexes[itemIndex] ?? -1;
+  });
+  const nextItem = items[nextIndex] ?? null;
+  if (focus) nextItem?.focus();
+  return nextItem;
+}
+
 export interface OverlayMenuListProps extends HTMLAttributes<HTMLDivElement> {
   ariaLabel: string;
   autoFocus?: boolean;
@@ -51,27 +91,79 @@ export function OverlayMenuList({
   ...props
 }: OverlayMenuListProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const rovingItemRef = useRef<HTMLButtonElement | null>(null);
   const typeaheadRef = useRef("");
   const typeaheadTimerRef = useRef<number | null>(null);
   const { dismissTop } = useOverlayStack();
 
-  const activateRovingItem = (items: HTMLButtonElement[], index: number, focus: boolean) => {
+  const activateRovingItem = (
+    container: HTMLElement,
+    items: HTMLButtonElement[],
+    index: number,
+    focus: boolean
+  ) => {
     const tabIndexes = overlayMenuTabIndexes(items.length, index);
+    allMenuItems(container).forEach((item) => {
+      item.tabIndex = -1;
+    });
     items.forEach((item, itemIndex) => {
       item.tabIndex = tabIndexes[itemIndex] ?? -1;
     });
-    if (focus) items[index]?.focus();
+    rovingItemRef.current = items[index] ?? null;
+    if (focus) rovingItemRef.current?.focus();
   };
 
   useLayoutEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const items = enabledMenuItems(container);
-    const preferredIndex = items.findIndex((item) =>
-      item.dataset.selected === "true" || item.getAttribute("aria-checked") === "true"
-    );
-    activateRovingItem(items, preferredIndex >= 0 ? preferredIndex : 0, autoFocus);
+    rovingItemRef.current = synchronizeRovingItems(container, null, false);
+  }, []);
+
+  useEffect(() => {
+    if (!autoFocus) return;
+    let frame = 0;
+    const focusInitialItem = () => {
+      const container = containerRef.current;
+      if (!container) return;
+      const surface = container.closest<HTMLElement>("[data-overlay-layer-kind]");
+      if (surface?.style.visibility === "hidden") {
+        frame = window.requestAnimationFrame(focusInitialItem);
+        return;
+      }
+      rovingItemRef.current = synchronizeRovingItems(
+        container,
+        rovingItemRef.current,
+        true
+      );
+    };
+    frame = window.requestAnimationFrame(focusInitialItem);
+    return () => window.cancelAnimationFrame(frame);
   }, [autoFocus]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const observer = new MutationObserver(() => {
+      const previousRovingItem = rovingItemRef.current;
+      const enabledItems = enabledMenuItems(container);
+      const activeElement = document.activeElement;
+      const shouldMoveFocus = previousRovingItem !== null &&
+        !enabledItems.includes(previousRovingItem) &&
+        (activeElement === previousRovingItem || activeElement === document.body);
+      rovingItemRef.current = synchronizeRovingItems(
+        container,
+        previousRovingItem,
+        shouldMoveFocus
+      );
+    });
+    observer.observe(container, {
+      attributeFilter: ["aria-checked", "aria-disabled", "data-selected", "disabled"],
+      attributes: true,
+      childList: true,
+      subtree: true
+    });
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => () => {
     if (typeaheadTimerRef.current !== null) {
@@ -100,7 +192,7 @@ export function OverlayMenuList({
 
     if (action.type === "focus") {
       event.preventDefault();
-      activateRovingItem(items, action.index, true);
+      activateRovingItem(container, items, action.index, true);
       return;
     }
     if (action.type === "activate" || action.type === "open-submenu") {
@@ -129,7 +221,7 @@ export function OverlayMenuList({
     );
     if (nextIndex === null) return;
     event.preventDefault();
-    activateRovingItem(items, nextIndex, true);
+    activateRovingItem(container, items, nextIndex, true);
   };
 
   const handleFocusCapture = (event: FocusEvent<HTMLDivElement>) => {
@@ -139,7 +231,7 @@ export function OverlayMenuList({
     if (!container || !(event.target instanceof HTMLButtonElement)) return;
     const items = enabledMenuItems(container);
     const activeIndex = items.indexOf(event.target);
-    if (activeIndex >= 0) activateRovingItem(items, activeIndex, false);
+    if (activeIndex >= 0) activateRovingItem(container, items, activeIndex, false);
   };
 
   return (
@@ -164,6 +256,7 @@ export function OverlayMenuItem({
   danger = false,
   disabled,
   icon,
+  onClick,
   role,
   secondary,
   selected = false,
@@ -191,6 +284,14 @@ export function OverlayMenuItem({
       data-selected={selected || undefined}
       data-submenu={submenu || undefined}
       disabled={disabled}
+      onClick={(event) => {
+        if (isDisabled) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        onClick?.(event);
+      }}
       role={resolvedRole}
       tabIndex={isDisabled ? -1 : tabIndex}
       type={type}

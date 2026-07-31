@@ -95,8 +95,8 @@ export function AnchoredOverlay({
     };
   }, [id, presence.present]);
 
-  useEffect(() => {
-    if (!open || !anchor) return;
+  useLayoutEffect(() => {
+    if (!open || !presence.present || !anchor) return;
     const surface = surfaceRef.current;
     if (!surface) return;
 
@@ -131,13 +131,14 @@ export function AnchoredOverlay({
     open,
     openRoot,
     parentId,
+    presence.present,
     registerLayer,
     restoreFocusTarget,
     rootId
   ]);
 
   useEffect(() => {
-    if (!open || !anchor) return;
+    if (!open || !presence.present || !anchor) return;
     const surface = surfaceRef.current;
     if (!surface) return;
 
@@ -169,6 +170,10 @@ export function AnchoredOverlay({
       if (frame) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(measure);
     };
+    const handleScroll = (event: Event) => {
+      if (event.target instanceof Node && surface.contains(event.target)) return;
+      scheduleMeasure();
+    };
 
     const resizeObserver = new ResizeObserver(scheduleMeasure);
     resizeObserver.observe(surface);
@@ -176,16 +181,16 @@ export function AnchoredOverlay({
       resizeObserver.observe(anchor);
     }
     window.addEventListener("resize", scheduleMeasure);
-    window.addEventListener("scroll", scheduleMeasure, true);
+    window.addEventListener("scroll", handleScroll, true);
     scheduleMeasure();
 
     return () => {
       if (frame) cancelAnimationFrame(frame);
       resizeObserver.disconnect();
       window.removeEventListener("resize", scheduleMeasure);
-      window.removeEventListener("scroll", scheduleMeasure, true);
+      window.removeEventListener("scroll", handleScroll, true);
     };
-  }, [anchor, kind, minWidth, open, placement, preferredWidth]);
+  }, [anchor, kind, minWidth, open, placement, preferredWidth, presence.present]);
 
   if (!presence.present || !renderedAnchor) return null;
 
@@ -197,7 +202,6 @@ export function AnchoredOverlay({
     top: layout?.top ?? 0,
     maxWidth: layout?.maxWidth ?? fallbackMaxWidth,
     maxHeight: layout?.maxHeight ?? fallbackMaxHeight,
-    overflowY: "auto",
     width: layout?.width,
     visibility: layout ? "visible" : "hidden"
   };
@@ -215,7 +219,13 @@ export function AnchoredOverlay({
       style={style}
       surfaceRole={resolvedSurfaceRole}
     >
-      {children}
+      <div
+        className="overlay-scroll-viewport"
+        data-overlay-scroll-viewport="true"
+        style={{ maxHeight: layout?.maxHeight ?? fallbackMaxHeight }}
+      >
+        {children}
+      </div>
     </OverlaySurface>,
     document.body
   );

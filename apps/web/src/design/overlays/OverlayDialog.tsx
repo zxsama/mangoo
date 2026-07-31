@@ -1,5 +1,4 @@
 import {
-  useEffect,
   useLayoutEffect,
   useRef,
   type HTMLAttributes,
@@ -53,10 +52,13 @@ export function ModalSurface({
     };
   }, [id, presence.present]);
 
-  useOverlayFocusTrap(open, containerRef, { initialFocusRef, restoreFocusRef });
+  useOverlayFocusTrap(open && presence.present, containerRef, {
+    initialFocusRef,
+    restoreFocusRef
+  });
 
-  useEffect(() => {
-    if (!open || !containerRef.current) return;
+  useLayoutEffect(() => {
+    if (!open || !presence.present || !containerRef.current) return;
     return registerLayer({
       id,
       rootId,
@@ -70,7 +72,16 @@ export function ModalSurface({
       restoreFocus: false,
       onDismiss
     });
-  }, [busy, id, onDismiss, open, registerLayer, restoreFocusRef, rootId]);
+  }, [
+    busy,
+    id,
+    onDismiss,
+    open,
+    presence.present,
+    registerLayer,
+    restoreFocusRef,
+    rootId
+  ]);
 
   if (!presence.present) return null;
 
