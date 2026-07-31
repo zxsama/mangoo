@@ -22,7 +22,9 @@ describe("REMOVE_ROOT_CONFIRM", () => {
 
   it("keeps cancellation inside the library root and initially focuses it", () => {
     assert.match(switcherSource, /<ModalSurface[^]*initialFocusRef=\{cancelRef\}/);
-    assert.match(switcherSource, /open=\{confirmRemove !== null\}/);
+    assert.match(switcherSource, /busy=\{removePending\}/);
+    assert.match(switcherSource, /open=\{removeTarget !== null\}/);
+    assert.match(switcherSource, /restoreFocusRef=\{removeTriggerRef\}/);
 
     const dialogActions = switcherSource.match(
       /<OverlayDialogActions>([^]*?)<\/OverlayDialogActions>/,
@@ -30,7 +32,7 @@ describe("REMOVE_ROOT_CONFIRM", () => {
     assert.ok(dialogActions);
     assert.match(
       dialogActions,
-      /<button[^]*?onClick=\{\(\) => setConfirmRemove\(null\)\}[^]*?ref=\{cancelRef\}/,
+      /<button[^]*?disabled=\{removePending\}[^]*?onClick=\{\(\) => dispatch\(\{ type: "cancel-remove" \}\)\}[^]*?ref=\{cancelRef\}/,
     );
     assert.doesNotMatch(dialogActions, /onClose/);
   });

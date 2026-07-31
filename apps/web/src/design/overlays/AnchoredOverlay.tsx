@@ -4,7 +4,8 @@ import {
   useRef,
   useState,
   type ReactNode,
-  type ReactPortal
+  type ReactPortal,
+  type RefObject
 } from "react";
 import { createPortal } from "react-dom";
 import { useOverlayStack } from "./OverlayProvider";
@@ -27,9 +28,11 @@ import { useOverlayPresence } from "./useOverlayPresence";
 export interface AnchoredOverlayProps {
   anchor: OverlayAnchor | null;
   ariaLabel: string;
+  autoFocus?: boolean;
   children: ReactNode;
   className?: string;
   id: string;
+  initialFocusRef?: RefObject<HTMLElement | null>;
   minWidth?: number;
   onDismiss: () => void;
   open: boolean;
@@ -60,9 +63,11 @@ function layoutUnchanged(
 export function AnchoredOverlay({
   anchor,
   ariaLabel,
+  autoFocus = false,
   children,
   className,
   id,
+  initialFocusRef,
   minWidth,
   onDismiss,
   open,
@@ -74,6 +79,7 @@ export function AnchoredOverlay({
   rootId,
   surfaceRole
 }: AnchoredOverlayProps): ReactPortal | null {
+  const autoFocusCompletedRef = useRef(false);
   const surfaceRef = useRef<HTMLElement | null>(null);
   const retainedAnchorRef = useRef<OverlayAnchor | null>(anchor);
   const [layout, setLayout] = useState<AnchoredOverlayLayoutResult | null>(null);
@@ -87,6 +93,7 @@ export function AnchoredOverlay({
   useLayoutEffect(() => {
     surfaceRef.current = presence.present ? document.getElementById(id) : null;
     if (!presence.present) {
+      autoFocusCompletedRef.current = false;
       setLayout(null);
       retainedAnchorRef.current = null;
     }
@@ -94,6 +101,19 @@ export function AnchoredOverlay({
       surfaceRef.current = null;
     };
   }, [id, presence.present]);
+
+  useLayoutEffect(() => {
+    if (!open || !presence.present || !autoFocus) {
+      autoFocusCompletedRef.current = false;
+      return;
+    }
+    if (!layout || autoFocusCompletedRef.current) return;
+    const surface = surfaceRef.current;
+    const target = initialFocusRef?.current;
+    if (!surface || !target || !surface.contains(target)) return;
+    autoFocusCompletedRef.current = true;
+    target.focus();
+  }, [autoFocus, initialFocusRef, layout, open, presence.present]);
 
   useLayoutEffect(() => {
     if (!open || !presence.present || !anchor) return;

@@ -117,6 +117,7 @@ export function ShellTitlebarPrimaryActions({
   activeLibraryIcon,
   activeLibraryName,
   librarySwitcherButtonRef,
+  librarySwitcherOpen,
   sidebarsHidden,
   onOpenLibrarySwitcher,
   onOpenPlugins,
@@ -128,8 +129,9 @@ export function ShellTitlebarPrimaryActions({
   activeLibraryIcon?: string;
   activeLibraryName: string;
   librarySwitcherButtonRef?: React.Ref<HTMLButtonElement>;
+  librarySwitcherOpen: boolean;
   sidebarsHidden: boolean;
-  onOpenLibrarySwitcher: () => void;
+  onOpenLibrarySwitcher: (source: HTMLButtonElement, autoFocus: boolean) => void;
   onOpenPlugins: () => void;
   onOpenSettings: () => void;
   onLocateFolder: () => void;
@@ -141,10 +143,14 @@ export function ShellTitlebarPrimaryActions({
       data-no-drag="true"
     >
       <LiquidGlassButton
+        active={librarySwitcherOpen}
+        aria-controls="library-root"
+        aria-expanded={librarySwitcherOpen}
+        aria-haspopup="dialog"
         aria-label={`Switch library, current library ${activeLibraryName}`}
         className="shell-library-switcher-button no-drag"
         data-titlebar-control="library-switcher"
-        onClick={onOpenLibrarySwitcher}
+        onClick={(event) => onOpenLibrarySwitcher(event.currentTarget, event.detail === 0)}
         ref={librarySwitcherButtonRef}
         title="Switch library"
         tone="control"

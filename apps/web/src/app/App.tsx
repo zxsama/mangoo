@@ -141,6 +141,9 @@ export function App() {
   const [libraryPhase, setLibraryPhase] = useState<LibraryLoadPhase>("starting-core");
   const [librarySwitcherAnchor, setLibrarySwitcherAnchor] =
     useState<HTMLButtonElement | null>(null);
+  const [librarySwitcherSource, setLibrarySwitcherSource] =
+    useState<HTMLButtonElement | null>(null);
+  const [librarySwitcherAutoFocus, setLibrarySwitcherAutoFocus] = useState(false);
   const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
   const [activeLibraryName, setActiveLibraryName] = useState<string>("Library");
   const [activeLibraryIcon, setActiveLibraryIcon] = useState<string | undefined>(undefined);
@@ -489,7 +492,9 @@ export function App() {
     [overlays]
   );
 
-  const openLibrarySwitcher = useCallback(() => {
+  const openLibrarySwitcher = useCallback((source: HTMLButtonElement, autoFocus: boolean) => {
+    setLibrarySwitcherSource(source);
+    setLibrarySwitcherAutoFocus(autoFocus);
     setRootOpen("library", true);
   }, [setRootOpen]);
   const closeLibrarySwitcher = useCallback(() => {
@@ -755,6 +760,7 @@ export function App() {
         activeLibraryIcon={activeLibraryIcon}
         activeLibraryName={activeLibraryName}
         librarySwitcherButtonRef={setLibrarySwitcherAnchor}
+        librarySwitcherOpen={librarySwitcherOpen}
         onOpenLibrarySwitcher={openLibrarySwitcher}
         onOpenPlugins={handleOpenPlugins}
         onOpenSettings={handleOpenSettings}
@@ -834,9 +840,16 @@ export function App() {
         />
         <LibrarySwitcher
           anchor={librarySwitcherAnchor}
+          autoFocus={librarySwitcherAutoFocus}
           library={library}
+          notificationContext={
+            activeLibraryId
+              ? { libraryId: activeLibraryId, libraryName: activeLibraryName }
+              : null
+          }
           onClose={closeLibrarySwitcher}
           open={librarySwitcherOpen}
+          restoreFocusTarget={librarySwitcherSource}
         />
       </>
     );

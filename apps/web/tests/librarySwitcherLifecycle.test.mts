@@ -7,9 +7,19 @@ import { createServer, type ViteDevServer } from "vite";
 interface LibrarySwitcherLifecycleResult {
   ok: boolean;
   error?: string;
-  fallback: {
-    activeRootId: string | null;
-    interactive: boolean;
+  productionWiring: {
+    activeWhenOpen: boolean;
+    controls: string | null;
+    expandedWhenClosed: string | null;
+    expandedWhenOpen: string | null;
+    hasPopup: string | null;
+    keyboardFocusedSearch: boolean;
+    keyboardRestoredTrigger: boolean;
+    mousePreservedTriggerFocus: boolean;
+  };
+  loadingSourceFocus: {
+    focusedSearch: boolean;
+    restoredSource: boolean;
     visible: boolean;
   };
   focusRestore: {
@@ -17,6 +27,39 @@ interface LibrarySwitcherLifecycleResult {
     escapeRestoredTrigger: boolean;
     nestedMenuStayedOpen: boolean;
     rootStayedOpen: boolean;
+  };
+  pendingRemove: {
+    actionDisabled: boolean;
+    backdropBlocked: boolean;
+    busy: boolean;
+    cancelBlocked: boolean;
+    cancelDisabled: boolean;
+    duplicateCalls: number;
+    escapeBlocked: boolean;
+    recovered: boolean;
+    reports: number;
+    unhandledRejections: number;
+  };
+  iconMenu: {
+    checkedItems: number;
+    focusedRadioItem: boolean;
+    keyboardSelections: number;
+    menuRoleCount: number;
+    radioItems: number;
+    rovingTabStops: number;
+    surfaceRole: string | null;
+    visualGridPresent: boolean;
+  };
+  requestOwnership: {
+    freshResponseWon: boolean;
+    staleMutationIgnored: boolean;
+    staleResponseIgnored: boolean;
+    unmountReports: number;
+    unmountUnhandledRejections: number;
+  };
+  mutationFailures: {
+    reports: number;
+    unhandledRejections: number;
   };
 }
 
@@ -101,10 +144,25 @@ after(async () => {
 });
 
 describe("mounted LibrarySwitcher lifecycle", () => {
-  it("opens a visible and interactive library root from loading UI without an element anchor", () => {
-    assert.equal(result.fallback.activeRootId, "library");
-    assert.equal(result.fallback.visible, true);
-    assert.equal(result.fallback.interactive, true);
+  it("uses production titlebar wiring for keyboard and pointer opening", () => {
+    assert.deepEqual(result.productionWiring, {
+      activeWhenOpen: true,
+      controls: "library-root",
+      expandedWhenClosed: "false",
+      expandedWhenOpen: "true",
+      hasPopup: "dialog",
+      keyboardFocusedSearch: true,
+      keyboardRestoredTrigger: true,
+      mousePreservedTriggerFocus: true,
+    });
+  });
+
+  it("restores point-anchored loading actions through their explicit source element", () => {
+    assert.deepEqual(result.loadingSourceFocus, {
+      focusedSearch: true,
+      restoredSource: true,
+      visible: true,
+    });
   });
 
   it("restores focus to the remove trigger after cancel and Escape", () => {
@@ -113,6 +171,49 @@ describe("mounted LibrarySwitcher lifecycle", () => {
       escapeRestoredTrigger: true,
       nestedMenuStayedOpen: true,
       rootStayedOpen: true,
+    });
+  });
+
+  it("owns remove confirmation as one busy recoverable mutation", () => {
+    assert.deepEqual(result.pendingRemove, {
+      actionDisabled: true,
+      backdropBlocked: true,
+      busy: true,
+      cancelBlocked: true,
+      cancelDisabled: true,
+      duplicateCalls: 1,
+      escapeBlocked: true,
+      recovered: true,
+      reports: 1,
+      unhandledRejections: 0,
+    });
+  });
+
+  it("uses one shared roving radio menu for icon and color choices", () => {
+    assert.equal(result.iconMenu.surfaceRole, "group");
+    assert.equal(result.iconMenu.menuRoleCount, 1);
+    assert.ok(result.iconMenu.radioItems > 2);
+    assert.equal(result.iconMenu.checkedItems, 2);
+    assert.equal(result.iconMenu.rovingTabStops, 1);
+    assert.equal(result.iconMenu.focusedRadioItem, true);
+    assert.equal(result.iconMenu.keyboardSelections, 1);
+    assert.equal(result.iconMenu.visualGridPresent, true);
+  });
+
+  it("rejects stale reloads and drops work after unmount", () => {
+    assert.deepEqual(result.requestOwnership, {
+      freshResponseWon: true,
+      staleMutationIgnored: true,
+      staleResponseIgnored: true,
+      unmountReports: 0,
+      unmountUnhandledRejections: 0,
+    });
+  });
+
+  it("reports rejected switch, create, open, add, and icon mutations", () => {
+    assert.deepEqual(result.mutationFailures, {
+      reports: 5,
+      unhandledRejections: 0,
     });
   });
 });

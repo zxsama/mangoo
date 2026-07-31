@@ -7883,43 +7883,6 @@ button:disabled {
 .library-loading-error-text { font-size: 13px; color: var(--text-soft); }
 .library-loading-actions { display: flex; gap: 10px; margin-top: 4px; }
 
-/* Switch popup anchored near the sidebar (top-left), not a centred modal. The
-   backdrop stays click-to-close; the panel sits just below the titlebar aligned
-   to the left edge so it reads as "beside the library". */
-.library-switcher-backdrop {
-  position: fixed; inset: 0; z-index: 40;
-  display: grid; place-items: start start; padding: 48px 0 0 10px;
-}
-/* Frosted settings-page look: the same translucent side-material fill + blur the
-   settings window and sidebar use (driven by the "侧栏材质" vars), a hairline
-   border and elevation — not the near-invisible elevated glass surface. */
-.library-switcher {
-  width: 460px; max-height: 72vh; display: flex; flex-direction: column; overflow: hidden;
-  background: var(--glass-side-fill, rgba(18, 22, 28, 0.82));
-  -webkit-backdrop-filter: blur(var(--glass-side-blur, 26px)) saturate(var(--glass-side-saturation, 1.55));
-  backdrop-filter: blur(var(--glass-side-blur, 26px)) saturate(var(--glass-side-saturation, 1.55));
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  box-shadow: var(--shadow-elevated, 0 18px 48px rgba(0, 0, 0, 0.45));
-  color: var(--text-soft);
-}
-.library-switcher-search { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--text-muted); }
-.library-switcher-search input { flex: 1; background: transparent; border: 0; outline: 0; color: var(--text-soft); font-size: 13px; }
-.library-switcher-search button { display: grid; place-items: center; background: transparent; border: 0; color: var(--text-muted); cursor: pointer; }
-.library-switcher-list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; display: grid; gap: 2px; }
-.library-switcher-row { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: var(--radius-control); }
-.library-switcher-row.active { background: var(--glass-hover-fill, rgba(255, 255, 255, 0.07)); }
-.library-switcher-row.unavailable { opacity: 0.5; }
-.library-switcher-icon-anchor { position: relative; flex: 0 0 auto; }
-.library-switcher-icon { display: grid; place-items: center; width: 28px; height: 28px; background: transparent; border: 1px solid transparent; border-radius: var(--radius-control); color: inherit; cursor: pointer; }
-.library-switcher-main { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 1px; background: transparent; border: 0; cursor: pointer; color: inherit; }
-.library-switcher-name { font-size: 13px; font-weight: 600; }
-.library-switcher-path { max-width: 100%; font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.library-switcher-check { flex: 0 0 auto; color: var(--accent, #7cc4ff); }
-.library-switcher-actions { display: flex; gap: 2px; flex: 0 0 auto; }
-.library-switcher-actions button { display: grid; place-items: center; width: 28px; height: 28px; background: transparent; border: 1px solid transparent; border-radius: var(--radius-control); color: var(--text-muted); cursor: pointer; }
-.library-switcher-actions button:hover:not(:disabled) { color: var(--text-soft); }
-.library-switcher-actions button:disabled { opacity: 0.35; cursor: default; }
 /* Preset icon + color picker, anchored under the row's icon button. */
 .library-icon-picker {
   position: absolute; top: calc(100% + 4px); left: 0; z-index: 12;
@@ -7934,43 +7897,3 @@ button:disabled {
 .library-icon-picker-colors { display: flex; flex-wrap: wrap; gap: 4px; padding-top: 6px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
 .library-icon-picker-swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(255, 255, 255, 0.2); cursor: pointer; padding: 0; }
 .library-icon-picker-swatch.selected { outline: 2px solid var(--text-soft); outline-offset: 1px; }
-.library-switcher-remove-menu-anchor { position: relative; }
-.library-switcher-remove-menu {
-  position: absolute; top: calc(100% + 4px); right: 0; z-index: 10;
-  min-width: 180px; max-height: 220px; overflow-y: auto;
-  list-style: none; margin: 0; padding: 4px;
-  background: var(--surface-elevated, #1c1c1e); border: 1px solid var(--line);
-  border-radius: var(--radius-control); box-shadow: var(--shadow-elevated, 0 8px 24px rgba(0, 0, 0, 0.35));
-}
-.library-switcher-remove-menu-empty { padding: 6px 8px; font-size: 12px; color: var(--text-muted); }
-.library-switcher-remove-menu-item {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  width: 100%; text-align: left; background: transparent; border: 0; color: inherit;
-  padding: 6px 8px; border-radius: var(--radius-control); cursor: pointer; font-size: 12px;
-}
-.library-switcher-footer { display: flex; flex-direction: column; padding: 8px; gap: 2px; border-top: 1px solid var(--line); }
-.library-switcher-footer button { text-align: left; background: transparent; border: 1px solid transparent; color: var(--text-soft); padding: 8px; border-radius: var(--radius-control); cursor: pointer; font-size: 13px; }
-/* Two-step remove-folder confirmation, layered above the switcher popup itself
-   (higher z-index backdrop) so cancelling it never closes the switcher. */
-.library-switcher-confirm-backdrop {
-  position: fixed; inset: 0; z-index: 50;
-  display: grid; place-items: center;
-  background: rgba(0, 0, 0, 0.35);
-}
-.library-switcher-confirm {
-  width: 340px; max-width: calc(100vw - 32px);
-  background: var(--surface-elevated, #1c1c1e); border: 1px solid var(--line);
-  border-radius: 12px; box-shadow: var(--shadow-elevated, 0 18px 48px rgba(0, 0, 0, 0.45));
-  padding: 16px; color: var(--text-soft);
-}
-.library-switcher-confirm-title { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
-.library-switcher-confirm-body { display: grid; gap: 4px; margin-bottom: 14px; }
-.library-switcher-confirm-body p { margin: 0; font-size: 12px; line-height: 1.5; color: var(--text-muted); white-space: pre-wrap; }
-.library-switcher-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
-.library-switcher-confirm-cancel,
-.library-switcher-confirm-remove {
-  padding: 6px 14px; border-radius: var(--radius-control); border: 1px solid transparent;
-  font-size: 13px; cursor: pointer;
-}
-.library-switcher-confirm-cancel { background: transparent; border-color: var(--line); color: var(--text-soft); }
-.library-switcher-confirm-remove { background: var(--danger, #e5484d); color: #fff; }

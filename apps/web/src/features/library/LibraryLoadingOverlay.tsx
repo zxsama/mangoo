@@ -15,7 +15,7 @@ export function LibraryLoadingOverlay({
 }: {
   phase: LibraryLoadPhase;
   onRetry: () => void;
-  onSwitchLibrary: () => void;
+  onSwitchLibrary: (source: HTMLButtonElement, autoFocus: boolean) => void;
 }) {
   if (phase === "ready") return null;
   const error = isErrorPhase(phase);
@@ -42,7 +42,12 @@ export function LibraryLoadingOverlay({
             <div className="library-loading-error-text">{phase.message}</div>
             <div className="library-loading-actions">
               <button type="button" onClick={onRetry}>重试</button>
-              <button type="button" onClick={onSwitchLibrary}>切换其它库</button>
+              <button
+                type="button"
+                onClick={(event) => onSwitchLibrary(event.currentTarget, event.detail === 0)}
+              >
+                切换其它库
+              </button>
             </div>
           </>
         ) : (

@@ -33,6 +33,23 @@ const secondaryReveal = read("apps/desktop/src/secondary-window-reveal.ts");
 const preload = read("apps/desktop/src/preload.cjs");
 const styles = read("apps/web/src/styles.css");
 const stylesForChecks = stripCssComments(styles);
+const retiredLibrarySwitcherSelectors = [
+  ".library-switcher-backdrop",
+  ".library-switcher-confirm-backdrop",
+  ".library-switcher-confirm",
+  ".library-switcher-remove-menu"
+];
+for (const selector of retiredLibrarySwitcherSelectors) {
+  const selectorFamily = new RegExp(`${escapeRegExp(selector)}(?=$|[^_a-zA-Z0-9]|-)`);
+  if (
+    cssRuleBlocksForMatchingSelectors(
+      stylesForChecks,
+      (candidateSelector) => selectorFamily.test(candidateSelector)
+    ).length > 0
+  ) {
+    fail(`retired LibrarySwitcher selector must stay in shared overlay CSS: ${selector}`);
+  }
+}
 const webMain = read("apps/web/src/main.tsx");
 const app = read("apps/web/src/app/App.tsx");
 const appShell = read("apps/web/src/app-shell/AppShell.tsx");

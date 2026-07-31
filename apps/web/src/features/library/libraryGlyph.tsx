@@ -17,6 +17,7 @@ import {
   Video
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { OverlayMenuItem, OverlayMenuList } from "../../design/overlays";
 
 // Preset visual identity for libraries. Each library stores an `icon` (one of
 // these keys) plus a `color`. Kept as a small curated set so the picker stays
@@ -101,12 +102,51 @@ export function LibraryIconPicker({
 }: LibraryIconPickerProps) {
   const currentIcon = icon ?? DEFAULT_LIBRARY_ICON;
   const currentColor = color ?? DEFAULT_LIBRARY_COLOR;
+  if (presentation === "overlay") {
+    return (
+      <OverlayMenuList
+        ariaLabel="选择资源库图标和颜色"
+        className="library-icon-picker library-icon-picker--overlay"
+      >
+        <div aria-label="资源库图标" className="library-icon-picker-grid" role="group">
+          {LIBRARY_ICONS.map(({ key }) => (
+            <OverlayMenuItem
+              aria-label={key}
+              checked={key === currentIcon}
+              className="library-icon-picker-cell"
+              icon={<LibraryGlyph icon={key} color={currentColor} size={16} />}
+              key={key}
+              onClick={() => onPick(key, currentColor)}
+              role="menuitemradio"
+            >
+              {key}
+            </OverlayMenuItem>
+          ))}
+        </div>
+        <div aria-hidden="true" className="library-icon-picker-separator" role="separator" />
+        <div aria-label="资源库颜色" className="library-icon-picker-colors" role="group">
+          {LIBRARY_COLORS.map((nextColor) => (
+            <OverlayMenuItem
+              aria-label={nextColor}
+              checked={nextColor === currentColor}
+              className="library-icon-picker-swatch"
+              key={nextColor}
+              onClick={() => onPick(currentIcon, nextColor)}
+              role="menuitemradio"
+              style={{ background: nextColor }}
+            >
+              {nextColor}
+            </OverlayMenuItem>
+          ))}
+        </div>
+      </OverlayMenuList>
+    );
+  }
   return (
-    <div className={`library-icon-picker library-icon-picker--${presentation}`}>
+    <div className="library-icon-picker library-icon-picker--embedded">
       <div className="library-icon-picker-grid">
         {LIBRARY_ICONS.map(({ key }) => (
           <button
-            data-interactive-pointer-target={presentation === "overlay" ? "true" : undefined}
             key={key}
             type="button"
             className={`library-icon-picker-cell${key === currentIcon ? " selected" : ""}`}
@@ -120,7 +160,6 @@ export function LibraryIconPicker({
       <div className="library-icon-picker-colors">
         {LIBRARY_COLORS.map((c) => (
           <button
-            data-interactive-pointer-target={presentation === "overlay" ? "true" : undefined}
             key={c}
             type="button"
             className={`library-icon-picker-swatch${c === currentColor ? " selected" : ""}`}
