@@ -18,6 +18,7 @@ import type {
   NotificationWindowIntent
 } from "@megle/notification-contract";
 import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
+import { useOverlayStack } from "../../design/overlays";
 import type {
   CompactNotificationModel,
   NotificationOperationViewModel
@@ -37,18 +38,38 @@ import {
 interface NotificationPopoverProps {
   anchor: HTMLElement;
   model: CompactNotificationModel;
+  onDismiss?: () => void;
   onOpenCenter: (intent?: NotificationWindowIntent) => void;
 }
 
 export function NotificationPopover({
   anchor,
   model,
+  onDismiss,
   onOpenCenter
 }: NotificationPopoverProps) {
   const [popoverElement, setPopoverElement] = useState<HTMLElement | null>(null);
+  const { registerLayer } = useOverlayStack();
   const position = useNotificationPopoverPosition(anchor, popoverElement);
   const hasContent =
     model.active.length > 0 || model.thumbnail.summaries.length > 0 || model.results.length > 0;
+
+  useLayoutEffect(() => {
+    if (!popoverElement) return;
+    return registerLayer({
+      id: "notifications-root",
+      rootId: "notifications",
+      kind: "root",
+      trigger: anchor,
+      surface: popoverElement,
+      dismissOnEscape: true,
+      dismissOnFocusOutside: true,
+      dismissOnOutsidePointer: true,
+      dismissOnWindowBlur: true,
+      restoreFocus: true,
+      onDismiss: onDismiss ?? (() => undefined)
+    });
+  }, [anchor, onDismiss, popoverElement, registerLayer]);
 
   return createPortal(
     <LiquidGlassSurface

@@ -82,6 +82,14 @@ interface OverlayLifecycleResult {
     pointerDownPrevented: boolean;
     pointerFocusedDisabled: boolean;
   };
+  notificationRoot: {
+    activeRootAfterSwitch: string | null;
+    blurClosed: boolean;
+    escapeClosed: boolean;
+    escapeFocus: string;
+    outsidePointerClosed: boolean;
+    switchClosed: boolean;
+  };
 }
 
 const webRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -264,5 +272,16 @@ describe("mounted overlay lifecycle", () => {
     assert.equal(result.dynamicMenu.pointerDownPrevented, true);
     assert.equal(result.dynamicMenu.pointerFocusedDisabled, false);
     assert.equal(result.dynamicMenu.enterFallbackClicks, 0);
+  });
+
+  it("dismisses the mounted notification root through the shared lifecycle", () => {
+    assert.deepEqual(result.notificationRoot, {
+      activeRootAfterSwitch: "filter",
+      blurClosed: true,
+      escapeClosed: true,
+      escapeFocus: "notification-root-trigger",
+      outsidePointerClosed: true,
+      switchClosed: true
+    });
   });
 });

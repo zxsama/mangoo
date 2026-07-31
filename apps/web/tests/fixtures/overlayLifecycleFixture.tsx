@@ -16,6 +16,8 @@ import {
   type OverlayLayerRegistration,
   type OverlayStackApi
 } from "../../src/design/overlays";
+import { NotificationPopover } from "../../src/features/notifications/NotificationPopover";
+import type { CompactNotificationModel } from "../../src/features/notifications/notificationModel";
 import "../../src/design/overlays/overlay.css";
 
 declare global {
@@ -101,6 +103,14 @@ interface OverlayLifecycleResult {
     enterFallbackClicks: number;
     pointerDownPrevented: boolean;
     pointerFocusedDisabled: boolean;
+  };
+  notificationRoot?: {
+    activeRootAfterSwitch: string | null;
+    blurClosed: boolean;
+    escapeClosed: boolean;
+    escapeFocus: string;
+    outsidePointerClosed: boolean;
+    switchClosed: boolean;
   };
 }
 
@@ -1033,6 +1043,126 @@ async function runDynamicMenuScenario() {
   return result;
 }
 
+const emptyNotificationModel: CompactNotificationModel = {
+  activeLibraryId: null,
+  active: [],
+  thumbnail: {
+    summaries: [],
+    libraryCount: 0,
+    cachedCount: 0,
+    totalCandidateCount: 0,
+    missingCount: 0,
+    staleCount: 0,
+    failedCount: 0,
+    pendingCount: 0,
+    activeBulkTaskCount: 0,
+    totalCacheBytes: null,
+    completionPercent: null,
+    active: false
+  },
+  results: [],
+  indicator: "idle",
+  degraded: false,
+  healthDetail: null
+};
+
+function NotificationRootLifecycleScenario({ control }: { control: ScenarioControl }) {
+  const [anchor, setAnchor] = useState<HTMLButtonElement | null>(null);
+  const overlays = useOverlayStack();
+  control.api = overlays;
+  control.openRoot = () => overlays.openRoot("notifications");
+
+  return (
+    <>
+      <button id="notification-root-trigger" ref={setAnchor}>Notifications</button>
+      <button id="notification-root-outside">Outside</button>
+      {overlays.isRootOpen("notifications") && anchor ? (
+        <NotificationPopover
+          anchor={anchor}
+          model={emptyNotificationModel}
+          onOpenCenter={() => undefined}
+        />
+      ) : null}
+    </>
+  );
+}
+
+async function runNotificationRootLifecycleScenario() {
+  const control: ScenarioControl = { api: null };
+  const mounted = await mountScenario(
+    <OverlayProvider>
+      <NotificationRootLifecycleScenario control={control} />
+    </OverlayProvider>
+  );
+  const trigger = await waitForSelector("#notification-root-trigger");
+  const outside = await waitForSelector("#notification-root-outside");
+  if (!(trigger instanceof HTMLButtonElement) || !(outside instanceof HTMLButtonElement)) {
+    throw new Error("notification lifecycle controls must be buttons");
+  }
+
+  const openNotification = async () => {
+    trigger.focus();
+    await act(async () => control.openRoot?.());
+    await waitForSelector('[data-compact-popover-root="notifications"]');
+    await settle(30);
+  };
+  const resetNotification = async () => {
+    await act(async () => control.api?.closeRoot("notifications"));
+    await settle(20);
+  };
+
+  await openNotification();
+  document.querySelector<HTMLButtonElement>(".notification-open-center")?.focus();
+  await act(async () => {
+    document.dispatchEvent(new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      key: "Escape"
+    }));
+  });
+  await settle(20);
+  const escapeClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
+  const escapeFocus = (document.activeElement as HTMLElement | null)?.id ?? "";
+  await resetNotification();
+
+  await openNotification();
+  await act(async () => {
+    outside.dispatchEvent(new PointerEvent("pointerdown", {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 2,
+      pointerType: "mouse"
+    }));
+  });
+  await settle(20);
+  const outsidePointerClosed =
+    document.querySelector('[data-compact-popover-root="notifications"]') === null;
+  await resetNotification();
+
+  await openNotification();
+  await act(async () => window.dispatchEvent(new Event("blur")));
+  await settle(20);
+  const blurClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
+  await resetNotification();
+
+  await openNotification();
+  await act(async () => control.api?.openRoot("filter"));
+  await settle(20);
+  const switchClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
+  const activeRootAfterSwitch = control.api?.activeRootId ?? null;
+
+  const result = {
+    activeRootAfterSwitch,
+    blurClosed,
+    escapeClosed,
+    escapeFocus,
+    outsidePointerClosed,
+    switchClosed
+  };
+  await unmountScenario(mounted);
+  return result;
+}
+
 async function run(): Promise<void> {
   try {
     const focusProbe = document.createElement("button");
@@ -1051,7 +1181,8 @@ async function run(): Promise<void> {
       deferredAutofocus: await runDeferredAutofocusScenarios(),
       portalDescendantAutofocus: await runPortalDescendantAutofocusScenarios(),
       scrollShell: await runScrollShellScenario(),
-      dynamicMenu: await runDynamicMenuScenario()
+      dynamicMenu: await runDynamicMenuScenario(),
+      notificationRoot: await runNotificationRootLifecycleScenario()
     };
   } catch (error) {
     window.__overlayLifecycleResult = {

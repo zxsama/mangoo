@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import type { ThumbnailFailureDetail } from "@megle/notification-contract";
 import "../../src/styles.css";
 import { LiquidGlassButton, LiquidGlassLayer } from "../../src/design/liquid-glass";
+import { OverlayProvider } from "../../src/design/overlays";
 import { NotificationPopover } from "../../src/features/notifications/NotificationPopover";
 import type {
   CompactNotificationModel,
@@ -335,6 +336,7 @@ function NotificationPopoverVisualFixture() {
           <NotificationPopover
             anchor={anchor}
             model={model}
+            onDismiss={() => setOpen(false)}
             onOpenCenter={() => setOpen(false)}
           />
         ) : null}
@@ -347,6 +349,8 @@ const root = document.getElementById("root");
 if (!root) throw new Error("notification fixture root is missing");
 createRoot(root).render(
   <StrictMode>
-    <NotificationPopoverVisualFixture />
+    <OverlayProvider>
+      <NotificationPopoverVisualFixture />
+    </OverlayProvider>
   </StrictMode>
 );
