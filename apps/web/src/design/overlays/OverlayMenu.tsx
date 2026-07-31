@@ -30,6 +30,13 @@ function allMenuItems(container: HTMLElement): HTMLButtonElement[] {
   );
 }
 
+function disabledMenuItemFromTarget(target: EventTarget | null): HTMLButtonElement | null {
+  if (!(target instanceof Element)) return null;
+  const item = target.closest<HTMLButtonElement>('[data-overlay-menu-item="true"]');
+  if (!item || (!item.disabled && item.getAttribute("aria-disabled") !== "true")) return null;
+  return item;
+}
+
 function preferredMenuItemIndex(items: HTMLButtonElement[]): number {
   return items.findIndex((item) =>
     item.dataset.selected === "true" || item.getAttribute("aria-checked") === "true"
@@ -120,30 +127,32 @@ export function OverlayMenuList({
   }, []);
 
   useEffect(() => {
-    if (!autoFocus) return;
-    let frame = 0;
-    const focusInitialItem = () => {
-      const container = containerRef.current;
-      if (!container) return;
-      const surface = container.closest<HTMLElement>("[data-overlay-layer-kind]");
-      if (surface?.style.visibility === "hidden") {
-        frame = window.requestAnimationFrame(focusInitialItem);
-        return;
-      }
-      rovingItemRef.current = synchronizeRovingItems(
-        container,
-        rovingItemRef.current,
-        true
-      );
-    };
-    frame = window.requestAnimationFrame(focusInitialItem);
-    return () => window.cancelAnimationFrame(frame);
-  }, [autoFocus]);
-
-  useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const observer = new MutationObserver(() => {
+    const surface = container.closest<HTMLElement>("[data-overlay-layer-kind]");
+    let autoFocusPending = autoFocus;
+    let frame = 0;
+
+    const surfaceCanReceiveFocus = () => surface === null || (
+      surface.getAttribute("aria-hidden") !== "true" &&
+      surface.dataset.overlayState !== "closing" &&
+      surface.style.visibility !== "hidden"
+    );
+    const scheduleAutoFocus = () => {
+      if (!autoFocusPending || !surfaceCanReceiveFocus()) return;
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        if (!autoFocusPending || !surfaceCanReceiveFocus()) return;
+        rovingItemRef.current = synchronizeRovingItems(
+          container,
+          rovingItemRef.current,
+          true
+        );
+        autoFocusPending = rovingItemRef.current === null;
+      });
+    };
+    const synchronizeItems = () => {
       const previousRovingItem = rovingItemRef.current;
       const enabledItems = enabledMenuItems(container);
       const activeElement = document.activeElement;
@@ -155,15 +164,38 @@ export function OverlayMenuList({
         previousRovingItem,
         shouldMoveFocus
       );
-    });
-    observer.observe(container, {
+      scheduleAutoFocus();
+    };
+    const itemObserver = new MutationObserver(synchronizeItems);
+    itemObserver.observe(container, {
       attributeFilter: ["aria-checked", "aria-disabled", "data-selected", "disabled"],
       attributes: true,
       childList: true,
       subtree: true
     });
-    return () => observer.disconnect();
-  }, []);
+    const surfaceObserver = surface ? new MutationObserver(() => {
+      if (!surfaceCanReceiveFocus()) {
+        autoFocusPending = autoFocus;
+        if (frame) {
+          window.cancelAnimationFrame(frame);
+          frame = 0;
+        }
+        return;
+      }
+      scheduleAutoFocus();
+    }) : null;
+    surfaceObserver?.observe(surface as HTMLElement, {
+      attributeFilter: ["aria-hidden", "data-overlay-state", "style"],
+      attributes: true
+    });
+    scheduleAutoFocus();
+
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      itemObserver.disconnect();
+      surfaceObserver?.disconnect();
+    };
+  }, [autoFocus]);
 
   useEffect(() => () => {
     if (typeaheadTimerRef.current !== null) {
@@ -177,6 +209,16 @@ export function OverlayMenuList({
 
     const container = containerRef.current;
     if (!container) return;
+    const disabledActivationTarget = disabledMenuItemFromTarget(event.target) ??
+      disabledMenuItemFromTarget(document.activeElement);
+    if (
+      (event.key === "Enter" || event.key === " ") &&
+      disabledActivationTarget &&
+      container.contains(disabledActivationTarget)
+    ) {
+      event.preventDefault();
+      return;
+    }
     const items = enabledMenuItems(container);
     if (items.length === 0) return;
 
@@ -257,6 +299,7 @@ export function OverlayMenuItem({
   disabled,
   icon,
   onClick,
+  onPointerDown,
   role,
   secondary,
   selected = false,
@@ -291,6 +334,14 @@ export function OverlayMenuItem({
           return;
         }
         onClick?.(event);
+      }}
+      onPointerDown={(event) => {
+        if (isDisabled) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        onPointerDown?.(event);
       }}
       role={resolvedRole}
       tabIndex={isDisabled ? -1 : tabIndex}

@@ -55,6 +55,22 @@ interface OverlayLifecycleResult {
     providerItemFocusedBefore: boolean;
     providerRootIdBefore: string | null;
   };
+  controlledFamily?: {
+    activeRootAfterFirstClose: string | null;
+    activeRootAfterReopen: string | null;
+    activeRootAfterSecondClose: string | null;
+    nestedDismissalsAfterFirstClose: number;
+    nestedDismissalsAfterSecondClose: number;
+    rootDismissals: number;
+    rootFocusesAfterFirstClose: number;
+    rootFocusesAfterSecondClose: number;
+  };
+  deferredAutofocus?: {
+    asyncItemFocused: boolean;
+    initialItemFocused: boolean;
+    reopenItemFocused: boolean;
+    triggerFocusedDuringClose: boolean;
+  };
   scrollShell?: {
     anchorMeasuresAfterScroll: number;
     anchorMeasuresBeforeScroll: number;
@@ -67,6 +83,9 @@ interface OverlayLifecycleResult {
     enabledTabStops: number;
     enabledClicks: number;
     disabledTabIndex: number;
+    enterFallbackClicks: number;
+    pointerDownPrevented: boolean;
+    pointerFocusedDisabled: boolean;
   };
 }
 
@@ -77,8 +96,10 @@ interface MountedScenario {
 
 interface ScenarioControl {
   api: OverlayStackApi | null;
+  addItems?: () => void;
   closeControlled?: () => void;
   disableSelectedItem?: () => void;
+  enableRootTrigger?: () => void;
   openModal?: () => void;
   openNested?: () => void;
   openRoot?: () => void;
@@ -136,6 +157,20 @@ async function waitForSelector(selector: string): Promise<HTMLElement> {
     await settle(10);
   }
   throw new Error(`Timed out waiting for ${selector}`);
+}
+
+async function waitForOpenSurface(id: string): Promise<HTMLElement> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const surface = document.getElementById(id);
+    if (
+      surface?.dataset.overlayState === "open" &&
+      surface.style.visibility === "visible"
+    ) {
+      return surface;
+    }
+    await settle(10);
+  }
+  throw new Error(`Timed out waiting for open overlay surface #${id}`);
 }
 
 async function waitForFocus(id: string): Promise<boolean> {
@@ -467,6 +502,183 @@ async function runControlledFocusScenarios() {
   };
 }
 
+function ControlledFamilyScenario({ control, metrics }: {
+  control: ScenarioControl;
+  metrics: { nestedDismissals: number; rootDismissals: number; rootFocuses: number };
+}) {
+  const [rootAnchor, setRootAnchor] = useState<HTMLButtonElement | null>(null);
+  const [nestedAnchor, setNestedAnchor] = useState<HTMLButtonElement | null>(null);
+  const [rootOpen, setRootOpen] = useState(false);
+  const [nestedOpen, setNestedOpen] = useState(false);
+  const [rootTriggerDisabled, setRootTriggerDisabled] = useState(true);
+  control.closeControlled = () => setRootOpen(false);
+  control.enableRootTrigger = () => setRootTriggerDisabled(false);
+  control.openNested = () => setNestedOpen(true);
+  control.openRoot = () => setRootOpen(true);
+
+  return (
+    <OverlayProvider>
+      <StackCapture control={control} />
+      <button
+        disabled={rootTriggerDisabled}
+        id="controlled-family-trigger"
+        onFocus={() => {
+          metrics.rootFocuses += 1;
+        }}
+        ref={setRootAnchor}
+      >
+        Root
+      </button>
+      <AnchoredOverlay
+        anchor={rootAnchor}
+        ariaLabel="Controlled family root"
+        id="controlled-family-root"
+        onDismiss={() => {
+          metrics.rootDismissals += 1;
+          setRootOpen(false);
+        }}
+        open={rootOpen}
+        rootId="library"
+      >
+        <button id="controlled-family-nested-trigger" ref={setNestedAnchor}>
+          Nested
+        </button>
+        <AnchoredOverlay
+          anchor={nestedAnchor}
+          ariaLabel="Controlled family nested"
+          id="controlled-family-nested"
+          onDismiss={() => {
+            metrics.nestedDismissals += 1;
+            setNestedOpen(false);
+          }}
+          open={nestedOpen}
+          parentId="controlled-family-root"
+          rootId="library"
+          surfaceRole="nested"
+        >
+          <OverlayMenuList ariaLabel="Controlled family choices">
+            <OverlayMenuItem id="controlled-family-item">Nested item</OverlayMenuItem>
+          </OverlayMenuList>
+        </AnchoredOverlay>
+      </AnchoredOverlay>
+    </OverlayProvider>
+  );
+}
+
+async function runControlledFamilyScenario() {
+  const control: ScenarioControl = { api: null };
+  const metrics = { nestedDismissals: 0, rootDismissals: 0, rootFocuses: 0 };
+  const mounted = await mountScenario(
+    <ControlledFamilyScenario control={control} metrics={metrics} />
+  );
+  await act(async () => control.openRoot?.());
+  await waitForSelector("#controlled-family-nested-trigger");
+  await act(async () => control.openNested?.());
+  await waitForFocus("controlled-family-item");
+
+  await act(async () => control.closeControlled?.());
+  await settle(20);
+  const activeRootAfterFirstClose = control.api?.activeRootId ?? null;
+  const nestedDismissalsAfterFirstClose = metrics.nestedDismissals;
+  const rootFocusesAfterFirstClose = metrics.rootFocuses;
+
+  await act(async () => control.enableRootTrigger?.());
+  await settle();
+  await act(async () => control.openRoot?.());
+  await settle(10);
+  await act(async () => control.openNested?.());
+  await settle(30);
+  const activeRootAfterReopen = control.api?.activeRootId ?? null;
+  await act(async () => control.closeControlled?.());
+  await settle(20);
+
+  const result = {
+    activeRootAfterFirstClose,
+    activeRootAfterReopen,
+    activeRootAfterSecondClose: control.api?.activeRootId ?? null,
+    nestedDismissalsAfterFirstClose,
+    nestedDismissalsAfterSecondClose: metrics.nestedDismissals,
+    rootDismissals: metrics.rootDismissals,
+    rootFocusesAfterFirstClose,
+    rootFocusesAfterSecondClose: metrics.rootFocuses
+  };
+  await unmountScenario(mounted);
+  return result;
+}
+
+function DeferredAutofocusScenario({ control, initialItems }: {
+  control: ScenarioControl;
+  initialItems: boolean;
+}) {
+  const [anchor, setAnchor] = useState<HTMLButtonElement | null>(null);
+  const [itemsVisible, setItemsVisible] = useState(initialItems);
+  const [open, setOpen] = useState(false);
+  control.addItems = () => setItemsVisible(true);
+  control.closeControlled = () => setOpen(false);
+  control.openRoot = () => setOpen(true);
+
+  return (
+    <OverlayProvider>
+      <StackCapture control={control} />
+      <button id="deferred-autofocus-trigger" ref={setAnchor}>Trigger</button>
+      <AnchoredOverlay
+        anchor={anchor}
+        ariaLabel="Deferred autofocus"
+        id="deferred-autofocus-surface"
+        onDismiss={() => setOpen(false)}
+        open={open}
+        rootId="library"
+      >
+        <OverlayMenuList ariaLabel="Deferred choices" style={{ minHeight: 24 }}>
+          {itemsVisible ? (
+            <>
+              <OverlayMenuItem disabled id="deferred-autofocus-disabled">
+                Disabled
+              </OverlayMenuItem>
+              <OverlayMenuItem id="deferred-autofocus-enabled">Enabled</OverlayMenuItem>
+            </>
+          ) : null}
+        </OverlayMenuList>
+      </AnchoredOverlay>
+    </OverlayProvider>
+  );
+}
+
+async function runDeferredAutofocusScenarios() {
+  const asyncControl: ScenarioControl = { api: null };
+  const asyncMounted = await mountScenario(
+    <DeferredAutofocusScenario control={asyncControl} initialItems={false} />
+  );
+  await act(async () => asyncControl.openRoot?.());
+  await waitForOpenSurface("deferred-autofocus-surface");
+  await settle(30);
+  await act(async () => asyncControl.addItems?.());
+  await waitForSelector("#deferred-autofocus-enabled");
+  const asyncItemFocused = await waitForFocus("deferred-autofocus-enabled");
+  await unmountScenario(asyncMounted);
+
+  const reopenControl: ScenarioControl = { api: null };
+  const reopenMounted = await mountScenario(
+    <DeferredAutofocusScenario control={reopenControl} initialItems />
+  );
+  await act(async () => reopenControl.openRoot?.());
+  const initialItemFocused = await waitForFocus("deferred-autofocus-enabled");
+  await act(async () => reopenControl.closeControlled?.());
+  await settle(10);
+  const triggerFocusedDuringClose = document.activeElement?.id ===
+    "deferred-autofocus-trigger";
+  await act(async () => reopenControl.openRoot?.());
+  const reopenItemFocused = await waitForFocus("deferred-autofocus-enabled");
+  await unmountScenario(reopenMounted);
+
+  return {
+    asyncItemFocused,
+    initialItemFocused,
+    reopenItemFocused,
+    triggerFocusedDuringClose
+  };
+}
+
 function ScrollShellScenario({ metrics }: { metrics: { anchorMeasures: number } }) {
   const anchor = useRef({
     getBoundingClientRect: () => {
@@ -558,12 +770,34 @@ async function runDynamicMenuScenario() {
   disabled?.click();
   const ariaDisabledClicks = metrics.clicks;
   document.querySelector<HTMLButtonElement>("#dynamic-a")?.click();
+  const enabledClicks = metrics.clicks;
+  const activeId = (document.activeElement as HTMLElement | null)?.id ?? "";
+  metrics.clicks = 0;
+  const pointerDown = new PointerEvent("pointerdown", {
+    bubbles: true,
+    cancelable: true,
+    pointerId: 1,
+    pointerType: "mouse"
+  });
+  const pointerDownAllowed = disabled?.dispatchEvent(pointerDown) ?? true;
+  if (pointerDownAllowed) disabled?.focus();
+  const pointerFocusedDisabled = document.activeElement === disabled;
+  disabled?.focus();
+  disabled?.dispatchEvent(new KeyboardEvent("keydown", {
+    bubbles: true,
+    cancelable: true,
+    key: "Enter"
+  }));
+  await settle();
   const result = {
-    activeId: (document.activeElement as HTMLElement | null)?.id ?? "",
+    activeId,
     ariaDisabledClicks,
     disabledTabIndex: disabled?.tabIndex ?? 0,
-    enabledClicks: metrics.clicks,
-    enabledTabStops: enabled.filter((item) => item.tabIndex === 0).length
+    enabledClicks,
+    enabledTabStops: enabled.filter((item) => item.tabIndex === 0).length,
+    enterFallbackClicks: metrics.clicks,
+    pointerDownPrevented: !pointerDownAllowed,
+    pointerFocusedDisabled
   };
   await unmountScenario(mounted);
   return result;
@@ -582,6 +816,8 @@ async function run(): Promise<void> {
       reentrancy: await runReentrancyScenarios(),
       autofocus: await runAutoFocusScenarios(),
       controlledFocus: await runControlledFocusScenarios(),
+      controlledFamily: await runControlledFamilyScenario(),
+      deferredAutofocus: await runDeferredAutofocusScenarios(),
       scrollShell: await runScrollShellScenario(),
       dynamicMenu: await runDynamicMenuScenario()
     };

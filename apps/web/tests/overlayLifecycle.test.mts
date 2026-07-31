@@ -35,6 +35,22 @@ interface OverlayLifecycleResult {
     providerItemFocusedBefore: boolean;
     providerRootIdBefore: string | null;
   };
+  controlledFamily: {
+    activeRootAfterFirstClose: string | null;
+    activeRootAfterReopen: string | null;
+    activeRootAfterSecondClose: string | null;
+    nestedDismissalsAfterFirstClose: number;
+    nestedDismissalsAfterSecondClose: number;
+    rootDismissals: number;
+    rootFocusesAfterFirstClose: number;
+    rootFocusesAfterSecondClose: number;
+  };
+  deferredAutofocus: {
+    asyncItemFocused: boolean;
+    initialItemFocused: boolean;
+    reopenItemFocused: boolean;
+    triggerFocusedDuringClose: boolean;
+  };
   scrollShell: {
     anchorMeasuresAfterScroll: number;
     anchorMeasuresBeforeScroll: number;
@@ -47,6 +63,9 @@ interface OverlayLifecycleResult {
     disabledTabIndex: number;
     enabledClicks: number;
     enabledTabStops: number;
+    enterFallbackClicks: number;
+    pointerDownPrevented: boolean;
+    pointerFocusedDisabled: boolean;
   };
 }
 
@@ -169,6 +188,28 @@ describe("mounted overlay lifecycle", () => {
     });
   });
 
+  it("atomically clears a controlled root family and supports rapid re-registration", () => {
+    assert.deepEqual(result.controlledFamily, {
+      activeRootAfterFirstClose: null,
+      activeRootAfterReopen: "library",
+      activeRootAfterSecondClose: null,
+      nestedDismissalsAfterFirstClose: 1,
+      nestedDismissalsAfterSecondClose: 2,
+      rootDismissals: 0,
+      rootFocusesAfterFirstClose: 0,
+      rootFocusesAfterSecondClose: 1
+    });
+  });
+
+  it("autofocuses deferred items and a menu reopened during presence exit", () => {
+    assert.deepEqual(result.deferredAutofocus, {
+      asyncItemFocused: true,
+      initialItemFocused: true,
+      reopenItemFocused: true,
+      triggerFocusedDuringClose: true
+    });
+  });
+
   it("keeps material fixed while inner scrolling avoids anchor measurement", () => {
     assert.equal(result.scrollShell.hasScrollViewport, true);
     assert.equal(result.scrollShell.shellOverflowY, "");
@@ -184,5 +225,8 @@ describe("mounted overlay lifecycle", () => {
     assert.equal(result.dynamicMenu.activeId, "dynamic-a");
     assert.equal(result.dynamicMenu.ariaDisabledClicks, 0);
     assert.equal(result.dynamicMenu.enabledClicks, 1);
+    assert.equal(result.dynamicMenu.pointerDownPrevented, true);
+    assert.equal(result.dynamicMenu.pointerFocusedDisabled, false);
+    assert.equal(result.dynamicMenu.enterFallbackClicks, 0);
   });
 });

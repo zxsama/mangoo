@@ -129,8 +129,24 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     return () => {
       queueMicrotask(() => {
         const current = stateRef.current;
+        const registered = current.layers.find((item) => item.id === layer.id);
+        if (registered !== layer) return;
+
+        if (layer.kind === "root") {
+          const descendants = current.layers.filter((item) => item !== layer).reverse();
+          const cleaned = closeOverlayRoot(current, layer.rootId);
+          if (cleaned === current) return;
+          commitState(cleaned);
+          for (const descendant of descendants) {
+            descendant.onDismiss();
+          }
+          if (stateRef.current === cleaned) {
+            restoreLayerFocus(layer, "programmatic");
+          }
+          return;
+        }
+
         let cleaned = unregisterOverlayLayer(current, layer);
-        if (cleaned === current) return;
         if (cleaned.layers.length === 0) {
           cleaned = closeOverlayRoot(cleaned);
         }
