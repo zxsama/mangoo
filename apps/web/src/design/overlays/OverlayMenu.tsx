@@ -138,12 +138,28 @@ export function OverlayMenuList({
       surface.dataset.overlayState !== "closing" &&
       surface.style.visibility !== "hidden"
     );
+    const meaningfulSurfaceFocusExists = () => {
+      const activeElement = document.activeElement;
+      return surface !== null &&
+        activeElement instanceof HTMLElement &&
+        surface.contains(activeElement) &&
+        activeElement !== surface &&
+        activeElement !== container;
+    };
     const scheduleAutoFocus = () => {
       if (!autoFocusPending || !surfaceCanReceiveFocus()) return;
+      if (meaningfulSurfaceFocusExists()) {
+        autoFocusPending = false;
+        return;
+      }
       if (frame) window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
         frame = 0;
         if (!autoFocusPending || !surfaceCanReceiveFocus()) return;
+        if (meaningfulSurfaceFocusExists()) {
+          autoFocusPending = false;
+          return;
+        }
         rovingItemRef.current = synchronizeRovingItems(
           container,
           rovingItemRef.current,

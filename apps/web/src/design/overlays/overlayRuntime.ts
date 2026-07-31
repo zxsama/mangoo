@@ -46,6 +46,10 @@ export function shouldRestoreOverlayFocus(
 export function canRestoreOverlayFocus(target: OverlayFocusTargetState): boolean {
   return target.isConnected &&
     !target.matches(":disabled") &&
+    !target.matches(
+      '[aria-hidden="true"], [aria-hidden="true"] *, ' +
+      '[data-overlay-state="closing"], [data-overlay-state="closing"] *'
+    ) &&
     target.getAttribute("aria-disabled")?.toLocaleLowerCase() !== "true";
 }
 

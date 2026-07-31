@@ -45,11 +45,20 @@ interface OverlayLifecycleResult {
     rootFocusesAfterFirstClose: number;
     rootFocusesAfterSecondClose: number;
   };
+  modalFamilyFocus: {
+    activeRootAfterClose: string | null;
+    focusAfterExit: string;
+    focusDuringClose: string;
+    modalDismissals: number;
+    modalFocusedBefore: boolean;
+    rootDismissals: number;
+  };
   deferredAutofocus: {
     asyncItemFocused: boolean;
     initialItemFocused: boolean;
     reopenItemFocused: boolean;
     triggerFocusedDuringClose: boolean;
+    userFocusPreserved: boolean;
   };
   scrollShell: {
     anchorMeasuresAfterScroll: number;
@@ -201,12 +210,24 @@ describe("mounted overlay lifecycle", () => {
     });
   });
 
+  it("keeps root focus while a controlled root and modal descendant exit", () => {
+    assert.deepEqual(result.modalFamilyFocus, {
+      activeRootAfterClose: null,
+      focusAfterExit: "modal-family-root-trigger",
+      focusDuringClose: "modal-family-root-trigger",
+      modalDismissals: 1,
+      modalFocusedBefore: true,
+      rootDismissals: 0
+    });
+  });
+
   it("autofocuses deferred items and a menu reopened during presence exit", () => {
     assert.deepEqual(result.deferredAutofocus, {
       asyncItemFocused: true,
       initialItemFocused: true,
       reopenItemFocused: true,
-      triggerFocusedDuringClose: true
+      triggerFocusedDuringClose: true,
+      userFocusPreserved: true
     });
   });
 

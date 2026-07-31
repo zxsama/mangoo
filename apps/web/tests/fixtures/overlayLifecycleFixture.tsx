@@ -65,11 +65,20 @@ interface OverlayLifecycleResult {
     rootFocusesAfterFirstClose: number;
     rootFocusesAfterSecondClose: number;
   };
+  modalFamilyFocus?: {
+    activeRootAfterClose: string | null;
+    focusAfterExit: string;
+    focusDuringClose: string;
+    modalDismissals: number;
+    modalFocusedBefore: boolean;
+    rootDismissals: number;
+  };
   deferredAutofocus?: {
     asyncItemFocused: boolean;
     initialItemFocused: boolean;
     reopenItemFocused: boolean;
     triggerFocusedDuringClose: boolean;
+    userFocusPreserved: boolean;
   };
   scrollShell?: {
     anchorMeasuresAfterScroll: number;
@@ -606,6 +615,85 @@ async function runControlledFamilyScenario() {
   return result;
 }
 
+function ControlledModalFamilyScenario({ control, metrics }: {
+  control: ScenarioControl;
+  metrics: { modalDismissals: number; rootDismissals: number };
+}) {
+  const [rootAnchor, setRootAnchor] = useState<HTMLButtonElement | null>(null);
+  const modalInitialFocusRef = useRef<HTMLButtonElement>(null);
+  const modalRestoreFocusRef = useRef<HTMLButtonElement>(null);
+  const [rootOpen, setRootOpen] = useState(false);
+  const [modalOpen, setModalOpen] = useState(false);
+  control.closeControlled = () => setRootOpen(false);
+  control.openModal = () => setModalOpen(true);
+  control.openRoot = () => setRootOpen(true);
+
+  return (
+    <OverlayProvider>
+      <StackCapture control={control} />
+      <button id="modal-family-root-trigger" ref={setRootAnchor}>Root</button>
+      <AnchoredOverlay
+        anchor={rootAnchor}
+        ariaLabel="Modal family root"
+        id="modal-family-root"
+        onDismiss={() => {
+          metrics.rootDismissals += 1;
+          setRootOpen(false);
+        }}
+        open={rootOpen}
+        rootId="library"
+      >
+        <button id="modal-family-open-trigger" ref={modalRestoreFocusRef}>
+          Open modal
+        </button>
+        <ModalSurface
+          ariaLabelledBy="modal-family-title"
+          id="modal-family-dialog"
+          initialFocusRef={modalInitialFocusRef}
+          onDismiss={() => {
+            metrics.modalDismissals += 1;
+            setModalOpen(false);
+          }}
+          open={modalOpen}
+          restoreFocusRef={modalRestoreFocusRef}
+          rootId="library"
+        >
+          <h2 id="modal-family-title">Modal family</h2>
+          <button id="modal-family-initial" ref={modalInitialFocusRef}>Confirm</button>
+        </ModalSurface>
+      </AnchoredOverlay>
+    </OverlayProvider>
+  );
+}
+
+async function runControlledModalFamilyScenario() {
+  const control: ScenarioControl = { api: null };
+  const metrics = { modalDismissals: 0, rootDismissals: 0 };
+  const mounted = await mountScenario(
+    <ControlledModalFamilyScenario control={control} metrics={metrics} />
+  );
+  await act(async () => control.openRoot?.());
+  await waitForSelector("#modal-family-open-trigger");
+  await act(async () => control.openModal?.());
+  const modalFocusedBefore = await waitForFocus("modal-family-initial");
+
+  await act(async () => control.closeControlled?.());
+  await settle(20);
+  const focusDuringClose = document.activeElement?.id ?? "";
+  const activeRootAfterClose = control.api?.activeRootId ?? null;
+  await settle(180);
+  const result = {
+    activeRootAfterClose,
+    focusAfterExit: document.activeElement?.id ?? "",
+    focusDuringClose,
+    modalDismissals: metrics.modalDismissals,
+    modalFocusedBefore,
+    rootDismissals: metrics.rootDismissals
+  };
+  await unmountScenario(mounted);
+  return result;
+}
+
 function DeferredAutofocusScenario({ control, initialItems }: {
   control: ScenarioControl;
   initialItems: boolean;
@@ -629,6 +717,7 @@ function DeferredAutofocusScenario({ control, initialItems }: {
         open={open}
         rootId="library"
       >
+        <input aria-label="Manual focus" id="deferred-autofocus-manual-control" />
         <OverlayMenuList ariaLabel="Deferred choices" style={{ minHeight: 24 }}>
           {itemsVisible ? (
             <>
@@ -671,11 +760,26 @@ async function runDeferredAutofocusScenarios() {
   const reopenItemFocused = await waitForFocus("deferred-autofocus-enabled");
   await unmountScenario(reopenMounted);
 
+  const userControl: ScenarioControl = { api: null };
+  const userMounted = await mountScenario(
+    <DeferredAutofocusScenario control={userControl} initialItems={false} />
+  );
+  await act(async () => userControl.openRoot?.());
+  await waitForOpenSurface("deferred-autofocus-surface");
+  const manualControl = await waitForSelector("#deferred-autofocus-manual-control");
+  await act(async () => manualControl.focus());
+  await act(async () => userControl.addItems?.());
+  await waitForSelector("#deferred-autofocus-enabled");
+  await settle(40);
+  const userFocusPreserved = document.activeElement === manualControl;
+  await unmountScenario(userMounted);
+
   return {
     asyncItemFocused,
     initialItemFocused,
     reopenItemFocused,
-    triggerFocusedDuringClose
+    triggerFocusedDuringClose,
+    userFocusPreserved
   };
 }
 
@@ -817,6 +921,7 @@ async function run(): Promise<void> {
       autofocus: await runAutoFocusScenarios(),
       controlledFocus: await runControlledFocusScenarios(),
       controlledFamily: await runControlledFamilyScenario(),
+      modalFamilyFocus: await runControlledModalFamilyScenario(),
       deferredAutofocus: await runDeferredAutofocusScenarios(),
       scrollShell: await runScrollShellScenario(),
       dynamicMenu: await runDynamicMenuScenario()
