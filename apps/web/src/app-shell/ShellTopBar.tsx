@@ -82,7 +82,7 @@ interface ShellRightActionsProps {
   notificationButtonRef: RefCallback<HTMLButtonElement>;
   notificationIndicator: "idle" | "active" | "failure";
   notificationsOpen: boolean;
-  onToggleNotifications: () => void;
+  onToggleNotifications: (autoFocus: boolean) => void;
 }
 
 export function ShellSidebarToggle({
@@ -425,7 +425,7 @@ export function ShellRightActions({
         className="titlebar-icon-button notification-toggle no-drag"
         data-compact-popover-trigger="notifications"
         data-titlebar-control="notifications"
-        onClick={onToggleNotifications}
+        onClick={(event) => onToggleNotifications(event.detail === 0)}
         ref={notificationButtonRef}
         title="通知"
         tone="control"

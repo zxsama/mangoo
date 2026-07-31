@@ -3186,11 +3186,6 @@ button:disabled {
   border-radius: 4px;
 }
 
-.search-bar-clear:hover {
-  color: rgba(255, 255, 255, 0.85);
-  background: rgba(255, 255, 255, 0.05);
-}
-
 .search-bar-input:focus-visible,
 .search-bar-clear:focus-visible {
   outline: none;
@@ -7617,55 +7612,6 @@ button:disabled {
 
 .shell-titlebar [data-titlebar-control] {
   -webkit-app-region: no-drag;
-}
-
-/* Titlebar search is a text field, not a spotlight target: it opts out of the
-   pointer-distance affordance glow (see the data-titlebar-search guard in
-   LiquidGlassSurface) and uses a clean, self-contained resting/hover/focus
-   treatment driven purely by :hover / :focus-within — no --glass-pointer-* vars. */
-.search-bar[data-titlebar-search="true"] {
-  --glass-fill: transparent;
-  --glass-border-current: rgba(255, 255, 255, 0.14);
-  --search-fill: rgba(5, 9, 13, 0.42);
-  --search-glow: 0;
-  padding-inline-end: 6px;
-  background: transparent;
-  border: 0;
-  box-shadow: none;
-  transition: color 140ms ease;
-}
-
-/* Suppress the inner refractive glass layers; the field renders a flat readable
-   fill + a single ::after border/glow instead. */
-.search-bar[data-titlebar-search="true"] > .liquid-glass-backdrop,
-.search-bar[data-titlebar-search="true"] > .liquid-glass-lens,
-.search-bar[data-titlebar-search="true"] > .liquid-glass-edge,
-.search-bar[data-titlebar-search="true"] > .liquid-glass-dim,
-.search-bar[data-titlebar-search="true"]::before {
-  display: none;
-}
-
-.search-bar[data-titlebar-search="true"]::after {
-  border: 1px solid var(--glass-border-current);
-  background: var(--search-fill);
-  box-shadow: 0 0 0 calc(var(--search-glow) * 3px) rgba(151, 219, 226, calc(var(--search-glow) * 0.22));
-  transition:
-    border-color 140ms ease,
-    background 140ms ease,
-    box-shadow 160ms ease;
-}
-
-.search-bar[data-titlebar-search="true"]:hover {
-  --glass-border-current: rgba(151, 219, 226, 0.4);
-  --search-fill: rgba(8, 14, 20, 0.5);
-  color: #f8fdff;
-}
-
-.search-bar[data-titlebar-search="true"]:focus-within {
-  --glass-border-current: rgba(151, 219, 226, 0.62);
-  --search-fill: rgba(8, 14, 20, 0.56);
-  --search-glow: 1;
-  color: #f8fdff;
 }
 
 @media (max-width: 720px) {

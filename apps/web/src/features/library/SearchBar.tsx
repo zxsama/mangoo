@@ -32,7 +32,6 @@ export function SearchBar({ value, onChange, placeholder = "Search library…" }
     >
       <OverlayField
         aria-label="Search library"
-        data-pointer-glow="off"
         inputRef={inputRef}
         leadingIcon={<Search aria-hidden="true" size={15} />}
         onChange={(event) => onChange(event.target.value)}

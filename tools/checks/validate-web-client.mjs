@@ -303,7 +303,7 @@ for (const [label, source, values] of [
 for (const [label, source, pattern] of [
   ["App", app, /notificationButtonRef\s*=\s*useRef/],
   ["ShellOverlayHost", shellOverlayHost, /notificationAnchorRef|RefObject<HTMLElement>/],
-  ["NotificationPopover", notificationPopover, /anchorRef|\.current\b|RefObject/]
+  ["NotificationPopover", notificationPopover, /anchorRef|anchor\.current\b|RefObject/]
 ]) {
   if (pattern.test(source)) fail(`${label} must not retain the notification RefObject snapshot path`);
 }

@@ -56,6 +56,7 @@ export function SortMenu({
       <LiquidGlassButton
         ref={buttonRef}
         active={open}
+        aria-controls="sort-root"
         aria-expanded={open}
         aria-haspopup="listbox"
         aria-label={`Sort: ${selectedLabel}`}
@@ -82,7 +83,7 @@ export function SortMenu({
         placement="bottom-start"
         preferredWidth={180}
         restoreFocusTarget={buttonRef.current}
-        role="listbox"
+        role="group"
         rootId="sort"
       >
         <OverlayMenuList

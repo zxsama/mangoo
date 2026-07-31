@@ -16,15 +16,34 @@ import {
   type OverlayLayerRegistration,
   type OverlayStackApi
 } from "../../src/design/overlays";
+import { LiquidGlassLayer } from "../../src/design/liquid-glass";
+import { FilterMenu } from "../../src/features/library/FilterMenu";
+import { LayoutMenu } from "../../src/features/library/LayoutMenu";
+import type { LibraryLayoutMode } from "../../src/features/media-grid/layoutMode";
+import { SearchBar } from "../../src/features/library/SearchBar";
+import { SortMenu, type SortOption } from "../../src/features/library/SortMenu";
 import { NotificationPopover } from "../../src/features/notifications/NotificationPopover";
 import type { CompactNotificationModel } from "../../src/features/notifications/notificationModel";
 import "../../src/design/overlays/overlay.css";
 
 declare global {
   interface Window {
+    __overlayLifecycleInputRequest?: NativeInputRequest;
+    __overlayLifecycleInputResponseId?: number;
     __overlayLifecycleResult?: OverlayLifecycleResult;
   }
 }
+
+type NativeInputPayload = {
+  type: "key";
+  keyCode: string;
+  modifiers?: string[];
+} | {
+  type: "mouse-click" | "mouse-move";
+  x: number;
+  y: number;
+};
+type NativeInputRequest = NativeInputPayload & { id: number };
 
 interface OverlayLifecycleResult {
   ok: boolean;
@@ -109,8 +128,33 @@ interface OverlayLifecycleResult {
     blurClosed: boolean;
     escapeClosed: boolean;
     escapeFocus: string;
+    keyboardAutoFocused: boolean;
+    keyboardActiveRoot: string | null;
+    keyboardOpened: boolean;
+    keyboardTriggerFocused: boolean;
+    mouseOpenFocus: string;
     outsidePointerClosed: boolean;
     switchClosed: boolean;
+    tabEnteredContent: boolean;
+    tabKeptOpen: boolean;
+  };
+  titlebarControls?: {
+    clearFocusedInput: boolean;
+    clearPointerTarget: string | null;
+    clearSynchronous: boolean;
+    filterCompositeRoles: number;
+    filterControls: string | null;
+    filterSurfaceRole: string | null;
+    inputPointerGlow: string | null;
+    layoutCompositeRoles: number;
+    layoutControls: string | null;
+    layoutSelectedStates: Array<string | null>;
+    layoutSurfaceRole: string | null;
+    searchValueAfterInput: string;
+    sortCompositeRoles: number;
+    sortControls: string | null;
+    sortSelectedStates: Array<string | null>;
+    sortSurfaceRole: string | null;
   };
 }
 
@@ -153,6 +197,29 @@ async function settle(milliseconds = 0): Promise<void> {
     await Promise.resolve();
   });
 }
+
+let nativeInputRequestId = 0;
+
+async function requestNativeInput(request: NativeInputPayload): Promise<void> {
+  const id = ++nativeInputRequestId;
+  window.__overlayLifecycleInputRequest = { ...request, id } as NativeInputRequest;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    if (window.__overlayLifecycleInputResponseId === id) return;
+    await delay(10);
+  }
+  throw new Error(`Timed out waiting for native input response ${id}`);
+}
+
+const requestNativeKey = (keyCode: string) => requestNativeInput({ type: "key", keyCode });
+
+const requestNativePointer = (type: "mouse-click" | "mouse-move", element: HTMLElement) => {
+  const bounds = element.getBoundingClientRect();
+  return requestNativeInput({
+    type,
+    x: Math.round(bounds.left + bounds.width / 2),
+    y: Math.round(bounds.top + bounds.height / 2)
+  });
+};
 
 async function mountScenario(element: ReactElement): Promise<MountedScenario> {
   const container = document.createElement("div");
@@ -1068,17 +1135,29 @@ const emptyNotificationModel: CompactNotificationModel = {
 
 function NotificationRootLifecycleScenario({ control }: { control: ScenarioControl }) {
   const [anchor, setAnchor] = useState<HTMLButtonElement | null>(null);
+  const autoFocusRef = useRef(false);
   const overlays = useOverlayStack();
   control.api = overlays;
   control.openRoot = () => overlays.openRoot("notifications");
 
   return (
     <>
-      <button id="notification-root-trigger" ref={setAnchor}>Notifications</button>
+      <button id="notification-root-before">Before</button>
+      <button
+        id="notification-root-trigger"
+        onClick={(event) => {
+          autoFocusRef.current = event.detail === 0;
+          overlays.openRoot("notifications");
+        }}
+        ref={setAnchor}
+      >
+        Notifications
+      </button>
       <button id="notification-root-outside">Outside</button>
       {overlays.isRootOpen("notifications") && anchor ? (
         <NotificationPopover
           anchor={anchor}
+          autoFocus={autoFocusRef.current}
           model={emptyNotificationModel}
           onOpenCenter={() => undefined}
         />
@@ -1094,15 +1173,19 @@ async function runNotificationRootLifecycleScenario() {
       <NotificationRootLifecycleScenario control={control} />
     </OverlayProvider>
   );
+  const before = await waitForSelector("#notification-root-before");
   const trigger = await waitForSelector("#notification-root-trigger");
   const outside = await waitForSelector("#notification-root-outside");
-  if (!(trigger instanceof HTMLButtonElement) || !(outside instanceof HTMLButtonElement)) {
+  if (
+    !(before instanceof HTMLButtonElement) ||
+    !(trigger instanceof HTMLButtonElement) ||
+    !(outside instanceof HTMLButtonElement)
+  ) {
     throw new Error("notification lifecycle controls must be buttons");
   }
 
-  const openNotification = async () => {
-    trigger.focus();
-    await act(async () => control.openRoot?.());
+  const openNotificationByMouse = async () => {
+    await requestNativePointer("mouse-click", trigger);
     await waitForSelector('[data-compact-popover-root="notifications"]');
     await settle(30);
   };
@@ -1111,41 +1194,46 @@ async function runNotificationRootLifecycleScenario() {
     await settle(20);
   };
 
-  await openNotification();
-  document.querySelector<HTMLButtonElement>(".notification-open-center")?.focus();
-  await act(async () => {
-    document.dispatchEvent(new KeyboardEvent("keydown", {
-      bubbles: true,
-      cancelable: true,
-      key: "Escape"
-    }));
-  });
+  await openNotificationByMouse();
+  const mouseOpenFocus = (document.activeElement as HTMLElement | null)?.id ?? "";
+  await requestNativeKey("Tab");
   await settle(20);
+  const tabEnteredContent = document.activeElement?.classList.contains("notification-open-center") ?? false;
+  const tabKeptOpen = document.querySelector('[data-compact-popover-root="notifications"]') !== null;
+  await resetNotification();
+
+  before.focus();
+  await requestNativeKey("Tab");
+  const keyboardTriggerFocused = document.activeElement === trigger;
+  await requestNativeKey("Space");
+  await settle(30);
+  const keyboardOpened =
+    document.querySelector('[data-compact-popover-root="notifications"]') !== null;
+  const keyboardActiveRoot = control.api?.activeRootId ?? null;
+  const keyboardAutoFocused =
+    document.activeElement?.classList.contains("notification-open-center") ?? false;
+  if (keyboardOpened) {
+    await requestNativeKey("Escape");
+    await settle(20);
+  }
   const escapeClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
   const escapeFocus = (document.activeElement as HTMLElement | null)?.id ?? "";
   await resetNotification();
 
-  await openNotification();
-  await act(async () => {
-    outside.dispatchEvent(new PointerEvent("pointerdown", {
-      bubbles: true,
-      cancelable: true,
-      pointerId: 2,
-      pointerType: "mouse"
-    }));
-  });
+  await openNotificationByMouse();
+  await requestNativePointer("mouse-click", outside);
   await settle(20);
   const outsidePointerClosed =
     document.querySelector('[data-compact-popover-root="notifications"]') === null;
   await resetNotification();
 
-  await openNotification();
+  await openNotificationByMouse();
   await act(async () => window.dispatchEvent(new Event("blur")));
   await settle(20);
   const blurClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
   await resetNotification();
 
-  await openNotification();
+  await openNotificationByMouse();
   await act(async () => control.api?.openRoot("filter"));
   await settle(20);
   const switchClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
@@ -1156,8 +1244,155 @@ async function runNotificationRootLifecycleScenario() {
     blurClosed,
     escapeClosed,
     escapeFocus,
+    keyboardAutoFocused,
+    keyboardActiveRoot,
+    keyboardOpened,
+    keyboardTriggerFocused,
+    mouseOpenFocus,
     outsidePointerClosed,
-    switchClosed
+    switchClosed,
+    tabEnteredContent,
+    tabKeptOpen
+  };
+  await unmountScenario(mounted);
+  return result;
+}
+
+function TitlebarControlsScenario() {
+  const overlays = useOverlayStack();
+  const [kind, setKind] = useState<"image" | "video" | "other" | undefined>();
+  const [rating, setRating] = useState<1 | 2 | 3 | 4 | 5 | undefined>();
+  const [favorite, setFavorite] = useState<boolean | undefined>();
+  const [sort, setSort] = useState<SortOption>("mtime_desc");
+  const [layout, setLayout] = useState<LibraryLayoutMode>("adaptive");
+  const [query, setQuery] = useState("");
+  const setRootOpen = (rootId: "filter" | "sort" | "layout", open: boolean) => {
+    if (open) overlays.openRoot(rootId);
+    else overlays.closeRoot(rootId);
+  };
+
+  return (
+    <LiquidGlassLayer>
+      <div
+        id="titlebar-controls-fixture"
+        style={{ alignItems: "flex-start", display: "flex", gap: 8 }}
+      >
+        <FilterMenu
+          favorite={favorite}
+          kind={kind}
+          minRating={rating}
+          onClear={() => {
+            setKind(undefined);
+            setRating(undefined);
+            setFavorite(undefined);
+          }}
+          onOpenChange={(open) => setRootOpen("filter", open)}
+          onSetKind={setKind}
+          onSetMinRating={setRating}
+          onToggleFavorite={() => setFavorite((current) => current === true ? undefined : true)}
+          onToggleTag={() => undefined}
+          open={overlays.isRootOpen("filter")}
+          tagIds={[]}
+          tags={[]}
+        />
+        <SortMenu
+          onChange={setSort}
+          onOpenChange={(open) => setRootOpen("sort", open)}
+          open={overlays.isRootOpen("sort")}
+          value={sort}
+        />
+        <LayoutMenu
+          onChange={setLayout}
+          onOpenChange={(open) => setRootOpen("layout", open)}
+          open={overlays.isRootOpen("layout")}
+          value={layout}
+        />
+        <SearchBar onChange={setQuery} value={query} />
+        <output id="titlebar-search-value">{query}</output>
+      </div>
+    </LiquidGlassLayer>
+  );
+}
+
+const COMPOSITE_ROLE_SELECTOR = '[role="menu"], [role="listbox"]';
+
+function compositeRoleCount(surface: HTMLElement) {
+  return Number(surface.matches(COMPOSITE_ROLE_SELECTOR)) +
+    surface.querySelectorAll(COMPOSITE_ROLE_SELECTOR).length;
+}
+
+async function runTitlebarControlsScenario() {
+  const mounted = await mountScenario(
+    <OverlayProvider>
+      <TitlebarControlsScenario />
+    </OverlayProvider>
+  );
+
+  const filterTrigger = await waitForSelector('[data-titlebar-control="library-filter"]');
+  await requestNativePointer("mouse-click", filterTrigger);
+  const filterSurface = await waitForOpenSurface("filter-root");
+  const filterCompositeRoles = compositeRoleCount(filterSurface);
+  const filterSurfaceRole = filterSurface.getAttribute("role");
+  const filterControls = filterTrigger.getAttribute("aria-controls");
+
+  const sortTrigger = await waitForSelector('[data-titlebar-control="library-sort"]');
+  await requestNativePointer("mouse-click", sortTrigger);
+  const sortSurface = await waitForOpenSurface("sort-root");
+  const sortCompositeRoles = compositeRoleCount(sortSurface);
+  const sortSurfaceRole = sortSurface.getAttribute("role");
+  const sortControls = sortTrigger.getAttribute("aria-controls");
+  const sortSelectedStates = Array.from(sortSurface.querySelectorAll('[role="option"]'))
+    .map((item) => item.getAttribute("aria-selected"));
+
+  const layoutTrigger = await waitForSelector('[data-titlebar-control="library-layout"]');
+  await requestNativePointer("mouse-click", layoutTrigger);
+  const layoutSurface = await waitForOpenSurface("layout-root");
+  const layoutCompositeRoles = compositeRoleCount(layoutSurface);
+  const layoutSurfaceRole = layoutSurface.getAttribute("role");
+  const layoutControls = layoutTrigger.getAttribute("aria-controls");
+  const layoutSelectedStates = Array.from(layoutSurface.querySelectorAll('[role="option"]'))
+    .map((item) => item.getAttribute("aria-selected"));
+
+  const searchInput = await waitForSelector('input[aria-label="Search library"]');
+  if (!(searchInput instanceof HTMLInputElement)) {
+    throw new Error("titlebar search control must be an input");
+  }
+  const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  if (!valueSetter) throw new Error("native input value setter is unavailable");
+  await act(async () => {
+    valueSetter.call(searchInput, "needle");
+    searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const searchValueAfterInput = document.querySelector("#titlebar-search-value")?.textContent ?? "";
+  const clearButton = await waitForSelector('.search-bar-clear');
+  await requestNativePointer("mouse-move", clearButton);
+  await settle(30);
+  const clearPointerTarget = clearButton.getAttribute("data-interactive-pointer-target");
+  const inputPointerGlow = searchInput.getAttribute("data-pointer-glow");
+  await requestNativePointer("mouse-click", clearButton);
+  await settle(20);
+  const clearSynchronous =
+    searchInput.value === "" &&
+    document.querySelector("#titlebar-search-value")?.textContent === "";
+  const clearFocusedInput = document.activeElement === searchInput;
+
+  const result = {
+    clearFocusedInput,
+    clearPointerTarget,
+    clearSynchronous,
+    filterCompositeRoles,
+    filterControls,
+    filterSurfaceRole,
+    inputPointerGlow,
+    layoutCompositeRoles,
+    layoutControls,
+    layoutSelectedStates,
+    layoutSurfaceRole,
+    searchValueAfterInput,
+    sortCompositeRoles,
+    sortControls,
+    sortSelectedStates,
+    sortSurfaceRole
   };
   await unmountScenario(mounted);
   return result;
@@ -1182,7 +1417,8 @@ async function run(): Promise<void> {
       portalDescendantAutofocus: await runPortalDescendantAutofocusScenarios(),
       scrollShell: await runScrollShellScenario(),
       dynamicMenu: await runDynamicMenuScenario(),
-      notificationRoot: await runNotificationRootLifecycleScenario()
+      notificationRoot: await runNotificationRootLifecycleScenario(),
+      titlebarControls: await runTitlebarControlsScenario()
     };
   } catch (error) {
     window.__overlayLifecycleResult = {

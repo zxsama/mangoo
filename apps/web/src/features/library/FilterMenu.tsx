@@ -60,6 +60,7 @@ export function FilterMenu({
       <LiquidGlassButton
         ref={buttonRef}
         active={open || hasFilters}
+        aria-controls="filter-root"
         aria-expanded={open}
         aria-haspopup="menu"
         aria-label="Filters"
@@ -84,6 +85,7 @@ export function FilterMenu({
         placement="bottom-start"
         preferredWidth={320}
         restoreFocusTarget={buttonRef.current}
+        role="group"
         rootId="filter"
       >
         <OverlayMenuList ariaLabel="Filters" className="filter-menu-content">

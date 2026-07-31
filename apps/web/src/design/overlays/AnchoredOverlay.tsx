@@ -36,7 +36,7 @@ export interface AnchoredOverlayProps {
   parentId?: string;
   placement?: OverlayPlacement;
   preferredWidth?: number;
-  role?: "menu" | "listbox" | "dialog" | "status";
+  role?: "menu" | "listbox" | "dialog" | "group" | "status";
   restoreFocusTarget?: HTMLElement | null;
   rootId: OverlayRootId;
   surfaceRole?: "popover" | "nested";

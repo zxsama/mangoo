@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import {
   useLayoutEffect,
+  useRef,
   useState,
   type CSSProperties,
   type ReactNode
@@ -35,8 +36,22 @@ import {
   resultOperationPresentation
 } from "./notificationPopoverPresentation";
 
+const NOTIFICATION_FOCUSABLE_SELECTOR = [
+  "button:not(:disabled)",
+  "[href]",
+  "input:not(:disabled)",
+  "select:not(:disabled)",
+  "textarea:not(:disabled)",
+  '[tabindex]:not([tabindex="-1"])'
+].join(",");
+
+function focusFirstNotificationControl(surface: HTMLElement) {
+  surface.querySelector<HTMLElement>(NOTIFICATION_FOCUSABLE_SELECTOR)?.focus();
+}
+
 interface NotificationPopoverProps {
   anchor: HTMLElement;
+  autoFocus?: boolean;
   model: CompactNotificationModel;
   onDismiss?: () => void;
   onOpenCenter: (intent?: NotificationWindowIntent) => void;
@@ -44,11 +59,13 @@ interface NotificationPopoverProps {
 
 export function NotificationPopover({
   anchor,
+  autoFocus = false,
   model,
   onDismiss,
   onOpenCenter
 }: NotificationPopoverProps) {
   const [popoverElement, setPopoverElement] = useState<HTMLElement | null>(null);
+  const autoFocusCompletedRef = useRef(false);
   const { registerLayer } = useOverlayStack();
   const position = useNotificationPopoverPosition(anchor, popoverElement);
   const hasContent =
@@ -56,7 +73,7 @@ export function NotificationPopover({
 
   useLayoutEffect(() => {
     if (!popoverElement) return;
-    return registerLayer({
+    const unregister = registerLayer({
       id: "notifications-root",
       rootId: "notifications",
       kind: "root",
@@ -69,7 +86,28 @@ export function NotificationPopover({
       restoreFocus: true,
       onDismiss: onDismiss ?? (() => undefined)
     });
+    const handleAnchorKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab" || event.shiftKey || event.defaultPrevented) return;
+      event.preventDefault();
+      focusFirstNotificationControl(popoverElement);
+    };
+    anchor.addEventListener("keydown", handleAnchorKeyDown);
+
+    return () => {
+      anchor.removeEventListener("keydown", handleAnchorKeyDown);
+      unregister();
+    };
   }, [anchor, onDismiss, popoverElement, registerLayer]);
+
+  useLayoutEffect(() => {
+    if (!autoFocus) {
+      autoFocusCompletedRef.current = false;
+      return;
+    }
+    if (!popoverElement || !position || autoFocusCompletedRef.current) return;
+    autoFocusCompletedRef.current = true;
+    focusFirstNotificationControl(popoverElement);
+  }, [autoFocus, popoverElement, position]);
 
   return createPortal(
     <LiquidGlassSurface

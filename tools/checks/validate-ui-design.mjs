@@ -49,6 +49,7 @@ const liquidGlassIndex = read("apps/web/src/design/liquid-glass/index.ts");
 const sortMenu = read("apps/web/src/features/library/SortMenu.tsx");
 const layoutMenu = read("apps/web/src/features/library/LayoutMenu.tsx");
 const searchBar = read("apps/web/src/features/library/SearchBar.tsx");
+const overlayField = read("apps/web/src/design/overlays/OverlayField.tsx");
 const overlayStyles = read("apps/web/src/design/overlays/overlay.css");
 const inspectorMetadata = read("apps/web/src/features/preview/InspectorMetadata.tsx");
 const renameDialog = read("apps/web/src/features/file-ops/RenameDialog.tsx");
@@ -487,19 +488,34 @@ if (
 
 for (const [source, value, message] of [
   [searchBar, "OverlayField", "titlebar search must use the shared OverlayField primitive"],
-  [searchBar, 'data-pointer-glow="off"', "titlebar search must opt out of the shared pointer glow"],
+  [overlayField, 'className="overlay-field-control"', "shared OverlayField must render its control container"],
+  [overlayField, "overlay-field-input", "shared OverlayField must render its input contract"],
+  [overlayField, 'data-pointer-glow="off"', "shared OverlayField input must opt out of pointer glow"],
+  [overlayField, "trailingAction", "shared OverlayField must render trailing actions outside the input opt-out"],
   [searchBar, 'onChange("")', "titlebar search clear action must synchronously clear the query"],
   [searchBar, "inputRef.current?.focus()", "titlebar search clear action must synchronously restore input focus"],
   [windowChrome, "data-titlebar-control", "window chrome buttons must participate in the shared titlebar pointer plane"],
-  [liquidGlassSurface, "outlineOnly", "liquid glass surface must expose an outline-only mode for the titlebar search rule"],
+  [liquidGlassSurface, "outlineOnly", "liquid glass surface must retain its outline-only material capability"],
   [liquidGlassSurface, "interactiveBackground", "liquid glass surface must support disabling local interactive background halo"],
-  [stylesForChecks, '[data-glass-outline-only="true"]', "styles must define the outline-only search-field surface contract"],
-  [stylesForChecks, '.search-bar[data-titlebar-search="true"]::after', "titlebar search must keep exactly one outer outline rule"],
-  [stylesForChecks, '.search-bar[data-titlebar-search="true"] > .liquid-glass-backdrop', "titlebar search must suppress the inner glass backdrop/lens layers"],
-  [stylesForChecks, ".search-bar-input:focus-visible", "titlebar search must suppress the inner input focus ring in CSS"]
+  [stylesForChecks, '[data-glass-outline-only="true"]', "styles must retain the outline-only material capability"]
 ]) {
   if (!source.includes(value)) {
     fail(message);
+  }
+}
+
+if (searchBar.includes('data-pointer-glow="off"')) {
+  fail("titlebar search wrapper and clear action must not opt out of the shared pointer glow");
+}
+if (liquidGlassSurface.includes("candidate.closest('[data-titlebar-search=\"true\"]')")) {
+  fail("interactive affordance discovery must not exclude the entire titlebar search subtree");
+}
+for (const selector of [
+  ".search-bar-clear:hover",
+  '.search-bar[data-titlebar-search="true"]:hover'
+]) {
+  if (stylesForChecks.includes(selector)) {
+    fail(`titlebar search must not define a feature-local hover treatment: ${selector}`);
   }
 }
 
@@ -1499,6 +1515,9 @@ for (const [label, source, rootId, overlayId, preferredWidth] of [
   if (/createPortal|LiquidGlassSurface/.test(source)) {
     fail(`${label} must not retain feature-local portal or popup surface code`);
   }
+  if (!source.includes(`aria-controls="${overlayId}"`) || !source.includes('role="group"')) {
+    fail(`${label} trigger and surface must expose one labelled composite relationship`);
+  }
 }
 if (!filterMenu?.includes('role="menuitemcheckbox"') || !filterMenu.includes("aria-checked")) {
   fail("filter menu checkbox items must expose menuitemcheckbox and aria-checked");
@@ -1544,6 +1563,9 @@ for (const value of [
   ".sort-menu-options",
   ".layout-menu-options",
   '.search-bar[data-titlebar-search="true"]',
+  ".search-bar .overlay-field-control",
+  ".search-bar .overlay-field-input",
+  ".search-bar .search-bar-clear",
   "--radius-control",
   "--radius-tight",
   "--glass-center-fill",

@@ -110,6 +110,7 @@ export function App() {
   const notifications = useNotifications();
   const notificationModel = notifications.compact;
   const [notificationAnchor, setNotificationAnchor] = useState<HTMLButtonElement | null>(null);
+  const notificationAutoFocusRef = useRef(false);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewDisplayedMediaId, setPreviewDisplayedMediaId] = useState<number | null>(null);
   const previewNavigationLockedRef = useRef(false);
@@ -501,7 +502,8 @@ export function App() {
     [setRootOpen]
   );
 
-  const onToggleNotifications = useCallback(() => {
+  const onToggleNotifications = useCallback((autoFocus: boolean) => {
+    notificationAutoFocusRef.current = !notificationsOpen && autoFocus;
     setRootOpen("notifications", !notificationsOpen);
   }, [notificationsOpen, setRootOpen]);
 
@@ -813,6 +815,7 @@ export function App() {
           fileOps={fileOps}
           library={library}
           notificationAnchor={notificationAnchor}
+          notificationAutoFocus={notificationAutoFocusRef.current}
           notificationModel={notificationModel}
           notificationsOpen={notificationsOpen}
           onCloseContextMenu={closeMenu}

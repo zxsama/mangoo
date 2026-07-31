@@ -337,7 +337,7 @@ export function OverlayMenuItem({
       aria-checked={checked}
       aria-disabled={ariaDisabled}
       aria-haspopup={submenu ? "menu" : props["aria-haspopup"]}
-      aria-selected={selected || undefined}
+      aria-selected={resolvedRole === "option" ? selected : props["aria-selected"]}
       className={`overlay-menu-item${className ? ` ${className}` : ""}`}
       data-danger={danger || undefined}
       data-interactive-pointer-target={!isDisabled ? "true" : undefined}

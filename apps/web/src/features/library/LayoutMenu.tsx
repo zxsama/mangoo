@@ -59,6 +59,7 @@ export function LayoutMenu({
       <LiquidGlassButton
         ref={buttonRef}
         active={open}
+        aria-controls="layout-root"
         aria-expanded={open}
         aria-haspopup="listbox"
         aria-label={`Layout: ${selectedLabel}`}
@@ -85,7 +86,7 @@ export function LayoutMenu({
         placement="bottom-start"
         preferredWidth={180}
         restoreFocusTarget={buttonRef.current}
-        role="listbox"
+        role="group"
         rootId="layout"
       >
         <OverlayMenuList

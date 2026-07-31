@@ -12,6 +12,8 @@ describe("titlebar overlay migration", () => {
   const sort = read("src/features/library/SortMenu.tsx");
   const layout = read("src/features/library/LayoutMenu.tsx");
   const search = read("src/features/library/SearchBar.tsx");
+  const overlayField = read("src/design/overlays/OverlayField.tsx");
+  const styles = read("src/styles.css");
   const webValidator = readRepo("tools/checks/validate-web-client.mjs");
   const uiValidator = readRepo("tools/checks/validate-ui-design.mjs");
 
@@ -26,16 +28,20 @@ describe("titlebar overlay migration", () => {
     for (const source of [filter, sort, layout]) assert.doesNotMatch(source, /createPortal/);
   });
 
-  it("keeps search inline and pointer-glow-free", () => {
+  it("keeps only the search input pointer-glow-free", () => {
     assert.match(search, /OverlayField/);
-    assert.match(search, /data-pointer-glow="off"/);
+    assert.doesNotMatch(search, /data-pointer-glow="off"/);
+    assert.match(overlayField, /data-pointer-glow="off"/);
     assert.doesNotMatch(search, /AnchoredOverlay|createPortal/);
+    assert.doesNotMatch(styles, /\.search-bar-clear:hover/);
+    assert.doesNotMatch(styles, /\.search-bar\[data-titlebar-search="true"\]:hover/);
   });
 
   it("keeps validators aligned with the shared titlebar overlay contract", () => {
     assert.match(webValidator, /for \(const rootId of \["notifications", "filter", "sort", "layout"\]\)/);
     assert.match(webValidator, /CompactPopover/);
     assert.match(uiValidator, /const layoutMenu = read\("apps\/web\/src\/features\/library\/LayoutMenu\.tsx"\)/);
+    assert.match(uiValidator, /const overlayField = read\("apps\/web\/src\/design\/overlays\/OverlayField\.tsx"\)/);
     assert.match(uiValidator, /const overlayStyles = read\("apps\/web\/src\/design\/overlays\/overlay\.css"\)/);
     for (const value of ["AnchoredOverlay", "OverlayMenuList", "OverlayMenuItem", "OverlayField"]) {
       assert.match(uiValidator, new RegExp(value));
@@ -43,5 +49,7 @@ describe("titlebar overlay migration", () => {
     assert.match(uiValidator, /data-pointer-glow/);
     assert.doesNotMatch(webValidator, /shared compact-popover state/);
     assert.doesNotMatch(uiValidator, /compact popover coordination contract/);
+    assert.doesNotMatch(uiValidator, /titlebar search must keep exactly one outer outline rule/);
+    assert.doesNotMatch(uiValidator, /titlebar search must suppress the inner glass backdrop/);
   });
 });

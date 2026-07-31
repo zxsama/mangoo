@@ -87,8 +87,33 @@ interface OverlayLifecycleResult {
     blurClosed: boolean;
     escapeClosed: boolean;
     escapeFocus: string;
+    keyboardAutoFocused: boolean;
+    keyboardActiveRoot: string | null;
+    keyboardOpened: boolean;
+    keyboardTriggerFocused: boolean;
+    mouseOpenFocus: string;
     outsidePointerClosed: boolean;
     switchClosed: boolean;
+    tabEnteredContent: boolean;
+    tabKeptOpen: boolean;
+  };
+  titlebarControls: {
+    clearFocusedInput: boolean;
+    clearPointerTarget: string | null;
+    clearSynchronous: boolean;
+    filterCompositeRoles: number;
+    filterControls: string | null;
+    filterSurfaceRole: string | null;
+    inputPointerGlow: string | null;
+    layoutCompositeRoles: number;
+    layoutControls: string | null;
+    layoutSelectedStates: Array<string | null>;
+    layoutSurfaceRole: string | null;
+    searchValueAfterInput: string;
+    sortCompositeRoles: number;
+    sortControls: string | null;
+    sortSelectedStates: Array<string | null>;
+    sortSurfaceRole: string | null;
   };
 }
 
@@ -280,8 +305,36 @@ describe("mounted overlay lifecycle", () => {
       blurClosed: true,
       escapeClosed: true,
       escapeFocus: "notification-root-trigger",
+      keyboardAutoFocused: true,
+      keyboardActiveRoot: "notifications",
+      keyboardOpened: true,
+      keyboardTriggerFocused: true,
+      mouseOpenFocus: "notification-root-trigger",
       outsidePointerClosed: true,
-      switchClosed: true
+      switchClosed: true,
+      tabEnteredContent: true,
+      tabKeptOpen: true
+    });
+  });
+
+  it("mounts titlebar controls with one composite role and synchronous search behavior", () => {
+    assert.deepEqual(result.titlebarControls, {
+      clearFocusedInput: true,
+      clearPointerTarget: "true",
+      clearSynchronous: true,
+      filterCompositeRoles: 1,
+      filterControls: "filter-root",
+      filterSurfaceRole: "group",
+      inputPointerGlow: "off",
+      layoutCompositeRoles: 1,
+      layoutControls: "layout-root",
+      layoutSelectedStates: ["true", "false", "false", "false"],
+      layoutSurfaceRole: "group",
+      searchValueAfterInput: "needle",
+      sortCompositeRoles: 1,
+      sortControls: "sort-root",
+      sortSelectedStates: ["true", "false", "false", "false", "false", "false"],
+      sortSurfaceRole: "group"
     });
   });
 });

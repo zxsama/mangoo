@@ -25,6 +25,7 @@ interface ShellOverlayHostProps {
   fileOps: FileOpsController;
   library: LibraryState;
   notificationAnchor: HTMLElement | null;
+  notificationAutoFocus: boolean;
   notificationModel: CompactNotificationModel;
   notificationsOpen: boolean;
   onCloseContextMenu: () => void;
@@ -36,6 +37,7 @@ export function ShellOverlayHost({
   fileOps,
   library,
   notificationAnchor,
+  notificationAutoFocus,
   notificationModel,
   notificationsOpen,
   onCloseContextMenu,
@@ -50,6 +52,7 @@ export function ShellOverlayHost({
       {notificationsOpen && notificationAnchor ? (
         <NotificationPopover
           anchor={notificationAnchor}
+          autoFocus={notificationAutoFocus}
           model={notificationModel}
           onOpenCenter={onOpenNotificationCenter}
         />
