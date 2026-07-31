@@ -34,6 +34,12 @@ import type {
 
 const OverlayStackContext = createContext<OverlayStackApi | null>(null);
 
+interface OverlayFamilyFocusApi {
+  isFocusOwnedByLayerAbove: (ownerSurface: HTMLElement, target: Node | null) => boolean;
+}
+
+const OverlayFamilyFocusContext = createContext<OverlayFamilyFocusApi | null>(null);
+
 function targetBelongsToLayer(layer: OverlayLayerRegistration, target: EventTarget | null): boolean {
   if (!(target instanceof Node)) return false;
   return Boolean(layer.surface?.contains(target) || layer.trigger?.contains(target));
@@ -205,10 +211,27 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     dismissTop
   }), [closeRoot, dismissTop, openRoot, registerLayer, state.activeRootId]);
 
+  const familyFocusApi = useMemo<OverlayFamilyFocusApi>(() => ({
+    isFocusOwnedByLayerAbove: (ownerSurface, target) => {
+      if (target === null) return false;
+      const current = stateRef.current;
+      const ownerIndex = current.layers.findIndex(
+        (layer) => layer.surface === ownerSurface
+      );
+      if (ownerIndex < 0) return false;
+      const owner = current.layers[ownerIndex];
+      return current.layers.slice(ownerIndex + 1).some((layer) => (
+        layer.rootId === owner.rootId && Boolean(layer.surface?.contains(target))
+      ));
+    }
+  }), []);
+
   return (
-    <OverlayStackContext.Provider value={api}>
-      {children}
-    </OverlayStackContext.Provider>
+    <OverlayFamilyFocusContext.Provider value={familyFocusApi}>
+      <OverlayStackContext.Provider value={api}>
+        {children}
+      </OverlayStackContext.Provider>
+    </OverlayFamilyFocusContext.Provider>
   );
 }
 
@@ -216,6 +239,14 @@ export function useOverlayStack(): OverlayStackApi {
   const value = useContext(OverlayStackContext);
   if (!value) {
     throw new Error("useOverlayStack must be used within OverlayProvider");
+  }
+  return value;
+}
+
+export function useOverlayFamilyFocus(): OverlayFamilyFocusApi {
+  const value = useContext(OverlayFamilyFocusContext);
+  if (!value) {
+    throw new Error("useOverlayFamilyFocus must be used within OverlayProvider");
   }
   return value;
 }

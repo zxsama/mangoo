@@ -8,7 +8,7 @@ import {
   type KeyboardEvent,
   type ReactNode
 } from "react";
-import { useOverlayStack } from "./OverlayProvider";
+import { useOverlayFamilyFocus, useOverlayStack } from "./OverlayProvider";
 import {
   findOverlayMenuTypeaheadMatch,
   overlayMenuTabIndexes,
@@ -102,6 +102,7 @@ export function OverlayMenuList({
   const typeaheadRef = useRef("");
   const typeaheadTimerRef = useRef<number | null>(null);
   const { dismissTop } = useOverlayStack();
+  const { isFocusOwnedByLayerAbove } = useOverlayFamilyFocus();
 
   const activateRovingItem = (
     container: HTMLElement,
@@ -140,11 +141,12 @@ export function OverlayMenuList({
     );
     const meaningfulSurfaceFocusExists = () => {
       const activeElement = document.activeElement;
-      return surface !== null &&
-        activeElement instanceof HTMLElement &&
+      if (surface === null || !(activeElement instanceof HTMLElement)) return false;
+      return (
         surface.contains(activeElement) &&
         activeElement !== surface &&
-        activeElement !== container;
+        activeElement !== container
+      ) || isFocusOwnedByLayerAbove(surface, activeElement);
     };
     const scheduleAutoFocus = () => {
       if (!autoFocusPending || !surfaceCanReceiveFocus()) return;
@@ -211,7 +213,7 @@ export function OverlayMenuList({
       itemObserver.disconnect();
       surfaceObserver?.disconnect();
     };
-  }, [autoFocus]);
+  }, [autoFocus, isFocusOwnedByLayerAbove]);
 
   useEffect(() => () => {
     if (typeaheadTimerRef.current !== null) {

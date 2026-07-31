@@ -80,6 +80,12 @@ interface OverlayLifecycleResult {
     triggerFocusedDuringClose: boolean;
     userFocusPreserved: boolean;
   };
+  portalDescendantAutofocus?: {
+    modalFocusPreserved: boolean;
+    modalFocusedBefore: boolean;
+    nestedFocusPreserved: boolean;
+    nestedFocusedBefore: boolean;
+  };
   scrollShell?: {
     anchorMeasuresAfterScroll: number;
     anchorMeasuresBeforeScroll: number;
@@ -783,6 +789,126 @@ async function runDeferredAutofocusScenarios() {
   };
 }
 
+function PortalDescendantAutofocusScenario({ control, descendantKind }: {
+  control: ScenarioControl;
+  descendantKind: "modal" | "nested";
+}) {
+  const [rootAnchor, setRootAnchor] = useState<HTMLButtonElement | null>(null);
+  const [nestedAnchor, setNestedAnchor] = useState<HTMLButtonElement | null>(null);
+  const modalInitialFocusRef = useRef<HTMLButtonElement>(null);
+  const modalRestoreFocusRef = useRef<HTMLButtonElement>(null);
+  const [parentItemsVisible, setParentItemsVisible] = useState(false);
+  const [rootOpen, setRootOpen] = useState(false);
+  const [nestedOpen, setNestedOpen] = useState(false);
+  const [modalOpen, setModalOpen] = useState(false);
+  control.addItems = () => setParentItemsVisible(true);
+  control.openModal = () => setModalOpen(true);
+  control.openNested = () => setNestedOpen(true);
+  control.openRoot = () => setRootOpen(true);
+
+  return (
+    <OverlayProvider>
+      <StackCapture control={control} />
+      <button id="portal-descendant-root-trigger" ref={setRootAnchor}>Root</button>
+      <AnchoredOverlay
+        anchor={rootAnchor}
+        ariaLabel="Portal descendant root"
+        id="portal-descendant-root"
+        onDismiss={() => setRootOpen(false)}
+        open={rootOpen}
+        rootId="library"
+      >
+        <OverlayMenuList ariaLabel="Deferred parent choices" style={{ minHeight: 24 }}>
+          {parentItemsVisible ? (
+            <OverlayMenuItem id="portal-descendant-parent-item">Parent item</OverlayMenuItem>
+          ) : null}
+        </OverlayMenuList>
+        {descendantKind === "nested" ? (
+          <>
+            <button id="portal-descendant-nested-trigger" ref={setNestedAnchor}>Nested</button>
+            <AnchoredOverlay
+              anchor={nestedAnchor}
+              ariaLabel="Portal descendant nested"
+              id="portal-descendant-nested"
+              onDismiss={() => setNestedOpen(false)}
+              open={nestedOpen}
+              parentId="portal-descendant-root"
+              rootId="library"
+              surfaceRole="nested"
+            >
+              <OverlayMenuList ariaLabel="Nested descendant choices">
+                <OverlayMenuItem id="portal-descendant-nested-item">
+                  Nested item
+                </OverlayMenuItem>
+              </OverlayMenuList>
+            </AnchoredOverlay>
+          </>
+        ) : (
+          <>
+            <button id="portal-descendant-modal-trigger" ref={modalRestoreFocusRef}>
+              Modal
+            </button>
+            <ModalSurface
+              ariaLabelledBy="portal-descendant-modal-title"
+              id="portal-descendant-modal"
+              initialFocusRef={modalInitialFocusRef}
+              onDismiss={() => setModalOpen(false)}
+              open={modalOpen}
+              restoreFocusRef={modalRestoreFocusRef}
+              rootId="library"
+            >
+              <h2 id="portal-descendant-modal-title">Modal descendant</h2>
+              <button id="portal-descendant-modal-item" ref={modalInitialFocusRef}>
+                Modal item
+              </button>
+            </ModalSurface>
+          </>
+        )}
+      </AnchoredOverlay>
+    </OverlayProvider>
+  );
+}
+
+async function runPortalDescendantAutofocusScenario(
+  descendantKind: "modal" | "nested"
+) {
+  const control: ScenarioControl = { api: null };
+  const mounted = await mountScenario(
+    <PortalDescendantAutofocusScenario
+      control={control}
+      descendantKind={descendantKind}
+    />
+  );
+  await act(async () => control.openRoot?.());
+  await waitForOpenSurface("portal-descendant-root");
+  await settle(30);
+  await act(async () => {
+    if (descendantKind === "nested") control.openNested?.();
+    else control.openModal?.();
+  });
+  const descendantItemId = descendantKind === "nested"
+    ? "portal-descendant-nested-item"
+    : "portal-descendant-modal-item";
+  const focusedBefore = await waitForFocus(descendantItemId);
+  await act(async () => control.addItems?.());
+  await waitForSelector("#portal-descendant-parent-item");
+  await settle(40);
+  const focusPreserved = document.activeElement?.id === descendantItemId;
+  await unmountScenario(mounted);
+  return { focusPreserved, focusedBefore };
+}
+
+async function runPortalDescendantAutofocusScenarios() {
+  const nested = await runPortalDescendantAutofocusScenario("nested");
+  const modal = await runPortalDescendantAutofocusScenario("modal");
+  return {
+    modalFocusPreserved: modal.focusPreserved,
+    modalFocusedBefore: modal.focusedBefore,
+    nestedFocusPreserved: nested.focusPreserved,
+    nestedFocusedBefore: nested.focusedBefore
+  };
+}
+
 function ScrollShellScenario({ metrics }: { metrics: { anchorMeasures: number } }) {
   const anchor = useRef({
     getBoundingClientRect: () => {
@@ -923,6 +1049,7 @@ async function run(): Promise<void> {
       controlledFamily: await runControlledFamilyScenario(),
       modalFamilyFocus: await runControlledModalFamilyScenario(),
       deferredAutofocus: await runDeferredAutofocusScenarios(),
+      portalDescendantAutofocus: await runPortalDescendantAutofocusScenarios(),
       scrollShell: await runScrollShellScenario(),
       dynamicMenu: await runDynamicMenuScenario()
     };

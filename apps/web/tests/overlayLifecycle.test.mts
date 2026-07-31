@@ -60,6 +60,12 @@ interface OverlayLifecycleResult {
     triggerFocusedDuringClose: boolean;
     userFocusPreserved: boolean;
   };
+  portalDescendantAutofocus: {
+    modalFocusPreserved: boolean;
+    modalFocusedBefore: boolean;
+    nestedFocusPreserved: boolean;
+    nestedFocusedBefore: boolean;
+  };
   scrollShell: {
     anchorMeasuresAfterScroll: number;
     anchorMeasuresBeforeScroll: number;
@@ -228,6 +234,15 @@ describe("mounted overlay lifecycle", () => {
       reopenItemFocused: true,
       triggerFocusedDuringClose: true,
       userFocusPreserved: true
+    });
+  });
+
+  it("preserves nested and modal portal focus when parent menu items arrive", () => {
+    assert.deepEqual(result.portalDescendantAutofocus, {
+      modalFocusPreserved: true,
+      modalFocusedBefore: true,
+      nestedFocusPreserved: true,
+      nestedFocusedBefore: true
     });
   });
 
