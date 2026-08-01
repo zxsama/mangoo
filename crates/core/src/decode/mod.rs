@@ -123,11 +123,15 @@ impl DecoderRegistry {
                     // Fall through to the next claiming decoder. Every failure
                     // text is preserved verbatim in the aggregate error so
                     // `classify_thumbnail_failure` still sees a transient
-                    // signature contributed by ANY link in the chain.
+                    // signature contributed by ANY link in the chain. Use the
+                    // alternate `{:#}` Display, which walks the whole `anyhow`
+                    // context chain — plain `{}` prints only the outermost
+                    // frame and would silently drop a leaf cause like
+                    // `os error 53` behind a decoder's `.context(...)` call.
                     if !report.is_empty() {
                         report.push_str("; ");
                     }
-                    let _ = write!(report, "{}: {error}", decoder.name());
+                    let _ = write!(report, "{}: {error:#}", decoder.name());
                 }
             }
         }
@@ -319,6 +323,32 @@ mod tests {
 
         assert_eq!(decoded.width, 1);
         assert_eq!(GOOD.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn aggregate_error_keeps_the_leaf_cause_behind_a_context_frame() {
+        static ONLY: AtomicUsize = AtomicUsize::new(0);
+        let registry = DecoderRegistry::new(vec![Box::new(FakeDecoder {
+            name: "ffmpeg",
+            claims: &[".heic"],
+            // Exactly the shape a real decoder produces: a readable outer message
+            // wrapping the OS error that carries the transient signature.
+            result: || {
+                Err(anyhow::anyhow!("找不到网络路径。 (os error 53)")
+                    .context("ffmpeg subprocess failed"))
+            },
+            calls: &ONLY,
+        })]);
+
+        let text = registry
+            .decode(&request(Path::new("a.heic"), ".heic"))
+            .expect_err("chain failed")
+            .to_string();
+
+        // Without the leaf, classify_thumbnail_failure would mark a retryable
+        // network drop as a permanent unsupported-format failure.
+        assert!(text.contains("ffmpeg subprocess failed"), "{text}");
+        assert!(text.contains("os error 53"), "{text}");
     }
 
     #[test]
