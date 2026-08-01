@@ -8,7 +8,9 @@
 //! next claiming decoder runs. That is what lets `image` lose on an exotic
 //! TIFF variant and ffmpeg still produce a picture.
 
+pub mod ffmpeg;
 pub mod image_crate;
+pub mod subprocess;
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -145,6 +147,30 @@ impl DecoderRegistry {
             request.ext
         ))
     }
+}
+
+impl DecoderRegistry {
+    /// Registered decoder names in chain order. Exposed so a test can assert
+    /// the capability-ascending ordering that the whole design depends on.
+    pub fn decoder_names(&self) -> Vec<&'static str> {
+        self.decoders.iter().map(|decoder| decoder.name()).collect()
+    }
+}
+
+/// The production chain, ordered capability-ascending: cheapest and most
+/// commonly correct first, so the JPEG/PNG majority never pays a subprocess.
+pub fn default_registry() -> DecoderRegistry {
+    DecoderRegistry::new(vec![
+        Box::new(image_crate::ImageCrateDecoder),
+        Box::new(ffmpeg::FfmpegDecoder),
+    ])
+}
+
+/// Process-wide chain. Construction is trivial, but the thumbnail worker asks
+/// for it once per task on a hot path, so build it once.
+pub fn shared_registry() -> &'static DecoderRegistry {
+    static REGISTRY: std::sync::OnceLock<DecoderRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(default_registry)
 }
 
 #[cfg(test)]

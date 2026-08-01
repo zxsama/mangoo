@@ -1,49 +1,18 @@
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use image::ImageReader;
 use sha2::{Digest, Sha256};
 
+pub use crate::decode::ffmpeg::ffmpeg_available;
+use crate::decode::subprocess::{wait_with_timeout, ChildWaitOutcome};
+
 /// Wall-clock cap for the ffmpeg subprocess used to extract a video poster.
 /// A malformed input or a stalled decoder must not pin the thumbnail worker.
 const FFMPEG_THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Polling cadence for [`wait_with_timeout`]. The helper is intentionally
-/// dependency-free so the worker doesn't pull in tokio/wait_timeout just to
-/// bound a single subprocess.
-const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Outcome of [`wait_with_timeout`]. The exit-status case is mapped onto
-/// `std::process::Output` by the ffmpeg path so the rest of the call site
-/// stays the same.
-enum ChildWaitOutcome {
-    Exited(std::process::ExitStatus),
-    TimedOut,
-}
-
-/// Polls `child.try_wait()` until it exits or `timeout` elapses. On timeout
-/// the child is killed and reaped so we don't leak a zombie. Stdout/stderr
-/// are *not* drained here — callers that piped them must read before the
-/// child exits to avoid deadlocking on a full pipe.
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<ChildWaitOutcome> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(ChildWaitOutcome::Exited(status));
-        }
-        if Instant::now() >= deadline {
-            // Best-effort kill + reap. If the child already exited between
-            // the try_wait above and the kill, both calls succeed cleanly.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(ChildWaitOutcome::TimedOut);
-        }
-        std::thread::sleep(CHILD_WAIT_POLL_INTERVAL);
-    }
-}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,16 +433,6 @@ fn bounded_dimensions(width: u32, height: u32, short_side_px: u32, max_side_px: 
         .max(1)
         .min(max_side_px.max(1));
     (target_width, target_height)
-}
-
-/// Detects whether `ffmpeg` is on PATH. Result is cached for the lifetime of
-/// the process so the worker only pays the spawn cost once.
-pub fn ffmpeg_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| match Command::new("ffmpeg").arg("-version").output() {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
