@@ -58,15 +58,14 @@ pub fn media_kind_for_path(path: &Path) -> Option<&'static str> {
     media_kind_for_extension(lowercase_extension(path).as_str())
 }
 
-/// Task 7's preview source resolver decides transcode-vs-serve-original with
-/// this; nothing outside tests reads it until then.
-#[allow(dead_code)]
+/// The preview source resolver (`api::routes::resolve_preview_plan`) decides
+/// transcode-vs-serve-original with this.
 pub fn is_browser_renderable_image(ext: &str) -> bool {
     BROWSER_RENDERABLE_IMAGE_EXTENSIONS.contains(&ext)
 }
 
-/// Task 7/10 keep multi-frame formats on `<img>` with this; nothing outside
-/// tests reads it until then.
+/// Task 10 keeps multi-frame formats on `<img>` with this; the web canvas lane
+/// mirrors the same set in TypeScript. No Rust caller outside tests yet.
 #[allow(dead_code)]
 pub fn is_animated_capable_image(ext: &str) -> bool {
     ANIMATION_CAPABLE_IMAGE_EXTENSIONS.contains(&ext)

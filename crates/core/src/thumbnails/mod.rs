@@ -41,41 +41,29 @@ pub const GENERATED_FORMAT: &str = "image/webp";
 /// `fit-long-edge`, and because it bounds decoded memory unconditionally: a
 /// longest-side-2048 tier is at most 2048*2048*4 = 17 MB no matter the aspect
 /// ratio, while a short-side-2048 tier on a 6:1 panorama is 100 MB.
-// No production caller until Task 7 wires the preview route.
-#[allow(dead_code)]
 pub const PREVIEW_2048_PROFILE: &str = "preview_2048";
-#[allow(dead_code)]
 pub const PREVIEW_3072_PROFILE: &str = "preview_3072";
 /// Cache profile for a browser-UNRENDERABLE image small enough that no tier
 /// applies (PSD/HEIC/TIFF under the threshold): the goal is format conversion,
 /// not shrinking, so this is "native resolution" — bounded by
 /// [`PREVIEW_NATIVE_MAX_PX`] purely as a safety rail for the case where
 /// `media.width/height` are still `pending` and the source turns out to be huge.
-#[allow(dead_code)]
 pub const PREVIEW_NATIVE_PROFILE: &str = "preview_native";
-#[allow(dead_code)]
 pub const PREVIEW_NATIVE_MAX_PX: u32 = 4096;
 /// The downscaled TIERS, ordered smallest-first; selection walks this list.
 /// `PREVIEW_NATIVE_PROFILE` is deliberately absent — it is not a tier.
-#[allow(dead_code)]
 pub const PREVIEW_PROFILE_VALUES: &[&str] = &[PREVIEW_2048_PROFILE, PREVIEW_3072_PROFILE];
 /// Originals whose longest side is at or below this never get a tier — the
 /// original is already a reasonable preview and streaming it costs nothing.
-#[allow(dead_code)]
 pub const PREVIEW_TIER_MIN_SOURCE_MAX_PX: u32 = 4096;
 /// Resolution headroom over the viewport (1.2x) so a modest zoom or a
 /// fractional device pixel ratio does not immediately look soft.
-#[allow(dead_code)]
 const PREVIEW_TIER_HEADROOM_NUMERATOR: u32 = 6;
-#[allow(dead_code)]
 const PREVIEW_TIER_HEADROOM_DENOMINATOR: u32 = 5;
 /// WebP quality for preview tiers. Higher than the 75 used for 320px grid
 /// thumbs because this IS the image the user looks at.
-#[allow(dead_code)]
 const PREVIEW_WEBP_QUALITY: f32 = 82.0;
 
-// No production caller until Task 7 wires the preview route.
-#[allow(dead_code)]
 pub fn preview_profile_max_px(profile: &str) -> Option<u32> {
     match profile {
         PREVIEW_2048_PROFILE => Some(2048),
@@ -89,8 +77,6 @@ pub fn preview_profile_max_px(profile: &str) -> Option<u32> {
 /// `viewport_long_px`. `None` means "serve the original bytes" — which is both
 /// the small-image case and the no-viewport-reported case, so a client that
 /// sends nothing gets exactly today's behaviour.
-// No production caller until Task 7 wires the preview route.
-#[allow(dead_code)]
 pub fn select_preview_profile(source_max_px: u32, viewport_long_px: u32) -> Option<&'static str> {
     if viewport_long_px == 0 || source_max_px <= PREVIEW_TIER_MIN_SOURCE_MAX_PX {
         return None;
@@ -127,8 +113,6 @@ pub const THUMBNAIL_PROFILE_VALUES: &[&str] = &[GRID_320_PROFILE];
 pub const THUMBNAIL_STATUS_VALUES: &[&str] =
     &["pending", "queued", "ready", "failed", "skipped_small"];
 
-// No production caller until Task 7 wires the preview route.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedPreviewTier {
     pub data: Vec<u8>,
@@ -387,8 +371,6 @@ pub fn generate_preview_placeholder(source_path: &Path) -> anyhow::Result<Previe
 /// to `max_px` on its longest side. A cap larger than the source is a no-op —
 /// this never upscales — so `PREVIEW_NATIVE_MAX_PX` doubles as "native
 /// resolution, with a safety rail".
-// No production caller until Task 7 wires the preview route.
-#[allow(dead_code)]
 pub fn generate_preview_webp(
     source_path: &Path,
     max_px: u32,
@@ -600,8 +582,6 @@ fn bounded_dimensions(width: u32, height: u32, short_side_px: u32, max_side_px: 
 /// Sibling of [`bounded_dimensions`] above: that helper fits by SHORT side
 /// with an `f64` round, this one fits by LONG side with integer truncation
 /// (deliberately, so a scaled dimension never rounds up past the cap).
-// No production caller until Task 7 wires the preview route.
-#[allow(dead_code)]
 pub fn preview_tier_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u32) {
     let longest = width.max(height);
     if longest == 0 || max_px == 0 || longest <= max_px {

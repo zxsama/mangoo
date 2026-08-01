@@ -22,9 +22,6 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodePurpose {
     Thumbnail,
-    // Task 6's `generate_preview_webp` constructs this, but that function has
-    // no production caller until Task 7 wires the preview route.
-    #[allow(dead_code)]
     Preview,
 }
 

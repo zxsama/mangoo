@@ -382,7 +382,10 @@ if (!migrationSql.includes("PRAGMA journal_mode = WAL")) {
 }
 
 function functionBody(name) {
-  const match = routesRs.match(new RegExp(`async fn ${name}[^]*?\\n}\\n`, "m"));
+  // `async` is optional: the pure resolvers (`resolve_preview_plan`) are plain
+  // sync fns, and every route handler this is asked about is defined exactly
+  // once, so the optional prefix cannot select a different definition.
+  const match = routesRs.match(new RegExp(`(?:async )?fn ${name}[^]*?\\n}\\n`, "m"));
   return match?.[0] ?? "";
 }
 
@@ -675,6 +678,30 @@ for (const value of [
 }
 if (previewBody.includes("StatusCode::ACCEPTED")) {
   fail("GET /api/media/{fileId}/preview must not be a 202 Accepted placeholder");
+}
+for (const value of [
+  "resolve_preview_plan",
+  "serve_cached_preview_webp",
+  "PREVIEW_TIER_HEADER",
+  "viewport_long_px"
+]) {
+  if (!previewBody.includes(value) && !routesRs.includes(value)) {
+    fail(`GET /api/media/{fileId}/preview must resolve its source: missing ${value}`);
+  }
+}
+const previewPlanBody = functionBody("resolve_preview_plan");
+for (const value of ["select_preview_profile", "is_browser_renderable_image", "PREVIEW_NATIVE_PROFILE"]) {
+  if (!previewPlanBody.includes(value)) {
+    fail(`resolve_preview_plan must apply the documented rule: missing ${value}`);
+  }
+}
+// Decode must never run on the single writer connection.
+const serveBody = functionBody("serve_cached_preview_webp");
+if (!serveBody.includes("spawn_blocking")) {
+  fail("preview tier generation must decode on a blocking thread, not inside the writer closure");
+}
+if (/run_shared_database[\s\S]{0,400}generate_preview_webp/.test(serveBody)) {
+  fail("preview tier generation must not decode inside the writer closure");
 }
 for (const value of [
   '"/api/thumbnails/cache/stats"',

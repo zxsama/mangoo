@@ -17,8 +17,8 @@ use crate::api::AppState;
 use crate::db::notification_outbox::NotificationOutboxEvent;
 use crate::db::{
     Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot,
-    NotificationOrigin, PluginRecord, RootRecord, SearchQuery, TagError, TagRecord, TaskRecord,
-    ThumbBlobRecord, ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult,
+    NotificationOrigin, PluginRecord, PreviewBlobRecord, RootRecord, SearchQuery, TagError,
+    TagRecord, TaskRecord, ThumbBlobRecord, ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult,
     ThumbnailCacheRefreshMode, ThumbnailCacheScope, ThumbnailCacheSnapshot, ThumbnailCacheStats,
     ThumbnailFailureRecord, ThumbnailRecord, ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority,
     UserMetadataPatch, UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
@@ -29,7 +29,10 @@ use crate::fsops::{
 };
 use crate::plugins;
 use crate::scan::ScanSummary;
-use crate::thumbnails::{is_pending_status, normalize_profile};
+use crate::thumbnails::{
+    generate_preview_webp, is_pending_status, normalize_profile, preview_profile_max_px,
+    select_preview_profile, PREVIEW_NATIVE_MAX_PX, PREVIEW_NATIVE_PROFILE,
+};
 
 const THUMBNAIL_TASK_WAKE_DEDUPE_WINDOW: Duration = Duration::from_millis(750);
 const INVALID_NOTIFICATION_OUTBOX_QUERY: &str = "invalid notification outbox query";
@@ -245,6 +248,56 @@ struct MediaPositionResponse {
 struct ThumbnailQuery {
     priority: Option<String>,
     target: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewQuery {
+    /// Cache-busting fingerprint; opaque to the server.
+    #[allow(dead_code)]
+    v: Option<String>,
+    /// Longest side of the preview viewport, in CSS pixels. Omitted by clients
+    /// that want the original bytes verbatim.
+    #[serde(rename = "viewportLongPx")]
+    viewport_long_px: Option<u32>,
+}
+
+/// What `get_preview` decided to serve instead of the raw original.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreviewPlan {
+    profile: &'static str,
+    max_px: u32,
+}
+
+/// Pure preview-source resolution. `None` means "stream the original file
+/// bytes", which is the zero-cost majority path and the exact behaviour that
+/// shipped before this pipeline existed.
+fn resolve_preview_plan(
+    media_kind: Option<&str>,
+    ext: &str,
+    source_max_px: u32,
+    viewport_long_px: u32,
+) -> Option<PreviewPlan> {
+    // Video always streams. Detecting "Chromium cannot play this HEVC/WMV" needs
+    // codec probing and a transcode pipeline, both explicitly later work; this
+    // early return is that plug point.
+    if media_kind != Some("image") {
+        return None;
+    }
+    if let Some(profile) = select_preview_profile(source_max_px, viewport_long_px) {
+        return Some(PreviewPlan {
+            profile,
+            max_px: preview_profile_max_px(profile)?,
+        });
+    }
+    if !crate::decode::formats::is_browser_renderable_image(ext) {
+        // Small enough that no tier applies, but the browser still cannot paint
+        // it — transcode at (bounded) native resolution.
+        return Some(PreviewPlan {
+            profile: PREVIEW_NATIVE_PROFILE,
+            max_px: PREVIEW_NATIVE_MAX_PX,
+        });
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -1229,21 +1282,30 @@ async fn cancel_bulk_thumbnail_cache(
 async fn get_preview(
     State(state): State<AppState>,
     Path(file_id): Path<i64>,
+    Query(query): Query<PreviewQuery>,
 ) -> ApiResult<Response> {
     use axum::body::Body;
     use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
     use tokio_util::io::ReaderStream;
 
-    let (source_path, media_kind) = run_read_database(state, move |database| {
-        let media = database
-            .get_media(file_id)?
-            .ok_or_else(|| CoreError::not_found(format!("media item not found: {file_id}")))?;
-        let source_path = database
-            .resolve_file_source_path(file_id)?
-            .ok_or_else(|| CoreError::not_found(format!("media source not found: {file_id}")))?;
-        Ok((source_path, media.kind))
-    })
-    .await?;
+    let (source_path, media_kind, source_max_px) =
+        run_read_database(state.clone(), move |database| {
+            let media = database
+                .get_media(file_id)?
+                .ok_or_else(|| CoreError::not_found(format!("media item not found: {file_id}")))?;
+            let source_path = database.resolve_file_source_path(file_id)?.ok_or_else(|| {
+                CoreError::not_found(format!("media source not found: {file_id}"))
+            })?;
+            // `width`/`height` stay NULL until the thumbnail pass fills them in;
+            // 0 then means "unknown", which resolves to "stream the original".
+            let source_max_px = media
+                .width
+                .unwrap_or(0)
+                .max(media.height.unwrap_or(0))
+                .clamp(0, u32::MAX as i64) as u32;
+            Ok((source_path, media.kind, source_max_px))
+        })
+        .await?;
 
     let file = tokio::fs::File::open(&source_path)
         .await
@@ -1259,16 +1321,103 @@ async fn get_preview(
         )));
     }
 
+    let ext = crate::decode::formats::lowercase_extension(&source_path);
+    if let Some(plan) = resolve_preview_plan(
+        media_kind.as_deref(),
+        ext.as_str(),
+        source_max_px,
+        query.viewport_long_px.unwrap_or(0),
+    ) {
+        return serve_cached_preview_webp(state, file_id, plan, source_path, &metadata).await;
+    }
+
     let body = Body::from_stream(ReaderStream::new(file));
     let mut response = Response::builder()
         .header(
             CONTENT_TYPE,
             preview_content_type(&source_path, media_kind.as_deref()),
         )
-        .header(CACHE_CONTROL, "private, max-age=0, must-revalidate");
+        .header(CACHE_CONTROL, "private, max-age=0, must-revalidate")
+        .header(PREVIEW_TIER_HEADER, "original");
     response = response.header(CONTENT_LENGTH, metadata.len().to_string());
     response
         .body(body)
+        .map_err(|err| CoreError::bad_request(format!("failed to build preview response: {err}")))
+}
+
+/// Tells the client WHICH representation it received, so it knows whether a
+/// background full-resolution upgrade is still worth requesting.
+const PREVIEW_TIER_HEADER: &str = "x-megle-preview-tier";
+
+async fn serve_cached_preview_webp(
+    state: AppState,
+    file_id: i64,
+    plan: PreviewPlan,
+    source_path: std::path::PathBuf,
+    metadata: &std::fs::Metadata,
+) -> ApiResult<Response> {
+    use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+
+    let source_size = metadata.len() as i64;
+    let source_mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+
+    let cached = run_read_database(state.clone(), move |database| {
+        Ok(database.get_preview_blob(file_id, plan.profile)?)
+    })
+    .await?
+    .filter(|blob| blob.source_size == source_size && blob.source_mtime == source_mtime);
+
+    let blob = match cached {
+        Some(blob) => blob,
+        None => {
+            // Decode on the blocking pool, NEVER inside the writer closure: the
+            // writer owns the process's single write connection, and a
+            // multi-hundred-millisecond decode there would stall every write.
+            let generation_path = source_path.clone();
+            let generated = tokio::task::spawn_blocking(move || {
+                generate_preview_webp(&generation_path, plan.max_px)
+            })
+            .await
+            .map_err(|err| CoreError::internal(format!("preview generation panicked: {err}")))?
+            .map_err(|err| CoreError::internal(err.to_string()))?;
+
+            let now = crate::db::unix_timestamp();
+            let record = PreviewBlobRecord {
+                file_id,
+                profile: plan.profile.to_string(),
+                data: generated.data,
+                width: generated.width,
+                height: generated.height,
+                byte_size: generated.byte_size,
+                output_format: generated.output_format.to_string(),
+                source_size,
+                source_mtime,
+                created_at: now,
+                updated_at: now,
+            };
+            let stored = record.clone();
+            // Short write: one upsert plus the LRU trim.
+            run_shared_database(state, move |database| {
+                database.upsert_preview_blob(stored)?;
+                Ok(())
+            })
+            .await?;
+            record
+        }
+    };
+
+    Response::builder()
+        .header(CONTENT_TYPE, blob.output_format)
+        // Same policy as the original-bytes branch: the frontend owns caching,
+        // and a tier can legitimately change when the source file changes.
+        .header(CACHE_CONTROL, "private, max-age=0, must-revalidate")
+        .header(PREVIEW_TIER_HEADER, plan.profile)
+        .body(axum::body::Body::from(blob.data))
         .map_err(|err| CoreError::bad_request(format!("failed to build preview response: {err}")))
 }
 
@@ -2425,6 +2574,14 @@ impl CoreError {
         }
     }
 
+    fn internal(message: String) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            code: None,
+        }
+    }
+
     fn coded(status: StatusCode, code: &str, message: String) -> Self {
         Self {
             status,
@@ -2452,10 +2609,14 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Method, Request, StatusCode};
+    use axum::Router;
     use base64::Engine as _;
     use tower::ServiceExt;
 
-    use super::{fallback_display_name, notification_outbox_response, router, ErrorResponse};
+    use super::{
+        fallback_display_name, notification_outbox_response, resolve_preview_plan, router,
+        ErrorResponse, PreviewBlobRecord, PREVIEW_NATIVE_MAX_PX, PREVIEW_NATIVE_PROFILE,
+    };
     use crate::api::{
         router_with_config, ApiConfig, AppState, BasicAuthCredentials, NotificationOutboxTestProbe,
         NOTIFICATION_OUTBOX_READ_CONCURRENCY,
@@ -2464,6 +2625,7 @@ mod tests {
         NotificationOperation, NotificationOutboxEvent, PublishMode,
     };
     use crate::db::{Database, NewRoot, ThumbnailTaskPriority};
+    use crate::thumbnails::{PREVIEW_2048_PROFILE, PREVIEW_3072_PROFILE};
 
     #[test]
     fn fallback_display_name_uses_last_path_component() {
@@ -2865,6 +3027,305 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    /// Router + real on-disk source image + a second connection to inspect what
+    /// the route persisted. File-backed on purpose: the preview cache lives in
+    /// SQLite, so an in-memory database could not be observed independently of
+    /// the writer actor.
+    struct PreviewHarness {
+        app: Router,
+        inspector: Database,
+        file_id: i64,
+        temp_root: PathBuf,
+        db_dir: PathBuf,
+    }
+
+    impl PreviewHarness {
+        fn database(&self) -> &Database {
+            &self.inspector
+        }
+
+        async fn get(&self, path: &str) -> axum::response::Response {
+            self.app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("build preview request"),
+                )
+                .await
+                .expect("preview request")
+        }
+    }
+
+    impl Drop for PreviewHarness {
+        fn drop(&mut self) {
+            // Best effort, same as the surrounding tests: the media directory
+            // always goes, the sqlite file may still be held by the writer
+            // thread and is left for the OS temp sweep.
+            let _ = fs::remove_dir_all(&self.temp_root);
+            let _ = fs::remove_dir_all(&self.db_dir);
+        }
+    }
+
+    async fn preview_harness() -> PreviewHarness {
+        preview_harness_with_image("original.jpg", 640, 480).await
+    }
+
+    async fn preview_harness_with_large_image() -> PreviewHarness {
+        preview_harness_with_image("large.jpg", 5000, 500).await
+    }
+
+    async fn preview_harness_with_image(name: &str, width: u32, height: u32) -> PreviewHarness {
+        let temp_root = unique_temp_dir();
+        fs::create_dir_all(&temp_root).expect("create preview root");
+        let source_path = temp_root.join(name);
+        image::DynamicImage::new_rgb8(width, height)
+            .save(&source_path)
+            .expect("write preview source image");
+        let size = fs::metadata(&source_path)
+            .expect("stat preview source image")
+            .len() as i64;
+
+        let db_dir = unique_temp_dir();
+        fs::create_dir_all(&db_dir).expect("create db dir");
+        let db_path = db_dir.join("megle.sqlite");
+        let (database, worker_database) = test_database_pair(db_path.clone());
+        let root_id = database
+            .add_root(NewRoot {
+                path: temp_root.to_string_lossy().into_owned(),
+                display_name: "Preview Harness Root".to_string(),
+            })
+            .expect("add root");
+        let folder_id = database
+            .upsert_folder(crate::db::FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: String::new(),
+                path_hash: format!("preview-harness-root-{name}"),
+                mtime: Some(1),
+            })
+            .expect("insert root folder");
+        let file_id = database
+            .upsert_file(crate::db::FileUpsert {
+                root_id,
+                folder_id,
+                name: name.to_string(),
+                ext: crate::decode::formats::lowercase_extension(&source_path),
+                size,
+                mtime: 2,
+                ctime: None,
+                file_key: None,
+            })
+            .expect("insert file");
+        database
+            .upsert_media_kind(file_id, "image")
+            .expect("insert media kind");
+        // `source_max_px` is read from the indexed dimensions, exactly as it is
+        // in production once the thumbnail pass has filled them in.
+        database
+            .update_media_dimensions(file_id, width as i64, height as i64)
+            .expect("record media dimensions");
+
+        let inspector = Database::open(&db_path).expect("open inspector database");
+        let app = router(AppState::new_with_worker(database, worker_database));
+        PreviewHarness {
+            app,
+            inspector,
+            file_id,
+            temp_root,
+            db_dir,
+        }
+    }
+
+    #[test]
+    fn preview_plan_streams_the_original_for_ordinary_browser_images() {
+        // The overwhelming majority path: a 3000px JPEG needs no work at all.
+        assert!(resolve_preview_plan(Some("image"), ".jpg", 3000, 1920).is_none());
+        assert!(resolve_preview_plan(Some("image"), ".png", 4096, 3840).is_none());
+        // And a client that reports no viewport gets today's behaviour exactly.
+        assert!(resolve_preview_plan(Some("image"), ".jpg", 16384, 0).is_none());
+    }
+
+    #[test]
+    fn preview_plan_tiers_large_browser_images() {
+        let plan = resolve_preview_plan(Some("image"), ".jpg", 16384, 1920)
+            .expect("large image should be tiered");
+        assert_eq!(plan.profile, PREVIEW_3072_PROFILE);
+        assert_eq!(plan.max_px, 3072);
+    }
+
+    #[test]
+    fn preview_plan_transcodes_unrenderable_images_even_when_small() {
+        let plan = resolve_preview_plan(Some("image"), ".heic", 2000, 1920)
+            .expect("heic is never browser renderable");
+        assert_eq!(plan.profile, PREVIEW_NATIVE_PROFILE);
+        assert_eq!(plan.max_px, PREVIEW_NATIVE_MAX_PX);
+    }
+
+    #[test]
+    fn preview_plan_prefers_the_tier_over_native_for_large_unrenderable_images() {
+        let plan = resolve_preview_plan(Some("image"), ".heic", 12000, 1366)
+            .expect("large heic should be tiered, not transcoded at native size");
+        assert_eq!(plan.profile, PREVIEW_2048_PROFILE);
+        assert_eq!(plan.max_px, 2048);
+    }
+
+    #[test]
+    fn preview_plan_never_touches_video() {
+        // Unplayable-video transcode is deliberately out of scope; this is the
+        // plug point where that branch will go.
+        assert!(resolve_preview_plan(Some("video"), ".mkv", 4000, 1920).is_none());
+        assert!(resolve_preview_plan(Some("video"), ".mp4", 16384, 1920).is_none());
+        assert!(resolve_preview_plan(None, ".bin", 16384, 1920).is_none());
+    }
+
+    #[tokio::test]
+    async fn preview_route_streams_original_bytes_when_no_viewport_is_reported() {
+        let harness = preview_harness().await;
+
+        let response = harness
+            .get(&format!("/api/media/{}/preview", harness.file_id))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-megle-preview-tier")
+                .and_then(|value| value.to_str().ok()),
+            Some("original")
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_route_still_accepts_the_cache_busting_v_parameter_alone() {
+        // `getPreviewBlob` — the untouched "give me the original" client call —
+        // sends `?v=<fingerprint>` and nothing else. The newly typed query
+        // extractor must keep that exact request on the raw-stream path rather
+        // than rejecting it as a malformed query.
+        let harness = preview_harness().await;
+
+        let response = harness
+            .get(&format!("/api/media/{}/preview?v=42", harness.file_id))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-megle-preview-tier")
+                .and_then(|value| value.to_str().ok()),
+            Some("original")
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_route_generates_caches_and_reuses_a_tier() {
+        let harness = preview_harness_with_large_image().await;
+        let path = format!("/api/media/{}/preview?viewportLongPx=1366", harness.file_id);
+
+        let first = harness.get(&path).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get("x-megle-preview-tier")
+                .and_then(|value| value.to_str().ok()),
+            Some(PREVIEW_2048_PROFILE)
+        );
+        assert_eq!(
+            first
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/webp")
+        );
+
+        // The generated tier is now persisted, and the second request is a
+        // pure cache read (no decode).
+        let cached = harness
+            .database()
+            .get_preview_blob(harness.file_id, PREVIEW_2048_PROFILE)
+            .expect("query")
+            .expect("tier cached");
+        assert!(cached.byte_size > 0);
+        assert_eq!(cached.width, 2048);
+
+        let second = harness.get(&path).await;
+        assert_eq!(second.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn preview_route_regenerates_a_tier_whose_source_changed() {
+        let harness = preview_harness_with_large_image().await;
+        let path = format!("/api/media/{}/preview?viewportLongPx=1366", harness.file_id);
+        harness.get(&path).await;
+
+        // Poison the cached tier's staleness key, as a real edit would.
+        harness
+            .database()
+            .upsert_preview_blob(PreviewBlobRecord {
+                source_size: 1,
+                source_mtime: 1,
+                ..harness
+                    .database()
+                    .get_preview_blob(harness.file_id, PREVIEW_2048_PROFILE)
+                    .expect("query")
+                    .expect("row")
+            })
+            .expect("poison");
+
+        let response = harness.get(&path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let refreshed = harness
+            .database()
+            .get_preview_blob(harness.file_id, PREVIEW_2048_PROFILE)
+            .expect("query")
+            .expect("row");
+        assert_ne!(refreshed.source_size, 1, "stale tier must be regenerated");
+    }
+
+    #[tokio::test]
+    async fn preview_route_transcodes_a_browser_unrenderable_image_at_native_size() {
+        // A small TIFF: no tier applies, but Chromium cannot paint it, so the
+        // route must transcode. This is also the only test that writes the
+        // `preview_native` profile through the route, which pins the profile
+        // constants against migration 0025's
+        // `CHECK(profile IN ('preview_2048','preview_3072','preview_native'))`.
+        let harness = preview_harness_with_image("scanned.tif", 640, 480).await;
+        let path = format!("/api/media/{}/preview?viewportLongPx=1366", harness.file_id);
+
+        let response = harness.get(&path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-megle-preview-tier")
+                .and_then(|value| value.to_str().ok()),
+            Some(PREVIEW_NATIVE_PROFILE)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/webp")
+        );
+
+        let cached = harness
+            .database()
+            .get_preview_blob(harness.file_id, PREVIEW_NATIVE_PROFILE)
+            .expect("query")
+            .expect("native transcode cached");
+        assert_eq!(cached.output_format, "image/webp");
+        // Never upscaled: the point is format conversion, not resizing.
+        assert_eq!(cached.width, 640);
+        assert_eq!(cached.height, 480);
     }
 
     #[tokio::test]

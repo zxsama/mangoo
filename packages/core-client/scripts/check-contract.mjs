@@ -383,6 +383,7 @@ assertOperationRoute("getMediaPosition", "get", "/media/{fileId}/position");
 assertOperationParameters("listThumbnailCacheFailures", ["limit"]);
 assertOperationParameters("getThumbnail", ["fileId", "target", "priority"]);
 assertOperationParameters("getThumbnailBlob", ["fileId", "target"]);
+assertOperationParameters("getPreview", ["fileId", "viewportLongPx"]);
 operation("syncThumbnailPriorityScope");
 assertOperationParameters("searchMedia", ["rootId", "folderId", "limit", "offset", "cursor", "sort", "kind"]);
 assertOperationRoute("listNotificationOutbox", "get", "/notifications/outbox");
@@ -430,6 +431,7 @@ for (const method of [
   "getThumbnailBlob",
   "listThumbnailCacheFailures",
   "getPreviewBlob",
+  "getPreviewResource",
   "listTasks",
   "cancelTask",
   "retryTask",
@@ -674,6 +676,18 @@ if (!/getThumbnailBlob[\s\S]*?query\(\{\s*target,\s*v:\s*options\.version/.test(
 
 if (!/getPreviewBlob:\s*\(fileId:\s*number,\s*options:\s*BlobRequestOptions\s*=\s*{}\)\s*=>\s*fetchBlob\(`\/media\/\$\{fileId\}\/preview\$\{query\(\{\s*v:\s*options\.version\s*}\)\}`,\s*\{[\s\S]*?\.\.\.options,[\s\S]*?requestPriority:\s*options\.requestPriority\s*\?\?\s*"interactive"[\s\S]*?\}\)/.test(client)) {
   fail("client.ts getPreviewBlob must request original media bytes from /media/{fileId}/preview");
+}
+
+if (!/getPreviewResource:\s*\(fileId:\s*number,\s*options:\s*PreviewResourceOptions\s*=\s*\{\}\)\s*=>\s*fetchBlobWithTier\(/.test(client)) {
+  fail("client.ts getPreviewResource must request the resolved preview representation");
+}
+if (!/x-megle-preview-tier/.test(client)) {
+  fail("client.ts must read the x-megle-preview-tier response header");
+}
+// The query serialiser is a whitelist; a parameter it does not know is dropped
+// silently and the server never sees a viewport.
+if (!/search\.set\("viewportLongPx"/.test(client)) {
+  fail("client.ts query() must serialize viewportLongPx");
 }
 
 if (!/removeRoot:\s*\(rootId:\s*number\)\s*=>\s*request<AcceptedRootResponse>\(`\/roots\/\$\{rootId\}`,\s*\{[\s\S]*?method:\s*"DELETE",[\s\S]*?requestPriority:\s*"interactive"[\s\S]*?\}\)/.test(client)) {

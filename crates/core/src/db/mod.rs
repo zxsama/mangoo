@@ -455,14 +455,8 @@ pub struct ThumbBlobRecord {
 /// least recently used. Tiers are 1–3 MB each and are created for every large
 /// image the user opens, so an unbounded cache would grow the library file
 /// without limit. Regenerating an evicted tier costs one decode.
-// Consumed by the preview tier generator (task 6) and the `get_preview` source
-// resolver (task 7); no production caller exists yet.
-#[allow(dead_code)]
 pub const PREVIEW_BLOB_CACHE_LIMIT_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
-// Consumed by the preview tier generator (task 6) and the `get_preview` source
-// resolver (task 7); no production caller exists yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PreviewBlobRecord {
     pub file_id: i64,
@@ -6026,9 +6020,6 @@ impl Database {
         Ok(rows.next()?.map(thumb_blob_from_row).transpose()?)
     }
 
-    // Consumed by the `get_preview` source resolver (task 7); no production
-    // caller exists yet.
-    #[allow(dead_code)]
     pub fn get_preview_blob(
         &self,
         file_id: i64,
@@ -6046,9 +6037,6 @@ impl Database {
         Ok(rows.next()?.map(preview_blob_from_row).transpose()?)
     }
 
-    // Consumed by the preview tier generator (task 6); no production caller
-    // exists yet.
-    #[allow(dead_code)]
     pub fn upsert_preview_blob(&self, blob: PreviewBlobRecord) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
@@ -9608,7 +9596,7 @@ fn configure_file_database_wal(connection: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn unix_timestamp() -> i64 {
+pub(crate) fn unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)

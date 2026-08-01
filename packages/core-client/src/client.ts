@@ -70,6 +70,17 @@ export interface BlobRequestOptions {
   requestPriority?: CoreRequestPriority;
 }
 
+export interface PreviewResourceOptions extends BlobRequestOptions {
+  /** Longest side of the preview viewport in CSS pixels. */
+  viewportLongPx?: number;
+}
+
+export interface PreviewResource {
+  blob: Blob;
+  /** original | preview_2048 | preview_3072 | preview_native */
+  tier: string;
+}
+
 export interface CoreRequestOptions {
   signal?: AbortSignal;
   requestPriority?: CoreRequestPriority;
@@ -101,6 +112,7 @@ type QueryParams = Partial<ListMediaParams & ListFolderChildrenParams> & {
   priority?: ThumbnailPriority;
   target?: "grid_320";
   v?: number | string | null;
+  viewportLongPx?: number;
 };
 
 const MAX_CORE_REQUESTS = 12;
@@ -211,6 +223,31 @@ export function createCoreClient(config: CoreClientConfig) {
       throw new CoreApiError(response.status, body);
     }
     return response.blob();
+  }
+
+  async function fetchBlobWithTier(
+    path: string,
+    options: BlobRequestOptions = {}
+  ): Promise<PreviewResource> {
+    const headers = new Headers();
+    if (config.sessionToken) {
+      headers.set("x-megle-session", config.sessionToken);
+    }
+    const response = await scheduleCoreRequest(
+      options.requestPriority ?? "resource",
+      options.signal,
+      () =>
+        fetchWithTimeout(resolveUrl(config.baseUrl, path), { headers }, options.signal),
+      path
+    );
+    if (!response.ok) {
+      const body = await readResponseBody(response);
+      throw new CoreApiError(response.status, body);
+    }
+    return {
+      blob: await response.blob(),
+      tier: response.headers.get("x-megle-preview-tier") ?? "original"
+    };
   }
 
   return {
@@ -359,6 +396,17 @@ export function createCoreClient(config: CoreClientConfig) {
         ...options,
         requestPriority: options.requestPriority ?? "interactive"
       }),
+    getPreviewResource: (fileId: number, options: PreviewResourceOptions = {}) =>
+      fetchBlobWithTier(
+        `/media/${fileId}/preview${query({
+          v: options.version,
+          viewportLongPx: options.viewportLongPx
+        })}`,
+        {
+          ...options,
+          requestPriority: options.requestPriority ?? "interactive"
+        }
+      ),
     listTags: () => request<TagListResponse>("/tags", { requestPriority: "metadata" }),
     createTag: (body: CreateTagRequest) =>
       request<TagRecord>("/tags", {
@@ -678,6 +726,9 @@ function query(params: QueryParams): string {
   if ("priority" in params && params.priority) search.set("priority", params.priority);
   if ("v" in params && params.v !== null && params.v !== undefined) {
     search.set("v", String(params.v));
+  }
+  if ("viewportLongPx" in params && typeof params.viewportLongPx === "number") {
+    search.set("viewportLongPx", String(Math.max(1, Math.round(params.viewportLongPx))));
   }
   const value = search.toString();
   return value ? `?${value}` : "";

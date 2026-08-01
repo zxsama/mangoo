@@ -341,13 +341,39 @@ paths:
   /media/{fileId}/preview:
     get:
       operationId: getPreview
+      description: >-
+        Resolves the best preview source for one media item. Browser-renderable
+        images at or below the tier threshold, and every video, stream the
+        original indexed bytes unchanged. Larger images return an adaptive
+        downscaled WebP tier, and browser-unrenderable images return a
+        transcoded WebP. The x-megle-preview-tier response header names which
+        representation was served.
       parameters:
         - $ref: "#/components/parameters/fileId"
+        - name: viewportLongPx
+          in: query
+          required: false
+          description: >-
+            Longest side of the preview viewport in CSS pixels. Omit to receive
+            the original bytes verbatim.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 16384
       responses:
         "200":
-          description: Original indexed media bytes.
+          description: Original indexed media bytes, or a WebP preview representation.
+          headers:
+            x-megle-preview-tier:
+              description: original | preview_2048 | preview_3072 | preview_native
+              schema:
+                type: string
           content:
             application/octet-stream:
+              schema:
+                type: string
+                format: binary
+            image/webp:
               schema:
                 type: string
                 format: binary
