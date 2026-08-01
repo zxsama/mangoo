@@ -451,6 +451,35 @@ pub struct ThumbBlobRecord {
     pub updated_at: i64,
 }
 
+/// Total bytes of cached preview tiers this library keeps before evicting the
+/// least recently used. Tiers are 1–3 MB each and are created for every large
+/// image the user opens, so an unbounded cache would grow the library file
+/// without limit. Regenerating an evicted tier costs one decode.
+// Consumed by the preview tier generator (task 6) and the `get_preview` source
+// resolver (task 7); no production caller exists yet.
+#[allow(dead_code)]
+pub const PREVIEW_BLOB_CACHE_LIMIT_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+
+// Consumed by the preview tier generator (task 6) and the `get_preview` source
+// resolver (task 7); no production caller exists yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct PreviewBlobRecord {
+    pub file_id: i64,
+    pub profile: String,
+    pub data: Vec<u8>,
+    pub width: i64,
+    pub height: i64,
+    pub byte_size: i64,
+    pub output_format: String,
+    /// Source file size at generation time; the tier is stale when it differs.
+    pub source_size: i64,
+    /// Source file mtime at generation time; the tier is stale when it differs.
+    pub source_mtime: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskRecord {
@@ -1049,6 +1078,10 @@ impl Database {
         if !self.migration_applied(24)? {
             self.connection
                 .execute_batch(migrations::FILE_OPERATION_OBJECT_BINDING_MIGRATION)?;
+        }
+        if !self.migration_applied(25)? {
+            self.connection
+                .execute_batch(migrations::PREVIEW_BLOBS_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
@@ -4655,6 +4688,9 @@ impl Database {
     pub fn clear_thumbnail_cache(&self) -> anyhow::Result<ThumbnailCacheClearResult> {
         let transaction = self.connection.unchecked_transaction()?;
         let deleted_blob_count = transaction.execute("DELETE FROM thumb_blobs", [])?;
+        // Preview tiers are regenerable from the same originals; clearing the
+        // thumbnail cache must not leave a second stale blob store behind.
+        transaction.execute("DELETE FROM preview_blobs", [])?;
         let reset_thumbnail_count = transaction.execute(
             r#"
             UPDATE thumbs
@@ -5988,6 +6024,91 @@ impl Database {
         )?;
         let mut rows = statement.query((file_id, profile))?;
         Ok(rows.next()?.map(thumb_blob_from_row).transpose()?)
+    }
+
+    // Consumed by the `get_preview` source resolver (task 7); no production
+    // caller exists yet.
+    #[allow(dead_code)]
+    pub fn get_preview_blob(
+        &self,
+        file_id: i64,
+        profile: &str,
+    ) -> anyhow::Result<Option<PreviewBlobRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT file_id, profile, data, width, height, byte_size, output_format,
+                   source_size, source_mtime, created_at, updated_at
+            FROM preview_blobs
+            WHERE file_id = ?1 AND profile = ?2
+            "#,
+        )?;
+        let mut rows = statement.query((file_id, profile))?;
+        Ok(rows.next()?.map(preview_blob_from_row).transpose()?)
+    }
+
+    // Consumed by the preview tier generator (task 6); no production caller
+    // exists yet.
+    #[allow(dead_code)]
+    pub fn upsert_preview_blob(&self, blob: PreviewBlobRecord) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            r#"
+            INSERT INTO preview_blobs(
+                file_id, profile, data, width, height, byte_size, output_format,
+                source_size, source_mtime, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(file_id, profile) DO UPDATE SET
+                data = excluded.data,
+                width = excluded.width,
+                height = excluded.height,
+                byte_size = excluded.byte_size,
+                output_format = excluded.output_format,
+                source_size = excluded.source_size,
+                source_mtime = excluded.source_mtime,
+                updated_at = excluded.updated_at
+            "#,
+            (
+                blob.file_id,
+                &blob.profile,
+                &blob.data,
+                blob.width,
+                blob.height,
+                blob.byte_size,
+                &blob.output_format,
+                blob.source_size,
+                blob.source_mtime,
+                blob.created_at,
+                blob.updated_at,
+            ),
+        )?;
+        // Evict least-recently-used tiers until the cache is inside budget:
+        // walk newest-first and drop everything past the point where the
+        // running total crosses the limit. The row just written is excluded
+        // outright rather than relying on it sorting first — a caller-supplied
+        // `updated_at` need not be the largest in the table, and a single tier
+        // bigger than the whole budget would otherwise delete itself, making
+        // the caller decode, store, and immediately miss.
+        transaction.execute(
+            r#"
+            DELETE FROM preview_blobs
+            WHERE rowid IN (
+              SELECT rowid FROM (
+                SELECT rowid,
+                       SUM(byte_size) OVER (
+                         ORDER BY updated_at DESC, rowid DESC
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS running_bytes
+                FROM preview_blobs
+              )
+              WHERE running_bytes > ?1
+            )
+              AND NOT (file_id = ?2 AND profile = ?3)
+            "#,
+            (PREVIEW_BLOB_CACHE_LIMIT_BYTES, blob.file_id, &blob.profile),
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn import_legacy_thumbnail_cache(&self) -> anyhow::Result<usize> {
@@ -7979,6 +8100,22 @@ fn thumb_blob_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThumbBlobRec
         output_format: row.get(6)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
+    })
+}
+
+fn preview_blob_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PreviewBlobRecord> {
+    Ok(PreviewBlobRecord {
+        file_id: row.get(0)?,
+        profile: row.get(1)?,
+        data: row.get(2)?,
+        width: row.get(3)?,
+        height: row.get(4)?,
+        byte_size: row.get(5)?,
+        output_format: row.get(6)?,
+        source_size: row.get(7)?,
+        source_mtime: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -10263,6 +10400,35 @@ mod tests {
                 .expect("seed candidate blob");
         }
         file_id
+    }
+
+    /// Seeds `count` real `files` rows (plus the root/folder they hang off) and
+    /// returns their ids. Preview-tier tests only need valid `files.id` values,
+    /// so this reuses the existing `seed_thumbnail_cache_scope_fixture` for the
+    /// root/folder pair and the same `upsert_file` call shape as
+    /// `seed_media_page_fixture` rather than introducing a new fixture path.
+    fn seed_media_files(database: &Database, count: usize) -> Vec<i64> {
+        let (root_id, folder_id) = seed_thumbnail_cache_scope_fixture(database, "preview-blobs");
+        (0..count)
+            .map(|index| {
+                database
+                    .upsert_file(FileUpsert {
+                        root_id,
+                        folder_id,
+                        name: format!("photo-{index}.jpg"),
+                        ext: ".jpg".to_string(),
+                        size: 100 + index as i64,
+                        mtime: 100 + index as i64,
+                        ctime: None,
+                        file_key: None,
+                    })
+                    .expect("insert preview fixture file")
+            })
+            .collect()
+    }
+
+    fn seed_single_media_file(database: &Database) -> i64 {
+        seed_media_files(database, 1)[0]
     }
 
     fn media_names(items: &[MediaRecord]) -> Vec<&str> {
@@ -16283,6 +16449,229 @@ mod tests {
             .expect("get thumbnail")
             .expect("thumbnail exists");
         assert_eq!(thumbnail.state, "pending");
+    }
+
+    #[test]
+    fn preview_blob_round_trips_and_reports_staleness_inputs() {
+        let database = migrated_database();
+        let file_id = seed_single_media_file(&database);
+
+        assert!(database
+            .get_preview_blob(file_id, "preview_2048")
+            .expect("query empty")
+            .is_none());
+
+        database
+            .upsert_preview_blob(PreviewBlobRecord {
+                file_id,
+                profile: "preview_2048".to_string(),
+                data: vec![1, 2, 3, 4],
+                width: 2048,
+                height: 1152,
+                byte_size: 4,
+                output_format: "image/webp".to_string(),
+                source_size: 9_000_000,
+                source_mtime: 1_700_000_000,
+                created_at: 10,
+                updated_at: 10,
+            })
+            .expect("insert");
+
+        let stored = database
+            .get_preview_blob(file_id, "preview_2048")
+            .expect("query")
+            .expect("row present");
+        assert_eq!(stored.data, vec![1, 2, 3, 4]);
+        assert_eq!(stored.width, 2048);
+        assert_eq!(stored.source_size, 9_000_000);
+        assert_eq!(stored.source_mtime, 1_700_000_000);
+    }
+
+    #[test]
+    fn preview_blob_upsert_replaces_the_same_profile_in_place() {
+        let database = migrated_database();
+        let file_id = seed_single_media_file(&database);
+
+        for (byte, updated_at) in [(1u8, 10i64), (2u8, 20i64)] {
+            database
+                .upsert_preview_blob(PreviewBlobRecord {
+                    file_id,
+                    profile: "preview_2048".to_string(),
+                    data: vec![byte],
+                    width: 2048,
+                    height: 1152,
+                    byte_size: 1,
+                    output_format: "image/webp".to_string(),
+                    source_size: 1,
+                    source_mtime: 1,
+                    created_at: 10,
+                    updated_at,
+                })
+                .expect("upsert");
+        }
+
+        let count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM preview_blobs", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1);
+        let stored = database
+            .get_preview_blob(file_id, "preview_2048")
+            .expect("query")
+            .expect("row");
+        assert_eq!(stored.data, vec![2]);
+        assert_eq!(stored.updated_at, 20);
+    }
+
+    #[test]
+    fn preview_blob_cache_evicts_least_recently_used_rows_past_the_budget() {
+        let database = migrated_database();
+        let file_ids = seed_media_files(&database, 3);
+        // Each blob is half the budget, so the third insert must evict the
+        // oldest by updated_at.
+        let half = PREVIEW_BLOB_CACHE_LIMIT_BYTES / 2;
+        for (index, file_id) in file_ids.iter().enumerate() {
+            database
+                .upsert_preview_blob(PreviewBlobRecord {
+                    file_id: *file_id,
+                    profile: "preview_2048".to_string(),
+                    data: vec![index as u8],
+                    width: 2048,
+                    height: 1152,
+                    byte_size: half,
+                    output_format: "image/webp".to_string(),
+                    source_size: 1,
+                    source_mtime: 1,
+                    created_at: 10,
+                    updated_at: 100 + index as i64,
+                })
+                .expect("upsert");
+        }
+
+        assert!(
+            database
+                .get_preview_blob(file_ids[0], "preview_2048")
+                .expect("query")
+                .is_none(),
+            "oldest tier should be evicted"
+        );
+        assert!(database
+            .get_preview_blob(file_ids[2], "preview_2048")
+            .expect("query")
+            .is_some());
+    }
+
+    #[test]
+    fn preview_blob_larger_than_the_whole_budget_is_still_stored() {
+        // A tier that alone exceeds the budget must still be readable after the
+        // write that produced it: the eviction pass runs in the same
+        // transaction as the upsert and must never choose its own row as a
+        // victim, or the caller would decode, store, and immediately miss.
+        let database = migrated_database();
+        let file_id = seed_single_media_file(&database);
+
+        database
+            .upsert_preview_blob(PreviewBlobRecord {
+                file_id,
+                profile: "preview_native".to_string(),
+                data: vec![9],
+                width: 8192,
+                height: 8192,
+                byte_size: PREVIEW_BLOB_CACHE_LIMIT_BYTES + 1,
+                output_format: "image/webp".to_string(),
+                source_size: 1,
+                source_mtime: 1,
+                created_at: 10,
+                updated_at: 10,
+            })
+            .expect("upsert oversized tier");
+
+        assert!(
+            database
+                .get_preview_blob(file_id, "preview_native")
+                .expect("query")
+                .is_some(),
+            "a tier larger than the whole budget must survive its own write"
+        );
+    }
+
+    #[test]
+    fn clearing_the_thumbnail_cache_also_drops_preview_tiers() {
+        let database = migrated_database();
+        let file_id = seed_single_media_file(&database);
+        database
+            .upsert_preview_blob(PreviewBlobRecord {
+                file_id,
+                profile: "preview_2048".to_string(),
+                data: vec![7],
+                width: 2048,
+                height: 1152,
+                byte_size: 1,
+                output_format: "image/webp".to_string(),
+                source_size: 1,
+                source_mtime: 1,
+                created_at: 10,
+                updated_at: 10,
+            })
+            .expect("upsert");
+
+        database.clear_thumbnail_cache().expect("clear");
+
+        assert!(database
+            .get_preview_blob(file_id, "preview_2048")
+            .expect("query")
+            .is_none());
+    }
+
+    #[test]
+    fn deleting_a_file_cascades_to_its_preview_tiers() {
+        let database = migrated_database();
+        let file_id = seed_single_media_file(&database);
+        database
+            .upsert_preview_blob(PreviewBlobRecord {
+                file_id,
+                profile: "preview_2048".to_string(),
+                data: vec![7],
+                width: 2048,
+                height: 1152,
+                byte_size: 1,
+                output_format: "image/webp".to_string(),
+                source_size: 1,
+                source_mtime: 1,
+                created_at: 10,
+                updated_at: 10,
+            })
+            .expect("upsert");
+        assert!(database
+            .get_preview_blob(file_id, "preview_2048")
+            .expect("query seeded tier")
+            .is_some());
+
+        // SQLite only enforces foreign keys when the pragma is on, so assert it
+        // instead of assuming — otherwise a cascade regression would pass here
+        // simply because nothing was ever enforced.
+        database
+            .connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("enable foreign keys");
+        let foreign_keys_enabled: i64 = database
+            .connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("read foreign_keys pragma");
+        assert_eq!(
+            foreign_keys_enabled, 1,
+            "foreign key enforcement must be on for this test to mean anything"
+        );
+        database
+            .connection
+            .execute("DELETE FROM files WHERE id = ?1", [file_id])
+            .expect("delete file");
+
+        let count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM preview_blobs", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 0);
     }
 
     #[test]

@@ -168,6 +168,9 @@ if (!dbMigrationsRs.includes('include_str!("../../migrations/0011_plugins_extend
 if (!dbMigrationsRs.includes('include_str!("../../migrations/0013_preview_served_by.sql")')) {
   fail("db preview served_by migration include path changed or missing");
 }
+if (!dbMigrationsRs.includes('include_str!("../../migrations/0025_preview_blobs.sql")')) {
+  fail("db preview_blobs migration include path changed or missing");
+}
 if (!dbModRs.includes("pub fn apply_migrations")) {
   fail("Database::apply_migrations is missing");
 }
