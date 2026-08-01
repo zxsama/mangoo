@@ -22,6 +22,9 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodePurpose {
     Thumbnail,
+    // Task 6's `generate_preview_webp` and Task 7's `resolve_preview_plan`
+    // construct this; no production caller until then.
+    #[allow(dead_code)]
     Preview,
 }
 
@@ -153,6 +156,7 @@ impl DecoderRegistry {
 impl DecoderRegistry {
     /// Registered decoder names in chain order. Exposed so a test can assert
     /// the capability-ascending ordering that the whole design depends on.
+    #[cfg(test)]
     pub fn decoder_names(&self) -> Vec<&'static str> {
         self.decoders.iter().map(|decoder| decoder.name()).collect()
     }

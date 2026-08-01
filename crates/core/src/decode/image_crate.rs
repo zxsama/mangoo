@@ -4,7 +4,7 @@
 
 use image::ImageReader;
 
-use super::{DecodePurpose, DecodeRequest, DecodedImage, MediaDecoder, MediaSource};
+use super::{DecodePurpose, DecodeRequest, DecodedImage, MediaDecoder};
 
 /// Extensions `image` 0.25 with DEFAULT features can actually decode.
 ///
@@ -66,6 +66,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::decode::MediaSource;
 
     fn unique_temp_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
