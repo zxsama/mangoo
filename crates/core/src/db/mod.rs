@@ -16555,6 +16555,13 @@ mod tests {
                 .is_none(),
             "oldest tier should be evicted"
         );
+        // The middle tier still fits inside the budget: without this, a
+        // regression that evicted everything except the row just written would
+        // still satisfy the two assertions around it.
+        assert!(database
+            .get_preview_blob(file_ids[1], "preview_2048")
+            .expect("query")
+            .is_some());
         assert!(database
             .get_preview_blob(file_ids[2], "preview_2048")
             .expect("query")
@@ -16614,6 +16621,10 @@ mod tests {
                 updated_at: 10,
             })
             .expect("upsert");
+        assert!(database
+            .get_preview_blob(file_id, "preview_2048")
+            .expect("query seeded tier")
+            .is_some());
 
         database.clear_thumbnail_cache().expect("clear");
 

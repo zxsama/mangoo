@@ -15,7 +15,6 @@ BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS preview_blobs (
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   profile TEXT NOT NULL CHECK(profile IN ('preview_2048','preview_3072','preview_native')),
-  data BLOB NOT NULL,
   width INTEGER NOT NULL,
   height INTEGER NOT NULL,
   byte_size INTEGER NOT NULL,
@@ -24,6 +23,15 @@ CREATE TABLE IF NOT EXISTS preview_blobs (
   source_mtime INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
+  -- `data` MUST stay the LAST column. A 1-3 MB BLOB spills onto overflow
+  -- pages, and SQLite reaches any column declared *after* a spilled BLOB by
+  -- walking that row's whole overflow-page chain. The LRU eviction pass reads
+  -- `byte_size` for every cached row, so with `data` declared third that scan
+  -- cost ~1.3 ms per MB of cache: measured 1852 ms at 800 rows / 1.2 GB,
+  -- versus 2.6 ms with `data` last. That is a multi-second stall inside a
+  -- write transaction on every preview cache miss. `tools/checks/
+  -- validate_sqlite_schema.py` asserts this ordering.
+  data BLOB NOT NULL,
   PRIMARY KEY(file_id, profile)
 );
 

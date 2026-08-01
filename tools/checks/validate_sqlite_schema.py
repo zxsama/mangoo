@@ -419,6 +419,20 @@ def main() -> None:
                 fail(
                     f"missing preview blob columns: {sorted(missing_preview_blobs_columns)}"
                 )
+            # PRAGMA table_info returns columns in declaration order.
+            preview_blobs_column_order = [
+                row[1] for row in conn.execute("PRAGMA table_info(preview_blobs)").fetchall()
+            ]
+            if preview_blobs_column_order[-1] != "data":
+                fail(
+                    "preview_blobs.data must be the LAST declared column: a 1-3 MB "
+                    "BLOB spills onto overflow pages, and SQLite reaches any column "
+                    "declared after it by walking that row's whole overflow chain. "
+                    "The LRU eviction pass reads byte_size for every cached row, so "
+                    "moving data earlier costs ~1.3 ms per MB of cache (measured "
+                    "1852 ms vs 2.6 ms at 800 rows / 1.2 GB) inside a write "
+                    f"transaction. Declared order: {preview_blobs_column_order}"
+                )
 
             task_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
