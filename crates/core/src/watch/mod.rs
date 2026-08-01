@@ -9,7 +9,7 @@ use notify::event::{ModifyKind, RenameMode};
 use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::db::{Database, DbWriter, FileUpsert, NotificationOrigin, RootRecord};
-use crate::decode::formats::{lowercase_extension as extension, media_kind_for_path as media_kind};
+use crate::decode::formats::{lowercase_extension as extension, media_kind_for_extension};
 use crate::tasks::TaskSender;
 
 const EVENT_COALESCE_WINDOW: Duration = Duration::from_millis(100);
@@ -264,7 +264,10 @@ fn upsert_media_file(
     path: &Path,
     metadata: &fs::Metadata,
 ) -> anyhow::Result<()> {
-    let Some(kind) = media_kind(path) else {
+    // One `lowercase_extension` allocation per event, not two: the guard and the
+    // stored `files.ext` are the same string.
+    let ext = extension(path);
+    let Some(kind) = media_kind_for_extension(ext.as_str()) else {
         return Ok(());
     };
     let Some(parent) = path.parent() else {
@@ -282,7 +285,7 @@ fn upsert_media_file(
         root_id: root.id,
         folder_id,
         name: file_name(path),
-        ext: extension(path),
+        ext,
         size: metadata.len() as i64,
         mtime: metadata_time(Some(metadata)),
         ctime: metadata_created_time(Some(metadata)),

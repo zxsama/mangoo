@@ -48,6 +48,12 @@ pub fn media_kind_for_extension(ext: &str) -> Option<&'static str> {
     None
 }
 
+/// Path-form convenience over [`lowercase_extension`] + [`media_kind_for_extension`].
+/// Test-only: every production caller (scan, the watcher) needs the extension
+/// string anyway to store in `files.ext`, so they call the two-step form and
+/// pay one allocation per file instead of two. Drop the gate if a caller ever
+/// genuinely has only a path.
+#[cfg(test)]
 pub fn media_kind_for_path(path: &Path) -> Option<&'static str> {
     media_kind_for_extension(lowercase_extension(path).as_str())
 }

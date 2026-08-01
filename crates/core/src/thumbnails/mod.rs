@@ -554,7 +554,42 @@ mod tests {
         // and transient would arm the 60s retry sweep against every AVIF/HEIC
         // in the library forever.
         assert!(matches!(classify_thumbnail_failure(error), Permanent));
-        assert!(error.contains("decoder unavailable"));
+        assert!(error.contains(crate::decode::DECODER_UNAVAILABLE_MARKER));
+    }
+
+    #[test]
+    fn heif_reaches_a_decoder_instead_of_falling_off_the_format_table() {
+        // The two halves of .heif support live in different files: the format
+        // table (decode/formats.rs) decides it is indexed at all, and
+        // FfmpegDecoder decides it is claimed. Asserting each half separately
+        // would still pass if an edit dropped .heif from either one, so join
+        // them here through the real thumbnail entry point.
+        let dir = std::env::temp_dir().join(format!(
+            "megle_thumb_heif_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // Uppercase on purpose: proves the lowercasing in lowercase_extension
+        // is on the path too.
+        let source = dir.join("photo.HEIF");
+        std::fs::write(&source, b"not a real heif payload").expect("write fixture");
+
+        let error =
+            generate_image_thumbnail_bytes(&source).expect_err("junk payload cannot decode");
+        let text = error.to_string();
+
+        // The point: it must have been ROUTED to a decoder. Reaching
+        // NO_DECODER_MARKER would mean .heif fell off the format table.
+        assert!(
+            !text.contains(crate::decode::NO_DECODER_MARKER),
+            "heif must reach a decoder, got: {text}"
+        );
+        assert!(text.contains("ffmpeg"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

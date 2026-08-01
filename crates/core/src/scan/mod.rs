@@ -10,7 +10,7 @@ use crate::db::{
     Database, FileUpsert, FolderUpsert, RootRecord, ScanFileUpsert, ScanWriteBatch,
     TaskScanProgress,
 };
-use crate::decode::formats::{lowercase_extension as extension, media_kind_for_path as media_kind};
+use crate::decode::formats::{lowercase_extension as extension, media_kind_for_extension};
 
 pub const INTERACTIVE_SCAN_WRITE_BATCH_SIZE: usize = 1;
 pub const BACKGROUND_SCAN_WRITE_BATCH_SIZE: usize = 256;
@@ -292,7 +292,11 @@ pub fn scan_root_with_options(
             continue;
         }
 
-        let Some(kind) = media_kind(path) else {
+        // One `lowercase_extension` allocation per file, not two: the guard and
+        // the stored `files.ext` are the same string. This runs once per file on
+        // multi-million-file libraries.
+        let ext = extension(path);
+        let Some(kind) = media_kind_for_extension(ext.as_str()) else {
             summary.skipped_files += 1;
             emit_progress(&mut options, items_seen, &summary);
             check_scan_cancelled(&mut options)?;
@@ -305,7 +309,7 @@ pub fn scan_root_with_options(
                 root_id: root.id,
                 folder_id,
                 name: file_name(path),
-                ext: extension(path),
+                ext,
                 size: metadata.len() as i64,
                 mtime: metadata_time(Some(&metadata), TimeField::Modified).unwrap_or(0),
                 ctime: metadata_time(Some(&metadata), TimeField::Created),
@@ -512,7 +516,11 @@ pub fn scan_folder_with_options(
             continue;
         }
 
-        let Some(kind) = media_kind(path) else {
+        // One `lowercase_extension` allocation per file, not two: the guard and
+        // the stored `files.ext` are the same string. This runs once per file on
+        // multi-million-file libraries.
+        let ext = extension(path);
+        let Some(kind) = media_kind_for_extension(ext.as_str()) else {
             summary.skipped_files += 1;
             emit_progress(&mut options, items_seen, &summary);
             check_scan_cancelled(&mut options)?;
@@ -525,7 +533,7 @@ pub fn scan_folder_with_options(
                 root_id: root.id,
                 folder_id: parent_id,
                 name: file_name(path),
-                ext: extension(path),
+                ext,
                 size: metadata.len() as i64,
                 mtime: metadata_time(Some(&metadata), TimeField::Modified).unwrap_or(0),
                 ctime: metadata_time(Some(&metadata), TimeField::Created),
