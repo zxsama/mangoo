@@ -4328,22 +4328,30 @@ export function PreviewCanvas({
 
 - [ ] **Step 3c: Dispatch to it from `MediaPreview`**
 
-In `apps/web/src/features/preview/MediaPreview.tsx`, add the imports:
+`MediaPreview` is **already** a dispatcher — a sequence of early returns, with every hook (`useThumbnailFallbackUrl` and friends) called above them. The lane branch goes there, immediately **before** the existing `if (source === "original" || shouldUseOriginalWhilePending)` block at `MediaPreview.tsx:73`. Putting it inside `ReadyPreviewMedia` instead would require an early return above that component's ten `useState`/`useRef`/`useEffect` calls — legal only by an argument about prop stability that no linter can check. Do not do that.
+
+Add the imports:
 
 ```typescript
 import { PreviewCanvas } from "./PreviewCanvas";
 import { selectPreviewRenderLane } from "./previewRenderLane";
 ```
 
-and, at the very top of `ReadyPreviewMedia`'s body (before any hook that the canvas lane does not need — place it as the first statement so the early return is unconditional for a given lane):
+and insert, directly above the `if (source === "original" || shouldUseOriginalWhilePending)` return:
 
 ```tsx
-  const lane = selectPreviewRenderLane({ source, kind, ext: media.ext });
-  if (lane === "canvas") {
+  // Gate on the LITERAL `source` prop, not on `shouldUseOriginalWhilePending`.
+  // The inspector panel (PreviewPanel.tsx) renders source="thumbnail" with
+  // preferOriginalWhilePending, and routing that small sidebar surface into the
+  // bitmap pool would spend the preview budget on thumbnails.
+  if (
+    source === "original" &&
+    selectPreviewRenderLane({ source, kind: media.kind, ext: media.ext }) === "canvas"
+  ) {
     return (
       <PreviewCanvas
-        alt={alt}
-        frameStyle={frameStyle}
+        alt={media.name}
+        frameStyle={stableFrameStyle}
         media={media}
         onLoadingChange={onLoadingChange}
         onMediaReady={onMediaReady}
@@ -4354,7 +4362,7 @@ and, at the very top of `ReadyPreviewMedia`'s body (before any hook that the can
   }
 ```
 
-> **Implementer note — React hook rules:** an early return before hooks is only legal if `ReadyPreviewMedia` never switches lanes for a given mounted instance. It does not: `source` and `media.ext` are fixed per mounted item, and `CentralPreviewStage` renders `<MediaPreview source="original">`. If the compiler or `react-hooks/rules-of-hooks` complains, split `ReadyPreviewMedia` into a thin dispatcher component that renders either `<PreviewCanvas>` or the existing `<ReadyPreviewImage>` body — do **not** move the hooks around inside the existing body.
+`ReadyPreviewMedia` itself is **not modified by this task** — it keeps serving the thumbnail lane, the animated-image lane, and video, exactly as today.
 
 Add the viewport helper at the bottom of `MediaPreview.tsx` (exported, because Task 11's prefetch effect needs the same number):
 
@@ -4797,4 +4805,4 @@ Recorded so the implementer knows what was already checked, and what to watch:
 - **Three deliberate deviations from the spec, each justified in its task:** a new `preview_blobs` table instead of widening `thumb_blobs` (18 GB rebuild); tiers keyed by longest side with a `viewportLongPx` parameter instead of short side / `viewportShortPx` (bounds decoded memory unconditionally and matches `fit-long-edge`); two tiers plus `preview_native` instead of three tiers.
 - **No zoom/rotate work appears anywhere in this plan** — verified that `.central-preview-transform` owns the transform, so the gesture state machine is untouched by design, not by omission.
 - **Guarded checks this plan edits on purpose:** `validate-core-api.mjs` (preview markers + new resolver assertions + migration include), `check-contract.mjs` (new `getPreviewResource`, `getPreviewBlob` left byte-identical so its pinned regex still matches), `validate_sqlite_schema.py` (migration, table, index, columns).
-- **Highest-risk task is 10** (React hook ordering when adding the early lane return in `ReadyPreviewMedia`). Its implementer note gives the fallback: split into a dispatcher component rather than reordering hooks.
+- **Highest-risk task is 10** (introducing a second render lane into a component tree that already has six). Its Step 3c pins the branch to `MediaPreview`'s existing early-return chain — above `ReadyPreviewMedia`, whose hooks must not be reordered — and gates on the literal `source` prop so the inspector panel (`PreviewPanel.tsx`, `source="thumbnail"` + `preferOriginalWhilePending`) never enters the bitmap pool.
