@@ -104,7 +104,12 @@ pub fn select_preview_profile(source_max_px: u32, viewport_long_px: u32) -> Opti
         .find(|profile| preview_profile_max_px(profile).unwrap_or(0) >= required)
         // Beyond the largest tier, clamp to it: the frontend's background
         // original-upgrade closes the remaining sharpness gap.
-        .unwrap_or(PREVIEW_3072_PROFILE);
+        .unwrap_or_else(|| {
+            PREVIEW_PROFILE_VALUES
+                .last()
+                .copied()
+                .unwrap_or(PREVIEW_3072_PROFILE)
+        });
     // A tier that is not smaller than the original would be pure loss.
     if preview_profile_max_px(profile).unwrap_or(0) >= source_max_px {
         return None;
@@ -112,19 +117,15 @@ pub fn select_preview_profile(source_max_px: u32, viewport_long_px: u32) -> Opti
     Some(profile)
 }
 
-/// Fit `width x height` inside a `max_px` box, preserving aspect ratio and
-/// never upscaling. Neither dimension is ever allowed to round to zero.
-// No production caller until Task 7 wires the preview route.
 #[allow(dead_code)]
-pub fn preview_tier_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u32) {
-    let longest = width.max(height);
-    if longest == 0 || max_px == 0 || longest <= max_px {
-        return (width, height);
-    }
-    let scaled_width = ((width as u64 * max_px as u64) / longest as u64) as u32;
-    let scaled_height = ((height as u64 * max_px as u64) / longest as u64) as u32;
-    (scaled_width.max(1), scaled_height.max(1))
-}
+pub const PREVIEW_PLACEHOLDER_SHORT_SIDE_PX: u32 = 20;
+#[allow(dead_code)]
+pub const PREVIEW_PLACEHOLDER_MAX_SIDE_PX: u32 = 64;
+#[allow(dead_code)]
+pub const THUMBNAIL_PROFILE_VALUES: &[&str] = &[GRID_320_PROFILE];
+#[allow(dead_code)]
+pub const THUMBNAIL_STATUS_VALUES: &[&str] =
+    &["pending", "queued", "ready", "failed", "skipped_small"];
 
 // No production caller until Task 7 wires the preview route.
 #[allow(dead_code)]
@@ -136,15 +137,6 @@ pub struct GeneratedPreviewTier {
     pub byte_size: i64,
     pub output_format: &'static str,
 }
-#[allow(dead_code)]
-pub const PREVIEW_PLACEHOLDER_SHORT_SIDE_PX: u32 = 20;
-#[allow(dead_code)]
-pub const PREVIEW_PLACEHOLDER_MAX_SIDE_PX: u32 = 64;
-#[allow(dead_code)]
-pub const THUMBNAIL_PROFILE_VALUES: &[&str] = &[GRID_320_PROFILE];
-#[allow(dead_code)]
-pub const THUMBNAIL_STATUS_VALUES: &[&str] =
-    &["pending", "queued", "ready", "failed", "skipped_small"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThumbnailPolicy {
@@ -596,6 +588,28 @@ fn bounded_dimensions(width: u32, height: u32, short_side_px: u32, max_side_px: 
         .max(1)
         .min(max_side_px.max(1));
     (target_width, target_height)
+}
+
+/// Fit `width x height` inside a `max_px` box, preserving aspect ratio and
+/// never upscaling. When the box actually forces a downscale, neither output
+/// dimension is ever allowed to round to zero. Inputs that pass through
+/// unscaled — already inside the box, or with no long side at all (`width ==
+/// height == 0`) — are returned exactly as given, including any zero
+/// dimension already present in the input.
+///
+/// Sibling of [`bounded_dimensions`] above: that helper fits by SHORT side
+/// with an `f64` round, this one fits by LONG side with integer truncation
+/// (deliberately, so a scaled dimension never rounds up past the cap).
+// No production caller until Task 7 wires the preview route.
+#[allow(dead_code)]
+pub fn preview_tier_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u32) {
+    let longest = width.max(height);
+    if longest == 0 || max_px == 0 || longest <= max_px {
+        return (width, height);
+    }
+    let scaled_width = ((width as u64 * max_px as u64) / longest as u64) as u32;
+    let scaled_height = ((height as u64 * max_px as u64) / longest as u64) as u32;
+    (scaled_width.max(1), scaled_height.max(1))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1192,7 +1206,22 @@ mod tests {
     }
 
     #[test]
-    fn the_no_upscale_guard_is_unreachable_while_the_threshold_exceeds_every_tier() {
+    fn tier_selection_switches_exactly_at_the_headroom_boundary() {
+        // required = ceil(viewport * 6 / 5). At viewport 1706: ceil(1706*6/5) =
+        // ceil(2047.2) = 2048, exactly covered by preview_2048. At 1707:
+        // ceil(1707*6/5) = ceil(2048.4) = 2049, which only preview_3072 covers.
+        assert_eq!(
+            select_preview_profile(16384, 1706),
+            Some(PREVIEW_2048_PROFILE)
+        );
+        assert_eq!(
+            select_preview_profile(16384, 1707),
+            Some(PREVIEW_3072_PROFILE)
+        );
+    }
+
+    #[test]
+    fn the_no_upscale_guard_is_unreachable_while_the_threshold_is_at_least_the_largest_tier() {
         // Documents a real invariant rather than testing behaviour: every source
         // that survives the PREVIEW_TIER_MIN_SOURCE_MAX_PX early return is
         // strictly larger than the biggest tier, so `tier >= source` can never
@@ -1226,6 +1255,9 @@ mod tests {
         }
         assert_eq!(preview_profile_max_px("grid_320"), None);
         assert_eq!(preview_profile_max_px("preview_9999"), None);
+        // preview_native is a format-transcode profile, not a viewport-selectable
+        // tier: it must never appear in the selection list.
+        assert!(!PREVIEW_PROFILE_VALUES.contains(&PREVIEW_NATIVE_PROFILE));
     }
 
     #[test]
@@ -1240,14 +1272,7 @@ mod tests {
 
     #[test]
     fn generates_a_downscaled_webp_tier_from_a_large_original() {
-        let dir = std::env::temp_dir().join(format!(
-            "megle_preview_tier_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
+        let dir = unique_temp_dir();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let source = dir.join("huge.png");
         let mut buffer = image::RgbaImage::new(5000, 500);
@@ -1272,14 +1297,7 @@ mod tests {
 
     #[test]
     fn a_cap_larger_than_the_source_transcodes_without_upscaling() {
-        let dir = std::env::temp_dir().join(format!(
-            "megle_preview_transcode_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
+        let dir = unique_temp_dir();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let source = dir.join("medium.png");
         let mut buffer = image::RgbaImage::new(640, 480);
@@ -1299,14 +1317,7 @@ mod tests {
 
     #[test]
     fn preview_generation_reports_chain_failures_verbatim() {
-        let dir = std::env::temp_dir().join(format!(
-            "megle_preview_fail_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
+        let dir = unique_temp_dir();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let source = dir.join("sensor.raw");
         std::fs::write(&source, b"not decodable").expect("write fixture");
