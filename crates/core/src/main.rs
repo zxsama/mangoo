@@ -1,5 +1,6 @@
 mod api;
 mod db;
+mod decode;
 #[macro_use]
 mod debug;
 mod fsops;
