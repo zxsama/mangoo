@@ -38,14 +38,26 @@ export function previewBitmapKey(epoch: number, mediaId: number, tier: string): 
   return `${epoch}:${mediaId}:${tier}`;
 }
 
+/** Non-finite (NaN/Infinity) dimensions are treated as 0, never propagated. */
+function finiteNonNegative(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
 export function decodedBitmapBytes(bitmap: PoolableBitmap): number {
-  return Math.max(0, bitmap.width) * Math.max(0, bitmap.height) * BYTES_PER_DECODED_PIXEL;
+  return (
+    finiteNonNegative(bitmap.width) * finiteNonNegative(bitmap.height) * BYTES_PER_DECODED_PIXEL
+  );
 }
 
 type PoolEntry = {
   bitmap: PoolableBitmap;
   bytes: number;
 };
+
+/** Non-finite (NaN/Infinity) budgets are treated as 0, never propagated. */
+function sanitizeBudgetBytes(budgetBytes: number): number {
+  return Number.isFinite(budgetBytes) ? Math.max(0, Math.floor(budgetBytes)) : 0;
+}
 
 export class PreviewBitmapPool {
   // Insertion order IS recency order: JS Map preserves it, and re-inserting
@@ -56,7 +68,7 @@ export class PreviewBitmapPool {
   private pinnedKey: string | null = null;
 
   constructor(budgetBytes: number) {
-    this.budgetBytes = Math.max(0, Math.floor(budgetBytes));
+    this.budgetBytes = sanitizeBudgetBytes(budgetBytes);
   }
 
   get size(): number {
@@ -72,7 +84,7 @@ export class PreviewBitmapPool {
   }
 
   configure(budgetBytes: number): void {
-    this.budgetBytes = Math.max(0, Math.floor(budgetBytes));
+    this.budgetBytes = sanitizeBudgetBytes(budgetBytes);
     this.evictUntilWithinBudget();
   }
 
@@ -102,11 +114,20 @@ export class PreviewBitmapPool {
   }
 
   set(key: string, bitmap: PoolableBitmap): void {
+    const existing = this.entries.get(key);
+    if (existing && existing.bitmap === bitmap) {
+      // Re-setting the exact same object under its own key must be a no-op:
+      // `delete()` below would close() the bitmap the caller is still holding
+      // and then store the now-closed object under the same key.
+      return;
+    }
     this.delete(key);
     const bytes = decodedBitmapBytes(bitmap);
     this.entries.set(key, { bitmap, bytes });
     this.currentBytes += bytes;
-    this.evictUntilWithinBudget();
+    // Protect the entry just admitted — it is what the caller is about to
+    // paint/hold, so the eviction sweep must never be allowed to close it.
+    this.evictUntilWithinBudget(key);
   }
 
   delete(key: string): void {
@@ -116,6 +137,12 @@ export class PreviewBitmapPool {
     }
     this.entries.delete(key);
     this.currentBytes -= entry.bytes;
+    if (key === this.pinnedKey) {
+      // Otherwise the stale pin lingers and silently confers eviction
+      // immunity on whatever gets stored under this key next, without
+      // anyone calling pin() again.
+      this.pinnedKey = null;
+    }
     // An ImageBitmap that is dropped without close() leaks GPU memory until GC
     // decides otherwise, which on a browsing session is never.
     entry.bitmap.close();
@@ -131,15 +158,29 @@ export class PreviewBitmapPool {
     this.pinnedKey = null;
   }
 
-  private evictUntilWithinBudget(): void {
+  /**
+   * Sweeps oldest-to-newest, closing unprotected entries until back within
+   * budget. Two keys are protected: the pinned frame (on screen right now —
+   * closing it would blank the canvas), and `protectedKey`, the entry the
+   * caller just admitted via `set()` (closing it would hand back a bitmap
+   * the caller is about to draw with, which is already closed).
+   *
+   * `configure()` deliberately passes no `protectedKey`: a budget shrink is
+   * free to evict everything down to the pinned frame (or to nothing, if
+   * unpinned) — there is no "entry just admitted" to protect there.
+   *
+   * A pinned entry plus a newly admitted entry can together exceed the
+   * budget on their own (e.g. one 60 MB pinned frame and one fresh 60 MB
+   * neighbour against a 100 MB budget) — that is the case `pin()` exists to
+   * survive, and the sweep must leave the budget over rather than close
+   * either of them.
+   */
+  private evictUntilWithinBudget(protectedKey: string | null = null): void {
     for (const key of [...this.entries.keys()]) {
       if (this.currentBytes <= this.budgetBytes) {
         return;
       }
-      // The pinned frame is on screen right now; closing it would blank the
-      // canvas. The newest entry is the one the caller just asked for, so
-      // evicting it would defeat the request that triggered this sweep.
-      if (key === this.pinnedKey || this.entries.size <= 1) {
+      if (key === this.pinnedKey || key === protectedKey) {
         continue;
       }
       this.delete(key);
