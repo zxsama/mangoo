@@ -70,6 +70,14 @@ impl MediaDecoder for FfmpegDecoder {
             return Err(unavailable_error());
         }
         let source_path = request.source.path();
+        // ffmpeg's stderr is its own English prose and carries none of
+        // `classify_thumbnail_failure`'s transient signatures. Because this
+        // decoder is the ONLY chain link for .avif/.heic/.heif/.psd, an
+        // unreachable NAS would otherwise produce an aggregate error with no
+        // transient signature at all and be marked permanently failed. Stat
+        // first so the OS error (e.g. `os error 53`, 找不到网络路径) is the leaf,
+        // and skip a pointless subprocess spawn while we are at it.
+        fs::metadata(source_path).map_err(|error| anyhow::anyhow!("ffmpeg source: {error}"))?;
         let scratch = scratch_path();
         if let Some(parent) = scratch.parent() {
             fs::create_dir_all(parent)
@@ -273,6 +281,12 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
+        // Pin that ffmpeg really produced AVIF and did not silently fall back
+        // to another container under the .avif name.
+        assert_eq!(
+            &std::fs::read(&source).expect("read fixture")[4..12],
+            b"ftypavif"
+        );
 
         let decoded = FfmpegDecoder
             .decode(&DecodeRequest {
@@ -285,6 +299,9 @@ mod tests {
 
         assert_eq!((decoded.width, decoded.height), (64, 48));
         assert_eq!(decoded.rgba.len(), 64 * 48 * 4);
+        // color=c=red — a YUV->RGB regression producing a black frame would
+        // otherwise pass every dimension assertion.
+        assert!(decoded.rgba[0] > 200, "red channel was {}", decoded.rgba[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -314,7 +331,7 @@ mod tests {
             })
             .expect("ffmpeg decodes and scales");
 
-        assert!(decoded.width <= 200, "width {}", decoded.width);
+        assert_eq!(decoded.width, 200, "cap must be filled, not undershot");
         assert!(decoded.height <= 200, "height {}", decoded.height);
         // Aspect ratio 2:1 preserved within a pixel of rounding.
         assert!(
@@ -348,7 +365,69 @@ mod tests {
 
         let text = error.to_string();
         assert!(text.contains("ffmpeg"), "{text}");
+        assert!(text.contains("stderr:"), "{text}");
         assert!(!text.contains(DECODER_UNAVAILABLE_MARKER), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreachable_source_surfaces_the_os_error_not_ffmpeg_prose() {
+        if !ffmpeg_available() {
+            eprintln!(
+                "SKIP an_unreachable_source_surfaces_the_os_error_not_ffmpeg_prose: no ffmpeg"
+            );
+            return;
+        }
+        let missing = std::env::temp_dir().join("megle-decode-does-not-exist-12345.heic");
+        let _ = std::fs::remove_file(&missing);
+
+        let error = FfmpegDecoder
+            .decode(&DecodeRequest {
+                source: MediaSource::Path(&missing),
+                ext: ".heic",
+                target_max_px: None,
+                purpose: DecodePurpose::Preview,
+            })
+            .expect_err("missing source cannot decode");
+
+        // `classify_thumbnail_failure` substring-matches this text; an OS error
+        // code must be present or a transient outage reads as permanent.
+        let text = error.to_string();
+        assert!(text.contains("os error"), "{text}");
+        assert!(text.contains("ffmpeg source"), "{text}");
+    }
+
+    #[test]
+    fn a_cap_larger_than_the_source_does_not_upscale() {
+        if !ffmpeg_available() {
+            eprintln!("SKIP a_cap_larger_than_the_source_does_not_upscale: no ffmpeg");
+            return;
+        }
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("small.png");
+        let mut buffer = image::RgbaImage::new(64, 48);
+        for pixel in buffer.pixels_mut() {
+            *pixel = image::Rgba([5, 5, 5, 255]);
+        }
+        image::DynamicImage::ImageRgba8(buffer)
+            .save(&source)
+            .expect("write fixture");
+
+        let decoded = FfmpegDecoder
+            .decode(&DecodeRequest {
+                source: MediaSource::Path(&source),
+                ext: ".tif",
+                target_max_px: Some(400),
+                purpose: DecodePurpose::Preview,
+            })
+            .expect("decodes");
+
+        assert_eq!(
+            (decoded.width, decoded.height),
+            (64, 48),
+            "must not upscale"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

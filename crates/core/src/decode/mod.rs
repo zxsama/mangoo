@@ -168,6 +168,8 @@ pub fn default_registry() -> DecoderRegistry {
 
 /// Process-wide chain. Construction is trivial, but the thumbnail worker asks
 /// for it once per task on a hot path, so build it once.
+// Task 4 wires the thumbnail worker onto this; unused until then.
+#[allow(dead_code)]
 pub fn shared_registry() -> &'static DecoderRegistry {
     static REGISTRY: std::sync::OnceLock<DecoderRegistry> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(default_registry)
