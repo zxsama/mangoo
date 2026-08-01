@@ -34,6 +34,108 @@ pub const GRID_320_PROFILE: &str = "grid_320";
 pub const GRID_320_SHORT_SIDE_PX: i64 = 320;
 pub const GRID_320_MAX_SIDE_PX: u32 = 4096;
 pub const GENERATED_FORMAT: &str = "image/webp";
+
+/// Adaptive downscaled preview tiers, keyed by the image's LONGEST side.
+///
+/// Longest-side (not short-side) because the preview's default view mode is
+/// `fit-long-edge`, and because it bounds decoded memory unconditionally: a
+/// longest-side-2048 tier is at most 2048*2048*4 = 17 MB no matter the aspect
+/// ratio, while a short-side-2048 tier on a 6:1 panorama is 100 MB.
+// No production caller until Task 7 wires the preview route.
+#[allow(dead_code)]
+pub const PREVIEW_2048_PROFILE: &str = "preview_2048";
+#[allow(dead_code)]
+pub const PREVIEW_3072_PROFILE: &str = "preview_3072";
+/// Cache profile for a browser-UNRENDERABLE image small enough that no tier
+/// applies (PSD/HEIC/TIFF under the threshold): the goal is format conversion,
+/// not shrinking, so this is "native resolution" — bounded by
+/// [`PREVIEW_NATIVE_MAX_PX`] purely as a safety rail for the case where
+/// `media.width/height` are still `pending` and the source turns out to be huge.
+#[allow(dead_code)]
+pub const PREVIEW_NATIVE_PROFILE: &str = "preview_native";
+#[allow(dead_code)]
+pub const PREVIEW_NATIVE_MAX_PX: u32 = 4096;
+/// The downscaled TIERS, ordered smallest-first; selection walks this list.
+/// `PREVIEW_NATIVE_PROFILE` is deliberately absent — it is not a tier.
+#[allow(dead_code)]
+pub const PREVIEW_PROFILE_VALUES: &[&str] = &[PREVIEW_2048_PROFILE, PREVIEW_3072_PROFILE];
+/// Originals whose longest side is at or below this never get a tier — the
+/// original is already a reasonable preview and streaming it costs nothing.
+#[allow(dead_code)]
+pub const PREVIEW_TIER_MIN_SOURCE_MAX_PX: u32 = 4096;
+/// Resolution headroom over the viewport (1.2x) so a modest zoom or a
+/// fractional device pixel ratio does not immediately look soft.
+#[allow(dead_code)]
+const PREVIEW_TIER_HEADROOM_NUMERATOR: u32 = 6;
+#[allow(dead_code)]
+const PREVIEW_TIER_HEADROOM_DENOMINATOR: u32 = 5;
+/// WebP quality for preview tiers. Higher than the 75 used for 320px grid
+/// thumbs because this IS the image the user looks at.
+#[allow(dead_code)]
+const PREVIEW_WEBP_QUALITY: f32 = 82.0;
+
+// No production caller until Task 7 wires the preview route.
+#[allow(dead_code)]
+pub fn preview_profile_max_px(profile: &str) -> Option<u32> {
+    match profile {
+        PREVIEW_2048_PROFILE => Some(2048),
+        PREVIEW_3072_PROFILE => Some(3072),
+        _ => None,
+    }
+}
+
+/// Which cached tier (if any) should back a preview of an image whose longest
+/// side is `source_max_px`, viewed in a window whose longest side is
+/// `viewport_long_px`. `None` means "serve the original bytes" — which is both
+/// the small-image case and the no-viewport-reported case, so a client that
+/// sends nothing gets exactly today's behaviour.
+// No production caller until Task 7 wires the preview route.
+#[allow(dead_code)]
+pub fn select_preview_profile(source_max_px: u32, viewport_long_px: u32) -> Option<&'static str> {
+    if viewport_long_px == 0 || source_max_px <= PREVIEW_TIER_MIN_SOURCE_MAX_PX {
+        return None;
+    }
+    let required = viewport_long_px
+        .saturating_mul(PREVIEW_TIER_HEADROOM_NUMERATOR)
+        .div_ceil(PREVIEW_TIER_HEADROOM_DENOMINATOR);
+    let profile = PREVIEW_PROFILE_VALUES
+        .iter()
+        .copied()
+        .find(|profile| preview_profile_max_px(profile).unwrap_or(0) >= required)
+        // Beyond the largest tier, clamp to it: the frontend's background
+        // original-upgrade closes the remaining sharpness gap.
+        .unwrap_or(PREVIEW_3072_PROFILE);
+    // A tier that is not smaller than the original would be pure loss.
+    if preview_profile_max_px(profile).unwrap_or(0) >= source_max_px {
+        return None;
+    }
+    Some(profile)
+}
+
+/// Fit `width x height` inside a `max_px` box, preserving aspect ratio and
+/// never upscaling. Neither dimension is ever allowed to round to zero.
+// No production caller until Task 7 wires the preview route.
+#[allow(dead_code)]
+pub fn preview_tier_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u32) {
+    let longest = width.max(height);
+    if longest == 0 || max_px == 0 || longest <= max_px {
+        return (width, height);
+    }
+    let scaled_width = ((width as u64 * max_px as u64) / longest as u64) as u32;
+    let scaled_height = ((height as u64 * max_px as u64) / longest as u64) as u32;
+    (scaled_width.max(1), scaled_height.max(1))
+}
+
+// No production caller until Task 7 wires the preview route.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedPreviewTier {
+    pub data: Vec<u8>,
+    pub width: i64,
+    pub height: i64,
+    pub byte_size: i64,
+    pub output_format: &'static str,
+}
 #[allow(dead_code)]
 pub const PREVIEW_PLACEHOLDER_SHORT_SIDE_PX: u32 = 20;
 #[allow(dead_code)]
@@ -284,6 +386,57 @@ pub fn generate_preview_placeholder(source_path: &Path) -> anyhow::Result<Previe
         data: bytes.to_vec(),
         width: target_width as i64,
         height: target_height as i64,
+        byte_size: bytes.len() as i64,
+        output_format: GENERATED_FORMAT,
+    })
+}
+
+/// Decode `source_path` through the registry and re-encode it as WebP, capped
+/// to `max_px` on its longest side. A cap larger than the source is a no-op —
+/// this never upscales — so `PREVIEW_NATIVE_MAX_PX` doubles as "native
+/// resolution, with a safety rail".
+// No production caller until Task 7 wires the preview route.
+#[allow(dead_code)]
+pub fn generate_preview_webp(
+    source_path: &Path,
+    max_px: u32,
+) -> anyhow::Result<GeneratedPreviewTier> {
+    let ext = crate::decode::formats::lowercase_extension(source_path);
+    let decoded = crate::decode::shared_registry()
+        .decode(&crate::decode::DecodeRequest {
+            source: crate::decode::MediaSource::Path(source_path),
+            ext: ext.as_str(),
+            // Passed as a hint: ffmpeg scales in-process (so a 16k HEIC never
+            // materialises at full size), while `image` ignores it and the
+            // resize below runs instead. Either way the output honours the cap.
+            target_max_px: Some(max_px),
+            purpose: crate::decode::DecodePurpose::Preview,
+        })
+        .map_err(|error| anyhow::anyhow!("preview decode failed: {error}"))?;
+    if decoded.width == 0 || decoded.height == 0 {
+        return Err(anyhow::anyhow!(
+            "preview decode failed: zero-sized source image"
+        ));
+    }
+    let (target_width, target_height) =
+        preview_tier_dimensions(decoded.width, decoded.height, max_px);
+    let dynamic = decoded
+        .into_dynamic()
+        .map_err(|error| anyhow::anyhow!("preview decode failed: {error}"))?;
+    let resized = if (dynamic.width(), dynamic.height()) == (target_width, target_height) {
+        dynamic
+    } else {
+        // Same single-pass area-average downscale the thumbnail path uses.
+        dynamic.thumbnail_exact(target_width, target_height)
+    };
+    let rgba = resized.to_rgba8();
+    let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+        .encode(PREVIEW_WEBP_QUALITY);
+    let bytes: &[u8] = &encoded;
+    Ok(GeneratedPreviewTier {
+        data: bytes.to_vec(),
+        width: rgba.width() as i64,
+        height: rgba.height() as i64,
         byte_size: bytes.len() as i64,
         output_format: GENERATED_FORMAT,
     })
@@ -987,6 +1140,184 @@ mod tests {
             FFMPEG_THUMBNAIL_TIMEOUT.as_secs()
         );
         assert!(message.contains("timed out"), "message: {message}");
+    }
+
+    #[test]
+    fn small_originals_never_get_a_downscaled_tier() {
+        // At or below the threshold the original IS the preview.
+        for source_max_px in [320, 1920, 4096] {
+            assert_eq!(
+                select_preview_profile(source_max_px, 2560),
+                None,
+                "source {source_max_px} should serve the original"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_selection_picks_the_smallest_profile_that_covers_the_viewport() {
+        // 1366x768 laptop: 1366 * 1.2 = 1639 -> 2048 is enough.
+        assert_eq!(
+            select_preview_profile(16384, 1366),
+            Some(PREVIEW_2048_PROFILE)
+        );
+        // 1920x1080: 1920 * 1.2 = 2304 -> needs 3072.
+        assert_eq!(
+            select_preview_profile(16384, 1920),
+            Some(PREVIEW_3072_PROFILE)
+        );
+        // 4K window: clamps at the largest tier; the background original
+        // upgrade closes the remaining gap.
+        assert_eq!(
+            select_preview_profile(16384, 3840),
+            Some(PREVIEW_3072_PROFILE)
+        );
+    }
+
+    #[test]
+    fn tier_selection_keeps_downscaling_when_the_viewport_outruns_the_largest_tier() {
+        // 5000px source on a 1366px viewport: preview_2048 covers it.
+        assert_eq!(
+            select_preview_profile(5000, 1366),
+            Some(PREVIEW_2048_PROFILE)
+        );
+        // 4200px source on a 4K viewport: required is 4608, past every tier, so
+        // it clamps to the largest. 3072 is still a real downscale of 4200, so
+        // serving the tier is correct — the frontend's background original
+        // upgrade closes the remaining sharpness gap.
+        assert_eq!(
+            select_preview_profile(4200, 3840),
+            Some(PREVIEW_3072_PROFILE)
+        );
+    }
+
+    #[test]
+    fn the_no_upscale_guard_is_unreachable_while_the_threshold_exceeds_every_tier() {
+        // Documents a real invariant rather than testing behaviour: every source
+        // that survives the PREVIEW_TIER_MIN_SOURCE_MAX_PX early return is
+        // strictly larger than the biggest tier, so `tier >= source` can never
+        // hold. If someone adds a tier above the threshold, or lowers the
+        // threshold, this fails and the guard's tests become worth writing.
+        let largest_tier = PREVIEW_PROFILE_VALUES
+            .iter()
+            .filter_map(|profile| preview_profile_max_px(profile))
+            .max()
+            .expect("at least one tier");
+        assert!(
+            largest_tier <= PREVIEW_TIER_MIN_SOURCE_MAX_PX,
+            "largest tier {largest_tier} exceeds the tier threshold {PREVIEW_TIER_MIN_SOURCE_MAX_PX}; \
+             the no-upscale guard in select_preview_profile is now reachable and needs its own test"
+        );
+    }
+
+    #[test]
+    fn an_unknown_viewport_serves_the_original_unchanged() {
+        // A client that sends no viewport gets today's exact behaviour.
+        assert_eq!(select_preview_profile(16384, 0), None);
+    }
+
+    #[test]
+    fn preview_profile_max_px_is_defined_for_every_declared_profile() {
+        for profile in PREVIEW_PROFILE_VALUES {
+            assert!(
+                preview_profile_max_px(profile).is_some(),
+                "no cap for {profile}"
+            );
+        }
+        assert_eq!(preview_profile_max_px("grid_320"), None);
+        assert_eq!(preview_profile_max_px("preview_9999"), None);
+    }
+
+    #[test]
+    fn tier_dimensions_fit_the_box_and_never_upscale() {
+        assert_eq!(preview_tier_dimensions(8000, 4000, 2048), (2048, 1024));
+        assert_eq!(preview_tier_dimensions(4000, 8000, 2048), (1024, 2048));
+        // Already inside the box: unchanged.
+        assert_eq!(preview_tier_dimensions(1000, 500, 2048), (1000, 500));
+        // Never collapse a dimension to zero on extreme ratios.
+        assert_eq!(preview_tier_dimensions(20000, 3, 2048), (2048, 1));
+    }
+
+    #[test]
+    fn generates_a_downscaled_webp_tier_from_a_large_original() {
+        let dir = std::env::temp_dir().join(format!(
+            "megle_preview_tier_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("huge.png");
+        let mut buffer = image::RgbaImage::new(5000, 500);
+        for pixel in buffer.pixels_mut() {
+            *pixel = image::Rgba([30, 60, 90, 255]);
+        }
+        image::DynamicImage::ImageRgba8(buffer)
+            .save(&source)
+            .expect("write fixture");
+
+        let tier = generate_preview_webp(&source, 2048).expect("tier generation");
+
+        assert_eq!(tier.width, 2048);
+        assert_eq!(tier.height, 204);
+        assert_eq!(tier.output_format, GENERATED_FORMAT);
+        assert_eq!(tier.byte_size, tier.data.len() as i64);
+        // RIFF....WEBP
+        assert_eq!(&tier.data[0..4], b"RIFF");
+        assert_eq!(&tier.data[8..12], b"WEBP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cap_larger_than_the_source_transcodes_without_upscaling() {
+        let dir = std::env::temp_dir().join(format!(
+            "megle_preview_transcode_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("medium.png");
+        let mut buffer = image::RgbaImage::new(640, 480);
+        for pixel in buffer.pixels_mut() {
+            *pixel = image::Rgba([7, 7, 7, 255]);
+        }
+        image::DynamicImage::ImageRgba8(buffer)
+            .save(&source)
+            .expect("write fixture");
+
+        let transcoded = generate_preview_webp(&source, PREVIEW_NATIVE_MAX_PX).expect("transcode");
+
+        assert_eq!((transcoded.width, transcoded.height), (640, 480));
+        assert_eq!(&transcoded.data[8..12], b"WEBP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_generation_reports_chain_failures_verbatim() {
+        let dir = std::env::temp_dir().join(format!(
+            "megle_preview_fail_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("sensor.raw");
+        std::fs::write(&source, b"not decodable").expect("write fixture");
+
+        let error = generate_preview_webp(&source, 2048).expect_err("no decoder for .raw");
+
+        assert!(
+            error.to_string().contains(crate::decode::NO_DECODER_MARKER),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {
