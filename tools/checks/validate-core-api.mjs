@@ -382,10 +382,20 @@ if (!migrationSql.includes("PRAGMA journal_mode = WAL")) {
 }
 
 function functionBody(name) {
-  // `async` is optional: the pure resolvers (`resolve_preview_plan`) are plain
-  // sync fns, and every route handler this is asked about is defined exactly
-  // once, so the optional prefix cannot select a different definition.
-  const match = routesRs.match(new RegExp(`(?:async )?fn ${name}[^]*?\\n}\\n`, "m"));
+  // Anchored on purpose, not merely widened. `^` (with the `m` flag) pins the
+  // match to a TOP-LEVEL definition, and the literal `(` after the name pins it
+  // to exactly this function. Both matter:
+  //   - without `\(`, functionBody("get_thumbnail") can select
+  //     `fn get_thumbnail_blob`, and the assertions then check the wrong body;
+  //   - without `^`, a sync `fn` nested in an `impl` block can win — and since
+  //     such a method ends with "\n    }\n" rather than "\n}\n", the lazy body
+  //     capture runs straight past its end and swallows every sibling method,
+  //     which makes the `.includes()` assertions below FALSELY PASS.
+  // `async` stays optional because the pure resolvers (`resolve_preview_plan`)
+  // are plain sync fns.
+  const match = routesRs.match(
+    new RegExp(`^(?:pub(?:\\(crate\\))? )?(?:async )?fn ${name}\\([^]*?\\n}\\n`, "m")
+  );
   return match?.[0] ?? "";
 }
 
@@ -685,7 +695,12 @@ for (const value of [
   "PREVIEW_TIER_HEADER",
   "viewport_long_px"
 ]) {
-  if (!previewBody.includes(value) && !routesRs.includes(value)) {
+  // Strictly `previewBody`, like the loop above. Every one of these tokens also
+  // occurs elsewhere in routes.rs (the struct field, the top-level const, the
+  // definitions themselves, the test imports), so an "|| routesRs.includes"
+  // escape hatch would let the whole loop pass even if get_preview stopped
+  // calling the resolver entirely.
+  if (!previewBody.includes(value)) {
     fail(`GET /api/media/{fileId}/preview must resolve its source: missing ${value}`);
   }
 }

@@ -607,6 +607,37 @@ describe("createCoreClient", () => {
     assert.equal(recorded[0].url, `${BASE_URL}/media/42/preview?v=42%3A1000%3A2048%3Aready`);
   });
 
+  test("getPreviewResource serializes a measured viewport", async () => {
+    mockFetch("tier bytes");
+    const resource = await client().getPreviewResource(42, { viewportLongPx: 1366.4 });
+    assert.equal(recorded[0].url, `${BASE_URL}/media/42/preview?viewportLongPx=1366`);
+    // No x-megle-preview-tier on the mock response, so the client falls back to
+    // "original" rather than reporting an undefined tier.
+    assert.equal(resource.tier, "original");
+  });
+
+  test("getPreviewResource drops a non-finite viewport instead of sending NaN", async () => {
+    // The viewport is measured off the DOM, so NaN is the ORDINARY failure mode
+    // (unmounted or not-yet-laid-out element). `String(Math.round(NaN))` is the
+    // literal "NaN", which the server's typed query extractor rejects with 400 —
+    // the preview would fail to load entirely instead of degrading to the
+    // original bytes.
+    for (const viewportLongPx of [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY
+    ]) {
+      recorded = [];
+      mockFetch("original bytes");
+      await client().getPreviewResource(42, { viewportLongPx });
+      assert.equal(
+        recorded[0].url,
+        `${BASE_URL}/media/42/preview`,
+        `viewportLongPx=${viewportLongPx} must be dropped, not serialized`
+      );
+    }
+  });
+
   test("getThumbnail requests the default grid target", async () => {
     mockFetch({
       fileId: 42,

@@ -284,12 +284,25 @@ fn resolve_preview_plan(
         return None;
     }
     if let Some(profile) = select_preview_profile(source_max_px, viewport_long_px) {
-        return Some(PreviewPlan {
-            profile,
-            max_px: preview_profile_max_px(profile)?,
-        });
+        match preview_profile_max_px(profile) {
+            Some(max_px) => return Some(PreviewPlan { profile, max_px }),
+            // Unreachable: `select_preview_profile` only ever returns a member of
+            // `PREVIEW_PROFILE_VALUES`, and `preview_profile_max_px` maps every
+            // one of them. Written as an explicit arm rather than `?` because `?`
+            // returns `None` from the WHOLE function and thereby skips the
+            // browser-renderable check below — i.e. it would silently stream raw
+            // bytes for a format Chromium cannot paint. Falling through keeps
+            // that check reachable, and the debug line makes the miss findable.
+            None => crate::debug_log!("preview profile has no max_px mapping: {profile}"),
+        }
     }
-    if !crate::decode::formats::is_browser_renderable_image(ext) {
+    // The transcode branch requires a REPORTED viewport. A client that sends no
+    // `viewportLongPx` is asking for the pre-pipeline behaviour — the original
+    // bytes, verbatim — and that request must keep succeeding. Transcoding here
+    // instead would route every `.raw` (no decoder claims it at all) and every
+    // `.heic`/`.heif`/`.psd` (ffmpeg-only, and ffmpeg may not be on PATH) into a
+    // decode that fails, turning a 200 into a 500 for a URL that used to work.
+    if viewport_long_px > 0 && !crate::decode::formats::is_browser_renderable_image(ext) {
         // Small enough that no tier applies, but the browser still cannot paint
         // it — transcode at (bounded) native resolution.
         return Some(PreviewPlan {
@@ -1328,7 +1341,16 @@ async fn get_preview(
         source_max_px,
         query.viewport_long_px.unwrap_or(0),
     ) {
-        return serve_cached_preview_webp(state, file_id, plan, source_path, &metadata).await;
+        // `Ok(None)` means the representation could not be produced (no decoder
+        // for the format, ffmpeg missing, NAS blip, locked file). That is a
+        // degradation, not a failure: fall through to the raw-stream branch
+        // below, which is exactly what this route served before the preview
+        // pipeline existed. Only a decode PANIC propagates as an error.
+        if let Some(response) =
+            serve_cached_preview_webp(state, file_id, plan, &source_path, &metadata).await?
+        {
+            return Ok(response);
+        }
     }
 
     let body = Body::from_stream(ReaderStream::new(file));
@@ -1349,13 +1371,18 @@ async fn get_preview(
 /// background full-resolution upgrade is still worth requesting.
 const PREVIEW_TIER_HEADER: &str = "x-megle-preview-tier";
 
+/// Serve one cached-or-generated WebP preview representation.
+///
+/// `Ok(None)` is the DEGRADE signal: the plan was valid but the representation
+/// could not be produced, and the caller must fall back to streaming the
+/// original bytes. Only a decode panic (a bug) becomes an `Err`.
 async fn serve_cached_preview_webp(
     state: AppState,
     file_id: i64,
     plan: PreviewPlan,
-    source_path: std::path::PathBuf,
+    source_path: &FilePath,
     metadata: &std::fs::Metadata,
-) -> ApiResult<Response> {
+) -> ApiResult<Option<Response>> {
     use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 
     let source_size = metadata.len() as i64;
@@ -1378,13 +1405,29 @@ async fn serve_cached_preview_webp(
             // Decode on the blocking pool, NEVER inside the writer closure: the
             // writer owns the process's single write connection, and a
             // multi-hundred-millisecond decode there would stall every write.
-            let generation_path = source_path.clone();
-            let generated = tokio::task::spawn_blocking(move || {
+            let generation_path = source_path.to_path_buf();
+            let outcome = tokio::task::spawn_blocking(move || {
                 generate_preview_webp(&generation_path, plan.max_px)
             })
             .await
-            .map_err(|err| CoreError::internal(format!("preview generation panicked: {err}")))?
-            .map_err(|err| CoreError::internal(err.to_string()))?;
+            // A panic is a bug in the decode path, not a runtime degradation.
+            .map_err(|err| CoreError::internal(format!("preview generation panicked: {err}")))?;
+            let generated = match outcome {
+                Ok(generated) => generated,
+                Err(error) => {
+                    // Degrade instead of failing. Every reason this fires — no
+                    // decoder for the format, ffmpeg not on PATH, an unreachable
+                    // NAS, a locked file, OOM — leaves the ORIGINAL bytes
+                    // perfectly servable, and those are what this route returned
+                    // before the preview pipeline existed. A 500 here would blank
+                    // out a picture that used to display fine.
+                    crate::debug_log!(
+                        "preview tier generation failed (file {file_id}, profile {}): {error:#}",
+                        plan.profile
+                    );
+                    return Ok(None);
+                }
+            };
 
             let now = crate::db::unix_timestamp();
             let record = PreviewBlobRecord {
@@ -1411,14 +1454,17 @@ async fn serve_cached_preview_webp(
         }
     };
 
-    Response::builder()
+    let response = Response::builder()
         .header(CONTENT_TYPE, blob.output_format)
         // Same policy as the original-bytes branch: the frontend owns caching,
         // and a tier can legitimately change when the source file changes.
         .header(CACHE_CONTROL, "private, max-age=0, must-revalidate")
         .header(PREVIEW_TIER_HEADER, plan.profile)
         .body(axum::body::Body::from(blob.data))
-        .map_err(|err| CoreError::bad_request(format!("failed to build preview response: {err}")))
+        .map_err(|err| {
+            CoreError::bad_request(format!("failed to build preview response: {err}"))
+        })?;
+    Ok(Some(response))
 }
 
 async fn list_tasks(State(state): State<AppState>) -> ApiResult<Json<ListResponse<TaskRecord>>> {
@@ -3071,6 +3117,21 @@ mod tests {
         }
     }
 
+    /// Bytes for the one fixture NO decoder can read. `.raw` is indexed as an
+    /// image (the user still expects to see it in the grid) but is claimed by
+    /// neither `ImageCrateDecoder` nor `FfmpegDecoder`, so every generation
+    /// attempt fails with `NO_DECODER_MARKER`. That is the degradation path the
+    /// route has to survive without turning a working 200 into a 500.
+    const UNDECODABLE_SOURCE_BYTES: &[u8] =
+        b"megle-test-raw-sensor-payload-no-decoder-handles-this";
+
+    /// A JPEG header with no scan data behind it: the file OPENS fine (so the
+    /// route reaches the tier path) and then fails to decode, which is what a
+    /// truncated download, a half-written file, or a mid-read NAS drop looks
+    /// like to the decoder.
+    const TRUNCATED_JPEG_BYTES: &[u8] =
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00 truncated before any scan data";
+
     async fn preview_harness() -> PreviewHarness {
         preview_harness_with_image("original.jpg", 640, 480).await
     }
@@ -3080,12 +3141,41 @@ mod tests {
     }
 
     async fn preview_harness_with_image(name: &str, width: u32, height: u32) -> PreviewHarness {
+        preview_harness_with_source(name, width, height, |path| {
+            image::DynamicImage::new_rgb8(width, height)
+                .save(path)
+                .expect("write preview source image");
+        })
+        .await
+    }
+
+    async fn preview_harness_with_undecodable_source() -> PreviewHarness {
+        preview_harness_with_source("camera.raw", 640, 480, |path| {
+            fs::write(path, UNDECODABLE_SOURCE_BYTES).expect("write undecodable preview source");
+        })
+        .await
+    }
+
+    /// Indexed as a 16384px JPEG — so the resolver plans a real downscale tier
+    /// for a format the browser CAN paint — while the bytes on disk are
+    /// undecodable.
+    async fn preview_harness_with_undecodable_large_image() -> PreviewHarness {
+        preview_harness_with_source("truncated.jpg", 16384, 16384, |path| {
+            fs::write(path, TRUNCATED_JPEG_BYTES).expect("write truncated preview source");
+        })
+        .await
+    }
+
+    async fn preview_harness_with_source(
+        name: &str,
+        width: u32,
+        height: u32,
+        write_source: impl FnOnce(&std::path::Path),
+    ) -> PreviewHarness {
         let temp_root = unique_temp_dir();
         fs::create_dir_all(&temp_root).expect("create preview root");
         let source_path = temp_root.join(name);
-        image::DynamicImage::new_rgb8(width, height)
-            .save(&source_path)
-            .expect("write preview source image");
+        write_source(&source_path);
         let size = fs::metadata(&source_path)
             .expect("stat preview source image")
             .len() as i64;
@@ -3183,6 +3273,23 @@ mod tests {
         assert!(resolve_preview_plan(None, ".bin", 16384, 1920).is_none());
     }
 
+    #[test]
+    fn preview_plan_never_transcodes_without_a_reported_viewport() {
+        // The Critical safety property of this pipeline: a client that sends no
+        // `viewportLongPx` gets byte-identical behaviour to the pre-pipeline
+        // route. `select_preview_profile` already returns `None` for viewport 0,
+        // so without an explicit gate control simply falls through into the
+        // transcode branch — and every one of these extensions then 500s.
+        // `.raw` is claimed by no decoder at all; `.heic`/`.heif`/`.psd` are
+        // ffmpeg-only and fail whenever ffmpeg is not on PATH.
+        assert!(resolve_preview_plan(Some("image"), ".heic", 2000, 0).is_none());
+        assert!(resolve_preview_plan(Some("image"), ".raw", 2000, 0).is_none());
+        assert!(resolve_preview_plan(Some("image"), ".heif", 12000, 0).is_none());
+        assert!(resolve_preview_plan(Some("image"), ".psd", 640, 0).is_none());
+        assert!(resolve_preview_plan(Some("image"), ".tif", 16384, 0).is_none());
+        assert!(resolve_preview_plan(Some("image"), ".tiff", 640, 0).is_none());
+    }
+
     #[tokio::test]
     async fn preview_route_streams_original_bytes_when_no_viewport_is_reported() {
         let harness = preview_harness().await;
@@ -3221,6 +3328,147 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("original")
         );
+
+        // An unknown query key must stay ignored. `serde` ignores unknown fields
+        // by default and every future cache-buster relies on it; pinned here so
+        // adding `deny_unknown_fields` later cannot silently 400 the app's own
+        // preview requests.
+        let unknown_key = harness
+            .get(&format!(
+                "/api/media/{}/preview?v=42&somethingNew=abc",
+                harness.file_id
+            ))
+            .await;
+        assert_eq!(unknown_key.status(), StatusCode::OK);
+
+        // A MALFORMED viewport, by contrast, is a client bug and is reported as
+        // one rather than silently coerced. This is the single input-space
+        // difference the typed query extractor introduced, so lock it in.
+        for malformed in ["abc", "-1", "1.5"] {
+            let rejected = harness
+                .get(&format!(
+                    "/api/media/{}/preview?viewportLongPx={malformed}",
+                    harness.file_id
+                ))
+                .await;
+            assert_eq!(
+                rejected.status(),
+                StatusCode::BAD_REQUEST,
+                "viewportLongPx={malformed} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_route_falls_back_to_original_bytes_when_generation_fails() {
+        // A `.raw` is indexed as an image and is not browser-renderable, so with
+        // a reported viewport the resolver legitimately plans a native
+        // transcode — but no decoder claims `.raw`, so generation always fails.
+        // The route must DEGRADE to the original bytes instead of 500ing; the
+        // same degradation covers a NAS blip or a locked file on an ordinary
+        // large JPEG that genuinely earned a tier.
+        let harness = preview_harness_with_undecodable_source().await;
+
+        let response = harness
+            .get(&format!(
+                "/api/media/{}/preview?viewportLongPx=1366",
+                harness.file_id
+            ))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-megle-preview-tier")
+                .and_then(|value| value.to_str().ok()),
+            Some("original")
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read degraded preview body");
+        assert_eq!(&bytes[..], UNDECODABLE_SOURCE_BYTES);
+
+        // A failed generation must not poison the tier cache with a row the next
+        // request would happily serve.
+        assert!(harness
+            .database()
+            .get_preview_blob(harness.file_id, PREVIEW_NATIVE_PROFILE)
+            .expect("query")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn preview_route_falls_back_to_original_bytes_when_a_tier_cannot_be_generated() {
+        // The other half of the degradation, on a path the viewport gate does
+        // NOT cover: an ordinary BROWSER-RENDERABLE JPEG, large enough to
+        // legitimately earn a downscale tier, whose generation then fails
+        // (truncated file, NAS blip, file lock, OOM). It displayed perfectly by
+        // streaming the original before this pipeline existed, and it must keep
+        // doing so instead of turning into a 500.
+        let harness = preview_harness_with_undecodable_large_image().await;
+
+        let response = harness
+            .get(&format!(
+                "/api/media/{}/preview?viewportLongPx=1366",
+                harness.file_id
+            ))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-megle-preview-tier")
+                .and_then(|value| value.to_str().ok()),
+            Some("original")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/jpeg")
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read degraded preview body");
+        assert_eq!(&bytes[..], TRUNCATED_JPEG_BYTES);
+
+        for profile in [PREVIEW_2048_PROFILE, PREVIEW_3072_PROFILE] {
+            assert!(
+                harness
+                    .database()
+                    .get_preview_blob(harness.file_id, profile)
+                    .expect("query")
+                    .is_none(),
+                "a failed generation must not cache {profile}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_route_streams_an_undecodable_source_without_a_viewport() {
+        // The same undecodable file with NO viewport never even plans a
+        // transcode, so it takes the untouched raw-stream path.
+        let harness = preview_harness_with_undecodable_source().await;
+
+        let response = harness
+            .get(&format!("/api/media/{}/preview", harness.file_id))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-megle-preview-tier")
+                .and_then(|value| value.to_str().ok()),
+            Some("original")
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read original preview body");
+        assert_eq!(&bytes[..], UNDECODABLE_SOURCE_BYTES);
     }
 
     #[tokio::test]
@@ -3255,8 +3503,40 @@ mod tests {
         assert!(cached.byte_size > 0);
         assert_eq!(cached.width, 2048);
 
+        // Prove "no decode" rather than asserting it in a comment. `updated_at`
+        // has whole-second granularity, so a plain before/after comparison would
+        // still pass if the tier were regenerated inside the same second. Stamp
+        // a sentinel `unix_timestamp()` can never produce and require it to
+        // survive: `get_preview_blob` is a plain SELECT that never touches
+        // `updated_at`, so only a regenerating upsert can clear it.
+        const CACHE_READ_SENTINEL: i64 = 1;
+        harness
+            .database()
+            .upsert_preview_blob(PreviewBlobRecord {
+                updated_at: CACHE_READ_SENTINEL,
+                ..cached.clone()
+            })
+            .expect("stamp the cache-read sentinel");
+
         let second = harness.get(&path).await;
         assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .headers()
+                .get("x-megle-preview-tier")
+                .and_then(|value| value.to_str().ok()),
+            Some(PREVIEW_2048_PROFILE)
+        );
+        assert_eq!(
+            harness
+                .database()
+                .get_preview_blob(harness.file_id, PREVIEW_2048_PROFILE)
+                .expect("query")
+                .expect("tier still cached")
+                .updated_at,
+            CACHE_READ_SENTINEL,
+            "the second request must be a pure cache read, not a regeneration"
+        );
     }
 
     #[tokio::test]

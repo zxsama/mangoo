@@ -727,7 +727,17 @@ function query(params: QueryParams): string {
   if ("v" in params && params.v !== null && params.v !== undefined) {
     search.set("v", String(params.v));
   }
-  if ("viewportLongPx" in params && typeof params.viewportLongPx === "number") {
+  // `typeof === "number"` is true for NaN and Infinity, and both stringify into
+  // a value the server's typed extractor rejects with a 400 — killing the
+  // preview outright. NaN is the ORDINARY failure mode here: the viewport is
+  // measured off the DOM, and an unmounted or not-yet-laid-out element measures
+  // as NaN. Drop the parameter instead, which degrades to "give me the
+  // original" rather than to a broken request.
+  if (
+    "viewportLongPx" in params &&
+    typeof params.viewportLongPx === "number" &&
+    Number.isFinite(params.viewportLongPx)
+  ) {
     search.set("viewportLongPx", String(Math.max(1, Math.round(params.viewportLongPx))));
   }
   const value = search.toString();

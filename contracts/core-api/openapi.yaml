@@ -377,8 +377,25 @@ paths:
               schema:
                 type: string
                 format: binary
+        "400":
+          description: Malformed viewportLongPx query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Media item or source file not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: >-
+            Preview generation panicked. A generation FAILURE (no decoder for
+            the format, decoder binary missing, unreachable source) is not an
+            error here — it degrades to the original bytes with
+            x-megle-preview-tier: original — so only an internal panic, which is
+            a bug, reaches this status.
           content:
             application/json:
               schema:
