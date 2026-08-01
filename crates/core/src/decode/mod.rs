@@ -8,6 +8,8 @@
 //! next claiming decoder runs. That is what lets `image` lose on an exotic
 //! TIFF variant and ffmpeg still produce a picture.
 
+pub mod image_crate;
+
 use std::fmt::Write as _;
 use std::path::Path;
 
