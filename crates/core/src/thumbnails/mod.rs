@@ -201,12 +201,22 @@ pub fn generate_image_thumbnail_bytes_with_checkpoint(
     source_path: &Path,
     mut checkpoint: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<GeneratedThumbnail> {
-    let reader = ImageReader::open(source_path)
-        .map_err(|error| anyhow::anyhow!("thumbnail decode failed: {error}"))?
-        .with_guessed_format()
+    let ext = crate::decode::formats::lowercase_extension(source_path);
+    // `target_max_px: None` on purpose. `source_width`/`source_height` below are
+    // persisted straight into `media.width/height` and drive both the grid's
+    // aspect ratios and the preview's natural frame; letting a decoder pre-scale
+    // would report the scaled size as the original's. The cost lands once per
+    // file, and only on formats that produce nothing at all today.
+    let decoded = crate::decode::shared_registry()
+        .decode(&crate::decode::DecodeRequest {
+            source: crate::decode::MediaSource::Path(source_path),
+            ext: ext.as_str(),
+            target_max_px: None,
+            purpose: crate::decode::DecodePurpose::Thumbnail,
+        })
         .map_err(|error| anyhow::anyhow!("thumbnail decode failed: {error}"))?;
-    let decoded = reader
-        .decode()
+    let decoded = decoded
+        .into_dynamic()
         .map_err(|error| anyhow::anyhow!("thumbnail decode failed: {error}"))?;
     checkpoint()?;
 
@@ -454,6 +464,14 @@ impl ThumbnailFailureKind {
 /// unreachable / contention / memory — will succeed on retry once conditions
 /// recover) or permanent (unsupported format / corrupt file — retrying is
 /// futile). Pure function on the stored error string.
+///
+/// Errors now arrive from the decode chain, so a single string can carry every
+/// link's failure ("all decoders failed for \".tif\": image_crate: ...; ffmpeg:
+/// ..."). That is exactly the semantics the classifier wants: a `contains`
+/// match means ANY link hit a transient condition, so the attempt is worth
+/// retrying, while a chain that failed purely on format grounds — or a
+/// `no decoder handles` / `decoder unavailable` result — falls through to
+/// permanent and is never auto-retried.
 pub fn classify_thumbnail_failure(error: &str) -> ThumbnailFailureKind {
     const TRANSIENT_SIGNATURES: &[&str] = &[
         "os error 53",    // Windows: network path not found
@@ -501,6 +519,97 @@ mod tests {
         ] {
             assert!(matches!(classify_thumbnail_failure(e), Permanent), "should be permanent: {e}");
         }
+    }
+
+    #[test]
+    fn chain_failures_stay_permanent_but_inherit_a_transient_link() {
+        use super::{classify_thumbnail_failure, ThumbnailFailureKind::*};
+        // Nothing in the chain claimed the format: genuinely unsupported.
+        assert!(matches!(
+            classify_thumbnail_failure("thumbnail decode failed: no decoder handles \".raw\""),
+            Permanent
+        ));
+        // Every claiming decoder failed on format grounds: still permanent.
+        assert!(matches!(
+            classify_thumbnail_failure(
+                "thumbnail decode failed: all decoders failed for \".tif\": image_crate: unsupported compression; ffmpeg: ffmpeg exit 1 stderr: Invalid data"
+            ),
+            Permanent
+        ));
+        // One link hit a network drop: the whole attempt is retryable, because
+        // the aggregate preserves each link's text verbatim.
+        assert!(matches!(
+            classify_thumbnail_failure(
+                "thumbnail decode failed: all decoders failed for \".tif\": image_crate: os error 53; ffmpeg: ffmpeg spawn: 找不到网络路径。"
+            ),
+            Transient
+        ));
+    }
+
+    #[test]
+    fn a_missing_ffmpeg_is_permanent_and_names_itself() {
+        use super::{classify_thumbnail_failure, ThumbnailFailureKind::*};
+        let error = "thumbnail decode failed: all decoders failed for \".heic\": ffmpeg: decoder unavailable: ffmpeg is not installed or not on PATH";
+        // Permanent on purpose: an uninstalled ffmpeg will not install itself,
+        // and transient would arm the 60s retry sweep against every AVIF/HEIC
+        // in the library forever.
+        assert!(matches!(classify_thumbnail_failure(error), Permanent));
+        assert!(error.contains("decoder unavailable"));
+    }
+
+    #[test]
+    fn image_thumbnail_generation_flows_through_the_decoder_registry() {
+        let dir = std::env::temp_dir().join(format!(
+            "megle_thumb_registry_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("wide.png");
+        let mut buffer = image::RgbaImage::new(900, 450);
+        for pixel in buffer.pixels_mut() {
+            *pixel = image::Rgba([200, 100, 50, 255]);
+        }
+        image::DynamicImage::ImageRgba8(buffer)
+            .save(&source)
+            .expect("write fixture");
+
+        let generated =
+            generate_image_thumbnail_bytes(&source).expect("registry-backed generation");
+
+        // Short side is exactly the profile; the true source dimensions survive
+        // for media.width/height.
+        assert_eq!(generated.height, GRID_320_SHORT_SIDE_PX);
+        assert_eq!(generated.source_width, 900);
+        assert_eq!(generated.source_height, 450);
+        assert!(generated.byte_size > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unclaimed_format_reports_the_no_decoder_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "megle_thumb_nodecoder_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("camera.raw");
+        std::fs::write(&source, b"raw sensor bytes").expect("write fixture");
+
+        let error = generate_image_thumbnail_bytes(&source).expect_err("no decoder claims .raw");
+
+        assert!(
+            error.to_string().contains(crate::decode::NO_DECODER_MARKER),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

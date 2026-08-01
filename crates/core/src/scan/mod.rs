@@ -10,6 +10,7 @@ use crate::db::{
     Database, FileUpsert, FolderUpsert, RootRecord, ScanFileUpsert, ScanWriteBatch,
     TaskScanProgress,
 };
+use crate::decode::formats::{lowercase_extension as extension, media_kind_for_path as media_kind};
 
 pub const INTERACTIVE_SCAN_WRITE_BATCH_SIZE: usize = 1;
 pub const BACKGROUND_SCAN_WRITE_BATCH_SIZE: usize = 256;
@@ -699,22 +700,6 @@ fn emit_progress(options: &mut ScanOptions<'_>, items_seen: i64, summary: &ScanS
             skipped_files: summary.skipped_files as i64,
         });
     }
-}
-
-fn media_kind(path: &Path) -> Option<&'static str> {
-    match extension(path).as_str() {
-        ".avif" | ".bmp" | ".gif" | ".heic" | ".jpeg" | ".jpg" | ".png" | ".psd" | ".raw"
-        | ".tif" | ".tiff" | ".webp" => Some("image"),
-        ".avi" | ".m4v" | ".mkv" | ".mov" | ".mp4" | ".webm" | ".wmv" => Some("video"),
-        _ => None,
-    }
-}
-
-fn extension(path: &Path) -> String {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .map(|value| format!(".{}", value.to_ascii_lowercase()))
-        .unwrap_or_default()
 }
 
 fn file_name(path: &Path) -> String {

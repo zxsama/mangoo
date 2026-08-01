@@ -9,6 +9,7 @@ use notify::event::{ModifyKind, RenameMode};
 use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::db::{Database, DbWriter, FileUpsert, NotificationOrigin, RootRecord};
+use crate::decode::formats::{lowercase_extension as extension, media_kind_for_path as media_kind};
 use crate::tasks::TaskSender;
 
 const EVENT_COALESCE_WINDOW: Duration = Duration::from_millis(100);
@@ -387,22 +388,6 @@ fn queue_root_rescan(
         }
     }
     Ok(true)
-}
-
-fn media_kind(path: &Path) -> Option<&'static str> {
-    match extension(path).as_str() {
-        ".avif" | ".bmp" | ".gif" | ".heic" | ".jpeg" | ".jpg" | ".png" | ".psd" | ".raw"
-        | ".tif" | ".tiff" | ".webp" => Some("image"),
-        ".avi" | ".m4v" | ".mkv" | ".mov" | ".mp4" | ".webm" | ".wmv" => Some("video"),
-        _ => None,
-    }
-}
-
-fn extension(path: &Path) -> String {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .map(|value| format!(".{}", value.to_ascii_lowercase()))
-        .unwrap_or_default()
 }
 
 fn file_name(path: &Path) -> String {
