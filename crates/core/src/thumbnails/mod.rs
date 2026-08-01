@@ -558,12 +558,15 @@ mod tests {
     }
 
     #[test]
-    fn heif_reaches_a_decoder_instead_of_falling_off_the_format_table() {
-        // The two halves of .heif support live in different files: the format
-        // table (decode/formats.rs) decides it is indexed at all, and
-        // FfmpegDecoder decides it is claimed. Asserting each half separately
-        // would still pass if an edit dropped .heif from either one, so join
-        // them here through the real thumbnail entry point.
+    fn heif_is_routed_to_a_decoder_rather_than_reported_unsupported() {
+        // Scope: this locks the DECODER half of `.heif` support only —
+        // `FfmpegDecoder::SUPPORTED_EXTENSIONS` claiming it, and the lowercasing
+        // in `lowercase_extension` being on the thumbnail path.
+        //
+        // It does NOT cover `formats::IMAGE_EXTENSIONS`: this entry point never
+        // reads that table. `IMAGE_EXTENSIONS` gates *indexing*, in scan and the
+        // watcher. The join of the two halves lives in
+        // `scan::tests::scan_indexes_heif_as_an_image_through_the_shared_format_table`.
         let dir = std::env::temp_dir().join(format!(
             "megle_thumb_heif_{}_{}",
             std::process::id(),
@@ -582,8 +585,11 @@ mod tests {
             generate_image_thumbnail_bytes(&source).expect_err("junk payload cannot decode");
         let text = error.to_string();
 
-        // The point: it must have been ROUTED to a decoder. Reaching
-        // NO_DECODER_MARKER would mean .heif fell off the format table.
+        // The point: a decoder must have CLAIMED it. Reaching NO_DECODER_MARKER
+        // would mean `.heif` fell out of the ffmpeg decoder's extension list.
+        // Holds with or without ffmpeg installed: a missing binary yields
+        // "ffmpeg: decoder unavailable", which also names ffmpeg and is also not
+        // the no-decoder marker.
         assert!(
             !text.contains(crate::decode::NO_DECODER_MARKER),
             "heif must reach a decoder, got: {text}"

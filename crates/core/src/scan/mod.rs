@@ -804,6 +804,62 @@ mod tests {
     }
 
     #[test]
+    fn scan_indexes_heif_as_an_image_through_the_shared_format_table() {
+        // The real join for `.heif`. Scan is the production consumer of
+        // `decode::formats::IMAGE_EXTENSIONS`, so this is where "is it in the
+        // table" meets "does a real scan actually index it". The old private
+        // per-file tables listed `.heic` but not `.heif`; this locks that drift
+        // shut at the production entry point, which asserting on the constant
+        // alone cannot do.
+        //
+        // Deliberately says nothing about decoding or thumbnails, so it holds
+        // whether or not ffmpeg is installed.
+        let temp_root = unique_temp_dir();
+        fs::create_dir_all(&temp_root).expect("create temp root");
+        // Uppercase on purpose: proves the lowercasing in `lowercase_extension`
+        // is on the indexing path too.
+        fs::write(temp_root.join("photo.HEIF"), b"fake heif").expect("write heif");
+
+        let mut database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(NewRoot {
+                path: temp_root.to_string_lossy().to_string(),
+                display_name: "heif-scan-test".to_string(),
+            })
+            .expect("add root");
+        let root = database
+            .list_roots()
+            .expect("list roots")
+            .into_iter()
+            .find(|item| item.id == root_id)
+            .expect("find root");
+
+        let summary = scan_root(&mut database, &root).expect("scan root");
+        // Dropping `.heif` from IMAGE_EXTENSIONS flips these to 0 / 1.
+        assert_eq!(summary.media_files_seen, 1);
+        assert_eq!(summary.skipped_files, 0);
+
+        let page = database
+            .list_media_page(MediaPageQuery {
+                root_id: Some(root_id),
+                folder_id: None,
+                include_descendants: false,
+                limit: 10,
+                offset: None,
+                cursor: None,
+                sort: "name_asc".to_string(),
+                kind: None,
+            })
+            .expect("list media");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].name, "photo.HEIF");
+        assert_eq!(page.items[0].kind.as_deref(), Some("image"));
+
+        fs::remove_dir_all(temp_root).expect("cleanup temp root");
+    }
+
+    #[test]
     fn scan_root_with_tiny_write_batch_preserves_summary_and_media_rows() {
         let temp_root = unique_temp_dir();
         fs::create_dir_all(temp_root.join("photos").join("raw")).expect("create photos dir");
