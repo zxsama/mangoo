@@ -139,3 +139,34 @@ describe("scrubber visibility", () => {
     assert.ok(SCRUBBER_REVEAL_BAND_PX >= 80, `got ${SCRUBBER_REVEAL_BAND_PX}`);
   });
 });
+
+const { DEFAULT_PREVIEW_PREFERENCES, normalizePreviewPreferences } = await import(
+  "../src/features/preview/previewPreferences.ts"
+);
+
+describe("scrubber pin persistence", () => {
+  it("defaults to unpinned", () => {
+    assert.equal(DEFAULT_PREVIEW_PREFERENCES.previewScrubberPinned, false);
+  });
+
+  it("falls back for a blob written before the key existed", () => {
+    const normalized = normalizePreviewPreferences({ previewBufferLimitMb: 900 });
+    assert.equal(normalized.previewScrubberPinned, false);
+    assert.equal(normalized.previewBufferLimitMb, 900, "unrelated fields survive");
+  });
+
+  it("round-trips a pinned bar", () => {
+    assert.equal(
+      normalizePreviewPreferences({ previewScrubberPinned: true }).previewScrubberPinned,
+      true
+    );
+  });
+
+  it("coerces a non-boolean stored value rather than passing it through", () => {
+    assert.equal(
+      normalizePreviewPreferences({ previewScrubberPinned: "yes" as never })
+        .previewScrubberPinned,
+      false
+    );
+  });
+});

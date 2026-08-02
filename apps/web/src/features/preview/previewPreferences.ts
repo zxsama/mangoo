@@ -40,6 +40,9 @@ export interface PreviewPreferences {
   // Global and persisted; see previewRenderSettings.ts for what each maps to.
   previewRenderFilter: PreviewRenderFilter;
   previewChannel: PreviewChannel;
+  // Whether the preview scrubber stays visible instead of auto-hiding.
+  // BandiView calls the equivalent `lockControlBar`.
+  previewScrubberPinned: boolean;
 }
 
 export const PREVIEW_PREFERENCE_LIMITS = {
@@ -53,7 +56,8 @@ export const DEFAULT_PREVIEW_PREFERENCES: PreviewPreferences = {
   persistentThumbnailCacheAutoRefresh: false,
   thumbnailGenerationMode: DEFAULT_THUMBNAIL_GENERATION_MODE,
   previewRenderFilter: DEFAULT_PREVIEW_RENDER_FILTER,
-  previewChannel: DEFAULT_PREVIEW_CHANNEL
+  previewChannel: DEFAULT_PREVIEW_CHANNEL,
+  previewScrubberPinned: false
 };
 
 export function readStoredPreviewPreferences(): PreviewPreferences {
@@ -111,7 +115,10 @@ export function normalizePreviewPreferences(
       : DEFAULT_PREVIEW_RENDER_FILTER,
     previewChannel: PREVIEW_CHANNELS.some((option) => option.value === value.previewChannel)
       ? (value.previewChannel as PreviewChannel)
-      : DEFAULT_PREVIEW_CHANNEL
+      : DEFAULT_PREVIEW_CHANNEL,
+    // `=== true` rather than a truthiness check: a stored string like "yes"
+    // must normalise to false, not sneak through as truthy.
+    previewScrubberPinned: value.previewScrubberPinned === true
   };
 }
 
