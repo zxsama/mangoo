@@ -109,6 +109,18 @@ export function mediaCacheEpochToken(): number {
   return mediaCacheEpoch;
 }
 
+// Consumers outside `core/` (the preview bitmap pool lives in `features/`) need
+// to release resources on a library switch. A listener registry keeps the
+// dependency pointing the right way — core never imports a feature.
+const mediaCacheResetListeners = new Set<() => void>();
+
+export function registerMediaCacheResetListener(listener: () => void): () => void {
+  mediaCacheResetListeners.add(listener);
+  return () => {
+    mediaCacheResetListeners.delete(listener);
+  };
+}
+
 // Invalidate ALL media/thumbnail/preview caches for a library switch: bump the
 // epoch (so any straggler in-flight request resolves into a dead key) and clear
 // the number-keyed caches (which carry no epoch in their key). Call this the
@@ -123,6 +135,15 @@ export function resetMediaCachesForLibrarySwitch(): void {
   originalPreviewBlobCacheBytes = 0;
   clearThumbnailObjectUrlCacheInternal();
   clearOriginalFallbackObjectUrlCache();
+
+  for (const listener of [...mediaCacheResetListeners]) {
+    try {
+      listener();
+    } catch {
+      // One listener failing must never strand the rest of the invalidation:
+      // a half-cleared cache is exactly the cross-library "串图" bug.
+    }
+  }
 }
 const foregroundResourceRequestQueue: QueuedForegroundResourceRequest[] = [];
 

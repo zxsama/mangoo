@@ -16,6 +16,7 @@ const {
   originalPreviewBlobCache,
   readCachedOriginalFallbackObjectUrl,
   readCachedThumbnailObjectUrl,
+  registerMediaCacheResetListener,
   rememberThumbnailObjectUrl,
   requestOriginalPreviewBlob,
   resetMediaCachesForLibrarySwitch,
@@ -165,5 +166,37 @@ describe("media resource library isolation", () => {
       resetMediaCachesForLibrarySwitch();
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+describe("media cache reset listeners", () => {
+  it("notifies registered listeners on a library switch", () => {
+    let calls = 0;
+    const unregister = registerMediaCacheResetListener(() => {
+      calls += 1;
+    });
+
+    resetMediaCachesForLibrarySwitch();
+    assert.equal(calls, 1);
+
+    unregister();
+    resetMediaCachesForLibrarySwitch();
+    assert.equal(calls, 1, "an unregistered listener must not fire again");
+  });
+
+  it("keeps clearing caches even if a listener throws", () => {
+    const unregister = registerMediaCacheResetListener(() => {
+      throw new Error("listener exploded");
+    });
+    let secondRan = false;
+    const unregisterSecond = registerMediaCacheResetListener(() => {
+      secondRan = true;
+    });
+
+    resetMediaCachesForLibrarySwitch();
+
+    assert.equal(secondRan, true, "one bad listener must not strand the rest");
+    unregister();
+    unregisterSecond();
   });
 });
