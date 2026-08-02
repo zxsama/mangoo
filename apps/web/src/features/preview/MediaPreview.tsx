@@ -12,6 +12,8 @@ import {
   requestThumbnailBlob,
   thumbnailObjectUrlCacheKey
 } from "../../core/mediaResources";
+import { PreviewCanvas } from "./PreviewCanvas";
+import { selectPreviewRenderLane } from "./previewRenderLane";
 import { resolveVideoPreviewNaturalSize } from "./videoPreviewSizing";
 
 const STALE_PREVIEW_OBJECT_URL_REVOKE_DELAY_MS = 8000;
@@ -69,6 +71,27 @@ export function MediaPreview({
     hasLiveReadyThumbnail ? thumbnail.updatedAt : null
   );
   const fallbackUrl = fallbackThumbnail ?? previewPlaceholderUrl;
+
+  // Gate on the LITERAL `source` prop, not on `shouldUseOriginalWhilePending`.
+  // The inspector panel (PreviewPanel.tsx) renders source="thumbnail" with
+  // preferOriginalWhilePending, and routing that small sidebar surface into the
+  // bitmap pool would spend the preview budget on thumbnails.
+  if (
+    source === "original" &&
+    selectPreviewRenderLane({ source, kind: media.kind, ext: media.ext }) === "canvas"
+  ) {
+    return (
+      <PreviewCanvas
+        alt={media.name}
+        frameStyle={stableFrameStyle}
+        media={media}
+        onLoadingChange={onLoadingChange}
+        onMediaReady={onMediaReady}
+        onNaturalSize={onNaturalSize}
+        viewportLongPx={previewViewportLongPx()}
+      />
+    );
+  }
 
   if (source === "original" || shouldUseOriginalWhilePending) {
     return (
@@ -610,6 +633,18 @@ function decodePendingPreviewImage(image: HTMLImageElement): Promise<void> {
     return Promise.resolve();
   }
   return image.decode().catch(() => undefined);
+}
+
+// Longest side of the window in device pixels, which is what the fit-long-edge
+// preview fills. Core turns this into a tier choice; 0 means "unknown", which
+// Core reads as "send the original bytes verbatim". Exported because the
+// neighbour-prefetch effect in App.tsx must ask for the same tier.
+export function previewViewportLongPx(): number {
+  if (typeof window === "undefined") {
+    return 0;
+  }
+  const longest = Math.max(window.innerWidth, window.innerHeight);
+  return Math.max(1, Math.round(longest * (window.devicePixelRatio || 1)));
 }
 
 function previewStableFrameStyle(media: MediaRecord): CSSProperties | undefined {

@@ -2443,6 +2443,14 @@ button:disabled {
   display: block;
 }
 
+/* The canvas occupies the same box as the <img> it replaces; the wrapper's
+   transform still owns zoom and pan. `object-fit` is meaningless on a canvas
+   (its backing store is the decoded bitmap, deliberately smaller than the CSS
+   box for a downscaled tier), so the browser's own scaling does the fitting. */
+.preview-canvas {
+  display: block;
+}
+
 .preview-panel .preview-image,
 .preview-panel img,
 .preview-panel video {
