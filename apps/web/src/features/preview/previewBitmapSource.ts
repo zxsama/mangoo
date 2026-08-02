@@ -111,12 +111,40 @@ export function createDecodeDispatcher(transport: DecodeTransport) {
 }
 
 type Dispatcher = ReturnType<typeof createDecodeDispatcher>;
-let dispatcher: Dispatcher | null = null;
 
-function workerDispatcher(): Dispatcher | null {
-  if (dispatcher) {
-    return dispatcher;
-  }
+/**
+ * Holds the lazily-created Worker dispatcher and — the part that matters — lets
+ * it be INVALIDATED.
+ *
+ * A dead Worker's dispatcher must never stay cached. Posting to a terminated
+ * Worker gets no reply, so the pending entry never settles and the caller's
+ * promise hangs forever; every later decode would hang too. Dropping the
+ * dispatcher on failure means the next decode builds a fresh Worker, or falls
+ * back to the main thread, instead of posting into the void.
+ */
+export function createDispatcherHolder(make: () => Dispatcher | null) {
+  let current: Dispatcher | null = null;
+  return {
+    get(): Dispatcher | null {
+      if (!current) {
+        current = make();
+      }
+      return current;
+    },
+    invalidate(dispatcherToDrop: Dispatcher): void {
+      // Identity-checked so a late failure from an already-replaced Worker
+      // cannot discard its healthy successor.
+      if (current === dispatcherToDrop) {
+        current = null;
+      }
+    },
+    peek(): Dispatcher | null {
+      return current;
+    }
+  };
+}
+
+const workerHolder = createDispatcherHolder(() => {
   if (typeof Worker === "undefined") {
     return null;
   }
@@ -135,25 +163,52 @@ function workerDispatcher(): Dispatcher | null {
         onMessage = handler;
       }
     });
-    worker.onerror = () => created.rejectAll(new Error("preview decode worker failed"));
-    dispatcher = created;
-    return dispatcher;
+    worker.onerror = () => {
+      created.rejectAll(new Error("preview decode worker failed"));
+      workerHolder.invalidate(created);
+      worker.terminate();
+    };
+    return created;
   } catch {
     // Bundler or CSP refused the worker; fall back to main-thread decoding
     // rather than losing preview entirely.
     return null;
   }
-}
+});
 
-async function decodeBlob(blob: Blob, signal?: AbortSignal): Promise<PoolableBitmap> {
-  const worker = workerDispatcher();
-  if (worker) {
-    return worker.decode(blob, signal);
-  }
+/**
+ * Main-thread decode, used when no Worker could be created. `createBitmap` is
+ * injected so the abort contract is testable in the DOM-less test harness.
+ */
+export async function decodeBlobOnMainThread(
+  blob: Blob,
+  signal: AbortSignal | undefined,
+  createBitmap: (input: Blob) => Promise<PoolableBitmap>
+): Promise<PoolableBitmap> {
   if (signal?.aborted) {
     throw new DOMException("aborted", "AbortError");
   }
-  return (await createImageBitmap(blob)) as unknown as PoolableBitmap;
+  const bitmap = await createBitmap(blob);
+  if (signal?.aborted) {
+    // The Worker path closes a bitmap that lands after an abort; this path has
+    // to behave identically, or an aborted navigation silently keeps a live
+    // bitmap that nothing will ever pool, paint, or close.
+    bitmap.close();
+    throw new DOMException("aborted", "AbortError");
+  }
+  return bitmap;
+}
+
+async function decodeBlob(blob: Blob, signal?: AbortSignal): Promise<PoolableBitmap> {
+  const worker = workerHolder.get();
+  if (worker) {
+    return worker.decode(blob, signal);
+  }
+  return decodeBlobOnMainThread(
+    blob,
+    signal,
+    async (input) => (await createImageBitmap(input)) as unknown as PoolableBitmap
+  );
 }
 
 export const previewBitmapPool = new PreviewBitmapPool(0);
@@ -242,7 +297,7 @@ export function prefetchPreviewBitmap(
 
 export function releasePreviewBitmaps(): void {
   previewBitmapPool.clear();
-  dispatcher?.rejectAll(new Error("library switched"));
+  workerHolder.peek()?.rejectAll(new Error("library switched"));
 }
 
 // A library switch must release every decoded frame: ImageBitmaps do not free

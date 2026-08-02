@@ -7,7 +7,7 @@ register("./resolve-source-imports.mjs", import.meta.url);
   megleDesktop: { coreUrl: "http://127.0.0.1:47321/api" }
 };
 
-const { createDecodeDispatcher } = await import(
+const { createDecodeDispatcher, createDispatcherHolder, decodeBlobOnMainThread } = await import(
   "../src/features/preview/previewBitmapSource.ts"
 );
 
@@ -107,5 +107,118 @@ describe("preview decode dispatcher", () => {
 
     await assert.rejects(pending, /terminated/);
     assert.equal(dispatcher.pendingCount(), 0);
+  });
+});
+
+describe("decode dispatcher holder", () => {
+  it("builds the dispatcher lazily, exactly once, and reuses it", () => {
+    let built = 0;
+    const holder = createDispatcherHolder(() => {
+      built += 1;
+      return { rejectAll() {}, pendingCount: () => 0 } as never;
+    });
+
+    assert.equal(built, 0, "construction must not happen at module load");
+    const first = holder.get();
+    const second = holder.get();
+
+    assert.equal(built, 1);
+    assert.equal(first, second);
+  });
+
+  it("rebuilds after invalidation, so a dead worker cannot hang every later decode", () => {
+    // Regression: onerror used to rejectAll but leave the dispatcher cached.
+    // The next decode then posted into a TERMINATED worker, got no reply, and
+    // its promise never settled — a permanent hang, not a failure.
+    let built = 0;
+    const holder = createDispatcherHolder(() => {
+      built += 1;
+      return { id: built, rejectAll() {}, pendingCount: () => 0 } as never;
+    });
+
+    const dead = holder.get();
+    holder.invalidate(dead as never);
+    const fresh = holder.get();
+
+    assert.equal(built, 2, "a new dispatcher must be constructed after invalidation");
+    assert.notEqual(fresh, dead);
+  });
+
+  it("ignores invalidation from an already-replaced dispatcher", () => {
+    // A late failure from the old worker must not discard its healthy successor.
+    let built = 0;
+    const holder = createDispatcherHolder(() => {
+      built += 1;
+      return { id: built, rejectAll() {}, pendingCount: () => 0 } as never;
+    });
+
+    const dead = holder.get();
+    holder.invalidate(dead as never);
+    const fresh = holder.get();
+    holder.invalidate(dead as never);
+
+    assert.equal(holder.peek(), fresh, "the live dispatcher must survive a stale invalidation");
+    assert.equal(built, 2);
+  });
+
+  it("reports null without constructing when the factory declines", () => {
+    const holder = createDispatcherHolder(() => null);
+
+    assert.equal(holder.get(), null);
+    assert.equal(holder.peek(), null);
+  });
+});
+
+describe("main-thread decode fallback", () => {
+  function fakeBitmap() {
+    const bitmap = {
+      width: 4,
+      height: 4,
+      closed: false,
+      close() {
+        bitmap.closed = true;
+      }
+    };
+    return bitmap;
+  }
+
+  it("returns the bitmap when nothing aborted", async () => {
+    const bitmap = fakeBitmap();
+
+    const decoded = await decodeBlobOnMainThread(new Blob(["a"]), undefined, async () => bitmap);
+
+    assert.equal(decoded, bitmap);
+    assert.equal(bitmap.closed, false);
+  });
+
+  it("rejects without decoding when the signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let called = false;
+
+    await assert.rejects(
+      decodeBlobOnMainThread(new Blob(["a"]), controller.signal, async () => {
+        called = true;
+        return fakeBitmap();
+      }),
+      /abort/i
+    );
+    assert.equal(called, false, "an already-aborted request must not decode at all");
+  });
+
+  it("closes a bitmap whose decode finished after the caller aborted", async () => {
+    // Parity with the Worker path, which closes a late-arriving bitmap. Without
+    // this the fallback silently keeps a live bitmap nothing will pool or close.
+    const controller = new AbortController();
+    const bitmap = fakeBitmap();
+
+    await assert.rejects(
+      decodeBlobOnMainThread(new Blob(["a"]), controller.signal, async () => {
+        controller.abort();
+        return bitmap;
+      }),
+      /abort/i
+    );
+    assert.equal(bitmap.closed, true, "a bitmap decoded into an aborted request must be closed");
   });
 });
