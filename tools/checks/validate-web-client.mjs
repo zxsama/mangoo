@@ -143,6 +143,9 @@ const previewPrefetchWindowPath = "apps/web/src/app/previewPrefetchWindow.ts";
 const previewPrefetchWindow = existsSync(path.join(root, previewPrefetchWindowPath))
   ? read(previewPrefetchWindowPath)
   : "";
+const previewBitmapSource = read("apps/web/src/features/preview/previewBitmapSource.ts");
+const previewCanvas = read("apps/web/src/features/preview/PreviewCanvas.tsx");
+const previewNavigationGate = read("apps/web/src/app/previewNavigationGate.ts");
 const shellTitlebar = read("apps/web/src/app-shell/ShellTopBar.tsx");
 const shellOverlayHost = read("apps/web/src/app-shell/ShellOverlayHost.tsx");
 const shellNotificationOverlay = read("apps/web/src/app-shell/useShellNotificationOverlay.ts");
@@ -1681,7 +1684,13 @@ if (
   !/previewBufferLimitMb/.test(previewPreferences) ||
   !/readStoredPreviewPreferences/.test(app) ||
   !/storePreviewPreferences/.test(app) ||
-  !/configureOriginalPreviewBuffer/.test(app) ||
+  // The single user-facing buffer number is now SPLIT between the decoded
+  // ImageBitmap pool and the compressed-byte cache, so App calls one helper and
+  // previewBitmapSource owns the split. Assert both halves so the preference
+  // still provably reaches the byte cache it used to configure directly.
+  !/configurePreviewBuffers/.test(app) ||
+  !/configureOriginalPreviewBuffer/.test(previewBitmapSource) ||
+  !/configurePreviewBitmapBudget/.test(previewBitmapSource) ||
   !/previewPreferences\.previewBufferLimitMb/.test(app) ||
   !/浏览缓存/.test(settingsView) ||
   !/预览缓冲区/.test(settingsView)
@@ -1902,15 +1911,31 @@ if (
 if (!/orderedPreviewMedia/.test(app) || /library\.media\[selectedMediaIndex [+-] offset\]/.test(app)) {
   fail("App preview navigation must use the current sorted/windowed mediaSlots order instead of append-loaded library.media order");
 }
+// The preview navigation lock was REMOVED deliberately. It existed because every
+// step cost a full-resolution main-thread decode (measured 337ms at 16384px), so
+// an unlocked held arrow key queued unbounded work. The pre-decoded ImageBitmap
+// pool removed that cost, and PreviewCanvas aborts the request it outran, so the
+// lock became pure input lag. Guard the replacement invariant instead — and
+// guard the absence, so nobody reintroduces the lag by reflex.
 if (
-  !/previewNavigationLockedRef/.test(app) ||
+  !/canNavigatePreview/.test(previewNavigationGate) ||
+  !/direction === "previous"/.test(previewNavigationGate) ||
+  !/canNavigatePreview\(\{[\s\S]*?direction: "previous"[\s\S]*?\}\)/.test(app) ||
+  !/canNavigatePreview\(\{[\s\S]*?direction: "next"[\s\S]*?\}\)/.test(app) ||
   !/previewDisplayedMediaId/.test(app) ||
-  !/const\s+previewNavigationReady\s*=[\s\S]*?previewDisplayedMediaId\s*===\s*library\.selectedMediaId/.test(app) ||
   !/function\s+startPreviewNavigation/.test(app) ||
-  !/previewNavigationLockedRef\.current\s*=\s*true[\s\S]*?library\.setSelectedMediaId/.test(app) ||
   !/onPreviewMediaSettled=\{handlePreviewMediaSettled\}/.test(app)
 ) {
-  fail("App preview navigation must lock wheel/key/button next/previous until the newly selected preview media has displayed");
+  fail("App preview navigation must gate next/previous on the pure position-only canNavigatePreview");
+}
+if (/previewNavigationLockedRef/.test(app) || /previewNavigationReady/.test(app)) {
+  fail("App preview navigation must not reintroduce a readiness lock; the bitmap pool replaced it");
+}
+if (
+  !/new AbortController\(\)/.test(previewCanvas) ||
+  !/controller\.abort\(\)/.test(previewCanvas)
+) {
+  fail("PreviewCanvas must abort the in-flight decode it outran, since navigation is no longer locked");
 }
 if (
   !/onPreviewNext\??:\s*\(\)\s*=>\s*void/.test(useShortcuts) ||

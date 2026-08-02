@@ -41,7 +41,6 @@ import {
 } from "../core/desktop";
 import { type LibraryLoadPhase } from "../core/libraryTypes";
 import {
-  configureOriginalPreviewBuffer,
   configureThumbnailCache,
   prefetchOriginalPreview
 } from "../core/mediaResources";
@@ -86,6 +85,13 @@ import { runCoordinatedMediaFocusSwitch } from "../core/mediaFocusLocateWorkflow
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
 import { buildPreviewPrefetchWindow } from "./previewPrefetchWindow";
+import { canNavigatePreview } from "./previewNavigationGate";
+import { previewViewportLongPx } from "../features/preview/MediaPreview";
+import {
+  configurePreviewBuffers,
+  prefetchPreviewBitmap
+} from "../features/preview/previewBitmapSource";
+import { selectPreviewRenderLane } from "../features/preview/previewRenderLane";
 import {
   prepareMediaFocusNavigation,
   type MediaGridLocateRequest
@@ -120,7 +126,6 @@ export function App() {
   } = useShellNotificationOverlay();
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewDisplayedMediaId, setPreviewDisplayedMediaId] = useState<number | null>(null);
-  const previewNavigationLockedRef = useRef(false);
   const [sidebarsHidden, setSidebarsHidden] = useState(false);
   const [locateRequest, setLocateRequest] =
     useState<LibrarySidebarLocateRequest | undefined>(undefined);
@@ -200,14 +205,18 @@ export function App() {
     mediaTotalCount: library.mediaTotalCount,
     selectedMediaId: library.selectedMediaId
   });
-  const previewNavigationReady =
-    !previewOpen ||
-    (library.selectedMediaId !== null && previewDisplayedMediaId === library.selectedMediaId);
-  const canPreviewPrevious = previewNavigationReady && selectedMediaIndex > 0;
-  const canPreviewNext =
-    previewNavigationReady &&
-    selectedMediaIndex >= 0 &&
-    selectedMediaIndex < orderedPreviewMedia.length - 1;
+  const canPreviewPrevious = canNavigatePreview({
+    previewOpen,
+    selectedMediaIndex,
+    itemCount: orderedPreviewMedia.length,
+    direction: "previous"
+  });
+  const canPreviewNext = canNavigatePreview({
+    previewOpen,
+    selectedMediaIndex,
+    itemCount: orderedPreviewMedia.length,
+    direction: "next"
+  });
 
   useEffect(() => {
     if (!previewOpen || selectedMediaIndex < 0) return;
@@ -218,8 +227,22 @@ export function App() {
       selectedMediaIndex,
       bufferBytes
     );
+    const viewportLongPx = previewViewportLongPx();
     for (const neighbor of prefetchWindow) {
-      prefetchOriginalPreview(neighbor, { signal: controller.signal });
+      // Still images are warmed as DECODED bitmaps — that is what makes the
+      // next step paint in one tick. Animated ones keep the <img> lane, so warm
+      // their compressed bytes instead; warming both would double-fetch.
+      if (
+        selectPreviewRenderLane({
+          source: "original",
+          kind: neighbor.kind,
+          ext: neighbor.ext
+        }) === "canvas"
+      ) {
+        prefetchPreviewBitmap(neighbor, { signal: controller.signal, viewportLongPx });
+      } else {
+        prefetchOriginalPreview(neighbor, { signal: controller.signal });
+      }
     }
     return () => controller.abort();
   }, [
@@ -232,7 +255,6 @@ export function App() {
   const handleClosePreview = useCallback(() => {
     setPreviewOpen(false);
     setPreviewDisplayedMediaId(null);
-    previewNavigationLockedRef.current = false;
     setPreviewViewCommands(null);
   }, []);
 
@@ -469,7 +491,7 @@ export function App() {
 
   useEffect(() => {
     storePreviewPreferences(previewPreferences);
-    configureOriginalPreviewBuffer(
+    configurePreviewBuffers(
       previewBufferLimitMbToBytes(previewPreferences.previewBufferLimitMb)
     );
     configureThumbnailCache(
@@ -538,7 +560,6 @@ export function App() {
 
   const handleOpenPreview = useCallback(
     (mediaId: number) => {
-      previewNavigationLockedRef.current = true;
       setPreviewDisplayedMediaId(null);
       library.setSelectedMediaId(mediaId);
       setPreviewViewCommands(null);
@@ -549,11 +570,10 @@ export function App() {
 
   function startPreviewNavigation(target: MediaRecord | undefined) {
     if (!target) return;
-    if (previewOpen) {
-      if (previewNavigationLockedRef.current || !previewNavigationReady) return;
-      previewNavigationLockedRef.current = true;
-      setPreviewDisplayedMediaId(null);
-    }
+    // No readiness gate: a pooled neighbour paints in this tick, and an
+    // unpooled one leaves the current canvas on screen until its bitmap lands.
+    // PreviewCanvas aborts the request it outran, so a held arrow key cancels
+    // rather than queues.
     library.setSelectedMediaId(target.id);
   }
 
@@ -561,19 +581,18 @@ export function App() {
     if (selectedMediaIndex <= 0) return;
     const previous = orderedPreviewMedia[selectedMediaIndex - 1];
     startPreviewNavigation(previous);
-  }, [library, orderedPreviewMedia, previewNavigationReady, previewOpen, selectedMediaIndex]);
+  }, [library, orderedPreviewMedia, selectedMediaIndex]);
 
   const handlePreviewNext = useCallback(() => {
     if (selectedMediaIndex < 0 || selectedMediaIndex >= orderedPreviewMedia.length - 1) return;
     const next = orderedPreviewMedia[selectedMediaIndex + 1];
     startPreviewNavigation(next);
-  }, [library, orderedPreviewMedia, previewNavigationReady, previewOpen, selectedMediaIndex]);
+  }, [library, orderedPreviewMedia, selectedMediaIndex]);
 
   const handlePreviewMediaSettled = useCallback(
     (mediaId: number) => {
       if (mediaId !== library.selectedMediaId) return;
       setPreviewDisplayedMediaId(mediaId);
-      previewNavigationLockedRef.current = false;
     },
     [library.selectedMediaId]
   );

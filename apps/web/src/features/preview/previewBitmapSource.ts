@@ -2,6 +2,7 @@ import type { MediaRecord } from "@megle/core-client";
 
 import { createCoreClient } from "../../core/client";
 import {
+  configureOriginalPreviewBuffer,
   mediaCacheEpochToken,
   registerMediaCacheResetListener
 } from "../../core/mediaResources";
@@ -217,6 +218,22 @@ export const previewBitmapPool = new PreviewBitmapPool(0);
 export function configurePreviewBitmapBudget(previewBufferBytes: number): void {
   previewBitmapPool.configure(
     Math.max(0, Math.floor(previewBufferBytes * PREVIEW_BITMAP_POOL_BUDGET_RATIO))
+  );
+}
+
+/**
+ * Applies the user's single "预览缓冲区" number to BOTH preview caches.
+ *
+ * The decoded-bitmap pool takes the larger share because it is what actually
+ * makes navigation instant; the compressed-byte cache is only its staging
+ * buffer, and Core re-serves those bytes cheaply from the OS cache. Splitting
+ * here — rather than handing the same number to both — keeps the setting honest
+ * instead of silently doubling the app's memory ceiling.
+ */
+export function configurePreviewBuffers(previewBufferBytes: number): void {
+  configurePreviewBitmapBudget(previewBufferBytes);
+  configureOriginalPreviewBuffer(
+    Math.max(0, Math.floor(previewBufferBytes * (1 - PREVIEW_BITMAP_POOL_BUDGET_RATIO)))
   );
 }
 
