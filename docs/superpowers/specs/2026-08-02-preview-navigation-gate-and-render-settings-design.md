@@ -30,8 +30,8 @@ channels or see through alpha compositing.
 ## 2. Scope
 
 - A first-paint navigation gate (Issue A).
-- A titlebar button opening a render-settings popover with three controls:
-  scaling filter, channel isolation, alpha handling (Issue B).
+- A titlebar button opening a render-settings popover with two controls:
+  scaling filter and channel isolation (Issue B).
 - Settings are global and survive restart.
 
 Explicitly out of scope: per-image or per-folder settings, colour management /
@@ -96,26 +96,50 @@ you" and "a broken image traps you".
 
 ### 4a. Controls
 
+Two groups. There is **no premultiply toggle** — see 4d for why it became
+unnecessary rather than merely dropped.
+
 | Group | Options | Default |
 |---|---|---|
-| 缩放过滤 (scaling filter) | Smooth · High quality · None | Smooth |
-| 通道 (channel) | RGBA · R · G · B · Alpha | RGBA |
-| Alpha | Composite · Ignore | Composite |
+| 缩放过滤 (scaling filter) | 最近邻 Nearest neighbour · 双线性 Bilinear | Bilinear |
+| 通道 (channel) | RGBA · RGB · R · G · B · A | RGBA |
 
-"None" is nearest-neighbour — hard pixel edges when zoomed in.
+**Filter options are named after the actual resampling algorithm**, not by
+vague quality words. That constrains the list to algorithms we genuinely
+control:
 
-**Verify before building the picker: does this Chromium actually distinguish
-three values?** Chromium's `image-rendering` support has historically been
-`auto | crisp-edges | pixelated`, with `smooth` and `high-quality` parsed but
-collapsing to `auto`. If `CSS.supports("image-rendering", "high-quality")` is
-false — or true but visually identical to `auto` — then "High quality" is a dead
-option that reads as a feature and does nothing, which is worse than not
-offering it.
+- `image-rendering: pixelated` → **nearest neighbour**, exactly and verifiably.
+- `image-rendering: auto` → Chromium's default filtered resampling, which is
+  **bilinear**.
 
-Check this in the running app first (`CSS.supports` over CDP takes seconds). If
-the three values do not genuinely differ, ship **Smooth · None** only. The user's
-stated requirement is that the set "must include 无 (none)"; a third option that
-does nothing was never the requirement.
+A third entry is only justified if it names a real, different algorithm.
+Chromium has historically parsed `image-rendering: high-quality` but collapsed
+it to `auto`, which would make a "Bicubic"/"High quality" row a label for
+behaviour that does not happen. **Verify in the running app before building the
+picker**: check `CSS.supports("image-rendering", "high-quality")` AND confirm it
+renders differently from `auto` on an upscaled image. Ship a third row only if
+both hold, and name it after whatever it actually is. Otherwise ship two.
+
+Delivering genuinely selectable Lanczos/bicubic would mean resampling ourselves
+in a shader or on the CPU. That is out of scope here — it is a different feature
+from "let me pick the filter the renderer already offers".
+
+### 4a-bis. Channel semantics
+
+Channel views show the **raw stored channel value, never multiplied by alpha**.
+This is the point of the feature: in a TGA (and in normal maps, packed masks,
+and game textures generally) the A channel is often data, not transparency, and
+the RGB channels carry their own meaning independent of it.
+
+| Option | Shows |
+|---|---|
+| RGBA | Normal display: colour with alpha composited, as today |
+| RGB | Colour with alpha forced opaque — the stored RGB, undarkened |
+| R / G / B | That one channel as greyscale, opaque |
+| A | The alpha channel as greyscale, opaque — readable as data |
+
+RGBA is the default and applies no filter at all, so the common path is
+untouched.
 
 ### 4b. Button and popover
 
@@ -128,7 +152,7 @@ copy of `apps/web/src/features/library/SortMenu.tsx`:
 - `AnchoredOverlay` with `className="overlay-titlebar-popover"`,
   `placement="bottom-end"`, and a new `"preview-render"` member of
   `OverlayRootId` (`apps/web/src/design/overlays/overlayTypes.ts`).
-- Three `OverlayMenuList` groups, each a single-select `listbox` of
+- Two `OverlayMenuList` groups, each a single-select `listbox` of
   `OverlayMenuItem`s with a checked marker — same primitives Sort uses.
 
 It renders in `PreviewTitlebarToolbar`
@@ -143,13 +167,12 @@ provides Esc, click-away, and focus restore.
 
 ### 4c. Persistence
 
-Three fields join `PreviewPreferences`
+Two fields join `PreviewPreferences`
 (`apps/web/src/features/preview/previewPreferences.ts`):
 
 ```ts
-previewRenderFilter: "smooth" | "highQuality" | "none";   // default "smooth"
-previewChannel: "rgba" | "r" | "g" | "b" | "alpha";       // default "rgba"
-previewAlphaMode: "composite" | "ignore";                 // default "composite"
+previewRenderFilter: "bilinear" | "nearest";                    // default "bilinear"
+previewChannel: "rgba" | "rgb" | "r" | "g" | "b" | "a";         // default "rgba"
 ```
 
 That inherits localStorage persistence, cross-window `broadcastPreference`
@@ -166,29 +189,34 @@ Both are **CSS-level**, applied to the shared `.preview-image` class that the
 canvas, `<img>`, and `<video>` lanes all already carry. Two data attributes on
 the preview stage select the rule:
 
-- **Filter** → `image-rendering: auto | high-quality | pixelated`.
-- **Channel + Alpha** → `filter: url(#megle-channel-…)` referencing an inline
-  SVG `feColorMatrix`. The matrices are static, defined once in a hidden `<svg>`
-  in the app shell; switching swaps which `#id` is referenced.
+- **Filter** → `image-rendering: auto | pixelated`.
+- **Channel** → `filter: url(#megle-channel-…)` referencing an inline SVG
+  `feColorMatrix`. The matrices are static, defined once in a hidden `<svg>` in
+  the app shell; switching swaps which `#id` is referenced.
 
 Nothing repaints, nothing re-decodes, and the effect is GPU-composited — so it
 stays instant on a 10240px image and cannot regress the decode-pipeline work.
 
-**Stated limitation, to be reflected in the UI wording.** A 2D canvas stores
-pixels premultiplied, and a linear `feColorMatrix` cannot divide by alpha. So
-the Alpha control is honestly named **Ignore** (force `A=1`, defeating
-compositing) rather than claiming true un-premultiplication. For fully opaque
-images — the overwhelming majority — the result is exact. Semi-transparent
-pixels will show their premultiplied RGB. Exactness there would require a WebGL
-paint path, which was considered and rejected: it would replace the renderer
-this branch just built and re-reviewed, for correctness visible only on
-semi-transparent pixels.
+**Why there is no premultiply control.** An earlier draft of this design assumed
+a linear colour matrix could not undo premultiplication, and proposed an
+"Ignore alpha" switch as a partial substitute. That was wrong: SVG defines
+`feColorMatrix` to operate on **non-premultiplied** colour values — the filter
+un-premultiplies its input, applies the matrix, and re-premultiplies the result.
+So a matrix that sets `A = 1` and passes RGB through yields the true stored RGB,
+undarkened, which is exactly the requirement. No user-facing premultiply switch
+is needed because the correct behaviour is unconditional.
 
-Separately, the decode Worker will pass `premultiplyAlpha: "none"` to
-`createImageBitmap` so the pooled bitmap holds straight values for any future
-exact renderer. Because this changes decoded pixel data, the bitmap pool must be
-cleared if it ever becomes user-toggleable; as a fixed decode option it is set
-once and needs no invalidation.
+**Verify this before building the matrices**, because the whole channel feature
+rests on it: render a PNG with a 50%-alpha region, apply the RGB matrix, and
+confirm the sampled colour matches the file's stored RGB rather than a halved
+value. If Chromium deviates from the spec here, fall back to a WebGL paint path
+for channel isolation only — and raise it before doing so, since that is a
+materially larger change than this design assumes.
+
+The decode Worker keeps its current `createImageBitmap` call unchanged. Passing
+`premultiplyAlpha: "none"` was considered and rejected: a 2D canvas re-multiplies
+on `drawImage` regardless, so the option would change nothing while adding a
+pool-invalidation concern.
 
 ### 4e. Pure core
 
@@ -197,10 +225,8 @@ unit-tested under `node --test` the way `previewRenderLane.ts` is:
 
 ```ts
 export function imageRenderingForFilter(filter: PreviewRenderFilter): string;
-export function channelMatrixId(
-  channel: PreviewChannel,
-  alphaMode: PreviewAlphaMode
-): string | null;   // null = no filter, the default RGBA+composite case
+export function channelMatrixId(channel: PreviewChannel): string | null;
+//                                          null = no filter, the default RGBA case
 ```
 
 Returning `null` for the default matters: the common case must apply **no** CSS
@@ -211,8 +237,8 @@ filter at all, so users who never open this panel pay nothing.
 - **Pure, `node --test`:** the navigation gate across every combination
   (painted === selected, painted !== selected, both ends of the list, closed
   preview, empty list, and the failed-image release); `imageRenderingForFilter`
-  for all three modes; `channelMatrixId` for all ten channel/alpha combinations
-  including the `null` default.
+  for both modes; `channelMatrixId` for all six channel values
+  including the `null` default, and a test asserting the RGB matrix forces A=1.
 - **Persistence:** defaults applied when the stored blob predates these keys;
   round-trip through `readStoredPreviewPreferences` / `storePreviewPreferences`.
 - **Structural:** `check:web` gains a guard that the gate is wired into
@@ -232,11 +258,10 @@ filter at all, so users who never open this panel pay nothing.
   call, menu open state, new preference wiring).
 - Create: `apps/web/src/features/preview/previewRenderSettings.ts`,
   `apps/web/src/features/preview/PreviewRenderMenu.tsx`.
-- Modify: `apps/web/src/features/preview/previewPreferences.ts` (three fields),
+- Modify: `apps/web/src/features/preview/previewPreferences.ts` (two fields),
   `apps/web/src/app-shell/ShellTopBar.tsx` (right-hand slot),
   `apps/web/src/design/overlays/overlayTypes.ts` (`"preview-render"`),
-  `apps/web/src/features/preview/previewDecodeWorker.ts`
-  (`premultiplyAlpha: "none"`), `apps/web/src/styles.css` (rules + the inline
+  `apps/web/src/styles.css` (rules + the inline
   SVG matrices), `tools/checks/validate-web-client.mjs` (guards).
 - Tests: `apps/web/tests/previewNavigationGate.test.mts` (extend),
   `apps/web/tests/previewRenderSettings.test.mts` (new).
