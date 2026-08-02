@@ -5921,6 +5921,39 @@ mod tests {
             Some(&"*".parse().expect("wildcard header"))
         );
 
+        // `Access-Control-Expose-Headers` rides on the ACTUAL response, not the
+        // preflight, so this needs a real request.
+        //
+        // The renderer and Core sit on different loopback PORTS, so every
+        // browser request is cross-origin and JS can read only CORS-safelisted
+        // response headers unless they are explicitly exposed. Without this the
+        // preview client reads `x-megle-preview-tier` as null, falls back to
+        // "original", and silently never requests the sharpening upgrade — a
+        // >4096px image stays at tier resolution however far you zoom. Caught
+        // only by driving the real app; no unit test saw it.
+        let actual = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/health")
+                    .header(header::ORIGIN, "http://127.0.0.1:5173")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("cors actual request");
+        let expose_headers = actual
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .expect("expose headers")
+            .to_ascii_lowercase();
+        assert!(
+            expose_headers.contains("x-megle-preview-tier"),
+            "preview tier header must be readable cross-origin, got: {expose_headers}"
+        );
+
         let response = app
             .oneshot(
                 Request::builder()

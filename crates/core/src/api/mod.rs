@@ -620,6 +620,13 @@ fn cors_layer(origin: HeaderValue) -> CorsLayer {
             header::CONTENT_TYPE,
             HeaderName::from_static("x-megle-session"),
         ])
+        // The renderer and Core are on different loopback PORTS, so every
+        // browser request is cross-origin and only CORS-safelisted response
+        // headers are readable from JS. Without this the preview client always
+        // saw `x-megle-preview-tier` as null and fell back to "original",
+        // silently disabling the background sharpening upgrade — a >4096px
+        // image would stay at tier resolution no matter how far you zoomed.
+        .expose_headers([HeaderName::from_static("x-megle-preview-tier")])
 }
 
 async fn require_session_token(
