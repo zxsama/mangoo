@@ -1932,7 +1932,18 @@ if (
   fail("App preview navigation must gate next/previous on the pure position-only canNavigatePreview");
 }
 if (/previewNavigationLockedRef/.test(app) || /previewNavigationReady/.test(app)) {
-  fail("App preview navigation must not reintroduce a readiness lock; the bitmap pool replaced it");
+  fail("App preview navigation must not reintroduce a settled-frame readiness lock; the first-paint gate replaced it");
+}
+// The gate that DID replace it. Releases on first paint rather than on a
+// settled frame, so it is invisible when prefetch keeps up and only engages on
+// a cold pool — which is exactly when navigation used to run past images that
+// never appeared.
+if (
+  !/canStartPreviewNavigation/.test(previewNavigationGate) ||
+  !/canStartPreviewNavigation\(\{/.test(app) ||
+  !/paintedMediaIdRef/.test(app)
+) {
+  fail("App preview navigation must gate next/previous on the first-paint canStartPreviewNavigation");
 }
 if (
   !/new AbortController\(\)/.test(previewCanvas) ||

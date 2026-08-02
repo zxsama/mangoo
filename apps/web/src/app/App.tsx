@@ -85,7 +85,7 @@ import { runCoordinatedMediaFocusSwitch } from "../core/mediaFocusLocateWorkflow
 import { useShortcuts } from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
 import { buildPreviewPrefetchWindow } from "./previewPrefetchWindow";
-import { canNavigatePreview } from "./previewNavigationGate";
+import { canNavigatePreview, canStartPreviewNavigation } from "./previewNavigationGate";
 import { previewViewportLongPx } from "../features/preview/MediaPreview";
 import {
   configurePreviewBuffers,
@@ -127,6 +127,10 @@ export function App() {
   } = useShellNotificationOverlay();
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewDisplayedMediaId, setPreviewDisplayedMediaId] = useState<number | null>(null);
+  // The media whose pixels are actually on screen. Written on EVERY paint —
+  // including PreviewCanvas's error path, so a media that fails to decode
+  // releases the navigation gate instead of trapping it forever.
+  const paintedMediaIdRef = useRef<number | null>(null);
   const [sidebarsHidden, setSidebarsHidden] = useState(false);
   const [locateRequest, setLocateRequest] =
     useState<LibrarySidebarLocateRequest | undefined>(undefined);
@@ -569,6 +573,7 @@ export function App() {
 
   const handleOpenPreview = useCallback(
     (mediaId: number) => {
+      paintedMediaIdRef.current = null;
       setPreviewDisplayedMediaId(null);
       library.setSelectedMediaId(mediaId);
       setPreviewViewCommands(null);
@@ -577,29 +582,44 @@ export function App() {
     [library]
   );
 
-  function startPreviewNavigation(target: MediaRecord | undefined) {
+  function startPreviewNavigation(
+    target: MediaRecord | undefined,
+    direction: "previous" | "next"
+  ) {
     if (!target) return;
-    // No readiness gate: a pooled neighbour paints in this tick, and an
-    // unpooled one leaves the current canvas on screen until its bitmap lands.
-    // PreviewCanvas aborts the request it outran, so a held arrow key cancels
-    // rather than queues.
+    // Drop, do not queue. A wheel flick emits many events and a held arrow key
+    // repeats far faster than a cold image can start painting; queueing would
+    // bank those steps and skip images the user never saw.
+    if (
+      !canStartPreviewNavigation({
+        previewOpen,
+        selectedMediaIndex,
+        itemCount: orderedPreviewMedia.length,
+        direction,
+        selectedMediaId: library.selectedMediaId,
+        paintedMediaId: paintedMediaIdRef.current
+      })
+    ) {
+      return;
+    }
     library.setSelectedMediaId(target.id);
   }
 
   const handlePreviewPrevious = useCallback(() => {
     if (selectedMediaIndex <= 0) return;
-    const previous = orderedPreviewMedia[selectedMediaIndex - 1];
-    startPreviewNavigation(previous);
+    startPreviewNavigation(orderedPreviewMedia[selectedMediaIndex - 1], "previous");
   }, [library, orderedPreviewMedia, selectedMediaIndex]);
 
   const handlePreviewNext = useCallback(() => {
     if (selectedMediaIndex < 0 || selectedMediaIndex >= orderedPreviewMedia.length - 1) return;
-    const next = orderedPreviewMedia[selectedMediaIndex + 1];
-    startPreviewNavigation(next);
+    startPreviewNavigation(orderedPreviewMedia[selectedMediaIndex + 1], "next");
   }, [library, orderedPreviewMedia, selectedMediaIndex]);
 
   const handlePreviewMediaSettled = useCallback(
     (mediaId: number) => {
+      // Recorded BEFORE the early return: a paint that lands after the user
+      // already moved on still proves this media reached the screen.
+      paintedMediaIdRef.current = mediaId;
       if (mediaId !== library.selectedMediaId) return;
       setPreviewDisplayedMediaId(mediaId);
     },
