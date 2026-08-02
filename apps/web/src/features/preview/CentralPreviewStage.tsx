@@ -704,6 +704,7 @@ export function CentralPreviewStage({
               onMediaReady={handleMediaReady}
               onNaturalSize={handleNaturalSize}
               onVideoElementChange={handleVideoElementChange}
+              previewScale={scale}
               stableFrame
             />
           </div>

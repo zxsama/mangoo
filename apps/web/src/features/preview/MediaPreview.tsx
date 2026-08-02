@@ -36,6 +36,7 @@ export function MediaPreview({
   onNaturalSize,
   onVideoElementChange,
   preferOriginalWhilePending = false,
+  previewScale = 1,
   preserveNaturalFrame,
   source = "thumbnail",
   stableFrame = false,
@@ -47,6 +48,8 @@ export function MediaPreview({
   onNaturalSize?: (size: { naturalHeight: number; naturalWidth: number }) => void;
   onVideoElementChange?: (element: HTMLVideoElement | null) => void;
   preferOriginalWhilePending?: boolean;
+  /** Current zoom scale of the preview transform; drives the sharpening upgrade. */
+  previewScale?: number;
   preserveNaturalFrame?: boolean;
   source?: "thumbnail" | "original";
   stableFrame?: boolean;
@@ -89,6 +92,7 @@ export function MediaPreview({
         onLoadingChange={onLoadingChange}
         onMediaReady={onMediaReady}
         onNaturalSize={onNaturalSize}
+        previewScale={previewScale}
         viewportLongPx={viewportLongPx}
       />
     );

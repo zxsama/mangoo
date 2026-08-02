@@ -28,6 +28,7 @@ export function PreviewCanvas({
   onLoadingChange,
   onMediaReady,
   onNaturalSize,
+  previewScale,
   viewportLongPx
 }: {
   alt: string;
@@ -36,12 +37,32 @@ export function PreviewCanvas({
   onLoadingChange?: (loading: boolean) => void;
   onMediaReady?: () => void;
   onNaturalSize?: (size: { naturalHeight: number; naturalWidth: number }) => void;
+  /** Zoom scale of the wrapper transform; the sharpening upgrade is gated on it. */
+  previewScale: number;
   viewportLongPx: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [boxStyle, setBoxStyle] = useState<CSSProperties | undefined>(undefined);
   const [failed, setFailed] = useState(false);
+  const [painted, setPainted] = useState<{
+    backingLongPx: number;
+    cssLongPx: number;
+    tier: string;
+  } | null>(null);
   const mediaSignature = mediaFileContentSignature(media);
+
+  // Pull the full-resolution original only once the zoom actually outruns the
+  // resolution already on screen.
+  //
+  // The plan upgraded unconditionally, which recreated the very memory blow-up
+  // the tier system exists to prevent: a 16384px original is 536 MB decoded, it
+  // evicted the entire prefetch window on admission, and at fit-to-screen it
+  // showed nothing a `viewport x 1.2` tier had not already shown. The design
+  // spec always said "zoom past the preview tier pulls the original on demand".
+  const wantsFullResolution =
+    painted !== null &&
+    painted.tier !== "original" &&
+    painted.cssLongPx * previewScale > painted.backingLongPx;
 
   useEffect(() => {
     let disposed = false;
@@ -53,7 +74,7 @@ export function PreviewCanvas({
         ? { naturalHeight: media.height, naturalWidth: media.width }
         : null;
 
-    const paint = (bitmap: PoolableBitmap, key: string) => {
+    const paint = (bitmap: PoolableBitmap, key: string, tier: string) => {
       const canvas = canvasRef.current;
       if (!canvas || disposed) {
         return;
@@ -74,6 +95,11 @@ export function PreviewCanvas({
       context.clearRect(0, 0, canvas.width, canvas.height);
       context.drawImage(bitmap as unknown as CanvasImageSource, 0, 0);
       setBoxStyle({ height: `${target.cssHeight}px`, width: `${target.cssWidth}px` });
+      setPainted({
+        backingLongPx: Math.max(target.backingWidth, target.backingHeight),
+        cssLongPx: Math.max(target.cssWidth, target.cssHeight),
+        tier
+      });
       // Never let the LRU close the frame that is on screen right now.
       pinPreviewFrame(key);
       onNaturalSize?.({ naturalHeight: target.cssHeight, naturalWidth: target.cssWidth });
@@ -85,7 +111,7 @@ export function PreviewCanvas({
     //    await, no decode, no loading flash.
     const warm = readAnyPooledPreviewFrame(media);
     if (warm) {
-      paint(warm.bitmap, warm.key);
+      paint(warm.bitmap, warm.key, warm.tier);
     } else {
       onLoadingChange?.(true);
     }
@@ -98,25 +124,7 @@ export function PreviewCanvas({
         if (disposed) {
           return;
         }
-        paint(frame.bitmap, frame.key);
-        // 3. Sharpening upgrade — only when what we painted really is a
-        //    DOWNSCALE of the original. `original` is already sharp, and
-        //    `preview_native` is a format transcode at native size, so asking
-        //    for an upgrade there would re-fetch identical bytes.
-        if (frame.tier === "original" || frame.tier === "preview_native") {
-          return;
-        }
-        void requestPreviewBitmap(media, {
-          original: true,
-          resourcePriority: "ahead",
-          signal: controller.signal
-        })
-          .then((sharp) => {
-            if (!disposed) {
-              paint(sharp.bitmap, sharp.key);
-            }
-          })
-          .catch(() => undefined);
+        paint(frame.bitmap, frame.key, frame.tier);
       })
       .catch((cause) => {
         if (disposed || controller.signal.aborted) {
@@ -141,6 +149,51 @@ export function PreviewCanvas({
     // repeatedly enough to starve it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mediaSignature, onLoadingChange, onMediaReady, onNaturalSize, viewportLongPx]);
+
+  // 3. Sharpening upgrade, ON DEMAND — only once the user zooms past what the
+  //    painted frame can resolve.
+  useEffect(() => {
+    if (!wantsFullResolution) {
+      return;
+    }
+    let disposed = false;
+    const controller = new AbortController();
+    void requestPreviewBitmap(media, {
+      original: true,
+      resourcePriority: "ahead",
+      signal: controller.signal
+    })
+      .then((sharp) => {
+        const canvas = canvasRef.current;
+        if (disposed || !canvas) {
+          return;
+        }
+        canvas.width = sharp.bitmap.width;
+        canvas.height = sharp.bitmap.height;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          return;
+        }
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(sharp.bitmap as unknown as CanvasImageSource, 0, 0);
+        pinPreviewFrame(sharp.key);
+        setPainted((current) =>
+          current
+            ? {
+                ...current,
+                backingLongPx: Math.max(sharp.bitmap.width, sharp.bitmap.height),
+                tier: sharp.tier
+              }
+            : current
+        );
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      controller.abort();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mediaSignature, wantsFullResolution]);
 
   useEffect(() => () => pinPreviewFrame(null), []);
 
