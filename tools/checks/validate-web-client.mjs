@@ -1682,6 +1682,8 @@ if (
 if (
   !/DEFAULT_PREVIEW_BUFFER_LIMIT_MB\s*=\s*1200/.test(previewPreferences) ||
   !/previewBufferLimitMb/.test(previewPreferences) ||
+  !/previewRenderFilter/.test(previewPreferences) ||
+  !/previewChannel/.test(previewPreferences) ||
   !/readStoredPreviewPreferences/.test(app) ||
   !/storePreviewPreferences/.test(app) ||
   // The single user-facing buffer number is now SPLIT between the decoded

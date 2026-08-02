@@ -87,3 +87,41 @@ describe("preview channel isolation", () => {
     }
   });
 });
+
+const { DEFAULT_PREVIEW_PREFERENCES, normalizePreviewPreferences } = await import(
+  "../src/features/preview/previewPreferences.ts"
+);
+
+describe("render settings persistence", () => {
+  it("defaults to bilinear and RGBA", () => {
+    assert.equal(DEFAULT_PREVIEW_PREFERENCES.previewRenderFilter, "bilinear");
+    assert.equal(DEFAULT_PREVIEW_PREFERENCES.previewChannel, "rgba");
+  });
+
+  it("falls back per field for a blob written before these keys existed", () => {
+    // A user upgrading has a stored object with none of these keys. It must not
+    // yield undefined, which would reach CSS as `image-rendering: undefined`.
+    const normalized = normalizePreviewPreferences({ previewBufferLimitMb: 900 });
+    assert.equal(normalized.previewRenderFilter, "bilinear");
+    assert.equal(normalized.previewChannel, "rgba");
+    assert.equal(normalized.previewBufferLimitMb, 900, "unrelated fields survive");
+  });
+
+  it("round-trips valid values", () => {
+    const normalized = normalizePreviewPreferences({
+      previewRenderFilter: "nearest",
+      previewChannel: "a"
+    });
+    assert.equal(normalized.previewRenderFilter, "nearest");
+    assert.equal(normalized.previewChannel, "a");
+  });
+
+  it("rejects a garbage value rather than passing it through to CSS", () => {
+    const normalized = normalizePreviewPreferences({
+      previewRenderFilter: "lanczos" as never,
+      previewChannel: "cmyk" as never
+    });
+    assert.equal(normalized.previewRenderFilter, "bilinear");
+    assert.equal(normalized.previewChannel, "rgba");
+  });
+});

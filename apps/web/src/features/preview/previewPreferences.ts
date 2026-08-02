@@ -1,5 +1,14 @@
 import type { ThumbnailGenerationMode } from "@megle/core-client";
 
+import {
+  DEFAULT_PREVIEW_CHANNEL,
+  DEFAULT_PREVIEW_RENDER_FILTER,
+  PREVIEW_CHANNELS,
+  PREVIEW_RENDER_FILTERS,
+  type PreviewChannel,
+  type PreviewRenderFilter
+} from "./previewRenderSettings";
+
 const PREVIEW_PREFERENCES_STORAGE_KEY = "megle.preview.preferences";
 
 export const DEFAULT_PREVIEW_BUFFER_LIMIT_MB = 1200;
@@ -27,6 +36,10 @@ export interface PreviewPreferences {
   // How thumbnails are generated and whether they are persisted. See
   // `ThumbnailGenerationMode` and the thumbnail-status settings tab.
   thumbnailGenerationMode: ThumbnailGenerationMode;
+  // How the preview resamples when zoomed, and which colour channel it shows.
+  // Global and persisted; see previewRenderSettings.ts for what each maps to.
+  previewRenderFilter: PreviewRenderFilter;
+  previewChannel: PreviewChannel;
 }
 
 export const PREVIEW_PREFERENCE_LIMITS = {
@@ -38,7 +51,9 @@ export const DEFAULT_PREVIEW_PREFERENCES: PreviewPreferences = {
   previewBufferLimitMb: DEFAULT_PREVIEW_BUFFER_LIMIT_MB,
   thumbnailCacheLimitMb: DEFAULT_THUMBNAIL_CACHE_LIMIT_MB,
   persistentThumbnailCacheAutoRefresh: false,
-  thumbnailGenerationMode: DEFAULT_THUMBNAIL_GENERATION_MODE
+  thumbnailGenerationMode: DEFAULT_THUMBNAIL_GENERATION_MODE,
+  previewRenderFilter: DEFAULT_PREVIEW_RENDER_FILTER,
+  previewChannel: DEFAULT_PREVIEW_CHANNEL
 };
 
 export function readStoredPreviewPreferences(): PreviewPreferences {
@@ -85,7 +100,18 @@ export function normalizePreviewPreferences(
       DEFAULT_PREVIEW_PREFERENCES.thumbnailCacheLimitMb
     ),
     persistentThumbnailCacheAutoRefresh: value.persistentThumbnailCacheAutoRefresh === true,
-    thumbnailGenerationMode: normalizeThumbnailGenerationMode(value)
+    thumbnailGenerationMode: normalizeThumbnailGenerationMode(value),
+    // Validated against the option lists rather than trusted: an unknown stored
+    // string would otherwise reach CSS as `image-rendering: lanczos` or a
+    // filter id that does not exist.
+    previewRenderFilter: PREVIEW_RENDER_FILTERS.some(
+      (option) => option.value === value.previewRenderFilter
+    )
+      ? (value.previewRenderFilter as PreviewRenderFilter)
+      : DEFAULT_PREVIEW_RENDER_FILTER,
+    previewChannel: PREVIEW_CHANNELS.some((option) => option.value === value.previewChannel)
+      ? (value.previewChannel as PreviewChannel)
+      : DEFAULT_PREVIEW_CHANNEL
   };
 }
 
