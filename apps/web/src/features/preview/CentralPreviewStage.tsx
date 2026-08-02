@@ -14,6 +14,8 @@ import {
   useShortcutBindings
 } from "../shortcuts/shortcutBindings";
 import { MediaPreview } from "./MediaPreview";
+import { PreviewScrubberBar } from "./PreviewScrubberBar";
+import { SCRUBBER_REVEAL_BAND_PX } from "./previewScrubber";
 import { MediaLoadingIndicator, MediaLoadingRing } from "../loading/MediaLoadingRing";
 import { DampedMotionAxis, normalizeWheelDelta } from "../../core/dampedMotion";
 import { VideoPlaybackControls } from "./VideoPlaybackControls";
@@ -43,6 +45,11 @@ interface CentralPreviewStageProps {
   onCommandChange: (
     commands: { reset: () => void; toggleActualSize: () => void } | null
   ) => void;
+  onScrubTo: (index: number) => void;
+  onToggleScrubberPinned: () => void;
+  scrubberCurrent: number;
+  scrubberPinned: boolean;
+  scrubberTotal: number;
 }
 
 type PreviewViewMode = "fit-long-edge" | "actual";
@@ -66,9 +73,17 @@ export function CentralPreviewStage({
   onPreviewNext,
   initialViewState,
   onViewStateChange,
-  onCommandChange
+  onCommandChange,
+  onScrubTo,
+  onToggleScrubberPinned,
+  scrubberCurrent,
+  scrubberPinned,
+  scrubberTotal
 }: CentralPreviewStageProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
+  // Drives the scrubber's auto-reveal: true while the pointer is within the
+  // reveal band across the bottom of the stage.
+  const [pointerNearBottom, setPointerNearBottom] = useState(false);
   const dragRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const videoPressRef = useRef<VideoPress | null>(null);
   const autoplayAttemptRef = useRef<{ element: HTMLVideoElement; mediaId: number } | null>(null);
@@ -569,6 +584,11 @@ export function CentralPreviewStage({
   }
 
   function handlePointerMove(event: PointerEvent<HTMLDivElement>) {
+    const proximityStage = stageRef.current;
+    if (proximityStage) {
+      const rect = proximityStage.getBoundingClientRect();
+      setPointerNearBottom(event.clientY >= rect.bottom - SCRUBBER_REVEAL_BAND_PX);
+    }
     const videoPress = videoPressRef.current;
     if (videoPress?.pointerId === event.pointerId) {
       const delta = pointerDisplacement(
@@ -695,6 +715,7 @@ export function CentralPreviewStage({
           onLostPointerCapture={handlePointerCancel}
           onPointerCancel={handlePointerCancel}
           onPointerDown={handlePointerDown}
+          onPointerLeave={() => setPointerNearBottom(false)}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           ref={stageRef}
@@ -736,6 +757,15 @@ export function CentralPreviewStage({
             state={videoPlayback}
           />
         ) : null}
+        <PreviewScrubberBar
+          current={scrubberCurrent}
+          onScrubTo={onScrubTo}
+          onTogglePinned={onToggleScrubberPinned}
+          pinned={scrubberPinned}
+          pointerNearBottom={pointerNearBottom}
+          previewOpen
+          total={scrubberTotal}
+        />
       </div>
     </section>
   );

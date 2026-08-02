@@ -642,6 +642,32 @@ export function App() {
     startPreviewNavigation(orderedPreviewMedia[selectedMediaIndex + 1], "next");
   }, [library, orderedPreviewMedia, selectedMediaIndex]);
 
+  const handleScrubToIndex = useCallback(
+    (index: number) => {
+      // Deliberately NOT startPreviewNavigation: the first-paint gate exists to
+      // stop the keyboard and wheel outrunning the display, but a drag must
+      // keep the thumb and the image in agreement, so it commits immediately.
+      const slotMedia = library.mediaSlots.get(index);
+      if (slotMedia) {
+        library.setSelectedMediaId(slotMedia.id);
+        return;
+      }
+      // Outside the loaded window: ask for that region. The thumb and tooltip
+      // have already moved; the image follows when the slot resolves. This is
+      // the one place position and picture can briefly disagree, and it is
+      // bounded by a single round-trip.
+      library.requestMediaWindow(index, index + 1);
+    },
+    [library]
+  );
+
+  const handleToggleScrubberPinned = useCallback(() => {
+    setPreviewPreferences((current) => ({
+      ...current,
+      previewScrubberPinned: !current.previewScrubberPinned
+    }));
+  }, []);
+
   const handlePreviewMediaSettled = useCallback(
     (mediaId: number) => {
       // Recorded BEFORE the early return: a paint that lands after the user
@@ -899,6 +925,11 @@ export function App() {
         onMediaLocateSettled={handleMediaLocateSettled}
         onPreviewCommandChange={setPreviewViewCommands}
         onPreviewMediaSettled={handlePreviewMediaSettled}
+        onScrubTo={handleScrubToIndex}
+        onToggleScrubberPinned={handleToggleScrubberPinned}
+        scrubberCurrent={previewTitlePosition?.current ?? 0}
+        scrubberPinned={previewPreferences.previewScrubberPinned}
+        scrubberTotal={previewTitlePosition?.total ?? 0}
         onPreviewNext={handlePreviewNext}
         onPreviewPrevious={handlePreviewPrevious}
         onPreviewViewStateChange={setPreviewViewState}

@@ -30,6 +30,11 @@ interface LibraryViewProps {
   onPreviewPrevious: () => void;
   onPreviewNext: () => void;
   onPreviewMediaSettled: (mediaId: number) => void;
+  onScrubTo: (index: number) => void;
+  onToggleScrubberPinned: () => void;
+  scrubberCurrent: number;
+  scrubberPinned: boolean;
+  scrubberTotal: number;
   onPreviewViewStateChange: (state: { mode: "fit-long-edge" | "actual"; scale: number }) => void;
   previewViewState: { mode: "fit-long-edge" | "actual"; scale: number };
   onPreviewCommandChange: (commands: {
@@ -63,6 +68,11 @@ export function LibraryView({
   onOpenPreview,
   onPreviewCommandChange,
   onPreviewMediaSettled,
+  onScrubTo,
+  onToggleScrubberPinned,
+  scrubberCurrent,
+  scrubberPinned,
+  scrubberTotal,
   onPreviewNext,
   onPreviewPrevious,
   onPreviewViewStateChange,
@@ -85,6 +95,11 @@ export function LibraryView({
         onOpenPreview={onOpenPreview}
         onPreviewCommandChange={onPreviewCommandChange}
         onPreviewMediaSettled={onPreviewMediaSettled}
+        onScrubTo={onScrubTo}
+        onToggleScrubberPinned={onToggleScrubberPinned}
+        scrubberCurrent={scrubberCurrent}
+        scrubberPinned={scrubberPinned}
+        scrubberTotal={scrubberTotal}
         onPreviewNext={onPreviewNext}
         onPreviewPrevious={onPreviewPrevious}
         onPreviewViewStateChange={onPreviewViewStateChange}
@@ -113,8 +128,13 @@ export function LibraryCenterPane({
   onPreviewNext,
   onPreviewPrevious,
   onPreviewViewStateChange,
+  onScrubTo,
+  onToggleScrubberPinned,
   previewViewState,
   previewOpen,
+  scrubberCurrent,
+  scrubberPinned,
+  scrubberTotal,
   sidebarLayoutTransitionKey
 }: LibraryViewProps) {
   const selectedRoot = library.roots.find((root) => root.id === library.selectedRootId) ?? null;
@@ -463,6 +483,11 @@ export function LibraryCenterPane({
               onClosePreview={onClosePreview}
               onCommandChange={onPreviewCommandChange}
               onPreviewMediaSettled={onPreviewMediaSettled}
+              onScrubTo={onScrubTo}
+              onToggleScrubberPinned={onToggleScrubberPinned}
+              scrubberCurrent={scrubberCurrent}
+              scrubberPinned={scrubberPinned}
+              scrubberTotal={scrubberTotal}
               onPreviewNext={onPreviewNext}
               onPreviewPrevious={onPreviewPrevious}
               initialViewState={previewViewState}

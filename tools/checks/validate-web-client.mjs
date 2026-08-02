@@ -1953,6 +1953,21 @@ if (
 ) {
   fail("PreviewCanvas must abort the in-flight decode it outran, since navigation is no longer locked");
 }
+
+// The scrubber drag MUST bypass the first-paint gate: routing it through
+// startPreviewNavigation would make the thumb stick while an image loaded,
+// breaking the rule that thumb position and displayed image always agree.
+const scrubHandler = /const handleScrubToIndex = useCallback\([\s\S]*?\n  \);/.exec(app);
+if (!scrubHandler) {
+  fail("App must define handleScrubToIndex for the preview scrubber");
+} else if (/startPreviewNavigation\s*\(/.test(scrubHandler[0].replace(/\/\/[^\n]*/g, ""))) {
+  // Comments stripped first: the handler's own comment explains WHY it does not
+  // call the gate, and matching that mention would be a permanent false alarm.
+  fail("The preview scrubber drag must not route through the first-paint navigation gate");
+}
+if (!/requestMediaWindow/.test(app)) {
+  fail("App scrubber must request the media window for an index outside the loaded range");
+}
 if (
   !/onPreviewNext\??:\s*\(\)\s*=>\s*void/.test(useShortcuts) ||
   !/onPreviewPrevious\??:\s*\(\)\s*=>\s*void/.test(useShortcuts) ||

@@ -10,7 +10,7 @@ import {
   shouldShowScrubber
 } from "./previewScrubber";
 
-interface PreviewScrubberProps {
+interface PreviewScrubberBarProps {
   /** 1-based position, the same value the titlebar renders. */
   current: number;
   /** Total images in the current folder, flattened when includeDescendants. */
@@ -30,7 +30,7 @@ interface PreviewScrubberProps {
 // The thumb position and the displayed image never disagree: a drag commits its
 // index immediately rather than deferring to pointerup, and the thumb is drawn
 // from the committed position rather than from local drag state.
-export function PreviewScrubber({
+export function PreviewScrubberBar({
   current,
   total,
   pinned,
@@ -38,7 +38,7 @@ export function PreviewScrubber({
   previewOpen,
   onScrubTo,
   onTogglePinned
-}: PreviewScrubberProps) {
+}: PreviewScrubberBarProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
   // The last index handed to onScrubTo, so pointer movement within one pixel of
