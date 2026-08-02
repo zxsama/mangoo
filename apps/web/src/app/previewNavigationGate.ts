@@ -21,3 +21,49 @@ export function canNavigatePreview(input: {
     ? input.selectedMediaIndex > 0
     : input.selectedMediaIndex < input.itemCount - 1;
 }
+
+/**
+ * Whether a prev/next step may START right now.
+ *
+ * Extends the position-only `canNavigatePreview` with one condition: the
+ * currently-selected media must have PAINTED at least once. Not committed, not
+ * fully loaded — the moment pixels appear.
+ *
+ * This is deliberately far weaker than the readiness lock it replaces.
+ * `PreviewCanvas` reports a paint on every draw, including the synchronous one
+ * that happens in the same tick when a neighbour is already pooled, so whenever
+ * prefetch keeps up this gate never engages. It bites only on a cold pool —
+ * exactly the case where navigation used to run past images that never
+ * appeared. The wheel makes that worse: a single flick emits many `wheel`
+ * events, each calling next/previous, so one gesture could advance several
+ * images at once.
+ *
+ * Input arriving while the gate is closed is DROPPED by the caller, never
+ * queued: holding a key advances exactly as fast as images can begin painting,
+ * so nothing banks up and nothing is skipped.
+ */
+export function canStartPreviewNavigation(input: {
+  previewOpen: boolean;
+  selectedMediaIndex: number;
+  itemCount: number;
+  direction: "previous" | "next";
+  selectedMediaId: number | null;
+  paintedMediaId: number | null;
+}): boolean {
+  if (
+    !canNavigatePreview({
+      previewOpen: input.previewOpen,
+      selectedMediaIndex: input.selectedMediaIndex,
+      itemCount: input.itemCount,
+      direction: input.direction
+    })
+  ) {
+    return false;
+  }
+  // Nothing selected and nothing painted is the "no frame expected" state, not
+  // a pending one — blocking it would wedge navigation before the first paint.
+  if (input.selectedMediaId === null && input.paintedMediaId === null) {
+    return true;
+  }
+  return input.selectedMediaId === input.paintedMediaId;
+}
