@@ -7935,3 +7935,75 @@ button:disabled {
 .library-icon-picker-colors { display: flex; flex-wrap: wrap; gap: 4px; padding-top: 6px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
 .library-icon-picker-swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(255, 255, 255, 0.2); cursor: pointer; padding: 0; }
 .library-icon-picker-swatch.selected { outline: 2px solid var(--text-soft); outline-offset: 1px; }
+
+/* Floating browsing control bar, bottom-centre of the preview stage. */
+.preview-scrubber {
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;
+  opacity: 0;
+  /* `visibility` rather than `display` so the fade can play both ways, and
+     `pointer-events: none` while hidden so it cannot swallow clicks on the
+     image underneath. */
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 140ms ease, visibility 0s linear 140ms;
+}
+
+.preview-scrubber[data-preview-scrubber-visible="true"] {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition: opacity 140ms ease, visibility 0s linear 0s;
+}
+
+.preview-scrubber-shell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 999px;
+}
+
+.preview-scrubber-track {
+  position: relative;
+  width: min(46vw, 620px);
+  height: 22px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.42);
+  cursor: pointer;
+  touch-action: none;
+}
+
+.preview-scrubber-thumb {
+  position: absolute;
+  top: 50%;
+  width: 16px;
+  height: 16px;
+  margin-left: -8px;
+  border-radius: 50%;
+  background: #fff;
+  transform: translateY(-50%);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+
+.preview-scrubber-tooltip {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  transform: translateX(-50%);
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  background: rgba(20, 20, 20, 0.82);
+  color: #fff;
+  pointer-events: none;
+}
+
+.preview-scrubber-pin {
+  flex: 0 0 auto;
+}
