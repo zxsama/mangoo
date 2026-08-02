@@ -61,4 +61,83 @@ gamma-shift every channel view and misreport the stored values.
 
 ## Results of the real-app feature verification
 
-Filled in by Task 8, after the feature is built.
+Run after the feature was built, driving the real desktop app over CDP.
+`npm test` was green first: exit 0, all nine stages PASS, 470 Rust / 326 web.
+
+### Navigation gate
+
+The gate releases on FIRST PAINT, so it is invisible whenever the bitmap pool is
+keeping up — which makes it easy to mis-measure. Two probes were needed.
+
+**Naive timing probe (misleading).** Dispatching six wheel events ~12 ms apart
+advanced six images, and 12 keypresses displayed 19. That is not a failure: a
+pooled frame paints in well under a millisecond, so each event legitimately
+found the gate open. It shows the gate is not adding lag on a warm pool.
+
+**Synchronous burst (the real test).** Six `wheel` events dispatched inside a
+single JS task, so no paint can land between them:
+
+```
+SYNCHRONOUS_BURST: {"startId":"663999","idImmediatelyAfter":"663999"}
+SETTLED_ID: 664000
+```
+
+Six events advanced **exactly one** image. Five were dropped. Before this change
+all six would have applied.
+
+**Throttled network (the cold-pool case the gate exists for).** 300 ms latency,
+200 KB/s, then 15 keypresses at 25 ms intervals:
+
+```
+THROTTLED_WALK: 15 keypresses -> 3 displayed, 0 skipped-over gap(s)
+SEQUENCE: 664000 664001 664002
+```
+
+Consecutive ids with no jumps: every image the selection moved through actually
+appeared. The 12 keypresses that outran painting were dropped, not queued.
+
+**Broken image.** A file with a valid `.png` extension and garbage content was
+placed in the root for the whole session. Navigation never wedged —
+`PreviewCanvas`'s error path calls `onMediaReady`, so a media that cannot decode
+releases the gate exactly like one that paints.
+
+### Render settings
+
+All seven options resolve to the intended CSS on the shared `.preview-image`
+class, so every preview lane (canvas, `<img>`, `<video>`) is covered:
+
+| Option | `image-rendering` | `filter` |
+|---|---|---|
+| 双线性 Bilinear | `auto` | `none` |
+| 最近邻 Nearest neighbour | `pixelated` | `none` |
+| RGBA (default) | `auto` | `none` |
+| RGB | `auto` | `url("#megle-channel-rgb")` |
+| R / G / B / A | `auto` | `url("#megle-channel-<c>")` |
+
+Button present in the titlebar (`[data-titlebar-control="preview-render"]`), all
+five matrices defined in the hidden SVG, and the RGBA default applies no filter
+at all.
+
+**The alpha claim, verified through the shipped filter** (not just the Task 1
+probe). A 50%-alpha red pixel drawn through `#megle-channel-rgb`:
+
+```json
+{ "rgbView":   [255, 0, 0, 255], "rawStoredRGBPreserved": true,
+  "alphaView": [128, 128, 128, 255] }
+```
+
+RGB reads back **255**, the raw stored value — not the 128 a premultiplied
+pipeline would show. The A view renders alpha 128 as neutral grey, readable as
+data. This is the behaviour the feature exists for on formats like TGA where the
+alpha channel carries information rather than transparency.
+
+### Not verified here
+
+- **Visual confirmation of nearest vs bilinear at high zoom.** The CSS is
+  provably applied, but "does it look right zoomed to 800%" is a judgement for
+  the human on the real display — CDP screenshots do not reliably reflect
+  on-screen resampling (see CLAUDE.md's note on capture vs realtime compositing).
+- **Restart persistence.** The values round-trip through
+  `normalizePreviewPreferences` under unit test, and ride the same localStorage
+  path as every other preview preference, but a full app restart with a changed
+  setting was not driven end to end.
