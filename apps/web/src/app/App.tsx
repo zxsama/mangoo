@@ -89,7 +89,8 @@ import { canNavigatePreview } from "./previewNavigationGate";
 import { previewViewportLongPx } from "../features/preview/MediaPreview";
 import {
   configurePreviewBuffers,
-  prefetchPreviewBitmap
+  prefetchPreviewBitmap,
+  previewPrefetchBudgetBytes
 } from "../features/preview/previewBitmapSource";
 import { selectPreviewRenderLane } from "../features/preview/previewRenderLane";
 import {
@@ -222,12 +223,20 @@ export function App() {
     if (!previewOpen || selectedMediaIndex < 0) return;
     const controller = new AbortController();
     const bufferBytes = previewBufferLimitMbToBytes(previewPreferences.previewBufferLimitMb);
+    const viewportLongPx = previewViewportLongPx();
+    // Size the window against the DECODED-frame budget, not the raw setting.
+    //
+    // `buildPreviewPrefetchWindow` measures candidates in compressed file
+    // bytes, but the pool that actually holds them is bounded in decoded bytes
+    // and only gets PREVIEW_BITMAP_POOL_BUDGET_RATIO of the setting. A decoded
+    // frame is 10-50x its file size, so sizing by the full budget picked a
+    // window an order of magnitude larger than the pool could hold: most of it
+    // fetched, decoded, and was evicted before it could ever be painted.
     const prefetchWindow = buildPreviewPrefetchWindow(
       orderedPreviewMedia,
       selectedMediaIndex,
-      bufferBytes
+      previewPrefetchBudgetBytes(bufferBytes, viewportLongPx)
     );
-    const viewportLongPx = previewViewportLongPx();
     for (const neighbor of prefetchWindow) {
       // Still images are warmed as DECODED bitmaps — that is what makes the
       // next step paint in one tick. Animated ones keep the <img> lane, so warm

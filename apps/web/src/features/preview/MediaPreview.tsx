@@ -52,6 +52,7 @@ export function MediaPreview({
   stableFrame?: boolean;
   thumbnail?: ThumbnailResponse;
 }) {
+  const viewportLongPx = usePreviewViewportLongPx();
   const previewPlaceholderUrl = previewPlaceholderDataUrl(media);
   const stableFrameStyle = stableFrame ? previewStableFrameStyle(media) : undefined;
   const shouldPreserveNaturalFrame =
@@ -88,7 +89,7 @@ export function MediaPreview({
         onLoadingChange={onLoadingChange}
         onMediaReady={onMediaReady}
         onNaturalSize={onNaturalSize}
-        viewportLongPx={previewViewportLongPx()}
+        viewportLongPx={viewportLongPx}
       />
     );
   }
@@ -644,7 +645,36 @@ export function previewViewportLongPx(): number {
     return 0;
   }
   const longest = Math.max(window.innerWidth, window.innerHeight);
-  return Math.max(1, Math.round(longest * (window.devicePixelRatio || 1)));
+  // Quantised to a step so ordinary resize jitter does not invalidate every
+  // pooled frame. The tier boundaries are hundreds of pixels apart, so this
+  // costs nothing in tier accuracy and keeps the value stable enough to use as
+  // a React dependency and as a cache-warmth key.
+  const raw = longest * (window.devicePixelRatio || 1);
+  return Math.max(1, Math.ceil(raw / VIEWPORT_QUANTUM_PX) * VIEWPORT_QUANTUM_PX);
+}
+
+const VIEWPORT_QUANTUM_PX = 128;
+
+/**
+ * The preview viewport, RECOMPUTED ON RESIZE.
+ *
+ * It used to be read once per render with no resize subscription, so maximizing
+ * the window left both the canvas and the prefetch effect asking for the tier
+ * that suited the old size — and because the prefetch short-circuit treated any
+ * pooled frame as warm, that never healed for the rest of the session.
+ */
+export function usePreviewViewportLongPx(): number {
+  const [value, setValue] = useState(() => previewViewportLongPx());
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const onResize = () => setValue(previewViewportLongPx());
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return value;
 }
 
 function previewStableFrameStyle(media: MediaRecord): CSSProperties | undefined {

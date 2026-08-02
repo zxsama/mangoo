@@ -7,7 +7,12 @@ register("./resolve-source-imports.mjs", import.meta.url);
   megleDesktop: { coreUrl: "http://127.0.0.1:47321/api" }
 };
 
-const { createDecodeDispatcher, createDispatcherHolder, decodeBlobOnMainThread } = await import(
+const {
+  createDecodeDispatcher,
+  createDispatcherHolder,
+  decodeBlobOnMainThread,
+  previewPrefetchBudgetBytes
+} = await import(
   "../src/features/preview/previewBitmapSource.ts"
 );
 
@@ -220,5 +225,68 @@ describe("main-thread decode fallback", () => {
       /abort/i
     );
     assert.equal(bitmap.closed, true, "a bitmap decoded into an aborted request must be closed");
+  });
+});
+
+describe("prefetch budget sizing", () => {
+  it("sizes the window against the DECODED-frame share, not the raw setting", () => {
+    // The window builder counts compressed file bytes; the pool it feeds counts
+    // decoded bytes and owns only 75% of the setting. Handing it the full
+    // setting picked a window an order of magnitude larger than the pool could
+    // hold, so most of it fetched, decoded, and was evicted unpainted.
+    const setting = 1200 * 1024 * 1024;
+
+    const budget = previewPrefetchBudgetBytes(setting, 2560);
+
+    assert.ok(budget > 0, "a real setting must yield a usable window");
+    assert.ok(
+      budget < setting * 0.75,
+      `budget ${budget} must be well under the pool's own share`
+    );
+    // 0.75 / 20 = 3.75% of the setting.
+    assert.equal(budget, Math.floor(setting * 0.75 / 20));
+  });
+
+  it("never returns a negative budget", () => {
+    assert.equal(previewPrefetchBudgetBytes(0, 2560), 0);
+    assert.equal(previewPrefetchBudgetBytes(-5, 2560), 0);
+  });
+});
+
+describe("abandoned decode adoption", () => {
+  it("pools a bitmap whose request was aborted after the decode finished", async () => {
+    // The App prefetch effect aborts on EVERY navigation, so at a held-arrow
+    // repeat rate essentially every prefetch is aborted mid-decode. Closing
+    // those finished bitmaps made a cold walk decode every frame twice.
+    const { transport, sent, reply } = fakeTransport();
+    const dispatcher = createDecodeDispatcher(transport as never);
+    const controller = new AbortController();
+    const key = "0:1:preview_2048";
+    const pending = dispatcher.decode(new Blob(["a"]), controller.signal, key);
+
+    controller.abort();
+    await assert.rejects(pending, /abort/i);
+
+    const late = fakeBitmap();
+    reply({ id: sent[0].id, ok: true, bitmap: late });
+
+    assert.equal(late.closed, false, "a finished bitmap must be pooled, not destroyed");
+    assert.equal(dispatcher.pendingCount(), 0);
+  });
+
+  it("still closes an abandoned bitmap when there is nowhere to pool it", async () => {
+    const { transport, sent, reply } = fakeTransport();
+    const dispatcher = createDecodeDispatcher(transport as never);
+    const controller = new AbortController();
+    // No key supplied: nothing can adopt it.
+    const pending = dispatcher.decode(new Blob(["a"]), controller.signal);
+
+    controller.abort();
+    await assert.rejects(pending, /abort/i);
+
+    const late = fakeBitmap();
+    reply({ id: sent[0].id, ok: true, bitmap: late });
+
+    assert.equal(late.closed, true, "an unadoptable bitmap must not leak");
   });
 });

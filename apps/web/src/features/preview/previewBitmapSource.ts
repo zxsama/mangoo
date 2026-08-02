@@ -39,6 +39,25 @@ export type PreviewBitmapRequestOptions = {
 };
 
 const ORIGINAL_TIER = "original";
+
+/**
+ * Pools a bitmap whose requester aborted before the decode landed. Returns
+ * false when there is nowhere to put it (unknown key, or the library moved on),
+ * in which case the caller must close it.
+ */
+function adoptAbandonedBitmap(key: string | null, bitmap: PoolableBitmap): boolean {
+  if (!key) {
+    return false;
+  }
+  // The key embeds the epoch it was minted under, so a key from a previous
+  // library simply will not match anything the pool is asked for again — but
+  // pooling it would still hold memory nothing reads, so drop it explicitly.
+  if (!key.startsWith(`${mediaCacheEpochToken()}:`)) {
+    return false;
+  }
+  previewBitmapPool.set(key, bitmap);
+  return true;
+}
 const client = createCoreClient();
 
 /**
@@ -51,6 +70,8 @@ export function createDecodeDispatcher(transport: DecodeTransport) {
     resolve: (bitmap: PoolableBitmap) => void;
     reject: (reason: Error) => void;
     aborted: boolean;
+    /** Where to pool a bitmap whose caller aborted before it finished. */
+    abandonKey: string | null;
   };
   const pending = new Map<number, Pending>();
   let nextId = 0;
@@ -71,20 +92,28 @@ export function createDecodeDispatcher(transport: DecodeTransport) {
       return;
     }
     if (entry.aborted) {
-      message.bitmap.close();
+      // The caller has already given up, but the decode is DONE. Hand it to the
+      // adopter (which pools it) rather than closing it — the App prefetch
+      // effect aborts on every navigation, so at a held-arrow-key repeat rate
+      // essentially every prefetch was aborted mid-decode and its finished
+      // bitmap destroyed, making a cold walk decode every frame twice.
+      // Pooling is budget-bounded, so this cannot grow without limit.
+      if (!adoptAbandonedBitmap(entry.abandonKey, message.bitmap)) {
+        message.bitmap.close();
+      }
       return;
     }
     entry.resolve(message.bitmap);
   });
 
   return {
-    decode(blob: Blob, signal?: AbortSignal): Promise<PoolableBitmap> {
+    decode(blob: Blob, signal?: AbortSignal, abandonKey?: string): Promise<PoolableBitmap> {
       if (signal?.aborted) {
         return Promise.reject(new DOMException("aborted", "AbortError"));
       }
       const id = (nextId += 1);
       return new Promise<PoolableBitmap>((resolve, reject) => {
-        const entry: Pending = { resolve, reject, aborted: false };
+        const entry: Pending = { resolve, reject, aborted: false, abandonKey: abandonKey ?? null };
         pending.set(id, entry);
         signal?.addEventListener(
           "abort",
@@ -200,10 +229,14 @@ export async function decodeBlobOnMainThread(
   return bitmap;
 }
 
-async function decodeBlob(blob: Blob, signal?: AbortSignal): Promise<PoolableBitmap> {
+async function decodeBlob(
+  blob: Blob,
+  signal?: AbortSignal,
+  abandonKey?: string
+): Promise<PoolableBitmap> {
   const worker = workerHolder.get();
   if (worker) {
-    return worker.decode(blob, signal);
+    return worker.decode(blob, signal, abandonKey);
   }
   return decodeBlobOnMainThread(
     blob,
@@ -237,6 +270,37 @@ export function configurePreviewBuffers(previewBufferBytes: number): void {
   );
 }
 
+/**
+ * Converts the user's preview-buffer setting into a budget the neighbour
+ * prefetch window can be measured against IN FILE BYTES.
+ *
+ * The window builder counts compressed bytes; the pool it feeds counts decoded
+ * bytes and owns only `PREVIEW_BITMAP_POOL_BUDGET_RATIO` of the setting. A
+ * decoded frame is far larger than its file, so we divide the pool's share by a
+ * conservative expansion factor to get an equivalent file-byte budget. Getting
+ * this wrong in the generous direction is what made most of the window fetch,
+ * decode, and evict without ever being painted.
+ *
+ * The factor is deliberately a fixed, pessimistic constant rather than a
+ * per-image estimate: `media.width/height` are frequently still pending while
+ * thumbnails generate, so a "smart" estimate would be wrong exactly when the
+ * window matters most.
+ */
+export function previewPrefetchBudgetBytes(
+  previewBufferBytes: number,
+  _viewportLongPx: number
+): number {
+  const poolBytes = Math.max(0, previewBufferBytes * PREVIEW_BITMAP_POOL_BUDGET_RATIO);
+  return Math.max(0, Math.floor(poolBytes / DECODED_TO_FILE_BYTES_RATIO));
+}
+
+/**
+ * How much larger a decoded RGBA frame is than the file it came from. A 3 MB
+ * JPEG decoding to ~130 MB is ~43x; 20 is a deliberately conservative floor, so
+ * the window under-fills rather than thrashes the pool.
+ */
+const DECODED_TO_FILE_BYTES_RATIO = 20;
+
 export function pinPreviewFrame(key: string | null): void {
   previewBitmapPool.pin(key);
 }
@@ -252,6 +316,18 @@ export function readPooledPreviewFrame(
 // beats a smaller one. This is the synchronous "can I paint RIGHT NOW?" probe
 // the canvas runs before it awaits anything.
 const TIER_PREFERENCE = [ORIGINAL_TIER, "preview_3072", "preview_2048", "preview_native"];
+
+/**
+ * "Is any frame for this media already decoded?" — using `peek`, so a warmth
+ * probe does not reorder the LRU. `readAnyPooledPreviewFrame` deliberately does
+ * touch recency, because it is the paint path.
+ */
+export function isPooledPreviewFrame(media: MediaRecord): boolean {
+  const epoch = mediaCacheEpochToken();
+  return TIER_PREFERENCE.some(
+    (tier) => previewBitmapPool.peek(previewBitmapKey(epoch, media.id, tier)) !== null
+  );
+}
 
 export function readAnyPooledPreviewFrame(media: MediaRecord): PooledPreviewFrame | null {
   const epoch = mediaCacheEpochToken();
@@ -291,7 +367,7 @@ export async function requestPreviewBitmap(
     return { bitmap: pooled, tier: resource.tier, key };
   }
 
-  const bitmap = await decodeBlob(resource.blob, options.signal);
+  const bitmap = await decodeBlob(resource.blob, options.signal, key);
   // A library switch during the decode invalidates this frame entirely: the
   // epoch moved, so pooling it under the old key would strand memory nothing
   // will ever read.
@@ -303,20 +379,36 @@ export async function requestPreviewBitmap(
   return { bitmap, tier: resource.tier, key };
 }
 
+/**
+ * Remembers which `viewportLongPx` produced each media's pooled frame, so the
+ * prefetch short-circuit can tell "already warm" from "warm at the WRONG tier".
+ *
+ * Without this, resizing the window (say 1280 -> 3840) left neighbours pooled
+ * at `preview_2048` while the canvas started asking for `preview_3072`: every
+ * navigation missed, and `readAnyPooledPreviewFrame` reported the stale entry
+ * as warm so prefetch refused to fix it for the rest of the session.
+ */
+const warmedViewportByMediaId = new Map<number, number>();
+
 export function prefetchPreviewBitmap(
   media: MediaRecord,
   options: PreviewBitmapRequestOptions = {}
 ): void {
-  // Already decoded and pooled: skip the HTTP round trip entirely.
+  // Already decoded and pooled AT THIS VIEWPORT: skip the HTTP round trip.
   //
   // `requestPreviewBitmap` cannot check the pool before fetching, because the
   // tier is part of the cache key and only the response reveals it. Without
   // this guard every navigation re-requested every neighbour's bytes even
   // though the pool already held their bitmaps — measured 350 preview requests
-  // across a 31-image walk. Warm is warm; a prefetch has nothing to add.
-  if (readAnyPooledPreviewFrame(media)) {
+  // across a 31-image walk, cut to 54.
+  //
+  // The viewport is part of the condition so a window resize re-warms at the
+  // new tier instead of being suppressed forever by a stale entry.
+  const wantedViewport = options.viewportLongPx ?? 0;
+  if (warmedViewportByMediaId.get(media.id) === wantedViewport && isPooledPreviewFrame(media)) {
     return;
   }
+  warmedViewportByMediaId.set(media.id, wantedViewport);
   void requestPreviewBitmap(media, { ...options, resourcePriority: "ahead" }).catch(
     () => undefined
   );
@@ -324,6 +416,7 @@ export function prefetchPreviewBitmap(
 
 export function releasePreviewBitmaps(): void {
   previewBitmapPool.clear();
+  warmedViewportByMediaId.clear();
   workerHolder.peek()?.rejectAll(new Error("library switched"));
 }
 
