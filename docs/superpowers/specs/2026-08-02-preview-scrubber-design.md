@@ -44,10 +44,18 @@ observed exactly this: "20k 图片拖动时有最小拖动张数，小小的拖�
 the same 1200 MB default), `preview_blobs` as the persistent cache, and the
 glass/overlay primitives for the UI. This design needs no new mechanism.
 
-**One structural difference with no BandiView analogue.** BandiView opens a
-single folder as a flat in-memory list it owns entirely. Megle windows a
-possibly-million-row SQLite query (`mediaSlots` is sparse; `mediaTotalCount` is
-the true size). §4 addresses the consequence.
+**Same problem as ours, solved with different timing.** BandiView also browses
+a whole folder tree flattened into one list — you can drop a directory on it and
+page through every descendant. It pays for that upfront: a progress bar while it
+enumerates, after which it owns a complete in-memory list and every index is
+immediately addressable.
+
+Megle has the same capability — `showChildFolderContents` drives the
+`includeDescendants` query flag in `useLibraryData`, and `mediaTotalCount` then
+reports the flattened total. The difference is only *when* the cost is paid: we
+load incrementally in the background instead of blocking on a progress bar, so
+`mediaSlots` is sparse and a far-away index may not be resident yet. §4 covers
+the consequence for the scrubber, which is a brief lag rather than a wait.
 
 ## 3. Drag model
 
@@ -85,16 +93,22 @@ computes `{ current, total }` from `mediaSlots` + `mediaTotalCount`, and already
 renders the "13/31" in the titlebar. The scrubber consumes the same value, so
 thumb, tooltip, and title cannot drift apart.
 
+This holds whether the list is a single folder or a whole subtree flattened by
+`showChildFolderContents` — the scrubber reads the same
+`mediaTotalCount`/`mediaSlots` pair either way and needs no special case.
+
 **Scrubbing outside the loaded window.** `mediaSlots` is sparse: dragging to
 image 8000 of 20000 may land on an unloaded slot, where there is no media id to
 select. The drag sets the target index and the existing media-window machinery
 loads that region — the same mechanism the grid uses when jumping to a position.
 Until the slot resolves, the thumb and tooltip move while the image follows.
 
-This is the one place position and picture can briefly disagree. It is
-unavoidable — an image whose record has not loaded cannot be displayed — and it
-is bounded by a single API round-trip. It does not occur within the loaded
-window, which extends well beyond the visible neighbourhood.
+This is the one place position and picture can briefly disagree, and it is the
+price of loading in the background instead of behind a progress bar. It is
+bounded by a single API round-trip, and it does not occur within the loaded
+window, which extends well beyond the visible neighbourhood. The alternative —
+blocking on a full enumeration the way BandiView does — was rejected: it would
+stall opening a large library for the sake of a rarely-used far jump.
 
 ## 5. Visibility and the pin
 
