@@ -355,7 +355,8 @@ paths:
           required: false
           description: >-
             Longest side of the preview viewport in CSS pixels. Omit to receive
-            the original bytes verbatim.
+            the original bytes verbatim. Values above the maximum are clamped,
+            not rejected; a non-integer value is a 400.
           schema:
             type: integer
             minimum: 1

@@ -1295,8 +1295,19 @@ async fn cancel_bulk_thumbnail_cache(
 async fn get_preview(
     State(state): State<AppState>,
     Path(file_id): Path<i64>,
-    Query(query): Query<PreviewQuery>,
+    query: Result<Query<PreviewQuery>, QueryRejection>,
 ) -> ApiResult<Response> {
+    // Map the extractor's rejection ourselves. Axum's built-in rejection body
+    // is PLAIN TEXT, but the OpenAPI contract declares every 400 on this route
+    // as an `ErrorResponse` JSON object — the same shape every other route
+    // returns. `list_notification_outbox` uses this pattern for the same reason.
+    let Query(query) = query.map_err(|_| {
+        CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "viewportLongPx must be a positive integer".to_string(),
+        )
+    })?;
     use axum::body::Body;
     use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
     use tokio_util::io::ReaderStream;
@@ -1335,11 +1346,19 @@ async fn get_preview(
     }
 
     let ext = crate::decode::formats::lowercase_extension(&source_path);
+    // Clamp rather than reject. `select_preview_profile` already saturates to
+    // the largest tier, so an absurd value is harmless — but clamping keeps the
+    // accepted input space finite and documented instead of "anything up to
+    // u32::MAX happens to work".
+    let viewport_long_px = query
+        .viewport_long_px
+        .unwrap_or(0)
+        .min(MAX_VIEWPORT_LONG_PX);
     if let Some(plan) = resolve_preview_plan(
         media_kind.as_deref(),
         ext.as_str(),
         source_max_px,
-        query.viewport_long_px.unwrap_or(0),
+        viewport_long_px,
     ) {
         // `Ok(None)` means the representation could not be produced (no decoder
         // for the format, ffmpeg missing, NAS blip, locked file). That is a
@@ -1370,6 +1389,10 @@ async fn get_preview(
 /// Tells the client WHICH representation it received, so it knows whether a
 /// background full-resolution upgrade is still worth requesting.
 const PREVIEW_TIER_HEADER: &str = "x-megle-preview-tier";
+
+/// Upper bound on a reported preview viewport. Far beyond any real display,
+/// and values above it are clamped rather than rejected.
+const MAX_VIEWPORT_LONG_PX: u32 = 16384;
 
 /// Serve one cached-or-generated WebP preview representation.
 ///
@@ -1406,6 +1429,17 @@ async fn serve_cached_preview_webp(
             // writer owns the process's single write connection, and a
             // multi-hundred-millisecond decode there would stall every write.
             let generation_path = source_path.to_path_buf();
+            // Bound concurrent decodes. Without this, one bare `spawn_blocking`
+            // per request stacked without limit on the shared blocking pool —
+            // each holding a full decoded image and delaying every read route
+            // using that pool. Acquired BEFORE the spawn so waiters queue on a
+            // cheap future rather than on a thread.
+            let _decode_permit = state
+                .preview_decode_gate
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| CoreError::internal("preview decode gate closed".to_string()))?;
             let outcome = tokio::task::spawn_blocking(move || {
                 generate_preview_webp(&generation_path, plan.max_px)
             })
@@ -2961,6 +2995,9 @@ mod tests {
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
             )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::PREVIEW_DECODE_CONCURRENCY,
+            )),
             notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
@@ -3370,7 +3407,39 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 "viewportLongPx={malformed} must be rejected"
             );
+            // ...and rejected as the ErrorResponse JSON the contract declares,
+            // not axum's default plain-text rejection body. Asserting only the
+            // STATUS is what let that drift ship unnoticed.
+            assert_eq!(
+                rejected
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.starts_with("application/json")),
+                Some(true),
+                "viewportLongPx={malformed} rejection must be JSON"
+            );
+            let body = to_bytes(rejected.into_body(), usize::MAX)
+                .await
+                .expect("rejection body");
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&body).expect("rejection body must parse as JSON");
+            assert!(
+                parsed.get("error").is_some() || parsed.get("message").is_some(),
+                "rejection must carry an ErrorResponse shape, got {parsed}"
+            );
         }
+
+        // An absurd viewport is CLAMPED, not rejected: select_preview_profile
+        // saturates to the largest tier anyway, and a client bug should cost a
+        // slightly-wrong tier, never a broken picture.
+        let clamped = harness
+            .get(&format!(
+                "/api/media/{}/preview?viewportLongPx=999999999",
+                harness.file_id
+            ))
+            .await;
+        assert_eq!(clamped.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3642,6 +3711,9 @@ mod tests {
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
             )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::PREVIEW_DECODE_CONCURRENCY,
+            )),
             notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
@@ -3720,6 +3792,9 @@ mod tests {
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::PREVIEW_DECODE_CONCURRENCY,
             )),
             notification_outbox_test_probe: None,
             fsops_database: None,
@@ -4712,6 +4787,9 @@ mod tests {
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
             )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::PREVIEW_DECODE_CONCURRENCY,
+            )),
             notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
@@ -4835,6 +4913,9 @@ mod tests {
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::PREVIEW_DECODE_CONCURRENCY,
             )),
             notification_outbox_test_probe: None,
             fsops_database: None,
@@ -5252,6 +5333,9 @@ mod tests {
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
             )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::PREVIEW_DECODE_CONCURRENCY,
+            )),
             notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: sender,
@@ -5345,6 +5429,9 @@ mod tests {
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::PREVIEW_DECODE_CONCURRENCY,
             )),
             notification_outbox_test_probe: None,
             fsops_database: None,
@@ -5597,6 +5684,9 @@ mod tests {
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
             )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::PREVIEW_DECODE_CONCURRENCY,
+            )),
             notification_outbox_test_probe: None,
             fsops_database: None,
             task_queue: _sender,
@@ -5655,6 +5745,9 @@ mod tests {
             notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
+            )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::api::PREVIEW_DECODE_CONCURRENCY,
             )),
             notification_outbox_test_probe: None,
             fsops_database: None,

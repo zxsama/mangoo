@@ -26,6 +26,10 @@ pub mod routes;
 pub const API_PREFIX: &str = "/api";
 pub const SESSION_HEADER: &str = "X-Megle-Session";
 pub(crate) const NOTIFICATION_OUTBOX_READ_CONCURRENCY: usize = 4;
+/// Concurrent preview decodes. Deliberately small: each one can hold a
+/// full-resolution decoded image, and they share Tokio's blocking pool with
+/// every `run_read_database` call.
+pub(crate) const PREVIEW_DECODE_CONCURRENCY: usize = 3;
 
 #[cfg(test)]
 pub(crate) struct NotificationOutboxTestProbe {
@@ -142,6 +146,15 @@ pub struct AppState {
     /// their permit before awaiting `notification_outbox_wake`, so the desktop
     /// drain loop is never pinned behind idle waiters.
     pub(crate) notification_outbox_read_gate: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent preview decodes.
+    ///
+    /// Every thumbnail decode already runs under a per-bucket semaphore; the
+    /// preview route had none, so one bare `spawn_blocking` per request could
+    /// stack unboundedly on the shared blocking pool — each holding a full
+    /// decoded image (hundreds of MB for a large source) and delaying every
+    /// read route sharing that pool. `spawn_blocking` is also uncancellable, so
+    /// a client that navigated away still pays for its decode to completion.
+    pub(crate) preview_decode_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) notification_outbox_test_probe: Option<Arc<NotificationOutboxTestProbe>>,
     /// A reopened connection used for file-operation preflight reads and plugin
@@ -189,6 +202,7 @@ impl AppState {
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
             )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(PREVIEW_DECODE_CONCURRENCY)),
             #[cfg(test)]
             notification_outbox_test_probe: None,
             fsops_database: None,
@@ -231,6 +245,7 @@ impl AppState {
             notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
                 NOTIFICATION_OUTBOX_READ_CONCURRENCY,
             )),
+            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(PREVIEW_DECODE_CONCURRENCY)),
             #[cfg(test)]
             notification_outbox_test_probe: None,
             fsops_database,

@@ -384,6 +384,10 @@ assertOperationParameters("listThumbnailCacheFailures", ["limit"]);
 assertOperationParameters("getThumbnail", ["fileId", "target", "priority"]);
 assertOperationParameters("getThumbnailBlob", ["fileId", "target"]);
 assertOperationParameters("getPreview", ["fileId", "viewportLongPx"]);
+// The declared bounds must stay pinned: the route clamps to the maximum and
+// 400s a non-integer, so a contract that drifted from these numbers would be
+// promising behaviour the server does not implement.
+assertIntegerParameterBounds("getPreview", "viewportLongPx", 1, 16384);
 operation("syncThumbnailPriorityScope");
 assertOperationParameters("searchMedia", ["rootId", "folderId", "limit", "offset", "cursor", "sort", "kind"]);
 assertOperationRoute("listNotificationOutbox", "get", "/notifications/outbox");
