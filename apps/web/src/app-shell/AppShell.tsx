@@ -10,6 +10,7 @@ import {
   type ReactNode
 } from "react";
 import { useDampedWheelScroll } from "./useDampedWheelScroll";
+import { CHANNEL_MATRICES } from "../features/preview/previewRenderSettings";
 import { LiquidGlassSurface } from "../design/liquid-glass";
 
 const SHELL_LEFT_WIDTH_STORAGE_KEY = "megle.shell.left-width";
@@ -159,6 +160,22 @@ export function AppShell({
       style={shellStyle}
     >
       <div className="shell-backdrop-canvas" aria-hidden="true" />
+      {/* Channel-isolation matrices, referenced by `filter: url(#...)` on
+          `.preview-image`. Generated from CHANNEL_MATRICES so the ids can never
+          drift from previewRenderSettings.
+
+          `colorInterpolationFilters="sRGB"` is required: the SVG default is
+          linearRGB, which would gamma-shift every channel view and misreport
+          the stored values the feature exists to show. */}
+      <svg aria-hidden="true" className="preview-channel-filters" focusable="false">
+        <defs>
+          {CHANNEL_MATRICES.map((matrix) => (
+            <filter colorInterpolationFilters="sRGB" id={matrix.id} key={matrix.id}>
+              <feColorMatrix type="matrix" values={matrix.values} />
+            </filter>
+          ))}
+        </defs>
+      </svg>
       {sidebarsHidden ? null : (
         <>
           <div

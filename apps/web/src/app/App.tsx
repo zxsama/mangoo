@@ -86,6 +86,11 @@ import { useShortcuts } from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
 import { buildPreviewPrefetchWindow } from "./previewPrefetchWindow";
 import { canNavigatePreview, canStartPreviewNavigation } from "./previewNavigationGate";
+import { PreviewRenderMenu } from "../features/preview/PreviewRenderMenu";
+import {
+  channelFilterId,
+  imageRenderingForFilter
+} from "../features/preview/previewRenderSettings";
 import { previewViewportLongPx } from "../features/preview/MediaPreview";
 import {
   configurePreviewBuffers,
@@ -502,6 +507,27 @@ export function App() {
     storeLibraryGridPreferences(gridPreferences);
   }, [gridPreferences]);
 
+  // Publish the render settings as CSS custom properties on <body>. styles.css
+  // consumes them on the shared `.preview-image` class, so the canvas, <img>
+  // and <video> lanes are all covered by one rule with no repaint and no
+  // re-decode.
+  //
+  // The VALUES come from previewRenderSettings, not from CSS selectors, so the
+  // mapping lives in exactly one tested place instead of being duplicated as a
+  // keyword list in the stylesheet. Both defaults (`auto`, `none`) are the CSS
+  // initial values, so the untouched common case costs nothing.
+  useEffect(() => {
+    const channel = channelFilterId(previewPreferences.previewChannel);
+    document.body.style.setProperty(
+      "--preview-image-rendering",
+      imageRenderingForFilter(previewPreferences.previewRenderFilter)
+    );
+    document.body.style.setProperty(
+      "--preview-channel-filter",
+      channel === null ? "none" : `url(#${channel})`
+    );
+  }, [previewPreferences.previewChannel, previewPreferences.previewRenderFilter]);
+
   useEffect(() => {
     storePreviewPreferences(previewPreferences);
     configurePreviewBuffers(
@@ -517,6 +543,7 @@ export function App() {
   const filterMenuOpen = overlays.isRootOpen("filter");
   const sortMenuOpen = overlays.isRootOpen("sort");
   const layoutMenuOpen = overlays.isRootOpen("layout");
+  const previewRenderMenuOpen = overlays.isRootOpen("preview-render");
   const librarySwitcherOpen = overlays.isRootOpen("library");
 
   const setRootOpen = useCallback(
@@ -753,6 +780,20 @@ export function App() {
           onGoPrevious={handlePreviewPrevious}
           primaryActions={primaryActions}
           onToggleActualSize={() => previewViewCommands?.toggleActualSize()}
+          renderActions={
+            <PreviewRenderMenu
+              channel={previewPreferences.previewChannel}
+              filter={previewPreferences.previewRenderFilter}
+              onChangeChannel={(previewChannel) =>
+                setPreviewPreferences((current) => ({ ...current, previewChannel }))
+              }
+              onChangeFilter={(previewRenderFilter) =>
+                setPreviewPreferences((current) => ({ ...current, previewRenderFilter }))
+              }
+              onOpenChange={(open) => setRootOpen("preview-render", open)}
+              open={previewRenderMenuOpen}
+            />
+          }
         />
       );
     }

@@ -2441,6 +2441,36 @@ button:disabled {
   height: 100%;
   object-fit: contain;
   display: block;
+  /* Render settings, published as custom properties by App.tsx from the tested
+     mapping in previewRenderSettings.ts. Both defaults are the CSS initial
+     values, so a user who never opens the render panel pays nothing.
+
+     Applied here rather than on the canvas alone so every preview lane is
+     covered by one rule: the canvas, the <img> used for animated formats, and
+     <video> all carry this class. Purely CSS — nothing repaints or re-decodes. */
+  image-rendering: var(--preview-image-rendering, auto);
+  filter: var(--preview-channel-filter, none);
+}
+
+/* The channel matrices are referenced by `filter: url(#...)`; the SVG holding
+   them never renders itself. */
+.preview-channel-filters {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+.preview-render-group + .preview-render-group {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--glass-divider, rgba(255, 255, 255, 0.08));
+}
+
+.preview-render-group-label {
+  padding: 4px 10px 2px;
+  font-size: 11px;
+  opacity: 0.6;
 }
 
 /* The canvas occupies the same box as the <img> it replaces; the wrapper's

@@ -76,6 +76,10 @@ interface PreviewTitlebarToolbarProps {
   onGoNext: () => void;
   onGoPrevious: () => void;
   primaryActions?: ReactNode;
+  // Right-hand slot for preview-scoped controls (the render settings popover).
+  // Kept separate from `shellActions`, which only appears when the sidebars are
+  // hidden, so these stay visible in every layout.
+  renderActions?: ReactNode;
   onToggleActualSize: () => void;
 }
 
@@ -338,6 +342,7 @@ export function PreviewTitlebarToolbar({
   onGoNext,
   onGoPrevious,
   primaryActions,
+  renderActions,
   onToggleActualSize
 }: PreviewTitlebarToolbarProps) {
   const previewScale = `${Math.round(scale * 100)}%`;
@@ -411,6 +416,11 @@ export function PreviewTitlebarToolbar({
       >
         {selectedName}
       </div>
+      {renderActions ? (
+        <div className="titlebar-preview-actions no-drag" data-no-drag="true">
+          {renderActions}
+        </div>
+      ) : null}
       {shellActions ? (
         <div className="titlebar-shell-actions no-drag">{shellActions}</div>
       ) : (
