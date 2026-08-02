@@ -307,6 +307,16 @@ export function prefetchPreviewBitmap(
   media: MediaRecord,
   options: PreviewBitmapRequestOptions = {}
 ): void {
+  // Already decoded and pooled: skip the HTTP round trip entirely.
+  //
+  // `requestPreviewBitmap` cannot check the pool before fetching, because the
+  // tier is part of the cache key and only the response reveals it. Without
+  // this guard every navigation re-requested every neighbour's bytes even
+  // though the pool already held their bitmaps — measured 350 preview requests
+  // across a 31-image walk. Warm is warm; a prefetch has nothing to add.
+  if (readAnyPooledPreviewFrame(media)) {
+    return;
+  }
   void requestPreviewBitmap(media, { ...options, resourcePriority: "ahead" }).catch(
     () => undefined
   );
