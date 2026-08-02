@@ -9,6 +9,7 @@ export type OverlayRootId =
   | "filter"
   | "sort"
   | "layout"
+  | "preview-render"
   | "notifications"
   | "context-menu"
   | "file-operation";
