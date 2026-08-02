@@ -1689,8 +1689,11 @@ if (
   // previewBitmapSource owns the split. Assert both halves so the preference
   // still provably reaches the byte cache it used to configure directly.
   !/configurePreviewBuffers/.test(app) ||
-  !/configureOriginalPreviewBuffer/.test(previewBitmapSource) ||
-  !/configurePreviewBitmapBudget/.test(previewBitmapSource) ||
+  // Match the CALL, not the import: `configureOriginalPreviewBuffer,` in the
+  // import list would otherwise satisfy this even if nothing ever invoked it,
+  // silently dropping the byte-cache half of the user's buffer setting.
+  !/configureOriginalPreviewBuffer\(/.test(previewBitmapSource) ||
+  !/configurePreviewBitmapBudget\(/.test(previewBitmapSource) ||
   !/previewPreferences\.previewBufferLimitMb/.test(app) ||
   !/浏览缓存/.test(settingsView) ||
   !/预览缓冲区/.test(settingsView)
