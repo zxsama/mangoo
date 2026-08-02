@@ -90,4 +90,45 @@ describe("preview render lane", () => {
     assert.equal(target.cssWidth, 800);
     assert.equal(target.cssHeight, 600);
   });
+
+  it("takes the css box's SHAPE from the bitmap, not from the natural dims", () => {
+    // Core and the browser can disagree about orientation (Core stores raw
+    // raster; createImageBitmap applies EXIF). Sizing a portrait bitmap into a
+    // landscape box letterboxed the image and threw off both fit-long-edge and
+    // "actual pixels" zoom. The long edge still comes from `natural`, so the
+    // frame is the right SIZE; the aspect comes from what is actually painted.
+    const target = canvasPaintTarget(
+      { width: 3000, height: 4000 },
+      { naturalWidth: 4000, naturalHeight: 3000 }
+    );
+
+    assert.equal(target.backingWidth, 3000);
+    assert.equal(target.backingHeight, 4000);
+    assert.equal(target.cssWidth, 3000, "css box must stay portrait");
+    assert.equal(target.cssHeight, 4000);
+  });
+
+  it("scales a downscaled tier back up to the original's display size", () => {
+    const target = canvasPaintTarget(
+      { width: 3072, height: 1536 },
+      { naturalWidth: 16384, naturalHeight: 8192 }
+    );
+
+    assert.equal(target.cssWidth, 16384);
+    assert.equal(target.cssHeight, 8192);
+  });
+
+  it("is a no-op when the bitmap already is the natural size", () => {
+    const target = canvasPaintTarget(
+      { width: 1920, height: 1080 },
+      { naturalWidth: 1920, naturalHeight: 1080 }
+    );
+
+    assert.deepEqual(target, {
+      backingWidth: 1920,
+      backingHeight: 1080,
+      cssWidth: 1920,
+      cssHeight: 1080
+    });
+  });
 });

@@ -44,19 +44,37 @@ export function selectPreviewRenderLane(input: {
  * be 536 MB of GPU memory; a preview_3072 one is 21 MB and the browser scales
  * it into the layout box for free.
  *
- * CSS box = the media's NATURAL size, which is exactly the box the `<img>`
- * occupied, so `.central-preview-transform`'s `translate(...) scale(...)` and
- * "actual pixels" zoom keep working without a single change.
+ * CSS box = the bitmap's SHAPE scaled to the media's natural SIZE. Taking the
+ * shape from `natural` instead was a real bug: Core and the browser can
+ * disagree about orientation, and then a portrait bitmap got sized into a
+ * landscape box — `object-fit: contain` letterboxed it and both fit-long-edge
+ * and "actual pixels" zoom were wrong by that factor. Core now applies EXIF so
+ * the two agree, but deriving shape from the thing actually being painted means
+ * a future disagreement degrades to a slightly-wrong scale rather than a
+ * visibly broken frame.
  */
 export function canvasPaintTarget(
   bitmap: { width: number; height: number },
   natural: { naturalWidth: number; naturalHeight: number } | null
 ): { backingWidth: number; backingHeight: number; cssWidth: number; cssHeight: number } {
   const hasNatural = !!natural && natural.naturalWidth > 0 && natural.naturalHeight > 0;
+  const bitmapLongEdge = Math.max(bitmap.width, bitmap.height);
+  if (!hasNatural || bitmapLongEdge <= 0) {
+    return {
+      backingWidth: bitmap.width,
+      backingHeight: bitmap.height,
+      cssWidth: bitmap.width,
+      cssHeight: bitmap.height
+    };
+  }
+  // Scale the bitmap's own aspect up to the media's long edge. For a tier this
+  // restores the original's display size; for a full-resolution frame it is a
+  // no-op (scale === 1).
+  const scale = Math.max(natural.naturalWidth, natural.naturalHeight) / bitmapLongEdge;
   return {
     backingWidth: bitmap.width,
     backingHeight: bitmap.height,
-    cssWidth: hasNatural ? natural.naturalWidth : bitmap.width,
-    cssHeight: hasNatural ? natural.naturalHeight : bitmap.height
+    cssWidth: Math.max(1, Math.round(bitmap.width * scale)),
+    cssHeight: Math.max(1, Math.round(bitmap.height * scale))
   };
 }

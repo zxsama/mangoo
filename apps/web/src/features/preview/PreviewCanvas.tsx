@@ -3,6 +3,8 @@ import type { CSSProperties } from "react";
 
 import type { MediaRecord } from "@megle/core-client";
 
+import { mediaFileContentSignature } from "../../core/mediaResources";
+
 import type { PoolableBitmap } from "./previewBitmapPool";
 import {
   pinPreviewFrame,
@@ -39,6 +41,7 @@ export function PreviewCanvas({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [boxStyle, setBoxStyle] = useState<CSSProperties | undefined>(undefined);
   const [failed, setFailed] = useState(false);
+  const mediaSignature = mediaFileContentSignature(media);
 
   useEffect(() => {
     let disposed = false;
@@ -131,21 +134,24 @@ export function PreviewCanvas({
       disposed = true;
       controller.abort();
     };
-  }, [media, onLoadingChange, onMediaReady, onNaturalSize, viewportLongPx]);
+    // Keyed on the media's CONTENT SIGNATURE, not the object identity. The
+    // record comes straight from the query cache, so a routine refetch (which
+    // happens constantly while thumbnails generate) hands down a fresh object
+    // and would otherwise abort an in-flight decode and restart from zero —
+    // repeatedly enough to starve it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mediaSignature, onLoadingChange, onMediaReady, onNaturalSize, viewportLongPx]);
 
   useEffect(() => () => pinPreviewFrame(null), []);
 
-  if (failed) {
-    return (
-      <div className="preview-placeholder failed" style={boxStyle ?? frameStyle}>
-        <span>load error</span>
-      </div>
-    );
-  }
-
+  // The canvas stays MOUNTED even when the last load failed. Replacing the
+  // subtree nulled `canvasRef`, so the NEXT media's synchronous warm paint hit
+  // the null-ref early return AND skipped `onLoadingChange(true)` — leaving a
+  // blank frame sized to the previous image, with no spinner, until the async
+  // path recovered it a full round trip later.
   return (
     <div
-      className="preview-placeholder ready"
+      className={failed ? "preview-placeholder failed" : "preview-placeholder ready"}
       data-preview-source="original"
       style={boxStyle ?? frameStyle}
     >
@@ -153,10 +159,12 @@ export function PreviewCanvas({
         aria-label={alt}
         className="preview-image preview-canvas"
         data-preview-media-id={media.id}
+        hidden={failed}
         ref={canvasRef}
         role="img"
         style={boxStyle}
       />
+      {failed ? <span>load error</span> : null}
     </div>
   );
 }

@@ -8257,6 +8257,25 @@ pub(crate) fn cleanup_inactive_thumbnail_artifacts_in_transaction(
         "#,
         [],
     )?;
+    // Preview tiers are reclaimed on the same terms as grid thumbs.
+    //
+    // Recycling files or disabling a root flips `files.status` WITHOUT deleting
+    // the row, so the FK cascade never fires. Omitting this left 1-3 MB tiers
+    // for unreachable files occupying the preview cache budget, where they
+    // evicted tiers for images the user is actually looking at.
+    transaction.execute(
+        r#"
+        DELETE FROM preview_blobs
+        WHERE EXISTS (
+          SELECT 1
+          FROM files
+          JOIN roots ON roots.id = files.root_id
+          WHERE files.id = preview_blobs.file_id
+            AND (files.status <> 'active' OR roots.enabled = 0)
+        )
+        "#,
+        [],
+    )?;
     Ok(())
 }
 
@@ -10418,6 +10437,69 @@ mod tests {
     fn seed_single_media_file(database: &Database) -> i64 {
         seed_media_files(database, 1)[0]
     }
+
+    #[test]
+    fn inactive_files_do_not_strand_preview_tiers_in_the_cache_budget() {
+        // Recycling a file or disabling a root flips `files.status` WITHOUT
+        // deleting the row, so the FK cascade never fires. Grid thumbs were
+        // already reclaimed here; preview tiers were not, so 1-3 MB blobs for
+        // unreachable files sat in the 2 GiB budget and evicted tiers for
+        // images the user is actually looking at.
+        let database = Database::open_in_memory().expect("open");
+        database.apply_migrations().expect("migrate");
+        let file_ids = seed_media_files(&database, 2);
+        let (kept, recycled) = (file_ids[0], file_ids[1]);
+
+        for file_id in [kept, recycled] {
+            database
+                .upsert_preview_blob(PreviewBlobRecord {
+                    file_id,
+                    profile: PREVIEW_2048_PROFILE_FOR_TEST.to_string(),
+                    data: vec![1, 2, 3, 4],
+                    width: 2048,
+                    height: 1152,
+                    byte_size: 4,
+                    output_format: "image/webp".to_string(),
+                    source_size: 1,
+                    source_mtime: 1,
+                    created_at: 10,
+                    updated_at: 10,
+                })
+                .expect("seed tier");
+        }
+
+        database
+            .connection
+            .execute(
+                "UPDATE files SET status = 'deleted' WHERE id = ?1",
+                [recycled],
+            )
+            .expect("mark inactive");
+
+        let transaction = database
+            .connection
+            .unchecked_transaction()
+            .expect("transaction");
+        cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction).expect("cleanup");
+        transaction.commit().expect("commit");
+
+        assert!(
+            database
+                .get_preview_blob(recycled, PREVIEW_2048_PROFILE_FOR_TEST)
+                .expect("query")
+                .is_none(),
+            "an inactive file's preview tier must be reclaimed"
+        );
+        assert!(
+            database
+                .get_preview_blob(kept, PREVIEW_2048_PROFILE_FOR_TEST)
+                .expect("query")
+                .is_some(),
+            "an active file's preview tier must survive"
+        );
+    }
+
+    const PREVIEW_2048_PROFILE_FOR_TEST: &str = "preview_2048";
 
     fn media_names(items: &[MediaRecord]) -> Vec<&str> {
         items.iter().map(|item| item.name.as_str()).collect()

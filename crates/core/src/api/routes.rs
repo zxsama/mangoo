@@ -1444,12 +1444,26 @@ async fn serve_cached_preview_webp(
                 updated_at: now,
             };
             let stored = record.clone();
-            // Short write: one upsert plus the LRU trim.
-            run_shared_database(state, move |database| {
+            // Persisting is a CACHE write, so its failure must never cost the
+            // user the picture we already decoded. Disk full, SQLITE_BUSY past
+            // the timeout (fsops writes on its own connection and genuinely
+            // contends), an FK violation because the file was removed during
+            // the decode, or a writer shut down by a library switch — every one
+            // of those leaves this WebP perfectly serveable. Propagating turned
+            // them into a 500 and a blank frame, which is the same hole the
+            // decode path already closes by degrading.
+            if let Err(error) = run_shared_database(state, move |database| {
                 database.upsert_preview_blob(stored)?;
                 Ok(())
             })
-            .await?;
+            .await
+            {
+                crate::debug_log!(
+                    "preview tier cache write failed (file {file_id}, profile {}): {}",
+                    plan.profile,
+                    error.message
+                );
+            }
             record
         }
     };

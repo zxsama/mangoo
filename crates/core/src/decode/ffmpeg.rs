@@ -20,6 +20,14 @@ use super::{DecodePurpose, DecodeRequest, DecodedImage, MediaDecoder, DECODER_UN
 /// preview path is interactive.
 const FFMPEG_DECODE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Longest-side ceiling applied when the caller supplies no `target_max_px`.
+///
+/// 8192 covers every real photograph (up to ~67 MP), so reported source
+/// dimensions stay exact for anything a user actually owns; it exists purely so
+/// a pathological gigapixel scan cannot write an unbounded temp PNG or blow the
+/// readback's allocation limit. See the rationale at the call site.
+const FFMPEG_DECODE_CEILING_PX: u32 = 8192;
+
 /// Extensions this decoder claims. Images only — video thumbnails keep their
 /// dedicated `generate_video_thumbnail_bytes` path, which already emits WebP
 /// directly and needs no RGBA round trip.
@@ -89,19 +97,47 @@ impl MediaDecoder for FfmpegDecoder {
             .args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(source_path)
             .args(["-frames:v", "1"]);
-        if let Some(max_px) = request.target_max_px {
-            command.args(["-vf", &ffmpeg_scale_filter(max_px)]);
-        }
+        // ALWAYS scale, even when the caller supplied no cap.
+        //
+        // The thumbnail path deliberately passes `target_max_px: None` so
+        // `media.width/height` stay the true source dimensions. Without a
+        // ceiling here that meant ffmpeg wrote a FULL-RESOLUTION PNG to %TEMP%
+        // and Core decoded it back: ~97 MB of heap and ~40 MB of temp I/O for
+        // an ordinary 12 MP phone HEIC — to produce a 320px tile — times up to
+        // 13 concurrent thumbnail workers. Above ~134 MP the readback also blew
+        // `image`'s default 512 MB allocation limit, and that failure text
+        // ("Memory limit exceeded") is a TRANSIENT signature, so the 60s sweep
+        // re-ran the whole doomed round trip every minute, forever.
+        //
+        // The ceiling is set high enough (8192 long side = up to 67 MP) that no
+        // real photograph is scaled, so reported source dimensions stay exact
+        // for every file a user actually owns. Only pathological gigapixel
+        // scans are downscaled, where slightly approximate dimensions are
+        // vastly better than an unbounded temp file and a permanent retry loop.
+        let max_px = request.target_max_px.unwrap_or(FFMPEG_DECODE_CEILING_PX);
+        command.args(["-vf", &ffmpeg_scale_filter(max_px)]);
         // PNG, not rawvideo: rawvideo carries no dimensions, so reading it back
         // would need a second ffprobe subprocess. PNG is self-describing and
         // keeps alpha unambiguously (HEIC/AVIF can be transparent).
+        //
+        // `-compression_level 1`: this PNG exists for microseconds and is read
+        // back by this same process. Paying maximum zlib on the write and then
+        // full inflate on the read is pure waste on the hot thumbnail path.
         //
         // The frame goes to a FILE, not stdout: `wait_with_timeout` does not
         // drain pipes, so a multi-megabyte frame on a 64 KB stdout pipe would
         // deadlock ffmpeg until the timeout. This mirrors the proven shape of
         // `thumbnails::generate_video_thumbnail`.
         command
-            .args(["-f", "image2", "-c:v", "png", "-y"])
+            .args([
+                "-f",
+                "image2",
+                "-c:v",
+                "png",
+                "-compression_level",
+                "1",
+                "-y",
+            ])
             .arg(&scratch)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
