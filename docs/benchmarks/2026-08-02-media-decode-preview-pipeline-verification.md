@@ -185,3 +185,82 @@ corresponding `close()` is removed.
   measurement against one: the full-resolution PNG round trip ffmpeg writes to
   `%TEMP%` per HEIC/AVIF/PSD thumbnail, and the absence of a negative cache
   (a permanently undecodable file re-runs generation on every preview request).
+
+---
+
+## 9. Post-final-review fix wave (2026-08-02, later)
+
+The whole-branch review was run in five slices and returned **2 Critical + 14
+Important**. All are fixed; the numbers below are re-measured on the fixed tree.
+
+### 9a. EXIF orientation — the Critical, fixed at the root
+
+Core applied EXIF nowhere, so it stored raw raster dimensions while the browser
+decoded the same file EXIF-applied. Verified before and after with a
+purpose-built orientation-6 JPEG driven through the running app:
+
+```
+before   coreStored 400x200   browserDecoded 200x400   MISMATCH
+after    coreStored 200x400   browserDecoded 200x400   AGREE
+```
+
+Fixed in the decode registry (`image` 0.25's native `ImageDecoder::orientation`
++ `DynamicImage::apply_orientation`, no new dependency), so Core's stored
+dimensions, grid thumbnails, preview tiers and the browser all agree. This also
+fixes the **pre-existing** sideways-thumbnail bug for rotated phone photos,
+rather than compensating for it in the canvas.
+
+### 9b. The sharpening upgrade is now on demand
+
+The plan had it fire unconditionally per image, which recreated the exact memory
+blow-up the tier system exists to prevent. It is now gated on the user actually
+zooming past fit — which is what the design spec said all along.
+
+| | originals per walk | median inter-frame gap | JS heap | canvas backing store |
+|---|---|---|---|---|
+| unconditional | 32 | 40 ms | 45 MB | 10240x5760 (**236 MB**) |
+| on demand | 17 | **14 ms** | 30 MB | 3072x1728 (**21 MB**) |
+
+The remaining 17 are images that legitimately get no tier (at or below 4096px,
+or dimensions still pending) — not upgrades.
+
+Navigation after the whole fix wave: **32 frames in 912 ms** against a 900 ms
+input window at 30 ms auto-repeat. Still keeping pace with the key repeat rate,
+now without the background full-resolution decodes.
+
+### 9c. Crash and resource-loop classes closed
+
+- A 20000x20000 TIFF preview was ~2.8 GB peak on an unbounded blocking pool — a
+  Rust OOM, which aborts the whole Core process. Now rejected from the file
+  header, with wording that classifies **permanent** so it cannot arm the retry
+  sweep.
+- ffmpeg's full-resolution `%TEMP%` PNG tripped `image`'s 512 MB limit, and that
+  failure text is a *transient* signature, so the 60 s sweep re-ran a doomed
+  gigapixel decode **every minute forever**. ffmpeg now always scales (8192
+  ceiling — above any real photograph, so reported dimensions stay exact) and
+  writes at `-compression_level 1`.
+- Preview decode is bounded by a 3-permit semaphore; it was the only decode path
+  in the codebase with no concurrency limit.
+- A cache-*write* failure used to 500 a successfully decoded preview. It now
+  degrades, closing the last hole in "degrade, never fail".
+- `preview_blobs` was missing from the inactive-artifact sweep, so recycled
+  files stranded tiers that then evicted live ones. Fixed and mutation-proofed.
+
+### 9d. Frontend efficiency
+
+Aborted prefetches now pool their finished bitmap instead of closing it (a cold
+walk was decoding every frame twice); the prefetch short-circuit is
+viewport-aware so a window resize re-warms instead of being suppressed for the
+rest of the session; the viewport is recomputed on resize; the prefetch window
+is sized against the decoded-byte pool share rather than the raw setting.
+
+### 9e. Process note
+
+Python `io.open(..., 'w')` on Windows silently rewrote every edited file from LF
+to CRLF, which broke `check:ui-design` (its regex matches `
+  \}
+
+  function`).
+Twelve files were normalised back and the gate re-run. Any future scripted edit
+in this repo must pass `newline='
+'`.

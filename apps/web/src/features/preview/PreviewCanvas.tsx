@@ -28,8 +28,8 @@ export function PreviewCanvas({
   onLoadingChange,
   onMediaReady,
   onNaturalSize,
-  previewScale,
-  viewportLongPx
+  viewportLongPx,
+  zoomedBeyondFit
 }: {
   alt: string;
   frameStyle?: CSSProperties;
@@ -37,9 +37,9 @@ export function PreviewCanvas({
   onLoadingChange?: (loading: boolean) => void;
   onMediaReady?: () => void;
   onNaturalSize?: (size: { naturalHeight: number; naturalWidth: number }) => void;
-  /** Zoom scale of the wrapper transform; the sharpening upgrade is gated on it. */
-  previewScale: number;
   viewportLongPx: number;
+  /** True once the user zooms past fit; gates the sharpening upgrade. */
+  zoomedBeyondFit: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [boxStyle, setBoxStyle] = useState<CSSProperties | undefined>(undefined);
@@ -60,9 +60,7 @@ export function PreviewCanvas({
   // showed nothing a `viewport x 1.2` tier had not already shown. The design
   // spec always said "zoom past the preview tier pulls the original on demand".
   const wantsFullResolution =
-    painted !== null &&
-    painted.tier !== "original" &&
-    painted.cssLongPx * previewScale > painted.backingLongPx;
+    zoomedBeyondFit && painted !== null && painted.tier !== "original";
 
   useEffect(() => {
     let disposed = false;

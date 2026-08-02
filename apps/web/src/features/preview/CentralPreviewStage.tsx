@@ -375,6 +375,16 @@ export function CentralPreviewStage({
     [selectedMedia.id]
   );
 
+  // "Has the user actually zoomed past fit?"
+  //
+  // Passing the raw transform scale was wrong: it starts at 1 before the
+  // fit-long-edge scale is computed for a new image, so for one tick a 10240px
+  // image reads as displayed at 10240px and the canvas fired a full-resolution
+  // upgrade it never needed. Comparing against the CURRENT fit scale is the
+  // question actually being asked, and it is false during that transient.
+  const zoomedBeyondFit =
+    viewMode === "actual" && scale > (fitLongEdgeScaleForMedia() ?? 1) * 1.05;
+
   const zoomAtPoint = useCallback(
     (clientX: number, clientY: number, nextScale: number, nextMode: PreviewViewMode = viewMode) => {
       const stage = stageRef.current;
@@ -704,7 +714,7 @@ export function CentralPreviewStage({
               onMediaReady={handleMediaReady}
               onNaturalSize={handleNaturalSize}
               onVideoElementChange={handleVideoElementChange}
-              previewScale={scale}
+              zoomedBeyondFit={zoomedBeyondFit}
               stableFrame
             />
           </div>
