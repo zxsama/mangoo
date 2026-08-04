@@ -120,6 +120,7 @@ export function App() {
   }, []);
   const interfaceStyle = useInterfaceStyle();
   const [menu, setMenu] = useState<ShellContextMenuState | null>(null);
+  const contextMenuReturnFocusRef = useRef<HTMLElement | null>(null);
   const notifications = useNotifications();
   const notificationModel = notifications.compact;
   const {
@@ -136,6 +137,8 @@ export function App() {
   // including PreviewCanvas's error path, so a media that fails to decode
   // releases the navigation gate instead of trapping it forever.
   const paintedMediaIdRef = useRef<number | null>(null);
+  // Index of a step that ran past the loaded window; selected once it loads.
+  const pendingPreviewStepIndexRef = useRef<number | null>(null);
   const [sidebarsHidden, setSidebarsHidden] = useState(false);
   const [locateRequest, setLocateRequest] =
     useState<LibrarySidebarLocateRequest | undefined>(undefined);
@@ -215,16 +218,27 @@ export function App() {
     mediaTotalCount: library.mediaTotalCount,
     selectedMediaId: library.selectedMediaId
   });
+  // The number of images the FOLDER holds, not the number currently loaded.
+  //
+  // Bounding navigation on the loaded slot count was a dead end: in a 220-image
+  // folder the preview refused to advance past 124 — the edge of what the grid
+  // happened to have fetched — while the title and scrubber correctly showed
+  // "124/220". MediaGrid already bounds this way (`Math.max(items.length,
+  // totalCount)`); the preview did not, and nothing asked for the next window.
+  const previewItemCount = Math.max(
+    orderedPreviewMedia.length,
+    library.mediaTotalCount
+  );
   const canPreviewPrevious = canNavigatePreview({
     previewOpen,
     selectedMediaIndex,
-    itemCount: orderedPreviewMedia.length,
+    itemCount: previewItemCount,
     direction: "previous"
   });
   const canPreviewNext = canNavigatePreview({
     previewOpen,
     selectedMediaIndex,
-    itemCount: orderedPreviewMedia.length,
+    itemCount: previewItemCount,
     direction: "next"
   });
 
@@ -538,7 +552,39 @@ export function App() {
     );
   }, [previewPreferences]);
 
-  const closeMenu = useCallback(() => setMenu(null), []);
+  const dismissContextMenuState = useCallback(() => setMenu(null), []);
+  const closeContextMenu = useCallback(() => {
+    setMenu(null);
+    overlays.closeRoot("context-menu");
+  }, [overlays]);
+  const openContextMenu = useCallback(
+    (nextMenu: ShellContextMenuState) => {
+      contextMenuReturnFocusRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      overlays.openRoot("context-menu");
+      setMenu(nextMenu);
+    },
+    [overlays],
+  );
+  const beginFileOperation = useCallback(
+    (openOperation: () => void) => {
+      overlays.openRoot("file-operation");
+      dismissContextMenuState();
+      openOperation();
+    },
+    [dismissContextMenuState, overlays],
+  );
+  const fileOperationOpen = Boolean(
+    fileOps.rename.target || fileOps.move.target || fileOps.remove.target,
+  );
+  const previousFileOperationOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (previousFileOperationOpenRef.current && !fileOperationOpen) {
+      overlays.closeRoot("file-operation");
+    }
+    previousFileOperationOpenRef.current = fileOperationOpen;
+  }, [fileOperationOpen, overlays]);
 
   const filterMenuOpen = overlays.isRootOpen("filter");
   const sortMenuOpen = overlays.isRootOpen("sort");
@@ -621,7 +667,7 @@ export function App() {
       !canStartPreviewNavigation({
         previewOpen,
         selectedMediaIndex,
-        itemCount: orderedPreviewMedia.length,
+        itemCount: previewItemCount,
         direction,
         selectedMediaId: library.selectedMediaId,
         paintedMediaId: paintedMediaIdRef.current
@@ -632,15 +678,44 @@ export function App() {
     library.setSelectedMediaId(target.id);
   }
 
+  // Steps to an adjacent index. When that index is inside the loaded window the
+  // media is already in hand; when it is past the edge there is nothing to
+  // select yet, so request that window and let the arriving slot be selected by
+  // the effect below. Previously this returned early and navigation dead-ended.
+  const stepPreview = useCallback(
+    (direction: "previous" | "next") => {
+      if (selectedMediaIndex < 0) return;
+      const targetIndex = selectedMediaIndex + (direction === "next" ? 1 : -1);
+      if (targetIndex < 0 || targetIndex > previewItemCount - 1) return;
+      const target = orderedPreviewMedia[targetIndex];
+      if (target) {
+        startPreviewNavigation(target, direction);
+        return;
+      }
+      pendingPreviewStepIndexRef.current = targetIndex;
+      const [start, end] = previewLandingWindow(targetIndex, previewItemCount);
+      library.requestMediaWindow(start, end);
+    },
+    [library, orderedPreviewMedia, previewItemCount, selectedMediaIndex]
+  );
+
+  // Completes a step that crossed the loaded edge, once the slot arrives.
+  useEffect(() => {
+    const pendingIndex = pendingPreviewStepIndexRef.current;
+    if (pendingIndex === null) return;
+    const arrived = orderedPreviewMedia[pendingIndex];
+    if (!arrived) return;
+    pendingPreviewStepIndexRef.current = null;
+    library.setSelectedMediaId(arrived.id);
+  }, [library, orderedPreviewMedia]);
+
   const handlePreviewPrevious = useCallback(() => {
-    if (selectedMediaIndex <= 0) return;
-    startPreviewNavigation(orderedPreviewMedia[selectedMediaIndex - 1], "previous");
-  }, [library, orderedPreviewMedia, selectedMediaIndex]);
+    stepPreview("previous");
+  }, [stepPreview]);
 
   const handlePreviewNext = useCallback(() => {
-    if (selectedMediaIndex < 0 || selectedMediaIndex >= orderedPreviewMedia.length - 1) return;
-    startPreviewNavigation(orderedPreviewMedia[selectedMediaIndex + 1], "next");
-  }, [library, orderedPreviewMedia, selectedMediaIndex]);
+    stepPreview("next");
+  }, [stepPreview]);
 
   const handleScrubToIndex = useCallback(
     (index: number) => {
@@ -652,11 +727,11 @@ export function App() {
         library.setSelectedMediaId(slotMedia.id);
         return;
       }
-      // Outside the loaded window: ask for that region. The thumb and tooltip
-      // have already moved; the image follows when the slot resolves. This is
-      // the one place position and picture can briefly disagree, and it is
-      // bounded by a single round-trip.
-      library.requestMediaWindow(index, index + 1);
+      // Outside the loaded window: ask for that region, WITH neighbours, so the
+      // landing is not an island you cannot step forward out of. The thumb and
+      // tooltip have already moved; the image follows when the slot resolves.
+      const [start, end] = previewLandingWindow(index, library.mediaTotalCount);
+      library.requestMediaWindow(start, end);
     },
     [library]
   );
@@ -701,7 +776,7 @@ export function App() {
       y: number;
       shiftKey: boolean;
     }) => {
-      setMenu({
+      openContextMenu({
         x,
         y,
         items: buildFileItems({
@@ -710,11 +785,12 @@ export function App() {
           shiftKey,
           fileOps,
           onPreview: handleOpenPreview,
-          closeMenu: () => setMenu(null)
+          beginFileOperation,
+          closeMenu: closeContextMenu,
         })
       });
     },
-    [fileOps, handleOpenPreview, library]
+    [beginFileOperation, closeContextMenu, fileOps, handleOpenPreview, library, openContextMenu]
   );
 
   const handleFolderContextMenu = useCallback(
@@ -729,7 +805,7 @@ export function App() {
       y: number;
       shiftKey: boolean;
     }) => {
-      setMenu({
+      openContextMenu({
         x,
         y,
         items: buildFolderItems({
@@ -747,11 +823,12 @@ export function App() {
           onRescanRoot: (rootId) => {
             void library.rescanRoot(rootId);
           },
-          closeMenu: () => setMenu(null)
+          beginFileOperation,
+          closeMenu: closeContextMenu,
         })
       });
     },
-    [fileOps, library]
+    [beginFileOperation, closeContextMenu, fileOps, library, openContextMenu]
   );
 
   const handleRootContextMenu = useCallback(
@@ -765,7 +842,7 @@ export function App() {
       y: number;
       shiftKey: boolean;
     }) => {
-      setMenu({
+      openContextMenu({
         x,
         y,
         items: buildRootItems({
@@ -777,11 +854,11 @@ export function App() {
           onRescanRoot: (rootId) => {
             void library.rescanRoot(rootId);
           },
-          closeMenu: () => setMenu(null)
+          closeMenu: closeContextMenu,
         })
       });
     },
-    [library]
+    [closeContextMenu, library, openContextMenu]
   );
 
   function renderCenterTitlebar() {
@@ -949,13 +1026,14 @@ export function App() {
       <>
         <ShellOverlayHost
           contextMenu={menu}
+          contextMenuReturnFocusRef={contextMenuReturnFocusRef}
           fileOps={fileOps}
           library={library}
           notificationAnchor={notificationAnchor}
           notificationAutoFocus={notificationAutoFocus}
           notificationModel={notificationModel}
           notificationsOpen={notificationsOpen}
-          onCloseContextMenu={closeMenu}
+          onDismissContextMenu={dismissContextMenuState}
           onOpenNotificationCenter={handleOpenNotificationCenter}
         />
         <LibrarySwitcher
@@ -1009,6 +1087,23 @@ export function App() {
   );
 }
 
+// How many neighbours to pull in around a preview landing.
+//
+// A landing used to request exactly ONE item, which stranded the user on an
+// island: after scrubbing far ahead you could step back into the previously
+// loaded region but forward died immediately, because nothing after the landing
+// slot existed. Requesting a span around the target means a landing always
+// arrives with room to keep moving. MediaGrid does the equivalent with a row's
+// worth of columns.
+const PREVIEW_LANDING_SPAN = 24;
+
+/** The window to request so a landing at `index` has neighbours on both sides. */
+function previewLandingWindow(index: number, itemCount: number): [number, number] {
+  const start = Math.max(0, index - PREVIEW_LANDING_SPAN);
+  const end = itemCount > 0 ? Math.min(itemCount, index + PREVIEW_LANDING_SPAN + 1) : index + 1;
+  return [start, Math.max(end, index + 1)];
+}
+
 function orderedMediaSlots(mediaSlots: Map<number, MediaRecord>): MediaRecord[] {
   return Array.from(mediaSlots.entries())
     .sort(([leftIndex], [rightIndex]) => leftIndex - rightIndex)
@@ -1038,6 +1133,7 @@ interface BuildFileItemsArgs {
   shiftKey: boolean;
   fileOps: FileOpsController;
   onPreview: (mediaId: number) => void;
+  beginFileOperation: (openOperation: () => void) => void;
   closeMenu: () => void;
 }
 
@@ -1049,6 +1145,7 @@ interface BuildFolderItemsArgs {
   onOpenFolder: (folder: FolderRecord) => void;
   onRefreshFolder: (folder: FolderRecord) => void;
   onRescanRoot: (rootId: number) => void;
+  beginFileOperation: (openOperation: () => void) => void;
   closeMenu: () => void;
 }
 
@@ -1066,6 +1163,7 @@ function buildFileItems({
   shiftKey,
   fileOps,
   onPreview,
+  beginFileOperation,
   closeMenu
 }: BuildFileItemsArgs): ContextMenuItem[] {
   const filePath = resolveMediaPath(library, file);
@@ -1096,8 +1194,7 @@ function buildFileItems({
       label: "Rename…",
       icon: <Pencil size={14} />,
       onSelect: () => {
-        closeMenu();
-        fileOps.openRename({ kind: "file", file });
+        beginFileOperation(() => fileOps.openRename({ kind: "file", file }));
       }
     },
     {
@@ -1105,8 +1202,7 @@ function buildFileItems({
       label: "Move to…",
       icon: <FolderInput size={14} />,
       onSelect: () => {
-        closeMenu();
-        fileOps.openMove({ kind: "file", file });
+        beginFileOperation(() => fileOps.openMove({ kind: "file", file }));
       }
     },
     {
@@ -1114,8 +1210,7 @@ function buildFileItems({
       label: "Move to recycle bin",
       icon: <Trash2 size={14} />,
       onSelect: () => {
-        closeMenu();
-        fileOps.openDelete({ kind: "file", file }, false);
+        beginFileOperation(() => fileOps.openDelete({ kind: "file", file }, false));
       }
     },
     {
@@ -1124,8 +1219,7 @@ function buildFileItems({
       danger: true,
       icon: <Trash2 size={14} />,
       onSelect: () => {
-        closeMenu();
-        fileOps.openDelete({ kind: "file", file }, true);
+        beginFileOperation(() => fileOps.openDelete({ kind: "file", file }, true));
       }
     },
     { id: "file-shell-separator", separator: true },
@@ -1160,6 +1254,7 @@ function buildFolderItems({
   onOpenFolder,
   onRefreshFolder,
   onRescanRoot,
+  beginFileOperation,
   closeMenu
 }: BuildFolderItemsArgs): ContextMenuItem[] {
   const folderPath = resolveFolderPath(library, folder);
@@ -1198,8 +1293,7 @@ function buildFolderItems({
       label: "Rename…",
       icon: <Pencil size={14} />,
       onSelect: () => {
-        closeMenu();
-        fileOps.openRename({ kind: "folder", folder });
+        beginFileOperation(() => fileOps.openRename({ kind: "folder", folder }));
       }
     },
     {
@@ -1207,8 +1301,7 @@ function buildFolderItems({
       label: "Move to…",
       icon: <FolderInput size={14} />,
       onSelect: () => {
-        closeMenu();
-        fileOps.openMove({ kind: "folder", folder });
+        beginFileOperation(() => fileOps.openMove({ kind: "folder", folder }));
       }
     },
     {
@@ -1216,8 +1309,7 @@ function buildFolderItems({
       label: "Move to recycle bin",
       icon: <Trash2 size={14} />,
       onSelect: () => {
-        closeMenu();
-        fileOps.openDelete({ kind: "folder", folder }, false);
+        beginFileOperation(() => fileOps.openDelete({ kind: "folder", folder }, false));
       }
     },
     {
@@ -1226,8 +1318,7 @@ function buildFolderItems({
       danger: true,
       icon: <Trash2 size={14} />,
       onSelect: () => {
-        closeMenu();
-        fileOps.openDelete({ kind: "folder", folder }, true);
+        beginFileOperation(() => fileOps.openDelete({ kind: "folder", folder }, true));
       }
     },
     { id: "folder-shell-separator", separator: true },

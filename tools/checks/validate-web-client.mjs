@@ -1968,6 +1968,38 @@ if (!scrubHandler) {
 if (!/requestMediaWindow/.test(app)) {
   fail("App scrubber must request the media window for an index outside the loaded range");
 }
+
+// Preview navigation must be bounded by the FOLDER TOTAL, never by the loaded
+// slot count. Bounding on `orderedPreviewMedia.length` produced a real dead
+// end: a 220-image folder refused to advance past 124 — the edge of what the
+// grid had fetched — while the title and scrubber correctly read "124/220".
+// The grid gets this right (MediaGrid's `Math.max(items.length, totalCount)`);
+// the preview did not.
+const previewNavBounds = app.match(/canNavigatePreview\(\{[\s\S]*?\}\)/g) ?? [];
+if (previewNavBounds.length === 0) {
+  fail("App must bound preview navigation with canNavigatePreview");
+}
+for (const call of previewNavBounds) {
+  if (/itemCount:\s*orderedPreviewMedia\.length/.test(call)) {
+    fail("Preview navigation must bound on the folder total, not the loaded slot count (orderedPreviewMedia.length)");
+  }
+  if (!/itemCount:\s*previewItemCount/.test(call)) {
+    fail("Preview navigation itemCount must come from previewItemCount (the folder total)");
+  }
+}
+if (!/const previewItemCount\s*=/.test(app)) {
+  fail("App must derive previewItemCount from the folder total so navigation can leave the loaded window");
+}
+
+// A preview landing must request a SPAN, never a single item. Requesting one
+// slot stranded the user on an island: after scrubbing ahead you could step
+// back but not forward, because nothing after the landing existed.
+if (/requestMediaWindow\(\s*(index|targetIndex)\s*,\s*\s*\+\s*1\s*\)/.test(app)) {
+  fail("Preview landings must request a window with neighbours, not a single item");
+}
+if (!/previewLandingWindow/.test(app)) {
+  fail("App must size preview landing requests through previewLandingWindow");
+}
 if (
   !/onPreviewNext\??:\s*\(\)\s*=>\s*void/.test(useShortcuts) ||
   !/onPreviewPrevious\??:\s*\(\)\s*=>\s*void/.test(useShortcuts) ||
