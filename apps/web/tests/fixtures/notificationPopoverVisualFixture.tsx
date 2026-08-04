@@ -3,6 +3,7 @@ import { StrictMode, useCallback, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { ThumbnailFailureDetail } from "@megle/notification-contract";
 import "../../src/styles.css";
+import "../../src/design/overlays/overlay.css";
 import { LiquidGlassButton, LiquidGlassLayer } from "../../src/design/liquid-glass";
 import { OverlayProvider } from "../../src/design/overlays";
 import { NotificationPopover } from "../../src/features/notifications/NotificationPopover";
@@ -12,7 +13,7 @@ import type {
 } from "../../src/features/notifications/notificationModel";
 import "./notificationPopoverVisualFixture.css";
 
-type FixtureState = "full" | "empty" | "degraded";
+type FixtureState = "full" | "scan" | "thumbnail" | "empty" | "degraded";
 
 const fixtureParameters = new URLSearchParams(window.location.search);
 const measurementMetrics = { anchorRectCalls: 0, popoverRectCalls: 0 };
@@ -39,7 +40,7 @@ Element.prototype.getBoundingClientRect = function fixtureMeasurementRect() {
   if (this.matches('[data-titlebar-control="notifications"]')) {
     measurementMetrics.anchorRectCalls += 1;
   }
-  if (this.matches('[data-compact-popover-root="notifications"]')) {
+  if (this.matches("#notifications-root")) {
     measurementMetrics.popoverRectCalls += 1;
   }
   return nativeGetBoundingClientRect.call(this);
@@ -111,7 +112,28 @@ function fullModel(): CompactNotificationModel {
   return {
     activeLibraryId: "artists",
     active: [
-      operation("重新索引 Artists"),
+      operation("重新索引 Artists", {
+        scanPaths: [
+          {
+            key: "artists:portraits",
+            libraryId: "artists",
+            operationId: "scan:portraits",
+            path: "Artists\\Portraits"
+          },
+          {
+            key: "artists:editorial",
+            libraryId: "artists",
+            operationId: "scan:editorial",
+            path: "Artists\\Editorial"
+          },
+          {
+            key: "artists:archive",
+            libraryId: "artists",
+            operationId: "scan:archive",
+            path: "Artists\\Archive"
+          }
+        ]
+      }),
       operation("分析 References", {
         operationId: "scan:references",
         libraryId: "references",
@@ -172,36 +194,7 @@ function fullModel(): CompactNotificationModel {
       completionPercent: 73,
       active: true
     },
-    results: [
-      operation("删除旧目录", {
-        operationId: "delete:archive",
-        status: "succeeded",
-        phase: "完成",
-        summary: "已删除 128 个索引项",
-        currentValue: 128,
-        totalValue: 128,
-        progress: { determinate: true, percent: 100, label: "128 / 128" },
-        completedAt: Date.now() - 60_000
-      }),
-      operation("移动 Portraits", {
-        operationId: "move:portraits",
-        libraryId: "references",
-        libraryName: "References",
-        libraryLabel: "References",
-        status: "failed",
-        phase: "失败",
-        errorDetail: "目标文件夹不可用",
-        retryable: true,
-        completedAt: Date.now() - 120_000
-      }),
-      operation("扫描 Archive", {
-        operationId: "scan:archive",
-        status: "cancelled",
-        phase: "已取消",
-        summary: "用户取消操作",
-        completedAt: Date.now() - 180_000
-      })
-    ],
+    results: [],
     indicator: "failure",
     degraded: false,
     healthDetail: null
@@ -209,7 +202,35 @@ function fullModel(): CompactNotificationModel {
 }
 
 function modelFor(state: FixtureState): CompactNotificationModel {
-  if (state === "full") return fullModel();
+  const full = fullModel();
+  if (state === "full") return full;
+  if (state === "scan") {
+    return {
+      ...full,
+      thumbnail: {
+        summaries: [],
+        libraryCount: 0,
+        cachedCount: 0,
+        totalCandidateCount: 0,
+        missingCount: 0,
+        staleCount: 0,
+        failedCount: 0,
+        pendingCount: 0,
+        activeBulkTaskCount: 0,
+        totalCacheBytes: null,
+        completionPercent: null,
+        active: false
+      },
+      indicator: "active"
+    };
+  }
+  if (state === "thumbnail") {
+    return {
+      ...full,
+      active: [],
+      indicator: "active"
+    };
+  }
   return {
     activeLibraryId: null,
     active: [],
@@ -243,7 +264,12 @@ function NotificationPopoverVisualFixture() {
   const [open, setOpen] = useState(true);
   const requestedState = fixtureParameters.get("state");
   const state: FixtureState =
-    requestedState === "empty" || requestedState === "degraded" ? requestedState : "full";
+    requestedState === "scan" ||
+    requestedState === "thumbnail" ||
+    requestedState === "empty" ||
+    requestedState === "degraded"
+      ? requestedState
+      : "full";
   const model = modelFor(state);
   const anchorId = `notification-anchor-${anchorLocation}-${anchorVersion}`;
   const bindAnchor = useCallback((node: HTMLButtonElement | null) => {
@@ -331,12 +357,14 @@ function NotificationPopoverVisualFixture() {
           </div>
           </header>
         </div>
-        <div className="notification-visual-fixture-stage">受控通知状态渲染器</div>
+        <div className="notification-visual-fixture-stage">
+          受控通知状态：{state}
+        </div>
         {open && anchor ? (
           <NotificationPopover
             anchor={anchor}
             model={model}
-            onDismiss={() => setOpen(false)}
+            onClose={() => setOpen(false)}
             onOpenCenter={() => setOpen(false)}
           />
         ) : null}

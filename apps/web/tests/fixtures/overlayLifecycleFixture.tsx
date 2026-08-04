@@ -1150,6 +1150,7 @@ interface ShellNotificationOverlayProps {
   notificationAutoFocus: boolean;
   notificationModel: CompactNotificationModel;
   notificationsOpen: boolean;
+  onCloseNotifications: () => void;
   onOpenNotificationCenter: () => void;
 }
 
@@ -1198,6 +1199,7 @@ function NotificationRootLifecycleScenario({
           notificationAutoFocus={wiring.notificationAutoFocus}
           notificationModel={emptyNotificationModel}
           notificationsOpen={wiring.notificationsOpen}
+          onCloseNotifications={wiring.closeNotifications}
           onOpenNotificationCenter={() => undefined}
         />
       ) : null}
@@ -1247,7 +1249,7 @@ async function runNotificationRootLifecycleScenario() {
 
   const openNotificationByMouse = async () => {
     await requestNativePointer("mouse-click", trigger);
-    await waitForSelector('[data-compact-popover-root="notifications"]');
+    await waitForSelector("#notifications-root");
     await settle(30);
   };
   const resetNotification = async () => {
@@ -1261,7 +1263,7 @@ async function runNotificationRootLifecycleScenario() {
   await requestNativeKey("Tab");
   await settle(20);
   const tabEnteredContent = document.activeElement?.classList.contains("notification-open-center") ?? false;
-  const tabKeptOpen = document.querySelector('[data-compact-popover-root="notifications"]') !== null;
+  const tabKeptOpen = document.querySelector("#notifications-root") !== null;
   await resetNotification();
 
   before.focus();
@@ -1270,7 +1272,7 @@ async function runNotificationRootLifecycleScenario() {
   await requestNativeKey("Space");
   await settle(30);
   const keyboardOpened =
-    document.querySelector('[data-compact-popover-root="notifications"]') !== null;
+    document.querySelector("#notifications-root") !== null;
   const keyboardActiveRoot = control.api?.activeRootId ?? null;
   const keyboardAutoFocused =
     document.activeElement?.classList.contains("notification-open-center") ?? false;
@@ -1278,28 +1280,28 @@ async function runNotificationRootLifecycleScenario() {
     await requestNativeKey("Escape");
     await settle(20);
   }
-  const escapeClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
+  const escapeClosed = document.querySelector("#notifications-root") === null;
   const escapeFocus = (document.activeElement as HTMLElement | null)?.dataset
     .compactPopoverTrigger ?? "";
   await resetNotification();
 
   await openNotificationByMouse();
-  await requestNativePointer("mouse-click", outside);
+  await requestNativePointer("mouse-click", before);
   await settle(20);
   const outsidePointerClosed =
-    document.querySelector('[data-compact-popover-root="notifications"]') === null;
+    document.querySelector("#notifications-root") === null;
   await resetNotification();
 
   await openNotificationByMouse();
   await act(async () => window.dispatchEvent(new Event("blur")));
   await settle(20);
-  const blurClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
+  const blurClosed = document.querySelector("#notifications-root") === null;
   await resetNotification();
 
   await openNotificationByMouse();
   await act(async () => control.api?.openRoot("filter"));
   await settle(20);
-  const switchClosed = document.querySelector('[data-compact-popover-root="notifications"]') === null;
+  const switchClosed = document.querySelector("#notifications-root") === null;
   const activeRootAfterSwitch = control.api?.activeRootId ?? null;
 
   const result = {

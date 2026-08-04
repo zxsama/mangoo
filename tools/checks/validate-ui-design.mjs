@@ -69,6 +69,7 @@ const layoutMenu = read("apps/web/src/features/library/LayoutMenu.tsx");
 const searchBar = read("apps/web/src/features/library/SearchBar.tsx");
 const overlayField = read("apps/web/src/design/overlays/OverlayField.tsx");
 const overlayStyles = read("apps/web/src/design/overlays/overlay.css");
+const overlayStylesForChecks = stripCssComments(overlayStyles);
 const inspectorMetadata = read("apps/web/src/features/preview/InspectorMetadata.tsx");
 const renameDialog = read("apps/web/src/features/file-ops/RenameDialog.tsx");
 const moveDialog = read("apps/web/src/features/file-ops/MoveDialog.tsx");
@@ -1564,21 +1565,24 @@ if (/AnchoredOverlay|createPortal|LiquidGlassSurface/.test(searchBar)) {
 }
 
 for (const value of [
-  'data-compact-popover-root="notifications"',
+  "AnchoredOverlay",
+  'id="notifications-root"',
+  'onDismiss={onClose}',
+  'role="status"',
   "notification-popover",
-  "popup-surface",
-  "floating-popover",
-  "LiquidGlassSurface",
-  'tone="elevated"'
+  "后台活动"
 ]) {
   if (!notificationPopover.includes(value)) {
     fail(`notification popover compact popover contract missing ${value}`);
   }
 }
+if (/createPortal|LiquidGlassSurface|useOverlayStack|model\.results/.test(notificationPopover)) {
+  fail("notification popover must reuse AnchoredOverlay and omit terminal results");
+}
 
 const titlebarOverlaySection =
   overlayStyles.match(
-    /\/\* Titlebar overlays \*\/([\s\S]*?)(?=\n\/\* Library switcher \*\/|\n@keyframes overlay-root-enter)/,
+    /\/\* Titlebar overlays \*\/([\s\S]*?)(?=\n\/\* Compact notification \*\/|\n\/\* Library switcher \*\/|\n@keyframes overlay-root-enter)/,
   )?.[1] ?? "";
 if (!titlebarOverlaySection) {
   fail("shared overlay stylesheet must define the Titlebar overlays section");
@@ -1603,6 +1607,13 @@ for (const value of [
 }
 if (/\b(?:backdrop-filter|box-shadow|z-index)\s*:/.test(titlebarOverlaySection)) {
   fail("shared titlebar overlay styles must not define local blur, shadow, or stacking systems");
+}
+const compactNotificationSection =
+  overlayStyles.match(
+    /\/\* Compact notification \*\/([\s\S]*?)(?=\n\/\* Library switcher \*\/|\n@keyframes overlay-root-enter)/,
+  )?.[1] ?? "";
+if (!compactNotificationSection) {
+  fail("shared overlay stylesheet must define the Compact notification section");
 }
 for (const value of [
   "data-notification-window-fixture",
@@ -1660,9 +1671,7 @@ for (const value of [
   "notification-thumbnail-summary-list",
   "data-notification-thumbnail-library-count",
   "data-overlay-scroll-container",
-  "notification-result-list",
   "notification-popover-empty",
-  "notification-popover-degraded",
   "notification-open-center"
 ]) {
   if (!notificationPopover.includes(value)) {
@@ -1671,9 +1680,9 @@ for (const value of [
 }
 if (
   !/\.notification-popover-body\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*auto;/s.test(
-    stylesForChecks
+    compactNotificationSection
   ) ||
-  !/\.notification-popover-footer\s*\{[^}]*flex:\s*0 0 auto;/s.test(stylesForChecks)
+  !/\.notification-popover-footer\s*\{[^}]*flex:\s*0 0 auto;/s.test(compactNotificationSection)
 ) {
   fail("notification popover must scroll its content while keeping the full-center footer reachable");
 }
@@ -1682,14 +1691,16 @@ if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopover)) {
 }
 for (const selector of [
   ".notification-popover",
-  ".notification-status-dot",
   ".notification-progress-track",
-  ".notification-progress-fill",
-  ".notification-progress-indeterminate"
+  ".notification-popover-empty",
+  ".notification-popover-footer"
 ]) {
-  if (cssBlocksForExactSelector(stylesForChecks, selector).length === 0) {
+  if (cssBlocksForExactSelector(overlayStylesForChecks, selector).length === 0) {
     fail(`notification compact UI style missing ${selector}`);
   }
+}
+if (cssBlocksForExactSelector(stylesForChecks, ".notification-status-dot").length === 0) {
+  fail("notification compact UI style missing .notification-status-dot");
 }
 
 for (const selector of [".floating-popover"]) {

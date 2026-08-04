@@ -1057,6 +1057,7 @@ export function App() {
           notificationAutoFocus={notificationAutoFocus}
           notificationModel={notificationModel}
           notificationsOpen={notificationsOpen}
+          onCloseNotifications={closeNotifications}
           onDismissContextMenu={dismissContextMenuState}
           onOpenNotificationCenter={handleOpenNotificationCenter}
         />

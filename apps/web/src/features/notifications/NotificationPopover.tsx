@@ -1,59 +1,23 @@
-import {
-  AlertTriangle,
-  CheckCircle2,
-  CircleDashed,
-  Image,
-  ListTodo,
-  XCircle
-} from "lucide-react";
-import {
-  useLayoutEffect,
-  useRef,
-  useState,
-  type CSSProperties,
-  type ReactNode
-} from "react";
-import { createPortal } from "react-dom";
+import { CircleDashed, Image, ListTodo } from "lucide-react";
+import { useRef, type CSSProperties, type ReactNode } from "react";
 import type {
   DesktopThumbnailCacheSummary,
   NotificationWindowIntent
 } from "@megle/notification-contract";
-import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
-import { useOverlayStack } from "../../design/overlays";
+import { LiquidGlassButton } from "../../design/liquid-glass";
+import { AnchoredOverlay } from "../../design/overlays";
 import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "./notificationModel";
-import {
-  activateThumbnailFailureLogs,
-  thumbnailFailureDetailsUnavailableMessage,
-  thumbnailStatusParts
-} from "./notificationModel";
-import { observeNotificationPopoverMeasurements } from "./notificationPopoverMeasurement";
-import { resolveNotificationPopoverPosition } from "./notificationPopoverPosition";
-import {
-  activeOperationPresentation,
-  resultOperationPresentation
-} from "./notificationPopoverPresentation";
-
-const NOTIFICATION_FOCUSABLE_SELECTOR = [
-  "button:not(:disabled)",
-  "[href]",
-  "input:not(:disabled)",
-  "select:not(:disabled)",
-  "textarea:not(:disabled)",
-  '[tabindex]:not([tabindex="-1"])'
-].join(",");
-
-function focusFirstNotificationControl(surface: HTMLElement) {
-  surface.querySelector<HTMLElement>(NOTIFICATION_FOCUSABLE_SELECTOR)?.focus();
-}
+import { thumbnailStatusParts } from "./notificationModel";
+import { activeOperationPresentation } from "./notificationPopoverPresentation";
 
 interface NotificationPopoverProps {
   anchor: HTMLElement;
   autoFocus?: boolean;
   model: CompactNotificationModel;
-  onDismiss?: () => void;
+  onClose: () => void;
   onOpenCenter: (intent?: NotificationWindowIntent) => void;
 }
 
@@ -61,228 +25,102 @@ export function NotificationPopover({
   anchor,
   autoFocus = false,
   model,
-  onDismiss,
+  onClose,
   onOpenCenter
 }: NotificationPopoverProps) {
-  const [popoverElement, setPopoverElement] = useState<HTMLElement | null>(null);
-  const autoFocusCompletedRef = useRef(false);
-  const { registerLayer } = useOverlayStack();
-  const position = useNotificationPopoverPosition(anchor, popoverElement);
-  const hasContent =
-    model.active.length > 0 || model.thumbnail.summaries.length > 0 || model.results.length > 0;
+  const openCenterButtonRef = useRef<HTMLButtonElement | null>(null);
+  const hasActivity = model.active.length > 0 || model.thumbnail.summaries.length > 0;
 
-  useLayoutEffect(() => {
-    if (!popoverElement) return;
-    const unregister = registerLayer({
-      id: "notifications-root",
-      rootId: "notifications",
-      kind: "root",
-      trigger: anchor,
-      surface: popoverElement,
-      dismissOnEscape: true,
-      dismissOnFocusOutside: true,
-      dismissOnOutsidePointer: true,
-      dismissOnWindowBlur: true,
-      restoreFocus: true,
-      onDismiss: onDismiss ?? (() => undefined)
-    });
-    const handleAnchorKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Tab" || event.shiftKey || event.defaultPrevented) return;
-      event.preventDefault();
-      focusFirstNotificationControl(popoverElement);
-    };
-    anchor.addEventListener("keydown", handleAnchorKeyDown);
+  const activityContent = (
+    <>
+      {model.degraded ? (
+        <p className="notification-health-detail">
+          {model.healthDetail?.trim() || "通知同步暂时不可用，当前进度可能延迟。"}
+        </p>
+      ) : null}
 
-    return () => {
-      anchor.removeEventListener("keydown", handleAnchorKeyDown);
-      unregister();
-    };
-  }, [anchor, onDismiss, popoverElement, registerLayer]);
+      {model.active.length > 0 ? (
+        <NotificationSection
+          icon={<ListTodo aria-hidden="true" size={14} />}
+          label="进行中"
+        >
+          <ul className="notification-active-list">
+            {model.active.map((operation) => (
+              <li
+                className="notification-operation-row"
+                data-notification-active-operation={operation.operationId}
+                key={`${operation.libraryId}:${operation.operationId}`}
+              >
+                <OperationHeading operation={operation} />
+                <OperationProgress operation={operation} />
+              </li>
+            ))}
+          </ul>
+        </NotificationSection>
+      ) : null}
 
-  useLayoutEffect(() => {
-    if (!autoFocus) {
-      autoFocusCompletedRef.current = false;
-      return;
-    }
-    if (!popoverElement || !position || autoFocusCompletedRef.current) return;
-    autoFocusCompletedRef.current = true;
-    focusFirstNotificationControl(popoverElement);
-  }, [autoFocus, popoverElement, position]);
+      {model.thumbnail.summaries.length > 0 ? (
+        <NotificationSection
+          icon={<Image aria-hidden="true" size={14} />}
+          label="缩略图缓存"
+        >
+          <div
+            className="notification-thumbnail-summary-list"
+            data-notification-thumbnail-library-count={model.thumbnail.libraryCount}
+          >
+            {model.thumbnail.summaries.map((summary) => (
+              <ThumbnailSummaryRow key={summary.libraryId} summary={summary} />
+            ))}
+          </div>
+        </NotificationSection>
+      ) : null}
 
-  return createPortal(
-    <LiquidGlassSurface
-      as="section"
-      aria-label="通知状态"
-      className="floating-popover notification-popover popup-surface"
-      data-compact-popover-root="notifications"
-      interactive
-      ref={setPopoverElement}
-      style={
-        position
-          ? {
-              left: position.left,
-              top: position.top,
-              maxHeight: position.maxHeight,
-              visibility: "visible"
-            }
-          : { left: 0, top: 0, visibility: "hidden" }
-      }
-      tone="elevated"
+      {!hasActivity ? (
+        <p className="notification-popover-empty">
+          <CircleDashed aria-hidden="true" size={16} />
+          <span>{model.degraded ? "等待通知同步恢复" : "当前没有后台活动"}</span>
+        </p>
+      ) : null}
+    </>
+  );
+
+  return (
+    <AnchoredOverlay
+      anchor={anchor}
+      ariaLabel="后台活动"
+      autoFocus={autoFocus}
+      className="notification-popover"
+      id="notifications-root"
+      initialFocusRef={openCenterButtonRef}
+      onDismiss={onClose}
+      open
+      placement="bottom-end"
+      preferredWidth={360}
+      role="status"
+      rootId="notifications"
     >
       <header className="notification-popover-header">
-        <div>
-          <span className="notification-popover-eyebrow">状态中心</span>
-          <h2>通知</h2>
-        </div>
-        <span
-          className={
-            model.degraded
-              ? "notification-health-state notification-popover-degraded"
-              : "notification-health-state"
-          }
-          data-notification-health={model.degraded ? "degraded" : "healthy"}
-          title={model.healthDetail ?? undefined}
-        >
+        <h2>后台活动</h2>
+        <span data-notification-health={model.degraded ? "degraded" : "healthy"}>
           {model.degraded ? "同步受限" : "运行正常"}
         </span>
       </header>
-
       <div className="notification-popover-body" data-overlay-scroll-container>
-        {model.degraded ? (
-          <p className="notification-health-detail">
-            {model.healthDetail?.trim() || "通知同步暂时不可用，已显示最近保存的状态。"}
-          </p>
-        ) : null}
-
-        {model.active.length > 0 ? (
-          <NotificationSection
-            icon={<ListTodo aria-hidden="true" size={14} />}
-            label="进行中"
-          >
-            <ul className="notification-active-list">
-              {model.active.map((operation) => (
-                <li
-                  className="notification-operation-row"
-                  data-notification-active-operation={operation.operationId}
-                  key={`${operation.libraryId}:${operation.operationId}`}
-                >
-                  <OperationHeading operation={operation} />
-                  <OperationProgress operation={operation} />
-                </li>
-              ))}
-            </ul>
-          </NotificationSection>
-        ) : null}
-
-        {model.thumbnail.summaries.length > 0 ? (
-          <NotificationSection
-            icon={<Image aria-hidden="true" size={14} />}
-            label="缩略图缓存"
-          >
-            <div
-              className="notification-thumbnail-summary-list"
-              data-notification-thumbnail-library-count={model.thumbnail.libraryCount}
-            >
-              {model.thumbnail.summaries.map((summary) => (
-                <ThumbnailSummaryRow
-                  key={summary.libraryId}
-                  onOpenCenter={onOpenCenter}
-                  summary={summary}
-                />
-              ))}
-            </div>
-          </NotificationSection>
-        ) : null}
-
-        {model.results.length > 0 ? (
-          <NotificationSection
-            icon={<CheckCircle2 aria-hidden="true" size={14} />}
-            label="最近结果"
-          >
-            <ul className="notification-result-list">
-              {model.results.map((operation) => (
-                <li
-                  className={`notification-result-row notification-result-${operation.status}`}
-                  data-notification-result={operation.operationId}
-                  key={`${operation.libraryId}:${operation.operationId}`}
-                >
-                  <span className="notification-result-icon" aria-hidden="true">
-                    {resultIcon(operation.status)}
-                  </span>
-                  <div className="notification-result-copy">
-                    <strong>{operation.title}</strong>
-                    <ResultDescription operation={operation} />
-                  </div>
-                  <time dateTime={new Date(operation.updatedAt).toISOString()}>
-                    {formatResultTime(operation.updatedAt)}
-                  </time>
-                </li>
-              ))}
-            </ul>
-          </NotificationSection>
-        ) : null}
-
-        {!hasContent ? (
-          <div className="notification-popover-empty">
-            <CircleDashed aria-hidden="true" size={20} />
-            <div>
-              <strong>{model.degraded ? "暂无可用状态" : "当前没有进行中的任务"}</strong>
-              <span>{model.degraded ? "等待通知同步恢复" : "后台状态正常"}</span>
-            </div>
-          </div>
-        ) : null}
+        {activityContent}
       </div>
-
       <footer className="notification-popover-footer">
         <LiquidGlassButton
           className="notification-open-center"
           onClick={() => onOpenCenter()}
+          ref={openCenterButtonRef}
           tone="control"
           type="button"
         >
           打开完整通知中心
         </LiquidGlassButton>
       </footer>
-    </LiquidGlassSurface>,
-    document.body
+    </AnchoredOverlay>
   );
-}
-
-function useNotificationPopoverPosition(anchor: HTMLElement, popover: HTMLElement | null) {
-  const [position, setPosition] = useState<ReturnType<
-    typeof resolveNotificationPopoverPosition
-  > | null>(null);
-
-  useLayoutEffect(() => {
-    setPosition(null);
-    if (!popover) return;
-
-    return observeNotificationPopoverMeasurements({
-      anchor,
-      onMeasure: (measurement) => {
-        const nextPosition = resolveNotificationPopoverPosition({
-          anchor: measurement.anchor,
-          popover: measurement.popover,
-          viewport: measurement.viewport,
-          gap: 4,
-          margin: 8
-        });
-        setPosition((current) =>
-          current && samePopoverPosition(current, nextPosition) ? current : nextPosition
-        );
-      },
-      popover
-    });
-  }, [anchor, popover]);
-
-  return position;
-}
-
-function samePopoverPosition(
-  left: ReturnType<typeof resolveNotificationPopoverPosition>,
-  right: ReturnType<typeof resolveNotificationPopoverPosition>
-): boolean {
-  return left.left === right.left && left.top === right.top && left.maxHeight === right.maxHeight;
 }
 
 function NotificationSection({
@@ -359,14 +197,7 @@ function OperationProgress({ operation }: { operation: NotificationOperationView
   );
 }
 
-function ThumbnailSummaryRow({
-  onOpenCenter,
-  summary
-}: {
-  onOpenCenter: (intent?: NotificationWindowIntent) => void;
-  summary: DesktopThumbnailCacheSummary;
-}) {
-  const unavailableMessage = thumbnailFailureDetailsUnavailableMessage(summary);
+function ThumbnailSummaryRow({ summary }: { summary: DesktopThumbnailCacheSummary }) {
   const status = thumbnailStatusParts(summary);
   const libraryLabel = summary.libraryName || summary.libraryId;
   return (
@@ -408,17 +239,7 @@ function ThumbnailSummaryRow({
             ? status.map((part, index) => (
                 <span key={part.kind}>
                   {index > 0 ? " · " : null}
-                  {part.kind !== "failure" ? part.label : unavailableMessage ? (
-                    <span title={unavailableMessage}>{part.label} · 详情不可用</span>
-                  ) : (
-                    <button
-                      className="notification-thumbnail-failure-action"
-                      onClick={() => activateThumbnailFailureLogs(summary, onOpenCenter)}
-                      type="button"
-                    >
-                      {part.label}
-                    </button>
-                  )}
+                  {part.label}
                 </span>
               ))
             : "已同步"}
@@ -431,30 +252,6 @@ function ThumbnailSummaryRow({
 
 function progressStyle(percent: number): CSSProperties {
   return { "--notification-progress": `${percent}%` } as CSSProperties;
-}
-
-function resultIcon(status: NotificationOperationViewModel["status"]) {
-  if (status === "failed") return <AlertTriangle size={14} />;
-  if (status === "cancelled") return <XCircle size={14} />;
-  return <CheckCircle2 size={14} />;
-}
-
-function ResultDescription({ operation }: { operation: NotificationOperationViewModel }) {
-  const presentation = resultOperationPresentation(operation);
-  return (
-    <span className="notification-result-detail">
-      <span className="notification-result-library">{presentation.libraryLabel}</span>
-      <span aria-hidden="true"> · </span>
-      {presentation.detail}
-    </span>
-  );
-}
-
-function formatResultTime(timestamp: number): string {
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "2-digit",
-    minute: "2-digit"
-  }).format(timestamp);
 }
 
 function formatBytes(value: number): string {

@@ -6,11 +6,6 @@ export interface ActiveOperationPresentation {
   percentLabel: string | null;
 }
 
-export interface ResultOperationPresentation {
-  libraryLabel: string;
-  detail: string;
-}
-
 export function activeOperationPresentation(
   operation: NotificationOperationViewModel
 ): ActiveOperationPresentation {
@@ -21,22 +16,5 @@ export function activeOperationPresentation(
       operation.progress.determinate && operation.progress.percent != null
         ? `${operation.progress.percent}%`
         : null
-  };
-}
-
-export function resultOperationPresentation(
-  operation: NotificationOperationViewModel
-): ResultOperationPresentation {
-  const explicitDetail = operation.errorDetail?.trim() || operation.summary?.trim();
-  const detail =
-    explicitDetail ||
-    (operation.status === "failed"
-      ? "操作失败"
-      : operation.status === "cancelled"
-        ? "操作已取消"
-        : "已完成");
-  return {
-    libraryLabel: operation.libraryLabel,
-    detail
   };
 }

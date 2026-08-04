@@ -34,3 +34,8 @@
   font-size: 12px;
   letter-spacing: 0.05em;
 }
+
+.notification-visual-fixture[data-notification-fixture="degraded"]
+  .notification-visual-fixture-stage {
+  color: rgba(222, 171, 126, 0.78);
+}

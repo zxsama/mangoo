@@ -30,6 +30,7 @@ interface ShellOverlayHostProps {
   notificationAutoFocus: boolean;
   notificationModel: CompactNotificationModel;
   notificationsOpen: boolean;
+  onCloseNotifications: () => void;
   onDismissContextMenu: () => void;
   onOpenNotificationCenter: (intent?: NotificationWindowIntent) => void;
 }
@@ -39,6 +40,7 @@ export interface ShellNotificationOverlayProps {
   notificationAutoFocus: boolean;
   notificationModel: CompactNotificationModel;
   notificationsOpen: boolean;
+  onCloseNotifications: () => void;
   onOpenNotificationCenter: (intent?: NotificationWindowIntent) => void;
 }
 
@@ -47,6 +49,7 @@ export function ShellNotificationOverlay({
   notificationAutoFocus,
   notificationModel,
   notificationsOpen,
+  onCloseNotifications,
   onOpenNotificationCenter
 }: ShellNotificationOverlayProps) {
   return notificationsOpen && notificationAnchor ? (
@@ -54,6 +57,7 @@ export function ShellNotificationOverlay({
       anchor={notificationAnchor}
       autoFocus={notificationAutoFocus}
       model={notificationModel}
+      onClose={onCloseNotifications}
       onOpenCenter={onOpenNotificationCenter}
     />
   ) : null;
@@ -68,6 +72,7 @@ export function ShellOverlayHost({
   notificationAutoFocus,
   notificationModel,
   notificationsOpen,
+  onCloseNotifications,
   onDismissContextMenu,
   onOpenNotificationCenter
 }: ShellOverlayHostProps) {
@@ -82,6 +87,7 @@ export function ShellOverlayHost({
         notificationAutoFocus={notificationAutoFocus}
         notificationModel={notificationModel}
         notificationsOpen={notificationsOpen}
+        onCloseNotifications={onCloseNotifications}
         onOpenNotificationCenter={onOpenNotificationCenter}
       />
 

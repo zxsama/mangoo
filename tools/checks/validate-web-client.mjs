@@ -154,11 +154,6 @@ const notificationPopoverPath =
 const notificationPopover = existsSync(path.join(root, notificationPopoverPath))
   ? read(notificationPopoverPath)
   : "";
-const notificationPopoverMeasurementPath =
-  "apps/web/src/features/notifications/notificationPopoverMeasurement.ts";
-const notificationPopoverMeasurement = existsSync(path.join(root, notificationPopoverMeasurementPath))
-  ? read(notificationPopoverMeasurementPath)
-  : "";
 const notificationModel = read("apps/web/src/features/notifications/notificationModel.ts");
 const notificationStatusView = read(
   "apps/web/src/features/notifications/NotificationStatusView.tsx"
@@ -238,7 +233,7 @@ for (const value of [
   }
 }
 for (const value of [
-  'type FixtureState = "full" | "empty" | "degraded"',
+  'type FixtureState = "full" | "scan" | "thumbnail" | "empty" | "degraded"',
   "data-notification-fixture",
   "NotificationPopover",
   "LiquidGlassButton",
@@ -310,7 +305,7 @@ for (const [label, source, values] of [
   [
     "NotificationPopover live anchor",
     notificationPopover,
-    ["anchor: HTMLElement", "popoverElement", "observeNotificationPopoverMeasurements"]
+    ["anchor: HTMLElement", "AnchoredOverlay", "onDismiss={onClose}"]
   ]
 ]) {
   for (const value of values) {
@@ -324,32 +319,22 @@ for (const [label, source, pattern] of [
 ]) {
   if (pattern.test(source)) fail(`${label} must not retain the notification RefObject snapshot path`);
 }
-for (const value of [
-  "createPortal",
-  "resolveNotificationPopoverPosition",
-  "observeNotificationPopoverMeasurements"
-]) {
+for (const value of ["AnchoredOverlay", 'placement="bottom-end"', "preferredWidth={360}"]) {
   if (!notificationPopover.includes(value)) {
-    fail(`notification popover true-anchor contract missing ${value}`);
+    fail(`notification popover shared anchor contract missing ${value}`);
   }
 }
 for (const value of [
   "ResizeObserver",
   "MutationObserver",
-  "visualViewport",
-  'addEventListener("resize"',
-  'addEventListener("scroll"',
-  "requestAnimationFrame",
-  "childList: true",
-  "subtree: true",
-  "unobserve(titlebar)"
+  "createPortal",
+  "model.results",
+  "resolveNotificationPopoverPosition",
+  "observeNotificationPopoverMeasurements"
 ]) {
-  if (!notificationPopoverMeasurement.includes(value)) {
-    fail(`notification popover measurement contract missing ${value}`);
+  if (notificationPopover.includes(value)) {
+    fail(`notification popover must delegate shared overlay behavior instead of retaining ${value}`);
   }
-}
-if (/attributes\s*:|attributeFilter\s*:/.test(notificationPopoverMeasurement)) {
-  fail("notification popover MutationObserver must ignore pointer-driven style attributes");
 }
 if (/\.notification-popover\s*\{[^}]*\bright\s*:/s.test(read("apps/web/src/styles.css"))) {
   fail("notification popover must not use a fixed right offset instead of the trigger anchor");
@@ -358,7 +343,6 @@ for (const value of [
   "notification-operation-phase",
   "notification-progress-percent",
   "notification-progress-label",
-  "notification-result-library",
   "model.thumbnail.summaries.map",
   "data-notification-thumbnail-library",
   "data-notification-thumbnail-library-count",
@@ -2069,7 +2053,9 @@ if (/notification-(?:badge|count)|notification-status-dot[^\n]*\{[^}]*\d+\s*\}/.
 }
 
 for (const value of [
-  'data-compact-popover-root="notifications"',
+  'id="notifications-root"',
+  "AnchoredOverlay",
+  "后台活动",
   "notification-active-list",
   "notification-progress-track",
   "notification-progress-fill",
@@ -2077,9 +2063,7 @@ for (const value of [
   "notification-thumbnail-summary",
   "notification-thumbnail-summary-list",
   "data-notification-thumbnail-library-count",
-  "notification-result-list",
   "notification-popover-empty",
-  "notification-popover-degraded",
   "notification-open-center"
 ]) {
   if (!notificationPopover.includes(value)) {
@@ -2089,11 +2073,10 @@ for (const value of [
 const popoverOrder = [
   "notification-active-list",
   "notification-thumbnail-summary",
-  "notification-result-list",
   "notification-open-center"
 ].map((value) => notificationPopover.indexOf(value));
 if (popoverOrder.some((index) => index < 0) || popoverOrder.some((index, i) => i > 0 && index <= popoverOrder[i - 1])) {
-  fail("compact notification popover must render active, thumbnail, results, then full-center action");
+  fail("compact notification popover must render active, thumbnail, then full-center action");
 }
 if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopover)) {
   fail("compact notification popover must stay read-only without cancel/retry actions");
