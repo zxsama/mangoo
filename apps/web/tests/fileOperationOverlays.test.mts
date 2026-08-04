@@ -49,7 +49,11 @@ interface FileOperationOverlayResult {
   movePagination: {
     busyVisible: boolean;
     duplicateBlocked: boolean;
+    emptyPageFallbackOwned: boolean;
+    emptyPageUniqueTabStop: boolean;
     failureVisible: boolean;
+    finalPageFocusOwned: boolean;
+    finalPageUniqueTabStop: boolean;
     loadedBeyondFirstPage: boolean;
     selectedBeyondFirstPage: boolean;
   };
@@ -154,7 +158,11 @@ interface FixtureResult {
   movePagination?: {
     busyVisible: boolean;
     duplicateBlocked: boolean;
+    emptyPageFallbackOwned: boolean;
+    emptyPageUniqueTabStop: boolean;
     failureVisible: boolean;
+    finalPageFocusOwned: boolean;
+    finalPageUniqueTabStop: boolean;
     loadedBeyondFirstPage: boolean;
     selectedBeyondFirstPage: boolean;
   };
@@ -213,6 +221,11 @@ interface MovePaginationControl {
   calls: number;
   requests: Array<Deferred<void>>;
   selectedTarget: number | null;
+}
+
+interface EmptyPaginationControl {
+  calls: number;
+  requests: Array<Deferred<void>>;
 }
 
 const lifecycleWindow = window as Window & {
@@ -935,6 +948,89 @@ function MovePaginationScenario({ control }: { control: MovePaginationControl })
   );
 }
 
+function EmptyPaginationScenario({ control }: { control: EmptyPaginationControl }) {
+  const overlays = useOverlayStack();
+  const [open, setOpen] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>("empty-page");
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const library = {
+    expandedFolderIds: new Set<number>([1_000]),
+    folderChildNextCursorByParent: { 1_000: nextCursor },
+    folderChildrenByParent: { 1_000: [pagedFolder(0)] },
+    loadMoreFolderChildren: async () => {
+      control.calls += 1;
+      const request = deferred<void>();
+      control.requests.push(request);
+      await request.promise;
+      setNextCursor(null);
+    },
+    loadingMoreFolderIds: new Set<number>(),
+    roots: [{ displayName: "Empty page root", id: 1, rootFolderId: 1_000 }],
+    toggleFolderExpanded: () => undefined,
+  };
+
+  return (
+    <>
+      <button
+        onClick={(event) => {
+          restoreFocusRef.current = event.currentTarget;
+          overlays.openRoot("file-operation");
+          setOpen(true);
+        }}
+      >
+        Open empty-page move
+      </button>
+      <MoveDialogCompat
+        busy={false}
+        fileIds={[41]}
+        folderIds={[]}
+        library={library}
+        onCancel={() => setOpen(false)}
+        onSubmit={() => undefined}
+        open={open}
+        restoreFocusRef={restoreFocusRef}
+        serverError={null}
+        serverErrorCode={null}
+      />
+    </>
+  );
+}
+
+async function runEmptyPaginationScenario() {
+  const control: EmptyPaginationControl = { calls: 0, requests: [] };
+  const mounted = await mountScenario(
+    <OverlayProvider><EmptyPaginationScenario control={control} /></OverlayProvider>,
+  );
+  await requestNativeClick(await findButton("Open empty-page move"));
+  const dialog = await waitForDialog("move-dialog", "move-dialog-title");
+  await settle(40);
+  const tree = await findElement('[role="tree"]', dialog);
+  const parent = Array.from(tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')).find(
+    (item) => item.textContent?.trim() === "Empty page root",
+  );
+  const loadMore = Array.from(tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')).find(
+    (item) => item.textContent?.includes("Load more children"),
+  );
+  if (!parent || !loadMore) {
+    await unmountScenario(mounted);
+    return { emptyPageFallbackOwned: false, emptyPageUniqueTabStop: false };
+  }
+
+  await requestNativeClick(loadMore);
+  await settle(20);
+  control.requests[0]?.resolve();
+  await settle(50);
+  const tabStops = Array.from(
+    tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]'),
+  ).filter((item) => item.tabIndex === 0);
+  const result = {
+    emptyPageFallbackOwned: document.activeElement === parent && parent.tabIndex === 0,
+    emptyPageUniqueTabStop: tabStops.length === 1 && tabStops[0] === parent,
+  };
+  await unmountScenario(mounted);
+  return result;
+}
+
 async function runMovePaginationScenario() {
   const control: MovePaginationControl = {
     calls: 0,
@@ -955,7 +1051,11 @@ async function runMovePaginationScenario() {
     const result = {
       busyVisible: false,
       duplicateBlocked: false,
+      emptyPageFallbackOwned: false,
+      emptyPageUniqueTabStop: false,
       failureVisible: false,
+      finalPageFocusOwned: false,
+      finalPageUniqueTabStop: false,
       loadedBeyondFirstPage: false,
       selectedBeyondFirstPage: false,
     };
@@ -991,7 +1091,15 @@ async function runMovePaginationScenario() {
     (item) => item.textContent?.trim() === "Paged folder 501",
   );
   const loadedBeyondFirstPage = pageItem instanceof HTMLButtonElement;
-  pageItem?.focus();
+  const finalPageTabStops = Array.from(
+    tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]'),
+  ).filter((item) => item.tabIndex === 0);
+  const finalPageFocusOwned =
+    pageItem instanceof HTMLButtonElement &&
+    document.activeElement === pageItem &&
+    pageItem.tabIndex === 0;
+  const finalPageUniqueTabStop =
+    finalPageTabStops.length === 1 && finalPageTabStops[0] === pageItem;
   await requestNativeKey("Enter");
   await settle(20);
   await requestNativeClick(await findButton("Move here", dialog));
@@ -999,11 +1107,13 @@ async function runMovePaginationScenario() {
     busyVisible,
     duplicateBlocked,
     failureVisible,
+    finalPageFocusOwned,
+    finalPageUniqueTabStop,
     loadedBeyondFirstPage,
     selectedBeyondFirstPage: control.selectedTarget === 2_500,
   };
   await unmountScenario(mounted);
-  return result;
+  return { ...result, ...await runEmptyPaginationScenario() };
 }
 
 async function runDeleteScenario() {
@@ -1246,6 +1356,8 @@ describe("file-operation overlay migration", () => {
     assert.match(moveSource, /ArrowRight/);
     assert.match(moveSource, /Home/);
     assert.match(moveSource, /End/);
+    assert.match(moveSource, /useLayoutEffect/);
+    assert.doesNotMatch(moveSource, /setTimeout/);
   });
 
   it("owns menu and dialog styling without local hover fills", () => {
@@ -1302,7 +1414,11 @@ describe("mounted file-operation overlays", () => {
     assert.deepEqual(mountedResult.movePagination, {
       busyVisible: true,
       duplicateBlocked: true,
+      emptyPageFallbackOwned: true,
+      emptyPageUniqueTabStop: true,
       failureVisible: true,
+      finalPageFocusOwned: true,
+      finalPageUniqueTabStop: true,
       loadedBeyondFirstPage: true,
       selectedBeyondFirstPage: true,
     });

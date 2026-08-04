@@ -1,6 +1,7 @@
 import { ChevronDown, ChevronRight, Folder } from "lucide-react";
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -40,9 +41,16 @@ interface MoveBranchSharedProps {
   library: LibraryState;
   loadingFolderIds: Set<number>;
   onFocusItem: (itemKey: string) => void;
-  onLoadMore: (folderId: number) => void;
+  onLoadMore: (folderId: number, sourceItemKey: string) => void;
   onSelect: (folderId: number) => void;
   selectedTarget: number | null;
+}
+
+interface PageFocusHandoff {
+  owner: symbol;
+  parentFolderId: number;
+  previousChildIds: Set<number>;
+  sourceItemKey: string;
 }
 
 interface MoveTreeRowProps {
@@ -163,12 +171,15 @@ export function MoveDialog({
   const [loadingFolderIds, setLoadingFolderIds] = useState<Set<number>>(() => new Set());
   const [pageError, setPageError] = useState<string | null>(null);
   const pageLoadOwnersRef = useRef(new Map<number, symbol>());
+  const pageFocusHandoffRef = useRef<PageFocusHandoff | null>(null);
+  const treeRef = useRef<HTMLDivElement | null>(null);
   const librarySnapshotRef = useRef(library);
   librarySnapshotRef.current = library;
 
   useEffect(() => {
     if (!open) {
       pageLoadOwnersRef.current.clear();
+      pageFocusHandoffRef.current = null;
       setLoadingFolderIds(new Set());
       return;
     }
@@ -179,7 +190,10 @@ export function MoveDialog({
     setPageError(null);
   }, [firstRootFolderId, open]);
 
-  useEffect(() => () => pageLoadOwnersRef.current.clear(), []);
+  useEffect(() => () => {
+    pageLoadOwnersRef.current.clear();
+    pageFocusHandoffRef.current = null;
+  }, []);
 
   // Compute the set of folder ids that should be excluded as drop targets
   // (folders being moved themselves and their currently-loaded descendants).
@@ -200,7 +214,7 @@ export function MoveDialog({
     return blocked;
   }, [folderIds, library.folderChildrenByParent]);
 
-  async function handleLoadMore(folderId: number): Promise<void> {
+  async function handleLoadMore(folderId: number, sourceItemKey: string): Promise<void> {
     if (
       busy ||
       pageLoadOwnersRef.current.has(folderId) ||
@@ -213,6 +227,19 @@ export function MoveDialog({
     const owner = Symbol(`move-folder-page:${folderId}`);
     const requestedCursor = library.folderChildNextCursorByParent?.[folderId] ?? null;
     pageLoadOwnersRef.current.set(folderId, owner);
+    const activeTreeItem = document.activeElement instanceof HTMLElement
+      ? document.activeElement.dataset.moveTreeItemKey
+      : undefined;
+    if (focusedItemKey === sourceItemKey || activeTreeItem === sourceItemKey) {
+      pageFocusHandoffRef.current = {
+        owner,
+        parentFolderId: folderId,
+        previousChildIds: new Set(
+          (library.folderChildrenByParent[folderId] ?? []).map((child) => child.id)
+        ),
+        sourceItemKey,
+      };
+    }
     setLoadingFolderIds((current) => new Set(current).add(folderId));
     setPageError(null);
     try {
@@ -225,9 +252,17 @@ export function MoveDialog({
         librarySnapshotRef.current.folderChildNextCursorByParent?.[folderId] === requestedCursor
       ) {
         setPageError("Could not load more folders. Try again.");
+      } else if (
+        pageFocusHandoffRef.current?.owner === owner &&
+        librarySnapshotRef.current.folderChildNextCursorByParent?.[folderId] !== null
+      ) {
+        pageFocusHandoffRef.current = null;
       }
     } catch {
       if (pageLoadOwnersRef.current.get(folderId) === owner) {
+        if (pageFocusHandoffRef.current?.owner === owner) {
+          pageFocusHandoffRef.current = null;
+        }
         setPageError("Could not load more folders. Try again.");
       }
     } finally {
@@ -245,12 +280,42 @@ export function MoveDialog({
   const itemCount = fileIds.length + folderIds.length;
   const isCrossRoot = serverErrorCode === "cross_root";
   const canSubmit = !busy && target !== null;
+  const focusHandoff = pageFocusHandoffRef.current;
+  let renderedFocusedItemKey = focusedItemKey;
+  if (
+    focusHandoff &&
+    focusedItemKey === focusHandoff.sourceItemKey &&
+    library.folderChildNextCursorByParent?.[focusHandoff.parentFolderId] === null
+  ) {
+    const firstNewChild = (
+      library.folderChildrenByParent[focusHandoff.parentFolderId] ?? []
+    ).find((child) => !focusHandoff.previousChildIds.has(child.id));
+    renderedFocusedItemKey = firstNewChild
+      ? folderItemKey(firstNewChild.id)
+      : folderItemKey(focusHandoff.parentFolderId);
+  }
+
+  useLayoutEffect(() => {
+    if (renderedFocusedItemKey === focusedItemKey || !focusHandoff) return;
+    if (pageFocusHandoffRef.current !== focusHandoff) return;
+
+    const target = Array.from(
+      treeRef.current?.querySelectorAll<HTMLButtonElement>('[role="treeitem"]') ?? []
+    ).find((item) => item.dataset.moveTreeItemKey === renderedFocusedItemKey);
+    pageFocusHandoffRef.current = null;
+    setFocusedItemKey(renderedFocusedItemKey);
+    setPageError(null);
+    target?.focus();
+  }, [focusHandoff, focusedItemKey, renderedFocusedItemKey]);
+
   const branchProps: Omit<MoveBranchSharedProps, "library"> = {
     excludedFolderIds,
-    focusedItemKey,
+    focusedItemKey: renderedFocusedItemKey,
     loadingFolderIds,
     onFocusItem: setFocusedItemKey,
-    onLoadMore: (folderId) => void handleLoadMore(folderId),
+    onLoadMore: (folderId, sourceItemKey) => {
+      void handleLoadMore(folderId, sourceItemKey);
+    },
     onSelect: setTarget,
     selectedTarget: target,
   };
@@ -272,7 +337,12 @@ export function MoveDialog({
         titleId="move-dialog-title"
       />
       <OverlayDialogBody>
-        <div className="move-tree" role="tree" aria-label="Destination folder">
+        <div
+          aria-label="Destination folder"
+          className="move-tree"
+          ref={treeRef}
+          role="tree"
+        >
           {library.roots.map((root) => (
             <RootBranch
               {...branchProps}
@@ -479,6 +549,7 @@ function MoveTreeRow({
       className={`move-row${selected ? " move-row-selected" : ""}${
         disabled ? " move-row-disabled" : ""
       }`}
+      data-move-tree-item-key={itemKey}
       onClick={() => {
         if (!disabled) onSelect(folderId);
       }}
@@ -527,7 +598,7 @@ function MoveLoadMoreItem({
   folderId: number;
   loading: boolean;
   onFocusItem: (itemKey: string) => void;
-  onLoadMore: (folderId: number) => void;
+  onLoadMore: (folderId: number, sourceItemKey: string) => void;
 }) {
   const itemKey = loadMoreItemKey(folderId);
 
@@ -537,12 +608,13 @@ function MoveLoadMoreItem({
       aria-level={depth + 1}
       aria-selected={false}
       className="move-row move-load-more"
+      data-move-tree-item-key={itemKey}
       onClick={() => {
-        if (!loading) onLoadMore(folderId);
+        if (!loading) onLoadMore(folderId, itemKey);
       }}
       onFocus={() => onFocusItem(itemKey)}
       onKeyDown={(event) => handleMoveTreeKey(event, {
-        onActivate: loading ? undefined : () => onLoadMore(folderId),
+        onActivate: loading ? undefined : () => onLoadMore(folderId, itemKey),
       })}
       role="treeitem"
       style={{ "--move-depth": String(depth) } as CSSProperties}
