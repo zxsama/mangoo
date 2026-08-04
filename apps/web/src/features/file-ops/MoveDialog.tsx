@@ -1,6 +1,13 @@
 import { ChevronDown, ChevronRight, Folder } from "lucide-react";
-import type { CSSProperties } from "react";
-import { useEffect, useMemo, useState, type RefObject } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type RefObject,
+} from "react";
 import type { FolderRecord } from "@megle/core-client";
 import type { LibraryState } from "../../core/useLibraryData";
 import { LiquidGlassButton } from "../../design/liquid-glass";
@@ -27,6 +34,117 @@ export interface MoveDialogProps {
   restoreFocusRef?: RefObject<HTMLElement | null>;
 }
 
+interface MoveBranchSharedProps {
+  excludedFolderIds: Set<number>;
+  focusedItemKey: string;
+  library: LibraryState;
+  loadingFolderIds: Set<number>;
+  onFocusItem: (itemKey: string) => void;
+  onLoadMore: (folderId: number) => void;
+  onSelect: (folderId: number) => void;
+  selectedTarget: number | null;
+}
+
+interface MoveTreeRowProps {
+  depth: number;
+  disabled: boolean;
+  expanded: boolean;
+  expandable: boolean;
+  folderId: number;
+  focusedItemKey: string;
+  label: string;
+  onExpandedChange: (expanded: boolean) => void;
+  onFocusItem: (itemKey: string) => void;
+  onSelect: (folderId: number) => void;
+  selected: boolean;
+}
+
+function folderItemKey(folderId: number): string {
+  return `folder:${folderId}`;
+}
+
+function loadMoreItemKey(folderId: number): string {
+  return `load-more:${folderId}`;
+}
+
+function visibleTreeItems(currentTarget: HTMLElement): HTMLButtonElement[] {
+  const tree = currentTarget.closest('[role="tree"]');
+  return tree
+    ? Array.from(tree.querySelectorAll<HTMLButtonElement>('button[role="treeitem"]'))
+    : [];
+}
+
+function focusTreeItem(items: HTMLButtonElement[], index: number): void {
+  items[Math.max(0, Math.min(index, items.length - 1))]?.focus();
+}
+
+function handleMoveTreeKey(
+  event: KeyboardEvent<HTMLButtonElement>,
+  options?: {
+    expanded?: boolean;
+    expandable?: boolean;
+    onActivate?: () => void;
+    onExpandedChange?: (expanded: boolean) => void;
+  }
+): void {
+  const items = visibleTreeItems(event.currentTarget);
+  const currentIndex = items.indexOf(event.currentTarget);
+  if (currentIndex < 0) return;
+
+  const currentLevel = Number(event.currentTarget.getAttribute("aria-level")) || 1;
+  switch (event.key) {
+    case "ArrowDown":
+      event.preventDefault();
+      focusTreeItem(items, currentIndex + 1);
+      break;
+    case "ArrowUp":
+      event.preventDefault();
+      focusTreeItem(items, currentIndex - 1);
+      break;
+    case "Home":
+      event.preventDefault();
+      focusTreeItem(items, 0);
+      break;
+    case "End":
+      event.preventDefault();
+      focusTreeItem(items, items.length - 1);
+      break;
+    case "Enter":
+    case " ":
+      if (!options?.onActivate) return;
+      event.preventDefault();
+      options.onActivate();
+      break;
+    case "ArrowRight": {
+      if (!options?.expandable || !options.onExpandedChange) return;
+      event.preventDefault();
+      if (!options.expanded) {
+        options.onExpandedChange(true);
+        return;
+      }
+      const next = items[currentIndex + 1];
+      const nextLevel = Number(next?.getAttribute("aria-level")) || 0;
+      if (nextLevel > currentLevel) next.focus();
+      break;
+    }
+    case "ArrowLeft": {
+      event.preventDefault();
+      if (options?.expandable && options.expanded && options.onExpandedChange) {
+        options.onExpandedChange(false);
+        return;
+      }
+      for (let index = currentIndex - 1; index >= 0; index -= 1) {
+        const level = Number(items[index]?.getAttribute("aria-level")) || 0;
+        if (level < currentLevel) {
+          items[index]?.focus();
+          break;
+        }
+      }
+      break;
+    }
+  }
+}
+
 export function MoveDialog({
   open,
   library,
@@ -39,12 +157,29 @@ export function MoveDialog({
   onSubmit,
   restoreFocusRef,
 }: MoveDialogProps) {
+  const firstRootFolderId = library.roots.find((root) => root.rootFolderId !== null)?.rootFolderId;
   const [target, setTarget] = useState<number | null>(null);
+  const [focusedItemKey, setFocusedItemKey] = useState("");
+  const [loadingFolderIds, setLoadingFolderIds] = useState<Set<number>>(() => new Set());
+  const [pageError, setPageError] = useState<string | null>(null);
+  const pageLoadOwnersRef = useRef(new Map<number, symbol>());
+  const librarySnapshotRef = useRef(library);
+  librarySnapshotRef.current = library;
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      pageLoadOwnersRef.current.clear();
+      setLoadingFolderIds(new Set());
+      return;
+    }
     setTarget(null);
-  }, [open]);
+    setFocusedItemKey(firstRootFolderId === null || firstRootFolderId === undefined
+      ? ""
+      : folderItemKey(firstRootFolderId));
+    setPageError(null);
+  }, [firstRootFolderId, open]);
+
+  useEffect(() => () => pageLoadOwnersRef.current.clear(), []);
 
   // Compute the set of folder ids that should be excluded as drop targets
   // (folders being moved themselves and their currently-loaded descendants).
@@ -65,9 +200,60 @@ export function MoveDialog({
     return blocked;
   }, [folderIds, library.folderChildrenByParent]);
 
+  async function handleLoadMore(folderId: number): Promise<void> {
+    if (
+      busy ||
+      pageLoadOwnersRef.current.has(folderId) ||
+      loadingFolderIds.has(folderId) ||
+      library.loadingMoreFolderIds?.has(folderId)
+    ) {
+      return;
+    }
+
+    const owner = Symbol(`move-folder-page:${folderId}`);
+    const requestedCursor = library.folderChildNextCursorByParent?.[folderId] ?? null;
+    pageLoadOwnersRef.current.set(folderId, owner);
+    setLoadingFolderIds((current) => new Set(current).add(folderId));
+    setPageError(null);
+    try {
+      await library.loadMoreFolderChildren(folderId);
+      // The library reports page failures globally and resolves. Give its state
+      // update one frame to commit, then treat an unchanged cursor as retryable.
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      if (
+        pageLoadOwnersRef.current.get(folderId) === owner &&
+        librarySnapshotRef.current.folderChildNextCursorByParent?.[folderId] === requestedCursor
+      ) {
+        setPageError("Could not load more folders. Try again.");
+      }
+    } catch {
+      if (pageLoadOwnersRef.current.get(folderId) === owner) {
+        setPageError("Could not load more folders. Try again.");
+      }
+    } finally {
+      if (pageLoadOwnersRef.current.get(folderId) === owner) {
+        pageLoadOwnersRef.current.delete(folderId);
+        setLoadingFolderIds((current) => {
+          const next = new Set(current);
+          next.delete(folderId);
+          return next;
+        });
+      }
+    }
+  }
+
   const itemCount = fileIds.length + folderIds.length;
   const isCrossRoot = serverErrorCode === "cross_root";
   const canSubmit = !busy && target !== null;
+  const branchProps: Omit<MoveBranchSharedProps, "library"> = {
+    excludedFolderIds,
+    focusedItemKey,
+    loadingFolderIds,
+    onFocusItem: setFocusedItemKey,
+    onLoadMore: (folderId) => void handleLoadMore(folderId),
+    onSelect: setTarget,
+    selectedTarget: target,
+  };
 
   return (
     <ModalSurface
@@ -89,18 +275,20 @@ export function MoveDialog({
         <div className="move-tree" role="tree" aria-label="Destination folder">
           {library.roots.map((root) => (
             <RootBranch
-              excludedFolderIds={excludedFolderIds}
+              {...branchProps}
               key={root.id}
               library={library}
               root={root}
-              selectedTarget={target}
-              onSelect={setTarget}
             />
           ))}
           {library.roots.length === 0 ? (
             <div className="empty-panel">No roots available</div>
           ) : null}
         </div>
+
+        {pageError ? (
+          <OverlayInlineStatus tone="error">{pageError}</OverlayInlineStatus>
+        ) : null}
 
         {isCrossRoot ? (
           <OverlayInlineStatus tone="error">
@@ -139,15 +327,9 @@ export function MoveDialog({
 function RootBranch({
   library,
   root,
-  selectedTarget,
-  excludedFolderIds,
-  onSelect
-}: {
-  library: LibraryState;
+  ...shared
+}: MoveBranchSharedProps & {
   root: { id: number; rootFolderId: number | null; displayName: string };
-  selectedTarget: number | null;
-  excludedFolderIds: Set<number>;
-  onSelect: (folderId: number) => void;
 }) {
   const folderId = root.rootFolderId;
   const [expanded, setExpanded] = useState(true);
@@ -155,9 +337,7 @@ function RootBranch({
   useEffect(() => {
     if (!folderId) return;
     if (!library.folderChildrenByParent[folderId]) {
-      // Trigger lazy load by toggling the expansion. The library hook lazy-loads
-      // children when toggleFolderExpanded is called.
-      // Use the library's own toggle so cursor pages are populated.
+      // Trigger lazy load through the library owner so its cursor state stays authoritative.
       if (!library.expandedFolderIds.has(folderId)) {
         library.toggleFolderExpanded(folderId);
       }
@@ -165,53 +345,47 @@ function RootBranch({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [folderId]);
 
-  if (!folderId) {
-    return null;
-  }
-  const isExcluded = excludedFolderIds.has(folderId);
-  const selected = selectedTarget === folderId;
+  if (!folderId) return null;
+
   const children = library.folderChildrenByParent[folderId] ?? [];
+  const cursor = library.folderChildNextCursorByParent?.[folderId] ?? null;
 
   return (
     <div className="move-branch">
-      <div
-        className={`move-row${selected ? " move-row-selected" : ""}${
-          isExcluded ? " move-row-disabled" : ""
-        }`}
-        role="treeitem"
-        aria-selected={selected}
-      >
-        <button
-          aria-label={expanded ? "Collapse" : "Expand"}
-          className="move-disclosure"
-          onClick={() => setExpanded((current) => !current)}
-          type="button"
-        >
-          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        </button>
-        <button
-          className="move-label"
-          disabled={isExcluded}
-          onClick={() => !isExcluded && onSelect(folderId)}
-          type="button"
-        >
-          <Folder size={14} />
-          <span>{root.displayName}</span>
-        </button>
-      </div>
+      <MoveTreeRow
+        depth={0}
+        disabled={shared.excludedFolderIds.has(folderId)}
+        expanded={expanded}
+        expandable
+        folderId={folderId}
+        focusedItemKey={shared.focusedItemKey}
+        label={root.displayName}
+        onExpandedChange={setExpanded}
+        onFocusItem={shared.onFocusItem}
+        onSelect={shared.onSelect}
+        selected={shared.selectedTarget === folderId}
+      />
       {expanded ? (
         <div role="group">
           {children.map((child) => (
             <FolderBranch
+              {...shared}
               depth={1}
-              excludedFolderIds={excludedFolderIds}
               folder={child}
               key={child.id}
               library={library}
-              onSelect={onSelect}
-              selectedTarget={selectedTarget}
             />
           ))}
+          {cursor ? (
+            <MoveLoadMoreItem
+              depth={1}
+              focusedItemKey={shared.focusedItemKey}
+              folderId={folderId}
+              loading={shared.loadingFolderIds.has(folderId)}
+              onFocusItem={shared.onFocusItem}
+              onLoadMore={shared.onLoadMore}
+            />
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -222,75 +396,163 @@ function FolderBranch({
   depth,
   folder,
   library,
-  selectedTarget,
-  excludedFolderIds,
-  onSelect
-}: {
+  ...shared
+}: MoveBranchSharedProps & {
   depth: number;
   folder: FolderRecord;
-  library: LibraryState;
-  selectedTarget: number | null;
-  excludedFolderIds: Set<number>;
-  onSelect: (folderId: number) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const isExcluded = excludedFolderIds.has(folder.id);
-  const selected = selectedTarget === folder.id;
   const children = library.folderChildrenByParent[folder.id] ?? [];
+  const cursor = library.folderChildNextCursorByParent?.[folder.id] ?? null;
+  const expandable = folder.hasChildren || children.length > 0 || cursor !== null;
 
-  function handleToggle() {
-    setExpanded((current) => {
-      const next = !current;
-      if (next && !library.folderChildrenByParent[folder.id]) {
-        library.toggleFolderExpanded(folder.id);
-      }
-      return next;
-    });
+  function handleExpandedChange(next: boolean) {
+    if (next && !library.folderChildrenByParent[folder.id]) {
+      library.toggleFolderExpanded(folder.id);
+    }
+    setExpanded(next);
   }
 
   return (
     <div className="move-branch">
-      <div
-        className={`move-row${selected ? " move-row-selected" : ""}${
-          isExcluded ? " move-row-disabled" : ""
-        }`}
-        role="treeitem"
-        aria-selected={selected}
-        style={{ "--move-depth": String(depth) } as CSSProperties}
-      >
-        <button
-          aria-label={expanded ? "Collapse" : "Expand"}
-          className="move-disclosure"
-          onClick={handleToggle}
-          type="button"
-        >
-          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        </button>
-        <button
-          className="move-label"
-          disabled={isExcluded}
-          onClick={() => !isExcluded && onSelect(folder.id)}
-          type="button"
-        >
-          <Folder size={14} />
-          <span>{folder.name}</span>
-        </button>
-      </div>
+      <MoveTreeRow
+        depth={depth}
+        disabled={shared.excludedFolderIds.has(folder.id)}
+        expanded={expanded}
+        expandable={expandable}
+        folderId={folder.id}
+        focusedItemKey={shared.focusedItemKey}
+        label={folder.name}
+        onExpandedChange={handleExpandedChange}
+        onFocusItem={shared.onFocusItem}
+        onSelect={shared.onSelect}
+        selected={shared.selectedTarget === folder.id}
+      />
       {expanded ? (
         <div role="group">
           {children.map((child) => (
             <FolderBranch
+              {...shared}
               depth={depth + 1}
-              excludedFolderIds={excludedFolderIds}
               folder={child}
               key={child.id}
               library={library}
-              onSelect={onSelect}
-              selectedTarget={selectedTarget}
             />
           ))}
+          {cursor ? (
+            <MoveLoadMoreItem
+              depth={depth + 1}
+              focusedItemKey={shared.focusedItemKey}
+              folderId={folder.id}
+              loading={shared.loadingFolderIds.has(folder.id)}
+              onFocusItem={shared.onFocusItem}
+              onLoadMore={shared.onLoadMore}
+            />
+          ) : null}
         </div>
       ) : null}
     </div>
+  );
+}
+
+function MoveTreeRow({
+  depth,
+  disabled,
+  expanded,
+  expandable,
+  folderId,
+  focusedItemKey,
+  label,
+  onExpandedChange,
+  onFocusItem,
+  onSelect,
+  selected,
+}: MoveTreeRowProps) {
+  const itemKey = folderItemKey(folderId);
+
+  return (
+    <button
+      aria-disabled={disabled || undefined}
+      aria-expanded={expandable ? expanded : undefined}
+      aria-level={depth + 1}
+      aria-selected={selected}
+      className={`move-row${selected ? " move-row-selected" : ""}${
+        disabled ? " move-row-disabled" : ""
+      }`}
+      onClick={() => {
+        if (!disabled) onSelect(folderId);
+      }}
+      onFocus={() => onFocusItem(itemKey)}
+      onKeyDown={(event) => handleMoveTreeKey(event, {
+        expanded,
+        expandable,
+        onActivate: disabled ? undefined : () => onSelect(folderId),
+        onExpandedChange,
+      })}
+      role="treeitem"
+      style={{ "--move-depth": String(depth) } as CSSProperties}
+      tabIndex={focusedItemKey === itemKey ? 0 : -1}
+      type="button"
+    >
+      <span
+        aria-hidden="true"
+        className="move-disclosure"
+        onClick={(event) => {
+          event.stopPropagation();
+          if (expandable) onExpandedChange(!expanded);
+        }}
+      >
+        {expandable ? (
+          expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />
+        ) : null}
+      </span>
+      <span className="move-label">
+        <Folder size={14} />
+        <span>{label}</span>
+      </span>
+    </button>
+  );
+}
+
+function MoveLoadMoreItem({
+  depth,
+  focusedItemKey,
+  folderId,
+  loading,
+  onFocusItem,
+  onLoadMore,
+}: {
+  depth: number;
+  focusedItemKey: string;
+  folderId: number;
+  loading: boolean;
+  onFocusItem: (itemKey: string) => void;
+  onLoadMore: (folderId: number) => void;
+}) {
+  const itemKey = loadMoreItemKey(folderId);
+
+  return (
+    <button
+      aria-disabled={loading || undefined}
+      aria-level={depth + 1}
+      aria-selected={false}
+      className="move-row move-load-more"
+      onClick={() => {
+        if (!loading) onLoadMore(folderId);
+      }}
+      onFocus={() => onFocusItem(itemKey)}
+      onKeyDown={(event) => handleMoveTreeKey(event, {
+        onActivate: loading ? undefined : () => onLoadMore(folderId),
+      })}
+      role="treeitem"
+      style={{ "--move-depth": String(depth) } as CSSProperties}
+      tabIndex={focusedItemKey === itemKey ? 0 : -1}
+      type="button"
+    >
+      <span aria-hidden="true" className="move-disclosure" />
+      <span className="move-label">
+        <span>{loading ? "Loading more…" : "Load more children"}</span>
+      </span>
+    </button>
   );
 }

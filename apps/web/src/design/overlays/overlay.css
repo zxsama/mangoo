@@ -801,6 +801,12 @@
   opacity: 0.58;
 }
 
+.file-operation-dialog .overlay-field-error {
+  color: #ffd2ce;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
 .file-operation-dialog .overlay-inline-status {
   padding: 8px 10px;
   border: 1px solid transparent;
@@ -869,8 +875,13 @@
 }
 
 .file-operation-dialog .move-row {
+  width: 100%;
+  padding: 0;
   border-color: transparent;
   background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
 }
 
 .file-operation-dialog .move-row-selected {
@@ -882,6 +893,16 @@
   color: var(--text-muted);
   cursor: default;
   opacity: 0.58;
+}
+
+.file-operation-dialog .move-load-more .move-label {
+  grid-template-columns: minmax(0, 1fr);
+  color: var(--text-muted);
+}
+
+.file-operation-dialog .move-load-more[aria-disabled="true"] {
+  cursor: progress;
+  opacity: 0.68;
 }
 
 @keyframes overlay-root-enter {

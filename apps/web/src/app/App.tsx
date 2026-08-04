@@ -82,7 +82,10 @@ import {
 import { subscribePreference } from "../core/preferenceSync";
 import { emitRendererStartupLog } from "../core/notificationReporting";
 import { runCoordinatedMediaFocusSwitch } from "../core/mediaFocusLocateWorkflow";
-import { useShortcuts } from "../features/shortcuts/useShortcuts";
+import {
+  beginFileOperationOverlay,
+  useShortcuts
+} from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
 import { buildPreviewPrefetchWindow } from "./previewPrefetchWindow";
 import { canNavigatePreview, canStartPreviewNavigation } from "./previewNavigationGate";
@@ -552,26 +555,34 @@ export function App() {
     );
   }, [previewPreferences]);
 
-  const dismissContextMenuState = useCallback(() => setMenu(null), []);
+  const dismissContextMenuState = useCallback(() => {
+    setMenu(null);
+    contextMenuReturnFocusRef.current = null;
+  }, []);
   const closeContextMenu = useCallback(() => {
     setMenu(null);
     overlays.closeRoot("context-menu");
+    contextMenuReturnFocusRef.current = null;
   }, [overlays]);
   const openContextMenu = useCallback(
     (nextMenu: ShellContextMenuState) => {
-      contextMenuReturnFocusRef.current =
+      const restoreFocusTarget =
         document.activeElement instanceof HTMLElement ? document.activeElement : null;
       overlays.openRoot("context-menu");
+      contextMenuReturnFocusRef.current = restoreFocusTarget;
       setMenu(nextMenu);
     },
     [overlays],
   );
   const beginFileOperation = useCallback(
-    (openOperation: () => void) => {
-      overlays.openRoot("file-operation");
-      dismissContextMenuState();
-      openOperation();
-    },
+    (openOperation: () => void, restoreFocusTarget?: HTMLElement | null) =>
+      beginFileOperationOverlay({
+        fileOperationRestoreFocusRef: contextMenuReturnFocusRef,
+        onDismissContextMenu: dismissContextMenuState,
+        openOperation,
+        overlays,
+        restoreFocusTarget,
+      }),
     [dismissContextMenuState, overlays],
   );
   const fileOperationOpen = Boolean(
@@ -582,6 +593,17 @@ export function App() {
   useEffect(() => {
     if (previousFileOperationOpenRef.current && !fileOperationOpen) {
       overlays.closeRoot("file-operation");
+      const restoreFocusOwner = contextMenuReturnFocusRef.current;
+      const clearFrame = window.requestAnimationFrame(() => {
+        if (
+          !fileOperationOpen &&
+          contextMenuReturnFocusRef.current === restoreFocusOwner
+        ) {
+          contextMenuReturnFocusRef.current = null;
+        }
+      });
+      previousFileOperationOpenRef.current = fileOperationOpen;
+      return () => window.cancelAnimationFrame(clearFrame);
     }
     previousFileOperationOpenRef.current = fileOperationOpen;
   }, [fileOperationOpen, overlays]);
@@ -755,11 +777,13 @@ export function App() {
   );
 
   useShortcuts({
+    fileOperationRestoreFocusRef: contextMenuReturnFocusRef,
     fileOps,
     library,
     onClosePreview: handleClosePreview,
     onPreviewNext: handlePreviewNext,
     onPreviewPrevious: handlePreviewPrevious,
+    onDismissContextMenu: dismissContextMenuState,
     onToggleSidebars: toggleSidebars,
     previewOpen
   });

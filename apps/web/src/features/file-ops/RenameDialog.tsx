@@ -6,7 +6,6 @@ import {
   OverlayDialogBody,
   OverlayDialogHeader,
   OverlayField,
-  OverlayInlineStatus,
 } from "../../design/overlays";
 
 export interface RenameDialogProps {
@@ -112,9 +111,9 @@ export function RenameDialog({
       >
         <OverlayDialogBody>
           <OverlayField
-            aria-describedby={displayedError ? "rename-dialog-status" : undefined}
             autoComplete="off"
             disabled={busy}
+            error={displayedError}
             inputRef={inputRef}
             label="New name"
             onChange={(event) => setValue(event.target.value)}
@@ -122,11 +121,6 @@ export function RenameDialog({
             type="text"
             value={value}
           />
-          {displayedError ? (
-            <div id="rename-dialog-status">
-              <OverlayInlineStatus tone="error">{displayedError}</OverlayInlineStatus>
-            </div>
-          ) : null}
           <OverlayDialogActions>
             <button
               className="overlay-dialog-button"

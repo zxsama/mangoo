@@ -56,7 +56,9 @@ export function OverlayField({
           <span className="overlay-field-trailing">{trailingAction}</span>
         ) : null}
       </div>
-      {error ? <div className="overlay-field-error" id={errorId}>{error}</div> : null}
+      {error ? (
+        <div className="overlay-field-error" id={errorId} role="alert">{error}</div>
+      ) : null}
     </div>
   );
 }

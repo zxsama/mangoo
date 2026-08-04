@@ -1,5 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, type MutableRefObject } from "react";
 import type { LibraryState } from "../../core/useLibraryData";
+import { useOverlayStack, type OverlayStackApi } from "../../design/overlays";
 import type { FileOpsController } from "../file-ops/useFileOps";
 import {
   matchShortcut,
@@ -14,6 +15,32 @@ export interface UseShortcutsOptions {
   onPreviewNext?: () => void;
   onPreviewPrevious?: () => void;
   onToggleSidebars: () => void;
+  fileOperationRestoreFocusRef: MutableRefObject<HTMLElement | null>;
+  onDismissContextMenu: () => void;
+}
+
+interface BeginFileOperationOverlayOptions {
+  fileOperationRestoreFocusRef: MutableRefObject<HTMLElement | null>;
+  onDismissContextMenu: () => void;
+  openOperation: () => void;
+  overlays: Pick<OverlayStackApi, "openRoot">;
+  restoreFocusTarget?: HTMLElement | null;
+}
+
+export function beginFileOperationOverlay({
+  fileOperationRestoreFocusRef,
+  onDismissContextMenu,
+  openOperation,
+  overlays,
+  restoreFocusTarget,
+}: BeginFileOperationOverlayOptions): void {
+  const focusOwner = restoreFocusTarget === undefined
+    ? fileOperationRestoreFocusRef.current
+    : restoreFocusTarget;
+  overlays.openRoot("file-operation");
+  onDismissContextMenu();
+  fileOperationRestoreFocusRef.current = focusOwner;
+  openOperation();
 }
 
 /**
@@ -31,9 +58,12 @@ export function useShortcuts({
   onPreviewNext,
   onPreviewPrevious,
   onToggleSidebars,
+  fileOperationRestoreFocusRef,
+  onDismissContextMenu,
   previewOpen
 }: UseShortcutsOptions): void {
   const { bindings } = useShortcutBindings();
+  const overlays = useOverlayStack();
 
   useEffect(() => {
     function handler(event: KeyboardEvent) {
@@ -130,7 +160,14 @@ export function useShortcuts({
       if (matchShortcut(event, bindings, "renameSelected")) {
         if (selected) {
           event.preventDefault();
-          fileOps.openRename({ kind: "file", file: selected });
+          beginFileOperationOverlay({
+            fileOperationRestoreFocusRef,
+            onDismissContextMenu,
+            openOperation: () => fileOps.openRename({ kind: "file", file: selected }),
+            overlays,
+            restoreFocusTarget:
+              document.activeElement instanceof HTMLElement ? document.activeElement : null,
+          });
         }
         return;
       }
@@ -138,7 +175,14 @@ export function useShortcuts({
       if (matchShortcut(event, bindings, "permanentDelete")) {
         if (selected) {
           event.preventDefault();
-          fileOps.openDelete({ kind: "file", file: selected }, true);
+          beginFileOperationOverlay({
+            fileOperationRestoreFocusRef,
+            onDismissContextMenu,
+            openOperation: () => fileOps.openDelete({ kind: "file", file: selected }, true),
+            overlays,
+            restoreFocusTarget:
+              document.activeElement instanceof HTMLElement ? document.activeElement : null,
+          });
         }
         return;
       }
@@ -146,7 +190,14 @@ export function useShortcuts({
       if (matchShortcut(event, bindings, "recycleDelete")) {
         if (selected) {
           event.preventDefault();
-          fileOps.openDelete({ kind: "file", file: selected }, false);
+          beginFileOperationOverlay({
+            fileOperationRestoreFocusRef,
+            onDismissContextMenu,
+            openOperation: () => fileOps.openDelete({ kind: "file", file: selected }, false),
+            overlays,
+            restoreFocusTarget:
+              document.activeElement instanceof HTMLElement ? document.activeElement : null,
+          });
         }
         return;
       }
@@ -156,12 +207,15 @@ export function useShortcuts({
     return () => window.removeEventListener("keydown", handler);
   }, [
     bindings,
+    fileOperationRestoreFocusRef,
     fileOps,
     library,
     onClosePreview,
     onPreviewNext,
     onPreviewPrevious,
+    onDismissContextMenu,
     onToggleSidebars,
+    overlays,
     previewOpen
   ]);
 }

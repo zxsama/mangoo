@@ -29,18 +29,29 @@ interface FileOperationOverlayResult {
     busyBlockedDismissal: boolean;
     callCount: number;
     failureVisible: boolean;
+    fieldErrorLinked: boolean;
     invalidBlocked: boolean;
     restoredFocus: boolean;
     selectedStem: boolean;
     sharedModal: boolean;
   };
   move: {
+    accessibleTreeModel: boolean;
     callCount: number;
     crossRootFailureVisible: boolean;
     descendantExcluded: boolean;
+    keyboardNavigation: boolean;
+    rovingTabStop: boolean;
     selectedTarget: number | null;
     selfExcluded: boolean;
     sharedModal: boolean;
+  };
+  movePagination: {
+    busyVisible: boolean;
+    duplicateBlocked: boolean;
+    failureVisible: boolean;
+    loadedBeyondFirstPage: boolean;
+    selectedBeyondFirstPage: boolean;
   };
   remove: {
     busyBlockedDismissal: boolean;
@@ -53,6 +64,13 @@ interface FileOperationOverlayResult {
     restoredFocus: boolean;
     sharedAlertDialog: boolean;
     typedConfirmationRequired: boolean;
+  };
+  shortcuts: {
+    deleteOwnerReplaced: boolean;
+    deleteRootOwnedBeforeOpen: boolean;
+    renameOwnerReplaced: boolean;
+    renameRootOwnedBeforeOpen: boolean;
+    staleContextOwnerCleared: boolean;
   };
 }
 
@@ -83,7 +101,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { OverlayProvider, useOverlayStack } from "/src/design/overlays/index.ts";
 import { ShellOverlayHost } from "/src/app-shell/ShellOverlayHost.tsx";
 import { ContextMenu } from "/src/features/file-ops/ContextMenu.tsx";
+import { MoveDialog } from "/src/features/file-ops/MoveDialog.tsx";
 import { useFileOpsController } from "/src/features/file-ops/useFileOps.ts";
+import { useShortcuts } from "/src/features/shortcuts/useShortcuts.ts";
 import "/src/styles.css";
 import "/src/design/overlays/overlay.css";
 
@@ -95,6 +115,7 @@ type OperationResult = { ok: boolean; code?: string; message?: string };
 
 interface Deferred<T> {
   promise: Promise<T>;
+  reject: (reason: unknown) => void;
   resolve: (value: T) => void;
 }
 
@@ -113,18 +134,29 @@ interface FixtureResult {
     busyBlockedDismissal: boolean;
     callCount: number;
     failureVisible: boolean;
+    fieldErrorLinked: boolean;
     invalidBlocked: boolean;
     restoredFocus: boolean;
     selectedStem: boolean;
     sharedModal: boolean;
   };
   move?: {
+    accessibleTreeModel: boolean;
     callCount: number;
     crossRootFailureVisible: boolean;
     descendantExcluded: boolean;
+    keyboardNavigation: boolean;
+    rovingTabStop: boolean;
     selectedTarget: number | null;
     selfExcluded: boolean;
     sharedModal: boolean;
+  };
+  movePagination?: {
+    busyVisible: boolean;
+    duplicateBlocked: boolean;
+    failureVisible: boolean;
+    loadedBeyondFirstPage: boolean;
+    selectedBeyondFirstPage: boolean;
   };
   remove?: {
     busyBlockedDismissal: boolean;
@@ -137,6 +169,13 @@ interface FixtureResult {
     restoredFocus: boolean;
     sharedAlertDialog: boolean;
     typedConfirmationRequired: boolean;
+  };
+  shortcuts?: {
+    deleteOwnerReplaced: boolean;
+    deleteRootOwnedBeforeOpen: boolean;
+    renameOwnerReplaced: boolean;
+    renameRootOwnedBeforeOpen: boolean;
+    staleContextOwnerCleared: boolean;
   };
 }
 
@@ -164,6 +203,18 @@ interface OperationControl {
   renameRequests: Array<Deferred<OperationResult>>;
 }
 
+interface ShortcutControl {
+  ownerAtOpen: string | null;
+  rootAtOpen: string | null;
+  staleContextOwnerCleared: boolean;
+}
+
+interface MovePaginationControl {
+  calls: number;
+  requests: Array<Deferred<void>>;
+  selectedTarget: number | null;
+}
+
 const lifecycleWindow = window as Window & {
   __overlayLifecycleInputRequest?: NativeInputRequest;
   __overlayLifecycleInputResponseId?: number;
@@ -174,7 +225,9 @@ const lifecycleWindow = window as Window & {
   .IS_REACT_ACT_ENVIRONMENT = true;
 
 const ContextMenuCompat = ContextMenu as ComponentType<Record<string, unknown>>;
+const MoveDialogCompat = MoveDialog as ComponentType<Record<string, unknown>>;
 const ShellOverlayHostCompat = ShellOverlayHost as ComponentType<Record<string, unknown>>;
+const useShortcutsCompat = useShortcuts as (options: Record<string, unknown>) => void;
 
 const media = {
   addedAt: 1,
@@ -212,11 +265,13 @@ const delay = (milliseconds = 0) =>
   new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 
 function deferred<T>(): Deferred<T> {
+  let reject!: (reason: unknown) => void;
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    reject = rejectPromise;
     resolve = resolvePromise;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }
 
 async function settle(milliseconds = 0): Promise<void> {
@@ -426,6 +481,133 @@ async function runContextMenuScenario() {
   return result;
 }
 
+function ShortcutScenario({
+  action,
+  control,
+}: {
+  action: "delete" | "rename";
+  control: ShortcutControl;
+}) {
+  const overlays = useOverlayStack();
+  const [contextOpen, setContextOpen] = useState(false);
+  const contextSourceRef = useRef<HTMLButtonElement | null>(null);
+  const shortcutSourceRef = useRef<HTMLButtonElement | null>(null);
+  const fileOperationRestoreFocusRef = useRef<HTMLElement | null>(null);
+
+  control.rootAtOpen = overlays.activeRootId;
+
+  const dismissContextMenu = () => {
+    setContextOpen(false);
+    fileOperationRestoreFocusRef.current = null;
+  };
+  const recordOpen = () => {
+    control.ownerAtOpen = fileOperationRestoreFocusRef.current?.id ?? null;
+  };
+  const fileOps = {
+    closeAll: () => undefined,
+    move: { busy: false, serverError: null, serverErrorCode: null, target: null },
+    openDelete: recordOpen,
+    openMove: () => undefined,
+    openRename: recordOpen,
+    remove: { busy: false, permanent: false, serverError: null, target: null },
+    rename: { busy: false, serverError: null, target: null },
+    submitDelete: async () => undefined,
+    submitMove: async () => undefined,
+    submitRename: async () => undefined,
+  };
+  const library = {
+    selectedMedia: media,
+    selectedMediaId: media.id,
+    setSelectedMediaId: () => undefined,
+  };
+
+  useShortcutsCompat({
+    fileOperationRestoreFocusRef,
+    fileOps,
+    library,
+    onClosePreview: () => undefined,
+    onDismissContextMenu: dismissContextMenu,
+    onPreviewNext: () => undefined,
+    onPreviewPrevious: () => undefined,
+    onToggleSidebars: () => undefined,
+    previewOpen: false,
+  });
+
+  control.staleContextOwnerCleared = !contextOpen && fileOperationRestoreFocusRef.current === null;
+
+  return (
+    <>
+      <button
+        id={action + "-context-source"}
+        onClick={() => {
+          fileOperationRestoreFocusRef.current = contextSourceRef.current;
+          setContextOpen(true);
+        }}
+        ref={contextSourceRef}
+      >
+        Open stale context
+      </button>
+      <button id={action + "-shortcut-source"} ref={shortcutSourceRef}>
+        Shortcut source
+      </button>
+      {contextOpen ? (
+        <ContextMenuCompat
+          ariaLabel="Stale context actions"
+          items={[{ id: "noop", label: "No operation" }]}
+          onDismiss={dismissContextMenu}
+          restoreFocusTarget={contextSourceRef.current}
+          x={40}
+          y={40}
+        />
+      ) : null}
+    </>
+  );
+}
+
+async function runShortcutAction(action: "delete" | "rename") {
+  const control: ShortcutControl = {
+    ownerAtOpen: null,
+    rootAtOpen: null,
+    staleContextOwnerCleared: false,
+  };
+  const mounted = await mountScenario(
+    <OverlayProvider><ShortcutScenario action={action} control={control} /></OverlayProvider>,
+  );
+  await requestNativeClick(await findButton("Open stale context"));
+  await waitForOpenSurface("context-menu-root");
+  await requestNativeKey("Escape");
+  await waitFor(() => document.getElementById("context-menu-root") === null, "stale context dismissal");
+  await settle(30);
+  const staleContextOwnerCleared = control.staleContextOwnerCleared;
+  const shortcutSource = document.getElementById(action + "-shortcut-source");
+  if (!(shortcutSource instanceof HTMLButtonElement)) {
+    throw new Error("Shortcut source is unavailable");
+  }
+  shortcutSource.focus();
+  await requestNativeKey(action === "rename" ? "F2" : "Delete");
+  await settle(30);
+  const result = {
+    ownerReplaced: control.ownerAtOpen === shortcutSource.id,
+    rootOwnedBeforeOpen: control.rootAtOpen === "file-operation",
+    staleContextOwnerCleared,
+  };
+  await unmountScenario(mounted);
+  return result;
+}
+
+async function runShortcutScenario() {
+  const rename = await runShortcutAction("rename");
+  const remove = await runShortcutAction("delete");
+  return {
+    deleteOwnerReplaced: remove.ownerReplaced,
+    deleteRootOwnedBeforeOpen: remove.rootOwnedBeforeOpen,
+    renameOwnerReplaced: rename.ownerReplaced,
+    renameRootOwnedBeforeOpen: rename.rootOwnedBeforeOpen,
+    staleContextOwnerCleared:
+      rename.staleContextOwnerCleared && remove.staleContextOwnerCleared,
+  };
+}
+
 function createLibrary(control: OperationControl) {
   return {
     deleteItems: (request: { fileIds: number[]; folderIds: number[]; permanent: boolean }) => {
@@ -554,6 +736,10 @@ async function runRenameScenario() {
   await settle();
   const renameButton = await findButton("Rename", dialog);
   const invalidBlocked = renameButton.disabled && dialog.querySelector('[role="alert"]') !== null;
+  const errorId = input.getAttribute("aria-describedby");
+  const fieldErrorLinked =
+    input.getAttribute("aria-invalid") === "true" &&
+    Boolean(errorId && document.getElementById(errorId)?.textContent?.includes("reserved"));
   await act(async () => setInputValue(input, "renamed.jpg"));
   await requestNativeClick(renameButton);
   await settle(20);
@@ -579,6 +765,7 @@ async function runRenameScenario() {
     busyBlockedDismissal,
     callCount: control.renameCalls.length,
     failureVisible,
+    fieldErrorLinked,
     invalidBlocked,
     restoredFocus: document.activeElement === trigger,
     selectedStem,
@@ -594,31 +781,227 @@ async function runMoveScenario() {
   const dialog = await waitForDialog("move-dialog", "move-dialog-title");
   const sharedModal =
     dialog.dataset.overlayLayerKind === "modal" && control.activeRootId() === "file-operation";
-  const self = await findButton("Moved folder", dialog);
-  const selfExcluded = self.disabled;
-  await requestNativeClick(await findElement(
-    'button[aria-label="Expand"]',
-    self.closest(".move-row") ?? dialog,
-  ));
-  const descendant = await findButton("Moved descendant", dialog);
-  const descendantExcluded = descendant.disabled;
-  await requestNativeClick(await findButton("Library root", dialog));
+  const tree = await findElement('[role="tree"]', dialog);
+  const treeItems = () => Array.from(tree.querySelectorAll<HTMLElement>('[role="treeitem"]'));
+  const itemNamed = (name: string) =>
+    treeItems().find((item) => item.textContent?.trim() === name) ?? null;
+  const rootItem = itemNamed("Library root");
+  const selfItem = itemNamed("Moved folder");
+  if (!rootItem || !selfItem) throw new Error("Move tree rows are unavailable");
+  const accessibleTreeModel =
+    rootItem instanceof HTMLButtonElement &&
+    selfItem instanceof HTMLButtonElement &&
+    rootItem.getAttribute("aria-expanded") === "true" &&
+    rootItem.getAttribute("aria-level") === "1";
+  const rovingTabStop =
+    treeItems().filter((item) => item.tabIndex === 0).length === 1 &&
+    treeItems().every((item) => item.tabIndex === 0 || item.tabIndex === -1);
+  const selfExcluded =
+    selfItem.getAttribute("aria-disabled") === "true" ||
+    Boolean(selfItem.querySelector<HTMLButtonElement>(".move-label")?.disabled);
+  let descendantExcluded = false;
+  let keyboardNavigation = false;
+
+  if (accessibleTreeModel) {
+    rootItem.focus();
+    await requestNativeKey("Down");
+    const movedFocused = document.activeElement === selfItem;
+    await requestNativeKey("Right");
+    await settle(20);
+    const expandedMoved = itemNamed("Moved folder");
+    await requestNativeKey("Down");
+    const descendantItem = itemNamed("Moved descendant");
+    descendantExcluded = descendantItem?.getAttribute("aria-disabled") === "true";
+    const descendantFocused = document.activeElement === descendantItem;
+    await requestNativeKey("Left");
+    const parentFocused = document.activeElement === expandedMoved;
+    await requestNativeKey("Left");
+    const parentCollapsed = expandedMoved?.getAttribute("aria-expanded") === "false";
+    await requestNativeKey("Home");
+    const homeFocused = document.activeElement === rootItem;
+    await requestNativeKey("End");
+    const endFocused = document.activeElement === itemNamed("Moved folder");
+    keyboardNavigation = Boolean(
+      movedFocused &&
+      descendantFocused &&
+      parentFocused &&
+      parentCollapsed &&
+      homeFocused &&
+      endFocused
+    );
+    await requestNativeKey("Home");
+    await requestNativeKey("Enter");
+  } else {
+    const self = await findButton("Moved folder", dialog);
+    await requestNativeClick(await findElement(
+      'button[aria-label="Expand"]',
+      self.closest(".move-row") ?? dialog,
+    ));
+    const descendant = await findButton("Moved descendant", dialog);
+    descendantExcluded = descendant.disabled;
+    await requestNativeClick(await findButton("Library root", dialog));
+  }
   await requestNativeClick(await findButton("Move here", dialog));
   await settle(20);
   control.moveRequests[0]?.resolve({ ok: false, code: "cross_root", message: "Choose the original root" });
   await settle(40);
   const activeMoveDialog = currentDialog("move-dialog", "move-dialog-title");
   const result = {
+    accessibleTreeModel,
     callCount: control.moveCalls.length,
     crossRootFailureVisible:
       activeMoveDialog?.querySelector('[role="alert"]')?.textContent === "Choose the original root",
     descendantExcluded,
+    keyboardNavigation,
+    rovingTabStop,
     selectedTarget: control.moveCalls[0]?.targetFolderId ?? null,
     selfExcluded,
     sharedModal,
   };
   await requestNativeClick(await findButton("Cancel", activeMoveDialog ?? document));
   await waitForDialogRemoval("move-dialog", "move-dialog-title");
+  await unmountScenario(mounted);
+  return result;
+}
+
+function pagedFolder(index: number) {
+  return {
+    hasChildren: false,
+    id: 2_000 + index,
+    mediaCount: 0,
+    name: "Paged folder " + (index + 1),
+    parentId: 1_000,
+    rootId: 1,
+    status: "ready",
+  };
+}
+
+function MovePaginationScenario({ control }: { control: MovePaginationControl }) {
+  const overlays = useOverlayStack();
+  const [open, setOpen] = useState(false);
+  const [children, setChildren] = useState(() =>
+    Array.from({ length: 500 }, (_, index) => pagedFolder(index))
+  );
+  const [nextCursor, setNextCursor] = useState<string | null>("page-2");
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const library = {
+    expandedFolderIds: new Set<number>([1_000]),
+    folderChildNextCursorByParent: { 1_000: nextCursor },
+    folderChildrenByParent: { 1_000: children },
+    loadMoreFolderChildren: async () => {
+      control.calls += 1;
+      const request = deferred<void>();
+      control.requests.push(request);
+      try {
+        await request.promise;
+      } catch {
+        // Production reports the failure globally and resolves the request.
+        return;
+      }
+      setChildren((current) => [...current, pagedFolder(500)]);
+      setNextCursor(null);
+    },
+    loadingMoreFolderIds: new Set<number>(),
+    roots: [{ displayName: "Paged root", id: 1, rootFolderId: 1_000 }],
+    toggleFolderExpanded: () => undefined,
+  };
+
+  return (
+    <>
+      <button
+        onClick={(event) => {
+          restoreFocusRef.current = event.currentTarget;
+          overlays.openRoot("file-operation");
+          setOpen(true);
+        }}
+      >
+        Open paginated move
+      </button>
+      <MoveDialogCompat
+        busy={false}
+        fileIds={[41]}
+        folderIds={[]}
+        library={library}
+        onCancel={() => setOpen(false)}
+        onSubmit={(folderId: number) => {
+          control.selectedTarget = folderId;
+        }}
+        open={open}
+        restoreFocusRef={restoreFocusRef}
+        serverError={null}
+        serverErrorCode={null}
+      />
+    </>
+  );
+}
+
+async function runMovePaginationScenario() {
+  const control: MovePaginationControl = {
+    calls: 0,
+    requests: [],
+    selectedTarget: null,
+  };
+  const mounted = await mountScenario(
+    <OverlayProvider><MovePaginationScenario control={control} /></OverlayProvider>,
+  );
+  await requestNativeClick(await findButton("Open paginated move"));
+  const dialog = await waitForDialog("move-dialog", "move-dialog-title");
+  await settle(40);
+  const tree = await findElement('[role="tree"]', dialog);
+  const loadMore = Array.from(tree.querySelectorAll<HTMLElement>('[role="treeitem"]')).find(
+    (item) => item.textContent?.includes("Load more children"),
+  );
+  if (!(loadMore instanceof HTMLButtonElement)) {
+    const result = {
+      busyVisible: false,
+      duplicateBlocked: false,
+      failureVisible: false,
+      loadedBeyondFirstPage: false,
+      selectedBeyondFirstPage: false,
+    };
+    await unmountScenario(mounted);
+    return result;
+  }
+
+  const firstItem = tree.querySelector<HTMLElement>('[role="treeitem"]');
+  firstItem?.focus();
+  await requestNativeKey("End");
+  const loadMoreKeyboardFocused = document.activeElement === loadMore;
+  await requestNativeKey("Enter");
+  await requestNativeKey("Enter");
+  await settle(30);
+  const busyVisible =
+    loadMoreKeyboardFocused &&
+    loadMore.getAttribute("aria-disabled") === "true" &&
+    loadMore.textContent?.includes("Loading") === true;
+  const duplicateBlocked = control.calls === 1;
+  control.requests[0]?.reject(new Error("Page denied"));
+  await settle(40);
+  const failureVisible =
+    dialog.querySelector<HTMLElement>('[role="alert"]')?.textContent?.includes("Could not load") === true;
+  const retry = Array.from(tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')).find(
+    (item) => item.textContent?.includes("Load more children"),
+  );
+  retry?.focus();
+  await requestNativeKey("Enter");
+  await settle(20);
+  control.requests[1]?.resolve();
+  await settle(50);
+  const pageItem = Array.from(tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')).find(
+    (item) => item.textContent?.trim() === "Paged folder 501",
+  );
+  const loadedBeyondFirstPage = pageItem instanceof HTMLButtonElement;
+  pageItem?.focus();
+  await requestNativeKey("Enter");
+  await settle(20);
+  await requestNativeClick(await findButton("Move here", dialog));
+  const result = {
+    busyVisible,
+    duplicateBlocked,
+    failureVisible,
+    loadedBeyondFirstPage,
+    selectedBeyondFirstPage: control.selectedTarget === 2_500,
+  };
   await unmountScenario(mounted);
   return result;
 }
@@ -693,9 +1076,11 @@ async function run(): Promise<void> {
     lifecycleWindow.__overlayLifecycleResult = {
       contextMenu: await runContextMenuScenario(),
       move: await runMoveScenario(),
+      movePagination: await runMovePaginationScenario(),
       ok: true,
       remove: await runDeleteScenario(),
       rename: await runRenameScenario(),
+      shortcuts: await runShortcutScenario(),
     };
   } catch (error) {
     lifecycleWindow.__overlayLifecycleResult = {
@@ -795,6 +1180,7 @@ describe("file-operation overlay migration", () => {
   const renameSource = read("src/features/file-ops/RenameDialog.tsx");
   const moveSource = read("src/features/file-ops/MoveDialog.tsx");
   const deleteSource = read("src/features/file-ops/DeleteConfirm.tsx");
+  const shortcutsSource = read("src/features/shortcuts/useShortcuts.ts");
   const overlayStyles = read("src/design/overlays/overlay.css");
 
   it("moves the context menu onto the shared point-anchored root", () => {
@@ -810,9 +1196,19 @@ describe("file-operation overlay migration", () => {
   it("switches context-menu ownership to one file-operation root", () => {
     assert.match(appSource, /dismissContextMenuState/);
     assert.match(appSource, /beginFileOperation/);
-    assert.match(appSource, /openRoot\("file-operation"\)/);
+    assert.match(shortcutsSource, /openRoot\("file-operation"\)/);
     assert.match(appSource, /previousFileOperationOpenRef/);
     assert.match(shellSource, /onDismissContextMenu/);
+  });
+
+  it("routes production rename and delete shortcuts through shared root ownership", () => {
+    assert.match(appSource, /useShortcuts\(\{[\s\S]*fileOperationRestoreFocusRef/);
+    assert.match(
+      shortcutsSource,
+      /openRoot\("file-operation"\)[\s\S]*onDismissContextMenu\(\)[\s\S]*openOperation\(\)/,
+    );
+    assert.match(shortcutsSource, /fileOperationRestoreFocusRef\.current/);
+    assert.match(shortcutsSource, /onDismissContextMenu/);
   });
 
   it("uses shared modal, field, status, and focus primitives", () => {
@@ -823,6 +1219,7 @@ describe("file-operation overlay migration", () => {
       assert.doesNotMatch(source, /\.\/useFocusTrap/);
     }
     assert.match(renameSource, /OverlayField/);
+    assert.match(renameSource, /error=\{displayedError\}/);
     assert.match(renameSource + moveSource + deleteSource, /OverlayInlineStatus/);
     assert.doesNotMatch(
       renameSource + moveSource + deleteSource,
@@ -838,11 +1235,25 @@ describe("file-operation overlay migration", () => {
     assert.match(moveSource, /serverErrorCode === "cross_root"/);
   });
 
+  it("implements paginated ARIA tree navigation for move targets", () => {
+    assert.match(moveSource, /folderChildNextCursorByParent/);
+    assert.match(moveSource, /loadMoreFolderChildren/);
+    assert.match(moveSource, /loadingMoreFolderIds/);
+    assert.match(moveSource, /aria-expanded/);
+    assert.match(moveSource, /aria-level/);
+    assert.match(moveSource, /tabIndex/);
+    assert.match(moveSource, /ArrowDown/);
+    assert.match(moveSource, /ArrowRight/);
+    assert.match(moveSource, /Home/);
+    assert.match(moveSource, /End/);
+  });
+
   it("owns menu and dialog styling without local hover fills", () => {
     const section = overlayStyles.split("/* Context menus and file dialogs */")[1] ?? "";
     assert.notEqual(section, "");
     assert.match(section, /\.context-menu/);
     assert.match(section, /\.overlay-dialog-wide/);
+    assert.match(section, /\.overlay-field-error/);
     assert.match(section, /\.move-tree/);
     assert.doesNotMatch(section, /:hover[^\{]*\{[^}]*\b(?:background|border(?:-color)?)\s*:/s);
   });
@@ -865,6 +1276,7 @@ describe("mounted file-operation overlays", () => {
       busyBlockedDismissal: true,
       callCount: 1,
       failureVisible: true,
+      fieldErrorLinked: true,
       invalidBlocked: true,
       restoredFocus: true,
       selectedStem: true,
@@ -874,12 +1286,25 @@ describe("mounted file-operation overlays", () => {
 
   it("keeps move exclusions, selected target, and cross-root failure behavior", () => {
     assert.deepEqual(mountedResult.move, {
+      accessibleTreeModel: true,
       callCount: 1,
       crossRootFailureVisible: true,
       descendantExcluded: true,
+      keyboardNavigation: true,
+      rovingTabStop: true,
       selectedTarget: 1,
       selfExcluded: true,
       sharedModal: true,
+    });
+  });
+
+  it("loads, retries, and selects folder targets beyond the first 500-item page", () => {
+    assert.deepEqual(mountedResult.movePagination, {
+      busyVisible: true,
+      duplicateBlocked: true,
+      failureVisible: true,
+      loadedBeyondFirstPage: true,
+      selectedBeyondFirstPage: true,
     });
   });
 
@@ -895,6 +1320,16 @@ describe("mounted file-operation overlays", () => {
       restoredFocus: true,
       sharedAlertDialog: true,
       typedConfirmationRequired: true,
+    });
+  });
+
+  it("opens F2 and Delete through the production shortcut root with fresh focus ownership", () => {
+    assert.deepEqual(mountedResult.shortcuts, {
+      deleteOwnerReplaced: true,
+      deleteRootOwnedBeforeOpen: true,
+      renameOwnerReplaced: true,
+      renameRootOwnedBeforeOpen: true,
+      staleContextOwnerCleared: true,
     });
   });
 });
