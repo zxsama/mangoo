@@ -2650,7 +2650,7 @@ for (const value of [
   "RefreshCw",
   "Copy",
   "FolderOpen",
-  "context-menu-separator",
+  "overlay-menu-separator",
   "Preview",
   "Rename",
   "Move to",

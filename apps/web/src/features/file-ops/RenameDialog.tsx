@@ -1,6 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
-import { useFocusTrap } from "./useFocusTrap";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { LiquidGlassButton } from "../../design/liquid-glass";
+import {
+  ModalSurface,
+  OverlayDialogActions,
+  OverlayDialogBody,
+  OverlayDialogHeader,
+  OverlayField,
+  OverlayInlineStatus,
+} from "../../design/overlays";
 
 export interface RenameDialogProps {
   open: boolean;
@@ -10,6 +17,7 @@ export interface RenameDialogProps {
   serverError?: string | null;
   onCancel: () => void;
   onSubmit: (newName: string) => void;
+  restoreFocusRef?: RefObject<HTMLElement | null>;
 }
 
 const RESERVED_WIN_NAMES = new Set([
@@ -18,7 +26,7 @@ const RESERVED_WIN_NAMES = new Set([
   "AUX",
   "NUL",
   ...Array.from({ length: 9 }, (_, i) => `COM${i + 1}`),
-  ...Array.from({ length: 9 }, (_, i) => `LPT${i + 1}`)
+  ...Array.from({ length: 9 }, (_, i) => `LPT${i + 1}`),
 ]);
 
 function validate(name: string): string | null {
@@ -26,7 +34,6 @@ function validate(name: string): string | null {
   if (name.length > 255) return "Name must be 255 characters or fewer";
   if (name === "." || name === "..") return "Name cannot be . or ..";
   if (/[\\/]/.test(name)) return "Name cannot contain '/' or '\\\\'";
-  // Strip extension before checking Windows reserved names
   const stem = name.includes(".") ? name.slice(0, name.indexOf(".")) : name;
   if (RESERVED_WIN_NAMES.has(stem.toUpperCase())) {
     return `'${stem}' is reserved on Windows`;
@@ -41,13 +48,12 @@ export function RenameDialog({
   busy = false,
   serverError = null,
   onCancel,
-  onSubmit
+  onSubmit,
+  restoreFocusRef,
 }: RenameDialogProps) {
   const [value, setValue] = useState(currentName);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const dialogRef = useRef<HTMLDivElement | null>(null);
-
-  useFocusTrap(open, dialogRef, { initialFocusRef: inputRef });
+  const initialSelectionPendingRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
@@ -56,93 +62,74 @@ export function RenameDialog({
 
   useEffect(() => {
     if (!open) return;
-    const node = inputRef.current;
-    if (!node) return;
-    // Select stem (without extension) for files; whole name for folders.
-    // useFocusTrap focuses the input; we just adjust the selection here.
-    if (kind === "file") {
-      const dot = currentName.lastIndexOf(".");
-      if (dot > 0) {
-        node.setSelectionRange(0, dot);
+    initialSelectionPendingRef.current = true;
+  }, [currentName, kind, open]);
+
+  const selectInitialValue = () => {
+    if (!initialSelectionPendingRef.current) return;
+    initialSelectionPendingRef.current = false;
+    window.requestAnimationFrame(() => {
+      const node = inputRef.current;
+      if (!node) return;
+      if (kind === "file") {
+        const dot = currentName.lastIndexOf(".");
+        if (dot > 0) node.setSelectionRange(0, dot);
+        else node.select();
       } else {
         node.select();
       }
-    } else {
-      node.select();
-    }
-  }, [open, currentName, kind]);
+    });
+  };
 
-  useEffect(() => {
-    if (!open) return;
-    function handleKey(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        if (busy) return;
-        event.preventDefault();
-        onCancel();
-      }
-    }
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [open, onCancel, busy]);
-
-  const validationError = useMemo(() => validate(value.trim()), [value]);
+  const clientError = useMemo(() => validate(value.trim()), [value]);
   const trimmed = value.trim();
   const unchanged = trimmed === currentName;
-  const canSubmit = !busy && !validationError && !unchanged;
-  const displayedError = validationError ?? serverError;
-
-  if (!open) return null;
+  const canSubmit = !busy && !clientError && !unchanged;
+  const displayedError = clientError ?? serverError;
 
   return (
-    <div
-      className="dialog-backdrop"
-      role="presentation"
-      onClick={() => {
-        if (busy) return;
-        onCancel();
-      }}
+    <ModalSurface
+      ariaLabelledBy="rename-dialog-title"
+      busy={busy}
+      className="file-operation-dialog"
+      id="rename-dialog"
+      initialFocusRef={inputRef}
+      onDismiss={onCancel}
+      open={open}
+      restoreFocusRef={restoreFocusRef}
+      rootId="file-operation"
     >
-      <LiquidGlassSurface
-        as="div"
-        aria-labelledby="rename-dialog-title"
-        aria-modal="true"
-        className="dialog"
-        interactive
-        onClick={(event) => event.stopPropagation()}
-        ref={dialogRef}
-        role="dialog"
-        tone="elevated"
-        variant="clear"
+      <OverlayDialogHeader
+        title={`Rename ${kind}`}
+        titleId="rename-dialog-title"
+      />
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!canSubmit) return;
+          onSubmit(trimmed);
+        }}
       >
-        <header className="dialog-header">
-          <h2 id="rename-dialog-title" className="dialog-title">
-            Rename {kind}
-          </h2>
-        </header>
-        <form
-          className="dialog-body"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (!canSubmit) return;
-            onSubmit(trimmed);
-          }}
-        >
-          <label className="dialog-field">
-            <span className="dialog-field-label">New name</span>
-            <input
-              autoComplete="off"
-              className="dialog-input"
-              disabled={busy}
-              onChange={(event) => setValue(event.target.value)}
-              ref={inputRef}
-              type="text"
-              value={value}
-            />
-          </label>
-          {displayedError ? <div className="dialog-error">{displayedError}</div> : null}
-          <footer className="dialog-actions">
+        <OverlayDialogBody>
+          <OverlayField
+            aria-describedby={displayedError ? "rename-dialog-status" : undefined}
+            autoComplete="off"
+            disabled={busy}
+            inputRef={inputRef}
+            label="New name"
+            onChange={(event) => setValue(event.target.value)}
+            onFocus={selectInitialValue}
+            type="text"
+            value={value}
+          />
+          {displayedError ? (
+            <div id="rename-dialog-status">
+              <OverlayInlineStatus tone="error">{displayedError}</OverlayInlineStatus>
+            </div>
+          ) : null}
+          <OverlayDialogActions>
             <button
-              className="dialog-button"
+              className="overlay-dialog-button"
               disabled={busy}
               onClick={onCancel}
               type="button"
@@ -150,16 +137,16 @@ export function RenameDialog({
               Cancel
             </button>
             <LiquidGlassButton
-              className="dialog-button dialog-button-primary"
+              className="overlay-dialog-button overlay-dialog-button-primary"
               disabled={!canSubmit}
               tone="primary"
               type="submit"
             >
               {busy ? "Renaming…" : "Rename"}
             </LiquidGlassButton>
-          </footer>
-        </form>
-      </LiquidGlassSurface>
-    </div>
+          </OverlayDialogActions>
+        </OverlayDialogBody>
+      </form>
+    </ModalSurface>
   );
 }

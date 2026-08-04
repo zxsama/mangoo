@@ -13,6 +13,7 @@ import { NotificationPopover } from "../features/notifications/NotificationPopov
 import type { CompactNotificationModel } from "../features/notifications/notificationModel";
 import type { NotificationWindowIntent } from "@megle/notification-contract";
 import type { LibraryState } from "../core/useLibraryData";
+import type { RefObject } from "react";
 
 export interface ShellContextMenuState {
   x: number;
@@ -22,13 +23,14 @@ export interface ShellContextMenuState {
 
 interface ShellOverlayHostProps {
   contextMenu: ShellContextMenuState | null;
+  contextMenuReturnFocusRef: RefObject<HTMLElement | null>;
   fileOps: FileOpsController;
   library: LibraryState;
   notificationAnchor: HTMLElement | null;
   notificationAutoFocus: boolean;
   notificationModel: CompactNotificationModel;
   notificationsOpen: boolean;
-  onCloseContextMenu: () => void;
+  onDismissContextMenu: () => void;
   onOpenNotificationCenter: (intent?: NotificationWindowIntent) => void;
 }
 
@@ -59,13 +61,14 @@ export function ShellNotificationOverlay({
 
 export function ShellOverlayHost({
   contextMenu,
+  contextMenuReturnFocusRef,
   fileOps,
   library,
   notificationAnchor,
   notificationAutoFocus,
   notificationModel,
   notificationsOpen,
-  onCloseContextMenu,
+  onDismissContextMenu,
   onOpenNotificationCenter
 }: ShellOverlayHostProps) {
   const renameTarget = fileOps.rename.target;
@@ -85,7 +88,8 @@ export function ShellOverlayHost({
       {contextMenu ? (
         <ContextMenu
           items={contextMenu.items}
-          onClose={onCloseContextMenu}
+          onDismiss={onDismissContextMenu}
+          restoreFocusTarget={contextMenuReturnFocusRef.current}
           x={contextMenu.x}
           y={contextMenu.y}
         />
@@ -98,6 +102,7 @@ export function ShellOverlayHost({
         onCancel={fileOps.closeAll}
         onSubmit={(newName) => void fileOps.submitRename(newName)}
         open={renameTarget !== null}
+        restoreFocusRef={contextMenuReturnFocusRef}
         serverError={fileOps.rename.serverError}
       />
 
@@ -109,6 +114,7 @@ export function ShellOverlayHost({
         onCancel={fileOps.closeAll}
         onSubmit={(folderId) => void fileOps.submitMove(folderId)}
         open={moveTarget !== null}
+        restoreFocusRef={contextMenuReturnFocusRef}
         serverError={fileOps.move.serverError}
         serverErrorCode={fileOps.move.serverErrorCode}
       />
@@ -121,6 +127,7 @@ export function ShellOverlayHost({
         onConfirm={() => void fileOps.submitDelete()}
         open={removeTarget !== null}
         permanent={fileOps.remove.permanent}
+        restoreFocusRef={contextMenuReturnFocusRef}
         serverError={fileOps.remove.serverError}
       />
     </>

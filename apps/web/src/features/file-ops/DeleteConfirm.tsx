@@ -1,6 +1,13 @@
-import { useEffect, useRef, useState } from "react";
-import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
-import { useFocusTrap } from "./useFocusTrap";
+import { useEffect, useRef, useState, type RefObject } from "react";
+import { LiquidGlassButton } from "../../design/liquid-glass";
+import {
+  ModalSurface,
+  OverlayDialogActions,
+  OverlayDialogBody,
+  OverlayDialogHeader,
+  OverlayField,
+  OverlayInlineStatus,
+} from "../../design/overlays";
 
 export interface DeleteConfirmProps {
   open: boolean;
@@ -12,6 +19,7 @@ export interface DeleteConfirmProps {
   serverError?: string | null;
   onCancel: () => void;
   onConfirm: () => void;
+  restoreFocusRef?: RefObject<HTMLElement | null>;
 }
 
 export function DeleteConfirm({
@@ -22,130 +30,106 @@ export function DeleteConfirm({
   busy = false,
   serverError = null,
   onCancel,
-  onConfirm
+  onConfirm,
+  restoreFocusRef,
 }: DeleteConfirmProps) {
   const total = fileCount + folderCount;
   const [confirmText, setConfirmText] = useState("");
-  const dialogRef = useRef<HTMLDivElement | null>(null);
   const confirmInputRef = useRef<HTMLInputElement | null>(null);
-
-  useFocusTrap(open, dialogRef, {
-    initialFocusRef: permanent ? confirmInputRef : undefined
-  });
+  const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
     setConfirmText("");
   }, [open, permanent]);
 
-  useEffect(() => {
-    if (!open) return;
-    function handleKey(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        if (busy) return;
-        event.preventDefault();
-        onCancel();
-      }
-    }
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [open, onCancel, busy]);
-
-  if (!open) return null;
-
   const expected = String(total);
   const matches = confirmText.trim() === expected;
   const canConfirm = !busy && total > 0 && (!permanent || matches);
+  const description = permanent
+    ? `${summarize(fileCount, folderCount)}. This cannot be undone.`
+    : summarize(fileCount, folderCount);
 
   return (
-    <div
-      className="dialog-backdrop"
-      role="presentation"
-      onClick={() => {
-        if (busy) return;
-        onCancel();
-      }}
+    <ModalSurface
+      ariaDescribedBy="delete-dialog-description"
+      ariaLabelledBy="delete-dialog-title"
+      busy={busy}
+      className="file-operation-dialog"
+      id="delete-dialog"
+      initialFocusRef={permanent ? confirmInputRef : cancelButtonRef}
+      onDismiss={onCancel}
+      open={open}
+      restoreFocusRef={restoreFocusRef}
+      role="alertdialog"
+      rootId="file-operation"
     >
-      <LiquidGlassSurface
-        as="div"
-        aria-labelledby="delete-dialog-title"
-        aria-modal="true"
-        className="dialog"
-        interactive
-        onClick={(event) => event.stopPropagation()}
-        ref={dialogRef}
-        role="dialog"
-        tone="elevated"
-        variant="clear"
-      >
-        <header className="dialog-header">
-          <h2 className="dialog-title" id="delete-dialog-title">
-            {permanent ? "Delete permanently" : "Move to recycle bin"}
-          </h2>
-          <p className="dialog-subtitle">
-            {summarize(fileCount, folderCount)}
-            {permanent ? " — this cannot be undone." : ""}
-          </p>
-        </header>
-        <div className="dialog-body">
-          {permanent ? (
-            <>
-              <p className="dialog-text">
-                This permanently removes the selected items from disk. To confirm, type{" "}
-                <code className="dialog-code">{expected}</code> below.
-              </p>
-              <label className="dialog-field">
-                <span className="dialog-field-label">Type item count to confirm</span>
-                <input
-                  autoComplete="off"
-                  className="dialog-input"
-                  disabled={busy}
-                  onChange={(event) => setConfirmText(event.target.value)}
-                  ref={confirmInputRef}
-                  type="text"
-                  value={confirmText}
-                />
-              </label>
-            </>
-          ) : (
-            <p className="dialog-text">
-              The selected items will be moved to the Windows recycle bin. You can restore them from
-              there.
+      <OverlayDialogHeader
+        description={description}
+        descriptionId="delete-dialog-description"
+        title={permanent ? "Delete permanently" : "Move to recycle bin"}
+        titleId="delete-dialog-title"
+      />
+      <OverlayDialogBody>
+        {permanent ? (
+          <>
+            <p className="overlay-dialog-text">
+              This permanently removes the selected items from disk. To confirm, type{" "}
+              <code className="overlay-dialog-code">{expected}</code> below.
             </p>
-          )}
-
-          {serverError ? <div className="dialog-error">{serverError}</div> : null}
-
-          <footer className="dialog-actions">
-            <button
-              className="dialog-button"
+            <OverlayField
+              autoComplete="off"
               disabled={busy}
-              onClick={onCancel}
-              type="button"
-            >
-              Cancel
-            </button>
-            <LiquidGlassButton
-              className={`dialog-button ${
-                permanent ? "dialog-button-danger" : "dialog-button-primary"
-              }`}
-              disabled={!canConfirm}
-              onClick={onConfirm}
-              tone={permanent ? "danger" : "primary"}
-              type="button"
-            >
-              {busy
-                ? permanent
-                  ? "Deleting…"
-                  : "Recycling…"
-                : permanent
-                  ? "Delete permanently"
-                  : "Move to recycle bin"}
-            </LiquidGlassButton>
-          </footer>
-        </div>
-      </LiquidGlassSurface>
-    </div>
+              inputRef={confirmInputRef}
+              label="Type item count to confirm"
+              onChange={(event) => setConfirmText(event.target.value)}
+              type="text"
+              value={confirmText}
+            />
+          </>
+        ) : (
+          <p className="overlay-dialog-text">
+            The selected items will be moved to the Windows recycle bin. You can restore them from
+            there.
+          </p>
+        )}
+
+        {serverError ? (
+          <OverlayInlineStatus tone="error">{serverError}</OverlayInlineStatus>
+        ) : null}
+
+        <OverlayDialogActions>
+          <button
+            className="overlay-dialog-button"
+            disabled={busy}
+            onClick={onCancel}
+            ref={cancelButtonRef}
+            type="button"
+          >
+            Cancel
+          </button>
+          <LiquidGlassButton
+            className={`overlay-dialog-button ${
+              permanent
+                ? "overlay-dialog-button-danger"
+                : "overlay-dialog-button-primary"
+            }`}
+            disabled={!canConfirm}
+            onClick={onConfirm}
+            tone={permanent ? "danger" : "primary"}
+            type="button"
+          >
+            {busy
+              ? permanent
+                ? "Deleting…"
+                : "Recycling…"
+              : permanent
+                ? "Delete permanently"
+                : "Move to recycle bin"}
+          </LiquidGlassButton>
+        </OverlayDialogActions>
+      </OverlayDialogBody>
+    </ModalSurface>
   );
 }
 

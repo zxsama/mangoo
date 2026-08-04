@@ -1,10 +1,16 @@
 import { ChevronDown, ChevronRight, Folder } from "lucide-react";
 import type { CSSProperties } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState, type RefObject } from "react";
 import type { FolderRecord } from "@megle/core-client";
 import type { LibraryState } from "../../core/useLibraryData";
-import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
-import { useFocusTrap } from "./useFocusTrap";
+import { LiquidGlassButton } from "../../design/liquid-glass";
+import {
+  ModalSurface,
+  OverlayDialogActions,
+  OverlayDialogBody,
+  OverlayDialogHeader,
+  OverlayInlineStatus,
+} from "../../design/overlays";
 
 export interface MoveDialogProps {
   open: boolean;
@@ -18,6 +24,7 @@ export interface MoveDialogProps {
   serverErrorCode?: string | null;
   onCancel: () => void;
   onSubmit: (targetFolderId: number) => void;
+  restoreFocusRef?: RefObject<HTMLElement | null>;
 }
 
 export function MoveDialog({
@@ -29,30 +36,15 @@ export function MoveDialog({
   serverError = null,
   serverErrorCode = null,
   onCancel,
-  onSubmit
+  onSubmit,
+  restoreFocusRef,
 }: MoveDialogProps) {
   const [target, setTarget] = useState<number | null>(null);
-  const dialogRef = useRef<HTMLDivElement | null>(null);
-
-  useFocusTrap(open, dialogRef);
 
   useEffect(() => {
     if (!open) return;
     setTarget(null);
   }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    function handleKey(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        if (busy) return;
-        event.preventDefault();
-        onCancel();
-      }
-    }
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [open, onCancel, busy]);
 
   // Compute the set of folder ids that should be excluded as drop targets
   // (folders being moved themselves and their currently-loaded descendants).
@@ -77,84 +69,70 @@ export function MoveDialog({
   const isCrossRoot = serverErrorCode === "cross_root";
   const canSubmit = !busy && target !== null;
 
-  if (!open) return null;
-
   return (
-    <div
-      className="dialog-backdrop"
-      role="presentation"
-      onClick={() => {
-        if (busy) return;
-        onCancel();
-      }}
+    <ModalSurface
+      ariaLabelledBy="move-dialog-title"
+      busy={busy}
+      className="file-operation-dialog overlay-dialog-wide"
+      id="move-dialog"
+      onDismiss={onCancel}
+      open={open}
+      restoreFocusRef={restoreFocusRef}
+      rootId="file-operation"
     >
-      <LiquidGlassSurface
-        as="div"
-        aria-labelledby="move-dialog-title"
-        aria-modal="true"
-        className="dialog dialog-wide"
-        interactive
-        onClick={(event) => event.stopPropagation()}
-        ref={dialogRef}
-        role="dialog"
-        tone="elevated"
-        variant="clear"
-      >
-        <header className="dialog-header">
-          <h2 id="move-dialog-title" className="dialog-title">
-            Move {itemCount} item{itemCount === 1 ? "" : "s"}
-          </h2>
-          <p className="dialog-subtitle">Pick a destination folder</p>
-        </header>
-        <div className="dialog-body">
-          <div className="move-tree" role="tree" aria-label="Destination folder">
-            {library.roots.map((root) => (
-              <RootBranch
-                excludedFolderIds={excludedFolderIds}
-                key={root.id}
-                library={library}
-                root={root}
-                selectedTarget={target}
-                onSelect={setTarget}
-              />
-            ))}
-            {library.roots.length === 0 ? (
-              <div className="empty-panel">No roots available</div>
-            ) : null}
-          </div>
-
-          {isCrossRoot ? (
-            <div className="dialog-error">
-              {serverError ?? "Cross-root moves are not supported yet. Pick a destination inside the same root."}
-            </div>
-          ) : serverError ? (
-            <div className="dialog-error">{serverError}</div>
+      <OverlayDialogHeader
+        description="Pick a destination folder"
+        title={`Move ${itemCount} item${itemCount === 1 ? "" : "s"}`}
+        titleId="move-dialog-title"
+      />
+      <OverlayDialogBody>
+        <div className="move-tree" role="tree" aria-label="Destination folder">
+          {library.roots.map((root) => (
+            <RootBranch
+              excludedFolderIds={excludedFolderIds}
+              key={root.id}
+              library={library}
+              root={root}
+              selectedTarget={target}
+              onSelect={setTarget}
+            />
+          ))}
+          {library.roots.length === 0 ? (
+            <div className="empty-panel">No roots available</div>
           ) : null}
-
-          <footer className="dialog-actions">
-            <button
-              className="dialog-button"
-              disabled={busy}
-              onClick={onCancel}
-              type="button"
-            >
-              Cancel
-            </button>
-            <LiquidGlassButton
-              className="dialog-button dialog-button-primary"
-              disabled={!canSubmit}
-              onClick={() => {
-                if (target !== null) onSubmit(target);
-              }}
-              tone="primary"
-              type="button"
-            >
-              {busy ? "Moving…" : "Move here"}
-            </LiquidGlassButton>
-          </footer>
         </div>
-      </LiquidGlassSurface>
-    </div>
+
+        {isCrossRoot ? (
+          <OverlayInlineStatus tone="error">
+            {serverError ?? "Cross-root moves are not supported yet. Pick a destination inside the same root."}
+          </OverlayInlineStatus>
+        ) : serverError ? (
+          <OverlayInlineStatus tone="error">{serverError}</OverlayInlineStatus>
+        ) : null}
+
+        <OverlayDialogActions>
+          <button
+            className="overlay-dialog-button"
+            disabled={busy}
+            onClick={onCancel}
+            type="button"
+          >
+            Cancel
+          </button>
+          <LiquidGlassButton
+            className="overlay-dialog-button overlay-dialog-button-primary"
+            disabled={!canSubmit}
+            onClick={() => {
+              if (target !== null) onSubmit(target);
+            }}
+            tone="primary"
+            type="button"
+          >
+            {busy ? "Moving…" : "Move here"}
+          </LiquidGlassButton>
+        </OverlayDialogActions>
+      </OverlayDialogBody>
+    </ModalSurface>
   );
 }
 
