@@ -55,6 +55,20 @@ interface PageFocusHandoff {
   sourceOwnsDomFocus: boolean;
 }
 
+interface SettledPageRequest {
+  folderId: number;
+  owner: symbol;
+  requestedCursor: string | null;
+}
+
+function releasePageFocusHandoff(
+  handoffRef: { current: PageFocusHandoff | null },
+  owner?: symbol,
+): void {
+  if (owner !== undefined && handoffRef.current?.owner !== owner) return;
+  handoffRef.current = null;
+}
+
 interface MoveTreeRowProps {
   depth: number;
   disabled: boolean;
@@ -172,6 +186,7 @@ export function MoveDialog({
   const [focusedItemKey, setFocusedItemKey] = useState("");
   const [loadingFolderIds, setLoadingFolderIds] = useState<Set<number>>(() => new Set());
   const [pageError, setPageError] = useState<string | null>(null);
+  const [settledPageRequests, setSettledPageRequests] = useState<SettledPageRequest[]>([]);
   const pageLoadOwnersRef = useRef(new Map<number, symbol>());
   const pageFocusHandoffRef = useRef<PageFocusHandoff | null>(null);
   const treeRef = useRef<HTMLDivElement | null>(null);
@@ -181,7 +196,7 @@ export function MoveDialog({
   useEffect(() => {
     if (!open) {
       pageLoadOwnersRef.current.clear();
-      pageFocusHandoffRef.current = null;
+      releasePageFocusHandoff(pageFocusHandoffRef);
       setLoadingFolderIds(new Set());
       return;
     }
@@ -194,7 +209,7 @@ export function MoveDialog({
 
   useEffect(() => () => {
     pageLoadOwnersRef.current.clear();
-    pageFocusHandoffRef.current = null;
+    releasePageFocusHandoff(pageFocusHandoffRef);
   }, []);
 
   // Compute the set of folder ids that should be excluded as drop targets
@@ -215,6 +230,35 @@ export function MoveDialog({
     }
     return blocked;
   }, [folderIds, library.folderChildrenByParent]);
+
+  function releasePageLoadOwner(folderId: number, owner: symbol): boolean {
+    if (pageLoadOwnersRef.current.get(folderId) !== owner) return false;
+    pageLoadOwnersRef.current.delete(folderId);
+    setLoadingFolderIds((current) => {
+      const next = new Set(current);
+      next.delete(folderId);
+      return next;
+    });
+    return true;
+  }
+
+  function releasePageRequestOwnership(folderId: number, owner: symbol): boolean {
+    releasePageFocusHandoff(pageFocusHandoffRef, owner);
+    return releasePageLoadOwner(folderId, owner);
+  }
+
+  function settleResolvedPageRequest(
+    folderId: number,
+    owner: symbol,
+    requestedCursor: string | null,
+  ): void {
+    const currentCursor =
+      librarySnapshotRef.current.folderChildNextCursorByParent?.[folderId] ?? null;
+    if (!releasePageRequestOwnership(folderId, owner)) return;
+    if (currentCursor === requestedCursor) {
+      setPageError("Could not load more folders. Try again.");
+    }
+  }
 
   async function handleLoadMore(folderId: number, sourceItemKey: string): Promise<void> {
     if (
@@ -245,38 +289,31 @@ export function MoveDialog({
     setPageError(null);
     try {
       await library.loadMoreFolderChildren(folderId);
-      // The library reports page failures globally and resolves. Give its state
-      // update one frame to commit, then treat an unchanged cursor as retryable.
-      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-      if (
-        pageLoadOwnersRef.current.get(folderId) === owner &&
-        librarySnapshotRef.current.folderChildNextCursorByParent?.[folderId] === requestedCursor
-      ) {
-        setPageError("Could not load more folders. Try again.");
-      } else if (
-        pageFocusHandoffRef.current?.owner === owner &&
-        librarySnapshotRef.current.folderChildNextCursorByParent?.[folderId] !== null
-      ) {
-        pageFocusHandoffRef.current = null;
-      }
+      setSettledPageRequests((current) => [
+        ...current,
+        { folderId, owner, requestedCursor },
+      ]);
     } catch {
-      if (pageLoadOwnersRef.current.get(folderId) === owner) {
-        if (pageFocusHandoffRef.current?.owner === owner) {
-          pageFocusHandoffRef.current = null;
-        }
+      if (releasePageRequestOwnership(folderId, owner)) {
         setPageError("Could not load more folders. Try again.");
-      }
-    } finally {
-      if (pageLoadOwnersRef.current.get(folderId) === owner) {
-        pageLoadOwnersRef.current.delete(folderId);
-        setLoadingFolderIds((current) => {
-          const next = new Set(current);
-          next.delete(folderId);
-          return next;
-        });
       }
     }
   }
+
+  useEffect(() => {
+    if (settledPageRequests.length === 0) return;
+    for (const request of settledPageRequests) {
+      settleResolvedPageRequest(
+        request.folderId,
+        request.owner,
+        request.requestedCursor,
+      );
+    }
+    const settledOwners = new Set(settledPageRequests.map((request) => request.owner));
+    setSettledPageRequests((current) =>
+      current.filter((request) => !settledOwners.has(request.owner))
+    );
+  }, [settledPageRequests]);
 
   const itemCount = fileIds.length + folderIds.length;
   const isCrossRoot = serverErrorCode === "cross_root";
@@ -285,6 +322,7 @@ export function MoveDialog({
   let renderedFocusedItemKey = focusedItemKey;
   if (
     focusHandoff &&
+    focusedItemKey === focusHandoff.sourceItemKey &&
     library.folderChildNextCursorByParent?.[focusHandoff.parentFolderId] === null
   ) {
     const firstNewChild = (
@@ -303,7 +341,7 @@ export function MoveDialog({
       treeRef.current?.querySelectorAll<HTMLButtonElement>('[role="treeitem"]') ?? []
     ).find((item) => item.dataset.moveTreeItemKey === renderedFocusedItemKey);
     const restoreDomFocus = focusHandoff.sourceOwnsDomFocus;
-    pageFocusHandoffRef.current = null;
+    releasePageFocusHandoff(pageFocusHandoffRef, focusHandoff.owner);
     setFocusedItemKey(renderedFocusedItemKey);
     setPageError(null);
     if (restoreDomFocus) target?.focus();

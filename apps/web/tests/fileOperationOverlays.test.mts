@@ -57,7 +57,12 @@ interface FileOperationOverlayResult {
     finalPageFocusOwned: boolean;
     finalPageUniqueTabStop: boolean;
     loadedBeyondFirstPage: boolean;
+    pendingTreeFocusPreserved: boolean;
+    pendingTreeUniqueTabStop: boolean;
+    resolvedFailureVisible: boolean;
     selectedBeyondFirstPage: boolean;
+    staleFailureFocusPreserved: boolean;
+    staleFailureUniqueTabStop: boolean;
   };
   remove: {
     busyBlockedDismissal: boolean;
@@ -168,7 +173,12 @@ interface FixtureResult {
     finalPageFocusOwned: boolean;
     finalPageUniqueTabStop: boolean;
     loadedBeyondFirstPage: boolean;
+    pendingTreeFocusPreserved: boolean;
+    pendingTreeUniqueTabStop: boolean;
+    resolvedFailureVisible: boolean;
     selectedBeyondFirstPage: boolean;
+    staleFailureFocusPreserved: boolean;
+    staleFailureUniqueTabStop: boolean;
   };
   remove?: {
     busyBlockedDismissal: boolean;
@@ -229,6 +239,11 @@ interface MovePaginationControl {
 
 interface EmptyPaginationControl {
   calls: number;
+  requests: Array<Deferred<void>>;
+}
+
+interface OwnershipPaginationControl {
+  applySharedUpdate: () => void;
   requests: Array<Deferred<void>>;
 }
 
@@ -1000,6 +1015,140 @@ function EmptyPaginationScenario({ control }: { control: EmptyPaginationControl 
   );
 }
 
+function OwnershipPaginationScenario({
+  control,
+  mode,
+}: {
+  control: OwnershipPaginationControl;
+  mode: "pending-success" | "resolved-failure";
+}) {
+  const overlays = useOverlayStack();
+  const [open, setOpen] = useState(false);
+  const [children, setChildren] = useState(() => [pagedFolder(0)]);
+  const [nextCursor, setNextCursor] = useState<string | null>("ownership-page");
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+
+  control.applySharedUpdate = () => {
+    setChildren((current) => [...current, pagedFolder(500)]);
+    setNextCursor(null);
+  };
+
+  const library = {
+    expandedFolderIds: new Set<number>([1_000]),
+    folderChildNextCursorByParent: { 1_000: nextCursor },
+    folderChildrenByParent: { 1_000: children },
+    loadMoreFolderChildren: async () => {
+      const request = deferred<void>();
+      control.requests.push(request);
+      if (mode === "resolved-failure") {
+        try {
+          await request.promise;
+        } catch {
+          // Match production: report the failure and resolve with the cursor unchanged.
+        }
+        return;
+      }
+      await request.promise;
+      control.applySharedUpdate();
+    },
+    loadingMoreFolderIds: new Set<number>(),
+    roots: [{ displayName: "Ownership root", id: 1, rootFolderId: 1_000 }],
+    toggleFolderExpanded: () => undefined,
+  };
+
+  return (
+    <>
+      <button
+        onClick={(event) => {
+          restoreFocusRef.current = event.currentTarget;
+          overlays.openRoot("file-operation");
+          setOpen(true);
+        }}
+      >
+        Open {mode} move
+      </button>
+      <MoveDialogCompat
+        busy={false}
+        fileIds={[41]}
+        folderIds={[]}
+        library={library}
+        onCancel={() => setOpen(false)}
+        onSubmit={() => undefined}
+        open={open}
+        restoreFocusRef={restoreFocusRef}
+        serverError={null}
+        serverErrorCode={null}
+      />
+    </>
+  );
+}
+
+async function runOwnershipPaginationScenario(
+  mode: "pending-success" | "resolved-failure",
+) {
+  const control: OwnershipPaginationControl = {
+    applySharedUpdate: () => undefined,
+    requests: [],
+  };
+  const mounted = await mountScenario(
+    <OverlayProvider>
+      <OwnershipPaginationScenario control={control} mode={mode} />
+    </OverlayProvider>,
+  );
+  await requestNativeClick(await findButton("Open " + mode + " move"));
+  const dialog = await waitForDialog("move-dialog", "move-dialog-title");
+  await settle(40);
+  const tree = await findElement('[role="tree"]', dialog);
+  const existingItem = Array.from(
+    tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]'),
+  ).find((item) => item.textContent?.trim() === "Paged folder 1");
+  const loadMore = Array.from(
+    tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]'),
+  ).find((item) => item.textContent?.includes("Load more children"));
+  if (!existingItem || !loadMore) {
+    await unmountScenario(mounted);
+    return {
+      focusPreserved: false,
+      resolvedFailureVisible: false,
+      uniqueTabStop: false,
+    };
+  }
+
+  loadMore.focus();
+  await requestNativeKey("Enter");
+  await settle(20);
+  if (mode === "resolved-failure") {
+    control.requests[0]?.reject(new Error("Ownership page denied"));
+    await settle(50);
+  }
+  await requestNativeKey("Up");
+  const existingOwnedBeforeCompletion = document.activeElement === existingItem;
+  if (mode === "resolved-failure") {
+    await act(async () => control.applySharedUpdate());
+  } else {
+    control.requests[0]?.resolve();
+  }
+  await settle(50);
+
+  const tabStops = Array.from(
+    tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]'),
+  ).filter((item) => item.tabIndex === 0);
+  const result = {
+    focusPreserved:
+      existingOwnedBeforeCompletion &&
+      document.activeElement === existingItem &&
+      existingItem.tabIndex === 0,
+    resolvedFailureVisible:
+      mode === "resolved-failure" &&
+      dialog.querySelector<HTMLElement>('[role="alert"]')?.textContent?.includes(
+        "Could not load",
+      ) === true,
+    uniqueTabStop: tabStops.length === 1 && tabStops[0] === existingItem,
+  };
+  await unmountScenario(mounted);
+  return result;
+}
+
 async function runEmptyPaginationScenario() {
   const control: EmptyPaginationControl = { calls: 0, requests: [] };
   const mounted = await mountScenario(
@@ -1074,7 +1223,12 @@ async function runMovePaginationScenario() {
       finalPageFocusOwned: false,
       finalPageUniqueTabStop: false,
       loadedBeyondFirstPage: false,
+      pendingTreeFocusPreserved: false,
+      pendingTreeUniqueTabStop: false,
+      resolvedFailureVisible: false,
       selectedBeyondFirstPage: false,
+      staleFailureFocusPreserved: false,
+      staleFailureUniqueTabStop: false,
     };
     await unmountScenario(mounted);
     return result;
@@ -1130,7 +1284,18 @@ async function runMovePaginationScenario() {
     selectedBeyondFirstPage: control.selectedTarget === 2_500,
   };
   await unmountScenario(mounted);
-  return { ...result, ...await runEmptyPaginationScenario() };
+  const emptyPage = await runEmptyPaginationScenario();
+  const pendingTree = await runOwnershipPaginationScenario("pending-success");
+  const staleFailure = await runOwnershipPaginationScenario("resolved-failure");
+  return {
+    ...result,
+    ...emptyPage,
+    pendingTreeFocusPreserved: pendingTree.focusPreserved,
+    pendingTreeUniqueTabStop: pendingTree.uniqueTabStop,
+    resolvedFailureVisible: staleFailure.resolvedFailureVisible,
+    staleFailureFocusPreserved: staleFailure.focusPreserved,
+    staleFailureUniqueTabStop: staleFailure.uniqueTabStop,
+  };
 }
 
 async function runDeleteScenario() {
@@ -1439,7 +1604,12 @@ describe("mounted file-operation overlays", () => {
       finalPageFocusOwned: true,
       finalPageUniqueTabStop: true,
       loadedBeyondFirstPage: true,
+      pendingTreeFocusPreserved: true,
+      pendingTreeUniqueTabStop: true,
+      resolvedFailureVisible: true,
       selectedBeyondFirstPage: true,
+      staleFailureFocusPreserved: true,
+      staleFailureUniqueTabStop: true,
     });
   });
 
