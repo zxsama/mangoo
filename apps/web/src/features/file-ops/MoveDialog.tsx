@@ -41,6 +41,7 @@ interface MoveBranchSharedProps {
   library: LibraryState;
   loadingFolderIds: Set<number>;
   onFocusItem: (itemKey: string) => void;
+  onLoadMoreFocusOwnershipChange: (sourceItemKey: string, ownsFocus: boolean) => void;
   onLoadMore: (folderId: number, sourceItemKey: string) => void;
   onSelect: (folderId: number) => void;
   selectedTarget: number | null;
@@ -51,6 +52,7 @@ interface PageFocusHandoff {
   parentFolderId: number;
   previousChildIds: Set<number>;
   sourceItemKey: string;
+  sourceOwnsDomFocus: boolean;
 }
 
 interface MoveTreeRowProps {
@@ -230,16 +232,15 @@ export function MoveDialog({
     const activeTreeItem = document.activeElement instanceof HTMLElement
       ? document.activeElement.dataset.moveTreeItemKey
       : undefined;
-    if (focusedItemKey === sourceItemKey || activeTreeItem === sourceItemKey) {
-      pageFocusHandoffRef.current = {
-        owner,
-        parentFolderId: folderId,
-        previousChildIds: new Set(
-          (library.folderChildrenByParent[folderId] ?? []).map((child) => child.id)
-        ),
-        sourceItemKey,
-      };
-    }
+    pageFocusHandoffRef.current = {
+      owner,
+      parentFolderId: folderId,
+      previousChildIds: new Set(
+        (library.folderChildrenByParent[folderId] ?? []).map((child) => child.id)
+      ),
+      sourceItemKey,
+      sourceOwnsDomFocus: activeTreeItem === sourceItemKey,
+    };
     setLoadingFolderIds((current) => new Set(current).add(folderId));
     setPageError(null);
     try {
@@ -284,7 +285,6 @@ export function MoveDialog({
   let renderedFocusedItemKey = focusedItemKey;
   if (
     focusHandoff &&
-    focusedItemKey === focusHandoff.sourceItemKey &&
     library.folderChildNextCursorByParent?.[focusHandoff.parentFolderId] === null
   ) {
     const firstNewChild = (
@@ -302,10 +302,11 @@ export function MoveDialog({
     const target = Array.from(
       treeRef.current?.querySelectorAll<HTMLButtonElement>('[role="treeitem"]') ?? []
     ).find((item) => item.dataset.moveTreeItemKey === renderedFocusedItemKey);
+    const restoreDomFocus = focusHandoff.sourceOwnsDomFocus;
     pageFocusHandoffRef.current = null;
     setFocusedItemKey(renderedFocusedItemKey);
     setPageError(null);
-    target?.focus();
+    if (restoreDomFocus) target?.focus();
   }, [focusHandoff, focusedItemKey, renderedFocusedItemKey]);
 
   const branchProps: Omit<MoveBranchSharedProps, "library"> = {
@@ -313,6 +314,12 @@ export function MoveDialog({
     focusedItemKey: renderedFocusedItemKey,
     loadingFolderIds,
     onFocusItem: setFocusedItemKey,
+    onLoadMoreFocusOwnershipChange: (sourceItemKey, ownsFocus) => {
+      const current = pageFocusHandoffRef.current;
+      if (current?.sourceItemKey === sourceItemKey) {
+        current.sourceOwnsDomFocus = ownsFocus;
+      }
+    },
     onLoadMore: (folderId, sourceItemKey) => {
       void handleLoadMore(folderId, sourceItemKey);
     },
@@ -453,6 +460,7 @@ function RootBranch({
               folderId={folderId}
               loading={shared.loadingFolderIds.has(folderId)}
               onFocusItem={shared.onFocusItem}
+              onFocusOwnershipChange={shared.onLoadMoreFocusOwnershipChange}
               onLoadMore={shared.onLoadMore}
             />
           ) : null}
@@ -516,6 +524,7 @@ function FolderBranch({
               folderId={folder.id}
               loading={shared.loadingFolderIds.has(folder.id)}
               onFocusItem={shared.onFocusItem}
+              onFocusOwnershipChange={shared.onLoadMoreFocusOwnershipChange}
               onLoadMore={shared.onLoadMore}
             />
           ) : null}
@@ -591,6 +600,7 @@ function MoveLoadMoreItem({
   folderId,
   loading,
   onFocusItem,
+  onFocusOwnershipChange,
   onLoadMore,
 }: {
   depth: number;
@@ -598,6 +608,7 @@ function MoveLoadMoreItem({
   folderId: number;
   loading: boolean;
   onFocusItem: (itemKey: string) => void;
+  onFocusOwnershipChange: (sourceItemKey: string, ownsFocus: boolean) => void;
   onLoadMore: (folderId: number, sourceItemKey: string) => void;
 }) {
   const itemKey = loadMoreItemKey(folderId);
@@ -609,10 +620,14 @@ function MoveLoadMoreItem({
       aria-selected={false}
       className="move-row move-load-more"
       data-move-tree-item-key={itemKey}
+      onBlur={() => onFocusOwnershipChange(itemKey, false)}
       onClick={() => {
         if (!loading) onLoadMore(folderId, itemKey);
       }}
-      onFocus={() => onFocusItem(itemKey)}
+      onFocus={() => {
+        onFocusItem(itemKey);
+        onFocusOwnershipChange(itemKey, true);
+      }}
       onKeyDown={(event) => handleMoveTreeKey(event, {
         onActivate: loading ? undefined : () => onLoadMore(folderId, itemKey),
       })}

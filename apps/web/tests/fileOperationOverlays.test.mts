@@ -49,7 +49,9 @@ interface FileOperationOverlayResult {
   movePagination: {
     busyVisible: boolean;
     duplicateBlocked: boolean;
-    emptyPageFallbackOwned: boolean;
+    emptyPageActivePreserved: boolean;
+    emptyPageCancelFocusedWhilePending: boolean;
+    emptyPageFallbackTabStop: boolean;
     emptyPageUniqueTabStop: boolean;
     failureVisible: boolean;
     finalPageFocusOwned: boolean;
@@ -158,7 +160,9 @@ interface FixtureResult {
   movePagination?: {
     busyVisible: boolean;
     duplicateBlocked: boolean;
-    emptyPageFallbackOwned: boolean;
+    emptyPageActivePreserved: boolean;
+    emptyPageCancelFocusedWhilePending: boolean;
+    emptyPageFallbackTabStop: boolean;
     emptyPageUniqueTabStop: boolean;
     failureVisible: boolean;
     finalPageFocusOwned: boolean;
@@ -1013,18 +1017,29 @@ async function runEmptyPaginationScenario() {
   );
   if (!parent || !loadMore) {
     await unmountScenario(mounted);
-    return { emptyPageFallbackOwned: false, emptyPageUniqueTabStop: false };
+    return {
+      emptyPageActivePreserved: false,
+      emptyPageCancelFocusedWhilePending: false,
+      emptyPageFallbackTabStop: false,
+      emptyPageUniqueTabStop: false,
+    };
   }
 
   await requestNativeClick(loadMore);
   await settle(20);
+  const cancel = await findButton("Cancel", dialog);
+  await requestNativeKey("Tab");
+  const emptyPageCancelFocusedWhilePending = document.activeElement === cancel;
   control.requests[0]?.resolve();
   await settle(50);
   const tabStops = Array.from(
     tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]'),
   ).filter((item) => item.tabIndex === 0);
   const result = {
-    emptyPageFallbackOwned: document.activeElement === parent && parent.tabIndex === 0,
+    emptyPageActivePreserved:
+      emptyPageCancelFocusedWhilePending && document.activeElement === cancel,
+    emptyPageCancelFocusedWhilePending,
+    emptyPageFallbackTabStop: parent.tabIndex === 0,
     emptyPageUniqueTabStop: tabStops.length === 1 && tabStops[0] === parent,
   };
   await unmountScenario(mounted);
@@ -1051,7 +1066,9 @@ async function runMovePaginationScenario() {
     const result = {
       busyVisible: false,
       duplicateBlocked: false,
-      emptyPageFallbackOwned: false,
+      emptyPageActivePreserved: false,
+      emptyPageCancelFocusedWhilePending: false,
+      emptyPageFallbackTabStop: false,
       emptyPageUniqueTabStop: false,
       failureVisible: false,
       finalPageFocusOwned: false,
@@ -1414,7 +1431,9 @@ describe("mounted file-operation overlays", () => {
     assert.deepEqual(mountedResult.movePagination, {
       busyVisible: true,
       duplicateBlocked: true,
-      emptyPageFallbackOwned: true,
+      emptyPageActivePreserved: true,
+      emptyPageCancelFocusedWhilePending: true,
+      emptyPageFallbackTabStop: true,
       emptyPageUniqueTabStop: true,
       failureVisible: true,
       finalPageFocusOwned: true,
