@@ -10,7 +10,7 @@ export interface ActiveOperationPresentation {
 }
 
 export interface CompactNotificationPresentation {
-  failureSummary: string | null;
+  failureCue: string | null;
   health: "degraded" | "failure" | "healthy";
   healthLabel: string;
   idleLabel: string | null;
@@ -26,19 +26,15 @@ export function compactNotificationPresentation(
 
   if (model.degraded) {
     return {
-      failureSummary: null,
+      failureCue: null,
       health: "degraded",
       healthLabel: "同步受限",
       idleLabel: hasCurrentActivity ? null : "等待通知同步恢复"
     };
   }
 
-  const failureSummary = failureOnly
-    ? model.results.find((result) => result.status === "failed")?.summary?.trim() ||
-      "有后台活动失败，请打开完整通知中心查看。"
-    : null;
   return {
-    failureSummary,
+    failureCue: failureOnly ? "部分任务失败，请打开完整通知中心查看" : null,
     health: model.indicator === "failure" ? "failure" : "healthy",
     healthLabel: model.indicator === "failure" ? "需要关注" : "运行正常",
     idleLabel: hasCurrentActivity || failureOnly ? null : "当前没有后台活动"

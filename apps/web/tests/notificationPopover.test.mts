@@ -66,6 +66,10 @@ describe("notification popover content presentation", () => {
 
 describe("compact notification product contract", () => {
   const popoverSource = read("src/features/notifications/NotificationPopover.tsx");
+  const presentationSource = read(
+    "src/features/notifications/notificationPopoverPresentation.ts"
+  );
+  const compactProductionBoundary = `${popoverSource}\n${presentationSource}`;
   const appSource = read("src/app/App.tsx");
   const desktopVisualHarnessSource = read("../../.tmp/visual-check/desktop-ui-regression.mjs");
   const fixtureSource = read("tests/fixtures/notificationPopoverVisualFixture.tsx");
@@ -77,11 +81,16 @@ describe("compact notification product contract", () => {
     assert.match(popoverSource, /model\.active/);
     assert.match(popoverSource, /model\.thumbnail\.summaries/);
     assert.match(popoverSource, /model\.degraded/);
-    assert.match(popoverSource, /notification-failure-summary/);
+    assert.match(popoverSource, /notification-failure-cue/);
     assert.match(popoverSource, /onOpenCenter/);
-    assert.doesNotMatch(popoverSource, /model\.results/);
-    assert.doesNotMatch(popoverSource, /cancel\s*\(|retry\s*\(/);
-    assert.doesNotMatch(popoverSource, /notification-result-list|最近结果/);
+    assert.match(presentationSource, /部分任务失败，请打开完整通知中心查看/);
+    assert.doesNotMatch(compactProductionBoundary, /model\s*\.\s*results/);
+    assert.doesNotMatch(compactProductionBoundary, /\bresults\s*(?:\?|:|=)/);
+    assert.doesNotMatch(compactProductionBoundary, /cancel\s*\(|retry\s*\(/);
+    assert.doesNotMatch(
+      compactProductionBoundary,
+      /notification-result|terminal-result|ResultDescription|最近结果/
+    );
     assert.match(popoverSource, /AnchoredOverlay/);
   });
 
@@ -100,7 +109,7 @@ describe("compact notification product contract", () => {
     );
     assert.match(fixtureSource, /design\/overlays\/overlay\.css/);
     assert.match(fixtureSource, /Artists\\\\Portraits/);
-    assert.match(fixtureSource, /Artists 扫描失败，请检查文件夹访问权限/);
+    assert.match(fixtureSource, /indicator: "failure"/);
     assert.match(fixtureSource, /results: \[\]/);
   });
 
@@ -133,7 +142,7 @@ describe("compact notification product contract", () => {
       /querySelectorAll\("#notifications-root, #filter-root, #sort-root"\)/
     );
     assert.match(compactHarnessContract, /onlyCurrentProgress/);
-    assert.match(compactHarnessContract, /failureSummary/);
+    assert.match(compactHarnessContract, /failureCue/);
     assert.match(compactHarnessContract, /footerVisible/);
     assert.match(compactHarnessContract, /boundedWidth/);
     assert.match(
@@ -148,6 +157,27 @@ describe("compact notification product contract", () => {
       `${compactHarnessContract}\n${compactFixtureContract}`,
       /\bresultCount\b|\bresultLibraryLabels\b/
     );
+    assert.match(
+      compactFixtureContract,
+      /failureFixtureRoot\.notification\.failureCue !== "部分任务失败，请打开完整通知中心查看"/
+    );
+  });
+
+  it("runs Task5 notification assertions before entering preview coverage", () => {
+    const fixtureIndex = desktopVisualHarnessSource.indexOf(
+      "const notificationFixture = await notificationPopoverFixtureEvidence(client);"
+    );
+    const assertionIndex = desktopVisualHarnessSource.indexOf(
+      "assertCompactNotificationTask5Evidence(compactPopovers, notificationFixture);"
+    );
+    const previewIndex = desktopVisualHarnessSource.indexOf(
+      'await selectMediaByName(client, "portrait-sample");'
+    );
+
+    assert.ok(fixtureIndex >= 0);
+    assert.ok(assertionIndex > fixtureIndex);
+    assert.ok(previewIndex > assertionIndex);
+    assert.match(desktopVisualHarnessSource, /PASS: Task5 compact notification assertions/);
   });
 
   it("guards the visual harness semantics instead of accepting marker substrings", () => {
@@ -158,6 +188,12 @@ describe("compact notification product contract", () => {
     assert.match(validatorSource, /sharedOverlayRootQueryPattern/);
     assert.match(validatorSource, /retiredCompactPopoverRootContract/);
     assert.match(validatorSource, /retiredNotificationHarnessContract/);
+    assert.match(validatorSource, /notificationPopoverPresentationPath/);
+    assert.match(validatorSource, /compactNotificationProductionPaths/);
+    assert.match(validatorSource, /directCompactHelperPaths/);
+    assert.match(validatorSource, /compactResultsPropPattern/);
+    assert.match(validatorSource, /compactTerminalResultPattern/);
+    assert.match(validatorSource, /retiredFailureSummaryContract/);
     assert.match(validatorSource, /!root\.notification\.onlyCurrentProgress/);
     assert.match(validatorSource, /failureFixtureRoot/);
   });

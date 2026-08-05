@@ -154,11 +154,20 @@ const notificationPopoverPath =
 const notificationPopover = existsSync(path.join(root, notificationPopoverPath))
   ? read(notificationPopoverPath)
   : "";
-const notificationModel = read("apps/web/src/features/notifications/notificationModel.ts");
+const notificationPopoverPresentationPath =
+  "apps/web/src/features/notifications/notificationPopoverPresentation.ts";
+const notificationPopoverPresentation = existsSync(
+  path.join(root, notificationPopoverPresentationPath)
+)
+  ? read(notificationPopoverPresentationPath)
+  : "";
+const notificationModelPath = "apps/web/src/features/notifications/notificationModel.ts";
+const notificationModel = read(notificationModelPath);
 const notificationStatusView = read(
   "apps/web/src/features/notifications/NotificationStatusView.tsx"
 );
 const notificationModelTests = read("apps/web/tests/notificationModel.test.mts");
+const notificationPopoverTests = read("apps/web/tests/notificationPopover.test.mts");
 const processLogModel = read("apps/web/src/features/notifications/processLogModel.ts");
 const processLogView = read("apps/web/src/features/notifications/ProcessLogView.tsx");
 const notificationWindow = read("apps/web/src/features/notifications/NotificationWindow.tsx");
@@ -169,6 +178,48 @@ const notificationVisualFixture = existsSync(path.join(root, notificationVisualF
   ? read(notificationVisualFixturePath)
   : "";
 const desktopVisualHarness = read(".tmp/visual-check/desktop-ui-regression.mjs");
+
+const compactNotificationEntrySources = [
+  [notificationPopoverPath, notificationPopover],
+  [notificationPopoverPresentationPath, notificationPopoverPresentation]
+];
+const compactNotificationDirectory = path.posix.dirname(notificationPopoverPath);
+const compactNotificationDataBoundaryPaths = new Set([notificationModelPath]);
+const directCompactHelperPaths = compactNotificationEntrySources.flatMap(
+  ([sourcePath, source]) => {
+    const imports = [];
+    const runtimeRelativeImportPattern =
+      /(?:^|\n)\s*import\s+(?!type\b)[\s\S]*?\sfrom\s+["'](\.[^"']+)["'];/g;
+    for (const match of source.matchAll(runtimeRelativeImportPattern)) {
+      const importBase = path.posix.normalize(
+        path.posix.join(path.posix.dirname(sourcePath), match[1])
+      );
+      const resolved = [importBase, `${importBase}.ts`, `${importBase}.tsx`].find(
+        (candidate) => existsSync(path.join(root, candidate))
+      );
+      if (
+        resolved?.startsWith(`${compactNotificationDirectory}/`) &&
+        !compactNotificationDataBoundaryPaths.has(resolved)
+      ) {
+        imports.push(resolved);
+      }
+    }
+    return imports;
+  }
+);
+const compactNotificationProductionPaths = [
+  ...new Set([
+    notificationPopoverPath,
+    notificationPopoverPresentationPath,
+    ...directCompactHelperPaths
+  ])
+];
+const compactNotificationProductionSources = compactNotificationProductionPaths.map(
+  (compactPath) => [compactPath, read(compactPath)]
+);
+if (!directCompactHelperPaths.includes(notificationPopoverPresentationPath)) {
+  fail("compact notification direct-helper discovery must include its presentation module");
+}
 const secondaryWindowFrame = read("apps/web/src/app-shell/SecondaryWindowFrame.tsx");
 const secondaryWindowInterfaceStyle = read("apps/web/src/app-shell/useSecondaryWindowInterfaceStyle.ts");
 const settingsWindow = read("apps/web/src/features/settings/SettingsWindow.tsx");
@@ -355,7 +406,7 @@ for (const [label, block] of [
 }
 for (const evidence of [
   "onlyCurrentProgress",
-  "failureSummary",
+  "failureCue",
   "footerVisible",
   "boundedWidth"
 ]) {
@@ -363,9 +414,16 @@ for (const evidence of [
     fail(`notification visual harness compact evidence missing ${evidence}`);
   }
 }
+const genericFailureCue = "部分任务失败，请打开完整通知中心查看";
+const compactFailureCueAssertions = [
+  ...compactFixtureAssertionBlock.matchAll(
+    /failureFixtureRoot\.notification\.failureCue\s*!==\s*(["'])(.*?)\1/g
+  )
+].map((match) => match[2]);
 if (
   !compactFixtureAssertionBlock.includes("if (!root.notification.onlyCurrentProgress)") ||
-  !compactFixtureAssertionBlock.includes("failureFixtureRoot") ||
+  compactFailureCueAssertions.length !== 1 ||
+  compactFailureCueAssertions[0] !== genericFailureCue ||
   !/near\(root\.anchorGeometry\?\.gap,\s*6,\s*1\)/.test(compactFixtureAssertionBlock)
 ) {
   fail("notification visual harness must assert current progress and failure-only fixture state");
@@ -374,13 +432,25 @@ const retiredCompactPopoverRootContract = "data-compact-popover-root";
 if (desktopVisualHarness.includes(retiredCompactPopoverRootContract)) {
   fail(`notification visual harness retains retired contract ${retiredCompactPopoverRootContract}`);
 }
-for (const retiredNotificationHarnessContract of ["resultCount", "resultLibraryLabels"]) {
+const retiredFailureSummaryContract = "failureSummary";
+for (const retiredNotificationHarnessContract of [
+  "resultCount",
+  "resultLibraryLabels",
+  retiredFailureSummaryContract
+]) {
   if (
     compactPopoverHarnessBlock.includes(retiredNotificationHarnessContract) ||
     compactFixtureAssertionBlock.includes(retiredNotificationHarnessContract)
   ) {
     fail(`notification visual harness retains retired compact assertion ${retiredNotificationHarnessContract}`);
   }
+}
+const compactNotificationTestSources = [notificationModelTests, notificationPopoverTests];
+if (
+  !compactNotificationTestSources.every((source) => source.includes(genericFailureCue)) ||
+  compactNotificationTestSources.some((source) => source.includes(retiredFailureSummaryContract))
+) {
+  fail("compact notification tests must assert only the generic failure cue contract");
 }
 for (const [label, source, values] of [
   [
@@ -442,12 +512,26 @@ for (const value of [
   "ResizeObserver",
   "MutationObserver",
   "createPortal",
-  "model.results",
   "resolveNotificationPopoverPosition",
   "observeNotificationPopoverMeasurements"
 ]) {
   if (notificationPopover.includes(value)) {
     fail(`notification popover must delegate shared overlay behavior instead of retaining ${value}`);
+  }
+}
+const compactModelResultsPattern = /\bmodel\s*\.\s*results\b/;
+const compactResultsPropPattern = /\bresults\s*(?:\?|:|=)/;
+const compactTerminalResultPattern =
+  /notification-result|terminal-result|ResultDescription|resultOperationPresentation|\bterminalResults?\b/i;
+for (const [compactPath, compactSource] of compactNotificationProductionSources) {
+  for (const [label, pattern] of [
+    ["model.results", compactModelResultsPattern],
+    ["a results prop", compactResultsPropPattern],
+    ["a terminal-result row contract", compactTerminalResultPattern]
+  ]) {
+    if (pattern.test(compactSource)) {
+      fail(`compact notification production boundary must not contain ${label}: ${compactPath}`);
+    }
   }
 }
 if (/\.notification-popover\s*\{[^}]*\bright\s*:/s.test(read("apps/web/src/styles.css"))) {
@@ -2177,12 +2261,16 @@ for (const value of [
   "notification-thumbnail-summary",
   "notification-thumbnail-summary-list",
   "data-notification-thumbnail-library-count",
+  "notification-failure-cue",
   "notification-popover-empty",
   "notification-open-center"
 ]) {
   if (!notificationPopover.includes(value)) {
     fail(`compact notification popover contract missing ${value}`);
   }
+}
+if (!notificationPopoverPresentation.includes(genericFailureCue)) {
+  fail("compact notification presentation must expose the generic failure cue");
 }
 const popoverOrder = [
   "notification-active-list",
@@ -2192,8 +2280,10 @@ const popoverOrder = [
 if (popoverOrder.some((index) => index < 0) || popoverOrder.some((index, i) => i > 0 && index <= popoverOrder[i - 1])) {
   fail("compact notification popover must render active, thumbnail, then full-center action");
 }
-if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopover)) {
-  fail("compact notification popover must stay read-only without cancel/retry actions");
+for (const [compactPath, compactSource] of compactNotificationProductionSources) {
+  if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(compactSource)) {
+    fail(`compact notification production boundary must stay read-only: ${compactPath}`);
+  }
 }
 for (const value of ["useOverlayStack", "OverlayRootId", "setRootOpen"]) {
   if (!app.includes(value)) {

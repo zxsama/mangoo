@@ -934,7 +934,7 @@ describe("notification selectors", () => {
     assert.equal(resolved.indicator, "idle");
   });
 
-  it("presents a failure-only compact model with its summary instead of healthy idle", () => {
+  it("presents a failure-only compact model with a generic cue instead of terminal detail", () => {
     const model = buildCompactNotificationModel(
       compact({
         hasRetryableFailure: true,
@@ -942,7 +942,7 @@ describe("notification selectors", () => {
           terminal("failed-scan", 400, {
             status: "failed",
             phase: "扫描失败",
-            summary: "Artists 扫描失败，请检查文件夹访问权限",
+            summary: "terminal detail",
             retryable: true
           })
         ]
@@ -955,12 +955,14 @@ describe("notification selectors", () => {
     ).compactNotificationPresentation;
 
     assert.equal(typeof present, "function");
-    assert.deepEqual(present?.(model), {
-      failureSummary: "Artists 扫描失败，请检查文件夹访问权限",
+    const presentation = present?.(model);
+    assert.deepEqual(presentation, {
+      failureCue: "部分任务失败，请打开完整通知中心查看",
       health: "failure",
       healthLabel: "需要关注",
       idleLabel: null
     });
+    assert.doesNotMatch(JSON.stringify(presentation), /terminal detail/);
   });
 
   it("preserves healthy idle, degraded idle, and active compact presentation", () => {
@@ -984,19 +986,19 @@ describe("notification selectors", () => {
 
     assert.equal(typeof present, "function");
     assert.deepEqual(present?.(healthy), {
-      failureSummary: null,
+      failureCue: null,
       health: "healthy",
       healthLabel: "运行正常",
       idleLabel: "当前没有后台活动"
     });
     assert.deepEqual(present?.(degraded), {
-      failureSummary: null,
+      failureCue: null,
       health: "degraded",
       healthLabel: "同步受限",
       idleLabel: "等待通知同步恢复"
     });
     assert.deepEqual(present?.(active), {
-      failureSummary: null,
+      failureCue: null,
       health: "healthy",
       healthLabel: "运行正常",
       idleLabel: null

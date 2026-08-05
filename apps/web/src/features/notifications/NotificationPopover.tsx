@@ -42,9 +42,9 @@ export function NotificationPopover({
         </p>
       ) : null}
 
-      {presentation.failureSummary ? (
-        <p className="notification-failure-summary">
-          {presentation.failureSummary}
+      {presentation.failureCue ? (
+        <p className="notification-failure-cue">
+          {presentation.failureCue}
         </p>
       ) : null}
 

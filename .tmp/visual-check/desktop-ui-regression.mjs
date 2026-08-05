@@ -9,14 +9,14 @@ import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-bro
 
 const root = path.resolve(process.cwd());
 const visualRoot = path.join(root, ".tmp", "visual-check");
+const visualRunId = `megle-visual-${Date.now().toString(36)}-${process.pid}`;
 const mediaDir = path.join(visualRoot, "media");
 const screenshotDir = path.join(visualRoot, "screenshots");
 const logDir = path.join(visualRoot, "logs");
-const dataDir = path.join(visualRoot, "data-desktop-ui");
+const dataDir = path.join(visualRoot, `data-desktop-ui-${visualRunId}`);
 const electronUserDataDir = path.join(dataDir, "electron-user-data");
 const webUrl = "http://127.0.0.1:5179";
 const debugPort = Number(process.env.MEGLE_VISUAL_DEBUG_PORT ?? process.env.MEGLE_REMOTE_DEBUG_PORT ?? 13242);
-const visualRunId = `megle-visual-${Date.now().toString(36)}-${process.pid}`;
 const runStartedAt = new Date();
 const osBackdropEvidenceEnabled = process.env.MEGLE_VISUAL_OS_BACKDROP === "1";
 const osBackdropEvidenceMode = osBackdropEvidenceEnabled
@@ -46,7 +46,6 @@ const desktopMainSource = await readFile(
   "utf8"
 );
 
-await rm(dataDir, { recursive: true, force: true });
 await mkdir(screenshotDir, { recursive: true });
 await mkdir(logDir, { recursive: true });
 await mkdir(dataDir, { recursive: true });
@@ -586,6 +585,8 @@ public class MegleBackdropCapture {
   [DllImport("user32.dll")]
   public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")]
+  public static extern bool IsWindow(IntPtr hWnd);
+  [DllImport("user32.dll")]
   public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")]
   public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -622,20 +623,34 @@ $notTopMost = [IntPtr]::new(-2)
 $swpNoMove = 0x0002
 $swpNoSize = 0x0001
 $swpShowWindow = 0x0040
-[MegleBackdropCapture]::ShowWindow($window.MainWindowHandle, 9) | Out-Null
-[MegleBackdropCapture]::SetForegroundWindow($window.MainWindowHandle) | Out-Null
-[MegleBackdropCapture]::SetWindowPos($window.MainWindowHandle, $topMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
-Start-Sleep -Milliseconds 220
 $rect = New-Object MegleBackdropCapture+RECT
-if (-not [MegleBackdropCapture]::GetWindowRect($window.MainWindowHandle, [ref] $rect)) {
-  throw 'GetWindowRect failed before backdrop capture'
+$handle = [IntPtr]::Zero
+$rectReady = $false
+for ($attempt = 0; $attempt -lt 20; $attempt++) {
+  $window.Refresh()
+  $candidate = $window.MainWindowHandle
+  if ($candidate -ne 0 -and [MegleBackdropCapture]::IsWindow($candidate)) {
+    $handle = $candidate
+    [MegleBackdropCapture]::ShowWindow($handle, 9) | Out-Null
+    [MegleBackdropCapture]::SetForegroundWindow($handle) | Out-Null
+    [MegleBackdropCapture]::SetWindowPos($handle, $topMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
+    Start-Sleep -Milliseconds 120
+    if ([MegleBackdropCapture]::GetWindowRect($handle, [ref] $rect)) {
+      $rectReady = $true
+      break
+    }
+  }
+  Start-Sleep -Milliseconds 100
+}
+if (-not $rectReady) {
+  throw "GetWindowRect failed before backdrop capture: handle=$($handle.ToInt64()) isWindow=$([MegleBackdropCapture]::IsWindow($handle))"
 }
 $windowWidth = [Math]::Max(1, $rect.Right - $rect.Left)
 $windowHeight = [Math]::Max(1, $rect.Bottom - $rect.Top)
 if ($rect.Left -lt ($margin + 12) -or $rect.Top -lt ($margin + 12)) {
-  [MegleBackdropCapture]::MoveWindow($window.MainWindowHandle, 72, 72, $windowWidth, $windowHeight, $true) | Out-Null
+  [MegleBackdropCapture]::MoveWindow($handle, 72, 72, $windowWidth, $windowHeight, $true) | Out-Null
   Start-Sleep -Milliseconds 260
-  if (-not [MegleBackdropCapture]::GetWindowRect($window.MainWindowHandle, [ref] $rect)) {
+  if (-not [MegleBackdropCapture]::GetWindowRect($handle, [ref] $rect)) {
     throw 'GetWindowRect failed after moving window for backdrop capture'
   }
   $windowWidth = [Math]::Max(1, $rect.Right - $rect.Left)
@@ -647,7 +662,7 @@ $leftMargin = $rect.Left - $captureX
 $topMargin = $rect.Top - $captureY
 $captureWidth = $windowWidth + $leftMargin + $margin
 $captureHeight = $windowHeight + $topMargin + $margin
-[MegleBackdropCapture]::SetWindowPos($window.MainWindowHandle, $topMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
+[MegleBackdropCapture]::SetWindowPos($handle, $topMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
 Start-Sleep -Milliseconds 260
 $bitmap = New-Object System.Drawing.Bitmap $captureWidth, $captureHeight
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -729,7 +744,7 @@ try {
       id = $window.Id
       name = $window.ProcessName
       title = $window.MainWindowTitle
-      handle = $window.MainWindowHandle.ToInt64()
+      handle = $handle.ToInt64()
       commandLine = $processInfo.CommandLine
     }
     margin = $margin
@@ -751,7 +766,9 @@ try {
     uiSurfaceDelta = MaxDelta $uiSamples
   } | ConvertTo-Json -Depth 8 -Compress
 } finally {
-  [MegleBackdropCapture]::SetWindowPos($window.MainWindowHandle, $notTopMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
+  if ($handle -ne [IntPtr]::Zero -and [MegleBackdropCapture]::IsWindow($handle)) {
+    [MegleBackdropCapture]::SetWindowPos($handle, $notTopMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
+  }
   if ($graphics) { $graphics.Dispose() }
   if ($bitmap) { $bitmap.Dispose() }
 }
@@ -2764,14 +2781,14 @@ function compactPopoverEvidenceExpression() {
       const thumbnailList = element.querySelector("[data-notification-thumbnail-library-count]");
       const body = element.querySelector(".notification-popover-body");
       const footer = element.querySelector(".notification-popover-footer");
-      const failure = element.querySelector(".notification-failure-summary");
+      const failure = element.querySelector(".notification-failure-cue");
       const empty = element.querySelector(".notification-popover-empty");
       const health = element.querySelector("[data-notification-health]");
       const sectionCount = element.querySelectorAll(".notification-section").length;
       const expectedSectionCount = Number(activeRows.length > 0) + Number(thumbnailRows.length > 0);
       const unexpectedBodyChildren = body
         ? [...body.children].filter((child) => !child.matches(
-            ".notification-health-detail, .notification-failure-summary, .notification-section, .notification-popover-empty"
+            ".notification-health-detail, .notification-failure-cue, .notification-section, .notification-popover-empty"
           )).length
         : 0;
       const bodyStyle = body ? getComputedStyle(body) : null;
@@ -2831,7 +2848,7 @@ function compactPopoverEvidenceExpression() {
               contentOrder: contentSections.map(([name, node]) => ({ name, top: node.getBoundingClientRect().top })),
               onlyCurrentProgress: sectionCount === expectedSectionCount && unexpectedBodyChildren === 0,
               failure: Boolean(failure),
-              failureSummary: failure?.textContent?.trim() ?? "",
+              failureCue: failure?.textContent?.trim() ?? "",
               health: health?.getAttribute("data-notification-health") ?? null,
               healthLabel: health?.textContent?.trim() ?? "",
               degraded: health?.getAttribute("data-notification-health") === "degraded",
@@ -3069,6 +3086,81 @@ function serializeError(error) {
   };
 }
 
+function assertCompactNotificationTask5Evidence(compactPopovers, fixture) {
+  const failures = [];
+  const stepByAction = new Map(
+    (compactPopovers?.steps ?? []).map((step) => [step.action, step])
+  );
+  const notificationRoot = (evidence) =>
+    evidence?.roots?.find((root) => root.name === "notifications") ?? null;
+  const openRoot = notificationRoot(stepByAction.get("open-notifications")?.evidence);
+
+  if (
+    !openRoot?.notification?.onlyCurrentProgress ||
+    openRoot.notification.actionCount !== 0 ||
+    openRoot.notification.fullCenterCount !== 1 ||
+    !openRoot.notification.bodyScrollable ||
+    !openRoot.notification.footerVisible ||
+    !openRoot.notification.boundedWidth
+  ) {
+    failures.push("production compact notification progress/layout contract failed");
+  }
+
+  for (const action of [
+    "open-full-center-closes-notifications",
+    "escape-closes-sort",
+    "workspace-click-closes-notifications",
+    "window-blur-closes-notifications"
+  ]) {
+    const step = stepByAction.get(action);
+    if (!step || step.expected !== null || step.evidence?.count !== 0) {
+      failures.push(`compact notification dismissal contract failed after ${action}`);
+    }
+  }
+
+  const fixtureRoot = (evidence) => notificationRoot(evidence);
+  const fullFixtureRoot = fixtureRoot(fixture?.full);
+  const failureFixtureRoot = fixtureRoot(fixture?.failure);
+  const emptyFixtureRoot = fixtureRoot(fixture?.empty);
+  if (
+    !fullFixtureRoot?.notification?.onlyCurrentProgress ||
+    fullFixtureRoot.notification.actionCount !== 0 ||
+    fullFixtureRoot.notification.fullCenterCount !== 1 ||
+    !fullFixtureRoot.notification.bodyScrollable ||
+    !fullFixtureRoot.notification.footerVisible ||
+    !fullFixtureRoot.notification.boundedWidth
+  ) {
+    failures.push("full compact notification fixture layout contract failed");
+  }
+  if (
+    !failureFixtureRoot?.notification?.failure ||
+    failureFixtureRoot.notification.failureCue !== "部分任务失败，请打开完整通知中心查看" ||
+    failureFixtureRoot.notification.health !== "failure" ||
+    failureFixtureRoot.notification.empty ||
+    failureFixtureRoot.notification.activeCount !== 0 ||
+    failureFixtureRoot.notification.thumbnailCount !== 0 ||
+    !failureFixtureRoot.notification.onlyCurrentProgress ||
+    failureFixtureRoot.notification.fullCenterCount !== 1
+  ) {
+    failures.push("failure-only compact notification fixture contract failed");
+  }
+  if (
+    !emptyFixtureRoot?.notification?.empty ||
+    emptyFixtureRoot.notification.failure ||
+    emptyFixtureRoot.notification.health !== "healthy" ||
+    emptyFixtureRoot.notification.activeCount !== 0 ||
+    emptyFixtureRoot.notification.thumbnailCount !== 0 ||
+    emptyFixtureRoot.notification.fullCenterCount !== 1
+  ) {
+    failures.push("empty compact notification fixture contract failed");
+  }
+
+  if (failures.length > 0) {
+    throw new Error(`Task5 compact notification assertions failed: ${failures.join("; ")}`);
+  }
+  console.log("PASS: Task5 compact notification assertions");
+}
+
 startDevApp();
 let client;
 let summary = null;
@@ -3171,6 +3263,8 @@ try {
     notificationButtonStyleEvidenceExpression()
   );
   const compactPopovers = await compactPopoverDismissalEvidence(client);
+  const notificationFixture = await notificationPopoverFixtureEvidence(client);
+  assertCompactNotificationTask5Evidence(compactPopovers, notificationFixture);
 
   await selectMediaByName(client, "portrait-sample");
   await waitFor(
@@ -3240,7 +3334,6 @@ try {
   const pointTileThumb = await moveToSelector(client, ".tile-thumb", 0.35, 0.72);
   const pointerTileThumb = await evaluate(client, pointerEvidenceExpression());
   const localEdgeHighlight = await screenshot(client, "ui-local-edge-highlight.png");
-  const notificationFixture = await notificationPopoverFixtureEvidence(client);
   const notificationWindowFixture = await notificationWindowFixtureEvidence(client);
 
   summary = {
@@ -3861,7 +3954,7 @@ try {
   }
   if (
     !failureFixtureRoot?.notification?.failure ||
-    failureFixtureRoot.notification.failureSummary !== "Artists 扫描失败，请检查文件夹访问权限" ||
+    failureFixtureRoot.notification.failureCue !== "部分任务失败，请打开完整通知中心查看" ||
     failureFixtureRoot.notification.health !== "failure" ||
     failureFixtureRoot.notification.healthLabel !== "需要关注" ||
     failureFixtureRoot.notification.empty ||

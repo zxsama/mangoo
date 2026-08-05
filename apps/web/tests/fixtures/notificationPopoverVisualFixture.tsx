@@ -261,7 +261,7 @@ function modelFor(state: FixtureState): CompactNotificationModel {
       operation("扫描 Artists", {
         status: "failed",
         phase: "扫描失败",
-        summary: "Artists 扫描失败，请检查文件夹访问权限",
+        summary: "fixture terminal detail must not render",
         cancellable: false,
         retryable: true,
         completedAt: Date.now()
