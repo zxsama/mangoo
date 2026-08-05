@@ -1010,11 +1010,11 @@ async function titlebarDragEvidence(client) {
 }
 
 async function searchNoDragEvidence(client) {
-  await clickSelector(client, ".shell-titlebar-center .search-bar-input");
+  await clickSelector(client, ".shell-titlebar-center .search-bar .overlay-field-input");
   return evaluate(
     client,
     `(() => {
-      const input = document.querySelector(".shell-titlebar-center .search-bar-input");
+      const input = document.querySelector(".shell-titlebar-center .search-bar .overlay-field-input");
       const style = input ? getComputedStyle(input) : null;
       return {
         searchInputPresent: Boolean(input),
@@ -1047,9 +1047,10 @@ async function waitForCompactPopoverState(client, expected, timeoutMs = 5000) {
   return waitFor(
     client,
     `(() => {
-      const roots = [...document.querySelectorAll("[data-compact-popover-root]")];
+      const roots = [...document.querySelectorAll("#notifications-root, #filter-root, #sort-root")];
       if (${expectedValue} === null) return roots.length === 0;
-      return roots.length === 1 && roots[0].getAttribute("data-compact-popover-root") === ${expectedValue};
+      const rootName = roots[0]?.id.replace(/-root$/, "");
+      return roots.length === 1 && rootName === ${expectedValue};
     })()`,
     timeoutMs,
     expected === null ? "compact popovers closed" : `${expected} compact popover`
@@ -1059,12 +1060,12 @@ async function waitForCompactPopoverState(client, expected, timeoutMs = 5000) {
 function notificationAnchorGeometryExpression() {
   return `(() => {
     const button = document.querySelector('[data-titlebar-control="notifications"]');
-    const popover = document.querySelector('[data-compact-popover-root="notifications"]');
+    const popover = document.querySelector('#notifications-root');
     if (!button || !popover || getComputedStyle(popover).visibility !== "visible") return false;
     const buttonRect = button.getBoundingClientRect();
     const popoverRect = popover.getBoundingClientRect();
     return Math.abs(popoverRect.right - buttonRect.right) <= 1 &&
-      Math.abs(popoverRect.top - buttonRect.bottom - 4) <= 1 &&
+      Math.abs(popoverRect.top - buttonRect.bottom - 6) <= 1 &&
       popoverRect.left >= 0 &&
       popoverRect.top >= 0 &&
       popoverRect.right <= window.innerWidth &&
@@ -1114,7 +1115,10 @@ async function compactPopoverDismissalEvidence(client) {
   await waitForCompactPopoverState(client, null).catch(() => undefined);
 
   for (const name of ["notifications", "filter", "sort"]) {
-    await clickSelector(client, `[data-compact-popover-trigger="${name}"]`);
+    const triggerSelector = name === "notifications"
+      ? `[data-compact-popover-trigger="notifications"]`
+      : `[data-titlebar-control="library-${name}"]`;
+    await clickSelector(client, triggerSelector);
     await waitForCompactPopoverState(client, name);
     const screenshotPath =
       name === "notifications"
@@ -1249,7 +1253,7 @@ async function notificationPopoverFixtureEvidence(client) {
     });
     await waitFor(
       fixtureClient,
-      `Boolean(document.querySelector('[data-notification-fixture="${state}"]') && document.querySelector('[data-compact-popover-root="notifications"]'))`,
+      `Boolean(document.querySelector('[data-notification-fixture="${state}"]') && document.querySelector('#notifications-root'))`,
       10000,
       `notification ${state} visual fixture`
     );
@@ -1401,6 +1405,11 @@ async function notificationPopoverFixtureEvidence(client) {
       fixtureClient,
       "notification anchor after zoom reset"
     );
+    const failure = await navigate("failure");
+    const failureScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-compact-fixture-failure.png"
+    );
     const empty = await navigate("empty");
     const emptyScreenshot = await rendererScreenshot(
       fixtureClient,
@@ -1418,6 +1427,7 @@ async function notificationPopoverFixtureEvidence(client) {
       zoomed,
       relocated,
       remounted,
+      failure,
       empty,
       degraded,
       resize,
@@ -1430,6 +1440,7 @@ async function notificationPopoverFixtureEvidence(client) {
       screenshots: {
         fullRenderer: fullRendererScreenshot,
         narrowRenderer: narrowRendererScreenshot,
+        failure: failureScreenshot,
         empty: emptyScreenshot,
         degraded: degradedScreenshot
       },
@@ -2579,7 +2590,7 @@ function glassMaterialEvidenceExpression() {
         titlebarRight: surface(".workbench-column-right"),
         sidebar: surface(".workbench-column-left"),
         inspector: surface(".workbench-column-right"),
-        popover: surface("[data-compact-popover-root]")
+        popover: surface("#notifications-root, #filter-root, #sort-root")
       }
     };
   })()`;
@@ -2638,7 +2649,7 @@ function titlebarControlsEvidenceExpression() {
       };
     });
     const search = document.querySelector(".shell-titlebar-center .search-bar");
-    const searchInput = document.querySelector(".shell-titlebar-center .search-bar-input");
+    const searchInput = document.querySelector(".shell-titlebar-center .search-bar .overlay-field-input");
     const searchRect = search?.getBoundingClientRect() ?? null;
     return {
       titlebarRect: titlebarRect ? serializeRect(titlebarRect) : null,
@@ -2742,22 +2753,38 @@ function compactPopoverEvidenceExpression() {
     const legacyButtons = [...document.querySelectorAll('[data-titlebar-control="tasks-palette"], [data-titlebar-control="recent-operations"]')];
     const notificationButton = notificationButtons[0] ?? null;
     const anchorRect = notificationButton?.getBoundingClientRect() ?? null;
-    const roots = [...document.querySelectorAll("[data-compact-popover-root]")].map((element) => {
+    const roots = [...document.querySelectorAll("#notifications-root, #filter-root, #sort-root")].map((element) => {
       const style = getComputedStyle(element);
       const backdrop = element.querySelector(".liquid-glass-backdrop");
       const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
       const rect = element.getBoundingClientRect();
+      const rootName = element.id.replace(/-root$/, "");
       const activeRows = [...element.querySelectorAll("[data-notification-active-operation]")];
       const thumbnailRows = [...element.querySelectorAll("[data-notification-thumbnail-library]")];
       const thumbnailList = element.querySelector("[data-notification-thumbnail-library-count]");
+      const body = element.querySelector(".notification-popover-body");
+      const footer = element.querySelector(".notification-popover-footer");
+      const failure = element.querySelector(".notification-failure-summary");
+      const empty = element.querySelector(".notification-popover-empty");
+      const health = element.querySelector("[data-notification-health]");
+      const sectionCount = element.querySelectorAll(".notification-section").length;
+      const expectedSectionCount = Number(activeRows.length > 0) + Number(thumbnailRows.length > 0);
+      const unexpectedBodyChildren = body
+        ? [...body.children].filter((child) => !child.matches(
+            ".notification-health-detail, .notification-failure-summary, .notification-section, .notification-popover-empty"
+          )).length
+        : 0;
+      const bodyStyle = body ? getComputedStyle(body) : null;
+      const footerRect = footer?.getBoundingClientRect() ?? null;
       const contentSections = [
         ["active", element.querySelector(".notification-active-list")],
         ["thumbnail", thumbnailList],
-        ["results", element.querySelector(".notification-result-list")],
+        ["failure", failure],
+        ["empty", empty],
         ["center", element.querySelector(".notification-open-center")]
       ].filter(([, node]) => Boolean(node));
       return {
-        name: element.getAttribute("data-compact-popover-root"),
+        name: rootName,
         className: element.className?.toString?.() ?? null,
         floating: element.classList.contains("floating-popover"),
         backgroundColor: style.backgroundColor,
@@ -2779,7 +2806,7 @@ function compactPopoverEvidenceExpression() {
               viewportContained: rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight
             }
           : null,
-        notification: element.getAttribute("data-compact-popover-root") === "notifications"
+        notification: rootName === "notifications"
           ? {
               activeCount: activeRows.length,
               activeProgressCount: activeRows.filter((row) => row.querySelector(".notification-progress-track")).length,
@@ -2799,13 +2826,24 @@ function compactPopoverEvidenceExpression() {
                 cachedTotal: row.querySelector(".notification-thumbnail-cached-total")?.textContent?.trim() ?? "",
                 status: row.querySelector(".notification-thumbnail-status")?.textContent?.trim() ?? ""
               })),
-              resultCount: element.querySelectorAll("[data-notification-result]").length,
-              resultLibraryLabels: [...element.querySelectorAll(".notification-result-library")].map((item) => item.textContent?.trim() ?? ""),
               actionCount: element.querySelectorAll("[data-notification-action], .task-action, [data-action='cancel'], [data-action='retry']").length,
               fullCenterCount: element.querySelectorAll(".notification-open-center").length,
               contentOrder: contentSections.map(([name, node]) => ({ name, top: node.getBoundingClientRect().top })),
-              degraded: Boolean(element.querySelector(".notification-popover-degraded")),
-              empty: Boolean(element.querySelector(".notification-popover-empty"))
+              onlyCurrentProgress: sectionCount === expectedSectionCount && unexpectedBodyChildren === 0,
+              failure: Boolean(failure),
+              failureSummary: failure?.textContent?.trim() ?? "",
+              health: health?.getAttribute("data-notification-health") ?? null,
+              healthLabel: health?.textContent?.trim() ?? "",
+              degraded: health?.getAttribute("data-notification-health") === "degraded",
+              empty: Boolean(empty),
+              bodyScrollable: bodyStyle?.overflowY === "auto" || bodyStyle?.overflowY === "scroll",
+              footerVisible: Boolean(
+                footerRect &&
+                footerRect.top >= rect.top &&
+                footerRect.bottom <= rect.bottom &&
+                footerRect.bottom <= window.innerHeight
+              ),
+              boundedWidth: rect.width <= 361 && rect.width <= window.innerWidth
             }
           : null
       };
@@ -3692,14 +3730,21 @@ try {
         if (root.notification.thumbnailCount > root.notification.thumbnailLibraryCount) {
           hardFailures.push("notification compact rendered more thumbnail aggregates than available libraries");
         }
-        if (root.notification.resultCount > 3) {
-          hardFailures.push("notification compact rendered more than three important results");
+        if (!root.notification.onlyCurrentProgress) {
+          hardFailures.push("notification compact rendered content outside current progress or status");
         }
         if (root.notification.actionCount !== 0) {
           hardFailures.push("notification compact exposed cancel/retry actions");
         }
         if (root.notification.fullCenterCount !== 1) {
           hardFailures.push("notification compact is missing the full-center action");
+        }
+        if (
+          !root.notification.bodyScrollable ||
+          !root.notification.footerVisible ||
+          !root.notification.boundedWidth
+        ) {
+          hardFailures.push("notification compact body, footer, or bounded-width layout is invalid");
         }
         const tops = root.notification.contentOrder.map((item) => item.top);
         if (tops.some((top, index) => index > 0 && top < tops[index - 1])) {
@@ -3714,7 +3759,7 @@ try {
           hardFailures.push("notification compact popover overflows the visual harness viewport");
         }
         if (
-          !near(root.anchorGeometry?.gap, 4, 1) ||
+          !near(root.anchorGeometry?.gap, 6, 1) ||
           !root.anchorGeometry?.viewportContained ||
           (!root.anchorGeometry?.clampedLeft && !near(root.anchorGeometry?.rightDelta, 0, 1))
         ) {
@@ -3740,12 +3785,13 @@ try {
   const zoomedFixtureRoot = fixtureRoot(fixture?.zoomed);
   const relocatedFixtureRoot = fixtureRoot(fixture?.relocated);
   const remountedFixtureRoot = fixtureRoot(fixture?.remounted);
+  const failureFixtureRoot = fixtureRoot(fixture?.failure);
   const emptyFixtureRoot = fixtureRoot(fixture?.empty);
   const degradedFixtureRoot = fixtureRoot(fixture?.degraded);
   const validFixtureAnchor = (root) =>
     Boolean(
       root?.anchorGeometry?.viewportContained &&
-        near(root.anchorGeometry.gap, 4, 1) &&
+        near(root.anchorGeometry.gap, 6, 1) &&
         (root.anchorGeometry.clampedLeft || near(root.anchorGeometry.rightDelta, 0, 1))
     );
   if (
@@ -3777,9 +3823,12 @@ try {
     !fullFixtureRoot.notification?.thumbnailSummaries?.[1]?.status.includes("18 待处理") ||
     !fullFixtureRoot.notification?.thumbnailSummaries?.[1]?.status.includes("9 失败") ||
     !fullFixtureRoot.notification?.thumbnailSummaries?.[1]?.status.includes("48 过期") ||
-    fullFixtureRoot.notification?.resultCount !== 3 ||
-    fullFixtureRoot.notification?.resultLibraryLabels?.length !== 3 ||
-    fullFixtureRoot.notification?.resultLibraryLabels?.some((label) => !label) ||
+    !fullFixtureRoot.notification?.onlyCurrentProgress ||
+    fullFixtureRoot.notification?.failure ||
+    fullFixtureRoot.notification?.health !== "failure" ||
+    !fullFixtureRoot.notification?.bodyScrollable ||
+    !fullFixtureRoot.notification?.footerVisible ||
+    !fullFixtureRoot.notification?.boundedWidth ||
     fullFixtureRoot.notification?.actionCount !== 0 ||
     fullFixtureRoot.notification?.fullCenterCount !== 1
   ) {
@@ -3789,7 +3838,7 @@ try {
     !narrowFixtureRoot ||
     fixture?.narrow?.viewport?.width > 820 ||
     !narrowFixtureRoot.anchorGeometry?.viewportContained ||
-    !near(narrowFixtureRoot.anchorGeometry?.gap, 4, 1) ||
+    !near(narrowFixtureRoot.anchorGeometry?.gap, 6, 1) ||
     (!narrowFixtureRoot.anchorGeometry?.clampedLeft &&
       !near(narrowFixtureRoot.anchorGeometry?.rightDelta, 0, 1))
   ) {
@@ -3811,15 +3860,35 @@ try {
     hardFailures.push("notification pointer or detached-node churn triggered redundant measurements");
   }
   if (
+    !failureFixtureRoot?.notification?.failure ||
+    failureFixtureRoot.notification.failureSummary !== "Artists 扫描失败，请检查文件夹访问权限" ||
+    failureFixtureRoot.notification.health !== "failure" ||
+    failureFixtureRoot.notification.healthLabel !== "需要关注" ||
+    failureFixtureRoot.notification.empty ||
+    failureFixtureRoot.notification.activeCount !== 0 ||
+    failureFixtureRoot.notification.thumbnailCount !== 0 ||
+    !failureFixtureRoot.notification.onlyCurrentProgress ||
+    failureFixtureRoot.notification.fullCenterCount !== 1
+  ) {
+    hardFailures.push("failure-only notification visual fixture is missing its compact failure status");
+  }
+  if (
     !emptyFixtureRoot?.notification?.empty ||
     emptyFixtureRoot.notification.degraded ||
+    emptyFixtureRoot.notification.health !== "healthy" ||
+    emptyFixtureRoot.notification.failure ||
     emptyFixtureRoot.notification.thumbnailCount !== 0 ||
     emptyFixtureRoot.notification.thumbnailLibraryCount !== 0 ||
     emptyFixtureRoot.notification.thumbnailSummaries.length !== 0
   ) {
     hardFailures.push("empty notification visual fixture is missing its healthy empty state");
   }
-  if (!degradedFixtureRoot?.notification?.empty || !degradedFixtureRoot.notification.degraded) {
+  if (
+    !degradedFixtureRoot?.notification?.empty ||
+    !degradedFixtureRoot.notification.degraded ||
+    degradedFixtureRoot.notification.health !== "degraded" ||
+    degradedFixtureRoot.notification.failure
+  ) {
     hardFailures.push("degraded notification visual fixture is missing its degraded empty state");
   }
   const unexpectedFixtureConsoleErrors =

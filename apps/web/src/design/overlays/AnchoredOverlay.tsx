@@ -115,6 +115,34 @@ export function AnchoredOverlay({
     target.focus();
   }, [autoFocus, initialFocusRef, layout, open, presence.present]);
 
+  useEffect(() => {
+    if (!open || !presence.present || autoFocus || !initialFocusRef) return;
+    const trigger =
+      typeof HTMLElement !== "undefined" && anchor instanceof HTMLElement
+        ? anchor
+        : null;
+    if (!trigger) return;
+
+    const handOffTriggerTab = (event: KeyboardEvent) => {
+      if (
+        event.key !== "Tab" ||
+        event.shiftKey ||
+        event.defaultPrevented ||
+        document.activeElement !== trigger
+      ) {
+        return;
+      }
+      const surface = surfaceRef.current;
+      const target = initialFocusRef.current;
+      if (!surface || !target || !surface.contains(target)) return;
+      event.preventDefault();
+      target.focus();
+    };
+
+    trigger.addEventListener("keydown", handOffTriggerTab);
+    return () => trigger.removeEventListener("keydown", handOffTriggerTab);
+  }, [anchor, autoFocus, initialFocusRef, open, presence.present]);
+
   useLayoutEffect(() => {
     if (!open || !presence.present || !anchor) return;
     const surface = surfaceRef.current;

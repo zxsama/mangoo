@@ -314,8 +314,8 @@ describe("mounted overlay lifecycle", () => {
       outsidePointerClosed: true,
       productionWiringMounted: true,
       switchClosed: true,
-      tabEnteredContent: false,
-      tabKeptOpen: false
+      tabEnteredContent: true,
+      tabKeptOpen: true
     });
   });
 

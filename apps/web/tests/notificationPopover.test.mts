@@ -67,14 +67,17 @@ describe("notification popover content presentation", () => {
 describe("compact notification product contract", () => {
   const popoverSource = read("src/features/notifications/NotificationPopover.tsx");
   const appSource = read("src/app/App.tsx");
+  const desktopVisualHarnessSource = read("../../.tmp/visual-check/desktop-ui-regression.mjs");
   const fixtureSource = read("tests/fixtures/notificationPopoverVisualFixture.tsx");
   const hostSource = read("src/app-shell/ShellOverlayHost.tsx");
+  const validatorSource = read("../../tools/checks/validate-web-client.mjs");
 
   it("renders current activity without terminal results or controls", () => {
     assert.match(popoverSource, /后台活动/);
     assert.match(popoverSource, /model\.active/);
     assert.match(popoverSource, /model\.thumbnail\.summaries/);
     assert.match(popoverSource, /model\.degraded/);
+    assert.match(popoverSource, /notification-failure-summary/);
     assert.match(popoverSource, /onOpenCenter/);
     assert.doesNotMatch(popoverSource, /model\.results/);
     assert.doesNotMatch(popoverSource, /cancel\s*\(|retry\s*\(/);
@@ -90,13 +93,72 @@ describe("compact notification product contract", () => {
     assert.match(appSource, /onCloseNotifications=\{closeNotifications\}/);
   });
 
-  it("exposes deterministic scan, thumbnail, empty, and degraded fixture states", () => {
+  it("exposes deterministic scan, thumbnail, failure, empty, and degraded fixture states", () => {
     assert.match(
       fixtureSource,
-      /type FixtureState = "full" \| "scan" \| "thumbnail" \| "empty" \| "degraded"/
+      /type FixtureState = "full" \| "scan" \| "thumbnail" \| "failure" \| "empty" \| "degraded"/
     );
     assert.match(fixtureSource, /design\/overlays\/overlay\.css/);
     assert.match(fixtureSource, /Artists\\\\Portraits/);
+    assert.match(fixtureSource, /Artists 扫描失败，请检查文件夹访问权限/);
     assert.match(fixtureSource, /results: \[\]/);
+  });
+
+  it("keeps the desktop harness on the shared root and current-progress contract", () => {
+    const compactEvidenceStart = desktopVisualHarnessSource.indexOf(
+      "function compactPopoverEvidenceExpression()"
+    );
+    const compactEvidenceEnd = desktopVisualHarnessSource.indexOf(
+      "function pointerEvidenceExpression()",
+      compactEvidenceStart
+    );
+    const compactFixtureStart = desktopVisualHarnessSource.indexOf(
+      "const fixture = summary.evidence.notificationFixture;"
+    );
+    const compactFixtureEnd = desktopVisualHarnessSource.indexOf(
+      "const unexpectedFixtureConsoleErrors =",
+      compactFixtureStart
+    );
+    const compactHarnessContract = desktopVisualHarnessSource.slice(
+      compactEvidenceStart,
+      compactEvidenceEnd
+    );
+    const compactFixtureContract = desktopVisualHarnessSource.slice(
+      compactFixtureStart,
+      compactFixtureEnd
+    );
+
+    assert.match(
+      compactHarnessContract,
+      /querySelectorAll\("#notifications-root, #filter-root, #sort-root"\)/
+    );
+    assert.match(compactHarnessContract, /onlyCurrentProgress/);
+    assert.match(compactHarnessContract, /failureSummary/);
+    assert.match(compactHarnessContract, /footerVisible/);
+    assert.match(compactHarnessContract, /boundedWidth/);
+    assert.match(
+      desktopVisualHarnessSource,
+      /popoverRect\.top - buttonRect\.bottom - 6/
+    );
+    assert.doesNotMatch(
+      desktopVisualHarnessSource,
+      /data-compact-popover-root/
+    );
+    assert.doesNotMatch(
+      `${compactHarnessContract}\n${compactFixtureContract}`,
+      /\bresultCount\b|\bresultLibraryLabels\b/
+    );
+  });
+
+  it("guards the visual harness semantics instead of accepting marker substrings", () => {
+    assert.match(validatorSource, /compactPopoverStateHarnessBlock/);
+    assert.match(validatorSource, /compactPopoverHarnessBlock/);
+    assert.match(validatorSource, /notificationAnchorGeometryHarnessBlock/);
+    assert.match(validatorSource, /compactFixtureAssertionBlock/);
+    assert.match(validatorSource, /sharedOverlayRootQueryPattern/);
+    assert.match(validatorSource, /retiredCompactPopoverRootContract/);
+    assert.match(validatorSource, /retiredNotificationHarnessContract/);
+    assert.match(validatorSource, /!root\.notification\.onlyCurrentProgress/);
+    assert.match(validatorSource, /failureFixtureRoot/);
   });
 });

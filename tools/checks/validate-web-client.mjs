@@ -233,7 +233,7 @@ for (const value of [
   }
 }
 for (const value of [
-  'type FixtureState = "full" | "scan" | "thumbnail" | "empty" | "degraded"',
+  'type FixtureState = "full" | "scan" | "thumbnail" | "failure" | "empty" | "degraded"',
   "data-notification-fixture",
   "NotificationPopover",
   "LiquidGlassButton",
@@ -261,11 +261,125 @@ for (const value of [
   "resizeScriptOpenedWindow(fixtureClient, 800, 720)",
   "ui-notification-compact-fixture-full.png",
   "ui-notification-compact-fixture-full-narrow.png",
+  "ui-notification-compact-fixture-failure.png",
   "thumbnailLibraryCount",
   "thumbnailSummaries"
 ]) {
   if (!desktopVisualHarness.includes(value)) {
     fail(`notification visual harness contract missing ${value}`);
+  }
+}
+const compactPopoverStateHarnessStart = desktopVisualHarness.indexOf(
+  "async function waitForCompactPopoverState"
+);
+const compactPopoverStateHarnessEnd = desktopVisualHarness.indexOf(
+  "function notificationAnchorGeometryExpression()",
+  compactPopoverStateHarnessStart
+);
+if (
+  compactPopoverStateHarnessStart < 0 ||
+  compactPopoverStateHarnessEnd <= compactPopoverStateHarnessStart
+) {
+  fail("notification visual harness shared root state helper is missing");
+}
+const compactPopoverStateHarnessBlock = desktopVisualHarness.slice(
+  compactPopoverStateHarnessStart,
+  compactPopoverStateHarnessEnd
+);
+const compactPopoverHarnessStart = desktopVisualHarness.indexOf(
+  "function compactPopoverEvidenceExpression()"
+);
+const compactPopoverHarnessEnd = desktopVisualHarness.indexOf(
+  "function pointerEvidenceExpression()",
+  compactPopoverHarnessStart
+);
+if (compactPopoverHarnessStart < 0 || compactPopoverHarnessEnd <= compactPopoverHarnessStart) {
+  fail("notification visual harness compact evidence function is missing");
+}
+const compactPopoverHarnessBlock = desktopVisualHarness.slice(
+  compactPopoverHarnessStart,
+  compactPopoverHarnessEnd
+);
+const notificationAnchorGeometryHarnessStart = desktopVisualHarness.indexOf(
+  "function notificationAnchorGeometryExpression()"
+);
+const notificationAnchorGeometryHarnessEnd = desktopVisualHarness.indexOf(
+  "async function waitForNotificationAnchorGeometry",
+  notificationAnchorGeometryHarnessStart
+);
+if (
+  notificationAnchorGeometryHarnessStart < 0 ||
+  notificationAnchorGeometryHarnessEnd <= notificationAnchorGeometryHarnessStart
+) {
+  fail("notification visual harness anchor geometry function is missing");
+}
+const notificationAnchorGeometryHarnessBlock = desktopVisualHarness.slice(
+  notificationAnchorGeometryHarnessStart,
+  notificationAnchorGeometryHarnessEnd
+);
+if (
+  !/document\.querySelector\(\s*["'`]#notifications-root["'`]\s*\)/.test(
+    notificationAnchorGeometryHarnessBlock
+  ) ||
+  !/popoverRect\.top\s*-\s*buttonRect\.bottom\s*-\s*6/.test(
+    notificationAnchorGeometryHarnessBlock
+  )
+) {
+  fail("notification visual harness must enforce the shared root selector and 6px anchor offset");
+}
+const compactFixtureAssertionStart = desktopVisualHarness.indexOf(
+  "for (const step of summary.evidence.compactPopovers.steps)"
+);
+const compactFixtureAssertionEnd = desktopVisualHarness.indexOf(
+  "const unexpectedFixtureConsoleErrors =",
+  compactFixtureAssertionStart
+);
+if (compactFixtureAssertionStart < 0 || compactFixtureAssertionEnd <= compactFixtureAssertionStart) {
+  fail("notification visual harness compact fixture assertions are missing");
+}
+const compactFixtureAssertionBlock = desktopVisualHarness.slice(
+  compactFixtureAssertionStart,
+  compactFixtureAssertionEnd
+);
+const sharedOverlayRootQueryPattern =
+  /const roots\s*=\s*\[\.\.\.document\.querySelectorAll\(\s*["'`]#notifications-root, #filter-root, #sort-root["'`]\s*\)\]/;
+const sharedOverlayRootNamePattern =
+  /const rootName\s*=\s*(?:roots\[0\]\?\.id|element\.id)\.replace\(\/-root\$\/,\s*["'`]{2}\)/;
+for (const [label, block] of [
+  ["state helper", compactPopoverStateHarnessBlock],
+  ["evidence function", compactPopoverHarnessBlock]
+]) {
+  if (!sharedOverlayRootQueryPattern.test(block) || !sharedOverlayRootNamePattern.test(block)) {
+    fail(`notification visual harness ${label} must query and identify shared AnchoredOverlay roots`);
+  }
+}
+for (const evidence of [
+  "onlyCurrentProgress",
+  "failureSummary",
+  "footerVisible",
+  "boundedWidth"
+]) {
+  if (!compactPopoverHarnessBlock.includes(evidence)) {
+    fail(`notification visual harness compact evidence missing ${evidence}`);
+  }
+}
+if (
+  !compactFixtureAssertionBlock.includes("if (!root.notification.onlyCurrentProgress)") ||
+  !compactFixtureAssertionBlock.includes("failureFixtureRoot") ||
+  !/near\(root\.anchorGeometry\?\.gap,\s*6,\s*1\)/.test(compactFixtureAssertionBlock)
+) {
+  fail("notification visual harness must assert current progress and failure-only fixture state");
+}
+const retiredCompactPopoverRootContract = "data-compact-popover-root";
+if (desktopVisualHarness.includes(retiredCompactPopoverRootContract)) {
+  fail(`notification visual harness retains retired contract ${retiredCompactPopoverRootContract}`);
+}
+for (const retiredNotificationHarnessContract of ["resultCount", "resultLibraryLabels"]) {
+  if (
+    compactPopoverHarnessBlock.includes(retiredNotificationHarnessContract) ||
+    compactFixtureAssertionBlock.includes(retiredNotificationHarnessContract)
+  ) {
+    fail(`notification visual harness retains retired compact assertion ${retiredNotificationHarnessContract}`);
   }
 }
 for (const [label, source, values] of [

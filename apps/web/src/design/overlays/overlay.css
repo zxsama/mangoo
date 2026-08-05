@@ -324,6 +324,13 @@
   line-height: 1.45;
 }
 
+.notification-failure-summary {
+  margin: 0 2px;
+  color: rgba(229, 181, 139, 0.86);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
 .notification-section {
   display: flex;
   min-width: 0;

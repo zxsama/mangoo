@@ -17,6 +17,7 @@ import {
   progressView,
   thumbnailStatusParts
 } from "../src/features/notifications/notificationModel.ts";
+import * as notificationPopoverPresentation from "../src/features/notifications/notificationPopoverPresentation.ts";
 import { createNotificationStore } from "../src/features/notifications/useNotifications.ts";
 import {
   createLibraryErrorReportAttempt,
@@ -931,6 +932,75 @@ describe("notification selectors", () => {
       })
     );
     assert.equal(resolved.indicator, "idle");
+  });
+
+  it("presents a failure-only compact model with its summary instead of healthy idle", () => {
+    const model = buildCompactNotificationModel(
+      compact({
+        hasRetryableFailure: true,
+        latestImportantResults: [
+          terminal("failed-scan", 400, {
+            status: "failed",
+            phase: "扫描失败",
+            summary: "Artists 扫描失败，请检查文件夹访问权限",
+            retryable: true
+          })
+        ]
+      })
+    );
+    const present = (
+      notificationPopoverPresentation as {
+        compactNotificationPresentation?: (value: typeof model) => unknown;
+      }
+    ).compactNotificationPresentation;
+
+    assert.equal(typeof present, "function");
+    assert.deepEqual(present?.(model), {
+      failureSummary: "Artists 扫描失败，请检查文件夹访问权限",
+      health: "failure",
+      healthLabel: "需要关注",
+      idleLabel: null
+    });
+  });
+
+  it("preserves healthy idle, degraded idle, and active compact presentation", () => {
+    const healthy = buildCompactNotificationModel(compact());
+    const degraded = buildCompactNotificationModel(
+      compact({
+        syncHealth: {
+          state: "degraded",
+          libraryId: "library-a",
+          detail: "通知同步已暂停",
+          updatedAt: 2
+        }
+      })
+    );
+    const active = buildCompactNotificationModel(compact({ active: [operation("scan")] }));
+    const present = (
+      notificationPopoverPresentation as {
+        compactNotificationPresentation?: (value: typeof healthy) => unknown;
+      }
+    ).compactNotificationPresentation;
+
+    assert.equal(typeof present, "function");
+    assert.deepEqual(present?.(healthy), {
+      failureSummary: null,
+      health: "healthy",
+      healthLabel: "运行正常",
+      idleLabel: "当前没有后台活动"
+    });
+    assert.deepEqual(present?.(degraded), {
+      failureSummary: null,
+      health: "degraded",
+      healthLabel: "同步受限",
+      idleLabel: "等待通知同步恢复"
+    });
+    assert.deepEqual(present?.(active), {
+      failureSummary: null,
+      health: "healthy",
+      healthLabel: "运行正常",
+      idleLabel: null
+    });
   });
 
   it("builds determinate and indeterminate progress without false percentages", () => {

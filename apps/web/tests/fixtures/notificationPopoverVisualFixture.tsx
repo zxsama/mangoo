@@ -13,7 +13,7 @@ import type {
 } from "../../src/features/notifications/notificationModel";
 import "./notificationPopoverVisualFixture.css";
 
-type FixtureState = "full" | "scan" | "thumbnail" | "empty" | "degraded";
+type FixtureState = "full" | "scan" | "thumbnail" | "failure" | "empty" | "degraded";
 
 const fixtureParameters = new URLSearchParams(window.location.search);
 const measurementMetrics = { anchorRectCalls: 0, popoverRectCalls: 0 };
@@ -231,7 +231,7 @@ function modelFor(state: FixtureState): CompactNotificationModel {
       indicator: "active"
     };
   }
-  return {
+  const idle: CompactNotificationModel = {
     activeLibraryId: null,
     active: [],
     thumbnail: {
@@ -253,6 +253,22 @@ function modelFor(state: FixtureState): CompactNotificationModel {
     degraded: state === "degraded",
     healthDetail: state === "degraded" ? "测试同步连接已暂停" : null
   };
+  if (state !== "failure") return idle;
+  return {
+    ...idle,
+    activeLibraryId: "artists",
+    results: [
+      operation("扫描 Artists", {
+        status: "failed",
+        phase: "扫描失败",
+        summary: "Artists 扫描失败，请检查文件夹访问权限",
+        cancellable: false,
+        retryable: true,
+        completedAt: Date.now()
+      })
+    ],
+    indicator: "failure"
+  };
 }
 
 function NotificationPopoverVisualFixture() {
@@ -266,6 +282,7 @@ function NotificationPopoverVisualFixture() {
   const state: FixtureState =
     requestedState === "scan" ||
     requestedState === "thumbnail" ||
+    requestedState === "failure" ||
     requestedState === "empty" ||
     requestedState === "degraded"
       ? requestedState

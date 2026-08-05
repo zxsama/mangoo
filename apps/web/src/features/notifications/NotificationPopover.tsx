@@ -11,7 +11,10 @@ import type {
   NotificationOperationViewModel
 } from "./notificationModel";
 import { thumbnailStatusParts } from "./notificationModel";
-import { activeOperationPresentation } from "./notificationPopoverPresentation";
+import {
+  activeOperationPresentation,
+  compactNotificationPresentation
+} from "./notificationPopoverPresentation";
 
 interface NotificationPopoverProps {
   anchor: HTMLElement;
@@ -29,13 +32,19 @@ export function NotificationPopover({
   onOpenCenter
 }: NotificationPopoverProps) {
   const openCenterButtonRef = useRef<HTMLButtonElement | null>(null);
-  const hasActivity = model.active.length > 0 || model.thumbnail.summaries.length > 0;
+  const presentation = compactNotificationPresentation(model);
 
   const activityContent = (
     <>
       {model.degraded ? (
         <p className="notification-health-detail">
           {model.healthDetail?.trim() || "通知同步暂时不可用，当前进度可能延迟。"}
+        </p>
+      ) : null}
+
+      {presentation.failureSummary ? (
+        <p className="notification-failure-summary">
+          {presentation.failureSummary}
         </p>
       ) : null}
 
@@ -75,10 +84,10 @@ export function NotificationPopover({
         </NotificationSection>
       ) : null}
 
-      {!hasActivity ? (
+      {presentation.idleLabel ? (
         <p className="notification-popover-empty">
           <CircleDashed aria-hidden="true" size={16} />
-          <span>{model.degraded ? "等待通知同步恢复" : "当前没有后台活动"}</span>
+          <span>{presentation.idleLabel}</span>
         </p>
       ) : null}
     </>
@@ -101,8 +110,8 @@ export function NotificationPopover({
     >
       <header className="notification-popover-header">
         <h2>后台活动</h2>
-        <span data-notification-health={model.degraded ? "degraded" : "healthy"}>
-          {model.degraded ? "同步受限" : "运行正常"}
+        <span data-notification-health={presentation.health}>
+          {presentation.healthLabel}
         </span>
       </header>
       <div className="notification-popover-body" data-overlay-scroll-container>
