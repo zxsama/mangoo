@@ -28,6 +28,7 @@ import type {
   ThumbnailFailureSnapshot,
   ThumbnailFailureDetail
 } from "@megle/notification-contract";
+import { OverlayField, OverlaySelect } from "../../design/overlays";
 import { copyText, getDesktopBridge } from "../../core/desktop";
 import type {
   NotificationRequestResult,
@@ -316,12 +317,7 @@ export function ProcessLogView({
   return (
     <div className="notification-view notification-process-log-view">
       <header className="notification-view-heading notification-log-heading">
-        <div>
-          <span className="notification-view-eyebrow">
-            {initialFilter?.eventKind === "thumbnail_failure" ? "FAILURE DIAGNOSTICS" : "CURRENT SESSION"}
-          </span>
-          <h1>进程日志</h1>
-        </div>
+        <h1>进程日志</h1>
         <div className="notification-log-live-state">
           <Radio aria-hidden="true" size={13} />
           {paused ? `已暂停${queuedLineCount ? ` · ${queuedLineCount} 条待显示` : ""}` : "实时"}
@@ -329,35 +325,33 @@ export function ProcessLogView({
       </header>
 
       <div aria-label="进程日志筛选和操作" className="notification-log-toolbar">
-        <label className="notification-filter-search notification-log-search">
-          <span className="sr-only">搜索进程日志</span>
-          <input
+        <div className="notification-filter-search notification-log-search">
+          <OverlayField
+            aria-label="搜索进程日志"
             onChange={(event) => setSearch(event.currentTarget.value)}
             placeholder="搜索本次运行日志"
             type="search"
             value={search}
           />
-        </label>
-        <label className="notification-filter-select compact">
-          <span>来源</span>
-          <select onChange={(event) => setSource(event.currentTarget.value as DesktopProcessLogSource | "")} value={source}>
+        </div>
+        <div className="notification-filter-select compact">
+          <OverlaySelect label="来源" onChange={(event) => setSource(event.currentTarget.value as DesktopProcessLogSource | "")} value={source}>
             <option value="">全部</option>
             <option value="main">Main</option>
             <option value="core">Core</option>
             <option value="renderer">Renderer</option>
-          </select>
-        </label>
-        <label className="notification-filter-select compact">
-          <span>级别</span>
-          <select onChange={(event) => setLevel(event.currentTarget.value as DesktopProcessLogLevel | "")} value={level}>
+          </OverlaySelect>
+        </div>
+        <div className="notification-filter-select compact">
+          <OverlaySelect label="级别" onChange={(event) => setLevel(event.currentTarget.value as DesktopProcessLogLevel | "")} value={level}>
             <option value="">全部</option>
             <option value="trace">Trace</option>
             <option value="debug">Debug</option>
             <option value="info">Info</option>
             <option value="warn">Warn</option>
             <option value="error">Error</option>
-          </select>
-        </label>
+          </OverlaySelect>
+        </div>
         <div className="notification-log-actions">
           <button aria-label={paused ? "继续日志" : "暂停日志"} className="notification-toolbar-action" onClick={togglePause} type="button">
             {paused ? <Play aria-hidden="true" size={14} /> : <Pause aria-hidden="true" size={14} />}
@@ -479,8 +473,12 @@ interface LogRowContentValue {
 function LogRowContent({ content }: { content: LogRowContentValue }) {
   return (
     <>
-      <span className="notification-log-sequence">{content.sequence}</span>
-      <time dateTime={new Date(content.timestamp).toISOString()}>{formatLogTime(content.timestamp)}</time>
+      <time
+        aria-label={`序列 ${content.sequence}，${formatLogTime(content.timestamp)}`}
+        dateTime={new Date(content.timestamp).toISOString()}
+      >
+        {formatLogTime(content.timestamp)}
+      </time>
       <span className="notification-log-source">{content.source}</span>
       <span className="notification-log-level">{content.level}</span>
       <span className="notification-log-message">{content.message}{content.metadata}</span>

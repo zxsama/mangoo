@@ -8,6 +8,7 @@ import type {
   DesktopProcessLogBatch,
   DesktopProcessLogFilter,
   DesktopProcessLogLine,
+  NotificationWindowIntent,
   ThumbnailFailureDetail
 } from "@megle/notification-contract";
 import { useOverlayScrollbars } from "../../src/app-shell/useOverlayScrollbars";
@@ -18,6 +19,7 @@ import { ProcessLogView } from "../../src/features/notifications/ProcessLogView"
 import { buildCompactNotificationModel } from "../../src/features/notifications/notificationModel";
 import type { NotificationHistoryState } from "../../src/features/notifications/useNotifications";
 import "../../src/styles.css";
+import "../../src/design/overlays/overlay.css";
 import "./notificationWindowVisualFixture.css";
 
 type FixturePage = "status" | "history" | "logs";
@@ -25,6 +27,8 @@ type FixtureState = "full" | "degraded";
 
 interface FixtureMetrics {
   historyQueries: number;
+  cancelActions: number;
+  retryActions: number;
   logSubscriptions: number;
   activeLogSubscriptions: number;
   logUnsubscriptions: number;
@@ -173,9 +177,20 @@ const compactSnapshot: DesktopNotificationCompactSnapshot = {
   }
 };
 
-const allHistory = Array.from({ length: 240 }, (_, index) =>
-  operation(index, index === 6 ? { operationId: "retry-error", status: "failed", retryable: true } : {})
-);
+const allHistory = Array.from({ length: 240 }, (_, index) => {
+  if (index === 5) {
+    return operation(index, {
+      operationId: "history-cancel",
+      status: "running",
+      completedAt: null,
+      cancellable: true
+    });
+  }
+  return operation(
+    index,
+    index === 6 ? { operationId: "retry-error", status: "failed", retryable: true } : {}
+  );
+});
 
 function filterHistory(query: DesktopNotificationHistoryQuery) {
   return allHistory.filter((item) => {
@@ -206,6 +221,7 @@ const allLogs: DesktopProcessLogLine[] = Array.from({ length: 260 }, (_, index) 
 function NotificationWindowVisualFixture() {
   useOverlayScrollbars();
   const [page, setPage] = useState<FixturePage>("status");
+  const [logIntent, setLogIntent] = useState<NotificationWindowIntent | null>(null);
   const [history, setHistory] = useState<NotificationHistoryState>({
     items: [],
     total: allHistory.length,
@@ -217,6 +233,8 @@ function NotificationWindowVisualFixture() {
   });
   const metricsRef = useRef<FixtureMetrics>({
     historyQueries: 0,
+    cancelActions: 0,
+    retryActions: 0,
     logSubscriptions: 0,
     activeLogSubscriptions: 0,
     logUnsubscriptions: 0
@@ -285,6 +303,21 @@ function NotificationWindowVisualFixture() {
     };
   }, []);
 
+  const selectPage = useCallback((nextPage: FixturePage) => {
+    setPage(nextPage);
+    if (nextPage !== "logs") setLogIntent(null);
+  }, []);
+  const cancel = useCallback(async () => {
+    metricsRef.current.cancelActions += 1;
+    return { ok: true, message: null };
+  }, []);
+  const retry = useCallback(async (_libraryId: string, operationId: string) => {
+    metricsRef.current.retryActions += 1;
+    return operationId === "retry-error"
+      ? { ok: false, message: "Fixture retry rejected" }
+      : { ok: true, message: null };
+  }, []);
+
   window.notificationWindowFixture = {
     emitGap() {
       const batch: DesktopProcessLogBatch = {
@@ -301,12 +334,12 @@ function NotificationWindowVisualFixture() {
       for (const subscription of logSubscriptionsRef.current) subscription.listener(batch);
     },
     getMetrics: () => ({ ...metricsRef.current }),
-    selectPage: setPage
+    selectPage
   };
 
   const tabs = [
     { id: "status", label: "当前状态", icon: Activity },
-    { id: "history", label: "通知历史", icon: History },
+    { id: "history", label: "历史记录", icon: History },
     { id: "logs", label: "进程日志", icon: ScrollText }
   ] as const;
 
@@ -326,15 +359,18 @@ function NotificationWindowVisualFixture() {
         <div className="secondary-window-body notification-window-body">
           <nav aria-label="通知中心页面" className="notification-window-nav">
             <div className="notification-window-nav-heading">通知中心</div>
-            <div aria-orientation="vertical" className="notification-window-tabs" role="tablist">
+            <div aria-label="通知中心页面" className="notification-window-tabs" role="tablist">
               {tabs.map(({ id, icon: Icon, label }) => (
                 <button
+                  aria-controls={`notification-fixture-panel-${id}`}
                   aria-selected={page === id}
                   className={`notification-window-tab${page === id ? " active" : ""}`}
                   data-fixture-page={id}
+                  id={`notification-fixture-tab-${id}`}
                   key={id}
-                  onClick={() => setPage(id)}
+                  onClick={() => selectPage(id)}
                   role="tab"
+                  tabIndex={page === id ? 0 : -1}
                   type="button"
                 >
                   <Icon aria-hidden="true" size={16} /><span>{label}</span>
@@ -344,19 +380,27 @@ function NotificationWindowVisualFixture() {
             <p className="notification-window-nav-note">跨资源库状态与本次运行日志</p>
           </nav>
           <main className="notification-window-content">
-            <section className="notification-window-panel" role="tabpanel">
+            <section
+              aria-labelledby={`notification-fixture-tab-${page}`}
+              className="notification-window-panel"
+              id={`notification-fixture-panel-${page}`}
+              role="tabpanel"
+            >
               {page === "status" ? (
                 <NotificationStatusView
-                  cancel={async () => ({ ok: true, message: null })}
+                  cancel={cancel}
                   model={buildCompactNotificationModel(compactSnapshot)}
-                  onOpenFailureLogs={() => undefined}
+                  onOpenFailureLogs={(intent) => {
+                    setLogIntent(intent);
+                    setPage("logs");
+                  }}
                   refreshCompact={async () => ({ ok: true, value: true })}
                 />
               ) : null}
               {page === "history" ? (
                 <NotificationHistoryView
                   activeLibraryId="artists"
-                  cancel={async () => ({ ok: true, message: null })}
+                  cancel={cancel}
                   history={history}
                   getHistoryFacets={async () => ({
                     ok: true,
@@ -371,12 +415,18 @@ function NotificationWindowVisualFixture() {
                   loadHistory={loadHistory}
                   loadMoreHistory={loadMoreHistory}
                   refreshCompact={async () => ({ ok: true, value: true })}
-                  retry={async (_libraryId, operationId) => operationId === "retry-error" ? { ok: false, message: "Fixture retry rejected" } : { ok: true, message: null }}
+                  retry={retry}
                 />
               ) : null}
               {page === "logs" ? (
                 <ProcessLogView
-                  authoritativeFailures={[]}
+                  authoritativeFailures={
+                    logIntent?.logFilter.eventKind === "thumbnail_failure"
+                      ? compactSnapshot.thumbnailSummaries.find(
+                          (summary) => summary.libraryId === logIntent.logFilter.libraryId
+                        )?.failureDetails ?? []
+                      : []
+                  }
                   clearLogs={async () => ({ ok: true, value: true })}
                   exportLogs={async () => ({
                     ok: true,
@@ -388,7 +438,10 @@ function NotificationWindowVisualFixture() {
                       error: null
                     }
                   })}
+                  failureSnapshot={logIntent?.failureSnapshot}
                   getLogPage={async (query) => ({ ok: true, value: pageLogs(query) })}
+                  initialFilter={logIntent?.logFilter}
+                  key={`${logIntent?.logFilter.eventKind ?? "session"}:${logIntent?.logFilter.libraryId ?? "all"}`}
                   openLogSubscription={openLogSubscription}
                 />
               ) : null}

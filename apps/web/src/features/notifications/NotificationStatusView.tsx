@@ -1,13 +1,13 @@
 import {
   AlertTriangle,
   CheckCircle2,
-  CircleDashed,
   Image,
   Layers3,
   Radio,
-  Square
+  Square,
+  type LucideIcon
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   DesktopThumbnailCacheSummary,
   NotificationWindowIntent
@@ -80,30 +80,25 @@ export function NotificationStatusView({
       ) : null}
 
       {model.degraded ? (
-        <section
-          aria-labelledby="notification-status-health-title"
-          className="notification-status-health notification-status-section"
+        <StatusSection
+          className="notification-status-health"
+          count={1}
+          headingId="notification-status-health-title"
+          icon={AlertTriangle}
+          title="通知同步受限"
         >
-          <SectionHeading
-            icon={<AlertTriangle aria-hidden="true" size={16} />}
-            id="notification-status-health-title"
-            title="通知同步受限"
-          />
           <p>{model.healthDetail || "通知服务暂时不可用，浏览不会因此中断。"}</p>
-        </section>
+        </StatusSection>
       ) : null}
 
       {model.active.length > 0 ? (
-        <section
-          aria-labelledby="notification-status-active-title"
-          className="notification-status-active notification-status-section"
+        <StatusSection
+          className="notification-status-active"
+          count={model.active.length}
+          headingId="notification-status-active-title"
+          icon={Radio}
+          title="正在进行"
         >
-          <SectionHeading
-            count={model.active.length}
-            icon={<Radio aria-hidden="true" size={16} />}
-            id="notification-status-active-title"
-            title="正在进行"
-          />
           <div className="notification-status-operation-list">
             {model.active.map((operation) => {
               const actionKey = notificationOperationActionKey(
@@ -151,20 +146,17 @@ export function NotificationStatusView({
               );
             })}
           </div>
-        </section>
+        </StatusSection>
       ) : null}
 
       {model.thumbnail.summaries.length > 0 ? (
-        <section
-          aria-labelledby="notification-status-thumbnails-title"
-          className="notification-status-thumbnails notification-status-section"
+        <StatusSection
+          className="notification-status-thumbnails"
+          count={model.thumbnail.summaries.length}
+          headingId="notification-status-thumbnails-title"
+          icon={Image}
+          title="缩略图缓存"
         >
-          <SectionHeading
-            count={model.thumbnail.summaries.length}
-            icon={<Image aria-hidden="true" size={16} />}
-            id="notification-status-thumbnails-title"
-            title="缩略图缓存"
-          />
           <div className="notification-thumbnail-grid">
             {model.thumbnail.summaries.map((summary) => (
               <ThumbnailStatus
@@ -174,19 +166,17 @@ export function NotificationStatusView({
               />
             ))}
           </div>
-        </section>
+        </StatusSection>
       ) : null}
 
       {model.results.length > 0 ? (
-        <section
-          aria-labelledby="notification-status-results-title"
-          className="notification-status-results notification-status-section"
+        <StatusSection
+          className="notification-status-results"
+          count={model.results.length}
+          headingId="notification-status-results-title"
+          icon={Layers3}
+          title="最近重要结果"
         >
-          <SectionHeading
-            icon={<Layers3 aria-hidden="true" size={16} />}
-            id="notification-status-results-title"
-            title="最近重要结果"
-          />
           <div className="notification-status-result-list">
             {model.results.map((operation) => (
               <article
@@ -204,7 +194,7 @@ export function NotificationStatusView({
               </article>
             ))}
           </div>
-        </section>
+        </StatusSection>
       ) : null}
     </div>
   );
@@ -213,32 +203,40 @@ export function NotificationStatusView({
 function ViewHeading({ detail, title }: { detail: string; title: string }) {
   return (
     <header className="notification-view-heading">
-      <div>
-        <span className="notification-view-eyebrow">OVERVIEW</span>
-        <h1>{title}</h1>
-      </div>
+      <h1>{title}</h1>
       <p>{detail}</p>
     </header>
   );
 }
 
-function SectionHeading({
+function StatusSection({
+  children,
+  className,
   count,
   icon,
-  id,
+  headingId,
   title
 }: {
-  count?: number;
-  icon: React.ReactNode;
-  id: string;
+  children: ReactNode;
+  className: string;
+  count: number;
+  icon: LucideIcon;
+  headingId: string;
   title: string;
 }) {
+  const SectionIcon = icon;
   return (
-    <header className="notification-status-section-heading">
-      <span className="notification-status-section-icon">{icon}</span>
-      <h2 id={id}>{title}</h2>
-      {count == null ? null : <span className="notification-status-count">{count}</span>}
-    </header>
+    <section
+      aria-labelledby={headingId}
+      className={`${className} notification-status-section`}
+    >
+      <header className="notification-section-heading">
+        <SectionIcon aria-hidden="true" size={15} />
+        <h2 id={headingId}>{title}</h2>
+        <span className="notification-section-count">{count}</span>
+      </header>
+      <div className="notification-section-content">{children}</div>
+    </section>
   );
 }
 

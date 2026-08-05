@@ -1,5 +1,5 @@
 import { Activity, History, ScrollText } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type {
   DesktopProcessLogFilter,
   NotificationWindowIntent,
@@ -18,7 +18,7 @@ type NotificationPage = "status" | "history" | "logs";
 
 const PAGES = [
   { id: "status", label: "当前状态", icon: Activity },
-  { id: "history", label: "通知历史", icon: History },
+  { id: "history", label: "历史记录", icon: History },
   { id: "logs", label: "进程日志", icon: ScrollText }
 ] as const;
 
@@ -30,8 +30,10 @@ export function NotificationWindow() {
   const [logFilter, setLogFilter] = useState<DesktopProcessLogFilter | null>(null);
   const [failureSnapshot, setFailureSnapshot] = useState<ThumbnailFailureSnapshot | null>(null);
   const [logIntentVersion, setLogIntentVersion] = useState(0);
+  const focusIntentPanelRef = useRef(false);
 
   const applyIntent = useCallback((intent: NotificationWindowIntent) => {
+    focusIntentPanelRef.current = true;
     setLogFilter(intent.logFilter);
     setFailureSnapshot(intent.failureSnapshot);
     setLogIntentVersion((version) => version + 1);
@@ -39,6 +41,12 @@ export function NotificationWindow() {
   }, []);
 
   useEffect(() => getDesktopBridge()?.onNotificationWindowIntent?.(applyIntent), [applyIntent]);
+
+  useEffect(() => {
+    if (page !== "logs" || !focusIntentPanelRef.current) return;
+    focusIntentPanelRef.current = false;
+    document.getElementById("notification-panel-logs")?.focus();
+  }, [logIntentVersion, page]);
 
   const authoritativeFailures = useMemo(() => {
     if (logFilter?.eventKind !== "thumbnail_failure" || !logFilter.libraryId) return [];
@@ -95,7 +103,7 @@ export function NotificationWindow() {
     >
       <nav aria-label="通知中心页面" className="notification-window-nav">
         <div className="notification-window-nav-heading">通知中心</div>
-        <div aria-orientation="vertical" className="notification-window-tabs" role="tablist">
+        <div aria-label="通知中心页面" className="notification-window-tabs" role="tablist">
           {PAGES.map(({ id, icon: Icon, label }) => (
             <button
               aria-controls={`notification-panel-${id}`}
@@ -124,6 +132,7 @@ export function NotificationWindow() {
             className="notification-window-panel"
             id="notification-panel-status"
             role="tabpanel"
+            tabIndex={-1}
           >
             <NotificationStatusView
               cancel={notifications.cancel}
@@ -139,6 +148,7 @@ export function NotificationWindow() {
             className="notification-window-panel"
             id="notification-panel-history"
             role="tabpanel"
+            tabIndex={-1}
           >
             <NotificationHistoryView
               activeLibraryId={notifications.compact.activeLibraryId}
@@ -158,6 +168,7 @@ export function NotificationWindow() {
             className="notification-window-panel"
             id="notification-panel-logs"
             role="tabpanel"
+            tabIndex={-1}
           >
             <ProcessLogView
               authoritativeFailures={authoritativeFailures}

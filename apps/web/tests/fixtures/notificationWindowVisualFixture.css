@@ -9,6 +9,12 @@ body,
 }
 
 .notification-window-fixture {
+  position: relative;
   min-width: 0;
   min-height: 0;
+  isolation: isolate;
+}
+
+.notification-window-fixture .notification-window-content {
+  min-width: 0;
 }

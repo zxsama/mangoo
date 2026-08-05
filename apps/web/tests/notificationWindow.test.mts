@@ -11,6 +11,7 @@ describe("full notification center contract", () => {
   const historySource = read("src/features/notifications/NotificationHistoryView.tsx");
   const logSource = read("src/features/notifications/ProcessLogView.tsx");
   const fixtureSource = read("tests/fixtures/notificationWindowVisualFixture.tsx");
+  const overlayCss = read("src/design/overlays/overlay.css");
   const styles = read("src/styles.css");
 
   it("uses the shared secondary window frame and three accessible pages", () => {
@@ -20,7 +21,18 @@ describe("full notification center contract", () => {
     assert.match(windowSource, /NotificationStatusView/);
     assert.match(windowSource, /NotificationHistoryView/);
     assert.match(windowSource, /ProcessLogView/);
+    assert.match(windowSource, /当前状态/);
+    assert.match(windowSource, /历史记录/);
+    assert.match(windowSource, /进程日志/);
+    assert.match(historySource, /OverlayField/);
+    assert.match(historySource, /OverlaySelect/);
+    assert.match(logSource, /OverlayField/);
+    assert.match(logSource, /OverlaySelect/);
     assert.doesNotMatch(windowSource, /unread|已读|未读/i);
+    assert.doesNotMatch(
+      windowSource + statusSource + historySource + logSource,
+      /notification-view-eyebrow/
+    );
   });
 
   it("keeps history actions capability-gated and rendering bounded", () => {
@@ -31,6 +43,8 @@ describe("full notification center contract", () => {
     assert.match(historySource, /origins/);
     assert.match(historySource, /kinds/);
     assert.match(historySource, /getHistoryFacets/);
+    assert.match(historySource, /cancel/);
+    assert.match(historySource, /retry/);
     assert.doesNotMatch(historySource, /MAX_CLIENT_FILTER_PAGES/);
     assert.doesNotMatch(historySource, /visibleItemss*=s*useMemo/);
     assert.doesNotMatch(historySource, /raw fetch|node:fs/i);
@@ -53,6 +67,8 @@ describe("full notification center contract", () => {
     assert.doesNotMatch(logSource, /queryGenerationRef/);
     assert.match(logSource, /clearLogs/);
     assert.match(logSource, /exportLogs/);
+    assert.match(logSource, /focusMedia/);
+    assert.match(logSource, /aria-label=\{`序列/);
     assert.doesNotMatch(logSource, /new Blob|URL\.createObjectURL|anchor\.download/);
     assert.match(logSource, /LOG_PAGE_SIZE = 200/);
     assert.match(logSource, /加载更早日志/);
@@ -61,12 +77,27 @@ describe("full notification center contract", () => {
   });
 
   it("uses the approved no-divider secondary-window material", () => {
-    assert.match(styles, /\.notification-window-body\s*\{/);
-    assert.match(styles, /\.notification-window-nav\s*\{[^}]*border-inline-end:\s*0;/s);
-    assert.match(styles, /\.notification-window-content\s*\{[^}]*overflow:\s*hidden;/s);
-    assert.match(styles, /var\(--secondary-window-pane-dark\)/);
-    assert.match(styles, /var\(--secondary-window-pane-light\)/);
-    assert.match(styles, /var\(--secondary-window-pane-end\)/);
+    const fullCenterCss = overlayCss.match(
+      /\/\* Full notification center \*\/([\s\S]*?)(?=\n\/\* Library switcher \*\/)/
+    )?.[1] ?? "";
+    assert.match(overlayCss, /\/\* Full notification center \*\//);
+    assert.match(overlayCss, /\.notification-window-body\s*\{/);
+    assert.match(overlayCss, /\.notification-window-nav\s*\{[^}]*border-inline-end:\s*0;/s);
+    assert.match(overlayCss, /\.notification-window-content\s*\{[^}]*overflow:\s*hidden;/s);
+    assert.match(overlayCss, /--secondary-window-pane-dark/);
+    assert.match(overlayCss, /--secondary-window-pane-light/);
+    assert.match(overlayCss, /--secondary-window-pane-end/);
+    assert.match(
+      overlayCss,
+      /\.notification-log-line\s*\{[^}]*grid-template-columns:\s*72px 92px 56px minmax\(0, 1fr\);[^}]*align-items:\s*baseline;/s
+    );
+    assert.match(overlayCss, /@media \(max-width:\s*760px\)[\s\S]*grid-template-rows:\s*auto minmax\(0, 1fr\)/);
+    assert.doesNotMatch(
+      overlayCss,
+      /notification-window-nav[^}]*border-(right|inline-end):\s*1px/s
+    );
+    assert.doesNotMatch(fullCenterCss, /:hover/);
+    assert.doesNotMatch(styles, /\/\* Full notification center|\.notification-window-body\s*\{/);
   });
 
   it("surfaces status, thumbnail, result, and degraded states", () => {
@@ -87,10 +118,15 @@ describe("full notification center contract", () => {
       "active-purge",
       "thumbnailSummaries",
       "retry-error",
+      "history-cancel",
+      "cancelActions",
+      "retryActions",
       "emitGap",
       "activeLogSubscriptions",
       "logUnsubscriptions",
       "droppedBeforeSequence",
+      "NotificationWindowIntent",
+      "failureSnapshot",
       "degraded"
     ]) {
       assert.match(fixtureSource, new RegExp(token));

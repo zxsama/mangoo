@@ -16,6 +16,7 @@ import type {
   DesktopNotificationOperation,
   DesktopNotificationStatus
 } from "@megle/notification-contract";
+import { OverlayField, OverlaySelect } from "../../design/overlays";
 import type {
   NotificationHistoryState,
   NotificationRequestResult
@@ -203,10 +204,7 @@ export function NotificationHistoryView({
   return (
     <div className="notification-view notification-history-view">
       <header className="notification-view-heading notification-history-heading">
-        <div>
-          <span className="notification-view-eyebrow">ALL LIBRARIES</span>
-          <h1>通知历史</h1>
-        </div>
+        <h1>历史记录</h1>
         <div className="notification-heading-actions">
           <span>{history.total.toLocaleString()} 条记录</span>
           <button
@@ -222,15 +220,15 @@ export function NotificationHistoryView({
       </header>
 
       <div aria-label="通知历史筛选" className="notification-history-filters" role="search">
-        <label className="notification-filter-search">
-          <span className="sr-only">搜索通知</span>
-          <input
+        <div className="notification-filter-search">
+          <OverlayField
+            aria-label="搜索通知"
             onChange={(event) => setSearch(event.currentTarget.value)}
             placeholder="搜索标题、目标或错误"
             type="search"
             value={search}
           />
-        </label>
+        </div>
         <FilterSelect label="资源库" onChange={setLibraryId} value={libraryId}>
           <option value="">所有资源库</option>
           {facets.libraries.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
@@ -416,12 +414,15 @@ function FilterSelect({
   value: string;
 }) {
   return (
-    <label className="notification-filter-select">
-      <span>{label}</span>
-      <select onChange={(event) => onChange(event.currentTarget.value)} value={value}>
+    <div className="notification-filter-select">
+      <OverlaySelect
+        label={label}
+        onChange={(event) => onChange(event.currentTarget.value)}
+        value={value}
+      >
         {children}
-      </select>
-    </label>
+      </OverlaySelect>
+    </div>
   );
 }
 
