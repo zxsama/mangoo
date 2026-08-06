@@ -18,6 +18,12 @@ describe("full notification center contract", () => {
     assert.match(windowSource, /SecondaryWindowFrame/);
     assert.match(windowSource, /role="notifications"/);
     assert.match(windowSource, /role="tablist"/);
+    assert.match(windowSource, /aria-orientation=\{tabOrientation\}/);
+    assert.match(windowSource, /window\.matchMedia\(NOTIFICATION_WINDOW_NARROW_QUERY\)/);
+    assert.match(windowSource, /addEventListener\("change"/);
+    assert.match(windowSource, /removeEventListener\("change"/);
+    assert.match(windowSource, /window\.addEventListener\("resize", syncOrientation\)/);
+    assert.match(windowSource, /window\.removeEventListener\("resize", syncOrientation\)/);
     assert.match(windowSource, /NotificationStatusView/);
     assert.match(windowSource, /NotificationHistoryView/);
     assert.match(windowSource, /ProcessLogView/);
@@ -46,7 +52,9 @@ describe("full notification center contract", () => {
     assert.match(historySource, /cancel/);
     assert.match(historySource, /retry/);
     assert.doesNotMatch(historySource, /MAX_CLIENT_FILTER_PAGES/);
-    assert.doesNotMatch(historySource, /visibleItemss*=s*useMemo/);
+    const forbiddenClientFilter = /visibleItems\s*=\s*useMemo\s*\(/;
+    assert.match("const visibleItems = useMemo(() => []);", forbiddenClientFilter);
+    assert.doesNotMatch(historySource, forbiddenClientFilter);
     assert.doesNotMatch(historySource, /raw fetch|node:fs/i);
   });
 
@@ -71,6 +79,10 @@ describe("full notification center contract", () => {
     assert.match(logSource, /aria-label=\{`序列/);
     assert.doesNotMatch(logSource, /new Blob|URL\.createObjectURL|anchor\.download/);
     assert.match(logSource, /LOG_PAGE_SIZE = 200/);
+    assert.match(logSource, /useLayoutEffect/);
+    assert.match(logSource, /queueMicrotask/);
+    assert.match(logSource, /dispatchEvent\(new Event\("scroll"\)\)/);
+    assert.doesNotMatch(logSource, /setInterval/);
     assert.match(logSource, /加载更早日志/);
     assert.doesNotMatch(logSource, /firstSequence.*lastSequenceRef/);
     assert.doesNotMatch(logSource, /node:fs|fetch\s*\(/);
@@ -126,6 +138,8 @@ describe("full notification center contract", () => {
       "logUnsubscriptions",
       "droppedBeforeSequence",
       "NotificationWindowIntent",
+      "useNotificationTabOrientation",
+      "aria-orientation={tabOrientation}",
       "failureSnapshot",
       "degraded"
     ]) {

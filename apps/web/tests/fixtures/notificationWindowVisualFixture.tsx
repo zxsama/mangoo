@@ -15,6 +15,7 @@ import { useOverlayScrollbars } from "../../src/app-shell/useOverlayScrollbars";
 import { LiquidGlassLayer, LiquidGlassSurface } from "../../src/design/liquid-glass";
 import { NotificationHistoryView } from "../../src/features/notifications/NotificationHistoryView";
 import { NotificationStatusView } from "../../src/features/notifications/NotificationStatusView";
+import { useNotificationTabOrientation } from "../../src/features/notifications/NotificationWindow";
 import { ProcessLogView } from "../../src/features/notifications/ProcessLogView";
 import { buildCompactNotificationModel } from "../../src/features/notifications/notificationModel";
 import type { NotificationHistoryState } from "../../src/features/notifications/useNotifications";
@@ -220,6 +221,7 @@ const allLogs: DesktopProcessLogLine[] = Array.from({ length: 260 }, (_, index) 
 
 function NotificationWindowVisualFixture() {
   useOverlayScrollbars();
+  const tabOrientation = useNotificationTabOrientation();
   const [page, setPage] = useState<FixturePage>("status");
   const [logIntent, setLogIntent] = useState<NotificationWindowIntent | null>(null);
   const [history, setHistory] = useState<NotificationHistoryState>({
@@ -359,7 +361,12 @@ function NotificationWindowVisualFixture() {
         <div className="secondary-window-body notification-window-body">
           <nav aria-label="通知中心页面" className="notification-window-nav">
             <div className="notification-window-nav-heading">通知中心</div>
-            <div aria-label="通知中心页面" className="notification-window-tabs" role="tablist">
+            <div
+              aria-label="通知中心页面"
+              aria-orientation={tabOrientation}
+              className="notification-window-tabs"
+              role="tablist"
+            >
               {tabs.map(({ id, icon: Icon, label }) => (
                 <button
                   aria-controls={`notification-fixture-panel-${id}`}

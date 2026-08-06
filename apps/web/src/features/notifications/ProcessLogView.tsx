@@ -11,6 +11,7 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -90,6 +91,7 @@ export function ProcessLogView({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const autoFollowSyncRef = useRef(false);
   const pausedRef = useRef(false);
   const pausedBufferRef = useRef(createPausedProcessLogBuffer());
 
@@ -196,9 +198,20 @@ export function ProcessLogView({
     getItemKey: (index) => processLogRowKey(rows[index], index)
   });
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!follow || paused || rows.length === 0) return;
-    virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      autoFollowSyncRef.current = true;
+      virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
+      scrollRef.current?.dispatchEvent(new Event("scroll"));
+      autoFollowSyncRef.current = false;
+    });
+    return () => {
+      cancelled = true;
+      autoFollowSyncRef.current = false;
+    };
   }, [follow, paused, rows.length, virtualizer]);
 
   const togglePause = () => {
@@ -390,7 +403,7 @@ export function ProcessLogView({
         aria-label="进程日志内容"
         className="notification-log-list"
         onScroll={(event) => {
-          if (!follow) return;
+          if (!follow || autoFollowSyncRef.current) return;
           const element = event.currentTarget;
           if (element.scrollHeight - element.scrollTop - element.clientHeight > 32) setFollow(false);
         }}

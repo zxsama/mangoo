@@ -22,6 +22,30 @@ const PAGES = [
   { id: "logs", label: "进程日志", icon: ScrollText }
 ] as const;
 
+export const NOTIFICATION_WINDOW_NARROW_QUERY = "(max-width: 760px)";
+
+export function useNotificationTabOrientation(): "horizontal" | "vertical" {
+  const [orientation, setOrientation] = useState<"horizontal" | "vertical">(() =>
+    typeof window !== "undefined" && window.matchMedia(NOTIFICATION_WINDOW_NARROW_QUERY).matches
+      ? "horizontal"
+      : "vertical"
+  );
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia(NOTIFICATION_WINDOW_NARROW_QUERY);
+    const syncOrientation = () => setOrientation(mediaQuery.matches ? "horizontal" : "vertical");
+    syncOrientation();
+    mediaQuery.addEventListener("change", syncOrientation);
+    window.addEventListener("resize", syncOrientation);
+    return () => {
+      mediaQuery.removeEventListener("change", syncOrientation);
+      window.removeEventListener("resize", syncOrientation);
+    };
+  }, []);
+
+  return orientation;
+}
+
 export function NotificationWindow() {
   useSecondaryWindowInterfaceStyle();
   useOverlayScrollbars();
@@ -31,6 +55,7 @@ export function NotificationWindow() {
   const [failureSnapshot, setFailureSnapshot] = useState<ThumbnailFailureSnapshot | null>(null);
   const [logIntentVersion, setLogIntentVersion] = useState(0);
   const focusIntentPanelRef = useRef(false);
+  const tabOrientation = useNotificationTabOrientation();
 
   const applyIntent = useCallback((intent: NotificationWindowIntent) => {
     focusIntentPanelRef.current = true;
@@ -103,7 +128,12 @@ export function NotificationWindow() {
     >
       <nav aria-label="通知中心页面" className="notification-window-nav">
         <div className="notification-window-nav-heading">通知中心</div>
-        <div aria-label="通知中心页面" className="notification-window-tabs" role="tablist">
+        <div
+          aria-label="通知中心页面"
+          aria-orientation={tabOrientation}
+          className="notification-window-tabs"
+          role="tablist"
+        >
           {PAGES.map(({ id, icon: Icon, label }) => (
             <button
               aria-controls={`notification-panel-${id}`}

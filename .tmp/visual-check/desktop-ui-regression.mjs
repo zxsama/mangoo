@@ -19,6 +19,7 @@ const webUrl = "http://127.0.0.1:5179";
 const debugPort = Number(process.env.MEGLE_VISUAL_DEBUG_PORT ?? process.env.MEGLE_REMOTE_DEBUG_PORT ?? 13242);
 const runStartedAt = new Date();
 const osBackdropEvidenceEnabled = process.env.MEGLE_VISUAL_OS_BACKDROP === "1";
+const notificationWindowOnly = process.env.MEGLE_VISUAL_NOTIFICATIONS_ONLY === "1";
 const osBackdropEvidenceMode = osBackdropEvidenceEnabled
   ? "required-os-composited"
   : "optional-skipped-static-only";
@@ -1511,6 +1512,8 @@ async function notificationWindowFixtureEvidence(client) {
       viewport: { width: window.innerWidth, height: window.innerHeight },
       selectedPage: document.querySelector('.notification-window-tab[aria-selected="true"]')?.getAttribute("data-fixture-page") ?? null,
       tabCount: document.querySelectorAll('.notification-window-tab[role="tab"]').length,
+      tabOrientation: document.querySelector('.notification-window-tabs[role="tablist"]')?.getAttribute("aria-orientation") ?? null,
+      narrowQueryMatches: window.matchMedia("(max-width: 760px)").matches,
       bodyGrid: bodyStyle?.gridTemplateColumns ?? null,
       bodyBackground: bodyStyle?.backgroundImage ?? null,
       navBorderRightWidth: navStyle?.borderRightWidth ?? null,
@@ -1563,6 +1566,73 @@ async function notificationWindowFixtureEvidence(client) {
       fixtureClient,
       "ui-notification-window-fixture-status.png"
     );
+
+    await clickSelector(fixtureClient, ".notification-thumbnail-failure-action");
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector(".notification-process-log-view")) && window.notificationWindowFixture?.getMetrics().activeLogSubscriptions === 1`,
+      10000,
+      "first-entry thumbnail failure logs"
+    );
+    const firstFailureEvidenceExpression = `(() => {
+      const list = document.querySelector(".notification-log-list");
+      if (!(list instanceof HTMLElement)) return { visibleActionableRows: 0, visibleFailureRows: 0 };
+      const listRect = list.getBoundingClientRect();
+      const rows = [...document.querySelectorAll(".notification-log-line")];
+      const visibleRows = rows.filter((row) => {
+        const rect = row.getBoundingClientRect();
+        return rect.bottom > listRect.top && rect.top < listRect.bottom;
+      });
+      const visibleFailureRows = visibleRows.filter((row) => row.textContent?.includes("failure-"));
+      return {
+        clientHeight: list.clientHeight,
+        scrollHeight: list.scrollHeight,
+        scrollTop: list.scrollTop,
+        mountedIndices: rows.map((row) => Number(row.getAttribute("data-index"))),
+        visibleRows: visibleRows.length,
+        visibleFailureRows: visibleFailureRows.length,
+        visibleActionableRows: visibleFailureRows.filter((row) => row instanceof HTMLButtonElement && !row.disabled).length
+      };
+    })()`;
+    const failureDeadline = Date.now() + 10000;
+    let firstFailureBeforeAction = null;
+    while (Date.now() < failureDeadline) {
+      firstFailureBeforeAction = await evaluate(fixtureClient, firstFailureEvidenceExpression);
+      if (firstFailureBeforeAction?.visibleActionableRows > 0) break;
+      await delay(200);
+    }
+    if (!firstFailureBeforeAction || firstFailureBeforeAction.visibleActionableRows < 1) {
+      throw new Error(
+        `Timed out waiting for visible actionable failure row on first drilldown; evidence=${JSON.stringify(firstFailureBeforeAction)}`
+      );
+    }
+    await evaluate(
+      fixtureClient,
+      `(() => {
+        const list = document.querySelector(".notification-log-list");
+        if (!(list instanceof HTMLElement)) return false;
+        const listRect = list.getBoundingClientRect();
+        const button = [...document.querySelectorAll("button.notification-log-line.actionable")].find((row) => {
+          const rect = row.getBoundingClientRect();
+          return row.textContent?.includes("failure-") && rect.bottom > listRect.top && rect.top < listRect.bottom;
+        });
+        button?.click();
+        return Boolean(button);
+      })()`
+    );
+    await waitFor(
+      fixtureClient,
+      `document.querySelector(".notification-log-footer span:last-child")?.textContent?.includes("媒体")`,
+      10000,
+      "first-entry failure action"
+    );
+    const firstFailureDrilldown = {
+      ...firstFailureBeforeAction,
+      actionMessage: await evaluate(
+        fixtureClient,
+        `document.querySelector(".notification-log-footer span:last-child")?.textContent?.trim() ?? null`
+      )
+    };
 
     await clickSelector(fixtureClient, '[data-fixture-page="history"]');
     await waitFor(
@@ -1683,6 +1753,13 @@ async function notificationWindowFixtureEvidence(client) {
 
     const resize = await resizeScriptOpenedWindow(fixtureClient, 640, 620);
     await waitFor(fixtureClient, `window.innerWidth <= 660`, 10000, "narrow notification window fixture");
+    await evaluate(fixtureClient, `window.dispatchEvent(new Event("resize"))`);
+    await waitFor(
+      fixtureClient,
+      `document.querySelector('.notification-window-tabs[role="tablist"]')?.getAttribute("aria-orientation") === "horizontal"`,
+      10000,
+      "narrow notification tab orientation"
+    );
     const narrow = await evaluate(fixtureClient, evidenceExpression);
     const narrowScreenshot = await rendererScreenshot(
       fixtureClient,
@@ -1706,6 +1783,7 @@ async function notificationWindowFixtureEvidence(client) {
 
     return {
       status,
+      firstFailureDrilldown,
       historyInitial,
       history,
       logsGap,
@@ -3218,6 +3296,41 @@ try {
     color: { r: 0, g: 0, b: 0, a: 0 }
   });
 
+  if (notificationWindowOnly) {
+    await waitFor(client, `Boolean(document.querySelector(".app-shell"))`, 30000, "app shell");
+    const notificationWindowFixture = await notificationWindowFixtureEvidence(client);
+    const notificationFailures = [];
+    if (
+      notificationWindowFixture.status?.tabOrientation !== "vertical" ||
+      notificationWindowFixture.narrow?.tabOrientation !== "horizontal"
+    ) {
+      notificationFailures.push("notification tab orientation did not follow the responsive layout");
+    }
+    if (
+      notificationWindowFixture.firstFailureDrilldown?.visibleFailureRows < 1 ||
+      notificationWindowFixture.firstFailureDrilldown?.visibleActionableRows < 1 ||
+      !notificationWindowFixture.firstFailureDrilldown?.actionMessage?.includes("媒体")
+    ) {
+      notificationFailures.push("first failure drilldown was not visible and actionable");
+    }
+    summary = {
+      run: {
+        id: visualRunId,
+        mode: "task6-notification-window",
+        startedAtUtc: runStartedAt.toISOString(),
+        completedAtUtc: new Date().toISOString()
+      },
+      screenshots: notificationWindowFixture.screenshots,
+      evidence: { notificationWindowFixture },
+      hardFailures: notificationFailures,
+      fatalError: null
+    };
+    await writeFile(summaryPath, JSON.stringify(summary, null, 2));
+    if (notificationFailures.length) {
+      throw new Error(`Task6 notification window harness failed: ${notificationFailures.join(", ")}`);
+    }
+  } else {
+
   await waitFor(client, `Boolean(document.querySelector(".app-shell"))`, 30000, "app shell");
   await waitFor(
     client,
@@ -4242,6 +4355,7 @@ try {
 
   if (hardFailures.length) {
     throw new Error(`Desktop UI visual regression failed: ${hardFailures.join(", ")}. See ${summaryPath}`);
+  }
   }
 } catch (error) {
   fatalError = error;
