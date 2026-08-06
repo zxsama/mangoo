@@ -2025,7 +2025,6 @@
   }
 }
 
-/* Library switcher */
 /* Responsive, reduced motion, reduced transparency, and backdrop-filter fallback */
 @media (max-width: 760px) {
   .notification-window-body {

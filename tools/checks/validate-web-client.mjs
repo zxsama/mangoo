@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import ts from "typescript";
 
 const root = process.cwd();
 const webSrc = path.join(root, "apps", "web", "src");
@@ -36,6 +37,97 @@ function walk(directory) {
 
 function sourceMatch(source, pattern) {
   return source.match(pattern)?.[0] ?? "";
+}
+
+function stripSourceCommentsAndStrings(source) {
+  let output = "";
+  let quote = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      output += character === "\n" ? "\n" : " ";
+      if (character === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      output += character === "\n" ? "\n" : " ";
+      if (character === "*" && next === "/") {
+        output += " ";
+        index += 1;
+        blockComment = false;
+      }
+      continue;
+    }
+    if (quote) {
+      output += character === "\n" ? "\n" : " ";
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === "/" && next === "/") {
+      output += "  ";
+      index += 1;
+      lineComment = true;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      output += "  ";
+      index += 1;
+      blockComment = true;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      output += " ";
+      quote = character;
+      continue;
+    }
+    output += character;
+  }
+  return output;
+}
+
+function sourceModuleSpecifiers(source) {
+  const sourceFile = ts.createSourceFile(
+    "web-client-source.tsx",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX
+  );
+  const moduleSpecifiers = [];
+
+  function visit(node) {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      moduleSpecifiers.push(node.moduleSpecifier.text);
+    }
+    if (ts.isCallExpression(node) && node.arguments.length === 1) {
+      const expression = node.expression;
+      const isDynamicImport = expression.kind === ts.SyntaxKind.ImportKeyword;
+      const isRequire = ts.isIdentifier(expression) && expression.text === "require";
+      if ((isDynamicImport || isRequire) && ts.isStringLiteral(node.arguments[0])) {
+        moduleSpecifiers.push(node.arguments[0].text);
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return moduleSpecifiers;
+}
+
+function retiredOverlayImportPatterns(source) {
+  return sourceModuleSpecifiers(source).filter((modulePath) => {
+    const moduleName = modulePath.replaceAll("\\", "/").split("/").at(-1);
+    return ["anchoredPopover", "anchoredPopover.ts", "useFocusTrap", "useFocusTrap.ts"].includes(
+      moduleName
+    );
+  });
 }
 
 const useLibraryData = read("apps/web/src/core/useLibraryData.ts");
@@ -196,15 +288,15 @@ for (const [modulePath, source, requiredValues] of [
   ]
 ]) {
   for (const value of requiredValues) {
-    if (!source.includes(value)) {
+    if (!stripSourceCommentsAndStrings(source).includes(value)) {
       fail(`shared overlay module ${modulePath} missing ${value}`);
     }
   }
 }
-if (!anchoredOverlay.includes('from "./overlayPosition"')) {
+if (!sourceModuleSpecifiers(anchoredOverlay).includes("./overlayPosition")) {
   fail("AnchoredOverlay must delegate positioning to the shared overlayPosition module");
 }
-if (!overlayProvider.includes('from "./overlayStack"')) {
+if (!sourceModuleSpecifiers(overlayProvider).includes("./overlayStack")) {
   fail("OverlayProvider must delegate stack state to the shared overlayStack module");
 }
 
@@ -217,11 +309,11 @@ for (const retiredPath of retiredOverlayHelperPaths) {
     fail(`retired overlay helper must stay deleted: ${retiredPath}`);
   }
 }
-const retiredOverlayImport = /from\s*["'][^"']*(?:anchoredPopover|features\/file-ops\/useFocusTrap|\.\/useFocusTrap)(?:\.ts)?["']/;
 for (const filePath of walk(webSrc)) {
   const source = read(path.relative(root, filePath));
-  if (retiredOverlayImport.test(source)) {
-    fail(`web source must not import retired overlay helpers: ${path.relative(root, filePath)}`);
+  const retiredImports = retiredOverlayImportPatterns(source);
+  if (retiredImports.length > 0) {
+    fail(`web source must not import retired overlay helpers (${retiredImports.join(", ")}): ${path.relative(root, filePath)}`);
   }
 }
 
@@ -570,12 +662,13 @@ const compactResultsPropPattern = /\bresults\s*(?:\?|:|=)/;
 const compactTerminalResultPattern =
   /notification-result|terminal-result|ResultDescription|resultOperationPresentation|\bterminalResults?\b/i;
 for (const [compactPath, compactSource] of compactNotificationProductionSources) {
+  const structuralSource = stripSourceCommentsAndStrings(compactSource);
   for (const [label, pattern] of [
     ["model.results", compactModelResultsPattern],
     ["a results prop", compactResultsPropPattern],
     ["a terminal-result row contract", compactTerminalResultPattern]
   ]) {
-    if (pattern.test(compactSource)) {
+    if (pattern.test(structuralSource)) {
       fail(`compact notification production boundary must not contain ${label}: ${compactPath}`);
     }
   }
@@ -2327,7 +2420,7 @@ if (popoverOrder.some((index) => index < 0) || popoverOrder.some((index, i) => i
   fail("compact notification popover must render active, thumbnail, then full-center action");
 }
 for (const [compactPath, compactSource] of compactNotificationProductionSources) {
-  if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(compactSource)) {
+  if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(stripSourceCommentsAndStrings(compactSource))) {
     fail(`compact notification production boundary must stay read-only: ${compactPath}`);
   }
 }

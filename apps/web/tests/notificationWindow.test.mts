@@ -90,7 +90,7 @@ describe("full notification center contract", () => {
 
   it("uses the approved no-divider secondary-window material", () => {
     const fullCenterCss = overlayCss.match(
-      /\/\* Full notification center \*\/([\s\S]*?)(?=\n\/\* Library switcher \*\/)/
+      /\/\* Full notification center \*\/([\s\S]*?)(?=\n\/\* Responsive, reduced motion, reduced transparency, and backdrop-filter fallback \*\/)/
     )?.[1] ?? "";
     assert.match(overlayCss, /\/\* Full notification center \*\//);
     assert.match(overlayCss, /\.notification-window-body\s*\{/);

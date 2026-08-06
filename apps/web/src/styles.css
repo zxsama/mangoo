@@ -3210,24 +3210,6 @@ button:disabled {
   background: rgba(206, 153, 113, 0.9);
 }
 
-.filter-menu-trigger {
-  position: relative;
-  width: var(--titlebar-control-size);
-  height: var(--titlebar-control-size);
-  padding: 0;
-}
-
-.filter-menu-dot {
-  position: absolute;
-  right: 5px;
-  top: 5px;
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--accent);
-  box-shadow: 0 0 0 2px rgba(5, 9, 13, 0.72);
-}
-
 .filter-chips {
   display: flex;
   flex-wrap: wrap;

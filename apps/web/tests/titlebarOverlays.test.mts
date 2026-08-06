@@ -6,6 +6,63 @@ const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.ur
 const readRepo = (path: string) =>
   readFileSync(new URL(`../../../${path}`, import.meta.url), "utf8");
 
+const cssRuleSelectors = (source: string) => {
+  const withoutComments = source.replace(/\/\*[\s\S]*?\*\//g, "");
+  const selectors: string[] = [];
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  let preludeStart = 0;
+  for (let index = 0; index < withoutComments.length; index += 1) {
+    const character = withoutComments[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === "{") {
+      const prelude = withoutComments.slice(preludeStart, index).trim();
+      if (prelude && !prelude.startsWith("@")) selectors.push(prelude);
+      preludeStart = index + 1;
+    } else if (character === "}") {
+      preludeStart = index + 1;
+    }
+  }
+  return selectors;
+};
+
+const hasCompleteSelector = (source: string, selector: string) =>
+  cssRuleSelectors(source)
+    .flatMap((rule) => rule.split(","))
+    .some((candidate) =>
+      new RegExp(`^${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[\\s:.#[>+~]|$)`).test(candidate.trim())
+    );
+
+const overlaySectionMarkers = [
+  "/* Core variables and surfaces */",
+  "/* Anchored positioning and modal shell */",
+  "/* Menu and field controls */",
+  "/* Titlebar overlays */",
+  "/* Library switcher */",
+  "/* Context menus and file dialogs */",
+  "/* Compact notification */",
+  "/* Full notification center */",
+  "/* Responsive, reduced motion, reduced transparency, and backdrop-filter fallback */"
+];
+
+const sectionPositions = (source: string, markers: string[]) =>
+  markers.map((marker) => {
+    const escapedMarker = marker.replaceAll("*", String.fromCharCode(92) + "*");
+    const matches = [...source.matchAll(new RegExp(`^[ \\t]*${escapedMarker}[ \\t]*\\r?$`, "gm"))];
+    assert.equal(matches.length, 1, `${marker} must appear exactly once`);
+    return matches[0]?.index ?? -1;
+  });
+
 describe("titlebar overlay migration", () => {
   const app = read("src/app/App.tsx");
   const filter = read("src/features/library/FilterMenu.tsx");
@@ -49,28 +106,31 @@ describe("titlebar overlay migration", () => {
       ".sort-menu-options",
       ".layout-menu-options"
     ]) {
-      assert.match(overlayCss, new RegExp(selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.equal(hasCompleteSelector(overlayCss, selector), true, `${selector} is not an owned CSS rule`);
     }
     for (const selector of [
       ".search-bar",
       ".filter-menu-popover",
       ".sort-menu-list",
-      ".layout-menu-options"
+      ".layout-menu-options",
+      ".filter-menu-trigger",
+      ".filter-menu-dot"
     ]) {
-      assert.doesNotMatch(styles, new RegExp(`^${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[\\s,{:.#]|$)`, "m"));
+      assert.equal(hasCompleteSelector(styles, selector), false, `${selector} remains in styles.css`);
     }
 
-    const sectionOrder = [
-      "/* Core variables and surfaces */",
-      "/* Titlebar overlays */",
-      "/* Library switcher */",
-      "/* Context menus and file dialogs */",
-      "/* Compact notification */",
-      "/* Full notification center */",
-      "/* Responsive, reduced motion, reduced transparency, and backdrop-filter fallback */"
-    ].map((marker) => overlayCss.indexOf(marker));
-    assert.ok(sectionOrder.every((index) => index >= 0));
+    const sectionOrder = sectionPositions(overlayCss, overlaySectionMarkers);
     assert.ok(sectionOrder.every((index, position) => position === 0 || index > sectionOrder[position - 1]));
+  });
+
+  it("requires actual CSS rules and ignores comment/string lookalikes", () => {
+    const fixture = `
+      /* .filter-menu-trigger { color: red; } */
+      .search-bar[data-titlebar-search="true"] { content: ".filter-menu-trigger"; }
+    `;
+    assert.equal(hasCompleteSelector(fixture, ".filter-menu-trigger"), false);
+    assert.equal(hasCompleteSelector(fixture, ".search-bar"), true);
+    assert.equal(hasCompleteSelector(fixture, '.search-bar[data-titlebar-search="true"]'), true);
   });
 
   it("keeps validators aligned with the shared titlebar overlay contract", () => {
@@ -91,6 +151,22 @@ describe("titlebar overlay migration", () => {
     assert.doesNotMatch(uiValidator, /compact popover coordination contract/);
     assert.doesNotMatch(uiValidator, /titlebar search must keep exactly one outer outline rule/);
     assert.doesNotMatch(uiValidator, /titlebar search must suppress the inner glass backdrop/);
+  });
+
+  it("uses comment/string-safe structural validator guards", () => {
+    assert.match(webValidator, /function stripSourceCommentsAndStrings/);
+    assert.match(uiValidator, /function stripSourceCommentsAndStrings/);
+    assert.match(webValidator, /function sourceModuleSpecifiers/);
+    assert.match(webValidator, /ts\.isImportDeclaration/);
+    assert.match(webValidator, /isDynamicImport/);
+    assert.match(webValidator, /isRequire/);
+    assert.match(webValidator, /retiredOverlayImportPatterns/);
+    assert.match(uiValidator, /stripSourceCommentsAndStrings\(source\)/);
+    assert.doesNotMatch(webValidator, /const retiredOverlayImport = \/from\\s/);
+    assert.doesNotMatch(
+      uiValidator,
+      /if \(\/createPortal\|LiquidGlassSurface\|useOverlayStack\|model\\\.results\/\.test\(notificationPopover\)\)/
+    );
   });
 
   it("exercises the production notification titlebar wiring", () => {

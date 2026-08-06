@@ -28,6 +28,59 @@ function readOptional(relativePath) {
   return readFileSync(absolutePath, "utf8");
 }
 
+function stripSourceCommentsAndStrings(source) {
+  let output = "";
+  let quote = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      output += character === "\n" ? "\n" : " ";
+      if (character === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      output += character === "\n" ? "\n" : " ";
+      if (character === "*" && next === "/") {
+        output += " ";
+        index += 1;
+        blockComment = false;
+      }
+      continue;
+    }
+    if (quote) {
+      output += character === "\n" ? "\n" : " ";
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === "/" && next === "/") {
+      output += "  ";
+      index += 1;
+      lineComment = true;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      output += "  ";
+      index += 1;
+      blockComment = true;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      output += " ";
+      quote = character;
+      continue;
+    }
+    output += character;
+  }
+  return output;
+}
+
 const desktopMain = read("apps/desktop/src/main.ts");
 const secondaryReveal = read("apps/desktop/src/secondary-window-reveal.ts");
 const preload = read("apps/desktop/src/preload.cjs");
@@ -80,7 +133,7 @@ const overlayPrimitives = [
   read("apps/web/src/design/overlays/OverlayMenu.tsx"),
   read("apps/web/src/design/overlays/OverlayDialog.tsx"),
   read("apps/web/src/design/overlays/useOverlayFocusTrap.ts")
-].join("\n");
+].map(stripSourceCommentsAndStrings).join("\n");
 const inspectorMetadata = read("apps/web/src/features/preview/InspectorMetadata.tsx");
 const renameDialog = read("apps/web/src/features/file-ops/RenameDialog.tsx");
 const moveDialog = read("apps/web/src/features/file-ops/MoveDialog.tsx");
@@ -1569,10 +1622,11 @@ const migratedOverlaySourceEntries = [
   ["ProcessLogView", processLogView]
 ];
 for (const [label, source] of migratedOverlaySourceEntries) {
-  if (/\bcreatePortal\b/.test(source)) {
+  const structuralSource = stripSourceCommentsAndStrings(source);
+  if (/\bcreatePortal\b/.test(structuralSource)) {
     fail(`${label} must delegate portal ownership to shared overlay primitives`);
   }
-  if (/\bzIndex\s*[:=]|\bz-index\s*:/.test(source)) {
+  if (/\bzIndex\s*[:=]|\bz-index\s*:/.test(structuralSource)) {
     fail(`${label} must not define feature-local overlay stacking`);
   }
 }
@@ -1665,7 +1719,7 @@ for (const [label, source, rootId, overlayId, preferredWidth] of [
       fail(`${label} shared anchored overlay contract missing ${value}`);
     }
   }
-  if (/createPortal|LiquidGlassSurface/.test(source)) {
+  if (/createPortal|LiquidGlassSurface/.test(stripSourceCommentsAndStrings(source))) {
     fail(`${label} must not retain feature-local portal or popup surface code`);
   }
   if (!source.includes(`aria-controls="${overlayId}"`) || !source.includes('role="group"')) {
@@ -1688,7 +1742,7 @@ for (const [label, source] of [
     }
   }
 }
-if (/AnchoredOverlay|createPortal|LiquidGlassSurface/.test(searchBar)) {
+if (/AnchoredOverlay|createPortal|LiquidGlassSurface/.test(stripSourceCommentsAndStrings(searchBar))) {
   fail("titlebar search must remain inline without a result popover or feature-local glass surface");
 }
 
@@ -1704,7 +1758,8 @@ for (const value of [
     fail(`notification popover compact popover contract missing ${value}`);
   }
 }
-if (/createPortal|LiquidGlassSurface|useOverlayStack|model\.results/.test(notificationPopover)) {
+const notificationPopoverStructuralSource = stripSourceCommentsAndStrings(notificationPopover);
+if (/createPortal|LiquidGlassSurface|useOverlayStack|model\.results/.test(notificationPopoverStructuralSource)) {
   fail("notification popover must reuse AnchoredOverlay and omit terminal results");
 }
 for (const [label, pattern] of [
@@ -1712,7 +1767,7 @@ for (const [label, pattern] of [
   ["cancel actions", /\b(?:cancel|onCancel)\b/i],
   ["retry actions", /\b(?:retry|onRetry)\b/i]
 ]) {
-  if (pattern.test(notificationPopover)) {
+  if (pattern.test(notificationPopoverStructuralSource)) {
     fail(`compact notification must not render ${label}`);
   }
 }
@@ -1823,7 +1878,7 @@ if (
 ) {
   fail("notification popover must scroll its content while keeping the full-center footer reachable");
 }
-if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopover)) {
+if (/\b(?:cancel|retry|onCancel|onRetry)\b/i.test(notificationPopoverStructuralSource)) {
   fail("compact notification UI must not contain task actions");
 }
 for (const selector of [

@@ -4,17 +4,64 @@ import { describe, it } from "node:test";
 
 const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
+const stripCssComments = (source: string) => {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "");
+};
+
 const cssRuleSelectors = (source: string) => {
-  const withoutComments = source.replace(/\/\*[\s\S]*?\*\//g, "");
-  return [...withoutComments.matchAll(/(?:^|[{}])\s*([^{}]+?)\s*\{/g)]
-    .map((match) => match[1].trim())
-    .filter((selector) => !selector.startsWith("@"));
+  const withoutComments = stripCssComments(source);
+  const selectors: string[] = [];
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  let preludeStart = 0;
+  for (let index = 0; index < withoutComments.length; index += 1) {
+    const character = withoutComments[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === "{") {
+      const prelude = withoutComments.slice(preludeStart, index).trim();
+      if (prelude && !prelude.startsWith("@")) selectors.push(prelude);
+      preludeStart = index + 1;
+    } else if (character === "}") {
+      preludeStart = index + 1;
+    }
+  }
+  return selectors;
 };
 
 const hasCompleteSelector = (source: string, selector: string) =>
   cssRuleSelectors(source)
     .flatMap((rule) => rule.split(","))
     .some((candidate) => new RegExp(`^${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[\\s:.#[>+~]|$)`).test(candidate.trim()));
+
+const overlaySectionMarkers = [
+  "/* Core variables and surfaces */",
+  "/* Anchored positioning and modal shell */",
+  "/* Menu and field controls */",
+  "/* Titlebar overlays */",
+  "/* Library switcher */",
+  "/* Context menus and file dialogs */",
+  "/* Compact notification */",
+  "/* Full notification center */",
+  "/* Responsive, reduced motion, reduced transparency, and backdrop-filter fallback */"
+];
+
+const sectionPositions = (source: string, markers: string[]) =>
+  markers.map((marker) => {
+    const escapedMarker = marker.replaceAll("*", String.fromCharCode(92) + "*");
+    const matches = [...source.matchAll(new RegExp(`^[ \\t]*${escapedMarker}[ \\t]*\\r?$`, "gm"))];
+    assert.equal(matches.length, 1, `${marker} must appear exactly once`);
+    return matches[0]?.index ?? -1;
+  });
 
 describe("shared overlay source contract", () => {
   const mainSource = read("src/main.tsx");
@@ -64,7 +111,9 @@ describe("shared overlay source contract", () => {
       ".sort-menu-list",
       ".filter-menu-popover",
       ".notification-popover",
-      ".notification-window-body"
+      ".notification-window-body",
+      ".filter-menu-trigger",
+      ".filter-menu-dot"
     ]) {
       assert.equal(hasCompleteSelector(legacyStyles, selector), false, `${selector} remains in styles.css`);
       assert.equal(hasCompleteSelector(overlayCss, selector), true, `${selector} is missing from overlay.css`);
@@ -73,6 +122,20 @@ describe("shared overlay source contract", () => {
     assert.doesNotMatch(legacyStyles, /rgba\(20,\s*20,\s*22,\s*0\.98\)/);
     assert.doesNotMatch(legacyStyles, /rgba\(23,\s*27,\s*32,\s*0\.99\)/);
     assert.doesNotMatch(legacyStyles, /#1c1c1e/i);
+  });
+
+  it("keeps overlay sections unique and ordered", () => {
+    const positions = sectionPositions(overlayCss, overlaySectionMarkers);
+    assert.ok(positions.every((position, index) => index === 0 || position > positions[index - 1]));
+  });
+
+  it("does not mistake CSS comments or strings for selector ownership", () => {
+    const fixture = `
+      /* .filter-menu-trigger { color: red; } */
+      .search-bar[data-titlebar-search="true"] { content: ".filter-menu-trigger"; }
+    `;
+    assert.equal(hasCompleteSelector(fixture, ".filter-menu-trigger"), false);
+    assert.equal(hasCompleteSelector(fixture, ".search-bar"), true);
   });
 
   it("preserves the locked anchor API and one rendered width path", () => {
