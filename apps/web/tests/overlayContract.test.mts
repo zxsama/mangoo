@@ -118,6 +118,11 @@ describe("shared overlay source contract", () => {
       assert.equal(hasCompleteSelector(legacyStyles, selector), false, `${selector} remains in styles.css`);
       assert.equal(hasCompleteSelector(overlayCss, selector), true, `${selector} is missing from overlay.css`);
     }
+    assert.equal(
+      hasCompleteSelector(legacyStyles, ".dialog-error"),
+      false,
+      ".dialog-error remains in styles.css"
+    );
 
     assert.doesNotMatch(legacyStyles, /rgba\(20,\s*20,\s*22,\s*0\.98\)/);
     assert.doesNotMatch(legacyStyles, /rgba\(23,\s*27,\s*32,\s*0\.99\)/);
