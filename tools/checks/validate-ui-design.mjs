@@ -70,6 +70,17 @@ const searchBar = read("apps/web/src/features/library/SearchBar.tsx");
 const overlayField = read("apps/web/src/design/overlays/OverlayField.tsx");
 const overlayStyles = read("apps/web/src/design/overlays/overlay.css");
 const overlayStylesForChecks = stripCssComments(overlayStyles);
+const overlayPosition = read("apps/web/src/design/overlays/overlayPosition.ts");
+const overlayStack = read("apps/web/src/design/overlays/overlayStack.ts");
+const overlayPrimitives = [
+  overlayPosition,
+  overlayStack,
+  read("apps/web/src/design/overlays/AnchoredOverlay.tsx"),
+  read("apps/web/src/design/overlays/OverlaySurface.tsx"),
+  read("apps/web/src/design/overlays/OverlayMenu.tsx"),
+  read("apps/web/src/design/overlays/OverlayDialog.tsx"),
+  read("apps/web/src/design/overlays/useOverlayFocusTrap.ts")
+].join("\n");
 const inspectorMetadata = read("apps/web/src/features/preview/InspectorMetadata.tsx");
 const renameDialog = read("apps/web/src/features/file-ops/RenameDialog.tsx");
 const moveDialog = read("apps/web/src/features/file-ops/MoveDialog.tsx");
@@ -100,6 +111,8 @@ const useShortcuts = read("apps/web/src/features/shortcuts/useShortcuts.ts");
 const settingsView = read("apps/web/src/features/settings/settingsPanels.tsx");
 const interfaceStyle = read("apps/web/src/features/settings/interfaceStyle.ts");
 const contextMenu = read("apps/web/src/features/file-ops/ContextMenu.tsx");
+const librarySwitcher = read("apps/web/src/features/library/LibrarySwitcher.tsx");
+const libraryGlyph = read("apps/web/src/features/library/libraryGlyph.tsx");
 const desktopBridge = read("apps/web/src/core/desktop.ts");
 const coreClientContract = read("packages/core-client/src/generated-contract.ts");
 const coreClient = read("packages/core-client/src/client.ts");
@@ -315,7 +328,10 @@ if (!/left:\s*50%/.test(notificationDotCss) ||
   fail("notification status dot must stay horizontally centered over the Bell icon");
 }
 for (const selector of [".notification-scan-paths", ".notification-thumbnail-failure-action"]) {
-  if (cssBlocksForExactSelector(stylesForChecks, selector).length === 0) {
+  if (
+    cssBlocksForExactSelector(stylesForChecks, selector).length === 0 &&
+    cssBlocksForExactSelector(overlayStylesForChecks, selector).length === 0
+  ) {
     fail(`notification drill-down style missing ${selector}`);
   }
 }
@@ -335,8 +351,7 @@ if (!/\.shell-right-actions \.titlebar-icon-button,[\s\S]*?border:\s*0;/.test(st
 for (const [selector, maxAlpha] of [
   [".liquid-glass-tone-chrome", 0.01],
   [".liquid-glass-tone-panel", 0.01],
-  [".liquid-glass.shell-titlebar", 0.01],
-  [".liquid-glass.context-menu", 0.01]
+  [".liquid-glass.shell-titlebar", 0.01]
 ]) {
   const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
   if (!blocks.some((block) => cssRgbaAlpha(latestDeclarationValue(block, "--glass-fill")) <= maxAlpha)) {
@@ -409,12 +424,13 @@ for (const selector of [
 }
 
 for (const value of [
+  ".overlay-surface",
   ".context-menu",
-  ".dialog-panel",
-  "backdrop-filter: blur(var(--glass-elevated-blur)) saturate(1.5)"
+  ".file-operation-dialog",
+  "var(--glass-dialog-blur)"
 ]) {
-  if (!stylesForChecks.includes(value)) {
-    fail(`floating glass layer styling missing ${value}`);
+  if (!overlayStylesForChecks.includes(value)) {
+    fail(`shared overlay glass layer styling missing ${value}`);
   }
 }
 
@@ -837,7 +853,12 @@ for (const [selector, checks, message] of [
     "main window controls must use the approved 32x28px titlebar tokens"
   ]
 ]) {
-  const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
+  const blocks = [
+    ...cssBlocksForExactSelector(stylesForChecks, selector),
+    ...(selector === ".search-bar"
+      ? cssBlocksForSelector(overlayStylesForChecks, selector)
+      : cssBlocksForExactSelector(overlayStylesForChecks, selector))
+  ];
   if (!blocks.some((block) => checks.every((check) => check.test(block)))) {
     fail(message);
   }
@@ -1500,6 +1521,113 @@ for (const value of ["useOverlayStack", "OverlayRootId", "setRootOpen"]) {
     fail(`shared titlebar overlay coordination contract missing ${value}`);
   }
 }
+
+for (const token of [
+  "--glass-dialog-fill",
+  "--glass-dialog-blur",
+  "--glass-center-fill",
+  "--secondary-window-pane-dark",
+  "--radius-overlay",
+  "--radius-surface",
+  "--radius-control",
+  "--radius-content",
+  "--radius-tight"
+]) {
+  if (!overlayStylesForChecks.includes(`var(${token})`)) {
+    fail(`shared overlay stylesheet must consume ${token}`);
+  }
+}
+for (const primitive of [
+  "resolveOverlayPosition",
+  "createOverlayStackState",
+  "AnchoredOverlay",
+  "OverlaySurface",
+  "OverlayMenuList",
+  "ModalSurface",
+  "useOverlayFocusTrap"
+]) {
+  if (!overlayPrimitives.includes(primitive)) {
+    fail(`shared overlay primitive contract missing ${primitive}`);
+  }
+}
+
+const migratedOverlaySourceEntries = [
+  ["FilterMenu", filterMenu ?? ""],
+  ["SortMenu", sortMenu],
+  ["LayoutMenu", layoutMenu],
+  ["SearchBar", searchBar],
+  ["LibrarySwitcher", librarySwitcher],
+  ["libraryGlyph", libraryGlyph],
+  ["ContextMenu", contextMenu],
+  ["RenameDialog", renameDialog],
+  ["MoveDialog", moveDialog],
+  ["DeleteConfirm", deleteConfirm],
+  ["NotificationPopover", notificationPopover],
+  ["NotificationWindow", notificationWindow],
+  ["NotificationStatusView", notificationStatusView],
+  ["NotificationHistoryView", notificationHistoryView],
+  ["ProcessLogView", processLogView]
+];
+for (const [label, source] of migratedOverlaySourceEntries) {
+  if (/\bcreatePortal\b/.test(source)) {
+    fail(`${label} must delegate portal ownership to shared overlay primitives`);
+  }
+  if (/\bzIndex\s*[:=]|\bz-index\s*:/.test(source)) {
+    fail(`${label} must not define feature-local overlay stacking`);
+  }
+}
+
+const migratedHoverFamilies = [
+  ".overlay-menu-item",
+  ".filter-menu-item",
+  ".library-switcher-row",
+  ".library-switcher-main",
+  ".library-switcher-actions",
+  ".notification-icon-action",
+  ".notification-text-action",
+  ".notification-primary-action",
+  ".notification-row-action",
+  ".notification-toolbar-action",
+  ".overlay-dialog-button",
+  ".context-menu-item"
+];
+const migratedOverlayCssFamilies = [
+  ".filter-menu-popover",
+  ".filter-menu-root",
+  ".sort-menu-list",
+  ".sort-menu-root",
+  ".layout-menu-root",
+  ".library-switcher",
+  ".library-icon-picker--overlay",
+  ".context-menu",
+  ".file-operation-dialog",
+  ".notification-popover"
+];
+const localHoverPaint = /\b(?:background(?:-color)?|border(?:-(?:color|style|width)|-(?:top|right|bottom|left|inline|block)(?:-(?:color|style|width))?)?)\s*:/;
+for (const [stylesheet, source] of [
+  ["styles.css", stylesForChecks],
+  ["overlay.css", overlayStylesForChecks]
+]) {
+  const localStack = cssRuleBlocksForMatchingSelectors(
+    source,
+    (selector) =>
+      migratedOverlayCssFamilies.some((family) => cssSelectorContainsClass(selector, family))
+  ).find(({ block }) => /\bz-index\s*:/.test(block));
+  if (localStack) {
+    fail(`${stylesheet} must not define feature-local overlay stacking: ${localStack.selectorList}`);
+  }
+
+  const paintedHover = cssRuleBlocksForMatchingSelectors(
+    source,
+    (selector) =>
+      selector.includes(":hover") &&
+      migratedHoverFamilies.some((family) => cssSelectorContainsClass(selector, family))
+  ).find(({ block }) => localHoverPaint.test(block));
+  if (paintedHover) {
+    fail(`${stylesheet} must not paint migrated overlay hover state: ${paintedHover.selectorList}`);
+  }
+}
+
 for (const rootId of ["notifications", "filter", "sort", "layout"]) {
   const source = rootId === "notifications" ? shellNotificationOverlay : app;
   if (!source.includes(`isRootOpen("${rootId}")`)) {
@@ -1579,6 +1707,15 @@ for (const value of [
 if (/createPortal|LiquidGlassSurface|useOverlayStack|model\.results/.test(notificationPopover)) {
   fail("notification popover must reuse AnchoredOverlay and omit terminal results");
 }
+for (const [label, pattern] of [
+  ["terminal results", /\bmodel\s*\.\s*results\b|notification-result/i],
+  ["cancel actions", /\b(?:cancel|onCancel)\b/i],
+  ["retry actions", /\b(?:retry|onRetry)\b/i]
+]) {
+  if (pattern.test(notificationPopover)) {
+    fail(`compact notification must not render ${label}`);
+  }
+}
 
 const titlebarOverlaySection =
   overlayStyles.match(
@@ -1610,7 +1747,7 @@ if (/\b(?:backdrop-filter|box-shadow|z-index)\s*:/.test(titlebarOverlaySection))
 }
 const compactNotificationSection =
   overlayStyles.match(
-    /\/\* Compact notification \*\/([\s\S]*?)(?=\n\/\* Library switcher \*\/|\n@keyframes overlay-root-enter)/,
+    /\/\* Compact notification \*\/([\s\S]*?)(?=\n\/\* Full notification center \*\/)/,
   )?.[1] ?? "";
 if (!compactNotificationSection) {
   fail("shared overlay stylesheet must define the Compact notification section");
@@ -1703,23 +1840,16 @@ if (cssBlocksForExactSelector(stylesForChecks, ".notification-status-dot").lengt
   fail("notification compact UI style missing .notification-status-dot");
 }
 
-for (const selector of [".floating-popover"]) {
-  const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
-  if (blocks.length === 0) {
-    fail(`compact popover material selector missing ${selector}`);
-  }
-}
-
-const floatingPopoverBlocks = cssBlocksForExactSelector(stylesForChecks, ".floating-popover");
+const floatingPopoverBlocks = cssBlocksForExactSelector(overlayStylesForChecks, ".overlay-surface");
 if (
   !floatingPopoverBlocks.some(
     (block) =>
-      /--glass-fill:\s*var\(--glass-elevated\)/.test(block) &&
-      /--glass-blur-current:\s*var\(--glass-elevated-blur\)/.test(block) &&
+      /--glass-fill:\s*var\(--glass-dialog-fill\)/.test(block) &&
+      /--glass-blur-current:\s*var\(--glass-dialog-blur\)/.test(block) &&
       hasNonNoneDeclaration(block, "box-shadow")
   )
 ) {
-  fail("floating popovers must use elevated glass material instead of flat content styling");
+  fail("shared overlay surfaces must use dialog glass tokens instead of feature-local material styling");
 }
 
 for (const value of [

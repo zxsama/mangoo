@@ -16,6 +16,7 @@ describe("titlebar overlay migration", () => {
   const overlayFixture = read("tests/fixtures/overlayLifecycleFixture.tsx");
   const shellOverlayHost = read("src/app-shell/ShellOverlayHost.tsx");
   const styles = read("src/styles.css");
+  const overlayCss = read("src/design/overlays/overlay.css");
   const webValidator = readRepo("tools/checks/validate-web-client.mjs");
   const uiValidator = readRepo("tools/checks/validate-ui-design.mjs");
 
@@ -37,6 +38,39 @@ describe("titlebar overlay migration", () => {
     assert.doesNotMatch(search, /AnchoredOverlay|createPortal/);
     assert.doesNotMatch(styles, /\.search-bar-clear:hover/);
     assert.doesNotMatch(styles, /\.search-bar\[data-titlebar-search="true"\]:hover/);
+  });
+
+  it("keeps migrated titlebar ownership in the shared stylesheet", () => {
+    for (const selector of [
+      '.search-bar[data-titlebar-search="true"]',
+      ".filter-menu-root",
+      ".filter-menu-popover",
+      ".sort-menu-list",
+      ".sort-menu-options",
+      ".layout-menu-options"
+    ]) {
+      assert.match(overlayCss, new RegExp(selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    }
+    for (const selector of [
+      ".search-bar",
+      ".filter-menu-popover",
+      ".sort-menu-list",
+      ".layout-menu-options"
+    ]) {
+      assert.doesNotMatch(styles, new RegExp(`^${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[\\s,{:.#]|$)`, "m"));
+    }
+
+    const sectionOrder = [
+      "/* Core variables and surfaces */",
+      "/* Titlebar overlays */",
+      "/* Library switcher */",
+      "/* Context menus and file dialogs */",
+      "/* Compact notification */",
+      "/* Full notification center */",
+      "/* Responsive, reduced motion, reduced transparency, and backdrop-filter fallback */"
+    ].map((marker) => overlayCss.indexOf(marker));
+    assert.ok(sectionOrder.every((index) => index >= 0));
+    assert.ok(sectionOrder.every((index, position) => position === 0 || index > sectionOrder[position - 1]));
   });
 
   it("keeps validators aligned with the shared titlebar overlay contract", () => {

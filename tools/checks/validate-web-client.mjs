@@ -139,6 +139,10 @@ const windowedMediaGeometry = read(
 );
 const main = read("apps/web/src/main.tsx");
 const app = read("apps/web/src/app/App.tsx");
+const overlayPosition = read("apps/web/src/design/overlays/overlayPosition.ts");
+const overlayStack = read("apps/web/src/design/overlays/overlayStack.ts");
+const anchoredOverlay = read("apps/web/src/design/overlays/AnchoredOverlay.tsx");
+const overlayProvider = read("apps/web/src/design/overlays/OverlayProvider.tsx");
 const previewPrefetchWindowPath = "apps/web/src/app/previewPrefetchWindow.ts";
 const previewPrefetchWindow = existsSync(path.join(root, previewPrefetchWindowPath))
   ? read(previewPrefetchWindowPath)
@@ -178,6 +182,48 @@ const notificationVisualFixture = existsSync(path.join(root, notificationVisualF
   ? read(notificationVisualFixturePath)
   : "";
 const desktopVisualHarness = read(".tmp/visual-check/desktop-ui-regression.mjs");
+
+for (const [modulePath, source, requiredValues] of [
+  [
+    "apps/web/src/design/overlays/overlayPosition.ts",
+    overlayPosition,
+    ["resolveOverlayPosition", "resolveAnchoredOverlayLayout", "resolveOverlayAnchorOffset"]
+  ],
+  [
+    "apps/web/src/design/overlays/overlayStack.ts",
+    overlayStack,
+    ["createOverlayStackState", "openOverlayRoot", "pushOverlayLayer", "topOverlayLayer"]
+  ]
+]) {
+  for (const value of requiredValues) {
+    if (!source.includes(value)) {
+      fail(`shared overlay module ${modulePath} missing ${value}`);
+    }
+  }
+}
+if (!anchoredOverlay.includes('from "./overlayPosition"')) {
+  fail("AnchoredOverlay must delegate positioning to the shared overlayPosition module");
+}
+if (!overlayProvider.includes('from "./overlayStack"')) {
+  fail("OverlayProvider must delegate stack state to the shared overlayStack module");
+}
+
+const retiredOverlayHelperPaths = [
+  "apps/web/src/features/library/anchoredPopover.ts",
+  "apps/web/src/features/file-ops/useFocusTrap.ts"
+];
+for (const retiredPath of retiredOverlayHelperPaths) {
+  if (existsSync(path.join(root, retiredPath))) {
+    fail(`retired overlay helper must stay deleted: ${retiredPath}`);
+  }
+}
+const retiredOverlayImport = /from\s*["'][^"']*(?:anchoredPopover|features\/file-ops\/useFocusTrap|\.\/useFocusTrap)(?:\.ts)?["']/;
+for (const filePath of walk(webSrc)) {
+  const source = read(path.relative(root, filePath));
+  if (retiredOverlayImport.test(source)) {
+    fail(`web source must not import retired overlay helpers: ${path.relative(root, filePath)}`);
+  }
+}
 
 const compactNotificationEntrySources = [
   [notificationPopoverPath, notificationPopover],

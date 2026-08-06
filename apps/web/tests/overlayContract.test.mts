@@ -4,10 +4,23 @@ import { describe, it } from "node:test";
 
 const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
+const cssRuleSelectors = (source: string) => {
+  const withoutComments = source.replace(/\/\*[\s\S]*?\*\//g, "");
+  return [...withoutComments.matchAll(/(?:^|[{}])\s*([^{}]+?)\s*\{/g)]
+    .map((match) => match[1].trim())
+    .filter((selector) => !selector.startsWith("@"));
+};
+
+const hasCompleteSelector = (source: string, selector: string) =>
+  cssRuleSelectors(source)
+    .flatMap((rule) => rule.split(","))
+    .some((candidate) => new RegExp(`^${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[\\s:.#[>+~]|$)`).test(candidate.trim()));
+
 describe("shared overlay source contract", () => {
   const mainSource = read("src/main.tsx");
   const settingsWindowSource = read("src/features/settings/SettingsWindow.tsx");
   const pluginsWindowSource = read("src/features/plugins/PluginsWindow.tsx");
+  const legacyStyles = read("src/styles.css");
   const overlayCss = read("src/design/overlays/overlay.css");
   const anchoredOverlaySource = read("src/design/overlays/AnchoredOverlay.tsx");
   const overlayPositionSource = read("src/design/overlays/overlayPosition.ts");
@@ -41,6 +54,25 @@ describe("shared overlay source contract", () => {
     assert.match(overlayCss, /var\(--glass-dialog-fill\)/);
     assert.match(overlayCss, /var\(--glass-center-stroke\)/);
     assert.doesNotMatch(overlaySourceBundle, /fetch\s*\(|node:fs|@radix|@floating-ui/);
+  });
+
+  it("keeps migrated overlay ownership in overlay.css", () => {
+    for (const selector of [
+      ".context-menu",
+      ".dialog-backdrop",
+      ".library-switcher-backdrop",
+      ".sort-menu-list",
+      ".filter-menu-popover",
+      ".notification-popover",
+      ".notification-window-body"
+    ]) {
+      assert.equal(hasCompleteSelector(legacyStyles, selector), false, `${selector} remains in styles.css`);
+      assert.equal(hasCompleteSelector(overlayCss, selector), true, `${selector} is missing from overlay.css`);
+    }
+
+    assert.doesNotMatch(legacyStyles, /rgba\(20,\s*20,\s*22,\s*0\.98\)/);
+    assert.doesNotMatch(legacyStyles, /rgba\(23,\s*27,\s*32,\s*0\.99\)/);
+    assert.doesNotMatch(legacyStyles, /#1c1c1e/i);
   });
 
   it("preserves the locked anchor API and one rendered width path", () => {
