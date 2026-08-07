@@ -78,7 +78,7 @@ The current plan is component-based. We are not forking an existing image-manage
    - Task-by-task implementation and verification plan.
 
 21. [Unified Overlay UI Verification](benchmarks/2026-07-27-unified-overlay-verification.md)
-   - Task 8 automated, controlled-fixture, native-window, appearance, DPI, and limitation evidence.
+   - Task 8 exact/dirty automated results, reproducible fixtures, native-window, appearance/DPI evidence, and strict residuals.
 
 ## Supporting
 

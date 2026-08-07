@@ -4,189 +4,171 @@ Date: 2026-08-08
 
 This report records Task 8 of
 [`2026-07-27-unified-overlay-ui.md`](../superpowers/plans/2026-07-27-unified-overlay-ui.md)
-against the design in
+against
 [`2026-07-27-unified-overlay-ui-design.md`](../superpowers/specs/2026-07-27-unified-overlay-ui-design.md).
 
-## Verification Basis
+## Immutable Scope
 
-- Verification base: `6561d5a0ab3b3e27ff38f3478a7030a7063f2572`, the HEAD before Task 8 edits.
-- The base worktree contained the user's 17 modified and 12 untracked WIP files. The index was empty before Task 8 staging and all unrelated WIP remained unstaged.
-- The Task 8 endpoint is the commit containing this report, the README index update, and the two visual harness files. The tested range is `6561d5a0..HEAD` after that commit is created.
-- `apps/web/src/app/App.tsx` remained SHA256 `5CDB9648949EF64AD2612D53C7029635EB5EFCC6F15F6305780454CB3F965A56`.
-- Settings and Plugins production source files were not modified.
+- Task 8 range: `6561d5a0ab3b3e27ff38f3478a7030a7063f2572..92d565a9e0d35f99f32026588dddb2a4f4e45e41`.
+- Review-fix range: `5e29d71fe12fd63c17e40e66897d64929e30d3a5..92d565a9e0d35f99f32026588dddb2a4f4e45e41`.
+- Exact clean source snapshot: `92d565a9e0d35f99f32026588dddb2a4f4e45e41`.
+- The live worktree retained the user's 17 modified and 12 untracked files. The index was empty before every Task 8 commit.
+- `apps/web/src/app/App.tsx` remained SHA-256 `5CDB9648949EF64AD2612D53C7029635EB5EFCC6F15F6305780454CB3F965A56`.
+- Settings and Plugins production sources were not changed. Task 8 changed only tracked harness and documentation files.
 
-## Automated Gate
+The clean snapshot was created with `git archive`, not a worktree, junction, or
+symbolic link. It was extracted to
+`D:\Megle\.tmp\task8-exact-92d565a9e0d3-20260808-062605` and was not deleted.
+No package install was run. The archive reused the existing
+`D:\Megle\node_modules`, a shared Cargo target, a normal two-line Electron CMD
+launcher, and a copied Core binary built from the archived source. Source files
+were exact; the dependency installation was not independently rebuilt.
 
-The pre-visual gate was run from `D:\Megle` on 2026-08-07. Exit evidence is in
-`.tmp/visual-check/logs/task8-2026-08-07/`.
+## Automated Gates
 
-| Command | Exit | Result |
-| --- | ---: | --- |
-| `git diff --check` | 0 | Clean whitespace check. |
-| `npm run check:structure` | 0 | Structure and contracts passed. |
-| `npm run check:web` | 0 | 371 tests passed, 0 failed, 61 suites. |
-| `npm run check:desktop` | 0 | 222 tests passed, 0 failed, 8 suites. |
-| `npm run check:ui-design` | 0 | Liquid glass design boundaries passed. |
-| `npm test` | 0 | Full gate passed; Rust reported 477 passed, 0 failed, 2 ignored. |
+| Tree | Command | Exit | Result | Evidence |
+| --- | --- | ---: | --- | --- |
+| Exact `92d565a9` | `node --test .tmp\visual-check\task8-harness-reproducibility.test.mjs` | 0 | 5 passed; root resolution, generated media, rejection, diagnostics, DPI/preferences/appearance contracts | Exact archive console run |
+| Exact `92d565a9` | `npm test` | 0 | Desktop 222/222; web 367/367; Rust 470 passed, 2 ignored | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\19-exact-final-npm-test.log` |
+| Dirty WIP | `npm test` | 1 | Web LibrarySwitcher before-hook failed; 10 children were cancelled | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\10-dirty-wip-npm-test.log` |
+| Dirty WIP | focused LibrarySwitcher test | 0 | 10/10 passed immediately after the failed full attempt | Console run |
+| Dirty WIP | final post-document `npm test` | 0 | Desktop 222/222; web 371/371; Rust 477 passed, 2 ignored | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\21-final-dirty-wip-npm-test.log` |
 
-`check:web` executed the mounted overlay lifecycle and mounted file-operation
-fixtures. These covered focus/re-entrancy, shared roots, context-menu clamping
-and keyboard traversal, rename validation, move exclusions and cross-root
-failure, permanent/recycle deletion confirmation, busy/failure recovery, and
-notification wiring. The notification contract tests also covered compact and
-full-center model behavior.
+The clean counts are 367 web and 470 Rust. The 371 web and 477 Rust counts are
+only dirty-WIP evidence and are not attributed to the immutable snapshot.
 
-After the documentation and harness edits, `git diff --check` and `npm test`
-were rerun. Their final exit evidence is recorded under
-`.tmp/visual-check/logs/task8-2026-08-08/` as
-`23-final-git-diff-check.*` and `24-final-npm-test.*`; both exited `0`.
+## Harness Results
 
-## Controlled Fixtures
+| Tree | Harness | Exit | Summary |
+| --- | --- | ---: | --- |
+| Dirty WIP | Notification-only controlled fixture | 0 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\01-controlled-notification-summary.json` |
+| Dirty WIP | Required OS backdrop regression | 0 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\05-os-backdrop-summary.json` |
+| Dirty WIP | Exhaustive interaction sweep | 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\08-os-exhaustive-summary.json` |
+| Exact `bfdc1386` | Notification-only controlled fixture | 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\15-exact-controlled-notification-summary.json` |
+| Exact `3874326b` | Required OS backdrop regression | 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\17-exact-os-backdrop-summary.json` |
+| Exact `92d565a9` | Exhaustive interaction sweep | 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\20-exact-final-os-exhaustive-summary.json` |
 
-The final Windows run was:
+The dirty notification run generated and validated its own media root, observed
+the exact root in the `auto-added root` startup line, and ended with no startup
+or hard failure. It retained two classified Electron sandbox console entries
+and four expected cancelled navigation requests in the JSON.
 
-```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP; exit $code
-```
+The dirty OS run reported `run.ok: true`, `required-os-composited: passed`, an
+empty hard-failure list, and no startup problem. It retained two classified
+Electron sandbox entries and 21 expected `net::ERR_ABORTED` selection/navigation
+requests. The successful run covered compact full/failure/empty/degraded and
+narrow states, anchor relocation/remount, full notification status/history/logs,
+failure drill-down, degraded/narrow layouts, preview fit/actual modes, secondary
+windows, and the production appearance matrix.
 
-Evidence:
+Both exhaustive runs completed all 18 named scenarios with no scenario failure:
+startup/library load; Settings and Plugins secondary windows; library switcher;
+notifications; filter, sort, and layout sweeps; child-content toggle; subfolder
+cards; search/clear; tree switching; zero-result restore; preview toolbar;
+Settings grid controls; and media, folder, and root context menus. This includes
+normal, disabled, danger, edge-clamped, rename, move, recycle, permanent-delete,
+and confirmation behavior. The dirty run still exited 1 because it recorded four
+Core task-persistence startup lines and two Electron sandbox console errors. The
+exact final run verified `http://127.0.0.1:5178/`, completed 18/18, and had zero
+scenario, console, and hard failures, but exited 1 because two Core
+`thumbnail source changed while processing` startup lines remained. Success is
+therefore gated by startup, console, hard, and scenario diagnostics rather than
+being assigned unconditionally.
 
-- Exit: `0`.
-- Summary: `D:\Megle\.tmp\visual-check\logs\task8-2026-08-08\21-os-backdrop-regression-final-coverage-summary.json`.
-- OS mode: `required-os-composited`, status `passed`.
-- `hardFailures`: empty; `startupProblems`: empty; console errors: 0.
-- Cancelled `net::ERR_ABORTED` thumbnail/preview requests are expected while the harness changes selection or priority; no unexpected fixture network failure was reported.
+## Controlled Media
 
-The required post-document OS rerun also exited `0` with
-`required-os-composited: passed`, no hard failures, and no startup problems.
-Its summary is
-`D:\Megle\.tmp\visual-check\logs\task8-2026-08-08\25-post-doc-os-backdrop-regression-summary.json`.
-That rerun emitted the two known Electron sandbox startup console entries
-(`sandboxed_renderer.bundle.js` and null `startupData.preloadScripts`) that the
-harness identifies explicitly; no other console error was present.
+Both harnesses resolve the repository from `import.meta.url` and validate the
+repository entrypoints before launch. Every run creates a unique ignored
+`runtime-media/<run-id>/outputs` tree containing deterministic BMP files:
 
-The final controlled coverage included:
+- `landscape-sample.bmp` and `portrait-sample.bmp` for preview geometry.
+- `img2img-images/nested-sample.bmp` and
+  `txt2img-images/txt2img-sample.bmp` for nested/tree switching.
+- Six `img2img-grids/grid-sample-*.bmp` files for zero-result restoration and
+  multi-column layout coverage.
 
-- Filter selected states and clear/empty restoration; all sort options; Adaptive, Waterfall, Grid, and List layout selection.
-- Library switcher normal open/close, nested folder/tree interaction, search/zero-result restoration, root context actions, and secondary Settings/Plugins windows.
-- Media, folder, and root context menus, including normal, disabled root actions, danger actions, viewport clamping, preview, rename, move, recycle-bin, and permanent-delete dialogs.
-- Compact notification full active/thumbnail/failure, healthy empty, degraded empty, narrow, relocated/remounted anchor, and 125%/150% controlled page-scale states.
-- Full notification center status/history/logs, failure drill-down, degraded, and narrow states.
-
-Final notification evidence from the OS summary includes 2 active rows, 1
-determinate and 1 indeterminate progress row, 2 thumbnail libraries, 3 tabs,
-5 history filters, 13 virtualized history rows, the final history footer
-`200 / 240`, rejected retry feedback, bounded logs with all five controls,
-four visible/actionable failure rows, and the degraded narrow status.
-
-The exhaustive command was:
-
-```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-exhaustive-interaction-sweep.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP; exit $code
-```
-
-- Exit: `0`.
-- Summary: `D:\Megle\.tmp\visual-check\logs\task8-2026-08-08\22-os-exhaustive-interaction-sweep-final-summary.json`.
-- `ok: true`, failures empty, console errors 0.
-- Results: startup/library load; Settings secondary window; Plugins secondary window; library switcher; notifications; filter/sort/layout sweeps; child-folder toggle; subfolder cards; search and clear; tree switch; zero-result restore; preview toolbar; Settings grid controls; media/folder/root context menus.
+The helper validates the marker, BMP signature, dimensions, byte length, and
+SHA-256 for every file before Electron starts. No run depends on the old
+untracked `.tmp/visual-check/media` directory or an external drive.
 
 ## Appearance Matrix
 
-The OS regression opened the real Settings appearance window, exercised each
-listed slider at its supported minimum, restored its initial value, exercised
-its maximum, and restored it again. The final matrix is in
-`evidence.settingsInterfaceStyle.appearanceMatrix` in the OS summary.
+The successful dirty OS run opened a real production Rename modal without
+submitting it. For each control it sampled minimum, default, maximum, and final
+restored state after CSS transitions settled. Evidence is under
+`evidence.settingsInterfaceStyle.appearanceMatrix` in the OS JSON.
 
-| Group | Controls exercised | Default | Minimum | Maximum | Restored |
-| --- | --- | --- | --- | --- | --- |
-| Side | blur, opacity, overlay strength, saturation, stroke opacity | `1`, `1`, `1`, `1.55`, `1` | `0`, `0`, `0`, `1`, `0` | `2`, `2`, `2`, `2.2`, `2` | yes |
-| Center | blur, opacity, overlay strength, saturation, stroke opacity | `1`, `1`, `1`, `1.55`, `1` | `0`, `0`, `0`, `1`, `0` | `2`, `2`, `2`, `2.2`, `2` | yes |
-| Dialog | blur, opacity, overlay strength, backdrop dim | `1`, `1`, `1`, `0.52` | `0`, `0`, `0`, `0` | `2`, `2`, `2`, `0.85` | yes |
+| Group | Controls | Min / Default / Max | Production result |
+| --- | --- | --- | --- |
+| Side | blur, opacity, overlay strength, saturation, stroke opacity | `0/1/2`; saturation `1/1.55/2.2` | Main left/right mapped values and rendered fill/filter/border effects changed; center/dialog remained stable |
+| Center | blur, opacity, overlay strength, saturation, stroke opacity | `0/1/2`; saturation `1/1.55/2.2` | Center mapped values and rendered effects changed; side remained stable; intentional center saturation/stroke dialog mappings were included |
+| Dialog | blur, opacity, overlay strength, backdrop dim | `0/1/2`; dim `0/0.52/0.85` | Modal surface/backdrop mapped values and rendered effects changed; side/center remained stable |
 
-Each endpoint changed at least one mapped CSS variable and the final Settings
-values returned to their initial values. The final OS run passed the matrix
-hard assertions. Settings and Plugins were observed as separate native
-secondary windows; their production sources were not changed.
+All 14 entries had mapped production-variable changes and rendered-effect
+changes. Surface custom values changed for every entry except backdrop dim,
+which maps directly to the modal backdrop background; that background effect
+changed. Every declared unaffected group was byte-for-byte stable across
+min/default/max. All sliders and all production groups returned to the initial
+state at the end.
 
-## DPI And Appearance
+## DPI And Preferences
 
-The default production window was captured at a `1440 x 920` renderer viewport.
-The controlled notification fixture used `784 x 655` at both 125% and 150%
-CDP page scale; in both cases the anchored surface had a 6px gap, was contained
-in the viewport, and retained its right alignment. These are controlled browser
-page-scale checks, not Windows display-scaling checks.
+The desktop Electron target did not apply `Emulation.setPageScaleFactor`: both
+protocol visual viewport scale and renderer visual viewport scale remained 1.
+The harness therefore does not claim that sending that command changed scale.
+It applies controlled CDP device metrics and hard-asserts the effective
+`window.devicePixelRatio` instead:
 
-The agent did not change Windows Settings or relaunch at actual 100%, 125%, or
-150% system display scaling. Changing system scaling is outside the harness's
-safe bounded scope and would invalidate the user's live desktop state. Actual
-Windows 125%/150% titlebar, corner, context-menu, and keyboard-dialog passes
-remain a manual follow-up.
+| Controlled state | Effective DPR | Viewport | Result |
+| --- | ---: | --- | --- |
+| 100% | 1.00 | `784 x 655` | Anchor contained and reset confirmed |
+| 125% | 1.25 | `784 x 655` | Effective DPR asserted; anchor contained |
+| 150% | 1.50 | `784 x 655` | Effective DPR asserted; anchor contained |
 
-Reduced-preference evidence was collected through CDP media emulation:
+This is controlled DPR evidence, not a claim that Windows display scaling was
+changed. The agent did not change Windows Settings or relaunch the desktop at
+actual OS 100%, 125%, and 150% scaling. Real system-scaling titlebar, corner,
+menu, and physical anti-aliasing checks remain manual.
 
-- `prefers-reduced-motion: reduce` matched; the compact overlay computed
-  `animationName: none`, `animationDuration: 0s`, and `transform: none`.
-- `prefers-reduced-transparency: reduce` matched; the overlay used opaque
-  `rgba(18, 24, 30, 0.98)` and both its own and child backdrop filters were
-  `none`.
-- The browser's `@supports not ((backdrop-filter: blur(1px)) ...)` fallback
-  branch was not forcibly selected. Chromium supports the property, and CDP
-  has no safe switch that makes the engine report unsupported CSS. The fallback
-  rule is covered statically by the UI-design gate; an unsupported-engine pass
-  remains a limitation.
+CDP media emulation was also asserted rather than assumed:
 
-## Native Window Evidence
+- `prefers-reduced-motion: reduce` matched `true`; animation name was `none`,
+  duration `0s`, and transform `none`.
+- `prefers-reduced-transparency: reduce` matched `true`; the surface was opaque
+  `rgba(18, 24, 30, 0.98)`, and all three relevant root/child backdrop-filter
+  records were `none` with `filter: none`.
+- Chromium cannot safely emulate an engine that reports backdrop-filter as
+  unsupported. The unsupported-engine fallback remains statically covered by
+  `check:ui-design` but was not visually executed.
 
-The OS harness uses a Windows desktop capture, separate from renderer/CDP
-screenshots. The native compositor evidence is:
+## Native Evidence
 
-- `D:\Megle\.tmp\visual-check\screenshots\ui-window-backdrop-evidence-megle-visual-msjentfl-12712.png`
+The successful OS run used the Windows desktop capture path, not
+`Page.captureScreenshot`, for compositor evidence:
 
-The evidence analyzer reported transparent/native-acrylic desktop variation
-around visible Megle surfaces, with maximum outside/inside backdrop delta
-145.69 and UI surface delta 128.58. This supports real backdrop composition;
-it is not a claim that CDP screenshots reproduce physical DWM anti-aliasing.
+`D:\Megle\.tmp\visual-check\screenshots\ui-window-backdrop-evidence-megle-visual-msjhd3yn-40428.png`
 
-Additional layout/state screenshots from the same run are under
-`D:\Megle\.tmp\visual-check\screenshots\`, including
-`ui-settings-interface-style.png`,
-`ui-notification-compact-fixture-full.png`,
-`ui-notification-compact-fixture-full-150.png`,
-`ui-notification-compact-fixture-degraded.png`,
-`ui-notification-window-fixture-status.png`,
-`ui-notification-window-fixture-history.png`,
-`ui-notification-window-fixture-logs.png`,
-`ui-notification-window-fixture-narrow.png`,
-`ui-central-landscape-fit-long-edge.png`,
-`ui-central-landscape-actual-100.png`, and
-`ui-central-portrait-fit-long-edge.png`. These are layout/state evidence only.
+The file exists at report time. Its JSON records `maxDelta: 23.9`,
+`bottomMaxDelta: 32.88`, and `uiSurfaceDelta: 169.07`; the OS verification status
+is `passed`. This is backdrop-composition evidence only. It is not physical DWM
+text/corner anti-aliasing evidence. Generated screenshots remain ignored and
+are not committed.
 
-## Harness Changes And Residuals
+## Residuals
 
-Only Task 8 harness coverage was changed:
+- Exact notification-only auto-add succeeded but exited 1 on two
+  `discarding worker error for stale task attempt` startup diagnostics.
+- Exact OS/full reached the controlled notification fixture but exited 1. The
+  timeout diagnostic is
+  `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\17-exact-notification-failure-timeout.json`.
+  The page was complete at `?state=failure`, the fixture shell and `failure`
+  state were present, `#notifications-root` was absent, and there were no
+  fixture console or network errors. This is not the old landscape-preview
+  timeout, and exact OS/full is not marked feature-complete.
+- Exact exhaustive completed all scenarios but strictly failed the remaining
+  Core task-persistence startup diagnostics. No assertion was removed or
+  downgraded to make it pass.
+- Actual Windows 125%/150% scaling, unsupported-backdrop visual fallback, and
+  physical display anti-aliasing remain unverified limitations.
 
-- `desktop-ui-regression.mjs` now restores CDP target focus before clicks,
-  diagnoses notification/landscape timeouts without converting them to passes,
-  recognizes the production canvas preview readiness contract, derives preview
-  scale from the transform matrix rather than canvas backing pixels, inspects
-  direct glass layers, recognizes fixed-position anchored surfaces, and runs
-  the appearance/DPI/reduced-preference matrix.
-- `desktop-ui-exhaustive-interaction-sweep.mjs` was adapted to the current
-  secondary-window and overlay selectors and current Library interaction
-  architecture. Its original hard waits and failure behavior remain.
-
-The first full OS attempt timed out at the compact degraded fixture. A later
-diagnostic run reached the final assertions. The old landscape timeout was
-accurately located in
-`D:\Megle\.tmp\visual-check\logs\task8-2026-08-07\16-landscape-timeout-diagnostic.json`:
-the selected media and ready placeholder were present, preview responses were
-HTTP 200, and the element was a production `preview-canvas`, so the old
-`naturalWidth` predicate could never become true. The hard 30-second wait was
-retained and the predicate was corrected for canvas readiness. A transient CDP
-`Runtime.evaluate` timeout also occurred in an intermediate run; the final OS
-and exhaustive runs completed with exit 0.
-
-Remaining risks are the unperformed real Windows scaling matrix, the
-unsupported-engine fallback branch, and physical text/corner anti-aliasing
-inspection on the user's display. No Task 8 production source changes were
-made to hide these limitations.
+No Task 1-7 production source was changed to hide these residuals.
