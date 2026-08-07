@@ -996,6 +996,12 @@ try {
   await client.send("Page.enable");
   await client.send("Runtime.enable");
   await client.send("Log.enable");
+  await waitFor(
+    client,
+    `location.href.startsWith(${JSON.stringify(webUrl)})`,
+    30_000,
+    "invoked tree URL"
+  );
   invokedTree = {
     harnessPath: fileURLToPath(import.meta.url),
     repositoryRoot: root,

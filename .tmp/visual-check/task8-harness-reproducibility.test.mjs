@@ -82,6 +82,7 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   }
 
   assert.doesNotMatch(exhaustiveSource, /buildSummary\(true\)/);
+  assert.match(exhaustiveSource, /invoked tree URL/);
   for (const field of ["startupProblems", "consoleErrors", "hardFailures", "failures"]) {
     assert.match(exhaustiveSource, new RegExp(`${field}\\.length`));
   }
