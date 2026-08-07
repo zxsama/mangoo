@@ -7,6 +7,7 @@ import process from "node:process";
 import WebSocket from "ws";
 import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-browser-window-options.mjs";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
+import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
 
 const root = await resolveRepositoryRoot(import.meta.url);
 const visualRoot = path.join(root, ".tmp", "visual-check");
@@ -35,6 +36,7 @@ const responses = [];
 const requestUrls = new Map();
 const startupOutput = [];
 let child;
+let stopDevAppPromise = null;
 
 function isPreviewApiResponse(item) {
   return item.url.includes("/api/media/") && item.url.includes("/preview");
@@ -97,8 +99,9 @@ function startDevApp() {
 }
 
 function stopDevApp() {
+  if (stopDevAppPromise) return stopDevAppPromise;
   if (!child || child.killed || child.pid === undefined) return Promise.resolve();
-  return new Promise((resolve) => {
+  stopDevAppPromise = new Promise((resolve) => {
     if (process.platform === "win32") {
       const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
         stdio: "ignore",
@@ -117,6 +120,7 @@ function stopDevApp() {
       resolve();
     }, 2000).unref();
   });
+  return stopDevAppPromise;
 }
 
 async function httpJson(url) {
@@ -1322,9 +1326,30 @@ async function notificationPopoverFixtureEvidence(client) {
     try {
       await waitFor(
         fixtureClient,
-        `Boolean(document.querySelector('[data-notification-fixture="${state}"]') && document.querySelector('#notifications-root'))`,
+        `(() => {
+          const lifecycle = window.notificationPopoverFixture?.getLifecycle();
+          return lifecycle?.ready === true && lifecycle.state === ${JSON.stringify(state)} &&
+            Boolean(document.querySelector('[data-notification-fixture="${state}"]'));
+        })()`,
         10000,
-        `notification ${state} visual fixture`
+        `notification ${state} fixture ready handshake`
+      );
+      await fixtureClient.send("Page.bringToFront");
+      const openRequestId = await evaluate(
+        fixtureClient,
+        `window.notificationPopoverFixture.open()`
+      );
+      await waitFor(
+        fixtureClient,
+        `(() => {
+          const lifecycle = window.notificationPopoverFixture?.getLifecycle();
+          return lifecycle?.ready === true && lifecycle.state === ${JSON.stringify(state)} &&
+            lifecycle.requestedOpenId === ${JSON.stringify(openRequestId)} &&
+            lifecycle.renderedOpenId === ${JSON.stringify(openRequestId)} &&
+            lifecycle.open === true && Boolean(document.querySelector('#notifications-root'));
+        })()`,
+        10000,
+        `notification ${state} fixture rendered-open handshake`
       );
     } catch (error) {
       const diagnosticPath = path.join(logDir, `desktop-ui-regression-notification-${state}-timeout.json`);
@@ -1340,6 +1365,7 @@ async function notificationPopoverFixtureEvidence(client) {
             fixtureRoot: Boolean(document.querySelector(".notification-visual-fixture")),
             notificationRoot: Boolean(document.querySelector("#notifications-root")),
             notificationRootAriaHidden: document.querySelector("#notifications-root")?.getAttribute("aria-hidden") ?? null,
+            lifecycle: window.notificationPopoverFixture?.getLifecycle?.() ?? null,
             bodyText: document.body?.textContent?.trim()?.slice(0, 500) ?? null
           }))()`
         ),
@@ -1350,7 +1376,6 @@ async function notificationPopoverFixtureEvidence(client) {
       await writeFile(diagnosticPath, JSON.stringify(diagnostic, null, 2));
       throw new Error(`${String(error)}; diagnostic=${diagnosticPath}`);
     }
-    await fixtureClient.send("Page.bringToFront");
     await fixtureClient.send("Page.captureScreenshot", {
       captureBeyondViewport: false,
       format: "png"
@@ -1989,125 +2014,167 @@ async function glassMaterialEvidence(client) {
   return evidence;
 }
 
-async function openAppearanceMatrixDialog(client) {
+async function openAppearanceMatrixFixture(client) {
+  const fixtureUrl = `${webUrl}/tests/fixtures/overlay-appearance.html`;
   const opened = await evaluate(
     client,
-    `(() => {
-      const tile = document.querySelector(".media-tile");
-      if (!(tile instanceof HTMLElement)) return { ok: false, reason: "media tile missing" };
-      const rect = tile.getBoundingClientRect();
-      tile.dispatchEvent(new MouseEvent("contextmenu", {
-        bubbles: true,
-        cancelable: true,
-        clientX: Math.round(rect.left + rect.width / 2),
-        clientY: Math.round(rect.top + Math.min(rect.height * 0.4, 80)),
-        button: 2
-      }));
-      return { ok: true };
-    })()`
+    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "megle-overlay-appearance-fixture", "popup=yes,width=1120,height=820,resizable=yes"))`
   );
-  if (!opened?.ok) throw new Error(`Appearance matrix could not open media menu: ${opened?.reason}`);
-  await waitFor(client, `Boolean(document.querySelector("#context-menu-root"))`, 10000, "appearance context menu");
-  const invoked = await evaluate(
-    client,
-    `(() => {
-      const item = [...document.querySelectorAll('#context-menu-root [data-overlay-menu-item="true"]')]
-        .find((node) => node.textContent?.includes("Rename"));
-      if (!(item instanceof HTMLButtonElement) || item.disabled) return false;
-      item.click();
-      return true;
-    })()`
+  if (!opened) throw new Error("Electron refused to open the overlay appearance fixture window");
+
+  const target = await waitForTarget(
+    (page) => page.url.includes("/tests/fixtures/overlay-appearance.html"),
+    10000
   );
-  if (!invoked) throw new Error("Appearance matrix could not invoke the Rename dialog");
+  const fixtureClient = new CdpClient(target.webSocketDebuggerUrl);
+  await fixtureClient.ready;
+  const consoleErrors = [];
+  const networkProblems = [];
+  fixtureClient.on("Runtime.consoleAPICalled", (event) => {
+    if (event.type !== "error") return;
+    consoleErrors.push({
+      type: event.type,
+      text: event.args?.map((arg) => arg.value ?? arg.description ?? "").join(" ") ?? ""
+    });
+  });
+  fixtureClient.on("Log.entryAdded", (event) => {
+    if (event.entry?.level === "error") {
+      consoleErrors.push({ type: "log", text: event.entry.text ?? "" });
+    }
+  });
+  fixtureClient.on("Network.responseReceived", (event) => {
+    if ((event.response?.status ?? 0) >= 400) {
+      networkProblems.push({
+        url: event.response?.url ?? "",
+        status: event.response?.status ?? 0,
+        type: event.type
+      });
+    }
+  });
+  fixtureClient.on("Network.loadingFailed", (event) => {
+    if (event.type !== "WebSocket") {
+      networkProblems.push({
+        requestId: event.requestId,
+        status: "loadingFailed",
+        type: event.type,
+        errorText: event.errorText
+      });
+    }
+  });
+  await Promise.all([
+    fixtureClient.send("Page.enable"),
+    fixtureClient.send("Runtime.enable"),
+    fixtureClient.send("Network.enable"),
+    fixtureClient.send("Log.enable")
+  ]);
+  await fixtureClient.send("Emulation.setEmulatedMedia", {
+    media: "",
+    features: [{ name: "prefers-reduced-motion", value: "reduce" }]
+  });
   await waitFor(
-    client,
-    `Boolean(document.querySelector('.overlay-modal-surface[data-overlay-state="open"]') && document.querySelector('.overlay-modal-backdrop[data-overlay-state="open"]'))`,
+    fixtureClient,
+    `matchMedia("(prefers-reduced-motion: reduce)").matches === true`,
     10000,
-    "appearance production dialog"
+    "appearance fixture reduced-motion settled sampling"
   );
+  await fixtureClient.send("Page.bringToFront");
+  await waitFor(
+    fixtureClient,
+    `Boolean(document.querySelector('[data-overlay-appearance-fixture="ready"]') &&
+      document.querySelector('[data-appearance-surface="popover"]') &&
+      document.querySelector('[data-appearance-surface="nested"]') &&
+      document.querySelector('[data-appearance-surface="context"]') &&
+      document.querySelector('#appearance-matrix-modal.overlay-modal-surface'))`,
+    10000,
+    "overlay appearance production fixture"
+  );
+  return { client: fixtureClient, consoleErrors, networkProblems };
 }
 
-async function closeAppearanceMatrixDialog(client) {
-  await pressKey(client, "Escape", "Escape", 27).catch(() => undefined);
-  await waitFor(
-    client,
-    `!document.querySelector('.overlay-modal-backdrop:not([aria-hidden="true"])')`,
-    10000,
-    "appearance production dialog close"
+async function closeAppearanceMatrixFixture(fixtureClient) {
+  await evaluate(fixtureClient, `window.close()`).catch(() => undefined);
+  fixtureClient.close();
+  await waitForTargetCount(
+    (page) => page.url.includes("/tests/fixtures/overlay-appearance.html"),
+    0,
+    10000
   ).catch(() => undefined);
 }
 
 function productionAppearanceEvidenceExpression(groupVariables) {
   return `(() => {
+    const filterPart = (value, name) => {
+      const match = String(value ?? "").match(new RegExp(name + "\\\\(([^)]+)\\\\)"));
+      return match?.[1] ?? "none";
+    };
     const surface = (selector) => {
       const element = document.querySelector(selector);
       const style = element ? getComputedStyle(element) : null;
       const backdrop = element?.querySelector(":scope > .liquid-glass-backdrop") ?? null;
       const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
+      const liquid = element?.classList.contains("liquid-glass") === true;
       return {
         present: Boolean(element),
-        mappedValues: {
+        mapped: liquid ? {
           glassFill: style?.getPropertyValue("--glass-fill").trim() ?? null,
           glassBlurCurrent: style?.getPropertyValue("--glass-blur-current").trim() ?? null,
           glassBorderCurrent: style?.getPropertyValue("--glass-border-current").trim() ?? null,
           glassSaturation: style?.getPropertyValue("--glass-saturation").trim() ?? null
-        },
+        } : null,
         effects: {
           backgroundColor: style?.backgroundColor ?? null,
           backgroundImage: style?.backgroundImage ?? null,
-          borderColor: style?.borderColor ?? null,
+          borderTopColor: style?.borderTopColor ?? null,
+          borderTopWidth: style?.borderTopWidth ?? null,
+          boxShadow: style?.boxShadow ?? null,
+          elementBackdrop: {
+            blur: filterPart(style?.backdropFilter ?? style?.webkitBackdropFilter, "blur"),
+            saturation: filterPart(style?.backdropFilter ?? style?.webkitBackdropFilter, "saturate")
+          },
           backdrop: {
             present: Boolean(backdrop),
             backgroundColor: backdropStyle?.backgroundColor ?? null,
             backgroundImage: backdropStyle?.backgroundImage ?? null,
-            backdropFilter: backdropStyle?.backdropFilter ?? null,
-            webkitBackdropFilter: backdropStyle?.webkitBackdropFilter ?? null
+            borderTopColor: backdropStyle?.borderTopColor ?? null,
+            blur: filterPart(backdropStyle?.backdropFilter ?? backdropStyle?.webkitBackdropFilter, "blur"),
+            saturation: filterPart(backdropStyle?.backdropFilter ?? backdropStyle?.webkitBackdropFilter, "saturate")
           }
         }
       };
     };
-    const modalBackdrop = document.querySelector(".overlay-modal-backdrop");
-    const modalBackdropStyle = modalBackdrop ? getComputedStyle(modalBackdrop) : null;
-    const variables = (names) => Object.fromEntries(names.map((name) => [
-      name,
-      getComputedStyle(document.documentElement).getPropertyValue(name).trim()
-    ]));
-    const sideLeft = surface(".workbench-column-left");
-    const sideRight = surface(".workbench-column-right");
-    const center = surface(".workbench-column-center");
-    const dialogSurface = surface(".overlay-modal-surface");
     return {
       side: {
-        variables: variables(${JSON.stringify(groupVariables.side)}),
-        surfaceValues: {
-          left: { present: sideLeft.present, ...sideLeft.mappedValues },
-          right: { present: sideRight.present, ...sideRight.mappedValues }
-        },
-        effects: {
-          left: { present: sideLeft.present, ...sideLeft.effects },
-          right: { present: sideRight.present, ...sideRight.effects }
-        }
+        libraryNavigation: surface('[data-appearance-surface="library-navigation"]'),
+        notificationNav: surface('[data-appearance-surface="notification-nav"]')
       },
       center: {
-        variables: variables(${JSON.stringify(groupVariables.center)}),
-        surfaceValues: { center: { present: center.present, ...center.mappedValues } },
-        effects: { center: { present: center.present, ...center.effects } }
+        centerSurface: surface('[data-appearance-surface="center-surface"]'),
+        notificationContent: surface('[data-appearance-surface="notification-content"]'),
+        fieldControl: surface('[data-appearance-surface="field-control"]'),
+        selectControl: surface('[data-appearance-surface="select-control"]'),
+        selectElement: surface('[data-appearance-surface="select-element"]'),
+        readableInner: surface('[data-appearance-surface="readable-inner"]'),
+        selectedFill: surface('[data-appearance-surface="selected-fill"]'),
+        selectedNotificationTab: surface(".notification-window-tab.active")
       },
       dialog: {
-        variables: variables(${JSON.stringify(groupVariables.dialog)}),
-        surfaceValues: {
-          surface: { present: dialogSurface.present, ...dialogSurface.mappedValues }
-        },
-        effects: {
-          surface: { present: dialogSurface.present, ...dialogSurface.effects },
-          backdrop: {
-            present: Boolean(modalBackdrop),
-            backgroundColor: modalBackdropStyle?.backgroundColor ?? null,
-            backgroundImage: modalBackdropStyle?.backgroundImage ?? null,
-            backdropFilter: modalBackdropStyle?.backdropFilter ?? null,
-            webkitBackdropFilter: modalBackdropStyle?.webkitBackdropFilter ?? null
-          }
-        }
+        popover: surface('[data-appearance-surface="popover"]'),
+        nested: surface('[data-appearance-surface="nested"]'),
+        context: surface('[data-appearance-surface="context"]'),
+        modal: surface("#appearance-matrix-modal.overlay-modal-surface"),
+        modalBackdrop: surface(".overlay-modal-backdrop")
+      },
+      shared: {
+        notificationBody: surface('[data-appearance-surface="notification-body"]')
+      },
+      unaffected: {
+        mediaGrid: surface('[data-appearance-surface="media-grid"]'),
+        previewCanvas: surface('[data-appearance-surface="preview-canvas"]')
+      },
+      relationships: {
+        notificationNavInsideBody: Boolean(document.querySelector('[data-appearance-surface="notification-nav"]')?.closest('[data-appearance-surface="notification-body"]')),
+        notificationContentInsideBody: Boolean(document.querySelector('[data-appearance-surface="notification-content"]')?.closest('[data-appearance-surface="notification-body"]')),
+        reducedMotionForSettledSampling: matchMedia("(prefers-reduced-motion: reduce)").matches
       }
     };
   })()`;
@@ -2140,12 +2207,182 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     "dialog-overlay-strength": "--glass-dialog-fill",
     "dialog-backdrop-dim": "--dialog-backdrop-dim"
   };
-  const additionallyAffectedGroups = {
-    "center-saturation": ["dialog"],
-    "center-stroke-opacity": ["dialog"]
+  const expectations = {
+    "side-blur": {
+      required: ["side.libraryNavigation"],
+      allowed: ["side.libraryNavigation"],
+      stableGroups: ["center", "dialog", "shared", "unaffected"]
+    },
+    "side-opacity": {
+      required: ["side.libraryNavigation", "shared.notificationBody"],
+      allowed: ["side.libraryNavigation", "shared.notificationBody"],
+      stableGroups: ["center", "dialog", "unaffected"]
+    },
+    "side-overlay-strength": {
+      required: ["side.libraryNavigation", "shared.notificationBody"],
+      allowed: ["side.libraryNavigation", "shared.notificationBody"],
+      stableGroups: ["center", "dialog", "unaffected"]
+    },
+    "side-saturation": {
+      required: ["side.libraryNavigation.mapped.glassSaturation"],
+      allowed: [
+        "side.libraryNavigation.mapped.glassSaturation",
+        "side.libraryNavigation.effects.backdrop.saturation"
+      ],
+      stableGroups: ["center", "dialog", "shared", "unaffected"]
+    },
+    "side-stroke-opacity": {
+      required: ["side.libraryNavigation.mapped.glassBorderCurrent"],
+      allowed: [
+        "side.libraryNavigation.mapped.glassBorderCurrent",
+        "side.libraryNavigation.effects.backdrop.borderTopColor"
+      ],
+      stableGroups: ["center", "dialog", "shared", "unaffected"]
+    },
+    "center-blur": {
+      required: ["center.centerSurface.mapped.glassBlurCurrent"],
+      allowed: [
+        "center.centerSurface.mapped.glassBlurCurrent",
+        "center.centerSurface.effects.backdrop.blur"
+      ],
+      stableGroups: ["side", "dialog", "shared", "unaffected"]
+    },
+    "center-opacity": {
+      required: [
+        "center.centerSurface",
+        "center.fieldControl",
+        "center.selectControl",
+        "center.readableInner",
+        "center.selectedFill",
+        "center.selectedNotificationTab"
+      ],
+      allowed: [
+        "center.centerSurface",
+        "center.fieldControl",
+        "center.selectControl",
+        "center.readableInner",
+        "center.selectedFill",
+        "center.selectedNotificationTab"
+      ],
+      stableGroups: ["side", "dialog", "shared", "unaffected"]
+    },
+    "center-overlay-strength": {
+      required: [
+        "center.centerSurface",
+        "center.fieldControl",
+        "center.selectControl",
+        "center.readableInner",
+        "center.selectedFill",
+        "center.selectedNotificationTab"
+      ],
+      allowed: [
+        "center.centerSurface",
+        "center.fieldControl",
+        "center.selectControl",
+        "center.readableInner",
+        "center.selectedFill",
+        "center.selectedNotificationTab"
+      ],
+      stableGroups: ["side", "dialog", "shared", "unaffected"]
+    },
+    "center-saturation": {
+      required: [
+        "center.centerSurface.mapped.glassSaturation",
+        "dialog.modalBackdrop.effects.elementBackdrop.saturation"
+      ],
+      allowed: [
+        "center.centerSurface.mapped.glassSaturation",
+        "center.centerSurface.effects.backdrop.saturation",
+        "dialog.popover.mapped.glassSaturation",
+        "dialog.popover.effects.backdrop.saturation",
+        "dialog.nested.mapped.glassSaturation",
+        "dialog.nested.effects.backdrop.saturation",
+        "dialog.context.mapped.glassSaturation",
+        "dialog.context.effects.backdrop.saturation",
+        "dialog.modal.mapped.glassSaturation",
+        "dialog.modal.effects.backdrop.saturation",
+        "dialog.modalBackdrop.effects.elementBackdrop.saturation"
+      ],
+      stableGroups: ["side", "shared", "unaffected"]
+    },
+    "center-stroke-opacity": {
+      required: [
+        "center.centerSurface.mapped.glassBorderCurrent",
+        "center.fieldControl.effects.borderTopColor",
+        "center.selectControl.effects.borderTopColor",
+        "dialog.modal.mapped.glassBorderCurrent"
+      ],
+      allowed: [
+        "center.centerSurface.mapped.glassBorderCurrent",
+        "center.centerSurface.effects.backdrop.borderTopColor",
+        "center.fieldControl.effects.borderTopColor",
+        "center.selectControl.effects.borderTopColor",
+        "dialog.popover.mapped.glassBorderCurrent",
+        "dialog.popover.effects.borderTopColor",
+        "dialog.popover.effects.backdrop.borderTopColor",
+        "dialog.nested.mapped.glassBorderCurrent",
+        "dialog.nested.effects.borderTopColor",
+        "dialog.nested.effects.backdrop.borderTopColor",
+        "dialog.context.mapped.glassBorderCurrent",
+        "dialog.context.effects.borderTopColor",
+        "dialog.context.effects.backdrop.borderTopColor",
+        "dialog.modal.mapped.glassBorderCurrent",
+        "dialog.modal.effects.borderTopColor",
+        "dialog.modal.effects.backdrop.borderTopColor"
+      ],
+      stableGroups: ["side", "shared", "unaffected"]
+    },
+    "dialog-blur": {
+      required: [
+        "dialog.popover.mapped.glassBlurCurrent",
+        "dialog.nested.mapped.glassBlurCurrent",
+        "dialog.context.mapped.glassBlurCurrent",
+        "dialog.modal.mapped.glassBlurCurrent",
+        "dialog.modalBackdrop.effects.elementBackdrop.blur"
+      ],
+      allowed: ["dialog"],
+      stableGroups: ["side", "center", "shared", "unaffected"]
+    },
+    "dialog-opacity": {
+      required: ["dialog.popover", "dialog.nested", "dialog.context", "dialog.modal"],
+      allowed: ["dialog.popover", "dialog.nested", "dialog.context", "dialog.modal"],
+      stableGroups: ["side", "center", "shared", "unaffected"]
+    },
+    "dialog-overlay-strength": {
+      required: ["dialog.popover", "dialog.nested", "dialog.context", "dialog.modal"],
+      allowed: ["dialog.popover", "dialog.nested", "dialog.context", "dialog.modal"],
+      stableGroups: ["side", "center", "shared", "unaffected"]
+    },
+    "dialog-backdrop-dim": {
+      required: ["dialog.modalBackdrop.effects.backgroundColor"],
+      allowed: ["dialog.modalBackdrop.effects.backgroundColor"],
+      stableGroups: ["side", "center", "shared", "unaffected"]
+    }
   };
+  const requiredSurfacePaths = [
+    "side.libraryNavigation",
+    "side.notificationNav",
+    "center.centerSurface",
+    "center.notificationContent",
+    "center.fieldControl",
+    "center.selectControl",
+    "center.selectElement",
+    "center.readableInner",
+    "center.selectedFill",
+    "center.selectedNotificationTab",
+    "dialog.popover",
+    "dialog.nested",
+    "dialog.context",
+    "dialog.modal",
+    "dialog.modalBackdrop",
+    "shared.notificationBody",
+    "unaffected.mediaGrid",
+    "unaffected.previewCanvas"
+  ];
   const sliderIds = Object.values(groups).flat();
   const variableNames = Object.values(groupVariables).flat();
+  const appearanceFixture = await openAppearanceMatrixFixture(mainClient);
+  const appearanceClient = appearanceFixture.client;
   const readSettingsState = () => evaluate(
     settingsClient,
     `(() => {
@@ -2170,7 +2407,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
   const readState = async () => {
     const settings = await readSettingsState();
     const production = await evaluate(
-      mainClient,
+      appearanceClient,
       productionAppearanceEvidenceExpression(groupVariables)
     );
     return { ...settings, production };
@@ -2192,23 +2429,44 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     const settingsState = await readSettingsState();
     const expectedValue = settingsState.variables[variableName];
     await waitFor(
-      mainClient,
+      appearanceClient,
       `getComputedStyle(document.documentElement).getPropertyValue(${JSON.stringify(variableName)}).trim() === ${JSON.stringify(expectedValue)}`,
       5000,
       `production appearance sync for ${id}`
     );
+    await appearanceClient.send("Page.bringToFront");
     await delay(350);
     return readState();
   };
   const pickVariables = (state, group) => Object.fromEntries(
     groupVariables[group].map((name) => [name, state.variables[name]])
   );
-
   const stable = (...values) => values.every((value) => JSON.stringify(value) === JSON.stringify(values[0]));
+  const valueAtPath = (value, pathValue) => pathValue.split(".").reduce(
+    (current, key) => current?.[key],
+    value
+  );
+  const changedLeafPaths = (left, right, prefix = "") => {
+    if (JSON.stringify(left) === JSON.stringify(right)) return [];
+    const leftObject = left !== null && typeof left === "object";
+    const rightObject = right !== null && typeof right === "object";
+    if (!leftObject || !rightObject) return [prefix];
+    const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+    return [...keys].flatMap((key) => changedLeafPaths(
+      left[key],
+      right[key],
+      prefix ? `${prefix}.${key}` : key
+    ));
+  };
+  const matchesPrefix = (pathValue, prefix) =>
+    pathValue === prefix || pathValue.startsWith(`${prefix}.`);
 
-  await openAppearanceMatrixDialog(mainClient);
   try {
     const initial = await readState();
+    const requiredSurfaces = Object.fromEntries(requiredSurfacePaths.map((surfacePath) => [
+      surfacePath,
+      valueAtPath(initial.production, surfacePath)?.present === true
+    ]));
     const matrix = {};
     for (const [group, ids] of Object.entries(groups)) {
       matrix[group] = {};
@@ -2222,57 +2480,68 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
         const defaultState = await setSlider(id, initialSlider.value);
         const maxState = await setSlider(id, initialSlider.max);
         const finalState = await setSlider(id, initialSlider.value);
-        const affectedGroups = [group, ...(additionallyAffectedGroups[id] ?? [])];
-        const unaffectedGroups = Object.fromEntries(
-          Object.keys(groups)
-            .filter((candidate) => !affectedGroups.includes(candidate))
-            .map((candidate) => [candidate, {
-              unchanged: stable(
-                minState.production[candidate],
-                defaultState.production[candidate],
-                maxState.production[candidate]
-              ),
-              min: minState.production[candidate],
-              default: defaultState.production[candidate],
-              max: maxState.production[candidate]
-            }])
+        const expectation = expectations[id];
+        const changedPaths = changedLeafPaths(minState.production, maxState.production);
+        const requiredTargets = Object.fromEntries(expectation.required.map((prefix) => [
+          prefix,
+          changedPaths.some((pathValue) => matchesPrefix(pathValue, prefix))
+        ]));
+        const unexpectedChangedPaths = changedPaths.filter(
+          (pathValue) => !expectation.allowed.some((prefix) => matchesPrefix(pathValue, prefix))
         );
+        const unaffectedGroups = Object.fromEntries(expectation.stableGroups.map((candidate) => [
+          candidate,
+          {
+            unchanged: stable(
+              minState.production[candidate],
+              defaultState.production[candidate],
+              maxState.production[candidate]
+            ),
+            min: minState.production[candidate],
+            default: defaultState.production[candidate],
+            max: maxState.production[candidate]
+          }
+        ]));
         matrix[group][id] = {
           present: true,
           default: initialSlider.value,
           min: minState.sliders[id]?.value ?? null,
           max: maxState.sliders[id]?.value ?? null,
           restored: finalState.sliders[id]?.value ?? null,
-          affectedGroups,
           mappedValuesChanged: !stable(
-            minState.production[group].variables,
-            maxState.production[group].variables
+            minState.variables[sliderVariables[id]],
+            maxState.variables[sliderVariables[id]]
           ),
-          surfaceValuesChanged: !stable(
-            minState.production[group].surfaceValues,
-            maxState.production[group].surfaceValues
-          ),
-          targetEffectsChanged: !stable(
-            minState.production[group].effects,
-            maxState.production[group].effects
-          ),
+          surfaceValuesChanged: Object.values(requiredTargets).every(Boolean),
+          targetEffectsChanged: changedPaths.length > 0,
+          changedPaths,
+          requiredTargets,
+          allowedChangedPrefixes: expectation.allowed,
+          unexpectedChangedPaths,
           variables: {
             min: pickVariables(minState, group),
             default: pickVariables(defaultState, group),
             max: pickVariables(maxState, group)
           },
-          production: {
-            min: minState.production[group],
-            default: defaultState.production[group],
-            max: maxState.production[group]
-          },
+          production: { min: minState.production, default: defaultState.production, max: maxState.production },
           unaffectedGroups
         };
       }
     }
-    return { groups, initial, matrix, final: await readState() };
+    return {
+      groups,
+      requiredSurfaces,
+      relationships: initial.production.relationships,
+      fixtureDiagnostics: {
+        consoleErrors: appearanceFixture.consoleErrors,
+        networkProblems: appearanceFixture.networkProblems
+      },
+      initial,
+      matrix,
+      final: await readState()
+    };
   } finally {
-    await closeAppearanceMatrixDialog(mainClient);
+    await closeAppearanceMatrixFixture(appearanceClient);
   }
 }
 
@@ -3810,8 +4079,11 @@ try {
     ) {
       notificationFailures.push("first failure drilldown was not visible and actionable");
     }
-    await delay(250);
-    const diagnostics = collectRunDiagnostics(notificationFailures);
+    const diagnostics = await stopThenCollectDiagnostics({
+      stop: stopDevApp,
+      waitForOutput: () => delay(300),
+      collect: () => collectRunDiagnostics(notificationFailures)
+    });
     hardFailures = diagnostics.hardFailures;
     summary = {
       run: {
@@ -4460,6 +4732,25 @@ try {
     hardFailures.push("Settings side blur slider did not change --glass-side-blur");
   }
   const appearanceMatrix = summary.evidence.settingsInterfaceStyle.appearanceMatrix;
+  const missingAppearanceSurfaces = Object.entries(appearanceMatrix?.requiredSurfaces ?? {})
+    .filter(([, present]) => present !== true)
+    .map(([surface]) => surface);
+  if (missingAppearanceSurfaces.length) {
+    hardFailures.push(`Settings appearance matrix missing production surfaces: ${missingAppearanceSurfaces.join(", ")}`);
+  }
+  if (
+    appearanceMatrix?.relationships?.notificationNavInsideBody !== true ||
+    appearanceMatrix?.relationships?.notificationContentInsideBody !== true ||
+    appearanceMatrix?.relationships?.reducedMotionForSettledSampling !== true
+  ) {
+    hardFailures.push("Settings appearance matrix notification nav/content zones are not mapped through the production body");
+  }
+  if (
+    appearanceMatrix?.fixtureDiagnostics?.consoleErrors?.length ||
+    appearanceMatrix?.fixtureDiagnostics?.networkProblems?.length
+  ) {
+    hardFailures.push("Settings appearance matrix fixture emitted console or network errors");
+  }
   for (const [group, ids] of Object.entries(appearanceMatrix?.groups ?? {})) {
     for (const id of ids) {
       const initial = appearanceMatrix.initial?.sliders?.[id];
@@ -4467,9 +4758,7 @@ try {
       const variableChanged = Object.keys(entry?.variables?.min ?? {}).some(
         (name) => entry.variables.min[name] !== entry.variables.max?.[name]
       );
-      const productionTargetsPresent = Object.values(
-        entry?.production?.default?.surfaceValues ?? {}
-      ).every((surface) => surface.present === true);
+      const requiredTargetsChanged = Object.values(entry?.requiredTargets ?? {}).every(Boolean);
       const unaffectedGroupsStable = Object.values(entry?.unaffectedGroups ?? {}).every(
         (candidate) => candidate.unchanged === true
       );
@@ -4482,12 +4771,13 @@ try {
         appearanceMatrix.final?.sliders?.[id]?.value !== entry.default ||
         !variableChanged ||
         !entry.mappedValuesChanged ||
-        (id !== "dialog-backdrop-dim" && !entry.surfaceValuesChanged) ||
+        !entry.surfaceValuesChanged ||
         !entry.targetEffectsChanged ||
-        !productionTargetsPresent ||
+        !requiredTargetsChanged ||
+        entry.unexpectedChangedPaths?.length !== 0 ||
         !unaffectedGroupsStable ||
         JSON.stringify(entry.production.default) !==
-          JSON.stringify(appearanceMatrix.initial?.production?.[group])
+          JSON.stringify(appearanceMatrix.initial?.production)
       ) {
         hardFailures.push(`Settings ${group} appearance matrix failed for ${id}`);
       }

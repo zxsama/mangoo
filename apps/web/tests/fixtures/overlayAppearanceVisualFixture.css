@@ -1,0 +1,56 @@
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+}
+
+.overlay-appearance-fixture {
+  display: grid;
+  min-height: 100vh;
+  gap: 18px;
+  padding: 24px;
+  grid-template-columns: 220px minmax(520px, 1fr);
+}
+
+.overlay-appearance-library-zone,
+.overlay-appearance-center-surface,
+.overlay-appearance-dialog-surface {
+  min-height: 96px;
+  padding: 12px;
+}
+
+.overlay-appearance-notification-window {
+  width: 720px;
+  min-height: 320px;
+}
+
+.overlay-appearance-notification-window .notification-window-content {
+  padding: 16px;
+}
+
+.overlay-appearance-center-probes,
+.overlay-appearance-dialog-probes {
+  display: grid;
+  gap: 10px;
+}
+
+.overlay-appearance-center-probes {
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+}
+
+.overlay-appearance-dialog-probes {
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+}
+
+.overlay-appearance-readable-inner,
+.overlay-appearance-unaffected {
+  min-height: 48px;
+  padding: 10px;
+}
+
+.overlay-appearance-modal {
+  width: min(420px, calc(100vw - 32px));
+}

@@ -10,11 +10,20 @@ import {
   resolveRepositoryRoot,
   validateControlledMediaRoot
 } from "./controlled-media.mjs";
+import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
 
 const harnessDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(harnessDirectory, "..", "..");
 const regressionPath = path.join(harnessDirectory, "desktop-ui-regression.mjs");
 const exhaustivePath = path.join(harnessDirectory, "desktop-ui-exhaustive-interaction-sweep.mjs");
+const appearanceFixturePath = path.join(
+  repositoryRoot,
+  "apps",
+  "web",
+  "tests",
+  "fixtures",
+  "overlayAppearanceVisualFixture.tsx"
+);
 
 test("repository root resolves from the harness URL instead of cwd", async () => {
   const harnessUrl = pathToFileURL(path.join(repositoryRoot, ".tmp", "visual-check", "fixture.mjs")).href;
@@ -64,6 +73,33 @@ test("controlled media validation rejects a missing root clearly", async () => {
   );
 });
 
+test("final diagnostics include errors emitted while the child is stopping", async () => {
+  const events = [];
+  const startupProblems = [];
+  const diagnostics = await stopThenCollectDiagnostics({
+    stop: async () => {
+      events.push("stop");
+      startupProblems.push({ source: "stderr", line: "late shutdown error" });
+    },
+    waitForOutput: async () => {
+      events.push("flush");
+    },
+    collect: () => {
+      events.push("collect");
+      return {
+        startupProblems: [...startupProblems],
+        hardFailures: startupProblems.map((problem) => problem.line)
+      };
+    }
+  });
+
+  assert.deepEqual(events, ["stop", "flush", "collect"]);
+  assert.deepEqual(diagnostics.startupProblems, [
+    { source: "stderr", line: "late shutdown error" }
+  ]);
+  assert.deepEqual(diagnostics.hardFailures, ["late shutdown error"]);
+});
+
 test("desktop harnesses have no machine-specific roots and gate diagnostics", async () => {
   const [regressionSource, exhaustiveSource] = await Promise.all([
     readFile(regressionPath, "utf8"),
@@ -89,7 +125,10 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
 });
 
 test("DPI, preference, and appearance checks assert effective production state", async () => {
-  const source = await readFile(regressionPath, "utf8");
+  const [source, appearanceFixture] = await Promise.all([
+    readFile(regressionPath, "utf8"),
+    readFile(appearanceFixturePath, "utf8")
+  ]);
 
   assert.match(source, /Emulation\.setDeviceMetricsOverride/);
   assert.match(source, /devicePixelRatio/);
@@ -104,4 +143,37 @@ test("DPI, preference, and appearance checks assert effective production state",
   assert.match(source, /production/);
   assert.match(source, /targetEffectsChanged/);
   assert.match(source, /unaffectedGroups/);
+  assert.match(source, /unexpectedChangedPaths/);
+  assert.match(source, /requiredSurfaces/);
+  for (const surface of [
+    "notification-nav",
+    "notification-content",
+    "field-control",
+    "select-control",
+    "readable-inner",
+    "selected-fill",
+    "popover",
+    "nested",
+    "context",
+    "media-grid",
+    "preview-canvas"
+  ]) {
+    assert.match(appearanceFixture, new RegExp(`data-appearance-surface=["']${surface}["']`));
+  }
+  assert.match(appearanceFixture, /ModalSurface/);
+  assert.match(appearanceFixture, /useSecondaryWindowInterfaceStyle/);
+});
+
+test("notification fixture navigation focuses before one explicit open handshake", async () => {
+  const source = await readFile(regressionPath, "utf8");
+  const start = source.indexOf("async function navigate(state)");
+  const end = source.indexOf("async function", start + 1);
+  const navigateSource = source.slice(start, end < 0 ? source.length : end);
+  const focusIndex = navigateSource.indexOf('send("Page.bringToFront")');
+  const openIndex = navigateSource.indexOf("notificationPopoverFixture.open()");
+
+  assert.ok(focusIndex >= 0, "navigate must focus the fixture window");
+  assert.ok(openIndex > focusIndex, "navigate must explicitly open only after focus");
+  assert.equal(navigateSource.match(/notificationPopoverFixture\.open\(\)/g)?.length, 1);
+  assert.match(navigateSource, /renderedOpenId/);
 });

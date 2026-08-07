@@ -1,5 +1,5 @@
 import { Bell } from "lucide-react";
-import { StrictMode, useCallback, useRef, useState } from "react";
+import { StrictMode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { ThumbnailFailureDetail } from "@megle/notification-contract";
 import "../../src/styles.css";
@@ -11,6 +11,10 @@ import type {
   CompactNotificationModel,
   NotificationOperationViewModel
 } from "../../src/features/notifications/notificationModel";
+import {
+  createNotificationPopoverFixtureHandshake,
+  type NotificationPopoverFixtureLifecycle
+} from "./notificationPopoverFixtureHandshake";
 import "./notificationPopoverVisualFixture.css";
 
 type FixtureState = "full" | "scan" | "thumbnail" | "failure" | "empty" | "degraded";
@@ -58,6 +62,8 @@ interface NotificationFixtureController {
     location: FixtureAnchorLocation;
     popoverRectCalls: number;
   };
+  getLifecycle(): NotificationPopoverFixtureLifecycle;
+  open(): number;
   relocate(location: FixtureAnchorLocation): void;
   remount(): void;
   resetMeasurements(): void;
@@ -278,6 +284,12 @@ function NotificationPopoverVisualFixture() {
   const anchorNodeRef = useRef<HTMLButtonElement | null>(null);
   const detachedAnchorsRef = useRef<HTMLButtonElement[]>([]);
   const [open, setOpen] = useState(true);
+  const [openRequestVersion, setOpenRequestVersion] = useState(0);
+  const handshakeRef = useRef<ReturnType<typeof createNotificationPopoverFixtureHandshake> | null>(null);
+  if (!handshakeRef.current) {
+    handshakeRef.current = createNotificationPopoverFixtureHandshake();
+  }
+  const handshake = handshakeRef.current;
   const requestedState = fixtureParameters.get("state");
   const state: FixtureState =
     requestedState === "scan" ||
@@ -297,6 +309,20 @@ function NotificationPopoverVisualFixture() {
     anchorNodeRef.current = node;
     setAnchor(node);
   }, []);
+  const closePopover = useCallback(() => {
+    handshake.markClosed();
+    setOpen(false);
+  }, [handshake]);
+
+  useEffect(() => {
+    handshake.markReady(state);
+    return () => handshake.markClosed();
+  }, [handshake, state]);
+
+  useLayoutEffect(() => {
+    if (!open || !anchor || !document.querySelector("#notifications-root")) return;
+    handshake.markRenderedOpen(openRequestVersion);
+  }, [anchor, handshake, open, openRequestVersion]);
   const notificationButton = (
     <LiquidGlassButton
       active={open}
@@ -306,7 +332,14 @@ function NotificationPopoverVisualFixture() {
       data-fixture-anchor-id={anchorId}
       data-titlebar-control="notifications"
       key={anchorId}
-      onClick={() => setOpen((current) => !current)}
+      onClick={() => {
+        if (open) closePopover();
+        else {
+          const requestId = handshake.requestOpen();
+          setOpenRequestVersion(requestId);
+          setOpen(true);
+        }
+      }}
       ref={bindAnchor}
       tone="control"
     >
@@ -339,6 +372,15 @@ function NotificationPopoverVisualFixture() {
         location: anchorLocation,
         popoverRectCalls: measurementMetrics.popoverRectCalls
       };
+    },
+    getLifecycle() {
+      return handshake.snapshot();
+    },
+    open() {
+      const requestId = handshake.requestOpen();
+      setOpenRequestVersion(requestId);
+      setOpen(true);
+      return requestId;
     },
     relocate(location) {
       setAnchorLocation(location);
@@ -381,8 +423,8 @@ function NotificationPopoverVisualFixture() {
           <NotificationPopover
             anchor={anchor}
             model={model}
-            onClose={() => setOpen(false)}
-            onOpenCenter={() => setOpen(false)}
+            onClose={closePopover}
+            onOpenCenter={closePopover}
           />
         ) : null}
       </main>
