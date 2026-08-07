@@ -218,7 +218,10 @@ class CdpClient {
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return;
         this.pending.delete(id);
-        reject(new Error(`CDP timeout: ${method}`));
+        const detail = method === "Runtime.evaluate"
+          ? ` expression=${JSON.stringify(String(params.expression ?? "").slice(0, 240))}`
+          : "";
+        reject(new Error(`CDP timeout: ${method}${detail}`));
       }, timeoutMs);
       timer.unref();
       this.pending.set(id, {

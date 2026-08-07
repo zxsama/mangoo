@@ -94,6 +94,8 @@ test("DPI, preference, and appearance checks assert effective production state",
   assert.match(source, /devicePixelRatio/);
   assert.match(source, /protocolVisualViewport/);
   assert.match(source, /effectiveScale/);
+  assert.match(source, /CDP timeout:/);
+  assert.match(source, /params\.expression/);
   assert.match(source, /page scale factor did not take effect/i);
   assert.match(source, /reduced-motion emulation did not match/i);
   assert.match(source, /reduced-transparency emulation did not match/i);
