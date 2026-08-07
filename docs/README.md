@@ -71,6 +71,15 @@ The current plan is component-based. We are not forking an existing image-manage
 18. [Complete Product Implementation Plan](superpowers/plans/2026-05-16-megle-complete-product-plan.md)
    - Master execution order that inserts the UI plan into the full product roadmap through release hardening.
 
+19. [Unified Overlay UI Design](superpowers/specs/2026-07-27-unified-overlay-ui-design.md)
+   - Shared overlay, dialog, context-menu, notification, and appearance rules.
+
+20. [Unified Overlay UI Implementation Plan](superpowers/plans/2026-07-27-unified-overlay-ui.md)
+   - Task-by-task implementation and verification plan.
+
+21. [Unified Overlay UI Verification](benchmarks/2026-07-27-unified-overlay-verification.md)
+   - Task 8 automated, controlled-fixture, native-window, appearance, DPI, and limitation evidence.
+
 ## Supporting
 
 - [Product Brief](product-brief.md)

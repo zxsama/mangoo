@@ -941,6 +941,8 @@ async function moveToSelector(client, selector, xRatio, yRatio) {
 }
 
 async function clickSelector(client, selector, xRatio = 0.5, yRatio = 0.5) {
+  await client.send("Page.bringToFront").catch(() => undefined);
+  await evaluate(client, "window.focus(); true").catch(() => undefined);
   const point = await pointFor(client, selector, xRatio, yRatio);
   await mouse(client, "mouseMoved", point);
   await mouse(client, "mousePressed", { ...point, button: "left", clickCount: 1 });
@@ -1269,12 +1271,37 @@ async function notificationPopoverFixtureEvidence(client) {
     await fixtureClient.send("Page.navigate", {
       url: `${webUrl}/tests/fixtures/notification-popover.html?state=${state}`
     });
-    await waitFor(
-      fixtureClient,
-      `Boolean(document.querySelector('[data-notification-fixture="${state}"]') && document.querySelector('#notifications-root'))`,
-      10000,
-      `notification ${state} visual fixture`
-    );
+    try {
+      await waitFor(
+        fixtureClient,
+        `Boolean(document.querySelector('[data-notification-fixture="${state}"]') && document.querySelector('#notifications-root'))`,
+        10000,
+        `notification ${state} visual fixture`
+      );
+    } catch (error) {
+      const diagnosticPath = path.join(logDir, `desktop-ui-regression-notification-${state}-timeout.json`);
+      const diagnostic = {
+        capturedAtUtc: new Date().toISOString(),
+        page: await evaluate(
+          fixtureClient,
+          `(() => ({
+            url: location.href,
+            readyState: document.readyState,
+            fixtureState: document.querySelector(".notification-visual-fixture")?.getAttribute("data-notification-fixture") ?? null,
+            fixtureText: document.querySelector(".notification-visual-fixture")?.textContent?.trim()?.slice(0, 300) ?? null,
+            fixtureRoot: Boolean(document.querySelector(".notification-visual-fixture")),
+            notificationRoot: Boolean(document.querySelector("#notifications-root")),
+            notificationRootAriaHidden: document.querySelector("#notifications-root")?.getAttribute("aria-hidden") ?? null,
+            bodyText: document.body?.textContent?.trim()?.slice(0, 500) ?? null
+          }))()`
+        ),
+        consoleErrors: fixtureConsoleErrors,
+        networkProblems: fixtureNetworkProblems,
+        error: String(error)
+      };
+      await writeFile(diagnosticPath, JSON.stringify(diagnostic, null, 2));
+      throw new Error(`${String(error)}; diagnostic=${diagnosticPath}`);
+    }
     await fixtureClient.send("Page.bringToFront");
     await fixtureClient.send("Page.captureScreenshot", {
       captureBeyondViewport: false,
@@ -1418,11 +1445,62 @@ async function notificationPopoverFixtureEvidence(client) {
       "notification anchor after page zoom"
     );
     const zoomed = await evaluate(fixtureClient, compactPopoverEvidenceExpression());
+    await fixtureClient.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1.5 });
+    await fixtureClient.send("Page.captureScreenshot", {
+      captureBeyondViewport: false,
+      format: "png"
+    });
+    await waitForNotificationAnchorGeometry(
+      fixtureClient,
+      "notification anchor after 150 percent page zoom"
+    );
+    const zoomed150 = await evaluate(fixtureClient, compactPopoverEvidenceExpression());
+    const zoomed150RendererScreenshot = await rendererScreenshot(
+      fixtureClient,
+      "ui-notification-compact-fixture-full-150.png"
+    );
     await fixtureClient.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
     await waitForNotificationAnchorGeometry(
       fixtureClient,
       "notification anchor after zoom reset"
     );
+    const readPreferenceEvidence = () => evaluate(
+      fixtureClient,
+      `(() => {
+        const root = document.querySelector("#notifications-root");
+        const style = root ? getComputedStyle(root) : null;
+        const backdrop = root?.querySelector(":scope > .liquid-glass-backdrop");
+        const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
+        return {
+          reducedMotion: {
+            matches: matchMedia("(prefers-reduced-motion: reduce)").matches,
+            animationName: style?.animationName ?? null,
+            animationDuration: style?.animationDuration ?? null,
+            transform: style?.transform ?? null
+          },
+          reducedTransparency: {
+            matches: matchMedia("(prefers-reduced-transparency: reduce)").matches,
+            backgroundColor: style?.backgroundColor ?? null,
+            backdropFilter: style?.backdropFilter ?? null,
+            childBackdropFilter: backdropStyle?.backdropFilter ?? null
+          }
+        };
+      })()`
+    );
+    await fixtureClient.send("Emulation.setEmulatedMedia", {
+      media: "",
+      features: [{ name: "prefers-reduced-motion", value: "reduce" }]
+    });
+    await delay(100);
+    const reducedMotion = await readPreferenceEvidence();
+    await fixtureClient.send("Emulation.setEmulatedMedia", {
+      media: "",
+      features: [{ name: "prefers-reduced-transparency", value: "reduce" }]
+    });
+    await delay(100);
+    const reducedTransparency = await readPreferenceEvidence();
+    await fixtureClient.send("Emulation.setEmulatedMedia", { media: "", features: [] });
+    await delay(100);
     const failure = await navigate("failure");
     const failureScreenshot = await rendererScreenshot(
       fixtureClient,
@@ -1443,11 +1521,13 @@ async function notificationPopoverFixtureEvidence(client) {
       full,
       narrow,
       zoomed,
+      zoomed150,
       relocated,
       remounted,
       failure,
       empty,
       degraded,
+      preferences: { reducedMotion, reducedTransparency },
       resize,
       measurement: {
         detachedChurnAfter,
@@ -1458,6 +1538,7 @@ async function notificationPopoverFixtureEvidence(client) {
       screenshots: {
         fullRenderer: fullRendererScreenshot,
         narrowRenderer: narrowRendererScreenshot,
+        zoomed150Renderer: zoomed150RendererScreenshot,
         failure: failureScreenshot,
         empty: emptyScreenshot,
         degraded: degradedScreenshot
@@ -1822,6 +1903,91 @@ async function glassMaterialEvidence(client) {
   return evidence;
 }
 
+async function settingsAppearanceMatrix(settingsClient) {
+  const groups = {
+    side: ["side-blur", "side-opacity", "side-overlay-strength", "side-saturation", "side-stroke-opacity"],
+    center: ["center-blur", "center-opacity", "center-overlay-strength", "center-saturation", "center-stroke-opacity"],
+    dialog: ["dialog-blur", "dialog-opacity", "dialog-overlay-strength", "dialog-backdrop-dim"]
+  };
+  const groupVariables = {
+    side: ["--glass-side-blur", "--glass-side-fill", "--glass-side-saturation", "--glass-side-stroke"],
+    center: ["--glass-center-blur", "--glass-center-fill", "--glass-center-saturation", "--glass-center-stroke"],
+    dialog: ["--glass-dialog-blur", "--glass-dialog-fill", "--dialog-blur", "--dialog-backdrop-dim"]
+  };
+  const sliderIds = Object.values(groups).flat();
+  const variableNames = Object.values(groupVariables).flat();
+  const readState = () => evaluate(
+    settingsClient,
+    `(() => {
+      const sliders = Object.fromEntries(${JSON.stringify(sliderIds)}.map((id) => {
+        const input = document.querySelector("#" + id);
+        return [id, input instanceof HTMLInputElement ? {
+          value: input.value,
+          min: input.getAttribute("min"),
+          max: input.getAttribute("max")
+        } : null];
+      }));
+      const root = getComputedStyle(document.documentElement);
+      return {
+        sliders,
+        variables: Object.fromEntries(${JSON.stringify(variableNames)}.map((name) => [
+          name,
+          root.getPropertyValue(name).trim()
+        ]))
+      };
+    })()`
+  );
+  const setSlider = async (id, value) => {
+    await evaluate(
+      settingsClient,
+      `(() => {
+        const input = document.querySelector(${JSON.stringify(`#${id}`)});
+        if (!(input instanceof HTMLInputElement)) return false;
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        setter?.call(input, ${JSON.stringify(value)});
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      })()`
+    );
+    await delay(120);
+    return readState();
+  };
+  const pickVariables = (state, group) => Object.fromEntries(
+    groupVariables[group].map((name) => [name, state.variables[name]])
+  );
+
+  const initial = await readState();
+  const matrix = {};
+  for (const [group, ids] of Object.entries(groups)) {
+    matrix[group] = {};
+    for (const id of ids) {
+      const initialSlider = initial.sliders[id];
+      if (!initialSlider) {
+        matrix[group][id] = { present: false };
+        continue;
+      }
+      const minState = await setSlider(id, initialSlider.min);
+      const defaultState = await setSlider(id, initialSlider.value);
+      const maxState = await setSlider(id, initialSlider.max);
+      const finalState = await setSlider(id, initialSlider.value);
+      matrix[group][id] = {
+        present: true,
+        default: initialSlider.value,
+        min: minState.sliders[id]?.value ?? null,
+        max: maxState.sliders[id]?.value ?? null,
+        restored: finalState.sliders[id]?.value ?? null,
+        variables: {
+          min: pickVariables(minState, group),
+          default: pickVariables(defaultState, group),
+          max: pickVariables(maxState, group)
+        }
+      };
+    }
+  }
+  return { groups, initial, matrix, final: await readState() };
+}
+
 async function settingsInterfaceStyleEvidence(client) {
   const materialBefore = await glassMaterialEvidence(client);
   await clickSelector(client, `[data-titlebar-control="open-settings"]`);
@@ -1858,6 +2024,7 @@ async function settingsInterfaceStyleEvidence(client) {
     );
     const screenshotPath = await screenshot(settingsClient, "ui-settings-interface-style.png");
     const evidenceBefore = await evaluate(settingsClient, settingsInterfaceStyleEvidenceExpression());
+    const appearanceMatrix = await settingsAppearanceMatrix(settingsClient);
     const pointSettingsSlider = await moveToSelector(
       settingsClient,
       '[data-settings-slider-control="side-blur"]',
@@ -1913,6 +2080,7 @@ async function settingsInterfaceStyleEvidence(client) {
         sliderChange,
         materialBefore,
         materialAfter,
+        appearanceMatrix,
         standaloneWindow: true
       }
     };
@@ -2359,7 +2527,7 @@ function layoutEvidenceExpression() {
     const styleState = (selector, pseudo = null) => {
       const element = document.querySelector(selector);
       const style = element ? getComputedStyle(element, pseudo) : null;
-      const backdrop = pseudo ? null : element?.querySelector(".liquid-glass-backdrop") ?? null;
+      const backdrop = pseudo ? null : element?.querySelector(":scope > .liquid-glass-backdrop") ?? null;
       const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
       return style
         ? {
@@ -2499,11 +2667,19 @@ function centralPreviewEvidenceExpression() {
     const imageRect = image ? image.getBoundingClientRect() : null;
     const titlebarRect = titlebar ? titlebar.getBoundingClientRect() : null;
     const titleRect = title ? title.getBoundingClientRect() : null;
-    const natural = image ? { width: image.naturalWidth, height: image.naturalHeight } : null;
-    const expectedFitScale = stageRect && natural
-      ? Math.min(stageRect.width / natural.width, stageRect.height / natural.height)
+    const natural = image
+      ? image instanceof HTMLCanvasElement
+        ? { width: image.width, height: image.height }
+        : { width: image.naturalWidth, height: image.naturalHeight }
       : null;
-    const actualScale = imageRect && natural ? imageRect.width / natural.width : null;
+    const layoutSize = image ? { width: image.offsetWidth, height: image.offsetHeight } : null;
+    const transformMatrix = transformStyle?.transform && transformStyle.transform !== "none"
+      ? new DOMMatrixReadOnly(transformStyle.transform)
+      : null;
+    const expectedFitScale = stageRect && layoutSize
+      ? Math.min(stageRect.width / layoutSize.width, stageRect.height / layoutSize.height)
+      : null;
+    const actualScale = transformMatrix?.a ?? null;
     return {
       mode: viewport?.getAttribute("data-preview-mode") ?? null,
       transform: transformStyle?.transform ?? null,
@@ -2528,6 +2704,7 @@ function centralPreviewEvidenceExpression() {
         ? Math.abs((titleRect.left + titleRect.width / 2) - (titlebarRect.left + titlebarRect.width / 2))
         : null,
       imageNatural: natural,
+      imageLayout: layoutSize,
       expectedFitScale,
       actualScale,
       imageWithinStage: imageRect && stageRect ? rectWithin(imageRect, stageRect, 2) : false,
@@ -2645,7 +2822,7 @@ function glassMaterialEvidenceExpression() {
     const surface = (selector) => {
       const element = document.querySelector(selector);
       const style = element ? getComputedStyle(element) : null;
-      const backdrop = element?.querySelector(".liquid-glass-backdrop") ?? null;
+      const backdrop = element?.querySelector(":scope > .liquid-glass-backdrop") ?? null;
       const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
       return {
         present: Boolean(element),
@@ -2653,6 +2830,7 @@ function glassMaterialEvidenceExpression() {
         backgroundColor: style?.backgroundColor ?? null,
         backgroundImage: style?.backgroundImage ?? null,
         backdropLayerPresent: Boolean(backdrop),
+        position: style?.position ?? null,
         backdropFilter: backdropStyle?.backdropFilter ?? null,
         webkitBackdropFilter: backdropStyle?.webkitBackdropFilter ?? null,
         glassBlurCurrent: style?.getPropertyValue("--glass-blur-current").trim() ?? null,
@@ -2881,7 +3059,7 @@ function compactPopoverEvidenceExpression() {
       return {
         name: rootName,
         className: element.className?.toString?.() ?? null,
-        floating: element.classList.contains("floating-popover"),
+        floating: style.position === "fixed" || style.position === "absolute",
         backgroundColor: style.backgroundColor,
         backgroundImage: style.backgroundImage,
         backdropLayerPresent: Boolean(backdrop),
@@ -3395,15 +3573,74 @@ try {
   const inspectorThumbnailBlobResponsesBeforeCentralOpen = responses.filter(isThumbnailBlobResponse);
 
   await doubleClickMediaByName(client, "landscape-sample");
-  await waitFor(
-    client,
-    `(() => {
-      const image = document.querySelector(".central-preview-stage .preview-image");
-      return Boolean(image && image.complete && image.naturalWidth > 0 && image.naturalHeight > 0);
-    })()`,
-    30000,
-    "landscape central preview image"
-  );
+  try {
+    await waitFor(
+      client,
+      `(() => {
+        const ready = document.querySelector(".central-preview-stage .preview-placeholder.ready");
+        const image = document.querySelector(".central-preview-stage .preview-image");
+        const rect = image?.getBoundingClientRect();
+        const isCanvas = image instanceof HTMLCanvasElement;
+        return Boolean(
+          ready &&
+            image &&
+            rect &&
+            rect.width > 0 &&
+            rect.height > 0 &&
+            (isCanvas
+              ? image.width > 0 && image.height > 0
+              : image.complete && image.naturalWidth > 0 && image.naturalHeight > 0)
+        );
+      })()`,
+      30000,
+      "landscape central preview image"
+    );
+  } catch (error) {
+    const diagnosticPath = path.join(logDir, "desktop-ui-regression-landscape-timeout.json");
+    const diagnostic = {
+      capturedAtUtc: new Date().toISOString(),
+      page: await evaluate(
+        client,
+        `(() => {
+          const readImage = (image) => image ? {
+            alt: image.getAttribute("alt"),
+            className: image.className?.toString?.() ?? null,
+            complete: image.complete,
+            naturalWidth: image.naturalWidth,
+            naturalHeight: image.naturalHeight,
+            canvasWidth: image instanceof HTMLCanvasElement ? image.width : null,
+            canvasHeight: image instanceof HTMLCanvasElement ? image.height : null,
+            rect: (() => {
+              const rect = image.getBoundingClientRect();
+              return { width: rect.width, height: rect.height };
+            })(),
+            src: image.currentSrc || image.getAttribute("src") || null
+          } : null;
+          return {
+            url: location.href,
+            selectedTile: document.querySelector(".media-tile.selected .tile-label")?.textContent?.trim() ?? null,
+            selectedMediaIds: [...document.querySelectorAll(".media-tile.selected")].map((tile) => tile.getAttribute("data-media-id")),
+            centralStage: Boolean(document.querySelector(".central-preview-stage")),
+            previewPlaceholders: [...document.querySelectorAll(".central-preview-stage .preview-placeholder")].map((node) => ({
+              className: node.className,
+              state: node.getAttribute("data-preview-state"),
+              source: node.getAttribute("data-preview-source"),
+              text: node.textContent?.trim() ?? null
+            })),
+            previewImages: [...document.querySelectorAll(".central-preview-stage .preview-image")].map(readImage),
+            title: document.querySelector(".titlebar-preview-title")?.textContent?.trim() ?? null,
+            bodyText: document.querySelector(".central-preview-stage")?.textContent?.trim()?.slice(0, 500) ?? null
+          };
+        })()`
+      ),
+      previewResponses: responses.filter(isPreviewApiResponse),
+      previewFailures: networkProblems.filter((item) => item.url?.includes("/api/media/") && item.url?.includes("/preview")),
+      consoleErrors,
+      error: String(error)
+    };
+    await writeFile(diagnosticPath, JSON.stringify(diagnostic, null, 2));
+    throw new Error(`${String(error)}; diagnostic=${diagnosticPath}`);
+  }
   await delay(500);
   const centralLandscapeFit = await screenshot(client, "ui-central-landscape-fit-long-edge.png");
   const landscapeFit = await evaluate(client, centralPreviewEvidenceExpression());
@@ -3421,8 +3658,20 @@ try {
   await waitFor(
     client,
     `(() => {
+      const ready = document.querySelector(".central-preview-stage .preview-placeholder.ready");
       const image = document.querySelector(".central-preview-stage .preview-image");
-      return Boolean(image && image.complete && image.naturalWidth > 0 && image.naturalHeight > 0);
+      const rect = image?.getBoundingClientRect();
+      const isCanvas = image instanceof HTMLCanvasElement;
+      return Boolean(
+        ready &&
+          image &&
+          rect &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          (isCanvas
+            ? image.width > 0 && image.height > 0
+            : image.complete && image.naturalWidth > 0 && image.naturalHeight > 0)
+      );
     })()`,
     30000,
     "portrait central preview image"
@@ -3885,6 +4134,27 @@ try {
   ) {
     hardFailures.push("Settings side blur slider did not change --glass-side-blur");
   }
+  const appearanceMatrix = summary.evidence.settingsInterfaceStyle.appearanceMatrix;
+  for (const [group, ids] of Object.entries(appearanceMatrix?.groups ?? {})) {
+    for (const id of ids) {
+      const initial = appearanceMatrix.initial?.sliders?.[id];
+      const entry = appearanceMatrix.matrix?.[group]?.[id];
+      const variableChanged = Object.keys(entry?.variables?.min ?? {}).some(
+        (name) => entry.variables.min[name] !== entry.variables.max?.[name]
+      );
+      if (
+        !initial ||
+        !entry?.present ||
+        entry.min !== initial.min ||
+        entry.max !== initial.max ||
+        entry.restored !== entry.default ||
+        appearanceMatrix.final?.sliders?.[id]?.value !== entry.default ||
+        !variableChanged
+      ) {
+        hardFailures.push(`Settings ${group} appearance matrix failed for ${id}`);
+      }
+    }
+  }
   for (const surfaceName of ["titlebarLeft", "titlebarRight", "sidebar", "inspector"]) {
     const before = summary.evidence.settingsInterfaceStyle.materialBefore?.surfaces?.[surfaceName];
     const after = summary.evidence.settingsInterfaceStyle.materialAfter?.surfaces?.[surfaceName];
@@ -3989,6 +4259,7 @@ try {
   const fullFixtureRoot = fixtureRoot(fixture?.full);
   const narrowFixtureRoot = fixtureRoot(fixture?.narrow);
   const zoomedFixtureRoot = fixtureRoot(fixture?.zoomed);
+  const zoomed150FixtureRoot = fixtureRoot(fixture?.zoomed150);
   const relocatedFixtureRoot = fixtureRoot(fixture?.relocated);
   const remountedFixtureRoot = fixtureRoot(fixture?.remounted);
   const failureFixtureRoot = fixtureRoot(fixture?.failure);
@@ -4052,6 +4323,23 @@ try {
   }
   if (!validFixtureAnchor(zoomedFixtureRoot)) {
     hardFailures.push("zoomed notification visual fixture is detached from its anchor or overflows");
+  }
+  if (!validFixtureAnchor(zoomed150FixtureRoot)) {
+    hardFailures.push("150 percent notification visual fixture is detached from its anchor or overflows");
+  }
+  const preferenceFixture = fixture?.preferences;
+  if (
+    preferenceFixture?.reducedMotion?.reducedMotion?.matches &&
+    (preferenceFixture.reducedMotion.reducedMotion.animationName !== "none" ||
+      preferenceFixture.reducedMotion.reducedMotion.transform !== "none")
+  ) {
+    hardFailures.push("reduced-motion notification fixture still animates its overlay surface");
+  }
+  if (
+    preferenceFixture?.reducedTransparency?.reducedTransparency?.matches &&
+    transparent(preferenceFixture.reducedTransparency.reducedTransparency.backgroundColor)
+  ) {
+    hardFailures.push("reduced-transparency notification fixture did not switch to an opaque surface");
   }
   if (!validFixtureAnchor(relocatedFixtureRoot) || !validFixtureAnchor(remountedFixtureRoot)) {
     hardFailures.push("relocated or remounted notification fixture lost its live anchor geometry");
