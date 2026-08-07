@@ -2828,11 +2828,28 @@ impl Database {
         attempt_generation: i64,
         error: &str,
     ) -> anyhow::Result<()> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let updated = transaction.execute(
-            "UPDATE tasks SET status = 'failed', updated_at = ?1, error = ?2 WHERE id = ?3 AND status IN ('pending', 'running') AND attempt_generation = ?4",
-            (unix_timestamp(), error, task_id, attempt_generation),
-        )?;
+        let updated = self.try_mark_task_failed_for_attempt(task_id, attempt_generation, error)?;
+        if !updated {
+            return self.ensure_one_task_attempt_updated(
+                task_id,
+                0,
+                "pending or running",
+                attempt_generation,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_mark_task_failed_for_attempt(
+        &self,
+        task_id: i64,
+        attempt_generation: i64,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let updated =
+            mark_task_failed_in_transaction(&transaction, task_id, attempt_generation, error)?;
         let appended = if updated == 1 {
             self.publish_task_notification_in_transaction(
                 &transaction,
@@ -3890,38 +3907,68 @@ impl Database {
             transaction.commit()?;
             return Ok(false);
         }
-        let current_source = thumbnail_source_in_transaction(&transaction, file_id)?
-            .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?;
-        let current_source_fingerprint = current_source.source_fingerprint(profile);
-        let is_current_attempt =
-            attempted_source_fingerprint == Some(current_source_fingerprint.as_str());
+        let published = publish_thumbnail_failure_for_attempted_source_in_transaction(
+            &transaction,
+            file_id,
+            profile,
+            attempted_source_fingerprint,
+            error,
+            failure_kind,
+        )?;
+        transaction.commit()?;
+        Ok(published)
+    }
 
-        if is_current_attempt {
-            upsert_thumbnail_state_in_transaction(
-                &transaction,
-                ThumbnailStateUpsert {
-                    file_id,
-                    profile: profile.to_string(),
-                    state: "failed".to_string(),
-                    cache_key: None,
-                    width: None,
-                    height: None,
-                    byte_size: None,
-                    error: Some(error.to_string()),
-                    source_fingerprint: Some(current_source_fingerprint),
-                },
-            )?;
-            transaction.execute(
-                "UPDATE thumbs SET failure_kind = ?1 WHERE file_id = ?2 AND profile = ?3",
-                (failure_kind, file_id, profile),
-            )?;
+    /// Atomically claims the task's failed terminal transition and applies its
+    /// thumbnail side effect. `None` means this attempt no longer owned the
+    /// transition; `Some` reports whether a current-source failure was stored.
+    pub(crate) fn try_mark_thumbnail_task_failed_for_attempt(
+        &self,
+        file_id: i64,
+        profile: &str,
+        attempted_source_fingerprint: Option<&str>,
+        error: &str,
+        failure_kind: &str,
+        source_changed: bool,
+        task_id: i64,
+        attempt_generation: i64,
+    ) -> anyhow::Result<Option<bool>> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let updated =
+            mark_task_failed_in_transaction(&transaction, task_id, attempt_generation, error)?;
+        if updated == 0 {
             transaction.commit()?;
-            return Ok(true);
+            return Ok(None);
         }
 
-        reset_thumbnail_after_stale_source_in_transaction(&transaction, file_id, profile, error)?;
+        let failure_persisted = if source_changed {
+            reset_thumbnail_after_stale_source_in_transaction(
+                &transaction,
+                file_id,
+                profile,
+                error,
+            )?;
+            false
+        } else {
+            publish_thumbnail_failure_for_attempted_source_in_transaction(
+                &transaction,
+                file_id,
+                profile,
+                attempted_source_fingerprint,
+                error,
+                failure_kind,
+            )?
+        };
+        let appended = self.publish_task_notification_in_transaction(
+            &transaction,
+            task_id,
+            None,
+            notification_outbox::PublishMode::Terminal,
+        )?;
         transaction.commit()?;
-        Ok(false)
+        self.publish_task_notification_after_commit(appended);
+        Ok(Some(failure_persisted))
     }
 
     pub fn get_thumbnail_source(
@@ -7210,6 +7257,18 @@ fn task_attempt_running_in_transaction(
     Ok(status == "running" && current_attempt == attempt_generation)
 }
 
+fn mark_task_failed_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: i64,
+    attempt_generation: i64,
+    error: &str,
+) -> anyhow::Result<usize> {
+    Ok(transaction.execute(
+        "UPDATE tasks SET status = 'failed', updated_at = ?1, error = ?2 WHERE id = ?3 AND status IN ('pending', 'running') AND attempt_generation = ?4",
+        (unix_timestamp(), error, task_id, attempt_generation),
+    )?)
+}
+
 fn hash_path(path: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
@@ -7799,6 +7858,46 @@ fn reset_thumbnail_after_stale_source_in_transaction(
         (file_id, profile),
     )?;
     Ok(())
+}
+
+fn publish_thumbnail_failure_for_attempted_source_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    file_id: i64,
+    profile: &str,
+    attempted_source_fingerprint: Option<&str>,
+    error: &str,
+    failure_kind: &str,
+) -> anyhow::Result<bool> {
+    let current_source = thumbnail_source_in_transaction(transaction, file_id)?
+        .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?;
+    let current_source_fingerprint = current_source.source_fingerprint(profile);
+    let is_current_attempt =
+        attempted_source_fingerprint == Some(current_source_fingerprint.as_str());
+
+    if is_current_attempt {
+        upsert_thumbnail_state_in_transaction(
+            transaction,
+            ThumbnailStateUpsert {
+                file_id,
+                profile: profile.to_string(),
+                state: "failed".to_string(),
+                cache_key: None,
+                width: None,
+                height: None,
+                byte_size: None,
+                error: Some(error.to_string()),
+                source_fingerprint: Some(current_source_fingerprint),
+            },
+        )?;
+        transaction.execute(
+            "UPDATE thumbs SET failure_kind = ?1 WHERE file_id = ?2 AND profile = ?3",
+            (failure_kind, file_id, profile),
+        )?;
+        return Ok(true);
+    }
+
+    reset_thumbnail_after_stale_source_in_transaction(transaction, file_id, profile, error)?;
+    Ok(false)
 }
 
 fn find_folder_id_in_transaction(

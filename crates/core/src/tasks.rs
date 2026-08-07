@@ -785,71 +785,15 @@ fn handle_task_error_for_attempt(
         }
     }
     let error_message = error.to_string();
-    match database.get_task(task_id) {
-        Ok(Some(task)) if task.kind == "thumbnail" => {
-            if let Some(file_id) = task.file_id {
-                let source_changed = error_message.contains(THUMBNAIL_SOURCE_CHANGED_ERROR);
-                let failure_kind = crate::thumbnails::classify_thumbnail_failure(&error_message);
-                let auxiliary_result = if source_changed {
-                    database.reset_thumbnail_after_stale_source_for_task_attempt(
-                        file_id,
-                        GRID_320_PROFILE,
-                        &error_message,
-                        task_id,
-                        attempt_generation,
-                    )
-                } else {
-                    database.publish_thumbnail_failure_for_attempted_source_for_task_attempt(
-                        file_id,
-                        GRID_320_PROFILE,
-                        task.thumbnail_source_fingerprint.as_deref(),
-                        &error_message,
-                        failure_kind.as_str(),
-                        task_id,
-                        attempt_generation,
-                    )
-                };
-                match auxiliary_result {
-                    Ok(true) if !source_changed => {
-                        match database.get_thumbnail_failure(file_id, GRID_320_PROFILE) {
-                            Ok(Some(detail)) => tracing::error!(
-                                event_kind = "thumbnail_failure",
-                                file_id = detail.file_id,
-                                folder_id = detail.folder_id,
-                                root_id = detail.root_id,
-                                relative_path = %detail.relative_path,
-                                failure_kind = %detail.failure_kind,
-                                error = %detail.error,
-                                "thumbnail generation failed"
-                            ),
-                            Ok(None) => {}
-                            Err(database_error) => tracing::warn!(
-                                task_id,
-                                attempt_generation,
-                                %database_error,
-                                "failed to resolve thumbnail failure detail"
-                            ),
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(database_error) => {
-                        tracing::warn!(
-                            task_id,
-                            attempt_generation,
-                            %database_error,
-                            "failed to update thumbnail failure state while handling worker error"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(Some(_)) => {}
+    let task = match database.get_task(task_id) {
+        Ok(Some(task)) => task,
         Ok(None) => {
             tracing::error!(
                 task_id,
                 attempt_generation,
                 "task disappeared while handling worker error"
             );
+            return;
         }
         Err(database_error) => {
             tracing::error!(
@@ -858,19 +802,74 @@ fn handle_task_error_for_attempt(
                 %database_error,
                 "failed to load task while handling worker error"
             );
+            return;
         }
-    }
-    if let Err(database_error) =
-        database.mark_task_failed_for_attempt(task_id, attempt_generation, &error_message)
-    {
-        tracing::error!(
+    };
+    invoke_worker_task_hook("task_failure_transition", task_id, database.path());
+    let transition_result = if task.kind == "thumbnail" {
+        if let Some(file_id) = task.file_id {
+            let source_changed = error_message.contains(THUMBNAIL_SOURCE_CHANGED_ERROR);
+            let failure_kind = crate::thumbnails::classify_thumbnail_failure(&error_message);
+            database.try_mark_thumbnail_task_failed_for_attempt(
+                file_id,
+                GRID_320_PROFILE,
+                task.thumbnail_source_fingerprint.as_deref(),
+                &error_message,
+                failure_kind.as_str(),
+                source_changed,
+                task_id,
+                attempt_generation,
+            )
+        } else {
+            database
+                .try_mark_task_failed_for_attempt(task_id, attempt_generation, &error_message)
+                .map(|owned| owned.then_some(false))
+        }
+    } else {
+        database
+            .try_mark_task_failed_for_attempt(task_id, attempt_generation, &error_message)
+            .map(|owned| owned.then_some(false))
+    };
+
+    match transition_result {
+        Ok(Some(true)) => {
+            let file_id = task.file_id.expect("thumbnail failure has file id");
+            match database.get_thumbnail_failure(file_id, GRID_320_PROFILE) {
+                Ok(Some(detail)) => tracing::error!(
+                    event_kind = "thumbnail_failure",
+                    file_id = detail.file_id,
+                    folder_id = detail.folder_id,
+                    root_id = detail.root_id,
+                    relative_path = %detail.relative_path,
+                    failure_kind = %detail.failure_kind,
+                    error = %detail.error,
+                    "thumbnail generation failed"
+                ),
+                Ok(None) => {}
+                Err(database_error) => tracing::warn!(
+                    task_id,
+                    attempt_generation,
+                    %database_error,
+                    "failed to resolve thumbnail failure detail"
+                ),
+            }
+        }
+        Ok(Some(false)) => {}
+        Ok(None) => tracing::warn!(
             task_id,
             attempt_generation,
-            error = %error_message,
-            %database_error,
-            recovery = "startup reset of running tasks",
-            "failed to persist worker task failure; task will remain recoverable by startup"
-        );
+            "discarding worker error after task attempt lost terminal transition ownership"
+        ),
+        Err(database_error) => {
+            tracing::error!(
+                task_id,
+                attempt_generation,
+                error = %error_message,
+                %database_error,
+                recovery = "startup reset of running tasks",
+                "failed to persist worker task failure; task will remain recoverable by startup"
+            );
+        }
     }
 }
 
@@ -2298,6 +2297,73 @@ mod tests {
         assert_eq!(thumbnail.state, "queued");
         assert_eq!(thumbnail.error, None);
 
+        fs::remove_dir_all(temp_root).expect("cleanup media root");
+    }
+
+    #[test]
+    fn late_thumbnail_failure_cannot_persist_after_same_attempt_succeeds() {
+        let temp_root = unique_temp_dir("late-thumbnail-failure");
+        fs::create_dir_all(&temp_root).expect("create media root");
+        fs::write(temp_root.join("image.jpg"), b"not a real image").expect("write media file");
+        let database_path = temp_root.join("tasks.sqlite");
+
+        let mut database = Database::open(&database_path).expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let file_id = seed_media_file(&database, &temp_root, "image.jpg");
+        let task_id = database
+            .request_thumbnail_task(
+                file_id,
+                crate::thumbnails::GRID_320_PROFILE,
+                crate::db::ThumbnailTaskPriority::Visible,
+            )
+            .expect("request thumbnail task")
+            .task_id
+            .expect("thumbnail task id");
+        let attempt_generation = database
+            .get_task(task_id)
+            .expect("get task")
+            .expect("task exists")
+            .attempt_generation;
+        database
+            .mark_task_running_for_attempt(task_id, attempt_generation)
+            .expect("mark task running");
+
+        let hook_database_path = database_path.clone();
+        let _hook_guard =
+            set_worker_task_hook_for_test(Arc::new(move |kind, hook_task_id, database_path| {
+                if kind != "task_failure_transition"
+                    || hook_task_id != task_id
+                    || database_path != Some(hook_database_path.as_path())
+                {
+                    return;
+                }
+                Database::open(&hook_database_path)
+                    .expect("reopen database")
+                    .mark_task_succeeded_for_attempt(task_id, attempt_generation)
+                    .expect("complete winning task attempt");
+            }));
+
+        handle_task_error_for_attempt(
+            &mut database,
+            task_id,
+            attempt_generation,
+            anyhow::anyhow!("late decode failure"),
+        );
+
+        let task = database
+            .get_task(task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(task.status, "succeeded");
+        assert_eq!(task.error, None);
+        let thumbnail = database
+            .get_thumbnail(file_id, crate::thumbnails::GRID_320_PROFILE)
+            .expect("get thumbnail")
+            .expect("thumbnail exists");
+        assert_ne!(thumbnail.state, "failed");
+        assert_eq!(thumbnail.error, None);
+
+        drop(database);
         fs::remove_dir_all(temp_root).expect("cleanup media root");
     }
 
