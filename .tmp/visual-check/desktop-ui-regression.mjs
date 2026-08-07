@@ -1,16 +1,18 @@
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import process from "node:process";
 import WebSocket from "ws";
 import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-browser-window-options.mjs";
+import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
 
-const root = path.resolve(process.cwd());
+const root = await resolveRepositoryRoot(import.meta.url);
 const visualRoot = path.join(root, ".tmp", "visual-check");
 const visualRunId = `megle-visual-${Date.now().toString(36)}-${process.pid}`;
-const mediaDir = path.join(visualRoot, "media");
+const controlledMedia = await prepareControlledMediaRoot(visualRoot, visualRunId);
+const mediaDir = controlledMedia.root;
 const screenshotDir = path.join(visualRoot, "screenshots");
 const logDir = path.join(visualRoot, "logs");
 const dataDir = path.join(visualRoot, `data-desktop-ui-${visualRunId}`);
@@ -51,10 +53,6 @@ await mkdir(screenshotDir, { recursive: true });
 await mkdir(logDir, { recursive: true });
 await mkdir(dataDir, { recursive: true });
 await mkdir(electronUserDataDir, { recursive: true });
-
-for (const file of await readdir(screenshotDir).catch(() => [])) {
-  await rm(path.join(screenshotDir, file), { force: true });
-}
 
 const stdoutPath = path.join(logDir, "desktop-ui-regression.stdout.log");
 const stderrPath = path.join(logDir, "desktop-ui-regression.stderr.log");
@@ -1267,6 +1265,53 @@ async function notificationPopoverFixtureEvidence(client) {
   ]);
   await fixtureClient.send("Page.bringToFront");
 
+  async function setAndReadPageScale(expected, label) {
+    const dimensions = await evaluate(
+      fixtureClient,
+      `({ width: window.innerWidth, height: window.innerHeight })`
+    );
+    await fixtureClient.send("Emulation.setPageScaleFactor", { pageScaleFactor: expected });
+    await fixtureClient.send("Emulation.setDeviceMetricsOverride", {
+      width: dimensions.width,
+      height: dimensions.height,
+      deviceScaleFactor: expected,
+      mobile: false,
+      screenWidth: dimensions.width,
+      screenHeight: dimensions.height
+    });
+    await fixtureClient.send("Emulation.setVisibleSize", dimensions).catch(() => undefined);
+    const deadline = Date.now() + 10000;
+    let lastEvidence = null;
+    while (Date.now() < deadline) {
+      const [metrics, renderer] = await Promise.all([
+        fixtureClient.send("Page.getLayoutMetrics"),
+        evaluate(
+          fixtureClient,
+          `(() => ({
+            devicePixelRatio: window.devicePixelRatio,
+            visualViewport: window.visualViewport ? {
+              width: window.visualViewport.width,
+              height: window.visualViewport.height,
+              scale: window.visualViewport.scale
+            } : null
+          }))()`
+        )
+      ]);
+      lastEvidence = {
+        expected,
+        effectiveScale: renderer.devicePixelRatio,
+        effectiveScaleSource: "window.devicePixelRatio after Emulation.setDeviceMetricsOverride",
+        emulationMode: "controlled-device-scale-factor",
+        protocolVisualViewport: metrics.visualViewport ?? null,
+        protocolCssVisualViewport: metrics.cssVisualViewport ?? null,
+        ...renderer
+      };
+      if (near(lastEvidence.effectiveScale, expected, 0.02)) return lastEvidence;
+      await delay(100);
+    }
+    throw new Error(`${label}; last=${JSON.stringify(lastEvidence)}`);
+  }
+
   async function navigate(state) {
     await fixtureClient.send("Page.navigate", {
       url: `${webUrl}/tests/fixtures/notification-popover.html?state=${state}`
@@ -1435,7 +1480,10 @@ async function notificationPopoverFixtureEvidence(client) {
       fixtureClient,
       "ui-notification-compact-fixture-full-narrow.png"
     );
-    await fixtureClient.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1.25 });
+    const pageScale125 = await setAndReadPageScale(
+      1.25,
+      "125 percent page scale factor did not take effect"
+    );
     await fixtureClient.send("Page.captureScreenshot", {
       captureBeyondViewport: false,
       format: "png"
@@ -1444,8 +1492,14 @@ async function notificationPopoverFixtureEvidence(client) {
       fixtureClient,
       "notification anchor after page zoom"
     );
-    const zoomed = await evaluate(fixtureClient, compactPopoverEvidenceExpression());
-    await fixtureClient.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1.5 });
+    const zoomed = {
+      ...(await evaluate(fixtureClient, compactPopoverEvidenceExpression())),
+      pageScale: pageScale125
+    };
+    const pageScale150 = await setAndReadPageScale(
+      1.5,
+      "150 percent page scale factor did not take effect"
+    );
     await fixtureClient.send("Page.captureScreenshot", {
       captureBeyondViewport: false,
       format: "png"
@@ -1454,12 +1508,18 @@ async function notificationPopoverFixtureEvidence(client) {
       fixtureClient,
       "notification anchor after 150 percent page zoom"
     );
-    const zoomed150 = await evaluate(fixtureClient, compactPopoverEvidenceExpression());
+    const zoomed150 = {
+      ...(await evaluate(fixtureClient, compactPopoverEvidenceExpression())),
+      pageScale: pageScale150
+    };
     const zoomed150RendererScreenshot = await rendererScreenshot(
       fixtureClient,
       "ui-notification-compact-fixture-full-150.png"
     );
-    await fixtureClient.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
+    const pageScaleReset = await setAndReadPageScale(
+      1,
+      "page scale factor did not take effect after reset"
+    );
     await waitForNotificationAnchorGeometry(
       fixtureClient,
       "notification anchor after zoom reset"
@@ -1471,6 +1531,9 @@ async function notificationPopoverFixtureEvidence(client) {
         const style = root ? getComputedStyle(root) : null;
         const backdrop = root?.querySelector(":scope > .liquid-glass-backdrop");
         const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
+        const relevantBackdropElements = root
+          ? [root, ...root.querySelectorAll(".liquid-glass-backdrop")]
+          : [];
         return {
           reducedMotion: {
             matches: matchMedia("(prefers-reduced-motion: reduce)").matches,
@@ -1482,7 +1545,16 @@ async function notificationPopoverFixtureEvidence(client) {
             matches: matchMedia("(prefers-reduced-transparency: reduce)").matches,
             backgroundColor: style?.backgroundColor ?? null,
             backdropFilter: style?.backdropFilter ?? null,
-            childBackdropFilter: backdropStyle?.backdropFilter ?? null
+            childBackdropFilter: backdropStyle?.backdropFilter ?? null,
+            allBackdropFilters: relevantBackdropElements.map((element) => {
+              const elementStyle = getComputedStyle(element);
+              return {
+                className: element.className?.toString?.() ?? null,
+                backdropFilter: elementStyle.backdropFilter,
+                webkitBackdropFilter: elementStyle.webkitBackdropFilter,
+                filter: elementStyle.filter
+              };
+            })
           }
         };
       })()`
@@ -1491,13 +1563,23 @@ async function notificationPopoverFixtureEvidence(client) {
       media: "",
       features: [{ name: "prefers-reduced-motion", value: "reduce" }]
     });
-    await delay(100);
+    await waitFor(
+      fixtureClient,
+      `matchMedia("(prefers-reduced-motion: reduce)").matches === true`,
+      10000,
+      "reduced-motion emulation did not match"
+    );
     const reducedMotion = await readPreferenceEvidence();
     await fixtureClient.send("Emulation.setEmulatedMedia", {
       media: "",
       features: [{ name: "prefers-reduced-transparency", value: "reduce" }]
     });
-    await delay(100);
+    await waitFor(
+      fixtureClient,
+      `matchMedia("(prefers-reduced-transparency: reduce)").matches === true`,
+      10000,
+      "reduced-transparency emulation did not match"
+    );
     const reducedTransparency = await readPreferenceEvidence();
     await fixtureClient.send("Emulation.setEmulatedMedia", { media: "", features: [] });
     await delay(100);
@@ -1528,6 +1610,7 @@ async function notificationPopoverFixtureEvidence(client) {
       empty,
       degraded,
       preferences: { reducedMotion, reducedTransparency },
+      pageScaleReset,
       resize,
       measurement: {
         detachedChurnAfter,
@@ -1903,7 +1986,131 @@ async function glassMaterialEvidence(client) {
   return evidence;
 }
 
-async function settingsAppearanceMatrix(settingsClient) {
+async function openAppearanceMatrixDialog(client) {
+  const opened = await evaluate(
+    client,
+    `(() => {
+      const tile = document.querySelector(".media-tile");
+      if (!(tile instanceof HTMLElement)) return { ok: false, reason: "media tile missing" };
+      const rect = tile.getBoundingClientRect();
+      tile.dispatchEvent(new MouseEvent("contextmenu", {
+        bubbles: true,
+        cancelable: true,
+        clientX: Math.round(rect.left + rect.width / 2),
+        clientY: Math.round(rect.top + Math.min(rect.height * 0.4, 80)),
+        button: 2
+      }));
+      return { ok: true };
+    })()`
+  );
+  if (!opened?.ok) throw new Error(`Appearance matrix could not open media menu: ${opened?.reason}`);
+  await waitFor(client, `Boolean(document.querySelector("#context-menu-root"))`, 10000, "appearance context menu");
+  const invoked = await evaluate(
+    client,
+    `(() => {
+      const item = [...document.querySelectorAll('#context-menu-root [data-overlay-menu-item="true"]')]
+        .find((node) => node.textContent?.includes("Rename"));
+      if (!(item instanceof HTMLButtonElement) || item.disabled) return false;
+      item.click();
+      return true;
+    })()`
+  );
+  if (!invoked) throw new Error("Appearance matrix could not invoke the Rename dialog");
+  await waitFor(
+    client,
+    `Boolean(document.querySelector('.overlay-modal-surface[data-overlay-state="open"]') && document.querySelector('.overlay-modal-backdrop[data-overlay-state="open"]'))`,
+    10000,
+    "appearance production dialog"
+  );
+}
+
+async function closeAppearanceMatrixDialog(client) {
+  await pressKey(client, "Escape", "Escape", 27).catch(() => undefined);
+  await waitFor(
+    client,
+    `!document.querySelector('.overlay-modal-backdrop:not([aria-hidden="true"])')`,
+    10000,
+    "appearance production dialog close"
+  ).catch(() => undefined);
+}
+
+function productionAppearanceEvidenceExpression(groupVariables) {
+  return `(() => {
+    const surface = (selector) => {
+      const element = document.querySelector(selector);
+      const style = element ? getComputedStyle(element) : null;
+      const backdrop = element?.querySelector(":scope > .liquid-glass-backdrop") ?? null;
+      const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
+      return {
+        present: Boolean(element),
+        mappedValues: {
+          glassFill: style?.getPropertyValue("--glass-fill").trim() ?? null,
+          glassBlurCurrent: style?.getPropertyValue("--glass-blur-current").trim() ?? null,
+          glassBorderCurrent: style?.getPropertyValue("--glass-border-current").trim() ?? null,
+          glassSaturation: style?.getPropertyValue("--glass-saturation").trim() ?? null
+        },
+        effects: {
+          backgroundColor: style?.backgroundColor ?? null,
+          backgroundImage: style?.backgroundImage ?? null,
+          borderColor: style?.borderColor ?? null,
+          backdrop: {
+            present: Boolean(backdrop),
+            backgroundColor: backdropStyle?.backgroundColor ?? null,
+            backgroundImage: backdropStyle?.backgroundImage ?? null,
+            backdropFilter: backdropStyle?.backdropFilter ?? null,
+            webkitBackdropFilter: backdropStyle?.webkitBackdropFilter ?? null
+          }
+        }
+      };
+    };
+    const modalBackdrop = document.querySelector(".overlay-modal-backdrop");
+    const modalBackdropStyle = modalBackdrop ? getComputedStyle(modalBackdrop) : null;
+    const variables = (names) => Object.fromEntries(names.map((name) => [
+      name,
+      getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+    ]));
+    const sideLeft = surface(".workbench-column-left");
+    const sideRight = surface(".workbench-column-right");
+    const center = surface(".workbench-column-center");
+    const dialogSurface = surface(".overlay-modal-surface");
+    return {
+      side: {
+        variables: variables(${JSON.stringify(groupVariables.side)}),
+        surfaceValues: {
+          left: { present: sideLeft.present, ...sideLeft.mappedValues },
+          right: { present: sideRight.present, ...sideRight.mappedValues }
+        },
+        effects: {
+          left: { present: sideLeft.present, ...sideLeft.effects },
+          right: { present: sideRight.present, ...sideRight.effects }
+        }
+      },
+      center: {
+        variables: variables(${JSON.stringify(groupVariables.center)}),
+        surfaceValues: { center: { present: center.present, ...center.mappedValues } },
+        effects: { center: { present: center.present, ...center.effects } }
+      },
+      dialog: {
+        variables: variables(${JSON.stringify(groupVariables.dialog)}),
+        surfaceValues: {
+          surface: { present: dialogSurface.present, ...dialogSurface.mappedValues }
+        },
+        effects: {
+          surface: { present: dialogSurface.present, ...dialogSurface.effects },
+          backdrop: {
+            present: Boolean(modalBackdrop),
+            backgroundColor: modalBackdropStyle?.backgroundColor ?? null,
+            backgroundImage: modalBackdropStyle?.backgroundImage ?? null,
+            backdropFilter: modalBackdropStyle?.backdropFilter ?? null,
+            webkitBackdropFilter: modalBackdropStyle?.webkitBackdropFilter ?? null
+          }
+        }
+      }
+    };
+  })()`;
+}
+
+async function settingsAppearanceMatrix(settingsClient, mainClient) {
   const groups = {
     side: ["side-blur", "side-opacity", "side-overlay-strength", "side-saturation", "side-stroke-opacity"],
     center: ["center-blur", "center-opacity", "center-overlay-strength", "center-saturation", "center-stroke-opacity"],
@@ -1914,9 +2121,29 @@ async function settingsAppearanceMatrix(settingsClient) {
     center: ["--glass-center-blur", "--glass-center-fill", "--glass-center-saturation", "--glass-center-stroke"],
     dialog: ["--glass-dialog-blur", "--glass-dialog-fill", "--dialog-blur", "--dialog-backdrop-dim"]
   };
+  const sliderVariables = {
+    "side-blur": "--glass-side-blur",
+    "side-opacity": "--glass-side-fill",
+    "side-overlay-strength": "--glass-side-fill",
+    "side-saturation": "--glass-side-saturation",
+    "side-stroke-opacity": "--glass-side-stroke",
+    "center-blur": "--glass-center-blur",
+    "center-opacity": "--glass-center-fill",
+    "center-overlay-strength": "--glass-center-fill",
+    "center-saturation": "--glass-center-saturation",
+    "center-stroke-opacity": "--glass-center-stroke",
+    "dialog-blur": "--glass-dialog-blur",
+    "dialog-opacity": "--glass-dialog-fill",
+    "dialog-overlay-strength": "--glass-dialog-fill",
+    "dialog-backdrop-dim": "--dialog-backdrop-dim"
+  };
+  const additionallyAffectedGroups = {
+    "center-saturation": ["dialog"],
+    "center-stroke-opacity": ["dialog"]
+  };
   const sliderIds = Object.values(groups).flat();
   const variableNames = Object.values(groupVariables).flat();
-  const readState = () => evaluate(
+  const readSettingsState = () => evaluate(
     settingsClient,
     `(() => {
       const sliders = Object.fromEntries(${JSON.stringify(sliderIds)}.map((id) => {
@@ -1937,6 +2164,14 @@ async function settingsAppearanceMatrix(settingsClient) {
       };
     })()`
   );
+  const readState = async () => {
+    const settings = await readSettingsState();
+    const production = await evaluate(
+      mainClient,
+      productionAppearanceEvidenceExpression(groupVariables)
+    );
+    return { ...settings, production };
+  };
   const setSlider = async (id, value) => {
     await evaluate(
       settingsClient,
@@ -1950,42 +2185,92 @@ async function settingsAppearanceMatrix(settingsClient) {
         return true;
       })()`
     );
-    await delay(120);
+    const variableName = sliderVariables[id];
+    const settingsState = await readSettingsState();
+    const expectedValue = settingsState.variables[variableName];
+    await waitFor(
+      mainClient,
+      `getComputedStyle(document.documentElement).getPropertyValue(${JSON.stringify(variableName)}).trim() === ${JSON.stringify(expectedValue)}`,
+      5000,
+      `production appearance sync for ${id}`
+    );
+    await delay(350);
     return readState();
   };
   const pickVariables = (state, group) => Object.fromEntries(
     groupVariables[group].map((name) => [name, state.variables[name]])
   );
 
-  const initial = await readState();
-  const matrix = {};
-  for (const [group, ids] of Object.entries(groups)) {
-    matrix[group] = {};
-    for (const id of ids) {
-      const initialSlider = initial.sliders[id];
-      if (!initialSlider) {
-        matrix[group][id] = { present: false };
-        continue;
-      }
-      const minState = await setSlider(id, initialSlider.min);
-      const defaultState = await setSlider(id, initialSlider.value);
-      const maxState = await setSlider(id, initialSlider.max);
-      const finalState = await setSlider(id, initialSlider.value);
-      matrix[group][id] = {
-        present: true,
-        default: initialSlider.value,
-        min: minState.sliders[id]?.value ?? null,
-        max: maxState.sliders[id]?.value ?? null,
-        restored: finalState.sliders[id]?.value ?? null,
-        variables: {
-          min: pickVariables(minState, group),
-          default: pickVariables(defaultState, group),
-          max: pickVariables(maxState, group)
+  const stable = (...values) => values.every((value) => JSON.stringify(value) === JSON.stringify(values[0]));
+
+  await openAppearanceMatrixDialog(mainClient);
+  try {
+    const initial = await readState();
+    const matrix = {};
+    for (const [group, ids] of Object.entries(groups)) {
+      matrix[group] = {};
+      for (const id of ids) {
+        const initialSlider = initial.sliders[id];
+        if (!initialSlider) {
+          matrix[group][id] = { present: false };
+          continue;
         }
-      };
+        const minState = await setSlider(id, initialSlider.min);
+        const defaultState = await setSlider(id, initialSlider.value);
+        const maxState = await setSlider(id, initialSlider.max);
+        const finalState = await setSlider(id, initialSlider.value);
+        const affectedGroups = [group, ...(additionallyAffectedGroups[id] ?? [])];
+        const unaffectedGroups = Object.fromEntries(
+          Object.keys(groups)
+            .filter((candidate) => !affectedGroups.includes(candidate))
+            .map((candidate) => [candidate, {
+              unchanged: stable(
+                minState.production[candidate],
+                defaultState.production[candidate],
+                maxState.production[candidate]
+              ),
+              min: minState.production[candidate],
+              default: defaultState.production[candidate],
+              max: maxState.production[candidate]
+            }])
+        );
+        matrix[group][id] = {
+          present: true,
+          default: initialSlider.value,
+          min: minState.sliders[id]?.value ?? null,
+          max: maxState.sliders[id]?.value ?? null,
+          restored: finalState.sliders[id]?.value ?? null,
+          affectedGroups,
+          mappedValuesChanged: !stable(
+            minState.production[group].variables,
+            maxState.production[group].variables
+          ),
+          surfaceValuesChanged: !stable(
+            minState.production[group].surfaceValues,
+            maxState.production[group].surfaceValues
+          ),
+          targetEffectsChanged: !stable(
+            minState.production[group].effects,
+            maxState.production[group].effects
+          ),
+          variables: {
+            min: pickVariables(minState, group),
+            default: pickVariables(defaultState, group),
+            max: pickVariables(maxState, group)
+          },
+          production: {
+            min: minState.production[group],
+            default: defaultState.production[group],
+            max: maxState.production[group]
+          },
+          unaffectedGroups
+        };
+      }
     }
+    return { groups, initial, matrix, final: await readState() };
+  } finally {
+    await closeAppearanceMatrixDialog(mainClient);
   }
-  return { groups, initial, matrix, final: await readState() };
 }
 
 async function settingsInterfaceStyleEvidence(client) {
@@ -2024,7 +2309,7 @@ async function settingsInterfaceStyleEvidence(client) {
     );
     const screenshotPath = await screenshot(settingsClient, "ui-settings-interface-style.png");
     const evidenceBefore = await evaluate(settingsClient, settingsInterfaceStyleEvidenceExpression());
-    const appearanceMatrix = await settingsAppearanceMatrix(settingsClient);
+    const appearanceMatrix = await settingsAppearanceMatrix(settingsClient, client);
     const pointSettingsSlider = await moveToSelector(
       settingsClient,
       '[data-settings-slider-control="side-blur"]',
@@ -3239,6 +3524,37 @@ function startupWarningsAndErrors() {
     .map((problem) => ({ ...problem, known: isKnownStartupProblem(problem.line) }));
 }
 
+function collectRunDiagnostics(scenarioFailures = []) {
+  const startupProblems = startupWarningsAndErrors();
+  const controlledRootStartup = {
+    expectedRoot: mediaDir,
+    added: startupOutput.some((entry) => entry.text.includes(`[megle] auto-added root ${mediaDir}`)),
+    failureLines: startupProblems.filter((problem) => /MEGLE_AUTO_ADD_ROOT|auto-add|auto.?added root/i.test(problem.line))
+  };
+  const unknownConsoleWarnings = consoleWarnings.filter((warning) => !warning.known);
+  const unexpectedConsoleErrors = consoleErrors.filter((entry) => !isKnownConsoleError(entry.text ?? ""));
+  const unexpectedNetworkProblems = networkProblems.filter((problem) => !isExpectedNetworkProblem(problem));
+  const unknownStartupProblems = startupProblems.filter((problem) => !problem.known);
+  const diagnosticFailures = [...scenarioFailures];
+  if (unexpectedConsoleErrors.length) diagnosticFailures.push("console errors");
+  if (unexpectedNetworkProblems.length) diagnosticFailures.push("network failures");
+  if (unknownConsoleWarnings.length) diagnosticFailures.push("unknown console warnings");
+  if (unknownStartupProblems.length) diagnosticFailures.push("unknown startup warnings/errors");
+  if (!controlledRootStartup.added) diagnosticFailures.push("controlled media root was not auto-added");
+  return {
+    consoleWarnings,
+    consoleErrors,
+    networkProblems,
+    startupProblems,
+    unexpectedConsoleErrors,
+    unexpectedNetworkProblems,
+    unknownConsoleWarnings,
+    unknownStartupProblems,
+    controlledRootStartup,
+    hardFailures: [...new Set(diagnosticFailures)]
+  };
+}
+
 function near(actual, expected, tolerance) {
   return typeof actual === "number" && typeof expected === "number" && Math.abs(actual - expected) <= tolerance;
 }
@@ -3491,21 +3807,34 @@ try {
     ) {
       notificationFailures.push("first failure drilldown was not visible and actionable");
     }
+    await delay(250);
+    const diagnostics = collectRunDiagnostics(notificationFailures);
+    hardFailures = diagnostics.hardFailures;
     summary = {
       run: {
         id: visualRunId,
+        ok: hardFailures.length === 0,
         mode: "task6-notification-window",
         startedAtUtc: runStartedAt.toISOString(),
-        completedAtUtc: new Date().toISOString()
+        completedAtUtc: new Date().toISOString(),
+        repositoryRoot: root
       },
+      controlledMedia,
       screenshots: notificationWindowFixture.screenshots,
       evidence: { notificationWindowFixture },
-      hardFailures: notificationFailures,
+      consoleWarnings: diagnostics.consoleWarnings,
+      consoleErrors: diagnostics.consoleErrors,
+      networkProblems: diagnostics.networkProblems,
+      startupProblems: diagnostics.startupProblems,
+      controlledRootStartup: diagnostics.controlledRootStartup,
+      hardFailures,
+      stdoutPath,
+      stderrPath,
       fatalError: null
     };
     await writeFile(summaryPath, JSON.stringify(summary, null, 2));
-    if (notificationFailures.length) {
-      throw new Error(`Task6 notification window harness failed: ${notificationFailures.join(", ")}`);
+    if (hardFailures.length) {
+      throw new Error(`Task6 notification window harness failed: ${hardFailures.join(", ")}`);
     }
   } else {
 
@@ -3778,15 +4107,8 @@ try {
   };
   await writeFile(summaryPath, JSON.stringify(summary, null, 2));
 
-  hardFailures = [];
-  const unknownConsoleWarnings = consoleWarnings.filter((warning) => !warning.known);
-  const unexpectedConsoleErrors = consoleErrors.filter((entry) => !isKnownConsoleError(entry.text ?? ""));
-  const unexpectedNetworkProblems = networkProblems.filter((problem) => !isExpectedNetworkProblem(problem));
-  const unknownStartupProblems = summary.startupProblems.filter((problem) => !problem.known);
-  if (unexpectedConsoleErrors.length) hardFailures.push("console errors");
-  if (unexpectedNetworkProblems.length) hardFailures.push("network failures");
-  if (unknownConsoleWarnings.length) hardFailures.push("unknown console warnings");
-  if (unknownStartupProblems.length) hardFailures.push("unknown startup warnings/errors");
+  const runDiagnostics = collectRunDiagnostics();
+  hardFailures = runDiagnostics.hardFailures;
   if (!transparent(layout.htmlBackground) || !transparent(layout.bodyBackground) || !transparent(layout.rootBackground)) {
     hardFailures.push("html/body/root backgrounds are not transparent");
   }
@@ -4142,6 +4464,12 @@ try {
       const variableChanged = Object.keys(entry?.variables?.min ?? {}).some(
         (name) => entry.variables.min[name] !== entry.variables.max?.[name]
       );
+      const productionTargetsPresent = Object.values(
+        entry?.production?.default?.surfaceValues ?? {}
+      ).every((surface) => surface.present === true);
+      const unaffectedGroupsStable = Object.values(entry?.unaffectedGroups ?? {}).every(
+        (candidate) => candidate.unchanged === true
+      );
       if (
         !initial ||
         !entry?.present ||
@@ -4149,11 +4477,24 @@ try {
         entry.max !== initial.max ||
         entry.restored !== entry.default ||
         appearanceMatrix.final?.sliders?.[id]?.value !== entry.default ||
-        !variableChanged
+        !variableChanged ||
+        !entry.mappedValuesChanged ||
+        (id !== "dialog-backdrop-dim" && !entry.surfaceValuesChanged) ||
+        !entry.targetEffectsChanged ||
+        !productionTargetsPresent ||
+        !unaffectedGroupsStable ||
+        JSON.stringify(entry.production.default) !==
+          JSON.stringify(appearanceMatrix.initial?.production?.[group])
       ) {
         hardFailures.push(`Settings ${group} appearance matrix failed for ${id}`);
       }
     }
+  }
+  if (
+    JSON.stringify(appearanceMatrix?.initial?.production) !==
+    JSON.stringify(appearanceMatrix?.final?.production)
+  ) {
+    hardFailures.push("Settings appearance matrix did not restore all production surface groups");
   }
   for (const surfaceName of ["titlebarLeft", "titlebarRight", "sidebar", "inspector"]) {
     const before = summary.evidence.settingsInterfaceStyle.materialBefore?.surfaces?.[surfaceName];
@@ -4324,22 +4665,41 @@ try {
   if (!validFixtureAnchor(zoomedFixtureRoot)) {
     hardFailures.push("zoomed notification visual fixture is detached from its anchor or overflows");
   }
+  if (!near(fixture?.zoomed?.pageScale?.effectiveScale, 1.25, 0.02)) {
+    hardFailures.push("125 percent page scale factor did not take effect in the notification fixture");
+  }
   if (!validFixtureAnchor(zoomed150FixtureRoot)) {
     hardFailures.push("150 percent notification visual fixture is detached from its anchor or overflows");
   }
+  if (!near(fixture?.zoomed150?.pageScale?.effectiveScale, 1.5, 0.02)) {
+    hardFailures.push("150 percent page scale factor did not take effect in the notification fixture");
+  }
+  if (!near(fixture?.pageScaleReset?.effectiveScale, 1, 0.02)) {
+    hardFailures.push("notification fixture page scale did not reset to 100 percent");
+  }
   const preferenceFixture = fixture?.preferences;
   if (
-    preferenceFixture?.reducedMotion?.reducedMotion?.matches &&
-    (preferenceFixture.reducedMotion.reducedMotion.animationName !== "none" ||
-      preferenceFixture.reducedMotion.reducedMotion.transform !== "none")
+    !preferenceFixture?.reducedMotion?.reducedMotion?.matches ||
+    preferenceFixture.reducedMotion.reducedMotion.animationName !== "none" ||
+    preferenceFixture.reducedMotion.reducedMotion.transform !== "none"
   ) {
-    hardFailures.push("reduced-motion notification fixture still animates its overlay surface");
+    hardFailures.push("reduced-motion emulation did not match or the notification overlay still animates");
   }
   if (
-    preferenceFixture?.reducedTransparency?.reducedTransparency?.matches &&
-    transparent(preferenceFixture.reducedTransparency.reducedTransparency.backgroundColor)
+    !preferenceFixture?.reducedTransparency?.reducedTransparency?.matches
   ) {
-    hardFailures.push("reduced-transparency notification fixture did not switch to an opaque surface");
+    hardFailures.push("reduced-transparency emulation did not match the notification fixture");
+  } else if (
+    transparent(preferenceFixture.reducedTransparency.reducedTransparency.backgroundColor) ||
+    !preferenceFixture.reducedTransparency.reducedTransparency.allBackdropFilters?.length ||
+    preferenceFixture.reducedTransparency.reducedTransparency.allBackdropFilters.some(
+      (entry) =>
+        !noBackdropFilter(entry.backdropFilter) ||
+        !noBackdropFilter(entry.webkitBackdropFilter) ||
+        !noBackdropFilter(entry.filter)
+    )
+  ) {
+    hardFailures.push("reduced-transparency notification fixture is not opaque or retained a backdrop filter");
   }
   if (!validFixtureAnchor(relocatedFixtureRoot) || !validFixtureAnchor(remountedFixtureRoot)) {
     hardFailures.push("relocated or remounted notification fixture lost its live anchor geometry");
@@ -4638,7 +4998,14 @@ try {
     hardFailures.push("preview route was not requested");
   }
 
-  summary = { ...summary, hardFailures, fatalError: null };
+  summary = {
+    ...summary,
+    run: { ...summary.run, ok: hardFailures.length === 0, repositoryRoot: root },
+    controlledMedia,
+    controlledRootStartup: runDiagnostics.controlledRootStartup,
+    hardFailures,
+    fatalError: null
+  };
   await writeFile(summaryPath, JSON.stringify(summary, null, 2));
 
   if (hardFailures.length) {
@@ -4647,19 +5014,25 @@ try {
   }
 } catch (error) {
   fatalError = error;
+  const failureDiagnostics = collectRunDiagnostics(hardFailures);
+  hardFailures = failureDiagnostics.hardFailures;
   if (!summary) {
     summary = {
       run: {
         id: visualRunId,
+        ok: false,
         startedAtUtc: runStartedAt.toISOString(),
-        completedAtUtc: new Date().toISOString()
+        completedAtUtc: new Date().toISOString(),
+        repositoryRoot: root
       },
+      controlledMedia,
       screenshots: {},
       evidence: {},
       consoleWarnings,
       consoleErrors,
       networkProblems,
       startupProblems: startupWarningsAndErrors(),
+      controlledRootStartup: failureDiagnostics.controlledRootStartup,
       stdoutPath,
       stderrPath,
       hardFailures,
@@ -4668,7 +5041,10 @@ try {
   } else {
     summary = {
       ...summary,
+      run: { ...summary.run, ok: false, repositoryRoot: root },
+      controlledMedia,
       startupProblems: startupWarningsAndErrors(),
+      controlledRootStartup: failureDiagnostics.controlledRootStartup,
       hardFailures,
       fatalError: serializeError(error)
     };

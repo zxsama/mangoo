@@ -4,14 +4,18 @@ import { mkdir, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
 
-const root = "D:\\Megle";
+const root = await resolveRepositoryRoot(import.meta.url);
 const visualRoot = path.join(root, ".tmp", "visual-check");
 const logDir = path.join(visualRoot, "logs");
-const dataDir = path.join(visualRoot, "data-exhaustive-ui");
+const visualRunId = `megle-exhaustive-${Date.now().toString(36)}-${process.pid}`;
+const dataDir = path.join(visualRoot, `data-exhaustive-ui-${visualRunId}`);
 const electronUserDataDir = path.join(dataDir, "electron-user-data");
-const autoRoot = "G:\\AI_Painter\\stable-diffusion\\stable-diffusion-webui\\outputs";
+const controlledMedia = await prepareControlledMediaRoot(visualRoot, visualRunId);
+const autoRoot = controlledMedia.root;
 const webUrl = "http://127.0.0.1:5178";
 const debugPort = Number(process.env.MEGLE_EXHAUSTIVE_DEBUG_PORT ?? 9247);
 
@@ -25,7 +29,11 @@ const stderr = createWriteStream(stderrPath, { flags: "w" });
 const results = [];
 const failures = [];
 const consoleErrors = [];
+const hardFailures = [];
+const startupOutput = [];
+let invokedTree = null;
 let child;
+let stoppingChild = false;
 
 await mkdir(logDir, { recursive: true });
 await mkdir(dataDir, { recursive: true });
@@ -33,6 +41,7 @@ await mkdir(electronUserDataDir, { recursive: true });
 
 function appendOutput(source, chunk) {
   const text = chunk.toString();
+  startupOutput.push({ source, text });
   if (source === "stderr") {
     stderr.write(text);
   } else {
@@ -42,6 +51,33 @@ function appendOutput(source, chunk) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function collectStartupProblems() {
+  return startupOutput
+    .flatMap((entry) => entry.text.split(/\r?\n/).map((line) => ({ source: entry.source, line })))
+    .filter(({ line }) => line.trim())
+    .filter(({ line }) => {
+      if (line.includes("Finished `dev` profile")) return false;
+      if (line.includes("Running `target\\debug\\megle-core.exe`")) return false;
+      if (line.includes("Running `target/debug/megle-core`")) return false;
+      return /\b(warn|warning|error|failed|panic|unhandled)\b/i.test(line);
+    });
+}
+
+async function waitForControlledRootStartup(timeoutMs = 60_000) {
+  const expected = `[megle] auto-added root ${autoRoot}`;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (startupOutput.some((entry) => entry.text.includes(expected))) return;
+    const startupProblems = collectStartupProblems();
+    const rootFailure = startupProblems.find((problem) =>
+      /MEGLE_AUTO_ADD_ROOT|auto-add|auto.?added root/i.test(problem.line)
+    );
+    if (rootFailure) throw new Error(`Controlled root startup failed: ${rootFailure.line}`);
+    await delay(100);
+  }
+  throw new Error(`Timed out waiting for controlled root startup evidence: ${expected}`);
 }
 
 function startDevApp() {
@@ -54,7 +90,9 @@ function startDevApp() {
       MEGLE_ELECTRON_USER_DATA_DIR: electronUserDataDir,
       MEGLE_AUTO_ADD_ROOT: autoRoot,
       MEGLE_REMOTE_DEBUG: "1",
-      MEGLE_REMOTE_DEBUG_PORT: String(debugPort)
+      MEGLE_REMOTE_DEBUG_PORT: String(debugPort),
+      MEGLE_VISUAL_HARNESS: "1",
+      MEGLE_VISUAL_RUN_ID: visualRunId
     },
     shell: process.platform === "win32",
     stdio: ["ignore", "pipe", "pipe"],
@@ -63,6 +101,12 @@ function startDevApp() {
 
   child.stdout.on("data", (chunk) => appendOutput("stdout", chunk));
   child.stderr.on("data", (chunk) => appendOutput("stderr", chunk));
+  child.on("error", (error) => hardFailures.push(`dev process error: ${error}`));
+  child.on("exit", (code, signal) => {
+    if (!stoppingChild) {
+      hardFailures.push(`dev process exited before sweep completion: code=${code} signal=${signal ?? "none"}`);
+    }
+  });
 }
 
 async function stopDevApp() {
@@ -70,6 +114,7 @@ async function stopDevApp() {
     return;
   }
 
+  stoppingChild = true;
   if (process.platform === "win32") {
     await new Promise((resolve) => {
       const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
@@ -196,6 +241,15 @@ class CdpClient {
     }
     if (message.method === "Runtime.exceptionThrown") {
       consoleErrors.push(message.params?.exceptionDetails?.exception?.description ?? JSON.stringify(message.params));
+    }
+    if (message.method === "Runtime.consoleAPICalled" && message.params?.type === "error") {
+      consoleErrors.push(
+        message.params.args?.map((argument) => argument.value ?? argument.description ?? "").join(" ") ??
+          JSON.stringify(message.params)
+      );
+    }
+    if (message.method === "Log.entryAdded" && message.params?.entry?.level === "error") {
+      consoleErrors.push(message.params.entry.text ?? JSON.stringify(message.params.entry));
     }
   }
 
@@ -902,40 +956,75 @@ async function runExhaustiveSweep(client) {
   results.push("root context menu sweep");
 }
 
-function buildSummary(ok) {
+function buildSummary() {
+  const startupProblems = collectStartupProblems();
+  const ok =
+    startupProblems.length === 0 &&
+    consoleErrors.length === 0 &&
+    hardFailures.length === 0 &&
+    failures.length === 0;
   return {
     run: {
       ok,
+      id: visualRunId,
       startedAtUtc: new Date(startedAt).toISOString(),
-      completedAtUtc: new Date().toISOString()
+      completedAtUtc: new Date().toISOString(),
+      repositoryRoot: root
     },
+    controlledMedia,
+    invokedTree,
     results,
     failures,
+    scenarioFailures: failures,
     consoleErrors,
+    startupProblems,
+    hardFailures,
     stdoutPath,
     stderrPath
   };
 }
 
 const startedAt = Date.now();
+let client;
 
 try {
   startDevApp();
   await waitForUrl(webUrl, 60_000);
-  const client = new CdpClient(await waitForTarget());
+  await waitForControlledRootStartup();
+  client = new CdpClient(await waitForTarget());
   await client.ready;
   await client.send("Page.enable");
   await client.send("Runtime.enable");
+  await client.send("Log.enable");
+  invokedTree = {
+    harnessPath: fileURLToPath(import.meta.url),
+    repositoryRoot: root,
+    childCwd: root,
+    controlledMediaRoot: autoRoot,
+    pageUrl: await evaluate(client, "location.href")
+  };
+  const controlledRelativePath = path.relative(root, autoRoot);
+  if (controlledRelativePath.startsWith("..") || path.isAbsolute(controlledRelativePath)) {
+    hardFailures.push(`controlled media root is outside the invoked repository: ${autoRoot}`);
+  }
+  if (!invokedTree.pageUrl.startsWith(webUrl)) {
+    hardFailures.push(`CDP target does not belong to the invoked tree URL: ${invokedTree.pageUrl}`);
+  }
   await runExhaustiveSweep(client);
-  client.close();
-  const summary = buildSummary(true);
-  await writeFile(summaryPath, JSON.stringify(summary, null, 2));
-  console.log(`Desktop exhaustive interaction sweep complete. Summary: ${summaryPath}`);
 } catch (error) {
   failures.push(String(error));
-  const summary = buildSummary(false);
-  await writeFile(summaryPath, JSON.stringify(summary, null, 2));
-  throw error;
 } finally {
+  client?.close();
   await stopDevApp();
+  await delay(250);
+  const summary = buildSummary();
+  await writeFile(summaryPath, JSON.stringify(summary, null, 2));
+  stdout.end();
+  stderr.end();
+  if (summary.run.ok) {
+    console.log(`Desktop exhaustive interaction sweep complete. Summary: ${summaryPath}`);
+  } else {
+    console.error(`Desktop exhaustive interaction sweep failed. Summary: ${summaryPath}`);
+    process.exitCode = 1;
+  }
 }
