@@ -754,7 +754,7 @@ fn handle_task_error_for_attempt(
     match database.task_attempt_is_current(task_id, attempt_generation) {
         Ok(true) => {}
         Ok(false) => {
-            tracing::warn!(
+            tracing::debug!(
                 task_id,
                 attempt_generation,
                 "discarding worker error for stale task attempt"
@@ -855,7 +855,7 @@ fn handle_task_error_for_attempt(
             }
         }
         Ok(Some(false)) => {}
-        Ok(None) => tracing::warn!(
+        Ok(None) => tracing::debug!(
             task_id,
             attempt_generation,
             "discarding worker error after task attempt lost terminal transition ownership"
