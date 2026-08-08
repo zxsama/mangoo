@@ -19,7 +19,7 @@ const logDir = path.join(visualRoot, "logs");
 const dataDir = path.join(visualRoot, `data-desktop-ui-${visualRunId}`);
 const electronUserDataDir = path.join(dataDir, "electron-user-data");
 const webUrl = "http://127.0.0.1:5179";
-const debugPort = Number(process.env.MEGLE_VISUAL_DEBUG_PORT ?? process.env.MEGLE_REMOTE_DEBUG_PORT ?? 13242);
+const debugPort = Number(process.env.MEGLE_VISUAL_DEBUG_PORT ?? process.env.MEGLE_REMOTE_DEBUG_PORT ?? 9500);
 const runStartedAt = new Date();
 const osBackdropEvidenceEnabled = process.env.MEGLE_VISUAL_OS_BACKDROP === "1";
 const notificationWindowOnly = process.env.MEGLE_VISUAL_NOTIFICATIONS_ONLY === "1";
@@ -3783,12 +3783,17 @@ function isKnownStartupProblem(line) {
 }
 
 function startupWarningsAndErrors() {
+  let cargoBuildFinished = false;
   return startupOutput
     .flatMap((entry) => entry.text.split(/\r?\n/).map((line) => ({ source: entry.source, line })))
     .filter(({ line }) => line.trim())
     .filter(({ line }) => {
+      if (line.includes("Finished `dev` profile")) {
+        cargoBuildFinished = true;
+        return false;
+      }
+      if (!cargoBuildFinished) return false;
       if (line.includes("[desktop-ui-regression] npm run dev exited")) return false;
-      if (line.includes("Finished `dev` profile")) return false;
       if (line.includes("Running `target\\debug\\megle-core.exe`")) return false;
       if (line.includes("Running `target/debug/megle-core`")) return false;
       return /\b(warn|warning|error|failed|panic|unhandled)\b/i.test(line);
@@ -4064,6 +4069,15 @@ try {
 
   if (notificationWindowOnly) {
     await waitFor(client, `Boolean(document.querySelector(".app-shell"))`, 30000, "app shell");
+    await waitFor(
+      client,
+      `[...document.querySelectorAll(".tile-label")].some((item) => item.textContent?.includes("landscape-sample")) &&
+        [...document.querySelectorAll(".tile-label")].some((item) => item.textContent?.includes("portrait-sample"))`,
+      90000,
+      "sample media tiles"
+    );
+    await waitFor(client, `document.querySelectorAll(".tile-thumb-image").length >= ${controlledMedia.files.length}`, 90000, "ready thumbnails");
+    await delay(3000);
     const notificationWindowFixture = await notificationWindowFixtureEvidence(client);
     const notificationFailures = [];
     if (
@@ -4099,6 +4113,9 @@ try {
       evidence: { notificationWindowFixture },
       consoleWarnings: diagnostics.consoleWarnings,
       consoleErrors: diagnostics.consoleErrors,
+      startupFailures: diagnostics.unknownStartupProblems,
+      consoleFailures: diagnostics.unexpectedConsoleErrors,
+      networkFailures: diagnostics.unexpectedNetworkProblems,
       networkProblems: diagnostics.networkProblems,
       startupProblems: diagnostics.startupProblems,
       controlledRootStartup: diagnostics.controlledRootStartup,
@@ -4121,7 +4138,8 @@ try {
     90000,
     "sample media tiles"
   );
-  await waitFor(client, `document.querySelectorAll(".tile-thumb-image").length >= 2`, 90000, "ready thumbnails");
+  await waitFor(client, `document.querySelectorAll(".tile-thumb-image").length >= ${controlledMedia.files.length}`, 90000, "ready thumbnails");
+  await delay(3000);
 
   const integratedTitlebarMain = await screenshot(client, "ui-integrated-titlebar-main.png");
   const layout = await evaluate(client, layoutEvidenceExpression());
@@ -5296,6 +5314,9 @@ try {
     run: { ...summary.run, ok: hardFailures.length === 0, repositoryRoot: root },
     controlledMedia,
     controlledRootStartup: runDiagnostics.controlledRootStartup,
+    startupFailures: runDiagnostics.unknownStartupProblems,
+    consoleFailures: runDiagnostics.unexpectedConsoleErrors,
+    networkFailures: runDiagnostics.unexpectedNetworkProblems,
     hardFailures,
     fatalError: null
   };
@@ -5323,6 +5344,9 @@ try {
       evidence: {},
       consoleWarnings,
       consoleErrors,
+      startupFailures: failureDiagnostics.unknownStartupProblems,
+      consoleFailures: failureDiagnostics.unexpectedConsoleErrors,
+      networkFailures: failureDiagnostics.unexpectedNetworkProblems,
       networkProblems,
       startupProblems: startupWarningsAndErrors(),
       controlledRootStartup: failureDiagnostics.controlledRootStartup,
@@ -5338,6 +5362,9 @@ try {
       controlledMedia,
       startupProblems: startupWarningsAndErrors(),
       controlledRootStartup: failureDiagnostics.controlledRootStartup,
+      startupFailures: failureDiagnostics.unknownStartupProblems,
+      consoleFailures: failureDiagnostics.unexpectedConsoleErrors,
+      networkFailures: failureDiagnostics.unexpectedNetworkProblems,
       hardFailures,
       fatalError: serializeError(error)
     };

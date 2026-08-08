@@ -113,15 +113,30 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   }
 
   assert.match(regressionSource, /collectRunDiagnostics/);
-  for (const field of ["startupProblems", "consoleErrors", "networkProblems", "hardFailures"]) {
+  for (const field of [
+    "startupProblems",
+    "startupFailures",
+    "consoleErrors",
+    "consoleFailures",
+    "networkProblems",
+    "networkFailures",
+    "hardFailures"
+  ]) {
     assert.match(regressionSource, new RegExp(`${field}[:,]`));
   }
+  assert.match(regressionSource, /MEGLE_VISUAL_DEBUG_PORT.*9500/);
+  assert.match(regressionSource, /controlledMedia\.files\.length/);
+  assert.match(regressionSource, /await delay\(3000\)/);
 
   assert.doesNotMatch(exhaustiveSource, /buildSummary\(true\)/);
   assert.match(exhaustiveSource, /invoked tree URL/);
   for (const field of ["startupProblems", "consoleErrors", "hardFailures", "failures"]) {
     assert.match(exhaustiveSource, new RegExp(`${field}\\.length`));
   }
+  for (const field of ["startupFailures", "consoleFailures"]) {
+    assert.match(exhaustiveSource, new RegExp(`${field}:`));
+  }
+  assert.match(exhaustiveSource, /MEGLE_EXHAUSTIVE_DEBUG_PORT.*9501/);
 });
 
 test("DPI, preference, and appearance checks assert effective production state", async () => {
