@@ -8,6 +8,7 @@ import WebSocket from "ws";
 import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-browser-window-options.mjs";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
 import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
+import { collectStartupDiagnostics as parseStartupDiagnostics } from "./startup-diagnostics.mjs";
 
 const root = await resolveRepositoryRoot(import.meta.url);
 const visualRoot = path.join(root, ".tmp", "visual-check");
@@ -56,8 +57,8 @@ await mkdir(logDir, { recursive: true });
 await mkdir(dataDir, { recursive: true });
 await mkdir(electronUserDataDir, { recursive: true });
 
-const stdoutPath = path.join(logDir, "desktop-ui-regression.stdout.log");
-const stderrPath = path.join(logDir, "desktop-ui-regression.stderr.log");
+const stdoutPath = path.join(logDir, `desktop-ui-regression-${visualRunId}.stdout.log`);
+const stderrPath = path.join(logDir, `desktop-ui-regression-${visualRunId}.stderr.log`);
 const summaryPath = path.join(logDir, "desktop-ui-regression-summary.json");
 const stdout = createWriteStream(stdoutPath, { flags: "w" });
 const stderr = createWriteStream(stderrPath, { flags: "w" });
@@ -3794,26 +3795,25 @@ function isKnownStartupProblem(line) {
 }
 
 function startupWarningsAndErrors() {
-  let cargoBuildFinished = false;
-  return startupOutput
-    .flatMap((entry) => entry.text.split(/\r?\n/).map((line) => ({ source: entry.source, line })))
-    .filter(({ line }) => line.trim())
-    .filter(({ line }) => {
-      if (line.includes("Finished `dev` profile")) {
-        cargoBuildFinished = true;
-        return false;
-      }
-      if (!cargoBuildFinished) return false;
-      if (line.includes("[desktop-ui-regression] npm run dev exited")) return false;
-      if (line.includes("Running `target\\debug\\megle-core.exe`")) return false;
-      if (line.includes("Running `target/debug/megle-core`")) return false;
-      return /\b(warn|warning|error|failed|panic|unhandled)\b/i.test(line);
-    })
-    .map((problem) => ({ ...problem, known: isKnownStartupProblem(problem.line) }));
+  return startupDiagnostics().startupProblems;
+}
+
+function startupDiagnostics() {
+  const parsed = parseStartupDiagnostics(startupOutput, {
+    ignoreRuntimeLine: (line) => line.includes("[desktop-ui-regression] npm run dev exited")
+  });
+  const decorate = (problem) => ({ ...problem, known: isKnownStartupProblem(problem.line) });
+  return {
+    ...parsed,
+    cargoDiagnostics: parsed.cargoDiagnostics.map(decorate),
+    runtimeProblems: parsed.runtimeProblems.map(decorate),
+    startupProblems: parsed.startupProblems.map(decorate)
+  };
 }
 
 function collectRunDiagnostics(scenarioFailures = []) {
-  const startupProblems = startupWarningsAndErrors();
+  const startup = startupDiagnostics();
+  const startupProblems = startup.startupProblems;
   const controlledRootStartup = {
     expectedRoot: mediaDir,
     added: startupOutput.some((entry) => entry.text.includes(`[megle] auto-added root ${mediaDir}`)),
@@ -3838,6 +3838,9 @@ function collectRunDiagnostics(scenarioFailures = []) {
     unexpectedNetworkProblems,
     unknownConsoleWarnings,
     unknownStartupProblems,
+    cargoBuildFinished: startup.cargoBuildFinished,
+    cargoDiagnostics: startup.cargoDiagnostics,
+    runtimeProblems: startup.runtimeProblems,
     controlledRootStartup,
     hardFailures: [...new Set(diagnosticFailures)]
   };
@@ -4128,6 +4131,9 @@ try {
       consoleFailures: diagnostics.unexpectedConsoleErrors,
       networkFailures: diagnostics.unexpectedNetworkProblems,
       networkProblems: diagnostics.networkProblems,
+      cargoBuildFinished: diagnostics.cargoBuildFinished,
+      cargoDiagnostics: diagnostics.cargoDiagnostics,
+      runtimeProblems: diagnostics.runtimeProblems,
       startupProblems: diagnostics.startupProblems,
       controlledRootStartup: diagnostics.controlledRootStartup,
       hardFailures,
@@ -5324,6 +5330,10 @@ try {
     ...summary,
     run: { ...summary.run, ok: hardFailures.length === 0, repositoryRoot: root },
     controlledMedia,
+    cargoBuildFinished: runDiagnostics.cargoBuildFinished,
+    cargoDiagnostics: runDiagnostics.cargoDiagnostics,
+    runtimeProblems: runDiagnostics.runtimeProblems,
+    startupProblems: runDiagnostics.startupProblems,
     controlledRootStartup: runDiagnostics.controlledRootStartup,
     startupFailures: runDiagnostics.unknownStartupProblems,
     consoleFailures: runDiagnostics.unexpectedConsoleErrors,
@@ -5359,7 +5369,10 @@ try {
       consoleFailures: failureDiagnostics.unexpectedConsoleErrors,
       networkFailures: failureDiagnostics.unexpectedNetworkProblems,
       networkProblems,
-      startupProblems: startupWarningsAndErrors(),
+      cargoBuildFinished: failureDiagnostics.cargoBuildFinished,
+      cargoDiagnostics: failureDiagnostics.cargoDiagnostics,
+      runtimeProblems: failureDiagnostics.runtimeProblems,
+      startupProblems: failureDiagnostics.startupProblems,
       controlledRootStartup: failureDiagnostics.controlledRootStartup,
       stdoutPath,
       stderrPath,
@@ -5371,7 +5384,10 @@ try {
       ...summary,
       run: { ...summary.run, ok: false, repositoryRoot: root },
       controlledMedia,
-      startupProblems: startupWarningsAndErrors(),
+      cargoBuildFinished: failureDiagnostics.cargoBuildFinished,
+      cargoDiagnostics: failureDiagnostics.cargoDiagnostics,
+      runtimeProblems: failureDiagnostics.runtimeProblems,
+      startupProblems: failureDiagnostics.startupProblems,
       controlledRootStartup: failureDiagnostics.controlledRootStartup,
       startupFailures: failureDiagnostics.unknownStartupProblems,
       consoleFailures: failureDiagnostics.unexpectedConsoleErrors,

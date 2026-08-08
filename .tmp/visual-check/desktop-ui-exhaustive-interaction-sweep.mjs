@@ -7,6 +7,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
+import { collectStartupDiagnostics as parseStartupDiagnostics } from "./startup-diagnostics.mjs";
 
 const root = await resolveRepositoryRoot(import.meta.url);
 const visualRoot = path.join(root, ".tmp", "visual-check");
@@ -19,8 +20,8 @@ const autoRoot = controlledMedia.root;
 const webUrl = "http://127.0.0.1:5178";
 const debugPort = Number(process.env.MEGLE_EXHAUSTIVE_DEBUG_PORT ?? 9501);
 
-const stdoutPath = path.join(logDir, "desktop-ui-exhaustive.stdout.log");
-const stderrPath = path.join(logDir, "desktop-ui-exhaustive.stderr.log");
+const stdoutPath = path.join(logDir, `desktop-ui-exhaustive-${visualRunId}.stdout.log`);
+const stderrPath = path.join(logDir, `desktop-ui-exhaustive-${visualRunId}.stderr.log`);
 const summaryPath = path.join(logDir, "desktop-ui-exhaustive-summary.json");
 
 const stdout = createWriteStream(stdoutPath, { flags: "w" });
@@ -54,20 +55,7 @@ function delay(ms) {
 }
 
 function collectStartupProblems() {
-  let cargoBuildFinished = false;
-  return startupOutput
-    .flatMap((entry) => entry.text.split(/\r?\n/).map((line) => ({ source: entry.source, line })))
-    .filter(({ line }) => line.trim())
-    .filter(({ line }) => {
-      if (line.includes("Finished `dev` profile")) {
-        cargoBuildFinished = true;
-        return false;
-      }
-      if (!cargoBuildFinished) return false;
-      if (line.includes("Running `target\\debug\\megle-core.exe`")) return false;
-      if (line.includes("Running `target/debug/megle-core`")) return false;
-      return /\b(warn|warning|error|failed|panic|unhandled)\b/i.test(line);
-    });
+  return parseStartupDiagnostics(startupOutput).startupProblems;
 }
 
 async function waitForControlledRootStartup(timeoutMs = 60_000) {
@@ -962,7 +950,8 @@ async function runExhaustiveSweep(client) {
 }
 
 function buildSummary() {
-  const startupProblems = collectStartupProblems();
+  const startupDiagnostics = parseStartupDiagnostics(startupOutput);
+  const startupProblems = startupDiagnostics.startupProblems;
   const ok =
     startupProblems.length === 0 &&
     consoleErrors.length === 0 &&
@@ -984,6 +973,9 @@ function buildSummary() {
     startupFailures: startupProblems,
     consoleFailures: consoleErrors,
     consoleErrors,
+    cargoBuildFinished: startupDiagnostics.cargoBuildFinished,
+    cargoDiagnostics: startupDiagnostics.cargoDiagnostics,
+    runtimeProblems: startupDiagnostics.runtimeProblems,
     startupProblems,
     hardFailures,
     stdoutPath,

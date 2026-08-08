@@ -11,6 +11,7 @@ import {
   validateControlledMediaRoot
 } from "./controlled-media.mjs";
 import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
+import { collectStartupDiagnostics } from "./startup-diagnostics.mjs";
 
 const harnessDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(harnessDirectory, "..", "..");
@@ -73,6 +74,29 @@ test("controlled media validation rejects a missing root clearly", async () => {
   );
 });
 
+test("Cargo diagnostics preserve pre-finish warnings without treating progress as failures", () => {
+  const diagnostics = collectStartupDiagnostics([
+    { source: "stdout", text: "Compiling megle-core v0.1.0\nFinished `dev` profile [unoptimized + debuginfo] target(s)\n" },
+    { source: "stdout", text: "Running `target\\debug\\megle-core.exe`\n" },
+    { source: "stderr", text: "error: runtime failure\n" }
+  ]);
+
+  assert.equal(diagnostics.cargoBuildFinished, true);
+  assert.deepEqual(diagnostics.cargoDiagnostics, []);
+  assert.deepEqual(diagnostics.runtimeProblems.map(({ line, phase }) => ({ line, phase })), [
+    { line: "error: runtime failure", phase: "runtime" }
+  ]);
+
+  const failedBuild = collectStartupDiagnostics([
+    { source: "stderr", text: "Compiling megle-core v0.1.0\nwarning: real build warning\nerror[E0308]: mismatched types\n" }
+  ]);
+  assert.equal(failedBuild.cargoBuildFinished, false);
+  assert.deepEqual(failedBuild.cargoDiagnostics.map(({ line, phase }) => ({ line, phase })), [
+    { line: "warning: real build warning", phase: "cargo-build" },
+    { line: "error[E0308]: mismatched types", phase: "cargo-build" }
+  ]);
+});
+
 test("final diagnostics include errors emitted while the child is stopping", async () => {
   const events = [];
   const startupProblems = [];
@@ -113,6 +137,8 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   }
 
   assert.match(regressionSource, /collectRunDiagnostics/);
+  assert.match(regressionSource, /cargoDiagnostics/);
+  assert.match(regressionSource, /cargoBuildFinished/);
   for (const field of [
     "startupProblems",
     "startupFailures",
@@ -125,6 +151,8 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
     assert.match(regressionSource, new RegExp(`${field}[:,]`));
   }
   assert.match(regressionSource, /MEGLE_VISUAL_DEBUG_PORT.*9500/);
+  assert.match(regressionSource, /desktop-ui-regression-\$\{visualRunId\}\.stdout\.log/);
+  assert.match(regressionSource, /desktop-ui-regression-\$\{visualRunId\}\.stderr\.log/);
   assert.match(regressionSource, /controlledMedia\.files\.length/);
   assert.match(regressionSource, /await delay\(3000\)/);
   assert.match(regressionSource, /const fallback = window\.setTimeout\(finish, 250\)/);
@@ -140,6 +168,10 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
     assert.match(exhaustiveSource, new RegExp(`${field}:`));
   }
   assert.match(exhaustiveSource, /MEGLE_EXHAUSTIVE_DEBUG_PORT.*9501/);
+  assert.match(exhaustiveSource, /desktop-ui-exhaustive-\$\{visualRunId\}\.stdout\.log/);
+  assert.match(exhaustiveSource, /desktop-ui-exhaustive-\$\{visualRunId\}\.stderr\.log/);
+  assert.match(exhaustiveSource, /cargoDiagnostics/);
+  assert.match(exhaustiveSource, /cargoBuildFinished/);
 });
 
 test("DPI, preference, and appearance checks assert effective production state", async () => {
