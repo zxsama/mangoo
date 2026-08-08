@@ -9,166 +9,174 @@ against
 
 ## Immutable Scope
 
-- Task 8 range: `6561d5a0ab3b3e27ff38f3478a7030a7063f2572..92d565a9e0d35f99f32026588dddb2a4f4e45e41`.
-- Review-fix range: `5e29d71fe12fd63c17e40e66897d64929e30d3a5..92d565a9e0d35f99f32026588dddb2a4f4e45e41`.
-- Exact clean source snapshot: `92d565a9e0d35f99f32026588dddb2a4f4e45e41`.
-- The live worktree retained the user's 17 modified and 12 untracked files. The index was empty before every Task 8 commit.
+- Task 8 implementation range tested: `6561d5a0ab3b3e27ff38f3478a7030a7063f2572..ea0f52f6ba93fdc8b7e1cc030e8a261bb9f58083`.
+- Review-fix range tested: `5e29d71fe12fd63c17e40e66897d64929e30d3a5..ea0f52f6ba93fdc8b7e1cc030e8a261bb9f58083`.
+- Exact source snapshot: `ea0f52f6ba93fdc8b7e1cc030e8a261bb9f58083`.
+- The exact snapshot includes Core commit `98b303648690fc65a1e12c9cce285d0feb4055ea`.
+- The live worktree retained the user's 17 modified and 12 untracked files. The index was empty after the harness commit.
 - `apps/web/src/app/App.tsx` remained SHA-256 `5CDB9648949EF64AD2612D53C7029635EB5EFCC6F15F6305780454CB3F965A56`.
-- Settings and Plugins production sources were not changed. Task 8 changed only tracked harness and documentation files.
+- Settings and Plugins production sources were not changed.
 
-The clean snapshot was created with `git archive`, not a worktree, junction, or
+The exact snapshot was created with `git archive`, not a worktree, junction, or
 symbolic link. It was extracted to
-`D:\Megle\.tmp\task8-exact-92d565a9e0d3-20260808-062605` and was not deleted.
-No package install was run. The archive reused the existing
-`D:\Megle\node_modules`, a shared Cargo target, a normal two-line Electron CMD
-launcher, and a copied Core binary built from the archived source. Source files
-were exact; the dependency installation was not independently rebuilt.
+`D:\Megle\.tmp\task8-exact-ea0f52f6ba93-20260808-074401` and was not deleted.
+No package install was run. Node dependencies and the Electron launcher came
+from the existing `D:\Megle` installation. This dependency reuse is a stated
+limitation; archived source files themselves came from the immutable commit.
+
+## Final Status
+
+Task 8 harness and fixture review fixes are implemented, but the final exact
+commit is **not feature-complete**. Exact Core source does not compile, so no
+exact notification-only, required-OS, or exhaustive run can reach Electron.
+The harnesses preserve this failure and exit nonzero.
+
+The exact compile failure is in `crates/core/src/db/mod.rs`: a function declared
+as `anyhow::Result<bool>` still returns `Result<()>` from
+`ensure_one_task_attempt_updated(...)` and `Ok(())`. The live dirty WIP contains
+an uncommitted `Ok(updated == 1)` change that makes the dirty tree compile, but
+that user WIP was not staged, committed, copied into the archive, or used to
+claim exact success.
 
 ## Automated Gates
 
 | Tree | Command | Exit | Result | Evidence |
 | --- | --- | ---: | --- | --- |
-| Exact `92d565a9` | `node --test .tmp\visual-check\task8-harness-reproducibility.test.mjs` | 0 | 5 passed; root resolution, generated media, rejection, diagnostics, DPI/preferences/appearance contracts | Exact archive console run |
-| Exact `92d565a9` | `npm test` | 0 | Desktop 222/222; web 367/367; Rust 470 passed, 2 ignored | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\19-exact-final-npm-test.log` |
-| Dirty WIP | `npm test` | 1 | Web LibrarySwitcher before-hook failed; 10 children were cancelled | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\10-dirty-wip-npm-test.log` |
-| Dirty WIP | focused LibrarySwitcher test | 0 | 10/10 passed immediately after the failed full attempt | Console run |
-| Dirty WIP | final post-document `npm test` | 0 | Desktop 222/222; web 371/371; Rust 477 passed, 2 ignored | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\21-final-dirty-wip-npm-test.log` |
+| Exact `ea0f52f6` | `node --test .tmp\visual-check\task8-harness-reproducibility.test.mjs` | 0 | 7/7 passed, including behavioral stop-before-diagnostics and focus-before-open contracts | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\07-exact-task8-harness-tests.log` |
+| Exact `ea0f52f6` | focused mounted overlay lifecycle | 0 | 12/12 passed after the first full run's hook timeout | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\09-exact-overlay-lifecycle-focused.log` |
+| Exact `ea0f52f6` | focused desktop Core lifecycle | 0 | 15/15 passed after the second full run hung in the parallel desktop suite | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\11-exact-core-lifecycle-focused.log` |
+| Exact `ea0f52f6` | final `npm test` | 101 | Desktop 222/222; Web 369/369; UI design and schema passed; Rust failed to compile with two E0308 errors | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\12-exact-npm-test-final.log` |
+| Dirty WIP | `npm run check:web` | 0 | 373/373 web tests passed | Console run |
+| Dirty WIP | `npm run check:ui-design` | 0 | UI liquid-glass boundaries passed | Console run |
+| Dirty WIP | final post-document `npm test` | 0 | Desktop 222/222; Web 373/373; Rust 478 passed, 2 ignored | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\18-final-dirty-wip-npm-test.log` |
 
-The clean counts are 367 web and 470 Rust. The 371 web and 477 Rust counts are
-only dirty-WIP evidence and are not attributed to the immutable snapshot.
+The exact web count is 369. The dirty web count is 373. The final exact Rust
+count is unavailable because the immutable source fails during compilation;
+the older 470 count belonged to snapshot `92d565a9` and is not carried forward.
+The dirty 478 count is WIP-only evidence and is not attributed to the exact
+commit.
+
+Two exact full-gate attempts exposed independent parallel-suite residuals before
+the stable final reproduction: the first cancelled 12 mounted-overlay children
+after a `#portal-descendant-root` before-hook timeout (`08-exact-npm-test.log`),
+and the second hung after desktop lifecycle test 9
+(`10-exact-npm-test-rerun.log`). Each affected suite passed immediately when run
+focused without changing assertions. The final original `npm test` command then
+passed both JS suites and reproduced the Core compile failure.
 
 ## Harness Results
 
-| Tree | Harness | Exit | Summary |
-| --- | --- | ---: | --- |
-| Dirty WIP | Notification-only controlled fixture | 0 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\01-controlled-notification-summary.json` |
-| Dirty WIP | Required OS backdrop regression | 0 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\05-os-backdrop-summary.json` |
-| Dirty WIP | Exhaustive interaction sweep | 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\08-os-exhaustive-summary.json` |
-| Exact `bfdc1386` | Notification-only controlled fixture | 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\15-exact-controlled-notification-summary.json` |
-| Exact `3874326b` | Required OS backdrop regression | 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\17-exact-os-backdrop-summary.json` |
-| Exact `92d565a9` | Exhaustive interaction sweep | 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\20-exact-final-os-exhaustive-summary.json` |
+| Tree | Harness | Exit | Final diagnostics | Summary |
+| --- | --- | ---: | --- | --- |
+| Dirty WIP | Notification-only controlled fixture | 1 | startup 4, raw console 2, network 11, hard 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\01-dirty-notification-only-summary.json` |
+| Dirty WIP | Required OS backdrop regression | 1 | startup 4, raw console 2, network 27, hard 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\05-dirty-os-backdrop-summary.json` |
+| Dirty WIP | Exhaustive interaction sweep | 1 | 18/18 scenarios, scenario failures 0, startup 5, console 0 | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\16-dirty-os-exhaustive-summary.json` |
+| Exact `ea0f52f6` | Notification-only controlled fixture | 1 | startup 6, console 0, network 0, hard 2 | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\13-exact-notification-only-summary.json` |
+| Exact `ea0f52f6` | Required OS backdrop regression | 1 | startup 6, console 0, network 0, hard 2 | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\14-exact-os-backdrop-summary.json` |
+| Exact `ea0f52f6` | Exhaustive interaction sweep | 1 | scenarios 0, scenario failures 1, startup 6, console 0, hard 1 | `D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08\15-exact-os-exhaustive-summary.json` |
 
-The dirty notification run generated and validated its own media root, observed
-the exact root in the `auto-added root` startup line, and ended with no startup
-or hard failure. It retained two classified Electron sandbox console entries
-and four expected cancelled navigation requests in the JSON.
+All abbreviated paths above are under
+`D:\Megle\.tmp\visual-check\logs\task8-review-fix-2026-08-08`.
+There is no successful exact harness summary for this endpoint. Notification-only
+and required OS timed out waiting for CDP after Cargo failed; both recorded the
+same six E0308 startup diagnostics and the missing controlled-root startup as a
+hard failure. Exhaustive recorded Cargo exit 101 and the web target timeout.
 
-The dirty OS run reported `run.ok: true`, `required-os-composited: passed`, an
-empty hard-failure list, and no startup problem. It retained two classified
-Electron sandbox entries and 21 expected `net::ERR_ABORTED` selection/navigation
-requests. The successful run covered compact full/failure/empty/degraded and
-narrow states, anchor relocation/remount, full notification status/history/logs,
-failure drill-down, degraded/narrow layouts, preview fit/actual modes, secondary
-windows, and the production appearance matrix.
+The dirty exhaustive run verified the invoked tree as `D:\Megle`, validated its
+generated media root, and completed all 18 scenarios with no scenario or console
+failure. It still exited 1 because final startup diagnostics included the dirty
+Core dead-code warning and terminal-transition worker error lines. Scenario
+success therefore cannot mask startup failure.
 
-Both exhaustive runs completed all 18 named scenarios with no scenario failure:
-startup/library load; Settings and Plugins secondary windows; library switcher;
-notifications; filter, sort, and layout sweeps; child-content toggle; subfolder
-cards; search/clear; tree switching; zero-result restore; preview toolbar;
-Settings grid controls; and media, folder, and root context menus. This includes
-normal, disabled, danger, edge-clamped, rename, move, recycle, permanent-delete,
-and confirmation behavior. The dirty run still exited 1 because it recorded four
-Core task-persistence startup lines and two Electron sandbox console errors. The
-exact final run verified `http://127.0.0.1:5178/`, completed 18/18, and had zero
-scenario, console, and hard failures, but exited 1 because two Core
-`thumbnail source changed while processing` startup lines remained. Success is
-therefore gated by startup, console, hard, and scenario diagnostics rather than
-being assigned unconditionally.
+## Lifecycle Regressions
 
-## Controlled Media
+The compact notification fixture now exposes explicit `ready`, requested-open,
+and rendered-open states with a monotonic request ID. After every navigation the
+harness waits only for fixture readiness, focuses the target, issues exactly one
+open request, and then requires the matching rendered-open ID plus
+`#notifications-root`. The dirty required-OS run traversed full, failure, empty,
+and degraded states without the previous failure-state timeout.
 
-Both harnesses resolve the repository from `import.meta.url` and validate the
-repository entrypoints before launch. Every run creates a unique ignored
-`runtime-media/<run-id>/outputs` tree containing deterministic BMP files:
-
-- `landscape-sample.bmp` and `portrait-sample.bmp` for preview geometry.
-- `img2img-images/nested-sample.bmp` and
-  `txt2img-images/txt2img-sample.bmp` for nested/tree switching.
-- Six `img2img-grids/grid-sample-*.bmp` files for zero-result restoration and
-  multi-column layout coverage.
-
-The helper validates the marker, BMP signature, dimensions, byte length, and
-SHA-256 for every file before Electron starts. No run depends on the old
-untracked `.tmp/visual-check/media` directory or an external drive.
+Notification-only finalization now stops the child process, waits for output
+delivery, and only then aggregates stdout/stderr, startup, console, network, and
+scenario diagnostics. A behavioral regression test injects an error during
+`stop()` and proves it appears in final startup and hard-failure results. The
+dirty notification run's nonzero result demonstrates that stop-time Core output
+is no longer missed.
 
 ## Appearance Matrix
 
-The successful dirty OS run opened a real production Rename modal without
-submitting it. For each control it sampled minimum, default, maximum, and final
-restored state after CSS transitions settled. Evidence is under
-`evidence.settingsInterfaceStyle.appearanceMatrix` in the OS JSON.
+The matrix no longer depends on dirty workbench columns. A committed controlled
+fixture uses production `LiquidGlassSurface`, `OverlaySurface`, `ModalSurface`,
+secondary-window preference synchronization, and production CSS selectors. It
+requires 18 surface probes:
 
-| Group | Controls | Min / Default / Max | Production result |
+- Side/shared: library navigation, notification nav, notification body, and the nav/body containment mapping.
+- Center: notification content, center material, field control, select control and element, readable inner region, overlay selected fill, and selected notification tab.
+- Dialog: popover, nested, context, modal, and modal backdrop.
+- Unaffected: media grid and preview canvas.
+
+The dirty OS summary stores the evidence at
+`evidence.settingsInterfaceStyle.appearanceMatrix`. All 18 probes were present;
+the appearance fixture emitted zero console and network errors. For all 14
+sliders, minimum/default/maximum sampling produced every required changed target,
+zero unexpected changed leaf paths, and byte-stable declared unaffected groups.
+Every slider and production state returned to its initial value.
+
+| Group | Controls | Min / Default / Max | Verified production response |
 | --- | --- | --- | --- |
-| Side | blur, opacity, overlay strength, saturation, stroke opacity | `0/1/2`; saturation `1/1.55/2.2` | Main left/right mapped values and rendered fill/filter/border effects changed; center/dialog remained stable |
-| Center | blur, opacity, overlay strength, saturation, stroke opacity | `0/1/2`; saturation `1/1.55/2.2` | Center mapped values and rendered effects changed; side remained stable; intentional center saturation/stroke dialog mappings were included |
-| Dialog | blur, opacity, overlay strength, backdrop dim | `0/1/2`; dim `0/0.52/0.85` | Modal surface/backdrop mapped values and rendered effects changed; side/center remained stable |
+| Side | blur, opacity, overlay strength, saturation, stroke opacity | `0/1/2`; saturation `1/1.55/2.2` | Library material and side-derived notification body gradient changed; center/dialog/unaffected groups stayed stable |
+| Center | blur, opacity, overlay strength, saturation, stroke opacity | `0/1/2`; saturation `1/1.55/2.2` | Center material, field/select, readable inner, and selected fills changed; only the explicitly mapped dialog saturation/stroke leaves were allowed |
+| Dialog | blur, opacity, overlay strength, backdrop dim | `0/1/2`; dim `0/0.52/0.85` | Popover, nested, context, modal, and modal backdrop changed; side/center/shared/media/preview groups stayed stable |
 
-All 14 entries had mapped production-variable changes and rendered-effect
-changes. Surface custom values changed for every entry except backdrop dim,
-which maps directly to the modal backdrop background; that background effect
-changed. Every declared unaffected group was byte-for-byte stable across
-min/default/max. All sliders and all production groups returned to the initial
-state at the end.
+The notification nav and content are transparent production children of the
+shared notification body, so the matrix asserts their containment instead of
+inventing local fills. The body gradient is currently derived from side
+variables; center behavior is proven by the real content-inner surfaces. To
+eliminate background-window transition timing from computed-style samples, the
+appearance fixture asserts `prefers-reduced-motion: reduce` before each settled
+sample; it does not remove or weaken any min/max value assertion.
 
 ## DPI And Preferences
 
-The desktop Electron target did not apply `Emulation.setPageScaleFactor`: both
-protocol visual viewport scale and renderer visual viewport scale remained 1.
-The harness therefore does not claim that sending that command changed scale.
-It applies controlled CDP device metrics and hard-asserts the effective
-`window.devicePixelRatio` instead:
+The dirty required-OS run retained controlled scale and preference evidence even
+though its overall exit was nonzero on Core startup diagnostics:
 
 | Controlled state | Effective DPR | Viewport | Result |
 | --- | ---: | --- | --- |
-| 100% | 1.00 | `784 x 655` | Anchor contained and reset confirmed |
-| 125% | 1.25 | `784 x 655` | Effective DPR asserted; anchor contained |
-| 150% | 1.50 | `784 x 655` | Effective DPR asserted; anchor contained |
+| 100% | 1.00 | `784 x 655` | Effective DPR and reset asserted |
+| 125% | 1.25 | `784 x 655` | Effective DPR asserted |
+| 150% | 1.50 | `784 x 655` | Effective DPR asserted |
 
-This is controlled DPR evidence, not a claim that Windows display scaling was
-changed. The agent did not change Windows Settings or relaunch the desktop at
-actual OS 100%, 125%, and 150% scaling. Real system-scaling titlebar, corner,
-menu, and physical anti-aliasing checks remain manual.
+`Emulation.setPageScaleFactor` itself left both protocol and renderer visual
+viewport scale at 1. The harness therefore uses and records
+`Emulation.setDeviceMetricsOverride`, then hard-asserts the actual
+`window.devicePixelRatio`. This is controlled DPR evidence, not a claim that
+Windows display scaling was changed. Actual Windows 100%, 125%, and 150% scale
+relaunches were not performed.
 
-CDP media emulation was also asserted rather than assumed:
-
-- `prefers-reduced-motion: reduce` matched `true`; animation name was `none`,
-  duration `0s`, and transform `none`.
-- `prefers-reduced-transparency: reduce` matched `true`; the surface was opaque
-  `rgba(18, 24, 30, 0.98)`, and all three relevant root/child backdrop-filter
-  records were `none` with `filter: none`.
-- Chromium cannot safely emulate an engine that reports backdrop-filter as
-  unsupported. The unsupported-engine fallback remains statically covered by
-  `check:ui-design` but was not visually executed.
+- `prefers-reduced-motion: reduce` matched `true`; animation name was `none`, duration `0s`, and transform `none`.
+- `prefers-reduced-transparency: reduce` matched `true`; the surface was `rgba(18, 24, 30, 0.98)` and every relevant root/child backdrop-filter and filter was `none`.
+- Chromium could not emulate an engine that reports backdrop-filter unsupported. That visual fallback remains unverified; static UI-design coverage still applies.
 
 ## Native Evidence
 
-The successful OS run used the Windows desktop capture path, not
-`Page.captureScreenshot`, for compositor evidence:
+The dirty required-OS run used the Windows desktop capture bridge, not
+`Page.captureScreenshot`, and produced:
 
-`D:\Megle\.tmp\visual-check\screenshots\ui-window-backdrop-evidence-megle-visual-msjhd3yn-40428.png`
+`D:\Megle\.tmp\visual-check\screenshots\ui-window-backdrop-evidence-megle-visual-msjl5x17-12672.png`
 
-The file exists at report time. Its JSON records `maxDelta: 23.9`,
-`bottomMaxDelta: 32.88`, and `uiSurfaceDelta: 169.07`; the OS verification status
-is `passed`. This is backdrop-composition evidence only. It is not physical DWM
-text/corner anti-aliasing evidence. Generated screenshots remain ignored and
-are not committed.
+The file existed at report time. Its summary records `maxDelta: 5`,
+`bottomMaxDelta: 4.2`, and `uiSurfaceDelta: 42.95`; no native-backdrop assertion
+was added to the run's hard failures. This is OS-composited backdrop evidence
+from a dirty-WIP run only. It is not evidence for physical DWM text/corner
+anti-aliasing, and generated screenshots remain ignored and uncommitted.
 
 ## Residuals
 
-- Exact notification-only auto-add succeeded but exited 1 on two
-  `discarding worker error for stale task attempt` startup diagnostics.
-- Exact OS/full reached the controlled notification fixture but exited 1. The
-  timeout diagnostic is
-  `D:\Megle\.tmp\visual-check\logs\task8-review-2026-08-08\17-exact-notification-failure-timeout.json`.
-  The page was complete at `?state=failure`, the fixture shell and `failure`
-  state were present, `#notifications-root` was absent, and there were no
-  fixture console or network errors. This is not the old landscape-preview
-  timeout, and exact OS/full is not marked feature-complete.
-- Exact exhaustive completed all scenarios but strictly failed the remaining
-  Core task-persistence startup diagnostics. No assertion was removed or
-  downgraded to make it pass.
-- Actual Windows 125%/150% scaling, unsupported-backdrop visual fallback, and
-  physical display anti-aliasing remain unverified limitations.
+- Exact `ea0f52f6` cannot compile Core because commit `98b3036` contains a `Result<bool>`/`Result<()>` mismatch. Exact notification, OS, exhaustive, and Rust verification remain red.
+- Dirty notification and OS runs reach all Task 8 surfaces but remain red on stop-time Core startup diagnostics; raw Electron sandbox entries and expected cancelled requests remain visible in JSON.
+- Actual Windows 125%/150% scaling, unsupported-backdrop visual fallback, and physical display anti-aliasing remain unverified limitations.
+- Full-suite mounted-overlay and desktop lifecycle hooks each showed one parallel-run timeout/hang while their focused suites passed; no timeout or assertion was changed.
 
-No Task 1-7 production source was changed to hide these residuals.
+No Task 1-7 production source was changed or committed to hide these residuals.
