@@ -3864,6 +3864,7 @@ impl Database {
         Ok(Some(thumbnail))
     }
 
+    #[cfg(test)]
     pub fn reset_thumbnail_after_stale_source_for_task_attempt(
         &self,
         file_id: i64,
@@ -3883,6 +3884,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn publish_thumbnail_failure_for_attempted_source_for_task_attempt(
         &self,
         file_id: i64,
