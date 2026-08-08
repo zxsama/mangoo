@@ -83,21 +83,39 @@ function OverlayAppearanceVisualFixture() {
             data-appearance-surface="popover"
             surfaceRole="popover"
           >
-            Popover material
+            <button
+              data-fallback-probe="popover"
+              onClick={(event) => { event.currentTarget.dataset.fallbackActivated = "true"; }}
+              type="button"
+            >
+              Popover material
+            </button>
           </OverlaySurface>
           <OverlaySurface
             className="overlay-appearance-dialog-surface"
             data-appearance-surface="nested"
             surfaceRole="nested"
           >
-            Nested material
+            <button
+              data-fallback-probe="nested"
+              onClick={(event) => { event.currentTarget.dataset.fallbackActivated = "true"; }}
+              type="button"
+            >
+              Nested material
+            </button>
           </OverlaySurface>
           <OverlaySurface
             className="context-menu overlay-appearance-dialog-surface"
             data-appearance-surface="context"
             surfaceRole="popover"
           >
-            Context material
+            <button
+              data-fallback-probe="context"
+              onClick={(event) => { event.currentTarget.dataset.fallbackActivated = "true"; }}
+              type="button"
+            >
+              Context material
+            </button>
           </OverlaySurface>
         </div>
 
@@ -118,7 +136,15 @@ function OverlayAppearanceVisualFixture() {
         rootId="file-operation"
       >
         <OverlayDialogHeader title="Modal material" titleId="appearance-modal-heading" />
-        <OverlayDialogBody>Controlled production modal surface.</OverlayDialogBody>
+        <OverlayDialogBody>
+          <button
+            data-fallback-probe="modal"
+            onClick={(event) => { event.currentTarget.dataset.fallbackActivated = "true"; }}
+            type="button"
+          >
+            Controlled production modal surface.
+          </button>
+        </OverlayDialogBody>
       </ModalSurface>
     </LiquidGlassLayer>
   );

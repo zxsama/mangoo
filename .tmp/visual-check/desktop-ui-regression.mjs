@@ -8,6 +8,7 @@ import WebSocket from "ws";
 import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-browser-window-options.mjs";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
 import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
+import { collectUnexpectedNetworkProblems } from "./network-diagnostics.mjs";
 import { collectStartupDiagnostics as parseStartupDiagnostics } from "./startup-diagnostics.mjs";
 
 const root = await resolveRepositoryRoot(import.meta.url);
@@ -2191,6 +2192,114 @@ function productionAppearanceEvidenceExpression(groupVariables) {
   })()`;
 }
 
+async function controlledSolidFallbackEvidence(fixtureClient) {
+  const probes = ["popover", "nested", "context", "modal"];
+  await evaluate(
+    fixtureClient,
+    `document.documentElement.setAttribute("data-overlay-solid-fallback", "forced")`
+  );
+  await delay(100);
+  try {
+    const keyboard = {};
+    for (const probe of probes) {
+      const selector = `[data-fallback-probe=${JSON.stringify(probe)}]`;
+      keyboard[probe] = {
+        focused: await evaluate(
+          fixtureClient,
+          `(() => {
+            const target = document.querySelector(${JSON.stringify(selector)});
+            if (!(target instanceof HTMLButtonElement)) return false;
+            target.focus();
+            return document.activeElement === target;
+          })()`
+        )
+      };
+      await pressKey(fixtureClient, "Enter", "Enter", 13);
+      await waitFor(
+        fixtureClient,
+        `document.querySelector(${JSON.stringify(selector)})?.getAttribute("data-fallback-activated") === "true"`,
+        5000,
+        `solid fallback ${probe} keyboard activation`
+      );
+      keyboard[probe].activated = true;
+    }
+
+    const styles = await evaluate(
+      fixtureClient,
+      `(() => {
+        const parseAlpha = (value) => {
+          const match = String(value ?? "").match(/rgba?\\(([^)]+)\\)/i);
+          if (!match) return 0;
+          const parts = match[1].split(",").map((part) => part.trim());
+          return parts.length >= 4 ? Number(parts[3]) : 1;
+        };
+        const readSurface = (selector) => {
+          const surface = document.querySelector(selector);
+          const style = surface ? getComputedStyle(surface) : null;
+          const backdrop = surface?.querySelector(":scope > .liquid-glass-backdrop") ?? null;
+          const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
+          const backgroundAlpha = parseAlpha(style?.backgroundColor);
+          const backdropAlpha = parseAlpha(backdropStyle?.backgroundColor);
+          const colorAlpha = parseAlpha(style?.color);
+          return {
+            present: Boolean(surface),
+            backgroundColor: style?.backgroundColor ?? null,
+            backgroundImage: style?.backgroundImage ?? null,
+            backgroundAlpha,
+            color: style?.color ?? null,
+            colorAlpha,
+            backdrop: {
+              present: Boolean(backdrop),
+              backgroundColor: backdropStyle?.backgroundColor ?? null,
+              backgroundAlpha: backdropAlpha,
+              backdropFilter: backdropStyle?.backdropFilter ?? null,
+              webkitBackdropFilter: backdropStyle?.webkitBackdropFilter ?? null
+            },
+            opaque: backgroundAlpha >= 0.95 && backdropAlpha >= 0.95,
+            readable: colorAlpha >= 0.95
+          };
+        };
+        const modalBackdrop = document.querySelector(".overlay-modal-backdrop");
+        const modalBackdropStyle = modalBackdrop ? getComputedStyle(modalBackdrop) : null;
+        return {
+          forcedAttribute: document.documentElement.getAttribute("data-overlay-solid-fallback"),
+          surfaces: {
+            popover: readSurface('[data-appearance-surface="popover"]'),
+            nested: readSurface('[data-appearance-surface="nested"]'),
+            context: readSurface('[data-appearance-surface="context"]'),
+            modal: readSurface("#appearance-matrix-modal.overlay-modal-surface")
+          },
+          modalBackdrop: {
+            present: Boolean(modalBackdrop),
+            backdropFilter: modalBackdropStyle?.backdropFilter ?? null,
+            webkitBackdropFilter: modalBackdropStyle?.webkitBackdropFilter ?? null
+          }
+        };
+      })()`
+    );
+    return {
+      mechanism: "production-data-overlay-solid-fallback-variable-path",
+      keyboard,
+      styles,
+      screenshotPath: await rendererScreenshot(
+        fixtureClient,
+        "ui-overlay-solid-fallback-controlled.png"
+      )
+    };
+  } finally {
+    await evaluate(
+      fixtureClient,
+      `(() => {
+        document.documentElement.removeAttribute("data-overlay-solid-fallback");
+        document.querySelectorAll("[data-fallback-activated]").forEach((element) => {
+          element.removeAttribute("data-fallback-activated");
+        });
+      })()`
+    );
+    await delay(100);
+  }
+}
+
 async function settingsAppearanceMatrix(settingsClient, mainClient) {
   const groups = {
     side: ["side-blur", "side-opacity", "side-overlay-strength", "side-saturation", "side-stroke-opacity"],
@@ -2474,6 +2583,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
 
   try {
     const initial = await readState();
+    const solidFallback = await controlledSolidFallbackEvidence(appearanceClient);
     const requiredSurfaces = Object.fromEntries(requiredSurfacePaths.map((surfacePath) => [
       surfacePath,
       valueAtPath(initial.production, surfacePath)?.present === true
@@ -2547,6 +2657,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
         consoleErrors: appearanceFixture.consoleErrors,
         networkProblems: appearanceFixture.networkProblems
       },
+      solidFallback,
       initial,
       matrix,
       final: await readState()
@@ -3784,12 +3895,6 @@ function isKnownConsoleError(text) {
   return /sandboxed_renderer\.bundle\.js script failed to run|preloadScripts.*startupData/i.test(text);
 }
 
-function isExpectedNetworkProblem(problem) {
-  return problem.status === "loadingFailed" &&
-    problem.errorText === "net::ERR_ABORTED" &&
-    problem.canceled === true;
-}
-
 function isKnownStartupProblem(line) {
   return false;
 }
@@ -3821,7 +3926,7 @@ function collectRunDiagnostics(scenarioFailures = []) {
   };
   const unknownConsoleWarnings = consoleWarnings.filter((warning) => !warning.known);
   const unexpectedConsoleErrors = consoleErrors.filter((entry) => !isKnownConsoleError(entry.text ?? ""));
-  const unexpectedNetworkProblems = networkProblems.filter((problem) => !isExpectedNetworkProblem(problem));
+  const unexpectedNetworkProblems = collectUnexpectedNetworkProblems(networkProblems);
   const unknownStartupProblems = startupProblems.filter((problem) => !problem.known);
   const diagnosticFailures = [...scenarioFailures];
   if (unexpectedConsoleErrors.length) diagnosticFailures.push("console errors");
@@ -4415,10 +4520,6 @@ try {
     stdoutPath,
     stderrPath
   };
-  await writeFile(summaryPath, JSON.stringify(summary, null, 2));
-
-  const runDiagnostics = collectRunDiagnostics();
-  hardFailures = runDiagnostics.hardFailures;
   if (!transparent(layout.htmlBackground) || !transparent(layout.bodyBackground) || !transparent(layout.rootBackground)) {
     hardFailures.push("html/body/root backgrounds are not transparent");
   }
@@ -4785,6 +4886,26 @@ try {
     appearanceMatrix?.fixtureDiagnostics?.networkProblems?.length
   ) {
     hardFailures.push("Settings appearance matrix fixture emitted console or network errors");
+  }
+  const solidFallback = appearanceMatrix?.solidFallback;
+  const fallbackSurfaces = Object.values(solidFallback?.styles?.surfaces ?? {});
+  const fallbackKeyboard = Object.values(solidFallback?.keyboard ?? {});
+  if (
+    solidFallback?.mechanism !== "production-data-overlay-solid-fallback-variable-path" ||
+    solidFallback?.styles?.forcedAttribute !== "forced" ||
+    fallbackSurfaces.length !== 4 ||
+    fallbackSurfaces.some((surface) =>
+      !surface.present || !surface.opaque || !surface.readable ||
+      surface.backdrop?.backdropFilter !== "none" ||
+      surface.backdrop?.webkitBackdropFilter !== "none"
+    ) ||
+    solidFallback?.styles?.modalBackdrop?.present !== true ||
+    solidFallback?.styles?.modalBackdrop?.backdropFilter !== "none" ||
+    solidFallback?.styles?.modalBackdrop?.webkitBackdropFilter !== "none" ||
+    fallbackKeyboard.length !== 4 ||
+    fallbackKeyboard.some((probe) => !probe.focused || !probe.activated)
+  ) {
+    hardFailures.push("production overlay solid fallback is not opaque, readable, keyboard accessible, and usable");
   }
   for (const [group, ids] of Object.entries(appearanceMatrix?.groups ?? {})) {
     for (const id of ids) {
@@ -5326,9 +5447,24 @@ try {
     hardFailures.push("preview route was not requested");
   }
 
+  const runDiagnostics = await stopThenCollectDiagnostics({
+    stop: stopDevApp,
+    waitForOutput: () => delay(300),
+    collect: () => collectRunDiagnostics(hardFailures)
+  });
+  hardFailures = runDiagnostics.hardFailures;
   summary = {
     ...summary,
-    run: { ...summary.run, ok: hardFailures.length === 0, repositoryRoot: root },
+    run: {
+      ...summary.run,
+      ok: hardFailures.length === 0,
+      completedAtUtc: new Date().toISOString(),
+      repositoryRoot: root,
+      finalization: {
+        childStoppedBeforeDiagnostics: true,
+        outputWaitCompletedBeforeDiagnostics: true
+      }
+    },
     controlledMedia,
     cargoBuildFinished: runDiagnostics.cargoBuildFinished,
     cargoDiagnostics: runDiagnostics.cargoDiagnostics,
@@ -5349,7 +5485,11 @@ try {
   }
 } catch (error) {
   fatalError = error;
-  const failureDiagnostics = collectRunDiagnostics(hardFailures);
+  const failureDiagnostics = await stopThenCollectDiagnostics({
+    stop: stopDevApp,
+    waitForOutput: () => delay(300),
+    collect: () => collectRunDiagnostics(hardFailures)
+  });
   hardFailures = failureDiagnostics.hardFailures;
   if (!summary) {
     summary = {
@@ -5358,7 +5498,11 @@ try {
         ok: false,
         startedAtUtc: runStartedAt.toISOString(),
         completedAtUtc: new Date().toISOString(),
-        repositoryRoot: root
+        repositoryRoot: root,
+        finalization: {
+          childStoppedBeforeDiagnostics: true,
+          outputWaitCompletedBeforeDiagnostics: true
+        }
       },
       controlledMedia,
       screenshots: {},
@@ -5382,7 +5526,15 @@ try {
   } else {
     summary = {
       ...summary,
-      run: { ...summary.run, ok: false, repositoryRoot: root },
+      run: {
+        ...summary.run,
+        ok: false,
+        repositoryRoot: root,
+        finalization: {
+          childStoppedBeforeDiagnostics: true,
+          outputWaitCompletedBeforeDiagnostics: true
+        }
+      },
       controlledMedia,
       cargoBuildFinished: failureDiagnostics.cargoBuildFinished,
       cargoDiagnostics: failureDiagnostics.cargoDiagnostics,
@@ -5399,12 +5551,10 @@ try {
   await writeFile(summaryPath, JSON.stringify(summary, null, 2));
   throw error;
 } finally {
-  if (summary) await writeFile(summaryPath, JSON.stringify(summary, null, 2));
-  if (client) client.close();
   await stopDevApp();
+  if (client) client.close();
   stdout.end();
   stderr.end();
-  await delay(300);
 }
 } finally {
   if (!fatalError) {

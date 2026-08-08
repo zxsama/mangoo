@@ -11,12 +11,17 @@ import {
   validateControlledMediaRoot
 } from "./controlled-media.mjs";
 import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
+import {
+  collectUnexpectedNetworkProblems,
+  isExpectedTeardownNetworkProblem
+} from "./network-diagnostics.mjs";
 import { collectStartupDiagnostics } from "./startup-diagnostics.mjs";
 
 const harnessDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(harnessDirectory, "..", "..");
 const regressionPath = path.join(harnessDirectory, "desktop-ui-regression.mjs");
 const exhaustivePath = path.join(harnessDirectory, "desktop-ui-exhaustive-interaction-sweep.mjs");
+const overlayCssPath = path.join(repositoryRoot, "apps", "web", "src", "design", "overlays", "overlay.css");
 const appearanceFixturePath = path.join(
   repositoryRoot,
   "apps",
@@ -124,6 +129,56 @@ test("final diagnostics include errors emitted while the child is stopping", asy
   assert.deepEqual(diagnostics.hardFailures, ["late shutdown error"]);
 });
 
+test("normal OS regression finalizes the child before collecting and writing diagnostics", async () => {
+  const source = await readFile(regressionPath, "utf8");
+  const normalBranchStart = source.indexOf("const integratedTitlebarMain");
+  const catchStart = source.lastIndexOf("} catch (error) {");
+  const normalBranch = source.slice(normalBranchStart, catchStart);
+  const finalizationIndex = normalBranch.indexOf("const runDiagnostics = await stopThenCollectDiagnostics");
+  const stopIndex = normalBranch.indexOf("stop: stopDevApp", finalizationIndex);
+  const waitIndex = normalBranch.indexOf("waitForOutput: () => delay(300)", stopIndex);
+  const collectIndex = normalBranch.indexOf("collect: () => collectRunDiagnostics(hardFailures)", waitIndex);
+  const finalSummaryIndex = normalBranch.indexOf("summary = {", collectIndex);
+  const writeIndex = normalBranch.indexOf("await writeFile(summaryPath", finalSummaryIndex);
+
+  assert.ok(normalBranchStart >= 0, "normal desktop regression branch must be present");
+  assert.ok(finalizationIndex >= 0, "normal branch must use stopThenCollectDiagnostics");
+  assert.ok(stopIndex > finalizationIndex);
+  assert.ok(waitIndex > stopIndex);
+  assert.ok(collectIndex > waitIndex);
+  assert.ok(finalSummaryIndex > collectIndex);
+  assert.ok(writeIndex > finalSummaryIndex);
+  assert.equal(
+    normalBranch.slice(0, finalizationIndex).includes("writeFile(summaryPath"),
+    false,
+    "normal branch must not write a pre-stop summary"
+  );
+  assert.match(normalBranch, /childStoppedBeforeDiagnostics: true/);
+  assert.match(normalBranch, /outputWaitCompletedBeforeDiagnostics: true/);
+});
+
+test("network diagnostics accept only the strict canceled teardown abort", () => {
+  const expected = {
+    status: "loadingFailed",
+    errorText: "net::ERR_ABORTED",
+    canceled: true
+  };
+  const httpFailure = { status: 503, url: "http://127.0.0.1:5178/api/assets" };
+  const activeAbort = {
+    status: "loadingFailed",
+    errorText: "net::ERR_ABORTED",
+    canceled: false
+  };
+
+  assert.equal(isExpectedTeardownNetworkProblem(expected), true);
+  assert.equal(isExpectedTeardownNetworkProblem(httpFailure), false);
+  assert.equal(isExpectedTeardownNetworkProblem(activeAbort), false);
+  assert.deepEqual(
+    collectUnexpectedNetworkProblems([expected, httpFailure, activeAbort]),
+    [httpFailure, activeAbort]
+  );
+});
+
 test("desktop harnesses have no machine-specific roots and gate diagnostics", async () => {
   const [regressionSource, exhaustiveSource] = await Promise.all([
     readFile(regressionPath, "utf8"),
@@ -161,12 +216,18 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
 
   assert.doesNotMatch(exhaustiveSource, /buildSummary\(true\)/);
   assert.match(exhaustiveSource, /invoked tree URL/);
-  for (const field of ["startupProblems", "consoleErrors", "hardFailures", "failures"]) {
+  for (const field of ["startupProblems", "consoleErrors", "networkFailures", "finalHardFailures", "failures"]) {
     assert.match(exhaustiveSource, new RegExp(`${field}\\.length`));
   }
-  for (const field of ["startupFailures", "consoleFailures"]) {
-    assert.match(exhaustiveSource, new RegExp(`${field}:`));
+  for (const field of ["startupFailures", "consoleFailures", "networkProblems", "networkFailures"]) {
+    assert.match(exhaustiveSource, new RegExp(`${field}[:,]`));
   }
+  assert.match(exhaustiveSource, /Network\.enable/);
+  assert.match(exhaustiveSource, /Network\.requestWillBeSent/);
+  assert.match(exhaustiveSource, /Network\.responseReceived/);
+  assert.match(exhaustiveSource, /Network\.loadingFailed/);
+  assert.match(exhaustiveSource, /collectUnexpectedNetworkProblems\(networkProblems\)/);
+  assert.match(exhaustiveSource, /finalHardFailures\.push\("network failures"\)/);
   assert.match(exhaustiveSource, /MEGLE_EXHAUSTIVE_DEBUG_PORT.*9501/);
   assert.match(exhaustiveSource, /desktop-ui-exhaustive-\$\{visualRunId\}\.stdout\.log/);
   assert.match(exhaustiveSource, /desktop-ui-exhaustive-\$\{visualRunId\}\.stderr\.log/);
@@ -175,9 +236,10 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
 });
 
 test("DPI, preference, and appearance checks assert effective production state", async () => {
-  const [source, appearanceFixture] = await Promise.all([
+  const [source, appearanceFixture, overlayCss] = await Promise.all([
     readFile(regressionPath, "utf8"),
-    readFile(appearanceFixturePath, "utf8")
+    readFile(appearanceFixturePath, "utf8"),
+    readFile(overlayCssPath, "utf8")
   ]);
 
   assert.match(source, /Emulation\.setDeviceMetricsOverride/);
@@ -212,6 +274,18 @@ test("DPI, preference, and appearance checks assert effective production state",
   }
   assert.match(appearanceFixture, /ModalSurface/);
   assert.match(appearanceFixture, /useSecondaryWindowInterfaceStyle/);
+  for (const probe of ["popover", "nested", "context", "modal"]) {
+    assert.match(appearanceFixture, new RegExp(`data-fallback-probe=["']${probe}["']`));
+  }
+  assert.match(source, /controlledSolidFallbackEvidence/);
+  assert.match(source, /production-data-overlay-solid-fallback-variable-path/);
+  assert.match(source, /solid fallback .* keyboard activation/);
+  assert.match(source, /surface\.opaque/);
+  assert.match(source, /surface\.readable/);
+  assert.match(overlayCss, /@supports not[\s\S]*--overlay-solid-fallback-fill/);
+  assert.match(overlayCss, /:root\[data-overlay-solid-fallback="forced"\][\s\S]*--overlay-solid-fallback-fill/);
+  assert.match(overlayCss, /background: var\(--overlay-solid-fallback-fill/);
+  assert.match(overlayCss, /--overlay-solid-fallback-filter/);
 });
 
 test("notification fixture navigation focuses before one explicit open handshake", async () => {

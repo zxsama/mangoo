@@ -23,9 +23,23 @@
 .overlay-surface-popover,
 .overlay-surface-nested {
   overflow: hidden;
-  background:
+  background: var(
+    --overlay-solid-fallback-fill,
     linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.018)),
-    var(--glass-dialog-fill);
+    var(--glass-dialog-fill)
+  );
+}
+
+.overlay-surface > .liquid-glass-backdrop {
+  background: var(--overlay-solid-fallback-fill, var(--glass-fill));
+  -webkit-backdrop-filter: var(
+    --overlay-solid-fallback-filter,
+    blur(var(--glass-blur-current)) saturate(var(--glass-saturation))
+  );
+  backdrop-filter: var(
+    --overlay-solid-fallback-filter,
+    blur(var(--glass-blur-current)) saturate(var(--glass-saturation))
+  );
 }
 
 .overlay-scroll-viewport {
@@ -35,9 +49,11 @@
 }
 
 .overlay-surface-nested {
-  background:
+  background: var(
+    --overlay-solid-fallback-fill,
     linear-gradient(rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.04)),
-    var(--glass-dialog-fill);
+    var(--glass-dialog-fill)
+  );
   box-shadow: var(--glass-shadow-tight);
 }
 
@@ -50,8 +66,14 @@
   display: grid;
   place-items: center;
   background: var(--dialog-backdrop-dim);
-  -webkit-backdrop-filter: blur(var(--dialog-blur)) saturate(var(--glass-center-saturation));
-  backdrop-filter: blur(var(--dialog-blur)) saturate(var(--glass-center-saturation));
+  -webkit-backdrop-filter: var(
+    --overlay-solid-fallback-filter,
+    blur(var(--dialog-blur)) saturate(var(--glass-center-saturation))
+  );
+  backdrop-filter: var(
+    --overlay-solid-fallback-filter,
+    blur(var(--dialog-blur)) saturate(var(--glass-center-saturation))
+  );
 }
 
 /* Menu and field controls */
@@ -2162,18 +2184,22 @@
 }
 
 @media (prefers-reduced-transparency: reduce) {
-  .overlay-surface,
-  .overlay-modal-backdrop {
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
-  }
-  .overlay-surface {
-    background: rgba(18, 24, 30, 0.98);
+  :root {
+    --overlay-solid-fallback-fill: rgba(18, 24, 30, 0.98);
+    --overlay-solid-fallback-filter: none;
   }
 }
 
 @supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
-  .overlay-surface {
-    background: rgba(18, 24, 30, 0.98);
+  :root {
+    --overlay-solid-fallback-fill: rgba(18, 24, 30, 0.98);
+    --overlay-solid-fallback-filter: none;
   }
+}
+
+/* The visual harness sets this attribute to exercise the exact production
+   declarations used by the unsupported-feature branch above. */
+:root[data-overlay-solid-fallback="forced"] {
+  --overlay-solid-fallback-fill: rgba(18, 24, 30, 0.98);
+  --overlay-solid-fallback-filter: none;
 }

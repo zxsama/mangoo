@@ -7,6 +7,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
+import { collectUnexpectedNetworkProblems } from "./network-diagnostics.mjs";
 import { collectStartupDiagnostics as parseStartupDiagnostics } from "./startup-diagnostics.mjs";
 
 const root = await resolveRepositoryRoot(import.meta.url);
@@ -30,6 +31,8 @@ const stderr = createWriteStream(stderrPath, { flags: "w" });
 const results = [];
 const failures = [];
 const consoleErrors = [];
+const networkProblems = [];
+const requestUrls = new Map();
 const hardFailures = [];
 const startupOutput = [];
 let invokedTree = null;
@@ -243,6 +246,31 @@ class CdpClient {
     }
     if (message.method === "Log.entryAdded" && message.params?.entry?.level === "error") {
       consoleErrors.push(message.params.entry.text ?? JSON.stringify(message.params.entry));
+    }
+    if (message.method === "Network.requestWillBeSent") {
+      requestUrls.set(message.params?.requestId, message.params?.request?.url ?? null);
+    }
+    if (message.method === "Network.responseReceived") {
+      const response = message.params?.response ?? {};
+      if ((response.status ?? 0) >= 400) {
+        networkProblems.push({
+          requestId: message.params?.requestId,
+          url: response.url ?? requestUrls.get(message.params?.requestId) ?? null,
+          status: response.status,
+          type: message.params?.type ?? null
+        });
+      }
+    }
+    if (message.method === "Network.loadingFailed" && message.params?.type !== "WebSocket") {
+      networkProblems.push({
+        requestId: message.params?.requestId,
+        url: requestUrls.get(message.params?.requestId) ?? null,
+        status: "loadingFailed",
+        type: message.params?.type ?? null,
+        errorText: message.params?.errorText ?? null,
+        canceled: message.params?.canceled === true,
+        blockedReason: message.params?.blockedReason ?? null
+      });
     }
   }
 
@@ -952,10 +980,14 @@ async function runExhaustiveSweep(client) {
 function buildSummary() {
   const startupDiagnostics = parseStartupDiagnostics(startupOutput);
   const startupProblems = startupDiagnostics.startupProblems;
+  const networkFailures = collectUnexpectedNetworkProblems(networkProblems);
+  const finalHardFailures = [...hardFailures];
+  if (networkFailures.length) finalHardFailures.push("network failures");
   const ok =
     startupProblems.length === 0 &&
     consoleErrors.length === 0 &&
-    hardFailures.length === 0 &&
+    networkFailures.length === 0 &&
+    finalHardFailures.length === 0 &&
     failures.length === 0;
   return {
     run: {
@@ -973,11 +1005,13 @@ function buildSummary() {
     startupFailures: startupProblems,
     consoleFailures: consoleErrors,
     consoleErrors,
+    networkProblems,
+    networkFailures,
     cargoBuildFinished: startupDiagnostics.cargoBuildFinished,
     cargoDiagnostics: startupDiagnostics.cargoDiagnostics,
     runtimeProblems: startupDiagnostics.runtimeProblems,
     startupProblems,
-    hardFailures,
+    hardFailures: [...new Set(finalHardFailures)],
     stdoutPath,
     stderrPath
   };
@@ -994,6 +1028,7 @@ try {
   await client.ready;
   await client.send("Page.enable");
   await client.send("Runtime.enable");
+  await client.send("Network.enable");
   await client.send("Log.enable");
   await waitFor(
     client,
