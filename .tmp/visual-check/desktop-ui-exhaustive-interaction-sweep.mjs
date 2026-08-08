@@ -1092,11 +1092,10 @@ try {
     client,
     `(() => {
       const tiles = [...document.querySelectorAll('.media-tile')];
-      const images = [...document.querySelectorAll('.media-tile img')];
-      return tiles.length > 0 &&
-        tiles.every((tile) => tile.getAttribute('data-thumb-state') === 'ready') &&
-        images.length > 0 &&
-        images.every((image) => image.complete && image.naturalWidth > 0);
+      return tiles.length > 0 && tiles.every((tile) => {
+        const image = tile.querySelector('.tile-thumb-ready img');
+        return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0;
+      });
     })()`,
     120_000,
     "initial thumbnails ready before scenario telemetry"
