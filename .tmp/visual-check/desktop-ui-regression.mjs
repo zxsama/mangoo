@@ -2592,6 +2592,7 @@ async function settingsInterfaceStyleEvidence(client) {
     const screenshotPath = await screenshot(settingsClient, "ui-settings-interface-style.png");
     const evidenceBefore = await evaluate(settingsClient, settingsInterfaceStyleEvidenceExpression());
     const appearanceMatrix = await settingsAppearanceMatrix(settingsClient, client);
+    await settingsClient.send("Page.bringToFront");
     const pointSettingsSlider = await moveToSelector(
       settingsClient,
       '[data-settings-slider-control="side-blur"]',

@@ -129,6 +129,7 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(regressionSource, /await delay\(3000\)/);
   assert.match(regressionSource, /const fallback = window\.setTimeout\(finish, 250\)/);
   assert.match(regressionSource, /window\.clearTimeout\(fallback\)/);
+  assert.match(regressionSource, /const appearanceMatrix = await settingsAppearanceMatrix\(settingsClient, client\);\s*await settingsClient\.send\("Page\.bringToFront"\)/);
 
   assert.doesNotMatch(exhaustiveSource, /buildSummary\(true\)/);
   assert.match(exhaustiveSource, /invoked tree URL/);
