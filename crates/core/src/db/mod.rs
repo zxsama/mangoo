@@ -2862,15 +2862,7 @@ impl Database {
         };
         transaction.commit()?;
         self.publish_task_notification_after_commit(appended);
-        if updated == 0 {
-            return self.ensure_one_task_attempt_updated(
-                task_id,
-                updated,
-                "pending or running",
-                attempt_generation,
-            );
-        }
-        Ok(())
+        Ok(updated == 1)
     }
 
     pub(crate) fn yield_running_root_scan_task_to_pending(
@@ -18861,6 +18853,74 @@ mod tests {
             .mark_task_failed_current_attempt_for_test(failed_task_id, "second failure")
             .expect_err("failed task should not be marked failed again");
         assert!(failed_error.to_string().contains("not pending or running"));
+    }
+
+    #[test]
+    fn try_mark_task_failed_reports_transition_ownership_and_publishes_terminal_state() {
+        let database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/FailureOwnership".to_string(),
+                display_name: "Failure Ownership".to_string(),
+            })
+            .expect("add root");
+        let failed_task_id = database
+            .create_root_scan_task_with_origin(root_id, NotificationOrigin::User)
+            .expect("create failed task");
+        let failed_attempt = database
+            .get_task(failed_task_id)
+            .expect("read failed task")
+            .expect("failed task exists")
+            .attempt_generation;
+
+        assert!(database
+            .try_mark_task_failed_for_attempt(
+                failed_task_id,
+                failed_attempt,
+                "owned worker failure",
+            )
+            .expect("claim failed transition"));
+        assert!(database
+            .notification_heads_for_test()
+            .expect("read failed notification")
+            .into_iter()
+            .any(|operation| operation.task_id == Some(failed_task_id)
+                && operation.status == "failed"));
+
+        let succeeded_task_id = database
+            .create_root_scan_task_with_origin(root_id, NotificationOrigin::User)
+            .expect("create succeeded task");
+        let succeeded_attempt = database
+            .get_task(succeeded_task_id)
+            .expect("read succeeded task")
+            .expect("succeeded task exists")
+            .attempt_generation;
+        database
+            .mark_task_running_for_attempt(succeeded_task_id, succeeded_attempt)
+            .expect("mark succeeded task running");
+        database
+            .mark_task_succeeded_for_attempt(succeeded_task_id, succeeded_attempt)
+            .expect("mark task succeeded");
+
+        assert!(!database
+            .try_mark_task_failed_for_attempt(
+                succeeded_task_id,
+                succeeded_attempt,
+                "late worker failure",
+            )
+            .expect("reject late failed transition"));
+        let succeeded_task = database
+            .get_task(succeeded_task_id)
+            .expect("read succeeded task after late failure")
+            .expect("succeeded task remains");
+        assert_eq!(succeeded_task.status, "succeeded");
+        assert_eq!(succeeded_task.error, None);
+        assert!(database
+            .notification_heads_for_test()
+            .expect("read succeeded notification")
+            .into_iter()
+            .any(|operation| operation.task_id == Some(succeeded_task_id)
+                && operation.status == "succeeded"));
     }
 
     #[test]
