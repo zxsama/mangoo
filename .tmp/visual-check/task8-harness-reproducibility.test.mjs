@@ -279,6 +279,7 @@ test("DPI, preference, and appearance checks assert effective production state",
     assert.match(appearanceFixture, new RegExp(`data-fallback-probe=["']${probe}["']`));
   }
   assert.match(source, /controlledSolidFallbackEvidence/);
+  assert.match(source, /controlledSolidFallbackEvidence[\s\S]*Page\.bringToFront[\s\S]*pressKey\(fixtureClient, "Enter"/);
   assert.match(source, /production-data-overlay-solid-fallback-variable-path/);
   assert.match(source, /solid fallback .* keyboard activation/);
   assert.match(source, /surface\.opaque/);

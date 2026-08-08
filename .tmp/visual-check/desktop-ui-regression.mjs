@@ -2194,6 +2194,7 @@ function productionAppearanceEvidenceExpression(groupVariables) {
 
 async function controlledSolidFallbackEvidence(fixtureClient) {
   const probes = ["popover", "nested", "context", "modal"];
+  await fixtureClient.send("Page.bringToFront");
   await evaluate(
     fixtureClient,
     `document.documentElement.setAttribute("data-overlay-solid-fallback", "forced")`
@@ -2202,6 +2203,7 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
   try {
     const keyboard = {};
     for (const probe of probes) {
+      await fixtureClient.send("Page.bringToFront");
       const selector = `[data-fallback-probe=${JSON.stringify(probe)}]`;
       keyboard[probe] = {
         focused: await evaluate(
