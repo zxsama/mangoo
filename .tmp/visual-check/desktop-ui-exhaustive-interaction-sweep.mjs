@@ -9,7 +9,7 @@ import WebSocket from "ws";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
 import {
   collectUnexpectedConsoleErrors,
-  collectUnexpectedNetworkProblems
+  collectUnexpectedPhaseAwareNetworkProblems
 } from "./network-diagnostics.mjs";
 import { collectStartupDiagnostics as parseStartupDiagnostics } from "./startup-diagnostics.mjs";
 
@@ -41,6 +41,7 @@ const startupOutput = [];
 let invokedTree = null;
 let child;
 let stoppingChild = false;
+let networkPhase = "scenario";
 
 await mkdir(logDir, { recursive: true });
 await mkdir(dataDir, { recursive: true });
@@ -257,6 +258,7 @@ class CdpClient {
       const response = message.params?.response ?? {};
       if ((response.status ?? 0) >= 400) {
         networkProblems.push({
+          phase: networkPhase,
           requestId: message.params?.requestId,
           url: response.url ?? requestUrls.get(message.params?.requestId) ?? null,
           status: response.status,
@@ -266,6 +268,7 @@ class CdpClient {
     }
     if (message.method === "Network.loadingFailed" && message.params?.type !== "WebSocket") {
       networkProblems.push({
+        phase: networkPhase,
         requestId: message.params?.requestId,
         url: requestUrls.get(message.params?.requestId) ?? null,
         status: "loadingFailed",
@@ -984,7 +987,7 @@ function buildSummary() {
   const startupDiagnostics = parseStartupDiagnostics(startupOutput);
   const startupProblems = startupDiagnostics.startupProblems;
   const consoleFailures = collectUnexpectedConsoleErrors(consoleErrors);
-  const networkFailures = collectUnexpectedNetworkProblems(networkProblems);
+  const networkFailures = collectUnexpectedPhaseAwareNetworkProblems(networkProblems);
   const finalHardFailures = [...hardFailures];
   if (consoleFailures.length) finalHardFailures.push("console errors");
   if (networkFailures.length) finalHardFailures.push("network failures");
@@ -1059,9 +1062,10 @@ try {
 } catch (error) {
   failures.push(String(error));
 } finally {
-  client?.close();
+  networkPhase = "teardown";
   await stopDevApp();
   await delay(250);
+  client?.close();
   const summary = buildSummary();
   await writeFile(summaryPath, JSON.stringify(summary, null, 2));
   stdout.end();

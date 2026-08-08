@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { Writable } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -10,10 +11,11 @@ import {
   resolveRepositoryRoot,
   validateControlledMediaRoot
 } from "./controlled-media.mjs";
-import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
+import { finalizeNormalOsDiagnostics } from "./harness-run-finalization.mjs";
 import {
   collectUnexpectedConsoleErrors,
   collectUnexpectedNetworkProblems,
+  collectUnexpectedPhaseAwareNetworkProblems,
   isExpectedTeardownNetworkProblem
 } from "./network-diagnostics.mjs";
 import { collectStartupDiagnostics } from "./startup-diagnostics.mjs";
@@ -103,17 +105,45 @@ test("Cargo diagnostics preserve pre-finish warnings without treating progress a
   ]);
 });
 
-test("final diagnostics include errors emitted while the child is stopping", async () => {
+test("normal OS finalization waits past 300ms for child close and both raw streams", async () => {
   const events = [];
   const startupProblems = [];
-  const diagnostics = await stopThenCollectDiagnostics({
+  let resolveChildClose;
+  const childClose = new Promise((resolve) => {
+    resolveChildClose = resolve;
+  });
+  const makeStream = (name) => {
+    const stream = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      }
+    });
+    stream.on("finish", () => events.push(`${name}-finish`));
+    stream.on("close", () => events.push(`${name}-close`));
+    return stream;
+  };
+  const stdout = makeStream("stdout");
+  const stderr = makeStream("stderr");
+  const startedAt = Date.now();
+  const diagnostics = await finalizeNormalOsDiagnostics({
     stop: async () => {
       events.push("stop");
-      startupProblems.push({ source: "stderr", line: "late shutdown error" });
+      setTimeout(() => {
+        events.push("late-output");
+        startupProblems.push({ source: "stderr", line: "warning: late shutdown warning" });
+        startupProblems.push({ source: "stderr", line: "error: late shutdown error" });
+        stderr.write("warning: late shutdown warning\nerror: late shutdown error\n");
+      }, 340);
+      setTimeout(() => {
+        events.push("child-close");
+        resolveChildClose({ closeObserved: true, code: 0, signal: null });
+      }, 380);
     },
-    waitForOutput: async () => {
-      events.push("flush");
-    },
+    waitForChildClose: () => childClose,
+    outputStreams: [
+      { name: "stdout", stream: stdout },
+      { name: "stderr", stream: stderr }
+    ],
     collect: () => {
       events.push("collect");
       return {
@@ -123,47 +153,60 @@ test("final diagnostics include errors emitted while the child is stopping", asy
     }
   });
 
-  assert.deepEqual(events, ["stop", "flush", "collect"]);
-  assert.deepEqual(diagnostics.startupProblems, [
-    { source: "stderr", line: "late shutdown error" }
+  const summary = {
+    run: { finalization: diagnostics.finalization },
+    startupFailures: diagnostics.startupProblems,
+    hardFailures: diagnostics.hardFailures
+  };
+  assert.ok(Date.now() - startedAt >= 330, "finalization must not use a fixed 300ms cutoff");
+  assert.ok(events.indexOf("late-output") > events.indexOf("stop"));
+  assert.ok(events.indexOf("child-close") > events.indexOf("late-output"));
+  assert.ok(events.indexOf("collect") > events.indexOf("stdout-close"));
+  assert.ok(events.indexOf("collect") > events.indexOf("stderr-close"));
+  assert.deepEqual(summary.startupFailures.map((problem) => problem.line), [
+    "warning: late shutdown warning",
+    "error: late shutdown error"
   ]);
-  assert.deepEqual(diagnostics.hardFailures, ["late shutdown error"]);
+  assert.deepEqual(summary.hardFailures, [
+    "warning: late shutdown warning",
+    "error: late shutdown error"
+  ]);
+  assert.deepEqual(summary.run.finalization, {
+    childCloseObserved: true,
+    childExitCode: 0,
+    childSignal: null,
+    stdoutFinished: true,
+    stdoutClosed: true,
+    stderrFinished: true,
+    stderrClosed: true,
+    streamErrors: [],
+    complete: true
+  });
 });
 
-test("normal OS regression finalizes the child before collecting and writing diagnostics", async () => {
+test("normal OS regression uses observed finalization instead of hard-coded booleans", async () => {
   const source = await readFile(regressionPath, "utf8");
   const normalBranchStart = source.indexOf("const integratedTitlebarMain");
   const catchStart = source.lastIndexOf("} catch (error) {");
   const normalBranch = source.slice(normalBranchStart, catchStart);
-  const finalizationIndex = normalBranch.indexOf("const runDiagnostics = await stopThenCollectDiagnostics");
-  const stopIndex = normalBranch.indexOf("stop: stopDevApp", finalizationIndex);
-  const waitIndex = normalBranch.indexOf("waitForOutput: () => delay(300)", stopIndex);
-  const collectIndex = normalBranch.indexOf("collect: () => collectRunDiagnostics(hardFailures)", waitIndex);
-  const finalSummaryIndex = normalBranch.indexOf("summary = {", collectIndex);
-  const writeIndex = normalBranch.indexOf("await writeFile(summaryPath", finalSummaryIndex);
 
   assert.ok(normalBranchStart >= 0, "normal desktop regression branch must be present");
-  assert.ok(finalizationIndex >= 0, "normal branch must use stopThenCollectDiagnostics");
-  assert.ok(stopIndex > finalizationIndex);
-  assert.ok(waitIndex > stopIndex);
-  assert.ok(collectIndex > waitIndex);
-  assert.ok(finalSummaryIndex > collectIndex);
-  assert.ok(writeIndex > finalSummaryIndex);
-  assert.equal(
-    normalBranch.slice(0, finalizationIndex).includes("writeFile(summaryPath"),
-    false,
-    "normal branch must not write a pre-stop summary"
-  );
-  assert.match(normalBranch, /childStoppedBeforeDiagnostics: true/);
-  assert.match(normalBranch, /outputWaitCompletedBeforeDiagnostics: true/);
+  assert.match(normalBranch, /finalizeNormalOsDiagnostics\(\{/);
+  assert.match(normalBranch, /waitForChildClose: waitForDevAppClose/);
+  assert.match(normalBranch, /outputStreams: outputStreams\(\)/);
+  assert.match(normalBranch, /finalization: runDiagnostics\.finalization/);
+  assert.doesNotMatch(normalBranch, /childStoppedBeforeDiagnostics: true/);
+  assert.doesNotMatch(normalBranch, /outputWaitCompletedBeforeDiagnostics: true/);
 });
 
 test("network diagnostics accept only the strict canceled teardown abort", () => {
-  const expected = {
+  const teardownAbort = {
+    phase: "teardown",
     status: "loadingFailed",
     errorText: "net::ERR_ABORTED",
     canceled: true
   };
+  const scenarioAbort = { ...teardownAbort, phase: "scenario" };
   const httpFailure = { status: 503, url: "http://127.0.0.1:5178/api/assets" };
   const activeAbort = {
     status: "loadingFailed",
@@ -171,11 +214,21 @@ test("network diagnostics accept only the strict canceled teardown abort", () =>
     canceled: false
   };
 
-  assert.equal(isExpectedTeardownNetworkProblem(expected), true);
+  assert.equal(isExpectedTeardownNetworkProblem(teardownAbort), true);
+  assert.equal(isExpectedTeardownNetworkProblem(scenarioAbort), false);
   assert.equal(isExpectedTeardownNetworkProblem(httpFailure), false);
   assert.equal(isExpectedTeardownNetworkProblem(activeAbort), false);
   assert.deepEqual(
-    collectUnexpectedNetworkProblems([expected, httpFailure, activeAbort]),
+    collectUnexpectedPhaseAwareNetworkProblems([
+      scenarioAbort,
+      teardownAbort,
+      httpFailure,
+      activeAbort
+    ]),
+    [scenarioAbort, httpFailure, activeAbort]
+  );
+  assert.deepEqual(
+    collectUnexpectedNetworkProblems([teardownAbort, httpFailure, activeAbort]),
     [httpFailure, activeAbort]
   );
 });
@@ -238,7 +291,9 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(exhaustiveSource, /Network\.requestWillBeSent/);
   assert.match(exhaustiveSource, /Network\.responseReceived/);
   assert.match(exhaustiveSource, /Network\.loadingFailed/);
-  assert.match(exhaustiveSource, /collectUnexpectedNetworkProblems\(networkProblems\)/);
+  assert.match(exhaustiveSource, /collectUnexpectedPhaseAwareNetworkProblems\(networkProblems\)/);
+  assert.match(exhaustiveSource, /phase: networkPhase/);
+  assert.match(exhaustiveSource, /networkPhase = "teardown";\s*await stopDevApp\(\)/);
   assert.match(exhaustiveSource, /collectUnexpectedConsoleErrors\(consoleErrors\)/);
   assert.match(exhaustiveSource, /finalHardFailures\.push\("console errors"\)/);
   assert.match(exhaustiveSource, /finalHardFailures\.push\("network failures"\)/);

@@ -7,7 +7,10 @@ import process from "node:process";
 import WebSocket from "ws";
 import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-browser-window-options.mjs";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
-import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
+import {
+  finalizeNormalOsDiagnostics,
+  stopThenCollectDiagnostics
+} from "./harness-run-finalization.mjs";
 import {
   collectUnexpectedConsoleErrors,
   collectUnexpectedNetworkProblems
@@ -42,6 +45,7 @@ const requestUrls = new Map();
 const startupOutput = [];
 let child;
 let stopDevAppPromise = null;
+let childCloseObservationPromise = Promise.resolve({ closeObserved: false, code: null, signal: null });
 
 function isPreviewApiResponse(item) {
   return item.url.includes("/api/media/") && item.url.includes("/preview");
@@ -95,12 +99,28 @@ function startDevApp() {
 
   child.stdout.on("data", (chunk) => appendOutput("stdout", chunk));
   child.stderr.on("data", (chunk) => appendOutput("stderr", chunk));
+  childCloseObservationPromise = new Promise((resolve) => {
+    child.once("close", (code, signal) => {
+      resolve({ closeObserved: true, code, signal });
+    });
+  });
   child.on("exit", (code, signal) => {
     appendOutput(
       "stdout",
       `\n[desktop-ui-regression] npm run dev exited code=${code} signal=${signal ?? "none"}\n`
     );
   });
+}
+
+function waitForDevAppClose() {
+  return childCloseObservationPromise;
+}
+
+function outputStreams() {
+  return [
+    { name: "stdout", stream: stdout },
+    { name: "stderr", stream: stderr }
+  ];
 }
 
 function stopDevApp() {
@@ -4303,7 +4323,8 @@ try {
     scenarioFailures = [...notificationFailures];
     const diagnostics = await stopThenCollectDiagnostics({
       stop: stopDevApp,
-      waitForOutput: () => delay(300),
+      waitForChildClose: waitForDevAppClose,
+      outputStreams: outputStreams(),
       collect: () => collectRunDiagnostics(notificationFailures)
     });
     hardFailures = diagnostics.hardFailures;
@@ -4314,7 +4335,8 @@ try {
         mode: "task6-notification-window",
         startedAtUtc: runStartedAt.toISOString(),
         completedAtUtc: new Date().toISOString(),
-        repositoryRoot: root
+        repositoryRoot: root,
+        finalization: diagnostics.finalization
       },
       controlledMedia,
       screenshots: notificationWindowFixture.screenshots,
@@ -5538,9 +5560,10 @@ try {
   }
 
   scenarioFailures = [...hardFailures];
-  const runDiagnostics = await stopThenCollectDiagnostics({
+  const runDiagnostics = await finalizeNormalOsDiagnostics({
     stop: stopDevApp,
-    waitForOutput: () => delay(300),
+    waitForChildClose: waitForDevAppClose,
+    outputStreams: outputStreams(),
     collect: () => collectRunDiagnostics(hardFailures)
   });
   hardFailures = runDiagnostics.hardFailures;
@@ -5551,10 +5574,7 @@ try {
       ok: hardFailures.length === 0,
       completedAtUtc: new Date().toISOString(),
       repositoryRoot: root,
-      finalization: {
-        childStoppedBeforeDiagnostics: true,
-        outputWaitCompletedBeforeDiagnostics: true
-      }
+      finalization: runDiagnostics.finalization
     },
     controlledMedia,
     cargoBuildFinished: runDiagnostics.cargoBuildFinished,
@@ -5582,7 +5602,8 @@ try {
   }
   const failureDiagnostics = await stopThenCollectDiagnostics({
     stop: stopDevApp,
-    waitForOutput: () => delay(300),
+    waitForChildClose: waitForDevAppClose,
+    outputStreams: outputStreams(),
     collect: () => collectRunDiagnostics(scenarioFailures)
   });
   hardFailures = failureDiagnostics.hardFailures;
@@ -5594,10 +5615,7 @@ try {
         startedAtUtc: runStartedAt.toISOString(),
         completedAtUtc: new Date().toISOString(),
         repositoryRoot: root,
-        finalization: {
-          childStoppedBeforeDiagnostics: true,
-          outputWaitCompletedBeforeDiagnostics: true
-        }
+        finalization: failureDiagnostics.finalization
       },
       controlledMedia,
       screenshots: {},
@@ -5626,10 +5644,7 @@ try {
         ...summary.run,
         ok: false,
         repositoryRoot: root,
-        finalization: {
-          childStoppedBeforeDiagnostics: true,
-          outputWaitCompletedBeforeDiagnostics: true
-        }
+        finalization: failureDiagnostics.finalization
       },
       controlledMedia,
       cargoBuildFinished: failureDiagnostics.cargoBuildFinished,
@@ -5650,8 +5665,6 @@ try {
 } finally {
   await stopDevApp();
   if (client) client.close();
-  stdout.end();
-  stderr.end();
 }
 } finally {
   if (!fatalError) {
