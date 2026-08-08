@@ -289,6 +289,8 @@ test("DPI, preference, and appearance checks assert effective production state",
   assert.match(source, /solid fallback .* keyboard activation/);
   assert.match(source, /surface\.opaque/);
   assert.match(source, /surface\.readable/);
+  assert.match(source, /contrastRatio >= 4\.5/);
+  assert.match(source, /background\.alpha >= 0\.95 \|\| backdropBackground\.alpha >= 0\.95/);
   assert.match(overlayCss, /@supports not[\s\S]*--overlay-solid-fallback-fill/);
   assert.match(overlayCss, /:root\[data-overlay-solid-fallback="forced"\][\s\S]*--overlay-solid-fallback-fill/);
   assert.match(overlayCss, /background: var\(--overlay-solid-fallback-fill/);

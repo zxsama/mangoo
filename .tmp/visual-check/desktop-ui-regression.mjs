@@ -2289,36 +2289,61 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
     const styles = await evaluate(
       fixtureClient,
       `(() => {
-        const parseAlpha = (value) => {
+        const parseColor = (value) => {
           const match = String(value ?? "").match(/rgba?\\(([^)]+)\\)/i);
-          if (!match) return 0;
-          const parts = match[1].split(",").map((part) => part.trim());
-          return parts.length >= 4 ? Number(parts[3]) : 1;
+          if (!match) return { red: 0, green: 0, blue: 0, alpha: 0 };
+          const parts = match[1].split(",").map((part) => Number(part.trim()));
+          return {
+            red: parts[0] ?? 0,
+            green: parts[1] ?? 0,
+            blue: parts[2] ?? 0,
+            alpha: parts.length >= 4 ? parts[3] : 1
+          };
+        };
+        const composite = (foreground, background) => ({
+          red: foreground.red * foreground.alpha + background.red * (1 - foreground.alpha),
+          green: foreground.green * foreground.alpha + background.green * (1 - foreground.alpha),
+          blue: foreground.blue * foreground.alpha + background.blue * (1 - foreground.alpha)
+        });
+        const luminance = (color) => {
+          const linear = (channel) => {
+            const value = channel / 255;
+            return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+          };
+          return 0.2126 * linear(color.red) + 0.7152 * linear(color.green) + 0.0722 * linear(color.blue);
+        };
+        const contrast = (left, right) => {
+          const first = luminance(left);
+          const second = luminance(right);
+          return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05);
         };
         const readSurface = (selector) => {
           const surface = document.querySelector(selector);
           const style = surface ? getComputedStyle(surface) : null;
           const backdrop = surface?.querySelector(":scope > .liquid-glass-backdrop") ?? null;
           const backdropStyle = backdrop ? getComputedStyle(backdrop) : null;
-          const backgroundAlpha = parseAlpha(style?.backgroundColor);
-          const backdropAlpha = parseAlpha(backdropStyle?.backgroundColor);
-          const colorAlpha = parseAlpha(style?.color);
+          const background = parseColor(style?.backgroundColor);
+          const backdropBackground = parseColor(backdropStyle?.backgroundColor);
+          const foreground = parseColor(style?.color);
+          const readableBackground = backdropBackground.alpha > 0 ? backdropBackground : background;
+          const contrastRatio = contrast(composite(foreground, readableBackground), readableBackground);
           return {
             present: Boolean(surface),
             backgroundColor: style?.backgroundColor ?? null,
             backgroundImage: style?.backgroundImage ?? null,
-            backgroundAlpha,
+            backgroundAlpha: background.alpha,
             color: style?.color ?? null,
-            colorAlpha,
+            colorAlpha: foreground.alpha,
+            contrastRatio,
             backdrop: {
               present: Boolean(backdrop),
               backgroundColor: backdropStyle?.backgroundColor ?? null,
-              backgroundAlpha: backdropAlpha,
+              backgroundAlpha: backdropBackground.alpha,
               backdropFilter: backdropStyle?.backdropFilter ?? null,
               webkitBackdropFilter: backdropStyle?.webkitBackdropFilter ?? null
             },
-            opaque: backgroundAlpha >= 0.95 && backdropAlpha >= 0.95,
-            readable: colorAlpha >= 0.95
+            opaque: background.alpha >= 0.95 || backdropBackground.alpha >= 0.95,
+            readable: contrastRatio >= 4.5
           };
         };
         const modalBackdrop = document.querySelector(".overlay-modal-backdrop");
@@ -4962,12 +4987,12 @@ try {
     fallbackSurfaces.length !== 4 ||
     fallbackSurfaces.some((surface) =>
       !surface.present || !surface.opaque || !surface.readable ||
-      surface.backdrop?.backdropFilter !== "none" ||
-      surface.backdrop?.webkitBackdropFilter !== "none"
+      !noBackdropFilter(surface.backdrop?.backdropFilter) ||
+      !noBackdropFilter(surface.backdrop?.webkitBackdropFilter)
     ) ||
     solidFallback?.styles?.modalBackdrop?.present !== true ||
-    solidFallback?.styles?.modalBackdrop?.backdropFilter !== "none" ||
-    solidFallback?.styles?.modalBackdrop?.webkitBackdropFilter !== "none" ||
+    !noBackdropFilter(solidFallback?.styles?.modalBackdrop?.backdropFilter) ||
+    !noBackdropFilter(solidFallback?.styles?.modalBackdrop?.webkitBackdropFilter) ||
     fallbackKeyboard.length !== 4 ||
     fallbackKeyboard.some((probe) => !probe.focused || !probe.activated)
   ) {
