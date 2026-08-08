@@ -1,5 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { useEffect, useState } from "react";
 import { useSecondaryWindowInterfaceStyle } from "../../src/app-shell/useSecondaryWindowInterfaceStyle";
 import { LiquidGlassLayer, LiquidGlassSurface } from "../../src/design/liquid-glass";
 import {
@@ -15,6 +16,15 @@ import "./overlayAppearanceVisualFixture.css";
 
 function OverlayAppearanceVisualFixture() {
   useSecondaryWindowInterfaceStyle();
+  const [modalOpen, setModalOpen] = useState(true);
+
+  useEffect(() => {
+    const handleModalToggle = (event: Event) => {
+      setModalOpen((event as CustomEvent<boolean>).detail !== false);
+    };
+    window.addEventListener("megle-overlay-fixture-modal", handleModalToggle);
+    return () => window.removeEventListener("megle-overlay-fixture-modal", handleModalToggle);
+  }, []);
 
   return (
     <LiquidGlassLayer>
@@ -132,7 +142,7 @@ function OverlayAppearanceVisualFixture() {
         className="file-operation-dialog overlay-appearance-modal"
         id="appearance-matrix-modal"
         onDismiss={() => undefined}
-        open
+        open={modalOpen}
         rootId="file-operation"
       >
         <OverlayDialogHeader title="Modal material" titleId="appearance-modal-heading" />

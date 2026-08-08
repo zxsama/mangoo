@@ -280,6 +280,10 @@ test("DPI, preference, and appearance checks assert effective production state",
   }
   assert.match(source, /controlledSolidFallbackEvidence/);
   assert.match(source, /controlledSolidFallbackEvidence[\s\S]*Page\.bringToFront[\s\S]*pressKey\(fixtureClient, "Enter"/);
+  assert.match(source, /megle-overlay-fixture-modal[\s\S]*solid fallback non-modal keyboard phase/);
+  assert.match(source, /solid fallback modal keyboard phase[\s\S]*solid fallback modal keyboard activation/);
+  assert.match(appearanceFixture, /open=\{modalOpen\}/);
+  assert.match(appearanceFixture, /megle-overlay-fixture-modal/);
   assert.match(source, /production-data-overlay-solid-fallback-variable-path/);
   assert.match(source, /solid fallback .* keyboard activation/);
   assert.match(source, /surface\.opaque/);

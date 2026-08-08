@@ -2202,7 +2202,17 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
   await delay(100);
   try {
     const keyboard = {};
-    for (const probe of probes) {
+    await evaluate(
+      fixtureClient,
+      `window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: false }))`
+    );
+    await waitFor(
+      fixtureClient,
+      `!document.querySelector("#appearance-matrix-modal")`,
+      5000,
+      "solid fallback non-modal keyboard phase"
+    );
+    for (const probe of probes.slice(0, 3)) {
       await fixtureClient.send("Page.bringToFront");
       const selector = `[data-fallback-probe=${JSON.stringify(probe)}]`;
       keyboard[probe] = {
@@ -2225,6 +2235,37 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
       );
       keyboard[probe].activated = true;
     }
+    await evaluate(
+      fixtureClient,
+      `window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: true }))`
+    );
+    await waitFor(
+      fixtureClient,
+      `Boolean(document.querySelector("#appearance-matrix-modal"))`,
+      5000,
+      "solid fallback modal keyboard phase"
+    );
+    await fixtureClient.send("Page.bringToFront");
+    const modalSelector = `[data-fallback-probe="modal"]`;
+    keyboard.modal = {
+      focused: await evaluate(
+        fixtureClient,
+        `(() => {
+          const target = document.querySelector(${JSON.stringify(modalSelector)});
+          if (!(target instanceof HTMLButtonElement)) return false;
+          target.focus();
+          return document.activeElement === target;
+        })()`
+      )
+    };
+    await pressKey(fixtureClient, "Enter", "Enter", 13);
+    await waitFor(
+      fixtureClient,
+      `document.querySelector(${JSON.stringify(modalSelector)})?.getAttribute("data-fallback-activated") === "true"`,
+      5000,
+      "solid fallback modal keyboard activation"
+    );
+    keyboard.modal.activated = true;
 
     const styles = await evaluate(
       fixtureClient,
@@ -2293,6 +2334,7 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
       fixtureClient,
       `(() => {
         document.documentElement.removeAttribute("data-overlay-solid-fallback");
+        window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: true }));
         document.querySelectorAll("[data-fallback-activated]").forEach((element) => {
           element.removeAttribute("data-fallback-activated");
         });
