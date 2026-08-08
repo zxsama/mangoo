@@ -4134,6 +4134,7 @@ let client;
 let summary = null;
 let fatalError = null;
 let hardFailures = [];
+let scenarioFailures = [];
 
 try {
 try {
@@ -4212,6 +4213,7 @@ try {
     ) {
       notificationFailures.push("first failure drilldown was not visible and actionable");
     }
+    scenarioFailures = [...notificationFailures];
     const diagnostics = await stopThenCollectDiagnostics({
       stop: stopDevApp,
       waitForOutput: () => delay(300),
@@ -4241,6 +4243,7 @@ try {
       runtimeProblems: diagnostics.runtimeProblems,
       startupProblems: diagnostics.startupProblems,
       controlledRootStartup: diagnostics.controlledRootStartup,
+      scenarioFailures,
       hardFailures,
       stdoutPath,
       stderrPath,
@@ -5447,6 +5450,7 @@ try {
     hardFailures.push("preview route was not requested");
   }
 
+  scenarioFailures = [...hardFailures];
   const runDiagnostics = await stopThenCollectDiagnostics({
     stop: stopDevApp,
     waitForOutput: () => delay(300),
@@ -5474,6 +5478,7 @@ try {
     startupFailures: runDiagnostics.unknownStartupProblems,
     consoleFailures: runDiagnostics.unexpectedConsoleErrors,
     networkFailures: runDiagnostics.unexpectedNetworkProblems,
+    scenarioFailures,
     hardFailures,
     fatalError: null
   };
@@ -5485,10 +5490,13 @@ try {
   }
 } catch (error) {
   fatalError = error;
+  if (scenarioFailures.length === 0) {
+    scenarioFailures = hardFailures.length > 0 ? [...hardFailures] : [String(error)];
+  }
   const failureDiagnostics = await stopThenCollectDiagnostics({
     stop: stopDevApp,
     waitForOutput: () => delay(300),
-    collect: () => collectRunDiagnostics(hardFailures)
+    collect: () => collectRunDiagnostics(scenarioFailures)
   });
   hardFailures = failureDiagnostics.hardFailures;
   if (!summary) {
@@ -5518,6 +5526,7 @@ try {
       runtimeProblems: failureDiagnostics.runtimeProblems,
       startupProblems: failureDiagnostics.startupProblems,
       controlledRootStartup: failureDiagnostics.controlledRootStartup,
+      scenarioFailures,
       stdoutPath,
       stderrPath,
       hardFailures,
@@ -5544,6 +5553,7 @@ try {
       startupFailures: failureDiagnostics.unknownStartupProblems,
       consoleFailures: failureDiagnostics.unexpectedConsoleErrors,
       networkFailures: failureDiagnostics.unexpectedNetworkProblems,
+      scenarioFailures,
       hardFailures,
       fatalError: serializeError(error)
     };

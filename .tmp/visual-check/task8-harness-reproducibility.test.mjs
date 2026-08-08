@@ -201,6 +201,7 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
     "consoleFailures",
     "networkProblems",
     "networkFailures",
+    "scenarioFailures",
     "hardFailures"
   ]) {
     assert.match(regressionSource, new RegExp(`${field}[:,]`));
