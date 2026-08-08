@@ -12,6 +12,7 @@ import {
 } from "./controlled-media.mjs";
 import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
 import {
+  collectUnexpectedConsoleErrors,
   collectUnexpectedNetworkProblems,
   isExpectedTeardownNetworkProblem
 } from "./network-diagnostics.mjs";
@@ -179,6 +180,16 @@ test("network diagnostics accept only the strict canceled teardown abort", () =>
   );
 });
 
+test("console diagnostics preserve raw Electron artifacts but fail every other error", () => {
+  const known = [
+    "Electron sandboxed_renderer.bundle.js script failed to run",
+    "TypeError: Cannot destructure property 'preloadScripts' of 'binding.startupData' as it is null."
+  ];
+  const unexpected = "TypeError: product overlay crashed";
+  assert.deepEqual(collectUnexpectedConsoleErrors([...known, unexpected]), [unexpected]);
+  assert.deepEqual(collectUnexpectedConsoleErrors(known), []);
+});
+
 test("desktop harnesses have no machine-specific roots and gate diagnostics", async () => {
   const [regressionSource, exhaustiveSource] = await Promise.all([
     readFile(regressionPath, "utf8"),
@@ -217,7 +228,7 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
 
   assert.doesNotMatch(exhaustiveSource, /buildSummary\(true\)/);
   assert.match(exhaustiveSource, /invoked tree URL/);
-  for (const field of ["startupProblems", "consoleErrors", "networkFailures", "finalHardFailures", "failures"]) {
+  for (const field of ["startupProblems", "consoleFailures", "networkFailures", "finalHardFailures", "failures"]) {
     assert.match(exhaustiveSource, new RegExp(`${field}\\.length`));
   }
   for (const field of ["startupFailures", "consoleFailures", "networkProblems", "networkFailures"]) {
@@ -228,6 +239,8 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(exhaustiveSource, /Network\.responseReceived/);
   assert.match(exhaustiveSource, /Network\.loadingFailed/);
   assert.match(exhaustiveSource, /collectUnexpectedNetworkProblems\(networkProblems\)/);
+  assert.match(exhaustiveSource, /collectUnexpectedConsoleErrors\(consoleErrors\)/);
+  assert.match(exhaustiveSource, /finalHardFailures\.push\("console errors"\)/);
   assert.match(exhaustiveSource, /finalHardFailures\.push\("network failures"\)/);
   assert.match(exhaustiveSource, /MEGLE_EXHAUSTIVE_DEBUG_PORT.*9501/);
   assert.match(exhaustiveSource, /desktop-ui-exhaustive-\$\{visualRunId\}\.stdout\.log/);

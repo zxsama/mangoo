@@ -7,7 +7,10 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
-import { collectUnexpectedNetworkProblems } from "./network-diagnostics.mjs";
+import {
+  collectUnexpectedConsoleErrors,
+  collectUnexpectedNetworkProblems
+} from "./network-diagnostics.mjs";
 import { collectStartupDiagnostics as parseStartupDiagnostics } from "./startup-diagnostics.mjs";
 
 const root = await resolveRepositoryRoot(import.meta.url);
@@ -980,12 +983,14 @@ async function runExhaustiveSweep(client) {
 function buildSummary() {
   const startupDiagnostics = parseStartupDiagnostics(startupOutput);
   const startupProblems = startupDiagnostics.startupProblems;
+  const consoleFailures = collectUnexpectedConsoleErrors(consoleErrors);
   const networkFailures = collectUnexpectedNetworkProblems(networkProblems);
   const finalHardFailures = [...hardFailures];
+  if (consoleFailures.length) finalHardFailures.push("console errors");
   if (networkFailures.length) finalHardFailures.push("network failures");
   const ok =
     startupProblems.length === 0 &&
-    consoleErrors.length === 0 &&
+    consoleFailures.length === 0 &&
     networkFailures.length === 0 &&
     finalHardFailures.length === 0 &&
     failures.length === 0;
@@ -1003,7 +1008,7 @@ function buildSummary() {
     failures,
     scenarioFailures: failures,
     startupFailures: startupProblems,
-    consoleFailures: consoleErrors,
+    consoleFailures,
     consoleErrors,
     networkProblems,
     networkFailures,

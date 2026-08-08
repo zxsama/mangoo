@@ -8,7 +8,10 @@ import WebSocket from "ws";
 import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-browser-window-options.mjs";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
 import { stopThenCollectDiagnostics } from "./harness-run-finalization.mjs";
-import { collectUnexpectedNetworkProblems } from "./network-diagnostics.mjs";
+import {
+  collectUnexpectedConsoleErrors,
+  collectUnexpectedNetworkProblems
+} from "./network-diagnostics.mjs";
 import { collectStartupDiagnostics as parseStartupDiagnostics } from "./startup-diagnostics.mjs";
 
 const root = await resolveRepositoryRoot(import.meta.url);
@@ -3979,10 +3982,6 @@ function isKnownWarning(text) {
   return /Electron Security Warning/i.test(text) && /Content-Security-Policy/i.test(text);
 }
 
-function isKnownConsoleError(text) {
-  return /sandboxed_renderer\.bundle\.js script failed to run|preloadScripts.*startupData/i.test(text);
-}
-
 function isKnownStartupProblem(line) {
   return false;
 }
@@ -4013,7 +4012,7 @@ function collectRunDiagnostics(scenarioFailures = []) {
     failureLines: startupProblems.filter((problem) => /MEGLE_AUTO_ADD_ROOT|auto-add|auto.?added root/i.test(problem.line))
   };
   const unknownConsoleWarnings = consoleWarnings.filter((warning) => !warning.known);
-  const unexpectedConsoleErrors = consoleErrors.filter((entry) => !isKnownConsoleError(entry.text ?? ""));
+  const unexpectedConsoleErrors = collectUnexpectedConsoleErrors(consoleErrors);
   const unexpectedNetworkProblems = collectUnexpectedNetworkProblems(networkProblems);
   const unknownStartupProblems = startupProblems.filter((problem) => !problem.known);
   const diagnosticFailures = [...scenarioFailures];
