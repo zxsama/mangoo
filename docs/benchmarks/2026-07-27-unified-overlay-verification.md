@@ -7,120 +7,152 @@ This report records the final Task 8 verification for
 against
 [`2026-07-27-unified-overlay-ui-design.md`](../superpowers/specs/2026-07-27-unified-overlay-ui-design.md).
 
-## Immutable Scope
+## Immutable scope
 
-- Exact visual verification range: `28ade3c08157c14346179839f759b8f6965019ce..0a702b506abcf64b64dc44be921d851bba403159`.
-- Exact visual source snapshot: `0a702b506abcf64b64dc44be921d851bba403159`.
-- The range includes the committed Core compile baseline and Core race fix ancestry (`98b3036`), harness stabilization (`eb19bcd`), expected stale-attempt log demotion (`f7917e8`), backdrop frame-settle fallback (`b371960`), and settings-window refocus before the pointer probe (`0a702b5`).
-- `f7917e8` changes only the severity of two already-handled stale task-attempt messages from warning to debug; task ownership and state transitions are unchanged. This prevents benign late worker races from being classified as startup failures.
-- Final archive: `D:\Megle\.tmp\task8-exact-0a702b5-20260809-final2.tar`.
-- Final archive SHA-256: `FEF7B46F8CFF1474C5E7BB60A4F546398042A261AC322E3B0FAC5912B331E3FB`.
-- The archive was extracted as a normal directory to `D:\Megle\.tmp\task8-exact-0a702b5-20260809-final2`; it was not a worktree, junction, or symbolic link and was retained. Earlier `f7917e8` and `b371960` archives were also retained.
-- No `npm install` or `npm ci` was run. Existing dependencies from `D:\Megle\node_modules` were reused through the local Electron shim.
-- The live worktree retained the user's 17 modified and 12 untracked files. The index was empty before and after the verification commits.
-- `apps/web/src/app/App.tsx` remained SHA-256 `5CDB9648949EF64AD2612D53C7029635EB5EFCC6F15F6305780454CB3F965A56`.
-- Settings and Plugins production sources were unchanged.
+- Exact verification range: `28ade3c08157c14346179839f759b8f6965019ce..7f407d98dc965906535baa33f12641576e7bb4d3`.
+- Exact committed source: `7f407d98dc965906535baa33f12641576e7bb4d3`.
+- The range includes the Core terminal-state fix (`28ade3c`), deterministic visual-harness fixes through `0a702b5`, zero-warning exact Core build/test coverage (`0744aa1`), and per-run Cargo/raw-output diagnostics (`7f407d9`).
+- Archive: `D:\Megle\.tmp\task8-exact-7f407d9-20260809-final.tar`.
+- Archive SHA-256: `A27863665AD4C615A79374446CFA5724BB99933AFC3AE6E5A8753E8321466CFC`.
+- A second `git archive` produced the same SHA-256. The retained extraction at `D:\Megle\.tmp\task8-exact-7f407d9-20260809-final` is an ordinary directory with zero reparse points; it is not a worktree, junction, or symbolic link.
+- No `npm install`, `npm ci`, recursive cleanup, reset, or checkout was used. The visual runs compiled Core inside the archive extraction at `target\debug\megle-core.exe`; they did not run the live dirty worktree binary. The existing root dependency installation supplied tooling only.
+- The live worktree remained separate: 17 modified files, 12 untracked files, empty index, and `apps/web/src/app/App.tsx` SHA-256 `5CDB9648949EF64AD2612D53C7029635EB5EFCC6F15F6305780454CB3F965A56` at takeover and before the report edit. Settings and Plugins production sources remained unmodified.
 
-## Final Status
+## Exact committed results
 
-The exact committed tree is green for the required Task 8 harnesses and full
-repository gates. All required visual runs exit 0 with `run.ok=true`, zero
-startup failures, zero unexpected console failures, zero unexpected network
-failures, zero hard failures, and zero scenario failures where applicable.
-
-The successful exact evidence is in
-`D:\Megle\.tmp\visual-check\logs\task8-final-2026-08-09`:
+Exact evidence is retained in
+`D:\Megle\.tmp\visual-check\logs\task8-final-7f407d9-20260809`.
 
 | Command | Exit | Result | Evidence |
 | --- | ---: | --- | --- |
-| `node --test .tmp\\visual-check\\task8-harness-reproducibility.test.mjs` | 0 | 7/7 passed, including stop-before-final-diagnostics, generated-root validation, and one-open notification handshake contracts | `30-exact-0a702b5-harness-tests.log` |
-| `$env:MEGLE_VISUAL_NOTIFICATIONS_ONLY='1'; node .tmp\\visual-check\\desktop-ui-regression.mjs` | 0 | controlled notification mode; startup/console/network/hard failures 0; raw known console 2 and expected teardown network 11; generated media 10 | `29-exact-0a702b5-notification-only-summary.json` |
-| `$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\\visual-check\\desktop-ui-regression.mjs` | 0 | required OS-composited backdrop; startup/console/network/hard failures 0; raw known console 2 and expected teardown network 27 | `28-exact-0a702b5-os-backdrop-summary.json` |
-| `node .tmp\\visual-check\\desktop-ui-exhaustive-interaction-sweep.mjs` | 0 | 18/18 scenarios, scenario failures 0, startup/console/hard failures 0 | `31-exact-0a702b5-exhaustive-summary.json` |
-| `npm test` | 0 | structure, API, client, notification contract, desktop, web, UI design, schema, and Rust gates passed | `32-exact-0a702b5-npm-test.log` |
+| `node --test .tmp\visual-check\task8-harness-reproducibility.test.mjs` | 0 | 8/8; includes generated-root validation, Cargo pre-`Finished` warning/error capture, ordinary-progress rejection, stop-before-final-diagnostics, unique raw paths, DPI/appearance assertions, and one-open notification handshake | `01-exact-7f407d9-harness-tests.log` |
+| `$env:MEGLE_VISUAL_NOTIFICATIONS_ONLY='1'; node .tmp\visual-check\desktop-ui-regression.mjs` | 0 | controlled notification center; startup/console/network/hard failures 0; Cargo diagnostics 0 | `03-exact-7f407d9-notification-only-summary.json` |
+| `$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs` | 0 | `required-os-composited: passed`; startup/console/network/hard failures 0; Cargo diagnostics 0 | `04-exact-7f407d9-os-backdrop-summary.json` |
+| `$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-exhaustive-interaction-sweep.mjs` | 0 | 18/18 scenarios; scenario/startup/console/hard failures 0; Cargo diagnostics 0 | `05-exact-7f407d9-exhaustive-summary.json` |
+| `npm run check:structure` | 0 | structure and contracts passed | `06b-exact-7f407d9-plan-gates.log` |
+| `npm run check:web` | 0 | boundary, typecheck, and 369/369 tests passed | `06b-exact-7f407d9-plan-gates.log` |
+| `npm run check:desktop` | 0 | boundary, typecheck, and 222/222 tests passed | `06b-exact-7f407d9-plan-gates.log` |
+| `npm run check:ui-design` | 0 | liquid-glass design boundaries passed | `06b-exact-7f407d9-plan-gates.log` |
+| `npm test` | 0 | all repository gates passed | `07-exact-7f407d9-npm-test.log` |
+| `git diff --check 28ade3c..7f407d9` | 0 | no whitespace errors in the immutable range | command transcript retained with Task 8 report |
 
-The exact `npm test` counts were notification contract 45/45, desktop 222/222,
-web 369/369, and Rust 472 passed, 0 failed, 2 ignored. The current dirty WIP
-tree also passed `npm test` before this document edit: notification contract
-45/45, desktop 222/222, web 373/373, and Rust 479 passed, 0 failed, 2 ignored;
-evidence is `D:\Megle\.tmp\visual-check\logs\task8-final-2026-08-09\33-current-tree-npm-test-pre-doc.log`.
+The exact full gate reports core-client 45/45, desktop 222/222, web 369/369,
+and Rust 472 passed, 0 failed, 2 ignored. The notification-contract package
+does not expose a TAP test count: its actual boundary is the package alignment
+check plus TypeScript typecheck, followed by the same package alignment check
+as its `test` script. Both checks passed. The 45/45 count belongs to
+`@megle/core-client`, not the notification contract.
 
-## Lifecycle Regressions
+## Run and raw-output identity
 
-The notification fixture uses an explicit deterministic handshake. After each
-navigation the harness waits for `ready=true` and the requested fixture state,
-focuses the fixture target, issues exactly one open request, and requires the
-same request ID to be both requested and rendered with `open=true` and
-`#notifications-root` present. The exact notification-only run covered the
-`status`, `historyInitial`, `history`, `logsGap`, `logs`, `cleanup`, `narrow`,
-and `degraded` fixture states, and reported zero fixture console/network errors.
+Each successful visual summary contains a `run.id`; each stdout/stderr filename
+contains that same ID, exists, and is unique across all three runs. The failed
+diagnostic attempt caused by an intentionally isolated `CARGO_TARGET_DIR` was
+retained separately as evidence that a missing archive-local Core binary is a
+hard startup failure. It is not one of the three final required runs.
 
-Notification-only finalization stops the child process, waits for output
-delivery, then collects stdout/stderr and all startup, console, network, and
-hard diagnostics. Harness test 4 injects an error during `stop()` and verifies
-that it is present in the final diagnostics, so stop-time output cannot be
-dropped.
+| Run | Run ID | Summary | Raw stdout / stderr |
+| --- | --- | --- | --- |
+| Controlled notification-only | `megle-visual-msky31yi-66372` | `03-exact-7f407d9-notification-only-summary.json` | `desktop-ui-regression-megle-visual-msky31yi-66372.stdout.log` / `.stderr.log` |
+| Required OS backdrop | `megle-visual-msky566o-29612` | `04-exact-7f407d9-os-backdrop-summary.json` | `desktop-ui-regression-megle-visual-msky566o-29612.stdout.log` / `.stderr.log` |
+| Exhaustive interaction | `megle-exhaustive-msky7c0k-17000` | `05-exact-7f407d9-exhaustive-summary.json` | `desktop-ui-exhaustive-megle-exhaustive-msky7c0k-17000.stdout.log` / `.stderr.log` |
 
-The exact notification controlled-media root was:
+Both desktop harnesses record Cargo warnings/errors emitted before Cargo's
+`Finished` marker as startup failures. The focused test injects a warning and
+an error before `Finished`, verifies both are retained, and verifies ordinary
+`Compiling` progress is not misclassified. All successful runs report
+`cargoBuildFinished=true` and `cargoDiagnostics=[]`. Finalization stops the
+child before collecting diagnostics; the focused stop-time injection test
+proves errors emitted during `stop()` reach the final result.
 
-`D:\Megle\.tmp\task8-exact-0a702b5-20260809-final2\.tmp\visual-check\runtime-media\megle-visual-msksqc3y-47184\outputs`
+## Controlled media and notification lifecycle
 
-It contained 10 generated files, including 1600x900 landscape, 900x1600
-portrait, nested 72x72 media, one 320x180 txt2img sample, and six 320x180
-grid samples. The exhaustive run independently generated and invoked:
+The notification-only run generated and invoked this controlled root:
 
-`D:\Megle\.tmp\task8-exact-0a702b5-20260809-final2\.tmp\visual-check\runtime-media\megle-exhaustive-msksrgjj-73756\outputs`
+`D:\Megle\.tmp\task8-exact-7f407d9-20260809-final\.tmp\visual-check\runtime-media\megle-visual-msky31yi-66372\outputs`
 
-Its summary records the harness path, repository root, child cwd, and page URL,
-all within the exact archive root.
+Its summary records `added=true`, no root-failure line, and 10 validated files:
+1600x900 landscape, 900x1600 portrait, nested 72x72 media, one 320x180 txt2img
+sample, and six 320x180 grid samples. The exhaustive run independently
+generated and invoked:
 
-## Appearance Matrix
+`D:\Megle\.tmp\task8-exact-7f407d9-20260809-final\.tmp\visual-check\runtime-media\megle-exhaustive-msky7c0k-17000\outputs`
 
-The required matrix is stored at
-`evidence.settingsInterfaceStyle.appearanceMatrix` in the exact OS summary.
-It requires 18 production surface probes:
+Its `invokedTree` records the exact harness path, repository root, child cwd,
+controlled root, and `http://127.0.0.1:5178/`, all inside the archive extraction.
 
-- Side/shared: library navigation, notification nav, notification body, and their containment mapping.
-- Center: notification content, center material, field control, select control and element, readable inner region, selected fill, and selected notification tab.
-- Dialog: popover, nested, context, modal, and modal backdrop.
-- Unaffected: media grid and preview canvas.
+The compact-notification fixture waits for `ready=true` and the requested state,
+focuses the target, issues exactly one explicit `open()` request, and requires
+the same request ID to be requested and rendered with `open=true` and
+`#notifications-root` present. The focused source-contract test passed, and
+the OS run reports zero fixture navigation console/network diagnostics. The
+controlled notification-only run covered status, initial history, retry/error
+history, log gap, log actions, subscription cleanup, narrow mode, and degraded
+mode.
 
-All 18 required surfaces were present. The matrix sampled all 14 appearance
-sliders (5 side, 5 center, 4 dialog) at minimum/default/maximum/restored
-values. Every sample changed its required production targets, had zero
-unexpected changed leaf paths, and restored its initial value. Every declared
-unaffected group remained byte-stable. The fixture used production glass and
-overlay surfaces and emitted zero fixture console or network errors. The
-notification nav and content are asserted as transparent children of the
-shared notification body rather than being treated as independent fills.
+## Surface and appearance matrix
 
-## DPI And Preferences
+The production appearance matrix is stored at
+`evidence.settingsInterfaceStyle.appearanceMatrix` in the OS summary.
 
-The exact controlled-device-scale evidence records effective DPR 1.25 and 1.5,
-then reset to 1.0. The protocol visual viewport scale remained 1 in each case;
-the harness hard-asserted the renderer's actual `window.devicePixelRatio` after
-`Emulation.setDeviceMetricsOverride`, not the page-scale field.
+- Required production surfaces: 18/18 present. These cover side/shared,
+  center/control, dialog/modal, media-grid, and preview-canvas probes.
+- Existing appearance controls: 14/14 sampled at minimum, default, maximum,
+  and restored values (5 side, 5 center, 4 dialog).
+- Every control changed its required production target and its allowed mapped
+  effects. All 14 restored to their initial values.
+- Unexpected changed leaf paths: 0. Declared unaffected group failures: 0.
+- Media grid and preview canvas remained byte-stable for every sample.
+- Fixture console failures: 0. Fixture network failures: 0.
+- Settings and Plugins retained their baseline; no production source under
+  either feature was changed by Task 8 completion.
 
-The exact reduced-preference assertions passed:
+## DPI, preferences, and compositor evidence
 
-- `prefers-reduced-motion: reduce` matched; animation name was `none`, duration was `0s`, and transform was `none`.
-- `prefers-reduced-transparency: reduce` matched; the surface became opaque and all inspected root/child backdrop and filter values were `none`.
-- The appearance matrix used reduced motion for settled sampling and recorded `reducedMotionForSettledSampling=true`.
+Controlled device-scale evidence hard-asserted renderer
+`window.devicePixelRatio` at 1.25 and 1.5, then reset it to 1.0. The CDP visual
+viewport scale remained 1.0. This is controlled renderer evidence, not a claim
+that Windows was physically relaunched at those display scale factors.
 
-The required OS evidence was captured by the Windows desktop capture bridge in
-`required-os-composited` mode, not by `Page.captureScreenshot`:
+- Reduced motion: media query matched; animation name `none`, duration `0s`,
+  transform `none`.
+- Reduced transparency: media query matched; inspected root/child backdrop and
+  filter values were `none`, with opaque `rgba(18, 24, 30, 0.98)` content.
+- Missing `backdrop-filter`: Chromium could not emulate an engine reporting the
+  feature unsupported, so that fallback remains residual rather than passed.
 
-`D:\Megle\.tmp\task8-exact-0a702b5-20260809-final2\.tmp\visual-check\screenshots\ui-window-backdrop-evidence-megle-visual-msksnak2-59492.png`
+The required OS screenshot was captured by the native Windows capture bridge,
+not `Page.captureScreenshot`:
 
-The summary records the native capture process, window geometry, `maxDelta`
-37.9, `bottomMaxDelta` 49.4, and `uiSurfaceDelta` 197.08.
+`D:\Megle\.tmp\task8-exact-7f407d9-20260809-final\.tmp\visual-check\screenshots\ui-window-backdrop-evidence-megle-visual-msky566o-29612.png`
+
+It records native Electron process ID 31760, window geometry 1456x928,
+`maxDelta=32.67`, `bottomMaxDelta=47.03`, and `uiSurfaceDelta=132.18`; the
+summary status is `required-os-composited: passed`.
+
+## Current dirty WIP confirmation (not committed evidence)
+
+After this report edit, the separate live worktree passed the focused Task 8
+harness tests 8/8 and a full `npm test` rerun: core-client 45/45, desktop
+222/222, web 373/373, and Rust 479 passed, 0 failed, 2 ignored. These larger
+web/Rust counts include the user's unrelated uncommitted work and are not
+attributed to `7f407d9` or any committed Task 8 source.
+
+The first live-worktree full-gate attempt exposed two timing-sensitive mounted
+file-operation focus assertions under the parallel web suite. The exact
+committed full gate had already passed them; an immediate focused rerun passed
+13/13, and the subsequent unchanged full rerun passed. Both the initial failure
+and the successful reruns are retained in the Task 8 evidence directory.
 
 ## Residuals
 
-- Actual Windows display relaunches at 125% and 150% were not performed; the values above are controlled DPR evidence, not a claim about physical display scaling.
-- Chromium could not emulate an engine that reports `backdrop-filter` unsupported; that fallback remains unverified.
-- `Page.captureScreenshot` and the captured native image do not prove physical DWM text, corner, or compositor anti-aliasing. Real display AA remains a Windows/on-display residual.
-- The raw known Electron sandbox startup entries and expected canceled teardown requests remain recorded in JSON, but are classified as non-failures by the existing exact diagnostics contract.
-
-No whitelist, weakened assertion, reset, checkout, worktree, junction, symlink,
-recursive cleanup, package installation, or CI command was used.
+- Physical Windows display relaunches at 125% and 150% were not performed.
+- An unsupported-`backdrop-filter` engine fallback was not available to the
+  Chromium harness and remains unverified.
+- CDP screenshots and the native captured image do not prove physical DWM text,
+  corner, or compositor anti-aliasing. Real on-display AA remains unverified.
+- Raw known Electron sandbox startup entries and expected canceled teardown
+  requests remain visible in JSON, but the harness classifies them separately;
+  unexpected console and network failure counts are zero.
+- The live dirty WIP counts above are verification of the current checkout only;
+  they are deliberately separated from immutable committed evidence.
