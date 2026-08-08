@@ -1079,6 +1079,25 @@ async function pressKey(client, key, code = key, windowsVirtualKeyCode = 0) {
   });
 }
 
+async function activateFocusedButtonWithEnter(client) {
+  await client.send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Enter",
+    code: "Enter",
+    text: "\r",
+    unmodifiedText: "\r",
+    windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 13
+  });
+  await client.send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Enter",
+    code: "Enter",
+    windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 13
+  });
+}
+
 async function waitForCompactPopoverState(client, expected, timeoutMs = 5000) {
   const expectedValue = expected === null ? "null" : JSON.stringify(expected);
   return waitFor(
@@ -2226,7 +2245,7 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
           })()`
         )
       };
-      await pressKey(fixtureClient, "Enter", "Enter", 13);
+      await activateFocusedButtonWithEnter(fixtureClient);
       await waitFor(
         fixtureClient,
         `document.querySelector(${JSON.stringify(selector)})?.getAttribute("data-fallback-activated") === "true"`,
@@ -2258,7 +2277,7 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
         })()`
       )
     };
-    await pressKey(fixtureClient, "Enter", "Enter", 13);
+    await activateFocusedButtonWithEnter(fixtureClient);
     await waitFor(
       fixtureClient,
       `document.querySelector(${JSON.stringify(modalSelector)})?.getAttribute("data-fallback-activated") === "true"`,
