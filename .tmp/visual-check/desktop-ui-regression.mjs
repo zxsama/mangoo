@@ -925,6 +925,13 @@ async function moveToSelector(client, selector, xRatio, yRatio) {
   await evaluate(
     client,
     `(() => new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve(true);
+      };
+      const fallback = window.setTimeout(finish, 250);
       window.focus();
       window.dispatchEvent(new PointerEvent("pointermove", {
         bubbles: true,
@@ -938,7 +945,10 @@ async function moveToSelector(client, selector, xRatio, yRatio) {
         clientY: ${point.y}
       }));
       window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => resolve(true));
+        window.requestAnimationFrame(() => {
+          window.clearTimeout(fallback);
+          finish();
+        });
       });
     }))()`
   );

@@ -127,6 +127,8 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(regressionSource, /MEGLE_VISUAL_DEBUG_PORT.*9500/);
   assert.match(regressionSource, /controlledMedia\.files\.length/);
   assert.match(regressionSource, /await delay\(3000\)/);
+  assert.match(regressionSource, /const fallback = window\.setTimeout\(finish, 250\)/);
+  assert.match(regressionSource, /window\.clearTimeout\(fallback\)/);
 
   assert.doesNotMatch(exhaustiveSource, /buildSummary\(true\)/);
   assert.match(exhaustiveSource, /invoked tree URL/);
