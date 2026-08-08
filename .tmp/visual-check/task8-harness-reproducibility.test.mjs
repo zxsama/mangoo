@@ -291,6 +291,10 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(exhaustiveSource, /Network\.requestWillBeSent/);
   assert.match(exhaustiveSource, /Network\.responseReceived/);
   assert.match(exhaustiveSource, /Network\.loadingFailed/);
+  assert.match(exhaustiveSource, /Network\.loadingFinished/);
+  assert.match(exhaustiveSource, /pendingNetworkRequests\.delete/);
+  assert.match(exhaustiveSource, /await waitForNetworkIdle\("initial library load"\)/);
+  assert.match(exhaustiveSource, /await waitForNetworkIdle\(`before invoke selector/);
   assert.match(exhaustiveSource, /collectUnexpectedPhaseAwareNetworkProblems\(networkProblems\)/);
   assert.match(exhaustiveSource, /phase: networkPhase/);
   assert.match(exhaustiveSource, /networkPhase = "teardown";\s*await stopDevApp\(\)/);

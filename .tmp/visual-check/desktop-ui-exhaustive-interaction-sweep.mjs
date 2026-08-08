@@ -36,6 +36,7 @@ const failures = [];
 const consoleErrors = [];
 const networkProblems = [];
 const requestUrls = new Map();
+const pendingNetworkRequests = new Map();
 const hardFailures = [];
 const startupOutput = [];
 let invokedTree = null;
@@ -252,7 +253,12 @@ class CdpClient {
       consoleErrors.push(message.params.entry.text ?? JSON.stringify(message.params.entry));
     }
     if (message.method === "Network.requestWillBeSent") {
-      requestUrls.set(message.params?.requestId, message.params?.request?.url ?? null);
+      const requestId = message.params?.requestId;
+      const url = message.params?.request?.url ?? null;
+      requestUrls.set(requestId, url);
+      if (requestId && /^https?:\/\//.test(url ?? "")) {
+        pendingNetworkRequests.set(requestId, { url, startedAt: Date.now() });
+      }
     }
     if (message.method === "Network.responseReceived") {
       const response = message.params?.response ?? {};
@@ -277,6 +283,9 @@ class CdpClient {
         canceled: message.params?.canceled === true,
         blockedReason: message.params?.blockedReason ?? null
       });
+    }
+    if (message.method === "Network.loadingFinished" || message.method === "Network.loadingFailed") {
+      pendingNetworkRequests.delete(message.params?.requestId);
     }
   }
 
@@ -332,6 +341,23 @@ async function waitFor(client, expression, timeoutMs = 60_000, label = expressio
   throw new Error(`Timed out waiting for ${label}; last=${JSON.stringify(lastValue)}`);
 }
 
+async function waitForNetworkIdle(label, timeoutMs = 30_000, idleMs = 250) {
+  const deadline = Date.now() + timeoutMs;
+  let idleSince = null;
+  while (Date.now() < deadline) {
+    if (pendingNetworkRequests.size === 0) {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= idleMs) return;
+    } else {
+      idleSince = null;
+    }
+    await delay(50);
+  }
+  throw new Error(
+    `Timed out waiting for network idle after ${label}; pending=${JSON.stringify([...pendingNetworkRequests.entries()])}`
+  );
+}
+
 async function pointFor(client, selector, xRatio = 0.5, yRatio = 0.5) {
   const point = await evaluate(
     client,
@@ -383,6 +409,7 @@ async function mouse(client, type, point, extra = {}) {
 }
 
 async function clickSelector(client, selector, xRatio = 0.5, yRatio = 0.5) {
+  await waitForNetworkIdle(`before click selector ${selector}`);
   await client.send("Page.bringToFront").catch(() => undefined);
   await evaluate(client, "window.focus(); true").catch(() => undefined);
   const point = await pointFor(client, selector, xRatio, yRatio);
@@ -390,17 +417,21 @@ async function clickSelector(client, selector, xRatio = 0.5, yRatio = 0.5) {
   await mouse(client, "mousePressed", point, { button: "left", clickCount: 1 });
   await mouse(client, "mouseReleased", point, { button: "left", clickCount: 1 });
   await delay(250);
+  await waitForNetworkIdle(`click selector ${selector}`);
 }
 
 async function clickContains(client, selector, text) {
+  await waitForNetworkIdle(`before click ${text}`);
   const point = await pointForContains(client, selector, text);
   await mouse(client, "mouseMoved", point);
   await mouse(client, "mousePressed", point, { button: "left", clickCount: 1 });
   await mouse(client, "mouseReleased", point, { button: "left", clickCount: 1 });
   await delay(300);
+  await waitForNetworkIdle(`click ${text}`);
 }
 
 async function invokeContains(client, selector, text) {
+  await waitForNetworkIdle(`before invoke ${text}`);
   const outcome = await evaluate(
     client,
     `(() => {
@@ -417,9 +448,11 @@ async function invokeContains(client, selector, text) {
     throw new Error(`Invoke target not found: ${text}; got=${JSON.stringify(outcome)}`);
   }
   await delay(300);
+  await waitForNetworkIdle(`invoke ${text}`);
 }
 
 async function invokeSelector(client, selector) {
+  await waitForNetworkIdle(`before invoke selector ${selector}`);
   const outcome = await evaluate(
     client,
     `(() => {
@@ -435,9 +468,11 @@ async function invokeSelector(client, selector) {
     throw new Error(`Invoke selector not found: ${selector}`);
   }
   await delay(300);
+  await waitForNetworkIdle(`invoke selector ${selector}`);
 }
 
 async function dispatchContextMenuContains(client, selector, text) {
+  await waitForNetworkIdle(`before context menu ${text}`);
   const result = await evaluate(
     client,
     `(() => {
@@ -463,9 +498,11 @@ async function dispatchContextMenuContains(client, selector, text) {
     throw new Error(`Context-menu target not found: ${text}; got=${JSON.stringify(result)}`);
   }
   await delay(350);
+  await waitForNetworkIdle(`context menu ${text}`);
 }
 
 async function dispatchContextMenuFirstMediaTile(client) {
+  await waitForNetworkIdle("before media context menu");
   const result = await evaluate(
     client,
     `(() => {
@@ -490,9 +527,11 @@ async function dispatchContextMenuFirstMediaTile(client) {
     throw new Error("No media tile available for context menu");
   }
   await delay(350);
+  await waitForNetworkIdle("media context menu");
 }
 
 async function doubleClickFirstTile(client) {
+  await waitForNetworkIdle("before preview open");
   const outcome = await evaluate(
     client,
     `(() => {
@@ -512,15 +551,19 @@ async function doubleClickFirstTile(client) {
     throw new Error("No media tile for preview");
   }
   await delay(400);
+  await waitForNetworkIdle("preview open");
 }
 
 async function pressKey(client, key) {
+  await waitForNetworkIdle(`before key ${key}`);
   await client.send("Input.dispatchKeyEvent", { type: "keyDown", key });
   await client.send("Input.dispatchKeyEvent", { type: "keyUp", key });
   await delay(120);
+  await waitForNetworkIdle(`key ${key}`);
 }
 
 async function setSearch(client, value) {
+  await waitForNetworkIdle(`before search ${value}`);
   await evaluate(
     client,
     `(() => {
@@ -535,6 +578,7 @@ async function setSearch(client, value) {
     })()`
   );
   await delay(500);
+  await waitForNetworkIdle(`search ${value}`);
 }
 
 async function installShellSpy(client) {
@@ -662,6 +706,7 @@ async function runExhaustiveSweep(client) {
     180_000,
     "library loaded"
   );
+  await waitForNetworkIdle("initial library load");
   results.push("startup/library load");
 
   await invokeSelector(client, '[data-titlebar-control="open-settings"]');
