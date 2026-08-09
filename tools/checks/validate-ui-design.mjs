@@ -2173,12 +2173,12 @@ for (const retiredAlias of ["--surface-corner-radius", "--control-corner-radius"
   }
 }
 
-const settingsPanelRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-section");
+const settingsPanelRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-group-body");
 if (!settingsPanelRadiusBlocks.some((block) => /border-radius:\s*var\(--radius-panel\)/.test(block))) {
   fail("Settings panel surfaces must consume --radius-panel");
 }
 
-const settingsControlRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-action");
+const settingsControlRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-inline-action");
 if (!settingsControlRadiusBlocks.some((block) => /border-radius:\s*var\(--radius-control\)/.test(block))) {
   fail("Settings controls must consume --radius-control");
 }

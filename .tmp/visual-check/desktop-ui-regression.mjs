@@ -1626,6 +1626,7 @@ async function notificationPopoverFixtureEvidence(client) {
           reducedTransparency: {
             matches: matchMedia("(prefers-reduced-transparency: reduce)").matches,
             backgroundColor: style?.backgroundColor ?? null,
+            directBackdropBackgroundColor: backdropStyle?.backgroundColor ?? null,
             backdropFilter: style?.backdropFilter ?? null,
             childBackdropFilter: backdropStyle?.backdropFilter ?? null,
             allBackdropFilters: relevantBackdropElements.map((element) => {
@@ -2583,8 +2584,8 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
       stableGroups: ["side", "center", "shared", "unaffected"]
     },
     "dialog-backdrop-dim": {
-      required: ["dialog.modalBackdrop.effects.backgroundColor"],
-      allowed: ["dialog.modalBackdrop.effects.backgroundColor"],
+      required: ["dialog.modal.effects.boxShadow"],
+      allowed: ["dialog.modal.effects.boxShadow"],
       stableGroups: ["side", "center", "shared", "unaffected"]
     }
   };
@@ -2840,8 +2841,8 @@ async function settingsInterfaceStyleEvidence(client) {
           settingsClient,
           `(() => {
             const root = getComputedStyle(document.documentElement);
-            const panel = document.querySelector(".settings-section");
-            const control = document.querySelector(".settings-action");
+            const panel = document.querySelector(".settings-group-body");
+            const control = document.querySelector(".settings-inline-action");
             return root.getPropertyValue("--radius-panel").trim() === ${JSON.stringify(`${radius}px`)} &&
               root.getPropertyValue("--radius-control").trim() === ${JSON.stringify(`${radius}px`)} &&
               panel && getComputedStyle(panel).borderRadius === ${JSON.stringify(`${radius}px`)} &&
@@ -2854,8 +2855,8 @@ async function settingsInterfaceStyleEvidence(client) {
           settingsClient,
           `(() => {
             const root = getComputedStyle(document.documentElement);
-            const panel = document.querySelector(".settings-section");
-            const control = document.querySelector(".settings-action");
+            const panel = document.querySelector(".settings-group-body");
+            const control = document.querySelector(".settings-inline-action");
             return {
               panelVariable: root.getPropertyValue("--radius-panel").trim(),
               controlVariable: root.getPropertyValue("--radius-control").trim(),
@@ -4170,6 +4171,27 @@ function noBackdropFilter(value) {
   return !value || value === "none";
 }
 
+function positiveCssNumber(value) {
+  return Number.parseFloat(String(value ?? "")) > 0;
+}
+
+function cssColorAlpha(value) {
+  const normalized = String(value ?? "").trim();
+  if (transparent(normalized)) return 0;
+  const commaRgba = normalized.match(
+    /^rgba\([^,]+,[^,]+,[^,]+,\s*([.\d]+)\s*\)$/i
+  );
+  if (commaRgba) return Number.parseFloat(commaRgba[1]);
+  const slashAlpha = normalized.match(
+    /^rgba?\([^/]+\/\s*([.\d]+)(%)?\s*\)$/i
+  );
+  if (slashAlpha) {
+    const alpha = Number.parseFloat(slashAlpha[1]);
+    return slashAlpha[2] ? alpha / 100 : alpha;
+  }
+  return /^rgba?\(/i.test(normalized) ? 1 : null;
+}
+
 function effectiveBlurFilter(value) {
   if (!value || value === "none") return false;
   const match = value.match(/blur\(([-.\d]+)px\)/i);
@@ -5390,7 +5412,10 @@ try {
   ) {
     hardFailures.push("reduced-transparency emulation did not match the notification fixture");
   } else if (
-    transparent(preferenceFixture.reducedTransparency.reducedTransparency.backgroundColor) ||
+    !transparent(preferenceFixture.reducedTransparency.reducedTransparency.backgroundColor) ||
+    cssColorAlpha(
+      preferenceFixture.reducedTransparency.reducedTransparency.directBackdropBackgroundColor
+    ) < 0.95 ||
     !preferenceFixture.reducedTransparency.reducedTransparency.allBackdropFilters?.length ||
     preferenceFixture.reducedTransparency.reducedTransparency.allBackdropFilters.some(
       (entry) =>

@@ -80,7 +80,7 @@ describe("unified panel and control radius", () => {
 });
 ```
 
-Update the UI-design validator so its required model/slider names are `panelControlCornerRadius` and `id="panel-control-corner-radius"`, it requires the label `面板与控件圆角`, and it rejects retired fields, slider ids, and undefined CSS aliases. Add static-default assertions for overlay/panel/surface/control `8px` and tight `4px`, plus representative consumer assertions that `.settings-section` uses `--radius-panel` and `.settings-action` uses `--radius-control`.
+Update the UI-design validator so its required model/slider names are `panelControlCornerRadius` and `id="panel-control-corner-radius"`, it requires the label `面板与控件圆角`, and it rejects retired fields, slider ids, and undefined CSS aliases. Add static-default assertions for overlay/panel/surface/control `8px` and tight `4px`, plus representative consumer assertions that the visible `.settings-group-body` uses `--radius-panel` and `.settings-inline-action` uses `--radius-control`.
 
 - [ ] **Step 2: Run the radius tests and validator to verify RED**
 
@@ -137,7 +137,7 @@ Replace the two Settings sliders with:
 
 Set the root fallback `--radius-overlay`, `--radius-panel`, `--radius-surface`, and `--radius-control` values to `8px`, with `--radius-tight: 4px`. Replace every `var(--control-corner-radius, ...)` with `var(--radius-control)` and `var(--surface-corner-radius, ...)` with `var(--radius-panel)`. Align `radiusTokens` to window/overlay/panel/surface/control/content values of `8`, tight `4`, and pill `999`.
 
-Extend the tracked Settings evidence in `desktop-ui-regression.mjs` to set `#panel-control-corner-radius` to `0`, `8`, and `16`, wait for the preference CSS variable to synchronize, and record `getComputedStyle(document.querySelector(".settings-section")).borderRadius` plus `getComputedStyle(document.querySelector(".settings-action")).borderRadius`. The hard gate requires both consumers to report the selected pixel value at all three samples, then restores the original slider value.
+Extend the tracked Settings evidence in `desktop-ui-regression.mjs` to set `#panel-control-corner-radius` to `0`, `8`, and `16`, wait for the preference CSS variable to synchronize, and record `getComputedStyle(document.querySelector(".settings-group-body")).borderRadius` plus `getComputedStyle(document.querySelector(".settings-inline-action")).borderRadius`. The hard gate requires both visible consumers to report the selected pixel value at all three samples, then restores the original slider value.
 
 - [ ] **Step 4: Run the focused checks to verify GREEN**
 
