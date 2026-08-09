@@ -256,7 +256,7 @@ class CdpClient {
       const requestId = message.params?.requestId;
       const url = message.params?.request?.url ?? null;
       requestUrls.set(requestId, url);
-      if (requestId && /^https?:\/\//.test(url ?? "")) {
+      if (requestId && /^https?:\/\/[^/]+\/api\//.test(url ?? "")) {
         pendingNetworkRequests.set(requestId, { url, startedAt: Date.now() });
       }
     }
@@ -535,7 +535,10 @@ async function doubleClickFirstTile(client) {
   const outcome = await evaluate(
     client,
     `(() => {
-      const tile = document.querySelector(".media-tile");
+      const tile = [...document.querySelectorAll(".media-tile")].find((candidate) => {
+        const image = candidate.querySelector(".tile-thumb-ready img");
+        return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0;
+      });
       if (!(tile instanceof HTMLElement)) {
         return false;
       }
@@ -548,7 +551,7 @@ async function doubleClickFirstTile(client) {
     })()`
   );
   if (!outcome) {
-    throw new Error("No media tile for preview");
+    throw new Error("No ready media tile for preview");
   }
   await delay(400);
   await waitForNetworkIdle("preview open");

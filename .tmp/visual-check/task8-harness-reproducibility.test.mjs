@@ -24,6 +24,7 @@ const harnessDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(harnessDirectory, "..", "..");
 const regressionPath = path.join(harnessDirectory, "desktop-ui-regression.mjs");
 const exhaustivePath = path.join(harnessDirectory, "desktop-ui-exhaustive-interaction-sweep.mjs");
+const libraryDataPath = path.join(repositoryRoot, "apps", "web", "src", "core", "useLibraryData.ts");
 const overlayCssPath = path.join(repositoryRoot, "apps", "web", "src", "design", "overlays", "overlay.css");
 const appearanceFixturePath = path.join(
   repositoryRoot,
@@ -293,6 +294,8 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(exhaustiveSource, /Network\.loadingFailed/);
   assert.match(exhaustiveSource, /Network\.loadingFinished/);
   assert.match(exhaustiveSource, /pendingNetworkRequests\.delete/);
+  assert.match(exhaustiveSource, /\^https\?:\\\/\\\/\[\^\/\]\+\\\/api\\\//);
+  assert.match(exhaustiveSource, /tile-thumb-ready img/);
   assert.match(exhaustiveSource, /initial library interaction readiness before scenario telemetry/);
   assert.match(exhaustiveSource, /await delay\(3000\);\s*await client\.send\("Network\.enable"\)/);
   assert.match(exhaustiveSource, /await waitForNetworkIdle\("initial library load"\)/);
@@ -308,6 +311,21 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(exhaustiveSource, /desktop-ui-exhaustive-\$\{visualRunId\}\.stderr\.log/);
   assert.match(exhaustiveSource, /cargoDiagnostics/);
   assert.match(exhaustiveSource, /cargoBuildFinished/);
+});
+
+test("thumbnail priority scope changes coalesce without scenario request aborts", async () => {
+  const source = await readFile(libraryDataPath, "utf8");
+  const start = source.indexOf("const flushThumbnailPriorityScopeSync");
+  const end = source.indexOf("const scheduleThumbnailPriorityScopeSync", start);
+  const flush = source.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(
+    flush,
+    /if \(thumbnailPriorityScopeSyncControllerRef\.current\) \{\s*thumbnailPriorityScopeSyncTrailingPendingRef\.current = true;\s*return;/
+  );
+  assert.doesNotMatch(flush, /thumbnailPriorityScopeSyncControllerRef\.current\?\.abort\(\)/);
+  assert.match(source, /if \(thumbnailPriorityScopeSyncTimerRef\.current === null\) \{\s*openThumbnailScopeSyncWindow\(\);/);
 });
 
 test("DPI, preference, and appearance checks assert effective production state", async () => {

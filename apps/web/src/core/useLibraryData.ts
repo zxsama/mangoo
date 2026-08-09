@@ -772,7 +772,10 @@ export function useLibraryData(
         return;
       }
 
-      thumbnailPriorityScopeSyncControllerRef.current?.abort();
+      if (thumbnailPriorityScopeSyncControllerRef.current) {
+        thumbnailPriorityScopeSyncTrailingPendingRef.current = true;
+        return;
+      }
       const controller = new AbortController();
       thumbnailPriorityScopeSyncControllerRef.current = controller;
       thumbnailPriorityScopeSyncKeyRef.current = requestKey;
@@ -871,7 +874,7 @@ export function useLibraryData(
             reportingAttempt
           );
         });
-        if (priority === "visible") {
+        if (thumbnailPriorityScopeSyncTimerRef.current === null) {
           openThumbnailScopeSyncWindow();
         }
         return;
