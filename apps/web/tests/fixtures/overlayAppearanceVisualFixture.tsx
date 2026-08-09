@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useSecondaryWindowInterfaceStyle } from "../../src/app-shell/useSecondaryWindowInterfaceStyle";
 import { LiquidGlassLayer, LiquidGlassSurface } from "../../src/design/liquid-glass";
 import {
+  AnchoredOverlay,
   ModalSurface,
   OverlayDialogBody,
   OverlayDialogHeader,
@@ -14,16 +15,50 @@ import "../../src/styles.css";
 import "../../src/design/overlays/overlay.css";
 import "./overlayAppearanceVisualFixture.css";
 
+function makeBlurProbeRaster(index: number): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = 240;
+  canvas.height = 150;
+  const context = canvas.getContext("2d");
+  if (!context) return "";
+  const hue = (index * 41) % 360;
+  const gradient = context.createLinearGradient(0, 0, canvas.width, canvas.height);
+  gradient.addColorStop(0, `hsl(${hue} 72% 48%)`);
+  gradient.addColorStop(1, `hsl(${(hue + 118) % 360} 68% 22%)`);
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.strokeStyle = index % 2 === 0 ? "rgba(255,255,255,.86)" : "rgba(5,9,18,.82)";
+  context.lineWidth = 3;
+  for (let x = 14; x < canvas.width; x += 24) {
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, canvas.height);
+    context.stroke();
+  }
+  context.fillStyle = "rgba(255,255,255,.94)";
+  context.font = "700 22px Segoe UI";
+  context.fillText(`IMG ${String(index + 1).padStart(2, "0")}`, 14, 32);
+  context.font = "12px Consolas";
+  context.fillText("EDGE 0123456789", 14, 132);
+  return canvas.toDataURL("image/png");
+}
+
+const blurProbeRasters = Array.from({ length: 18 }, (_, index) => makeBlurProbeRaster(index));
+
 function OverlayAppearanceVisualFixture() {
   useSecondaryWindowInterfaceStyle();
   const [modalOpen, setModalOpen] = useState(true);
+  const [blurProbeOpen, setBlurProbeOpen] = useState(false);
+  const [blurProbeAnchor, setBlurProbeAnchor] = useState<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     const handleModalToggle = (event: Event) => {
       setModalOpen((event as CustomEvent<boolean>).detail !== false);
     };
     window.addEventListener("megle-overlay-fixture-modal", handleModalToggle);
-    return () => window.removeEventListener("megle-overlay-fixture-modal", handleModalToggle);
+    return () => {
+      window.removeEventListener("megle-overlay-fixture-modal", handleModalToggle);
+    };
   }, []);
 
   return (
@@ -87,6 +122,42 @@ function OverlayAppearanceVisualFixture() {
           </main>
         </section>
 
+        <section className="overlay-appearance-blur-scene" data-appearance-blur-scene="true">
+          <button
+            aria-controls="appearance-blur-popover"
+            aria-expanded={blurProbeOpen}
+            className="overlay-appearance-blur-trigger"
+            data-appearance-blur-trigger="true"
+            data-pointer-glow="off"
+            onClick={() => setBlurProbeOpen(true)}
+            ref={setBlurProbeAnchor}
+            type="button"
+          >
+            Open regional blur probe
+          </button>
+          {blurProbeRasters.map((source, index) => (
+            <article className="overlay-appearance-sample-card" key={index}>
+              <img
+                alt=""
+                data-appearance-blur-sample="image"
+                data-appearance-blur-sample-id={`image-${index + 1}`}
+                src={source}
+              />
+              <span
+                data-appearance-blur-sample="text"
+                data-appearance-blur-sample-id={`text-${index + 1}`}
+              >
+                frame_{String(index + 1).padStart(4, "0")}.png
+              </span>
+            </article>
+          ))}
+          <div
+            aria-hidden="true"
+            className="overlay-appearance-blur-reference"
+            data-appearance-blur-reference="true"
+          />
+        </section>
+
         <div className="overlay-appearance-dialog-probes">
           <OverlaySurface
             className="overlay-appearance-dialog-surface"
@@ -136,6 +207,19 @@ function OverlayAppearanceVisualFixture() {
           Preview canvas invariant
         </div>
       </main>
+
+      <AnchoredOverlay
+        anchor={blurProbeAnchor}
+        ariaLabel="Independent image blur probe"
+        className="overlay-appearance-blur-probe"
+        id="appearance-blur-popover"
+        onDismiss={() => setBlurProbeOpen(false)}
+        open={blurProbeOpen && Boolean(blurProbeAnchor)}
+        preferredWidth={360}
+        rootId="notifications"
+      >
+        <div className="overlay-appearance-blur-probe-content">Regional blur sampling surface</div>
+      </AnchoredOverlay>
 
       <ModalSurface
         ariaLabelledBy="appearance-modal-heading"

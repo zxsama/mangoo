@@ -351,6 +351,642 @@ async function rendererScreenshot(client, name) {
   return filePath;
 }
 
+async function analyzeOverlayBlurScreenshot(filePath, viewport, probeRect, referenceRect, sampleRects) {
+  const escapedPath = filePath.replace(/'/g, "''");
+  const serializeRect = (rect) => JSON.stringify({
+    left: Math.round(rect.left),
+    top: Math.round(rect.top),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height)
+  });
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+$path = '${escapedPath}'
+$viewportWidth = ${Math.round(viewport.width)}
+$viewportHeight = ${Math.round(viewport.height)}
+$probeRect = '${serializeRect(probeRect).replace(/'/g, "''")}' | ConvertFrom-Json
+$referenceRect = '${serializeRect(referenceRect).replace(/'/g, "''")}' | ConvertFrom-Json
+$sampleRects = '${JSON.stringify(sampleRects.map((sample) => ({
+    kind: sample.kind,
+    id: sample.id,
+    left: Math.round(sample.rect.left),
+    top: Math.round(sample.rect.top),
+    width: Math.round(sample.rect.width),
+    height: Math.round(sample.rect.height)
+  }))).replace(/'/g, "''")}' | ConvertFrom-Json
+$bitmap = [System.Drawing.Bitmap]::FromFile($path)
+try {
+  $scaleX = $bitmap.Width / $viewportWidth
+  $scaleY = $bitmap.Height / $viewportHeight
+  $imageRects = @($sampleRects | Where-Object { $_.kind -eq 'image' })
+  $textRects = @($sampleRects | Where-Object { $_.kind -eq 'text' })
+
+  function AnalyzeCrop($rect, $collectPixels) {
+    $insetX = [Math]::Round(20 * $scaleX)
+    $insetY = [Math]::Round(20 * $scaleY)
+    $left = [Math]::Round($rect.left * $scaleX) + $insetX
+    $top = [Math]::Round($rect.top * $scaleY) + $insetY
+    $right = [Math]::Round(($rect.left + $rect.width) * $scaleX) - $insetX
+    $bottom = [Math]::Round(($rect.top + $rect.height) * $scaleY) - $insetY
+    if ($left -lt 0 -or $top -lt 0 -or $right -gt $bitmap.Width -or $bottom -gt $bitmap.Height -or $right -le $left -or $bottom -le $top) {
+      throw "invalid blur crop $left,$top,$right,$bottom for $($bitmap.Width)x$($bitmap.Height)"
+    }
+
+    $sum = 0.0
+    $count = 0
+    $pixels = if ($collectPixels) { New-Object System.Collections.Generic.List[object] } else { $null }
+    for ($y = $top; $y -lt $bottom; $y++) {
+      for ($x = $left; $x -lt $right; $x++) {
+        $pixel = $bitmap.GetPixel($x, $y)
+        if ($collectPixels) { $pixels.Add(@($pixel.R, $pixel.G, $pixel.B)) }
+        if ($x + 1 -lt $right) {
+          $next = $bitmap.GetPixel($x + 1, $y)
+          $sum += ([Math]::Abs($pixel.R - $next.R) + [Math]::Abs($pixel.G - $next.G) + [Math]::Abs($pixel.B - $next.B)) / 3.0
+          $count += 1
+        }
+        if ($y + 1 -lt $bottom) {
+          $next = $bitmap.GetPixel($x, $y + 1)
+          $sum += ([Math]::Abs($pixel.R - $next.R) + [Math]::Abs($pixel.G - $next.G) + [Math]::Abs($pixel.B - $next.B)) / 3.0
+          $count += 1
+        }
+      }
+    }
+    return [pscustomobject]@{
+      rect = @{ left = $left; top = $top; width = $right - $left; height = $bottom - $top }
+      edgeEnergy = [Math]::Round($sum / $count, 4)
+      pixels = if ($collectPixels) { $pixels } else { @() }
+    }
+  }
+
+  function PixelDelta($leftPixel, $rightPixel) {
+    return ([Math]::Abs($leftPixel.R - $rightPixel.R) + [Math]::Abs($leftPixel.G - $rightPixel.G) + [Math]::Abs($leftPixel.B - $rightPixel.B)) / 3.0
+  }
+
+  function AnalyzeIndependentImageEdges($rects, $probe) {
+    $probeLeft = [Math]::Round($probe.left * $scaleX) + [Math]::Round(8 * $scaleX)
+    $probeTop = [Math]::Round($probe.top * $scaleY) + [Math]::Round(8 * $scaleY)
+    $probeRight = [Math]::Round(($probe.left + $probe.width) * $scaleX) - [Math]::Round(8 * $scaleX)
+    $probeBottom = [Math]::Round(($probe.top + $probe.height) * $scaleY) - [Math]::Round(8 * $scaleY)
+    $boundarySum = 0.0
+    $boundaryCount = 0
+    $interiorSum = 0.0
+    $interiorCount = 0
+    $rectCount = 0
+    foreach ($rect in $rects) {
+      $left = [Math]::Round($rect.left * $scaleX)
+      $top = [Math]::Round($rect.top * $scaleY)
+      $right = [Math]::Round(($rect.left + $rect.width) * $scaleX)
+      $bottom = [Math]::Round(($rect.top + $rect.height) * $scaleY)
+      if ($right -le $probeLeft -or $left -ge $probeRight -or $bottom -le $probeTop -or $top -ge $probeBottom) { continue }
+      $rectCount += 1
+      $bandX = [Math]::Max(1, [Math]::Round(2 * $scaleX))
+      $bandY = [Math]::Max(1, [Math]::Round(2 * $scaleY))
+      foreach ($edgeX in @($left, $right)) {
+        $fromY = [Math]::Max($probeTop, $top + [Math]::Round(6 * $scaleY))
+        $toY = [Math]::Min($probeBottom, $bottom - [Math]::Round(6 * $scaleY))
+        for ($y = $fromY; $y -lt $toY; $y++) {
+          for ($x = $edgeX - $bandX; $x -lt $edgeX + $bandX; $x++) {
+            if ($x -ge $probeLeft -and $x + 1 -lt $probeRight) {
+              $boundarySum += PixelDelta ($bitmap.GetPixel($x, $y)) ($bitmap.GetPixel($x + 1, $y))
+              $boundaryCount += 1
+            }
+          }
+        }
+      }
+      foreach ($edgeY in @($top, $bottom)) {
+        $fromX = [Math]::Max($probeLeft, $left + [Math]::Round(6 * $scaleX))
+        $toX = [Math]::Min($probeRight, $right - [Math]::Round(6 * $scaleX))
+        for ($x = $fromX; $x -lt $toX; $x++) {
+          for ($y = $edgeY - $bandY; $y -lt $edgeY + $bandY; $y++) {
+            if ($y -ge $probeTop -and $y + 1 -lt $probeBottom) {
+              $boundarySum += PixelDelta ($bitmap.GetPixel($x, $y)) ($bitmap.GetPixel($x, $y + 1))
+              $boundaryCount += 1
+            }
+          }
+        }
+      }
+      $insetX = [Math]::Round(12 * $scaleX)
+      $insetY = [Math]::Round(12 * $scaleY)
+      $fromX = [Math]::Max($probeLeft, $left + $insetX)
+      $toX = [Math]::Min($probeRight, $right - $insetX)
+      $fromY = [Math]::Max($probeTop, $top + $insetY)
+      $toY = [Math]::Min($probeBottom, $bottom - $insetY)
+      for ($y = $fromY; $y -lt $toY - 1; $y++) {
+        for ($x = $fromX; $x -lt $toX - 1; $x++) {
+          $pixel = $bitmap.GetPixel($x, $y)
+          $interiorSum += PixelDelta $pixel ($bitmap.GetPixel($x + 1, $y))
+          $interiorSum += PixelDelta $pixel ($bitmap.GetPixel($x, $y + 1))
+          $interiorCount += 2
+        }
+      }
+    }
+    $boundaryEnergy = if ($boundaryCount -gt 0) { $boundarySum / $boundaryCount } else { 0 }
+    $interiorEnergy = if ($interiorCount -gt 0) { $interiorSum / $interiorCount } else { 0 }
+    return [pscustomobject]@{
+      boundaryEdgeEnergy = [Math]::Round($boundaryEnergy, 4)
+      interiorEdgeEnergy = [Math]::Round($interiorEnergy, 4)
+      boundaryInteriorRatio = if ($interiorEnergy -gt 0.0001) { [Math]::Round($boundaryEnergy / $interiorEnergy, 4) } else { 9999 }
+      boundarySamples = $boundaryCount
+      interiorSamples = $interiorCount
+      rectCount = $rectCount
+    }
+  }
+
+  function AnalyzeTextEdges($rects, $probe) {
+    $probeLeft = [Math]::Round($probe.left * $scaleX) + [Math]::Round(12 * $scaleX)
+    $probeTop = [Math]::Round($probe.top * $scaleY) + [Math]::Round(12 * $scaleY)
+    $probeRight = [Math]::Round(($probe.left + $probe.width) * $scaleX) - [Math]::Round(12 * $scaleX)
+    $probeBottom = [Math]::Round(($probe.top + $probe.height) * $scaleY) - [Math]::Round(12 * $scaleY)
+    $sum = 0.0
+    $count = 0
+    $rectCount = 0
+    foreach ($rect in $rects) {
+      $left = [Math]::Max($probeLeft, [Math]::Round($rect.left * $scaleX) + [Math]::Round(3 * $scaleX))
+      $top = [Math]::Max($probeTop, [Math]::Round($rect.top * $scaleY) + [Math]::Round(3 * $scaleY))
+      $right = [Math]::Min($probeRight, [Math]::Round(($rect.left + $rect.width) * $scaleX) - [Math]::Round(3 * $scaleX))
+      $bottom = [Math]::Min($probeBottom, [Math]::Round(($rect.top + $rect.height) * $scaleY) - [Math]::Round(3 * $scaleY))
+      if ($right -le $left + 2 -or $bottom -le $top + 2) { continue }
+      $rectCount += 1
+      for ($y = $top; $y -lt $bottom - 1; $y++) {
+        for ($x = $left; $x -lt $right - 1; $x++) {
+          $pixel = $bitmap.GetPixel($x, $y)
+          $sum += PixelDelta $pixel ($bitmap.GetPixel($x + 1, $y))
+          $sum += PixelDelta $pixel ($bitmap.GetPixel($x, $y + 1))
+          $count += 2
+        }
+      }
+    }
+    return [pscustomobject]@{
+      edgeEnergy = if ($count -gt 0) { [Math]::Round($sum / $count, 4) } else { 0 }
+      samples = $count
+      rectCount = $rectCount
+    }
+  }
+
+  [pscustomobject]@{
+    image = @{ width = $bitmap.Width; height = $bitmap.Height }
+    inferredScale = @{ x = [Math]::Round($scaleX, 3); y = [Math]::Round($scaleY, 3) }
+    probe = AnalyzeCrop $probeRect $false
+    reference = AnalyzeCrop $referenceRect $true
+    independentImages = AnalyzeIndependentImageEdges $imageRects $probeRect
+    independentText = AnalyzeTextEdges $textRects $probeRect
+  } | ConvertTo-Json -Depth 10 -Compress
+} finally {
+  $bitmap.Dispose()
+}
+`;
+
+  return new Promise((resolve, reject) => {
+    const ps = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+    );
+    let output = "";
+    let errorText = "";
+    ps.stdout.on("data", (chunk) => {
+      output += chunk.toString();
+    });
+    ps.stderr.on("data", (chunk) => {
+      errorText += chunk.toString();
+    });
+    ps.on("error", reject);
+    ps.on("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(errorText.trim() || `Overlay blur screenshot analysis failed with exit code ${code}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(output));
+      } catch (error) {
+        reject(new Error(`Overlay blur screenshot analysis did not return JSON: ${String(error)}; output=${output}`));
+      }
+    });
+  });
+}
+
+function referencePixelDelta(left, right) {
+  const leftPixels = left?.reference?.pixels ?? [];
+  const rightPixels = right?.reference?.pixels ?? [];
+  if (leftPixels.length === 0 || leftPixels.length !== rightPixels.length) return Number.POSITIVE_INFINITY;
+  const total = leftPixels.reduce((sum, pixel, index) => {
+    const other = rightPixels[index];
+    return sum + (Math.abs(pixel[0] - other[0]) + Math.abs(pixel[1] - other[1]) + Math.abs(pixel[2] - other[2])) / 3;
+  }, 0);
+  return Number((total / leftPixels.length).toFixed(4));
+}
+
+async function waitForOverlayBlurSettled(client, expectedSigma) {
+  const expected = Number(expectedSigma);
+  await waitFor(
+    client,
+    `(async () => {
+      const surface = document.querySelector('#appearance-blur-popover');
+      if (!(surface instanceof HTMLElement) || surface.getAttribute('data-overlay-state') !== 'open') return false;
+      const imagesReady = [...document.querySelectorAll('[data-appearance-blur-sample="image"]')]
+        .every((image) => image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0 && image.naturalHeight > 0);
+      if (!imagesReady) return false;
+      const read = () => {
+        const rect = surface.getBoundingClientRect();
+        return [rect.left, rect.top, rect.width, rect.height].map((value) => Math.round(value * 100) / 100);
+      };
+      const first = read();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const second = read();
+      if (JSON.stringify(first) !== JSON.stringify(second)) return false;
+      const root = document.querySelector('#root');
+      const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+      const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
+      if (${expected} === 0) {
+        return root?.getAttribute('data-overlay-regional-blur') !== 'active' && !filter && !gaussian;
+      }
+      return root?.getAttribute('data-overlay-regional-blur') === 'active' &&
+        filter?.getAttribute('filterUnits') === 'userSpaceOnUse' &&
+        filter?.getAttribute('primitiveUnits') === 'userSpaceOnUse' &&
+        filter?.getAttribute('data-overlay-regional-full-target') === 'false' &&
+        filter?.getAttribute('data-overlay-regional-mask-count') === '1' &&
+        gaussian?.getAttribute('in') === 'SourceGraphic' &&
+        gaussian?.getAttribute('edgeMode') === 'duplicate' &&
+        Math.abs(Number(gaussian?.getAttribute('stdDeviation')) - ${expected}) <= 0.01;
+    })()`,
+    10000,
+    `overlay regional blur settled at sigma ${expected}`
+  );
+}
+
+async function captureOverlayBlurEvidence(client, name, expectedSigma) {
+  await waitForOverlayBlurSettled(client, expectedSigma);
+  await evaluate(client, `document.body.setAttribute("data-overlay-blur-sampling", "true")`);
+  await delay(80);
+  const snapshot = await evaluate(
+    client,
+    `(() => {
+      const surface = document.querySelector('#appearance-blur-popover');
+      const reference = document.querySelector('[data-appearance-blur-reference="true"]');
+      const child = surface?.querySelector(':scope > .liquid-glass-backdrop') ?? null;
+      const root = document.querySelector('#root');
+      const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+      const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
+      const saturation = filter?.querySelector('feColorMatrix[in="blurred"][type="saturate"]') ?? null;
+      if (!(surface instanceof HTMLElement) || !(reference instanceof HTMLElement)) return null;
+      const style = getComputedStyle(surface);
+      const childStyle = child ? getComputedStyle(child) : null;
+      const rect = (element) => {
+        const value = element.getBoundingClientRect();
+        return { left: value.left, top: value.top, width: value.width, height: value.height };
+      };
+      const probeRect = rect(surface);
+      const referenceRect = rect(reference);
+      const probeRight = probeRect.left + probeRect.width;
+      const probeBottom = probeRect.top + probeRect.height;
+      const referenceRight = referenceRect.left + referenceRect.width;
+      const referenceBottom = referenceRect.top + referenceRect.height;
+      const separationX = Math.max(0, Math.max(referenceRect.left - probeRight, probeRect.left - referenceRight));
+      const separationY = Math.max(0, Math.max(referenceRect.top - probeBottom, probeRect.top - referenceBottom));
+      return {
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        renderer: {
+          devicePixelRatio: window.devicePixelRatio,
+          visualViewportScale: window.visualViewport?.scale ?? null
+        },
+        probeRect,
+        referenceRect,
+        referenceClearance: Math.hypot(separationX, separationY),
+        sampleRects: [...document.querySelectorAll('[data-appearance-blur-sample]')]
+          .filter((element) => element instanceof HTMLElement)
+          .map((element) => ({
+            kind: element.getAttribute('data-appearance-blur-sample'),
+            id: element.getAttribute('data-appearance-blur-sample-id'),
+            rect: rect(element)
+          })),
+        regional: {
+          rootFiltered: root?.getAttribute('data-overlay-regional-blur') === 'active',
+          inlineFilter: root instanceof HTMLElement ? root.style.filter : '',
+          defsCount: document.querySelectorAll('svg[data-overlay-regional-blur-defs="true"]').length,
+          present: Boolean(filter),
+          id: filter?.id ?? null,
+          target: filter?.getAttribute('data-overlay-regional-blur-target') ?? null,
+          filterUnits: filter?.getAttribute('filterUnits') ?? null,
+          primitiveUnits: filter?.getAttribute('primitiveUnits') ?? null,
+          fullTarget: filter?.getAttribute('data-overlay-regional-full-target') ?? null,
+          maskCount: filter?.getAttribute('data-overlay-regional-mask-count') ?? null,
+          gaussian: gaussian ? {
+            input: gaussian.getAttribute('in'),
+            stdDeviation: gaussian.getAttribute('stdDeviation'),
+            edgeMode: gaussian.getAttribute('edgeMode')
+          } : null,
+          saturation: saturation ? {
+            input: saturation.getAttribute('in'),
+            type: saturation.getAttribute('type'),
+            values: saturation.getAttribute('values')
+          } : null
+        },
+        surface: {
+          backgroundImage: style.backgroundImage,
+          backdropFilter: style.backdropFilter,
+          webkitBackdropFilter: style.webkitBackdropFilter
+        },
+        child: {
+          present: Boolean(child),
+          backgroundColor: childStyle?.backgroundColor ?? null,
+          backgroundImage: childStyle?.backgroundImage ?? null,
+          backdropFilter: childStyle?.backdropFilter ?? null,
+          webkitBackdropFilter: childStyle?.webkitBackdropFilter ?? null
+        }
+      };
+    })()`
+  );
+  try {
+    if (!snapshot) throw new Error("overlay blur probe fixture is missing");
+    const screenshotPath = await rendererScreenshot(client, name);
+    return {
+      screenshotPath,
+      ...snapshot,
+      analysis: await analyzeOverlayBlurScreenshot(
+        screenshotPath,
+        snapshot.viewport,
+        snapshot.probeRect,
+        snapshot.referenceRect,
+        snapshot.sampleRects
+      )
+    };
+  } finally {
+    await evaluate(client, `document.body.removeAttribute("data-overlay-blur-sampling")`).catch(() => undefined);
+  }
+}
+
+async function openRealPortalBlurProbe(client) {
+  await client.send("Page.bringToFront");
+  await pressKey(client, "Escape", "Escape", 27);
+  await waitForCompactPopoverState(client, null).catch(() => undefined);
+  await clickSelector(client, '[data-compact-popover-trigger="notifications"]');
+  await waitForCompactPopoverState(client, "notifications");
+  const placement = await evaluate(
+    client,
+    `(() => {
+      const surface = document.querySelector('#notifications-root');
+      const sampleImage = [...document.querySelectorAll('.media-tile .tile-thumb-image')].find((candidate) => {
+        const rect = candidate.getBoundingClientRect();
+        return rect.width > 80 && rect.height > 80 && rect.bottom > 0 && rect.right > 0 &&
+          rect.top < window.innerHeight && rect.left < window.innerWidth;
+      });
+      if (!(surface instanceof HTMLElement) || !(sampleImage instanceof HTMLImageElement)) return null;
+      const tileRect = sampleImage.getBoundingClientRect();
+      const width = 360;
+      const height = 220;
+      const left = Math.max(8, Math.min(tileRect.left, window.innerWidth - width - 8));
+      const top = Math.max(8, Math.min(tileRect.top, window.innerHeight - height - 8));
+      for (const [name, value] of Object.entries({
+        position: 'fixed',
+        left: left + 'px',
+        top: top + 'px',
+        right: 'auto',
+        bottom: 'auto',
+        width: width + 'px',
+        height: height + 'px',
+        'max-height': height + 'px',
+        transform: 'none'
+      })) surface.style.setProperty(name, value, 'important');
+      surface.setAttribute('data-real-portal-blur-probe', 'true');
+      let reference = document.querySelector('[data-real-portal-blur-reference="true"]');
+      if (!(reference instanceof HTMLElement)) {
+        reference = document.createElement('div');
+        reference.setAttribute('data-real-portal-blur-reference', 'true');
+        reference.setAttribute('aria-hidden', 'true');
+        document.body.append(reference);
+      }
+      Object.assign(reference.style, {
+        position: 'fixed',
+        left: Math.max(8, window.innerWidth - 200) + 'px',
+        top: Math.max(8, Math.min(top, window.innerHeight - 140)) + 'px',
+        width: '180px',
+        height: '120px',
+        pointerEvents: 'none',
+        zIndex: '1'
+      });
+      let style = document.querySelector('style[data-real-portal-blur-sampling-style="true"]');
+      if (!(style instanceof HTMLStyleElement)) {
+        style = document.createElement('style');
+        style.setAttribute('data-real-portal-blur-sampling-style', 'true');
+        style.textContent = [
+          '#notifications-root[data-real-portal-blur-probe="true"] { position: fixed !important; left: ' + left + 'px !important; top: ' + top + 'px !important; right: auto !important; bottom: auto !important; width: ' + width + 'px !important; height: ' + height + 'px !important; max-height: ' + height + 'px !important; transform: none !important; }',
+          'body[data-real-portal-blur-sampling="true"] #notifications-root { border-color: transparent !important; background: transparent !important; box-shadow: none !important; }',
+          'body[data-real-portal-blur-sampling="true"] #notifications-root::before, body[data-real-portal-blur-sampling="true"] #notifications-root::after { opacity: 0 !important; border: 0 !important; box-shadow: none !important; }',
+          'body[data-real-portal-blur-sampling="true"] #notifications-root > .liquid-glass-backdrop, body[data-real-portal-blur-sampling="true"] #notifications-root > .liquid-glass-lens, body[data-real-portal-blur-sampling="true"] #notifications-root > .liquid-glass-dither, body[data-real-portal-blur-sampling="true"] #notifications-root > .liquid-glass-edge, body[data-real-portal-blur-sampling="true"] #notifications-root > .overlay-scroll-viewport { opacity: 0 !important; }'
+        ].join('\\n');
+        document.head.append(style);
+      }
+      return { left, top, width, height };
+    })()`
+  );
+  if (!placement) throw new Error("real Library portal blur probe could not be positioned");
+  await waitFor(
+    client,
+    `(() => {
+      const surface = document.querySelector('#notifications-root');
+      if (!(surface instanceof HTMLElement)) return false;
+      const probe = surface.getBoundingClientRect();
+      const intersects = (element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.right > probe.left + 12 && rect.left < probe.right - 12 &&
+          rect.bottom > probe.top + 12 && rect.top < probe.bottom - 12;
+      };
+      const images = [...document.querySelectorAll('.media-tile .tile-thumb-image')]
+        .filter((image) => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0 && intersects(image));
+      const labels = [...document.querySelectorAll('.media-tile .tile-label')].filter(intersects);
+      return images.length >= 2 && labels.length >= 2;
+    })()`,
+    10000,
+    "real Library portal covers independent images and text"
+  );
+}
+
+async function waitForRealPortalBlurSettled(client, expectedSigma) {
+  const expected = Number(expectedSigma);
+  const deadline = Date.now() + 10000;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await evaluate(
+      client,
+      `(async () => {
+      const surface = document.querySelector('#notifications-root');
+      if (!(surface instanceof HTMLElement)) return { ok: false, reason: 'surface-missing' };
+      const read = () => {
+        const rect = surface.getBoundingClientRect();
+        return [rect.left, rect.top, rect.width, rect.height].map((value) => Math.round(value * 100) / 100);
+      };
+      const first = read();
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const second = read();
+      const root = document.querySelector('#root');
+      const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+      const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
+      const geometryStable = JSON.stringify(first) === JSON.stringify(second);
+      const graphMatches = ${expected} === 0
+        ? root?.getAttribute('data-overlay-regional-blur') !== 'active' && !filter
+        : root?.getAttribute('data-overlay-regional-blur') === 'active' &&
+        filter?.getAttribute('data-overlay-regional-full-target') === 'false' &&
+        filter?.getAttribute('data-overlay-regional-mask-count') === '1' &&
+        gaussian?.getAttribute('edgeMode') === 'duplicate' &&
+        Math.abs(Number(gaussian?.getAttribute('stdDeviation')) - ${expected}) <= 0.01;
+      return {
+        ok: geometryStable && graphMatches,
+        presence: surface.getAttribute('data-overlay-state'),
+        first,
+        second,
+        geometryStable,
+        rootActive: root?.getAttribute('data-overlay-regional-blur') ?? null,
+        inlineFilter: root instanceof HTMLElement ? root.style.filter : null,
+        filterPresent: Boolean(filter),
+        fullTarget: filter?.getAttribute('data-overlay-regional-full-target') ?? null,
+        maskCount: filter?.getAttribute('data-overlay-regional-mask-count') ?? null,
+        sigma: gaussian?.getAttribute('stdDeviation') ?? null,
+        computedDialogBlur: getComputedStyle(document.documentElement).getPropertyValue('--glass-dialog-blur').trim()
+      };
+    })()`
+    );
+    if (last?.ok) return last;
+    await delay(200);
+  }
+  throw new Error(
+    `Timed out waiting for real Library portal regional blur settled at sigma ${expected}; last=${JSON.stringify(last)}`
+  );
+}
+
+async function captureRealPortalBlurEvidence(client, name, expectedSigma) {
+  await waitForRealPortalBlurSettled(client, expectedSigma);
+  await evaluate(client, `document.body.setAttribute('data-real-portal-blur-sampling', 'true')`);
+  await delay(80);
+  const snapshot = await evaluate(
+    client,
+    `(() => {
+      const surface = document.querySelector('#notifications-root');
+      const reference = document.querySelector('[data-real-portal-blur-reference="true"]');
+      const child = surface?.querySelector(':scope > .liquid-glass-backdrop') ?? null;
+      const root = document.querySelector('#root');
+      const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+      const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
+      const saturation = filter?.querySelector('feColorMatrix[in="blurred"][type="saturate"]') ?? null;
+      if (!(surface instanceof HTMLElement) || !(reference instanceof HTMLElement)) return null;
+      const style = getComputedStyle(surface);
+      const childStyle = child ? getComputedStyle(child) : null;
+      const rect = (element) => {
+        const value = element.getBoundingClientRect();
+        return { left: value.left, top: value.top, width: value.width, height: value.height };
+      };
+      const probeRect = rect(surface);
+      const referenceRect = rect(reference);
+      const probeRight = probeRect.left + probeRect.width;
+      const probeBottom = probeRect.top + probeRect.height;
+      const referenceRight = referenceRect.left + referenceRect.width;
+      const referenceBottom = referenceRect.top + referenceRect.height;
+      const separationX = Math.max(0, Math.max(referenceRect.left - probeRight, probeRect.left - referenceRight));
+      const separationY = Math.max(0, Math.max(referenceRect.top - probeBottom, probeRect.top - referenceBottom));
+      const samples = [
+        ...[...document.querySelectorAll('.media-tile .tile-thumb-image')].map((element, index) => ({ element, kind: 'image', id: 'real-image-' + index })),
+        ...[...document.querySelectorAll('.media-tile .tile-label')].map((element, index) => ({ element, kind: 'text', id: 'real-text-' + index }))
+      ].filter(({ element }) => element instanceof HTMLElement);
+      return {
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        renderer: { devicePixelRatio: window.devicePixelRatio, visualViewportScale: window.visualViewport?.scale ?? null },
+        probeRect,
+        referenceRect,
+        referenceClearance: Math.hypot(separationX, separationY),
+        sampleRects: samples.map(({ element, kind, id }) => ({ kind, id, rect: rect(element) })),
+        regional: {
+          rootFiltered: root?.getAttribute('data-overlay-regional-blur') === 'active',
+          inlineFilter: root instanceof HTMLElement ? root.style.filter : '',
+          defsCount: document.querySelectorAll('svg[data-overlay-regional-blur-defs="true"]').length,
+          present: Boolean(filter),
+          id: filter?.id ?? null,
+          target: filter?.getAttribute('data-overlay-regional-blur-target') ?? null,
+          filterUnits: filter?.getAttribute('filterUnits') ?? null,
+          primitiveUnits: filter?.getAttribute('primitiveUnits') ?? null,
+          fullTarget: filter?.getAttribute('data-overlay-regional-full-target') ?? null,
+          maskCount: filter?.getAttribute('data-overlay-regional-mask-count') ?? null,
+          gaussian: gaussian ? { input: gaussian.getAttribute('in'), stdDeviation: gaussian.getAttribute('stdDeviation'), edgeMode: gaussian.getAttribute('edgeMode') } : null,
+          saturation: saturation ? { input: saturation.getAttribute('in'), type: saturation.getAttribute('type'), values: saturation.getAttribute('values') } : null
+        },
+        surface: {
+          backgroundImage: style.backgroundImage,
+          backdropFilter: style.backdropFilter,
+          webkitBackdropFilter: style.webkitBackdropFilter
+        },
+        child: {
+          present: Boolean(child),
+          backgroundColor: childStyle?.backgroundColor ?? null,
+          backgroundImage: childStyle?.backgroundImage ?? null,
+          backdropFilter: childStyle?.backdropFilter ?? null,
+          webkitBackdropFilter: childStyle?.webkitBackdropFilter ?? null
+        }
+      };
+    })()`
+  );
+  try {
+    if (!snapshot) throw new Error("real Library portal blur probe is missing");
+    const screenshotPath = await rendererScreenshot(client, name);
+    return {
+      screenshotPath,
+      ...snapshot,
+      analysis: await analyzeOverlayBlurScreenshot(
+        screenshotPath,
+        snapshot.viewport,
+        snapshot.probeRect,
+        snapshot.referenceRect,
+        snapshot.sampleRects
+      )
+    };
+  } finally {
+    await evaluate(client, `document.body.removeAttribute('data-real-portal-blur-sampling')`).catch(() => undefined);
+  }
+}
+
+async function closeRealPortalBlurProbe(client) {
+  await pressKey(client, "Escape", "Escape", 27);
+  await waitForCompactPopoverState(client, null);
+  await evaluate(
+    client,
+    `(() => {
+      document.querySelector('[data-real-portal-blur-reference="true"]')?.remove();
+      document.querySelector('style[data-real-portal-blur-sampling-style="true"]')?.remove();
+      document.body.removeAttribute('data-real-portal-blur-sampling');
+    })()`
+  );
+  await waitFor(
+    client,
+    `document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') !== 'active' &&
+      !document.querySelector('filter[data-overlay-regional-blur-target="app-root"]')`,
+    10000,
+    "real Library portal regional graph cleanup"
+  );
+}
+
+async function setRendererDialogBlurOverride(client, sigma) {
+  await evaluate(
+    client,
+    `document.documentElement.style.setProperty('--glass-dialog-blur', ${JSON.stringify(`${Number(sigma)}px`)})`
+  );
+  await waitFor(
+    client,
+    `Math.abs(parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--glass-dialog-blur')) - ${Number(sigma)}) <= 0.01`,
+    5000,
+    `renderer dialog blur override ${Number(sigma)}px`
+  );
+}
+
+async function restoreRendererDialogBlurOverride(client, previous) {
+  await evaluate(
+    client,
+    `(() => {
+      const root = document.documentElement;
+      const previous = ${JSON.stringify(previous)};
+      if (previous.value) root.style.setProperty('--glass-dialog-blur', previous.value, previous.priority);
+      else root.style.removeProperty('--glass-dialog-blur');
+    })()`
+  );
+}
+
 async function resizeScriptOpenedWindow(client, width, height) {
   await evaluate(
     client,
@@ -361,6 +997,52 @@ async function resizeScriptOpenedWindow(client, width, height) {
     client,
     `({ innerWidth: window.innerWidth, innerHeight: window.innerHeight, outerWidth: window.outerWidth, outerHeight: window.outerHeight })`
   );
+}
+
+async function setRendererDeviceScale(client, expected, dimensions, label) {
+  await client.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
+  await client.send("Emulation.setDeviceMetricsOverride", {
+    width: dimensions.width,
+    height: dimensions.height,
+    deviceScaleFactor: expected,
+    mobile: false,
+    screenWidth: dimensions.width,
+    screenHeight: dimensions.height
+  });
+  await client.send("Emulation.setVisibleSize", dimensions).catch(() => undefined);
+  const deadline = Date.now() + 10000;
+  let lastEvidence = null;
+  while (Date.now() < deadline) {
+    lastEvidence = await evaluate(
+      client,
+      `(() => ({
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+        visualViewportScale: window.visualViewport?.scale ?? null
+      }))()`
+    );
+    if (
+      near(lastEvidence.devicePixelRatio, expected, 0.02) &&
+      near(lastEvidence.innerWidth, dimensions.width, 1) &&
+      near(lastEvidence.innerHeight, dimensions.height, 1) &&
+      near(lastEvidence.visualViewportScale ?? 1, 1, 0.02)
+    ) {
+      return {
+        expected,
+        ...lastEvidence,
+        emulationMode: "device-scale-factor-only",
+        pageScaleFactor: 1
+      };
+    }
+    await delay(100);
+  }
+  throw new Error(`${label}; last=${JSON.stringify(lastEvidence)}`);
+}
+
+async function clearRendererDeviceScale(client) {
+  await client.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 }).catch(() => undefined);
+  await client.send("Emulation.clearDeviceMetricsOverride").catch(() => undefined);
 }
 
 async function captureWindowBackdropEvidence(client, name, layout) {
@@ -2139,6 +2821,9 @@ async function openAppearanceMatrixFixture(client) {
       document.querySelector('[data-appearance-surface="popover"]') &&
       document.querySelector('[data-appearance-surface="nested"]') &&
       document.querySelector('[data-appearance-surface="context"]') &&
+      document.querySelector('[data-appearance-blur-trigger="true"]') &&
+      [...document.querySelectorAll('[data-appearance-blur-sample="image"]')]
+        .every((image) => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0) &&
       document.querySelector('#appearance-matrix-modal.overlay-modal-surface'))`,
     10000,
     "overlay appearance production fixture"
@@ -2197,6 +2882,9 @@ function productionAppearanceEvidenceExpression(groupVariables) {
         }
       };
     };
+    const regionalFilter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+    const regionalGaussian = regionalFilter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
+    const regionalSaturation = regionalFilter?.querySelector('feColorMatrix[type="saturate"]') ?? null;
     return {
       side: {
         libraryNavigation: surface('[data-appearance-surface="library-navigation"]'),
@@ -2217,7 +2905,14 @@ function productionAppearanceEvidenceExpression(groupVariables) {
         nested: surface('[data-appearance-surface="nested"]'),
         context: surface('[data-appearance-surface="context"]'),
         modal: surface("#appearance-matrix-modal.overlay-modal-surface"),
-        modalBackdrop: surface(".overlay-modal-backdrop")
+        modalBackdrop: surface(".overlay-modal-backdrop"),
+        regional: {
+          present: Boolean(regionalFilter),
+          active: document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') === 'active',
+          blur: regionalGaussian?.getAttribute('stdDeviation') ?? 'none',
+          saturation: regionalSaturation?.getAttribute('values') ?? 'none',
+          fullTarget: regionalFilter?.getAttribute('data-overlay-regional-full-target') ?? null
+        }
       },
       shared: {
         notificationBody: surface('[data-appearance-surface="notification-body"]')
@@ -2349,7 +3044,7 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
           const background = parseColor(style?.backgroundColor);
           const backdropBackground = parseColor(backdropStyle?.backgroundColor);
           const foreground = parseColor(style?.color);
-          const readableBackground = backdropBackground.alpha > 0 ? backdropBackground : background;
+          const readableBackground = background;
           const contrastRatio = contrast(composite(foreground, readableBackground), readableBackground);
           return {
             present: Boolean(surface),
@@ -2366,7 +3061,7 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
               backdropFilter: backdropStyle?.backdropFilter ?? null,
               webkitBackdropFilter: backdropStyle?.webkitBackdropFilter ?? null
             },
-            opaque: background.alpha >= 0.95 || backdropBackground.alpha >= 0.95,
+            opaque: background.alpha >= 0.95,
             readable: contrastRatio >= 4.5
           };
         };
@@ -2520,19 +3215,16 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     "center-saturation": {
       required: [
         "center.centerSurface.mapped.glassSaturation",
-        "dialog.modal.effects.backdrop.saturation"
+        "dialog.regional.saturation"
       ],
       allowed: [
         "center.centerSurface.mapped.glassSaturation",
         "center.centerSurface.effects.backdrop.saturation",
         "dialog.popover.mapped.glassSaturation",
-        "dialog.popover.effects.backdrop.saturation",
         "dialog.nested.mapped.glassSaturation",
-        "dialog.nested.effects.backdrop.saturation",
         "dialog.context.mapped.glassSaturation",
-        "dialog.context.effects.backdrop.saturation",
         "dialog.modal.mapped.glassSaturation",
-        "dialog.modal.effects.backdrop.saturation"
+        "dialog.regional.saturation"
       ],
       stableGroups: ["side", "shared", "unaffected"]
     },
@@ -2565,10 +3257,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     },
     "dialog-blur": {
       required: [
-        "dialog.popover.effects.backdrop.blur",
-        "dialog.nested.effects.backdrop.blur",
-        "dialog.context.effects.backdrop.blur",
-        "dialog.modal.effects.backdrop.blur"
+        "dialog.regional.blur"
       ],
       allowed: ["dialog"],
       stableGroups: ["side", "center", "shared", "unaffected"]
@@ -2690,6 +3379,99 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
   };
   const matchesPrefix = (pathValue, prefix) =>
     pathValue === prefix || pathValue.startsWith(`${prefix}.`);
+  const sigmaFromState = (state) => Number.parseFloat(
+    state?.variables?.["--glass-dialog-blur"] ?? "NaN"
+  );
+  const regionalGraphMatches = (evidence, sigma) => {
+    const regional = evidence?.regional;
+    if (sigma === 0) {
+      return regional?.rootFiltered === false &&
+        regional?.present === false &&
+        regional?.fullTarget === null &&
+        regional?.gaussian === null &&
+        regional?.defsCount === 0 &&
+        !String(regional?.inlineFilter ?? "").includes("overlay-regional");
+    }
+    return regional?.rootFiltered === true &&
+      regional?.present === true &&
+      regional?.target === "app-root" &&
+      regional?.filterUnits === "userSpaceOnUse" &&
+      regional?.primitiveUnits === "userSpaceOnUse" &&
+      regional?.fullTarget === "false" &&
+      regional?.maskCount === "1" &&
+      regional?.gaussian?.input === "SourceGraphic" &&
+      regional?.gaussian?.edgeMode === "duplicate" &&
+      near(Number(regional?.gaussian?.stdDeviation), sigma, 0.01) &&
+      regional?.saturation?.input === "blurred" &&
+      regional?.saturation?.type === "saturate" &&
+      Number.isFinite(Number(regional?.saturation?.values)) &&
+      String(regional?.inlineFilter ?? "").includes(String(regional?.id ?? "__missing__"));
+  };
+  const evaluateBlurScaleTriplet = (scale, zero, configured, maximum, sigmas) => {
+    const referenceStability = {
+      zeroToConfigured: referencePixelDelta(zero.analysis, configured.analysis),
+      zeroToMaximum: referencePixelDelta(zero.analysis, maximum.analysis)
+    };
+    const zeroImages = zero.analysis.independentImages;
+    const configuredImages = configured.analysis.independentImages;
+    const maximumImages = maximum.analysis.independentImages;
+    const zeroText = zero.analysis.independentText;
+    const configuredText = configured.analysis.independentText;
+    const maximumText = maximum.analysis.independentText;
+    const evidence = [zero, configured, maximum];
+    const scaleMatches = evidence.every((entry) =>
+      near(entry.renderer?.devicePixelRatio, scale, 0.02) &&
+      near(entry.renderer?.visualViewportScale ?? 1, 1, 0.02) &&
+      near(entry.analysis?.inferredScale?.x, scale, 0.02) &&
+      near(entry.analysis?.inferredScale?.y, scale, 0.02)
+    );
+    const noElementBackdrop = evidence.every((entry) =>
+      noBackdropFilter(entry.surface?.backdropFilter) &&
+      noBackdropFilter(entry.surface?.webkitBackdropFilter) &&
+      noBackdropFilter(entry.child?.backdropFilter) &&
+      noBackdropFilter(entry.child?.webkitBackdropFilter)
+    );
+    const requiredClearance = sigmas.maximum * 3 + 32;
+    const passed =
+      scaleMatches &&
+      noElementBackdrop &&
+      regionalGraphMatches(zero, sigmas.zero) &&
+      regionalGraphMatches(configured, sigmas.configured) &&
+      regionalGraphMatches(maximum, sigmas.maximum) &&
+      zeroImages.rectCount >= 2 &&
+      zeroImages.boundarySamples >= 100 &&
+      zeroImages.interiorSamples >= 1000 &&
+      zeroImages.boundaryEdgeEnergy >= 2 &&
+      configuredImages.boundaryEdgeEnergy <= zeroImages.boundaryEdgeEnergy * 0.82 &&
+      configuredImages.interiorEdgeEnergy <= zeroImages.interiorEdgeEnergy * 0.82 &&
+      configuredImages.boundaryInteriorRatio <= 3 &&
+      maximumImages.boundaryInteriorRatio <= 3 &&
+      maximumImages.boundaryEdgeEnergy <= configuredImages.boundaryEdgeEnergy * 1.05 &&
+      maximumImages.interiorEdgeEnergy <= configuredImages.interiorEdgeEnergy * 1.05 &&
+      zeroText.rectCount >= 2 &&
+      zeroText.samples >= 100 &&
+      zeroText.edgeEnergy >= 1 &&
+      configuredText.edgeEnergy <= zeroText.edgeEnergy * 0.82 &&
+      maximumText.edgeEnergy <= configuredText.edgeEnergy * 1.05 &&
+      referenceStability.zeroToConfigured <= 1 &&
+      referenceStability.zeroToMaximum <= 1 &&
+      evidence.every((entry) => entry.referenceClearance >= requiredClearance);
+    for (const entry of evidence) {
+      const pixels = entry.analysis?.reference?.pixels ?? [];
+      entry.analysis.reference.pixelCount = pixels.length;
+      delete entry.analysis.reference.pixels;
+    }
+    return {
+      expectedScale: scale,
+      sigmas,
+      requiredReferenceClearance: requiredClearance,
+      zero,
+      default: configured,
+      maximum,
+      referenceStability,
+      passed
+    };
+  };
 
   try {
     const initial = await readState();
@@ -2699,6 +3481,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
       valueAtPath(initial.production, surfacePath)?.present === true
     ]));
     const matrix = {};
+    let blurPixels = null;
     for (const [group, ids] of Object.entries(groups)) {
       matrix[group] = {};
       for (const id of ids) {
@@ -2708,8 +3491,209 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
           continue;
         }
         const minState = await setSlider(id, initialSlider.min);
-        const defaultState = await setSlider(id, initialSlider.value);
-        const maxState = await setSlider(id, initialSlider.max);
+        let defaultState;
+        let maxState;
+        if (id === "dialog-blur") {
+          await evaluate(
+            appearanceClient,
+            `window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: false }))`
+          );
+          await waitFor(
+            appearanceClient,
+            `!document.querySelector("#appearance-matrix-modal")`,
+            5000,
+            "overlay blur probe modal exclusion"
+          );
+          const baselineDimensions = await evaluate(
+            appearanceClient,
+            `(() => {
+              document.querySelector('[data-appearance-blur-scene="true"]')?.scrollIntoView({ block: 'start' });
+              return { width: window.innerWidth, height: window.innerHeight };
+            })()`
+          );
+          await clickSelector(appearanceClient, '[data-appearance-blur-trigger="true"]');
+          await waitFor(
+            appearanceClient,
+            `Boolean(document.querySelector("#appearance-blur-popover")) &&
+              [...document.querySelectorAll('[data-appearance-blur-sample="image"]')]
+                .every((image) => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0)`,
+            5000,
+            "registered independent-image blur probe"
+          );
+          const scaleTriplets = {};
+          try {
+            for (const scaleEntry of [
+              { label: "100", value: 1 },
+              { label: "125", value: 1.25 },
+              { label: "150", value: 1.5 }
+            ]) {
+              await setRendererDeviceScale(
+                appearanceClient,
+                scaleEntry.value,
+                baselineDimensions,
+                `${scaleEntry.label} percent overlay device scale did not take effect`
+              );
+              const zeroState = await setSlider(id, initialSlider.min);
+              const zeroSigma = sigmaFromState(zeroState);
+              const zero = await captureOverlayBlurEvidence(
+                appearanceClient,
+                `ui-overlay-regional-blur-${scaleEntry.label}-zero.png`,
+                zeroSigma
+              );
+              const configuredState = await setSlider(id, initialSlider.value);
+              const configuredSigma = sigmaFromState(configuredState);
+              const configured = await captureOverlayBlurEvidence(
+                appearanceClient,
+                `ui-overlay-regional-blur-${scaleEntry.label}-default.png`,
+                configuredSigma
+              );
+              const maximumState = await setSlider(id, initialSlider.max);
+              const maximumSigma = sigmaFromState(maximumState);
+              const maximum = await captureOverlayBlurEvidence(
+                appearanceClient,
+                `ui-overlay-regional-blur-${scaleEntry.label}-maximum.png`,
+                maximumSigma
+              );
+              scaleTriplets[scaleEntry.label] = evaluateBlurScaleTriplet(
+                scaleEntry.value,
+                zero,
+                configured,
+                maximum,
+                { zero: zeroSigma, configured: configuredSigma, maximum: maximumSigma }
+              );
+            }
+          } finally {
+            await clearRendererDeviceScale(appearanceClient);
+          }
+          await pressKey(appearanceClient, "Escape", "Escape", 27);
+          await waitFor(
+            appearanceClient,
+            `!document.querySelector("#appearance-blur-popover") &&
+              document.activeElement?.matches('[data-appearance-blur-trigger="true"]') === true &&
+              document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') !== 'active' &&
+              !document.querySelector('filter[data-overlay-regional-blur-target="app-root"]')`,
+            10000,
+            "overlay blur probe dismiss focus and graph cleanup"
+          );
+          await evaluate(
+            appearanceClient,
+            `window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: true }))`
+          );
+          await waitFor(
+            appearanceClient,
+            `Boolean(document.querySelector("#appearance-matrix-modal"))`,
+            5000,
+            "overlay blur probe modal restoration"
+          );
+          const modalScales = {};
+          try {
+            for (const scaleEntry of [
+              { label: "100", value: 1 },
+              { label: "125", value: 1.25 },
+              { label: "150", value: 1.5 }
+            ]) {
+              await setRendererDeviceScale(
+                appearanceClient,
+                scaleEntry.value,
+                baselineDimensions,
+                `${scaleEntry.label} percent modal device scale did not take effect`
+              );
+              const modalState = await setSlider(id, initialSlider.value);
+              const modalDialog = modalState.production.dialog;
+              const renderer = await evaluate(
+                appearanceClient,
+                `({ devicePixelRatio: window.devicePixelRatio, visualViewportScale: window.visualViewport?.scale ?? null })`
+              );
+              const screenshotPath = await rendererScreenshot(
+                appearanceClient,
+                `ui-overlay-regional-modal-${scaleEntry.label}.png`
+              );
+              modalScales[scaleEntry.label] = {
+                screenshotPath,
+                renderer,
+                dialog: modalDialog,
+                passed: near(renderer.devicePixelRatio, scaleEntry.value, 0.02) &&
+                  near(renderer.visualViewportScale ?? 1, 1, 0.02) &&
+                  modalDialog?.regional?.present === true &&
+                  modalDialog?.regional?.active === true &&
+                  near(Number(modalDialog?.regional?.blur), sigmaFromState(modalState), 0.01) &&
+                  modalDialog?.regional?.fullTarget === "true" &&
+                  modalDialog?.modal?.effects?.elementBackdrop?.blur === "none" &&
+                  modalDialog?.modal?.effects?.backdrop?.blur === "none" &&
+                  modalDialog?.modalBackdrop?.effects?.elementBackdrop?.blur === "none"
+              };
+            }
+          } finally {
+            await clearRendererDeviceScale(appearanceClient);
+          }
+          let realPortal = null;
+          const previousRealPortalBlur = await evaluate(
+            mainClient,
+            `(() => ({
+              value: document.documentElement.style.getPropertyValue('--glass-dialog-blur'),
+              priority: document.documentElement.style.getPropertyPriority('--glass-dialog-blur')
+            }))()`
+          );
+          try {
+            const realZeroState = await setSlider(id, initialSlider.min);
+            const realZeroSigma = sigmaFromState(realZeroState);
+            await setRendererDialogBlurOverride(mainClient, realZeroSigma);
+            await openRealPortalBlurProbe(mainClient);
+            const realZero = await captureRealPortalBlurEvidence(
+              mainClient,
+              "ui-real-portal-regional-zero.png",
+              realZeroSigma
+            );
+            await closeRealPortalBlurProbe(mainClient);
+            const realConfiguredState = await setSlider(id, initialSlider.value);
+            const realConfiguredSigma = sigmaFromState(realConfiguredState);
+            await setRendererDialogBlurOverride(mainClient, realConfiguredSigma);
+            await openRealPortalBlurProbe(mainClient);
+            const realConfigured = await captureRealPortalBlurEvidence(
+              mainClient,
+              "ui-real-portal-regional-default.png",
+              realConfiguredSigma
+            );
+            await closeRealPortalBlurProbe(mainClient);
+            const realMaximumState = await setSlider(id, initialSlider.max);
+            const realMaximumSigma = sigmaFromState(realMaximumState);
+            await setRendererDialogBlurOverride(mainClient, realMaximumSigma);
+            await openRealPortalBlurProbe(mainClient);
+            const realMaximum = await captureRealPortalBlurEvidence(
+              mainClient,
+              "ui-real-portal-regional-maximum.png",
+              realMaximumSigma
+            );
+            await closeRealPortalBlurProbe(mainClient);
+            realPortal = evaluateBlurScaleTriplet(
+              realZero.renderer.devicePixelRatio,
+              realZero,
+              realConfigured,
+              realMaximum,
+              {
+                zero: realZeroSigma,
+                configured: realConfiguredSigma,
+                maximum: realMaximumSigma
+              }
+            );
+          } finally {
+            await closeRealPortalBlurProbe(mainClient).catch(() => undefined);
+            await restoreRendererDialogBlurOverride(mainClient, previousRealPortalBlur).catch(() => undefined);
+          }
+          defaultState = await setSlider(id, initialSlider.value);
+          maxState = await setSlider(id, initialSlider.max);
+          blurPixels = {
+            scales: scaleTriplets,
+            modalScales,
+            realPortal,
+            passed: ["100", "125", "150"].every((label) =>
+              scaleTriplets[label]?.passed === true && modalScales[label]?.passed === true
+            ) && realPortal?.passed === true
+          };
+        } else {
+          defaultState = await setSlider(id, initialSlider.value);
+          maxState = await setSlider(id, initialSlider.max);
+        }
         const finalState = await setSlider(id, initialSlider.value);
         const expectation = expectations[id];
         const changedPaths = changedLeafPaths(minState.production, maxState.production);
@@ -2768,6 +3752,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
         networkProblems: appearanceFixture.networkProblems
       },
       solidFallback,
+      blurPixels,
       initial,
       matrix,
       final: await readState()
@@ -3711,6 +4696,8 @@ function settingsInterfaceStyleEvidenceExpression() {
 function glassMaterialEvidenceExpression() {
   return `(() => {
     const root = getComputedStyle(document.documentElement);
+    const regionalFilter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+    const regionalGaussian = regionalFilter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
     const surface = (selector) => {
       const element = document.querySelector(selector);
       const style = element ? getComputedStyle(element) : null;
@@ -3723,6 +4710,8 @@ function glassMaterialEvidenceExpression() {
         backgroundImage: style?.backgroundImage ?? null,
         backdropLayerPresent: Boolean(backdrop),
         position: style?.position ?? null,
+        surfaceBackdropFilter: style?.backdropFilter ?? null,
+        surfaceWebkitBackdropFilter: style?.webkitBackdropFilter ?? null,
         backdropFilter: backdropStyle?.backdropFilter ?? null,
         webkitBackdropFilter: backdropStyle?.webkitBackdropFilter ?? null,
         glassBlurCurrent: style?.getPropertyValue("--glass-blur-current").trim() ?? null,
@@ -3748,6 +4737,12 @@ function glassMaterialEvidenceExpression() {
         centerBlur: root.getPropertyValue("--glass-center-blur").trim(),
         dialogBlur: root.getPropertyValue("--glass-dialog-blur").trim(),
         dialogBackdropDim: root.getPropertyValue("--dialog-backdrop-dim").trim()
+      },
+      regional: {
+        present: Boolean(regionalFilter),
+        active: document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') === 'active',
+        blur: regionalGaussian?.getAttribute('stdDeviation') ?? 'none',
+        fullTarget: regionalFilter?.getAttribute('data-overlay-regional-full-target') ?? null
       },
       surfaces: {
         titlebarLeft: surface(".workbench-column-left"),
@@ -3918,6 +4913,9 @@ function compactPopoverEvidenceExpression() {
     const legacyButtons = [...document.querySelectorAll('[data-titlebar-control="tasks-palette"], [data-titlebar-control="recent-operations"]')];
     const notificationButton = notificationButtons[0] ?? null;
     const anchorRect = notificationButton?.getBoundingClientRect() ?? null;
+    const regionalFilter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+    const regionalGaussian = regionalFilter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
+    const regionalSaturation = regionalFilter?.querySelector('feColorMatrix[in="blurred"][type="saturate"]') ?? null;
     const roots = [...document.querySelectorAll("#notifications-root, #filter-root, #sort-root")].map((element) => {
       const style = getComputedStyle(element);
       const backdrop = element.querySelector(".liquid-glass-backdrop");
@@ -3955,6 +4953,8 @@ function compactPopoverEvidenceExpression() {
         backgroundColor: style.backgroundColor,
         backgroundImage: style.backgroundImage,
         backdropLayerPresent: Boolean(backdrop),
+        surfaceBackdropFilter: style.backdropFilter,
+        surfaceWebkitBackdropFilter: style.webkitBackdropFilter,
         backdropFilter: backdropStyle?.backdropFilter ?? null,
         webkitBackdropFilter: backdropStyle?.webkitBackdropFilter ?? null,
         boxShadow: style.boxShadow,
@@ -4017,6 +5017,13 @@ function compactPopoverEvidenceExpression() {
       count: roots.length,
       names: roots.map((root) => root.name),
       roots,
+      regional: {
+        present: Boolean(regionalFilter),
+        active: document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') === 'active',
+        blur: regionalGaussian?.getAttribute('stdDeviation') ?? 'none',
+        saturation: regionalSaturation?.getAttribute('values') ?? 'none',
+        fullTarget: regionalFilter?.getAttribute('data-overlay-regional-full-target') ?? null
+      },
       titlebar: {
         notificationButtonCount: notificationButtons.length,
         legacyButtonCount: legacyButtons.length,
@@ -4169,6 +5176,29 @@ function transparent(value) {
 
 function noBackdropFilter(value) {
   return !value || value === "none";
+}
+
+function regionalGraphMatchesForSummary(evidence, sigma) {
+  const regional = evidence?.regional;
+  if (Number(sigma) === 0) {
+    return regional?.rootFiltered === false &&
+      regional?.present === false &&
+      regional?.fullTarget === null &&
+      regional?.gaussian === null &&
+      regional?.defsCount === 0;
+  }
+  return regional?.rootFiltered === true &&
+    regional?.present === true &&
+    regional?.target === "app-root" &&
+    regional?.filterUnits === "userSpaceOnUse" &&
+    regional?.primitiveUnits === "userSpaceOnUse" &&
+    regional?.fullTarget === "false" &&
+    regional?.maskCount === "1" &&
+    regional?.gaussian?.input === "SourceGraphic" &&
+    regional?.gaussian?.edgeMode === "duplicate" &&
+    near(Number(regional?.gaussian?.stdDeviation), Number(sigma), 0.01) &&
+    regional?.saturation?.input === "blurred" &&
+    regional?.saturation?.type === "saturate";
 }
 
 function positiveCssNumber(value) {
@@ -5126,14 +6156,30 @@ try {
     const maxBlurSurface = maxBlurDialogMaterial?.[surfaceName];
     if (
       !surface?.present ||
-      !transparent(surface.effects?.backgroundColor) ||
-      surface.effects?.backgroundImage !== "none" ||
+      !String(surface.effects?.backgroundImage).includes("linear-gradient") ||
+      surface.effects?.elementBackdrop?.blur !== "none" ||
+      surface.effects?.elementBackdrop?.saturation !== "none" ||
       surface.effects?.backdrop?.present !== true ||
-      !String(surface.effects?.backdrop?.backgroundImage).includes("linear-gradient") ||
-      !positiveCssNumber(maxBlurSurface?.effects?.backdrop?.blur)
+      !transparent(surface.effects?.backdrop?.backgroundColor) ||
+      surface.effects?.backdrop?.backgroundImage !== "none" ||
+      surface.effects?.backdrop?.blur !== "none" ||
+      surface.effects?.backdrop?.saturation !== "none" ||
+      maxBlurSurface?.effects?.elementBackdrop?.blur !== "none"
     ) {
-      hardFailures.push(`production ${surfaceName} overlay does not use one transparent-outer frosted backdrop`);
+      hardFailures.push(`production ${surfaceName} overlay does not use the regional dialog material`);
     }
+  }
+  if (
+    dialogMaterial?.regional?.present !== true ||
+    dialogMaterial?.regional?.active !== true ||
+    dialogMaterial.regional.blur !== "34" ||
+    dialogMaterial.regional.fullTarget !== "true" ||
+    maxBlurDialogMaterial?.regional?.present !== true ||
+    maxBlurDialogMaterial?.regional?.active !== true ||
+    maxBlurDialogMaterial.regional.blur !== "68" ||
+    maxBlurDialogMaterial.regional.fullTarget !== "true"
+  ) {
+    hardFailures.push("production modal stack does not own the expected regional Gaussian blur");
   }
   if (
     !dialogMaterial?.modalBackdrop?.present ||
@@ -5159,6 +6205,7 @@ try {
     hardFailures.push("Settings appearance matrix fixture emitted console or network errors");
   }
   const solidFallback = appearanceMatrix?.solidFallback;
+  const blurPixels = appearanceMatrix?.blurPixels;
   const fallbackSurfaces = Object.values(solidFallback?.styles?.surfaces ?? {});
   const fallbackKeyboard = Object.values(solidFallback?.keyboard ?? {});
   if (
@@ -5167,8 +6214,8 @@ try {
     fallbackSurfaces.length !== 4 ||
     fallbackSurfaces.some((surface) =>
       !surface.present || !surface.opaque || !surface.readable ||
-      surface.backgroundAlpha > 0.01 ||
-      surface.backdrop?.backgroundAlpha < 0.95 ||
+      surface.backgroundAlpha < 0.95 ||
+      surface.backdrop?.backgroundAlpha > 0.01 ||
       !noBackdropFilter(surface.backdrop?.backdropFilter) ||
       !noBackdropFilter(surface.backdrop?.webkitBackdropFilter)
     ) ||
@@ -5179,6 +6226,51 @@ try {
     fallbackKeyboard.some((probe) => !probe.focused || !probe.activated)
   ) {
     hardFailures.push("production overlay solid fallback is not opaque, readable, keyboard accessible, and usable");
+  }
+  const blurScaleLabels = ["100", "125", "150"];
+  if (!blurPixels?.passed) {
+    hardFailures.push("overlay blur pixel probe did not pass every renderer DPI scale");
+  }
+  for (const label of blurScaleLabels) {
+    const scale = blurPixels?.scales?.[label];
+    const modalScale = blurPixels?.modalScales?.[label];
+    if (
+      !scale?.passed ||
+      !scale.zero?.screenshotPath ||
+      !scale.default?.screenshotPath ||
+      !scale.maximum?.screenshotPath ||
+      scale.zero?.analysis?.independentImages?.rectCount < 2 ||
+      scale.zero?.analysis?.independentText?.rectCount < 2 ||
+      !regionalGraphMatchesForSummary(scale.zero, 0) ||
+      !regionalGraphMatchesForSummary(scale.default, scale.sigmas?.configured) ||
+      !regionalGraphMatchesForSummary(scale.maximum, scale.sigmas?.maximum)
+    ) {
+      hardFailures.push(`overlay blur pixel probe did not prove regional image and text blur at ${label}%`);
+    }
+    if (
+      !modalScale?.passed ||
+      !modalScale.screenshotPath ||
+      modalScale.dialog?.regional?.present !== true ||
+      modalScale.dialog?.regional?.active !== true ||
+      modalScale.dialog?.regional?.fullTarget !== "true" ||
+      !(Number(modalScale.dialog?.regional?.blur) > 0)
+    ) {
+      hardFailures.push(`production modal did not preserve full-root regional blur at ${label}%`);
+    }
+  }
+  const realPortal = blurPixels?.realPortal;
+  if (
+    !realPortal?.passed ||
+    !realPortal.zero?.screenshotPath ||
+    !realPortal.default?.screenshotPath ||
+    !realPortal.maximum?.screenshotPath ||
+    realPortal.zero?.analysis?.independentImages?.rectCount < 2 ||
+    realPortal.zero?.analysis?.independentText?.rectCount < 2 ||
+    !regionalGraphMatchesForSummary(realPortal.zero, 0) ||
+    !regionalGraphMatchesForSummary(realPortal.default, realPortal.sigmas?.configured) ||
+    !regionalGraphMatchesForSummary(realPortal.maximum, realPortal.sigmas?.maximum)
+  ) {
+    hardFailures.push("real Library portal did not prove flattened image and text blur");
   }
   for (const [group, ids] of Object.entries(appearanceMatrix?.groups ?? {})) {
     for (const id of ids) {
@@ -5233,8 +6325,19 @@ try {
     }
   }
   const popoverSurface = summary.evidence.settingsInterfaceStyle.materialAfter?.surfaces?.popover;
-  if (!popoverSurface?.present || !effectiveBlurFilter(popoverSurface.backdropFilter)) {
-    hardFailures.push("floating popover does not use an effective frosted blur surface");
+  const popoverRegional = summary.evidence.settingsInterfaceStyle.materialAfter?.regional;
+  if (
+    !popoverSurface?.present ||
+    !noBackdropFilter(popoverSurface.surfaceBackdropFilter) ||
+    !noBackdropFilter(popoverSurface.surfaceWebkitBackdropFilter) ||
+    !noBackdropFilter(popoverSurface.backdropFilter) ||
+    !noBackdropFilter(popoverSurface.webkitBackdropFilter) ||
+    popoverRegional?.present !== true ||
+    popoverRegional?.active !== true ||
+    !(Number(popoverRegional?.blur) > 0) ||
+    popoverRegional?.fullTarget !== "false"
+  ) {
+    hardFailures.push("floating popover does not use the regional frosted blur graph");
   }
   for (const value of Object.values(summary.evidence.settingsInterfaceStyle.materialAfter?.rootBackgrounds ?? {})) {
     if (!transparent(value)) hardFailures.push("root backgrounds changed away from transparent after blur slider update");
@@ -5258,8 +6361,24 @@ try {
     if (JSON.stringify(step.evidence.names) !== JSON.stringify(expectedNames)) {
       hardFailures.push(`compact popover state mismatch after ${step.action}`);
     }
+    if (
+      step.evidence.count === 0 &&
+      (step.evidence.regional?.present === true || step.evidence.regional?.active === true)
+    ) {
+      hardFailures.push(`regional compact-popover graph remained active after ${step.action}`);
+    }
     for (const root of step.evidence.roots) {
-      if (!root.floating || !effectiveBlurFilter(root.backdropFilter)) {
+      if (
+        !root.floating ||
+        !noBackdropFilter(root.surfaceBackdropFilter) ||
+        !noBackdropFilter(root.surfaceWebkitBackdropFilter) ||
+        !noBackdropFilter(root.backdropFilter) ||
+        !noBackdropFilter(root.webkitBackdropFilter) ||
+        step.evidence.regional?.present !== true ||
+        step.evidence.regional?.active !== true ||
+        !(Number(step.evidence.regional?.blur) > 0) ||
+        step.evidence.regional?.fullTarget !== "false"
+      ) {
         hardFailures.push(`${root.name} compact popover is not floating glass material`);
       }
       if (root.notification) {
@@ -5412,10 +6531,8 @@ try {
   ) {
     hardFailures.push("reduced-transparency emulation did not match the notification fixture");
   } else if (
-    !transparent(preferenceFixture.reducedTransparency.reducedTransparency.backgroundColor) ||
-    cssColorAlpha(
-      preferenceFixture.reducedTransparency.reducedTransparency.directBackdropBackgroundColor
-    ) < 0.95 ||
+    cssColorAlpha(preferenceFixture.reducedTransparency.reducedTransparency.backgroundColor) < 0.95 ||
+    !transparent(preferenceFixture.reducedTransparency.reducedTransparency.directBackdropBackgroundColor) ||
     !preferenceFixture.reducedTransparency.reducedTransparency.allBackdropFilters?.length ||
     preferenceFixture.reducedTransparency.reducedTransparency.allBackdropFilters.some(
       (entry) =>

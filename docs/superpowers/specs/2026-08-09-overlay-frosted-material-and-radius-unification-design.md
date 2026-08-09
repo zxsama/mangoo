@@ -1,6 +1,6 @@
 # Overlay Frosted Material and Radius Unification Design
 
-**Status:** Revised after physical-window validation on 2026-08-10; written revision pending user review
+**Status:** Implemented; automated real-window and 100%/125%/150% renderer verification green on 2026-08-10; physical-monitor confirmation pending
 
 ## 1. Goal
 
@@ -19,11 +19,15 @@ This document supersedes the independent `surfaceCornerRadius` and `controlCorne
 
 ## 3. Root Cause
 
-The first implementation removed duplicate dark fills, but physical-window validation showed that its blur owner was still wrong. `OverlaySurface` placed `backdrop-filter` on a direct `.liquid-glass-backdrop` child. That child sits inside a `LiquidGlassSurface`, while root, nested, and modal opening animations temporarily apply `opacity < 1` to the surface or one of its ancestors. Under the CSS Backdrop Root rules, an ancestor with partial opacity bounds the pixels available to descendant backdrop filters. The child can therefore receive an empty transparent intermediate surface even though its computed `backdrop-filter` reports `blur(34px)`.
+The first revision fixed duplicate fills and moved `backdrop-filter` to the portal-mounted surface. That made the blur property active, but a real-window probe exposed a second, independent compositor failure that the patterned fixture did not model.
 
-Computed-style evidence was insufficient because it proved only that Chromium accepted the property, not that the filtered input contained application pixels. The previous fixture also lacked a high-frequency background that would make successful blur measurable.
+The CSS Filter Effects model requires a backdrop to be painted in order, flattened into one 2D screen-space buffer, and only then filtered. Electron 43/Chromium does not produce that unified input for the current real Library scene. Replaced `<img>` elements, clipped thumbnail boxes, and text paint/compositor chunks retain their individual box boundaries. Fine detail inside each box is blurred, but the box edges and text silhouettes are composited back as distinct boundaries. Raising the declared blur from `34px` to `52px` does not correct the missing flattening step.
 
-The Settings window is not evidence that the child-backdrop topology works. Settings is a separate Electron `BrowserWindow` with native Windows acrylic applied to the whole window. Its right content pane only paints the lighter 108-degree translucent gradient over that already-blurred native material. Renderer popups remain DOM elements in the main window, so they need in-app acrylic: the popup element itself must sample already-painted application content with CSS `backdrop-filter`.
+The real notification-popover crop measured the defect directly. At the default `34px`, mean thumbnail-boundary gradient was `11.194` while interior texture gradient was `0.818`, a boundary/interior ratio of `13.69`. At `52px` the boundary remained `12.433`. In contrast, applying an ordinary `filter: blur(34px)` to the common grid ancestor first flattened its complete `SourceGraphic`; boundary gradient fell to `0.296`, text and rounded image edges became unreadable, and the ratio fell to `1.55`.
+
+Full-viewport `backdrop-filter`, overscan, moving the property between the surface and its child, removing isolation and outer clips, `translateZ(0)`, `will-change`, near-identity filters, and disabling thumbnail fade animation were all falsified in the same real scene. The old fixture looked correct because its checkerboard and repeated text were primarily one CSS background paint layer. Computed style and a single-layer fixture therefore cannot be completion evidence.
+
+Settings remains a separate Electron `BrowserWindow` whose native Windows acrylic operates on a unified window surface. Renderer overlays stay DOM overlays, but they must reproduce the same ordering explicitly: flatten the already-painted renderer scene with an ordinary SVG filter on the common content ancestor, create the Gaussian-blurred result from that `SourceGraphic`, and composite the blurred result only inside active overlay regions. No screenshot capture or native child popup window is required.
 
 ## 4. Radius Model
 
@@ -67,32 +71,46 @@ linear-gradient(
 )
 ```
 
-## 6. One Material Layer per Visual Depth
+## 6. Regional Flatten-Then-Blur Material
 
 ### 6.1 Root and nested popups
 
-The portal-mounted `.overlay-surface` element is the only in-app acrylic owner. It paints the dialog gradient and applies `blur(var(--glass-dialog-blur)) saturate(var(--glass-center-saturation))` to its own backdrop. Its direct `.liquid-glass-backdrop` child is transparent and has no backdrop filter, so the generic Liquid Glass DOM structure cannot introduce a nested filtering pass.
+`OverlayProvider` owns one regional-blur controller for the main renderer. It consumes the already-authoritative ordered `OverlayLayerRegistration[]`; feature overlays do not implement material capture themselves.
 
-Root and nested popup opacity/transform motion may remain on the surface itself. The filtered backdrop is produced by that same element before the element's final opacity is composited; there is no partially opaque ancestor between the portal target and the blur owner. Feature classes such as `.context-menu`, `.library-switcher`, and their headers, lists, footers, or confirmation surfaces may lay out and separate content, but must not repaint sidebar or dialog material.
+For every visible root or nested overlay, the controller reads the surface border box and computed radius in CSS pixels. It applies an SVG filter to `#root` with the following fixed pipeline:
+
+1. use the target's complete `SourceGraphic`, which forces the renderer content into one offscreen image;
+2. run `feGaussianBlur` with `stdDeviation` equal to `--glass-dialog-blur` and `edgeMode="duplicate"`;
+3. apply the current `--glass-center-saturation` to the blurred result;
+4. build each rounded alpha mask synchronously inside the filter graph from `feFlood`, a small mask-only Gaussian, and an alpha-threshold `feComponentTransfer`;
+5. merge the blurred image inside that mask with the untouched `SourceGraphic` outside it.
+
+The Gaussian primitive subregion is the union of active masks expanded by `3 * stdDeviation` and clipped to the target bounds. The common source still flattens as one image, but the expensive blur kernel does not run across unrelated viewport pixels. Filter and primitive units are `userSpaceOnUse`, so geometry remains in CSS pixels at 100%, 125%, and 150% display scale.
+
+Nested overlays preserve visual depth. `#root` receives masks for every active overlay. Each lower overlay surface receives a separate regional filter only for intersections with layers above it; the top surface remains unfiltered and sharp. This makes a nested menu blur both the application and the root popup beneath it without blurring its own content.
+
+The portal-mounted `.overlay-surface` paints only the approved 108-degree dialog gradient, border, dither, and elevation. Both of its backdrop-filter declarations are `none`, and its direct `.liquid-glass-backdrop` child stays transparent and unfiltered. Feature classes such as `.context-menu`, `.library-switcher`, and their headers, lists, footers, or confirmation surfaces may lay out and separate content, but must not repaint sidebar or dialog material.
+
+Stack changes and direct surface/root mutations rebuild the self-contained filter graph synchronously during the same layout or mutation phase, so a removed modal/nested mask cannot survive into the next painted frame. Window resize and captured scroll are event-driven and coalesced into one animation frame. The graph has no `feImage`, data URL, or image-decode dependency. Closing the final layer removes generated SVG definitions and restores every target's prior inline `filter` value.
 
 ### 6.2 Modal dialogs
 
-`.overlay-modal-backdrop` remains transparent and has no backdrop filter. It owns only viewport layout and pointer capture; it must not animate opacity because that would create a transient Backdrop Root above the dialog. Modal entrance/exit motion stays on `.overlay-modal-surface` itself.
+`.overlay-modal-backdrop` remains transparent and unfiltered. It owns only viewport layout and pointer capture; it must not animate opacity. Modal entrance/exit motion stays on `.overlay-modal-surface` itself.
 
-The modal surface itself owns the same right-content gradient and one `--glass-dialog-blur` pass as a normal popup. Its direct `.liquid-glass-backdrop` is inert. This keeps the blur area bounded to the dialog instead of expanding the dialog slider's default 34px and maximum 68px radius across the full viewport. Rename, Move To, library removal confirmation, and all other `ModalSurface` consumers inherit this topology without feature JSX changes.
+A modal registration changes the regional mask to the full viewport for every lower target. Rename, Move To, library removal confirmation, and all other `ModalSurface` consumers therefore receive one uniform, live blur of the complete renderer scene behind the modal, while the dialog itself stays sharp and paints the same right-content gradient as a normal popup. The modal surface and its direct backdrop child have no backdrop filter.
 
-The outside-only dim is implemented with a spread shadow on `.overlay-modal-surface`, equivalent to `0 0 0 100vmax var(--dialog-backdrop-dim)`, followed by the normal glass elevation shadow. A full-screen filtered pseudo-element, mask, or dark background beneath the translucent dialog is not permitted because it would either reintroduce a second blur plane or contaminate the dialog material.
+The outside-only dim remains a spread shadow on `.overlay-modal-surface`, equivalent to `0 0 0 100vmax var(--dialog-backdrop-dim)`, followed by the normal glass elevation shadow. The dim is composited above the one regionally blurred content image and never becomes another blur owner.
 
 ### 6.3 Reduced-transparency and unsupported-filter fallback
 
-The modal viewport container remains transparent in every mode. When transparency is reduced, unsupported, or force-disabled by the visual harness, the overlay surface itself becomes `rgba(18, 24, 30, 0.98)` and its backdrop filter becomes `none`; the direct backdrop child remains inert. The outside-only modal dim shadow remains available for hierarchy, while no blur is attempted.
+The modal viewport remains transparent in every mode. When transparency is reduced, the SVG filter path is unavailable, `--glass-dialog-blur` is zero, or fallback is force-enabled by the visual harness, the controller removes all target filters. The overlay surface itself becomes `rgba(18, 24, 30, 0.98)` for fallback modes; the direct backdrop child remains inert. The outside-only modal dim remains available for hierarchy.
 
 ## 7. Preserved Behavior
 
 - Overlay stack ownership, focus trapping, Escape/outside-pointer dismissal, portals, and z-index levels remain unchanged. Root/nested and modal-surface motion remain; only the modal viewport opacity animation is removed.
 - The global pointer-highlight system remains the only hover system.
-- Settings and Plugins keep native Windows acrylic; no Electron window lifecycle changes are required.
-- Media grids, preview canvases, Core APIs, and filesystem operations are outside this change.
+- Settings and Plugins keep native Windows acrylic; no Electron window lifecycle or capture IPC is added.
+- Media grids and preview canvases are only transient `SourceGraphic` inputs while an overlay is open; their layout, interaction, data, Core APIs, and filesystem operations do not change.
 
 ## 8. Verification Contract
 
@@ -106,10 +124,17 @@ Automated coverage must prove:
 - representative Settings panel and control elements report `0px`, `8px`, and `16px` computed radii when the combined slider is exercised;
 - dialog pane colors follow the declared light/mid/end derivation and become transparent when dialog opacity or strength is zero;
 - feature-specific inner surfaces do not repaint dialog or sidebar material;
-- a normal popup surface is the sole gradient and blur owner, while its direct backdrop child is transparent and unfiltered;
-- a modal viewport has no fill, filter, or opacity animation; its modal surface is the sole blur owner, and its dim shadow does not paint inside the dialog border;
+- a normal popup surface is the sole gradient owner and has no backdrop filter, while its direct backdrop child is transparent and unfiltered;
+- the provider builds one root regional filter from the ordered overlay stack, using `SourceGraphic`, Gaussian blur, saturation, rounded masks, and untouched output outside each mask;
+- the rounded mask graph is synchronous, does not decode an image resource, follows stack pops and geometry changes before the next painted frame, and does not hide a focusable modal surface while focus is assigned;
+- a nested layer adds its rounded mask to the app root and applies only its intersection mask to every lower overlay surface;
+- a modal viewport has no fill, filter, or opacity animation; a modal registration expands lower-target masks to the full viewport, and its dim shadow does not paint inside the dialog border;
 - the modal center remains within the same luminance family as a normal popup and preserves visibly blurred background texture instead of collapsing to a flat dark fill;
 - solid fallback is opaque on the overlay surface and disables every filter without reactivating the direct backdrop child;
-- a deterministic visual fixture places a high-frequency checkerboard and fine text behind the popup, captures zero-blur and configured-blur states, and verifies that edge energy inside the popup decreases while the outside reference crop remains stable.
+- a deterministic visual fixture places independent replaced `<img>` elements, rounded clips, gaps, and fine text behind a real registered popup; zero/default/maximum captures verify that both interior texture and element-boundary gradients decrease, the boundary/interior ratio no longer exposes box edges, and an outside reference crop remains stable;
+- a real Library portal-popover crop repeats the same boundary measurement so a single-layer fixture cannot hide a compositor regression;
+- generated filter definitions and inline target filters are removed after the final overlay closes, reduced-transparency/fallback disables them, and the maximum blur path does not leak observers or animation frames.
 
-Required final checks are the focused interface/overlay tests, `npm run check:ui-design`, `npm run check:web`, `npm run check:desktop`, `npm test`, and the OS-backdrop desktop visual harness. The harness must exercise zero, default, and maximum dialog blur against the patterned fixture, report a real pixel-level blur delta, and show no interaction timeout or material-topology regression. The new build must be checked at 100%, 125%, and 150% display scale for a normal popup, a nested popup, Rename, and Move To. The real window must be inspected for material layering because CDP screenshots cannot validate physical compositor anti-aliasing.
+Required final checks are the focused interface/overlay tests, `npm run check:ui-design`, `npm run check:web`, `npm run check:desktop`, `npm test`, and the OS-backdrop desktop visual harness. The harness must exercise zero, default, and maximum dialog blur against the independent-image fixture and the real Library portal crop, report real boundary/interior pixel deltas, and show no interaction timeout or material-topology regression. It must use device-scale-only `1`, `1.25`, and `1.5` captures for a real registered popup and the shared production `ModalSurface`; mounted file-operation coverage must prove Rename and Move To consume that primitive, and the lifecycle fixture must prove nested lower-surface and full-target modal topology. The real window must still be inspected by the user for final material layering because CDP screenshots cannot validate physical compositor anti-aliasing.
+
+The recorded real-Library default result is image-boundary energy `40.3865 -> 0.3793` (`0.94%` retained), DOM-label energy `19.2672 -> 0.3324` (`1.73%` retained), boundary/interior ratio `1.1035`, and outside-reference MAD `0`. The three scale captures inferred `1`, `1.25`, and `1.5` physical output and all shared-modal captures reported a full-target `34px` Gaussian behind a sharp dialog surface.
