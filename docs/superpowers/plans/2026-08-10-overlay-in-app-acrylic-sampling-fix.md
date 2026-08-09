@@ -311,7 +311,7 @@ Use a device-scale-only 1.0/1.25/1.5 matrix with page scale fixed at `1` to veri
 Set the spec status to:
 
 ```markdown
-**Status:** Implemented; automated real-window and 100%/125%/150% renderer verification green on 2026-08-10; physical-monitor confirmation pending
+**Status:** Implemented; regional-mask edge containment is superseded by `2026-08-10-overlay-regional-mask-edge-alignment-design.md` after physical 100% review exposed a one-pixel rounded-mask alpha tail
 ```
 
 Run fresh:
@@ -389,5 +389,5 @@ Use the existing overlay reviewer for both verdicts. Stage only Task 4 files and
 - `100%`, `125%`, and `150%` popup captures inferred physical scales `1`, `1.25`, and `1.5`; all image/text, graph, cleanup, and outside-reference checks passed.
 - The shared production modal reported `fullTarget="true"`, `stdDeviation="34"`, inert surface/direct-backdrop filters, and a sharp foreground at all three scales.
 - Task 4 RED trace: the first graph used a hidden surface at `0,-4,166.78125 x 190`; the final graph was `160,96,280 x 190`. The new gate removes every hidden/invalid active entry without changing outer mask geometry.
-- Task 4 100% outline result: historical reference and production surface have identical `548 x 274` outer rectangles; all four edge shifts, fill/full/stroke residuals, and four corner residuals are `0`; background outside the reference stroke is `0` pixels.
+- Task 4 100% static outline result: historical reference and production surface have identical `548 x 274` outer rectangles; this proves same-element border/gradient ownership only. It did not register the surface in the regional filter and therefore did not prove filtered-plane containment; real left/right titlebar-popup evidence is added by `2026-08-10-overlay-regional-mask-edge-alignment.md`.
 - Task 4 verification: focused lifecycle `9/9`, overlay contract `10/10`, `check:ui-design`, `check:web`, `check:desktop`, OS-backdrop desktop harness, `git diff --check`, and `npm test` all passed; Rust reported `479 passed, 0 failed, 2 ignored`.
