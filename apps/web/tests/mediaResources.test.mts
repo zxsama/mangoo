@@ -216,13 +216,16 @@ describe("media resource library isolation", () => {
       fetchCount += 1;
       assert.ok(init?.signal);
       requestSignals.push(init.signal);
-      return new Promise<Response>((_resolve, reject) => {
-        init.signal?.addEventListener(
-          "abort",
-          () => reject(new DOMException("The operation was aborted.", "AbortError")),
-          { once: true }
-        );
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init.signal?.addEventListener(
+            "abort",
+            () => controller.error(init.signal?.reason),
+            { once: true }
+          );
+        }
       });
+      return Promise.resolve(new Response(body, { status: 200 }));
     }) as typeof fetch;
 
     try {

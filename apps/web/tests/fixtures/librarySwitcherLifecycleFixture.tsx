@@ -6,7 +6,7 @@ import {
 } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { MegleDesktopBridge } from "../../src/core/desktop";
-import type { LibrarySummary } from "../../src/core/libraryTypes";
+import type { LibraryLoadPhase, LibrarySummary } from "../../src/core/libraryTypes";
 import { useLibraryData, type LibraryState } from "../../src/core/useLibraryData";
 import { ShellTitlebarPrimaryActions } from "../../src/app-shell/ShellTopBar";
 import {
@@ -89,9 +89,11 @@ interface LibrarySwitcherLifecycleResult {
     unmountUnhandledRejections: number;
   };
   hardMediaCancellation?: {
+    activeFetchAbortedOnStartingCore: boolean;
     activeFetchAbortedOnUnmount: boolean;
+    noDuplicateAfterRetiredSettlement: boolean;
+    retiredFetchAbortedOnStartingCore: boolean;
     retiredFetchAbortedOnUnmount: boolean;
-    retiredFetchStayedLiveDuringRefresh: boolean;
     staleResponseIgnored: boolean;
     unhandledRejections: number;
   };
@@ -858,11 +860,16 @@ async function runRequestOwnershipScenario() {
   };
 }
 
-async function runHardMediaCancellationScenario() {
+async function runMediaOwnershipBoundary(boundary: "starting-core" | "unmount") {
   const originalFetch = window.fetch;
   const coreUrl = "http://hard-media-cancel.fixture/api";
-  const mediaSignals: AbortSignal[] = [];
-  const mediaRequests: Array<Deferred<Response>> = [];
+  const mediaRequests: Array<{
+    offset: string | null;
+    response: Deferred<Response>;
+    settled: boolean;
+    signal: AbortSignal;
+  }> = [];
+  let phaseListener: ((phase: LibraryLoadPhase) => void) | null = null;
   let unhandledRejections = 0;
   const handleUnhandled = (event: PromiseRejectionEvent) => {
     unhandledRejections += 1;
@@ -899,36 +906,66 @@ async function runHardMediaCancellationScenario() {
     }
     if (url.pathname === "/api/media") {
       if (!init?.signal) throw new Error("production media fetch must own an AbortSignal");
-      mediaSignals.push(init.signal);
-      const request = deferred<Response>();
+      if (url.searchParams.get("offset") === "0" && !url.searchParams.has("cursor")) {
+        return jsonResponse({ items: [], nextCursor: null, totalCount: 1_000 });
+      }
+      const response = deferred<Response>();
+      const request = {
+        offset: url.searchParams.get("offset"),
+        response,
+        settled: false,
+        signal: init.signal,
+      };
       mediaRequests.push(request);
       init.signal.addEventListener(
         "abort",
-        () => request.reject(new DOMException("The operation was aborted.", "AbortError")),
+        () => {
+          request.settled = true;
+          response.reject(init.signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+        },
         { once: true },
       );
-      return request.promise;
+      return response.promise;
     }
     return jsonResponse({ items: [], nextCursor: null, totalCount: 0 });
   }) as typeof window.fetch;
   installBridge({
     coreUrl,
+    getLibraryPhase: async () => "ready",
     notifications: {
       reportError: async () => true,
     } as unknown as MegleDesktopBridge["notifications"],
+    onLibraryPhase: (listener) => {
+      phaseListener = listener;
+      return () => {
+        if (phaseListener === listener) phaseListener = null;
+      };
+    },
     sessionToken: "fixture-token",
   });
   const control: HardMediaCancellationControl = { library: null };
   let mounted: MountedScenario | null = null;
-  const refreshPromises: Promise<void>[] = [];
   try {
     mounted = await mountScenario(<HardMediaCancellationScenario control={control} />);
-    await waitFor(() => mediaSignals.length === 1, "initial media request");
+    await waitFor(() => control.library?.mediaTotalCount === 1_000, "initial media total count");
     if (!control.library) throw new Error("useLibraryData control was not mounted");
     const library = control.library;
-    refreshPromises.push(library.refresh());
-    await waitFor(() => mediaSignals.length === 2, "same-library retired media replacement");
-    mediaRequests[0].resolve(jsonResponse({
+
+    await act(async () => library.requestMediaWindow(200, 300));
+    await waitFor(() => mediaRequests.length === 1, "first A media window");
+    await act(async () => library.requestMediaWindow(400, 500));
+    await waitFor(() => mediaRequests.length === 2, "B media window");
+    await act(async () => library.requestMediaWindow(200, 300));
+
+    const oldA = mediaRequests[0];
+    const retiredB = mediaRequests[1];
+    retiredB.settled = true;
+    retiredB.response.resolve(jsonResponse({ items: [], nextCursor: null, totalCount: 1_000 }));
+    await waitFor(() => mediaRequests.length === 3, "replacement A media window");
+    const replacementA = mediaRequests[2];
+
+    oldA.settled = true;
+    oldA.response.resolve(jsonResponse({
       items: [{
         ext: "jpg",
         folderId: null,
@@ -942,32 +979,80 @@ async function runHardMediaCancellationScenario() {
         width: 10,
       }],
       nextCursor: null,
-      totalCount: 1,
+      totalCount: 1_000,
     }));
     await settle(20);
     const staleResponseIgnored = control.library?.media.length === 0;
 
-    refreshPromises.push(library.refresh());
-    await waitFor(() => mediaSignals.length === 3, "second retired media replacement");
-    const retiredFetchStayedLiveDuringRefresh = mediaSignals[1].aborted === false;
-
-    await unmountScenario(mounted);
-    mounted = null;
-    await Promise.all(refreshPromises);
+    await act(async () => library.requestMediaWindow(200, 300));
     await delay(20);
+    const noDuplicateAfterRetiredSettlement = mediaRequests.length === 3;
+
+    await act(async () => library.requestMediaWindow(600, 700));
+    await delay(20);
+    const activeC = mediaRequests.find(({ offset }) => offset === "600");
+    const liveRequests = mediaRequests.filter((request) => !request.settled);
+
+    if (boundary === "starting-core") {
+      if (!phaseListener) throw new Error("library phase listener was not installed");
+      await act(async () => phaseListener?.("starting-core"));
+      await settle(20);
+    } else {
+      await unmountScenario(mounted);
+      mounted = null;
+    }
+
+    const activeFetchAborted = activeC?.signal.aborted ?? false;
+    const allLiveFetchesAborted = liveRequests.every(({ signal }) => signal.aborted);
+    const retiredFetchAborted = replacementA.signal.aborted;
+    for (const request of mediaRequests) {
+      if (!request.settled) {
+        request.settled = true;
+        request.response.resolve(jsonResponse({ items: [], nextCursor: null, totalCount: 1_000 }));
+      }
+    }
+    await Promise.all(
+      mediaRequests.map(({ response }) => response.promise.catch(() => undefined)),
+    );
+    await settle(20);
     return {
-      activeFetchAbortedOnUnmount: mediaSignals[2].aborted,
-      retiredFetchAbortedOnUnmount: mediaSignals[1].aborted,
-      retiredFetchStayedLiveDuringRefresh,
+      activeFetchAborted,
+      allLiveFetchesAborted,
+      noDuplicateAfterRetiredSettlement,
+      retiredFetchAborted,
       staleResponseIgnored,
       unhandledRejections,
     };
   } finally {
     if (mounted) await unmountScenario(mounted);
-    await Promise.all(refreshPromises.map((request) => request.catch(() => undefined)));
+    for (const request of mediaRequests) {
+      if (!request.settled) {
+        request.settled = true;
+        request.response.resolve(jsonResponse({ items: [], nextCursor: null, totalCount: 1_000 }));
+      }
+    }
+    await Promise.all(
+      mediaRequests.map(({ response }) => response.promise.catch(() => undefined)),
+    );
     window.removeEventListener("unhandledrejection", handleUnhandled);
     window.fetch = originalFetch;
   }
+}
+
+async function runHardMediaCancellationScenario() {
+  const startingCore = await runMediaOwnershipBoundary("starting-core");
+  const unmount = await runMediaOwnershipBoundary("unmount");
+  return {
+    activeFetchAbortedOnStartingCore:
+      startingCore.activeFetchAborted && startingCore.allLiveFetchesAborted,
+    activeFetchAbortedOnUnmount: unmount.activeFetchAborted && unmount.allLiveFetchesAborted,
+    noDuplicateAfterRetiredSettlement:
+      startingCore.noDuplicateAfterRetiredSettlement && unmount.noDuplicateAfterRetiredSettlement,
+    retiredFetchAbortedOnStartingCore: startingCore.retiredFetchAborted,
+    retiredFetchAbortedOnUnmount: unmount.retiredFetchAborted,
+    staleResponseIgnored: startingCore.staleResponseIgnored && unmount.staleResponseIgnored,
+    unhandledRejections: startingCore.unhandledRejections + unmount.unhandledRejections,
+  };
 }
 
 async function runMutationFailureScenario() {

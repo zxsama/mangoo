@@ -861,17 +861,20 @@ if (
   fail("core-client must globally schedule Core fetches with reserved navigation/interactive slots");
 }
 if (
-  !/const\s+response\s*=\s*await\s+scheduleCoreRequest\([\s\S]*?fetchWithTimeout\(\s*resolveUrl/.test(coreClient) ||
-  !/async\s+function\s+fetchBlob[\s\S]*?scheduleCoreRequest\([\s\S]*?fetchWithTimeout\(\s*resolveUrl/.test(coreClient)
+  !/async\s+function\s+request[\s\S]*?return\s+scheduleCoreRequest\([\s\S]*?fetchWithTimeout(?:<T>)?\([\s\S]*?readJson\(response\)/.test(coreClient) ||
+  !/async\s+function\s+fetchBlob[\s\S]*?return\s+scheduleCoreRequest\([\s\S]*?fetchWithTimeout\([\s\S]*?response\.blob\(\)/.test(coreClient) ||
+  !/async\s+function\s+fetchBlobWithTier[\s\S]*?return\s+scheduleCoreRequest\([\s\S]*?fetchWithTimeout\([\s\S]*?response\.blob\(\)/.test(coreClient)
 ) {
-  fail("core-client JSON and blob helpers must both route through the global request scheduler");
+  fail("core-client JSON and blob helpers must consume responses inside the global request scheduler");
 }
 if (
   !/CORE_REQUEST_TIMEOUT_MS\s*=\s*60_000/.test(coreClient) ||
   !/requestController\.abort\(new Error\("Core request timed out"\)\)/.test(coreClient) ||
-  !/Promise\.race\(\[fetchRequest,\s*abortRequest\]\)/.test(coreClient)
+  !/Promise\.race\(\[fetchRequest,\s*abortRequest\]\)/.test(coreClient) ||
+  !/consumeResponse:\s*\(response:\s*Response\)\s*=>\s*Promise<T>/.test(coreClient) ||
+  !/return\s+consumeResponse\(response\)/.test(coreClient)
 ) {
-  fail("core-client requests must abort and settle at the bounded 60s network ceiling");
+  fail("core-client requests must bound fetch, status handling, and body consumption at 60s");
 }
 if (
   !/listFolderChildren:\s*\(\s*folderId:\s*number,\s*params:\s*ListFolderChildrenParams\s*=\s*\{\},\s*options:\s*CoreRequestOptions\s*=\s*\{\}\s*\)\s*=>[\s\S]*?request<Page<FolderRecord>>\([\s\S]*?\{[\s\S]*?signal:\s*options\.signal[\s\S]*?\}\s*\)/.test(
@@ -1057,6 +1060,12 @@ if (
   !/retireStaleMediaPageRequests/.test(useLibraryData) ||
   !/abortAllMediaPageRequests/.test(useLibraryData) ||
   !/abortAllControllers\(mediaPageControllersRef\.current\)/.test(useLibraryData) ||
+  !/const\s+ownsActiveRequest\s*=\s*mediaPageControllersRef\.current\.get\(requestKey\)\s*===\s*controller/.test(
+    useLibraryData
+  ) ||
+  !/if\s*\(ownsActiveRequest\)\s*\{[\s\S]*?mediaPageControllersRef\.current\.delete\(requestKey\)[\s\S]*?inFlightMediaPageKeys\.current\.delete\(requestKey\)/.test(
+    useLibraryData
+  ) ||
   !/for\s*\(const controller of retiredMediaPageControllersRef\.current\)[\s\S]*?controller\.abort\(\)/.test(
     useLibraryData
   )

@@ -1824,14 +1824,15 @@ export function useLibraryData(
         }
       } finally {
         scope.signal?.removeEventListener("abort", abortForScope);
-        if (mediaPageControllersRef.current.get(requestKey) === controller) {
+        const ownsActiveRequest = mediaPageControllersRef.current.get(requestKey) === controller;
+        if (ownsActiveRequest) {
           mediaPageControllersRef.current.delete(requestKey);
+          inFlightMediaPageKeys.current.delete(requestKey);
+          if (scope.requestGeneration === mediaPageGeneration.current) {
+            setLoadingMoreMedia(mediaPageControllersRef.current.size > 0);
+          }
         }
         retiredMediaPageControllersRef.current.delete(controller);
-        inFlightMediaPageKeys.current.delete(requestKey);
-        if (scope.requestGeneration === mediaPageGeneration.current) {
-          setLoadingMoreMedia(mediaPageControllersRef.current.size > 0);
-        }
       }
     },
     [createReportingAttempt, loadMediaPage, reportLibraryFailure, retireStaleMediaPageRequests]

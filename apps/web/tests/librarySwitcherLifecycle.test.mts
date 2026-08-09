@@ -68,9 +68,11 @@ interface LibrarySwitcherLifecycleResult {
     unmountUnhandledRejections: number;
   };
   hardMediaCancellation: {
+    activeFetchAbortedOnStartingCore: boolean;
     activeFetchAbortedOnUnmount: boolean;
+    noDuplicateAfterRetiredSettlement: boolean;
+    retiredFetchAbortedOnStartingCore: boolean;
     retiredFetchAbortedOnUnmount: boolean;
-    retiredFetchStayedLiveDuringRefresh: boolean;
     staleResponseIgnored: boolean;
     unhandledRejections: number;
   };
@@ -260,11 +262,13 @@ describe("mounted LibrarySwitcher lifecycle", () => {
     });
   });
 
-  it("hard-aborts active and same-library-retired media fetches on unmount", () => {
+  it("preserves same-key media ownership through retired settlement and both hard boundaries", () => {
     assert.deepEqual(result.hardMediaCancellation, {
+      activeFetchAbortedOnStartingCore: true,
       activeFetchAbortedOnUnmount: true,
+      noDuplicateAfterRetiredSettlement: true,
+      retiredFetchAbortedOnStartingCore: true,
       retiredFetchAbortedOnUnmount: true,
-      retiredFetchStayedLiveDuringRefresh: true,
       staleResponseIgnored: true,
       unhandledRejections: 0,
     });

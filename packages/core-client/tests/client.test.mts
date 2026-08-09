@@ -18,6 +18,11 @@ interface DeferredRecordedRequest extends RecordedRequest {
   reject: (cause: unknown) => void;
 }
 
+interface HangingBodyRecordedRequest extends RecordedRequest {
+  bodyAbortCount: number;
+  bodyAbortReason: unknown;
+}
+
 const BASE_URL = "http://127.0.0.1:47321/api";
 const CORE_RESOURCE_SLOT_COUNT = 12;
 
@@ -146,6 +151,50 @@ function mockHangOnAbortFetch() {
     });
   }) as typeof fetch;
   return requests;
+}
+
+function mockNeverEndingBodyFetch() {
+  const requests: HangingBodyRecordedRequest[] = [];
+  globalThis.fetch = (async (input: Request | string | URL, init?: RequestInit) => {
+    const url =
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const signal = init?.signal ?? null;
+    const request: HangingBodyRecordedRequest = {
+      url,
+      method: init?.method ?? "GET",
+      headers: {},
+      body: null,
+      signal,
+      bodyAbortCount: 0,
+      bodyAbortReason: null
+    };
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const abortBody = () => {
+          request.bodyAbortCount += 1;
+          request.bodyAbortReason = signal?.reason;
+          controller.error(signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+        };
+        if (signal?.aborted) {
+          abortBody();
+        } else {
+          signal?.addEventListener("abort", abortBody, { once: true });
+        }
+      }
+    });
+    requests.push(request);
+    return new Response(body, {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  }) as typeof fetch;
+  return requests;
+}
+
+async function flushMicrotasks(iterations = 16): Promise<void> {
+  for (let index = 0; index < iterations; index += 1) {
+    await Promise.resolve();
+  }
 }
 
 function requestPath(request: RecordedRequest) {
@@ -444,6 +493,110 @@ describe("createCoreClient", () => {
     assert.equal(requests[0].settled, true);
   });
 
+  test("caller abort bounds JSON body consumption and terminates the underlying stream", async (context) => {
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const requests = mockNeverEndingBodyFetch();
+    const controller = new AbortController();
+    const unhandledRejections: unknown[] = [];
+    const handleUnhandled = (cause: unknown) => unhandledRejections.push(cause);
+    process.on("unhandledRejection", handleUnhandled);
+
+    try {
+      const outcome = client()
+        .listMedia({ rootId: 7, limit: 50 }, { signal: controller.signal })
+        .then(
+          () => ({ error: null }),
+          (error: unknown) => ({ error })
+        );
+      await flushMicrotasks();
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].bodyAbortCount, 0);
+
+      controller.abort();
+      const result = await outcome;
+      assert.equal((result.error as Error | null)?.name, "AbortError");
+      assert.equal(requests[0].signal?.aborted, true);
+      assert.equal(requests[0].bodyAbortCount, 1);
+      assert.equal(requests[0].bodyAbortReason, controller.signal.reason);
+
+      context.mock.timers.tick(60_000);
+      await flushMicrotasks();
+      assert.equal(requests[0].bodyAbortCount, 1, "cleanup must prevent a timeout double-abort");
+      assert.deepEqual(unhandledRejections, []);
+    } finally {
+      process.off("unhandledRejection", handleUnhandled);
+      context.mock.timers.reset();
+    }
+  });
+
+  test("the 60s ceiling bounds blob body consumption and releases scheduler slots without a caller signal", async (context) => {
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const requests = mockNeverEndingBodyFetch();
+    const resourcesClient = createCoreClient({ baseUrl: BASE_URL, sessionToken: "secret" });
+    const unhandledRejections: unknown[] = [];
+    const handleUnhandled = (cause: unknown) => unhandledRejections.push(cause);
+    process.on("unhandledRejection", handleUnhandled);
+
+    try {
+      const blockers = Array.from({ length: CORE_RESOURCE_SLOT_COUNT }, (_value, index) =>
+        resourcesClient.getThumbnailBlob(10_000 + index).then(
+          () => ({ error: null }),
+          (error: unknown) => ({ error })
+        )
+      );
+      const queued = resourcesClient.getThumbnailBlob(20_000).then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error })
+      );
+      await flushMicrotasks();
+      assert.equal(
+        requests.length,
+        CORE_RESOURCE_SLOT_COUNT,
+        "headers alone must not release scheduler ownership while the body is pending"
+      );
+
+      context.mock.timers.tick(59_999);
+      await flushMicrotasks();
+      assert.equal(requests.some((request) => request.signal?.aborted), false);
+
+      context.mock.timers.tick(1);
+      const blockerResults = await Promise.all(blockers);
+      await flushMicrotasks();
+      assert.equal(
+        blockerResults.every(({ error }) => (error as Error | null)?.message === "Core request timed out"),
+        true
+      );
+      assert.equal(
+        requests.slice(0, CORE_RESOURCE_SLOT_COUNT).every((request) =>
+          request.signal?.aborted &&
+          request.bodyAbortCount === 1 &&
+          (request.bodyAbortReason as Error | null)?.message === "Core request timed out"
+        ),
+        true
+      );
+      assert.equal(requests.length, CORE_RESOURCE_SLOT_COUNT + 1);
+
+      context.mock.timers.tick(60_000);
+      assert.equal((await queued).error instanceof Error, true);
+      await flushMicrotasks();
+      assert.equal(requests.at(-1)?.bodyAbortCount, 1);
+
+      context.mock.timers.tick(60_000);
+      await flushMicrotasks();
+      assert.equal(
+        requests.every((request) => request.bodyAbortCount === 1),
+        true,
+        "settled operations must remove timeout and abort listeners"
+      );
+      assert.deepEqual(unhandledRejections, []);
+    } finally {
+      context.mock.timers.tick(180_000);
+      await flushMicrotasks();
+      process.off("unhandledRejection", handleUnhandled);
+      context.mock.timers.reset();
+    }
+  });
+
   test("listFolderChildren serializes recursive descendant mode", async () => {
     mockFetch({ items: [], nextCursor: null });
     await client().listFolderChildren(42, { includeDescendants: true, limit: 25 });
@@ -645,6 +798,24 @@ describe("createCoreClient", () => {
     // No x-megle-preview-tier on the mock response, so the client falls back to
     // "original" rather than reporting an undefined tier.
     assert.equal(resource.tier, "original");
+  });
+
+  test("getPreviewResource keeps tiered blob body consumption inside caller abort ownership", async () => {
+    const requests = mockNeverEndingBodyFetch();
+    const controller = new AbortController();
+    const outcome = client()
+      .getPreviewResource(42, { signal: controller.signal, viewportLongPx: 1366 })
+      .then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error })
+      );
+    await flushMicrotasks();
+    assert.equal(requests.length, 1);
+
+    controller.abort();
+    assert.equal(((await outcome).error as Error | null)?.name, "AbortError");
+    assert.equal(requests[0].signal?.aborted, true);
+    assert.equal(requests[0].bodyAbortCount, 1);
   });
 
   test("getPreviewResource drops a non-finite viewport instead of sending NaN", async () => {
@@ -904,6 +1075,26 @@ describe("createCoreClient", () => {
       const body = (error as Error & { body?: unknown }).body;
       assert.equal(status, 404);
       assert.deepEqual(body, { error: "nope", code: "plugin_not_found" });
+      return true;
+    });
+  });
+
+  test("empty successful responses retain the existing null body contract", async () => {
+    globalThis.fetch = (async () => new Response(null, { status: 204 })) as typeof fetch;
+    const result = await client().ackNotificationOutbox({ maxSequence: 57 });
+    assert.equal(result, null);
+  });
+
+  test("blob helpers retain plain-text error bodies in CoreApiError", async () => {
+    globalThis.fetch = (async () =>
+      new Response("Core unavailable", {
+        status: 503,
+        headers: { "content-type": "text/plain" }
+      })) as typeof fetch;
+    await assert.rejects(() => client().getPreviewBlob(42), (error: Error) => {
+      assert.equal(error.name, "CoreApiError");
+      assert.equal((error as Error & { status?: number }).status, 503);
+      assert.equal((error as Error & { body?: unknown }).body, "Core unavailable");
       return true;
     });
   });

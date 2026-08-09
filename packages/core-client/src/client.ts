@@ -187,23 +187,25 @@ export function createCoreClient(config: CoreClientConfig) {
       headers.set("x-megle-session", config.sessionToken);
     }
 
-    const response = await scheduleCoreRequest(
+    return scheduleCoreRequest(
       requestPriority,
       signal,
       () =>
-        fetchWithTimeout(
+        fetchWithTimeout<T>(
           resolveUrl(config.baseUrl, path),
           { ...fetchInit, headers },
-          signal
+          signal,
+          async (response) => {
+            if (!response.ok) {
+              const body = await readResponseBody(response);
+              throw new CoreApiError(response.status, body);
+            }
+            const body = await readJson(response);
+            return body as T;
+          }
         ),
       path
     );
-    if (!response.ok) {
-      const body = await readResponseBody(response);
-      throw new CoreApiError(response.status, body);
-    }
-    const body = await readJson(response);
-    return body as T;
   }
 
   async function fetchBlob(path: string, options: BlobRequestOptions = {}): Promise<Blob> {
@@ -211,22 +213,24 @@ export function createCoreClient(config: CoreClientConfig) {
     if (config.sessionToken) {
       headers.set("x-megle-session", config.sessionToken);
     }
-    const response = await scheduleCoreRequest(
+    return scheduleCoreRequest(
       options.requestPriority ?? "resource",
       options.signal,
       () =>
         fetchWithTimeout(
           resolveUrl(config.baseUrl, path),
           { headers },
-          options.signal
+          options.signal,
+          async (response) => {
+            if (!response.ok) {
+              const body = await readResponseBody(response);
+              throw new CoreApiError(response.status, body);
+            }
+            return response.blob();
+          }
         ),
       path
     );
-    if (!response.ok) {
-      const body = await readResponseBody(response);
-      throw new CoreApiError(response.status, body);
-    }
-    return response.blob();
   }
 
   async function fetchBlobWithTier(
@@ -237,21 +241,27 @@ export function createCoreClient(config: CoreClientConfig) {
     if (config.sessionToken) {
       headers.set("x-megle-session", config.sessionToken);
     }
-    const response = await scheduleCoreRequest(
+    return scheduleCoreRequest(
       options.requestPriority ?? "resource",
       options.signal,
       () =>
-        fetchWithTimeout(resolveUrl(config.baseUrl, path), { headers }, options.signal),
+        fetchWithTimeout(
+          resolveUrl(config.baseUrl, path),
+          { headers },
+          options.signal,
+          async (response) => {
+            if (!response.ok) {
+              const body = await readResponseBody(response);
+              throw new CoreApiError(response.status, body);
+            }
+            return {
+              blob: await response.blob(),
+              tier: response.headers.get("x-megle-preview-tier") ?? "original"
+            };
+          }
+        ),
       path
     );
-    if (!response.ok) {
-      const body = await readResponseBody(response);
-      throw new CoreApiError(response.status, body);
-    }
-    return {
-      blob: await response.blob(),
-      tier: response.headers.get("x-megle-preview-tier") ?? "original"
-    };
   }
 
   return {
@@ -679,19 +689,17 @@ function createAbortError(): Error {
   return error;
 }
 
-/// Run `fetch` with a safety timeout for requests that have NO caller abort
-/// signal. Those are the ones that can leak a scheduler slot forever if their
-/// connection hangs (e.g. a background cache enqueue during a Core restart):
-/// nothing else will ever abort them, so without a timeout their slot is never
-/// released and enough of them wedge the whole scheduler ("grid stuck on
-/// placeholders"). Requests that DO pass a signal are already abortable by their
-/// owner (the grid aborts stale tile fetches on scroll), so we forward their
-/// signal unchanged — preserving the caller's exact signal reference.
-function fetchWithTimeout(
+/// Bound the complete HTTP operation: fetching headers, checking status, and
+/// consuming the response body. Headers alone do not release the timer or the
+/// scheduler slot, because a stalled JSON/blob stream is still live network
+/// work. Every request owns an internal controller so either the caller or the
+/// 60-second ceiling reaches the underlying fetch and settles the wrapper.
+function fetchWithTimeout<T>(
   url: string,
   init: RequestInit,
-  callerSignal: AbortSignal | null | undefined
-): Promise<Response> {
+  callerSignal: AbortSignal | null | undefined,
+  consumeResponse: (response: Response) => Promise<T>
+): Promise<T> {
   const requestController = new AbortController();
   const forwardCallerAbort = () => {
     requestController.abort(callerSignal?.reason ?? createAbortError());
@@ -704,8 +712,9 @@ function fetchWithTimeout(
   const timer = setTimeout(() => {
     requestController.abort(new Error("Core request timed out"));
   }, CORE_REQUEST_TIMEOUT_MS);
-  const abortRequest = new Promise<Response>((_resolve, reject) => {
-    const rejectOnAbort = () => {
+  let rejectOnAbort: (() => void) | null = null;
+  const abortRequest = new Promise<never>((_resolve, reject) => {
+    rejectOnAbort = () => {
       reject(requestController.signal.reason ?? createAbortError());
     };
     if (requestController.signal.aborted) {
@@ -714,10 +723,16 @@ function fetchWithTimeout(
     }
     requestController.signal.addEventListener("abort", rejectOnAbort, { once: true });
   });
-  const fetchRequest = fetch(url, { ...init, signal: requestController.signal });
+  const fetchRequest = (async () => {
+    const response = await fetch(url, { ...init, signal: requestController.signal });
+    return consumeResponse(response);
+  })();
   return Promise.race([fetchRequest, abortRequest]).finally(() => {
     clearTimeout(timer);
     callerSignal?.removeEventListener("abort", forwardCallerAbort);
+    if (rejectOnAbort) {
+      requestController.signal.removeEventListener("abort", rejectOnAbort);
+    }
   });
 }
 
