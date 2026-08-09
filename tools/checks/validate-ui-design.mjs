@@ -1971,6 +1971,7 @@ if (!roundedMaskPrimitivesBody) {
     /const\s+roundedUnclippedResult\s*=\s*`regional-mask-\$\{index\}-rounded`;/,
     /setAttributes\(rounded,\s*\{\s*in:\s*softenedResult,\s*\.\.\.bounds,\s*result:\s*roundedUnclippedResult\s*\}\);/,
     /const\s+clippedResult\s*=\s*`regional-mask-\$\{index\}-clipped`;/,
+    /const\s+clipped\s*=\s*svgElement\(ownerDocument,\s*"feComposite"\);/,
     /setAttributes\(clipped,\s*\{\s*in:\s*roundedUnclippedResult,\s*in2:\s*sourceResult,\s*operator:\s*"in",\s*result:\s*clippedResult\s*\}\);/,
     /filter\.append\(softened,\s*rounded,\s*clipped\);/,
     /return\s+clippedResult;/
