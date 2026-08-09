@@ -167,6 +167,43 @@ describe("media resource library isolation", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("keeps a shared original request alive after its only view consumer departs", async () => {
+    const originalFetch = globalThis.fetch;
+    const response = deferred<Response>();
+    let requestSignal: AbortSignal | undefined;
+    let fetchCount = 0;
+    globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+      fetchCount += 1;
+      requestSignal = init?.signal ?? undefined;
+      return response.promise;
+    }) as typeof fetch;
+
+    try {
+      resetMediaCachesForLibrarySwitch();
+      const consumer = new AbortController();
+      const request = requestOriginalPreviewBlob(media(8), { signal: consumer.signal });
+      const outcome = request.then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error })
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(fetchCount, 1);
+
+      consumer.abort();
+      assert.equal((await outcome).error instanceof Error, true);
+      assert.equal(requestSignal?.aborted, false, "view cleanup must not abort the cacheable shared request");
+
+      response.resolve(new Response("cached-after-departure", { status: 200 }));
+      await new Promise((resolve) => setImmediate(resolve));
+      const cached = await requestOriginalPreviewBlob(media(8));
+      assert.equal(await cached.text(), "cached-after-departure");
+      assert.equal(fetchCount, 1, "the completed shared request must satisfy the next consumer from cache");
+    } finally {
+      resetMediaCachesForLibrarySwitch();
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 describe("media cache reset listeners", () => {

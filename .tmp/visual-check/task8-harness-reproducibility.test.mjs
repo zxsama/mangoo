@@ -25,6 +25,7 @@ const repositoryRoot = path.resolve(harnessDirectory, "..", "..");
 const regressionPath = path.join(harnessDirectory, "desktop-ui-regression.mjs");
 const exhaustivePath = path.join(harnessDirectory, "desktop-ui-exhaustive-interaction-sweep.mjs");
 const libraryDataPath = path.join(repositoryRoot, "apps", "web", "src", "core", "useLibraryData.ts");
+const mediaResourcesPath = path.join(repositoryRoot, "apps", "web", "src", "core", "mediaResources.ts");
 const overlayCssPath = path.join(repositoryRoot, "apps", "web", "src", "design", "overlays", "overlay.css");
 const appearanceFixturePath = path.join(
   repositoryRoot,
@@ -326,6 +327,18 @@ test("thumbnail priority scope changes coalesce without scenario request aborts"
   );
   assert.doesNotMatch(flush, /thumbnailPriorityScopeSyncControllerRef\.current\?\.abort\(\)/);
   assert.match(source, /if \(thumbnailPriorityScopeSyncTimerRef\.current === null\) \{\s*openThumbnailScopeSyncWindow\(\);/);
+});
+
+test("departed preview consumers keep the shared cacheable request alive", async () => {
+  const source = await readFile(mediaResourcesPath, "utf8");
+  const start = source.indexOf("function withSharedAbortSignal");
+  const end = source.indexOf("function createAbortError", start);
+  const sharedAbort = source.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(sharedAbort, /entry\.activeConsumers = Math\.max\(0, entry\.activeConsumers - 1\)/);
+  assert.doesNotMatch(sharedAbort, /entry\.controller\.abort\(\)/);
+  assert.match(source, /abortSharedRequests\(inFlightOriginalPreviewRequests\)/);
 });
 
 test("DPI, preference, and appearance checks assert effective production state", async () => {

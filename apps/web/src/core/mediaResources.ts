@@ -996,9 +996,9 @@ function withSharedAbortSignal<T>(
       released = true;
       signal.removeEventListener("abort", abort);
       entry.activeConsumers = Math.max(0, entry.activeConsumers - 1);
-      if (entry.activeConsumers === 0 && !entry.hasUnabortableConsumer) {
-        entry.controller.abort();
-      }
+      // A departed view rejects immediately, but the shared request keeps
+      // running so its bounded result can populate the cache for the next
+      // consumer. Only a library-epoch reset aborts the underlying request.
     };
     const abort = () => {
       release();

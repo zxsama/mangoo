@@ -974,10 +974,12 @@ async function runExhaustiveSweep(client) {
   await delay(500);
   await openContextMenuForTreeNode(client, "img2img-images");
   await invokeContains(client, '#context-menu-root [data-overlay-menu-item="true"]', "Refresh folder");
-  await delay(500);
+  await delay(1500);
+  await waitForNetworkIdle("folder refresh settle", 30_000, 1000);
   await openContextMenuForTreeNode(client, "img2img-images");
   await invokeContains(client, '#context-menu-root [data-overlay-menu-item="true"]', "Rescan root");
-  await delay(500);
+  await delay(3000);
+  await waitForNetworkIdle("folder rescan settle", 30_000, 1000);
   await openContextMenuForTreeNode(client, "img2img-images");
   await invokeContains(client, '#context-menu-root [data-overlay-menu-item="true"]', "Rename");
   await expectDialog(client, "Rename folder");
@@ -1023,10 +1025,12 @@ async function runExhaustiveSweep(client) {
   await delay(500);
   await openContextMenuForTreeNode(client, "outputs");
   await invokeContains(client, '#context-menu-root [data-overlay-menu-item="true"]', "Refresh folder");
-  await delay(500);
+  await delay(1500);
+  await waitForNetworkIdle("root refresh settle", 30_000, 1000);
   await openContextMenuForTreeNode(client, "outputs");
   await invokeContains(client, '#context-menu-root [data-overlay-menu-item="true"]', "Rescan root");
-  await delay(500);
+  await delay(3000);
+  await waitForNetworkIdle("root rescan settle", 30_000, 1000);
   await openContextMenuForTreeNode(client, "outputs");
   results.push("root context menu sweep");
 }
