@@ -1042,93 +1042,204 @@ async function captureOverlaySurfaceOutlineEvidence(client, baselineDimensions) 
   };
 }
 
-async function openRealPortalBlurProbe(client) {
-  await client.send("Page.bringToFront");
-  await pressKey(client, "Escape", "Escape", 27);
-  await waitForCompactPopoverState(client, null).catch(() => undefined);
-  await clickSelector(client, '[data-compact-popover-trigger="notifications"]');
-  await waitForCompactPopoverState(client, "notifications");
-  const placement = await evaluate(
+async function analyzeRealTitlebarPopupEdgeFrames(framePaths, viewport, surfaceRect, radius) {
+  const escapedPaths = JSON.stringify(framePaths).replace(/'/g, "''");
+  const escapedViewport = JSON.stringify(viewport).replace(/'/g, "''");
+  const escapedRect = JSON.stringify(surfaceRect).replace(/'/g, "''");
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+$paths = '${escapedPaths}' | ConvertFrom-Json
+$viewport = '${escapedViewport}' | ConvertFrom-Json
+$surface = '${escapedRect}' | ConvertFrom-Json
+$radius = ${Number(radius)}
+$threshold = 3
+$bitmaps = @{}
+try {
+  foreach ($property in $paths.PSObject.Properties) {
+    $bitmaps[$property.Name] = [System.Drawing.Bitmap]::FromFile([string]$property.Value)
+  }
+  $first = $bitmaps['zeroBefore']
+  $scaleX = $first.Width / [double]$viewport.width
+  $scaleY = $first.Height / [double]$viewport.height
+  foreach ($bitmap in $bitmaps.Values) {
+    if ($bitmap.Width -ne $first.Width -or $bitmap.Height -ne $first.Height) {
+      throw 'Real popup edge frames do not have identical dimensions'
+    }
+  }
+  $surfaceLeft = [double]$surface.left * $scaleX
+  $surfaceTop = [double]$surface.top * $scaleY
+  $surfaceRight = ([double]$surface.left + [double]$surface.width) * $scaleX
+  $surfaceBottom = ([double]$surface.top + [double]$surface.height) * $scaleY
+  $leftInsideEdge = [Math]::Ceiling($surfaceLeft)
+  $topInsideEdge = [Math]::Ceiling($surfaceTop)
+  $rightInsideEdge = [Math]::Floor($surfaceRight)
+  $bottomInsideEdge = [Math]::Floor($surfaceBottom)
+  $leftOutside = [Math]::Floor($surfaceLeft) - 1
+  $topOutside = [Math]::Floor($surfaceTop) - 1
+  $rightOutside = [Math]::Ceiling($surfaceRight)
+  $bottomOutside = [Math]::Ceiling($surfaceBottom)
+  $marginX = [Math]::Max(16, [Math]::Ceiling($radius * $scaleX) + 8)
+  $marginY = [Math]::Max(16, [Math]::Ceiling($radius * $scaleY) + 8)
+
+  function RegionStats($before, $after, $x, $y, $width, $height) {
+    $x0 = [Math]::Max(0, [int]$x)
+    $y0 = [Math]::Max(0, [int]$y)
+    $x1 = [Math]::Min($before.Width, [int]($x + $width))
+    $y1 = [Math]::Min($before.Height, [int]($y + $height))
+    $sum = 0.0
+    $classified = 0
+    $pixels = 0
+    for ($py = $y0; $py -lt $y1; $py++) {
+      for ($px = $x0; $px -lt $x1; $px++) {
+        $a = $before.GetPixel($px, $py)
+        $b = $after.GetPixel($px, $py)
+        $dr = [Math]::Abs([int]$a.R - [int]$b.R)
+        $dg = [Math]::Abs([int]$a.G - [int]$b.G)
+        $db = [Math]::Abs([int]$a.B - [int]$b.B)
+        $sum += ($dr + $dg + $db) / 3.0
+        if ([Math]::Max($dr, [Math]::Max($dg, $db)) -gt $threshold) { $classified++ }
+        $pixels++
+      }
+    }
+    if ($pixels -le 0) { throw "Real popup edge sample region is empty: $x,$y,$width,$height" }
+    return [ordered]@{
+      mean = [Math]::Round($sum / $pixels, 4)
+      classified = $classified
+      ratio = [Math]::Round($classified / [double]$pixels, 4)
+      pixels = $pixels
+    }
+  }
+
+  $regions = @(
+    [ordered]@{ edge = 'left'; inside = @(($leftInsideEdge + 2), ($topInsideEdge + $marginY), 4, (($bottomInsideEdge - $topInsideEdge) - 2 * $marginY)); outside = @($leftOutside, ($topInsideEdge + $marginY), 1, (($bottomInsideEdge - $topInsideEdge) - 2 * $marginY)) },
+    [ordered]@{ edge = 'right'; inside = @(($rightInsideEdge - 6), ($topInsideEdge + $marginY), 4, (($bottomInsideEdge - $topInsideEdge) - 2 * $marginY)); outside = @($rightOutside, ($topInsideEdge + $marginY), 1, (($bottomInsideEdge - $topInsideEdge) - 2 * $marginY)) },
+    [ordered]@{ edge = 'top'; inside = @(($leftInsideEdge + $marginX), ($topInsideEdge + 2), (($rightInsideEdge - $leftInsideEdge) - 2 * $marginX), 4); outside = @(($leftInsideEdge + $marginX), $topOutside, (($rightInsideEdge - $leftInsideEdge) - 2 * $marginX), 1) },
+    [ordered]@{ edge = 'bottom'; inside = @(($leftInsideEdge + $marginX), ($bottomInsideEdge - 6), (($rightInsideEdge - $leftInsideEdge) - 2 * $marginX), 4); outside = @(($leftInsideEdge + $marginX), $bottomOutside, (($rightInsideEdge - $leftInsideEdge) - 2 * $marginX), 1) }
+  )
+
+  function AnalyzePair($before, $after) {
+    $result = @()
+    foreach ($region in $regions) {
+      $result += [ordered]@{
+        edge = $region.edge
+        inside = (RegionStats $before $after $region.inside[0] $region.inside[1] $region.inside[2] $region.inside[3])
+        outside = (RegionStats $before $after $region.outside[0] $region.outside[1] $region.outside[2] $region.outside[3])
+      }
+    }
+    return @($result)
+  }
+
+  [ordered]@{
+    threshold = $threshold
+    inferredScale = [ordered]@{ x = [Math]::Round($scaleX, 4); y = [Math]::Round($scaleY, 4) }
+    physicalOuterBox = [ordered]@{
+      left = $surfaceLeft
+      top = $surfaceTop
+      right = $surfaceRight
+      bottom = $surfaceBottom
+      firstFullyOutside = [ordered]@{ left = $leftOutside; top = $topOutside; right = $rightOutside; bottom = $bottomOutside }
+    }
+    defaultVsZeroBefore = (AnalyzePair $bitmaps['zeroBefore'] $bitmaps['default'])
+    zeroBeforeVsZeroAfter = (AnalyzePair $bitmaps['zeroBefore'] $bitmaps['zeroAfter'])
+    legacyUnclippedVsZeroAfter = (AnalyzePair $bitmaps['zeroAfter'] $bitmaps['legacyUnclipped'])
+    restoredClippedVsZeroAfter = (AnalyzePair $bitmaps['zeroAfter'] $bitmaps['restoredClipped'])
+  } | ConvertTo-Json -Depth 8 -Compress
+} finally {
+  foreach ($bitmap in $bitmaps.Values) { $bitmap.Dispose() }
+}
+`;
+  return new Promise((resolve, reject) => {
+    const ps = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+    );
+    let output = "";
+    let errorText = "";
+    ps.stdout.on("data", (chunk) => { output += chunk.toString(); });
+    ps.stderr.on("data", (chunk) => { errorText += chunk.toString(); });
+    ps.on("error", reject);
+    ps.on("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(errorText.trim() || `Real popup edge analysis failed with exit code ${code}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(output));
+      } catch (error) {
+        reject(new Error(`Real popup edge analysis did not return JSON: ${String(error)}; output=${output}`));
+      }
+    });
+  });
+}
+
+async function installRealTitlebarPopupDiagnostic(client) {
+  const result = await evaluate(
     client,
     `(() => {
-      const surface = document.querySelector('#notifications-root');
-      const sampleImage = [...document.querySelectorAll('.media-tile .tile-thumb-image')].find((candidate) => {
-        const rect = candidate.getBoundingClientRect();
-        return rect.width > 80 && rect.height > 80 && rect.bottom > 0 && rect.right > 0 &&
-          rect.top < window.innerHeight && rect.left < window.innerWidth;
-      });
-      if (!(surface instanceof HTMLElement) || !(sampleImage instanceof HTMLImageElement)) return null;
-      const tileRect = sampleImage.getBoundingClientRect();
-      const width = 360;
-      const height = 220;
-      const left = Math.max(8, Math.min(tileRect.left, window.innerWidth - width - 8));
-      const top = Math.max(8, Math.min(tileRect.top, window.innerHeight - height - 8));
-      for (const [name, value] of Object.entries({
-        position: 'fixed',
-        left: left + 'px',
-        top: top + 'px',
-        right: 'auto',
-        bottom: 'auto',
-        width: width + 'px',
-        height: height + 'px',
-        'max-height': height + 'px',
-        transform: 'none'
-      })) surface.style.setProperty(name, value, 'important');
-      surface.setAttribute('data-real-portal-blur-probe', 'true');
-      let reference = document.querySelector('[data-real-portal-blur-reference="true"]');
-      if (!(reference instanceof HTMLElement)) {
-        reference = document.createElement('div');
-        reference.setAttribute('data-real-portal-blur-reference', 'true');
-        reference.setAttribute('aria-hidden', 'true');
-        document.body.append(reference);
+      document.querySelector('[data-real-titlebar-edge-diagnostic="true"]')?.remove();
+      const root = document.querySelector('#root');
+      if (!(root instanceof HTMLElement)) return null;
+      const layer = document.createElement('canvas');
+      layer.setAttribute('data-real-titlebar-edge-diagnostic', 'true');
+      layer.setAttribute('aria-hidden', 'true');
+      layer.width = Math.round(window.innerWidth);
+      layer.height = Math.round(window.innerHeight);
+      const context = layer.getContext('2d', { alpha: false });
+      if (!context) return null;
+      const image = context.createImageData(layer.width, layer.height);
+      const colors = [
+        [0, 0, 0],
+        [255, 255, 255],
+        [255, 255, 255],
+        [0, 0, 0]
+      ];
+      for (let y = 0; y < layer.height; y += 1) {
+        for (let x = 0; x < layer.width; x += 1) {
+          const color = colors[((x >> 2) & 1) | (((y >> 2) & 1) << 1)];
+          const offset = (y * layer.width + x) * 4;
+          image.data[offset] = color[0];
+          image.data[offset + 1] = color[1];
+          image.data[offset + 2] = color[2];
+          image.data[offset + 3] = 255;
+        }
       }
-      Object.assign(reference.style, {
+      context.putImageData(image, 0, 0);
+      Object.assign(layer.style, {
         position: 'fixed',
-        left: Math.max(8, window.innerWidth - 200) + 'px',
-        top: Math.max(8, Math.min(top, window.innerHeight - 140)) + 'px',
-        width: '180px',
-        height: '120px',
+        inset: '0',
+        display: 'block',
+        width: window.innerWidth + 'px',
+        height: window.innerHeight + 'px',
         pointerEvents: 'none',
-        zIndex: '1'
+        zIndex: '119',
+        imageRendering: 'pixelated'
       });
-      let style = document.querySelector('style[data-real-portal-blur-sampling-style="true"]');
-      if (!(style instanceof HTMLStyleElement)) {
-        style = document.createElement('style');
-        style.setAttribute('data-real-portal-blur-sampling-style', 'true');
-        style.textContent = [
-          '#notifications-root[data-real-portal-blur-probe="true"] { position: fixed !important; left: ' + left + 'px !important; top: ' + top + 'px !important; right: auto !important; bottom: auto !important; width: ' + width + 'px !important; height: ' + height + 'px !important; max-height: ' + height + 'px !important; transform: none !important; }',
-          'body[data-real-portal-blur-sampling="true"] #notifications-root { border-color: transparent !important; background: transparent !important; box-shadow: none !important; }',
-          'body[data-real-portal-blur-sampling="true"] #notifications-root::before, body[data-real-portal-blur-sampling="true"] #notifications-root::after { opacity: 0 !important; border: 0 !important; box-shadow: none !important; }',
-          'body[data-real-portal-blur-sampling="true"] #notifications-root > .liquid-glass-backdrop, body[data-real-portal-blur-sampling="true"] #notifications-root > .liquid-glass-lens, body[data-real-portal-blur-sampling="true"] #notifications-root > .liquid-glass-dither, body[data-real-portal-blur-sampling="true"] #notifications-root > .liquid-glass-edge, body[data-real-portal-blur-sampling="true"] #notifications-root > .overlay-scroll-viewport { opacity: 0 !important; }'
-        ].join('\\n');
-        document.head.append(style);
-      }
-      return { left, top, width, height };
+      root.append(layer);
+      const rect = layer.getBoundingClientRect();
+      return {
+        parentIsRoot: layer.parentElement === root,
+        pointerEvents: getComputedStyle(layer).pointerEvents,
+        canvasResolution: { width: layer.width, height: layer.height },
+        rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+      };
     })()`
   );
-  if (!placement) throw new Error("real Library portal blur probe could not be positioned");
-  await waitFor(
+  if (!result?.parentIsRoot || result.pointerEvents !== "none") {
+    throw new Error(`real titlebar popup diagnostic layer was not installed correctly: ${JSON.stringify(result)}`);
+  }
+  return result;
+}
+
+async function removeRealTitlebarPopupDiagnostic(client) {
+  await evaluate(
     client,
-    `(() => {
-      const surface = document.querySelector('#notifications-root');
-      if (!(surface instanceof HTMLElement)) return false;
-      const probe = surface.getBoundingClientRect();
-      const intersects = (element) => {
-        const rect = element.getBoundingClientRect();
-        return rect.right > probe.left + 12 && rect.left < probe.right - 12 &&
-          rect.bottom > probe.top + 12 && rect.top < probe.bottom - 12;
-      };
-      const images = [...document.querySelectorAll('.media-tile .tile-thumb-image')]
-        .filter((image) => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0 && intersects(image));
-      const labels = [...document.querySelectorAll('.media-tile .tile-label')].filter(intersects);
-      return images.length >= 2 && labels.length >= 2;
-    })()`,
-    10000,
-    "real Library portal covers independent images and text"
+    `document.querySelector('[data-real-titlebar-edge-diagnostic="true"]')?.remove()`
   );
 }
 
-async function waitForRealPortalBlurSettled(client, expectedSigma) {
+async function waitForRealTitlebarPopupEdgeSettled(client, surfaceSelector, expectedSigma) {
   const expected = Number(expectedSigma);
   const deadline = Date.now() + 10000;
   let last = null;
@@ -1136,169 +1247,506 @@ async function waitForRealPortalBlurSettled(client, expectedSigma) {
     last = await evaluate(
       client,
       `(async () => {
-      const surface = document.querySelector('#notifications-root');
-      if (!(surface instanceof HTMLElement)) return { ok: false, reason: 'surface-missing' };
-      const read = () => {
-        const rect = surface.getBoundingClientRect();
-        return [rect.left, rect.top, rect.width, rect.height].map((value) => Math.round(value * 100) / 100);
-      };
-      const first = read();
-      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      const second = read();
-      const root = document.querySelector('#root');
-      const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
-      const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
-      const geometryStable = JSON.stringify(first) === JSON.stringify(second);
-      const graphMatches = ${expected} === 0
-        ? root?.getAttribute('data-overlay-regional-blur') !== 'active' && !filter
-        : root?.getAttribute('data-overlay-regional-blur') === 'active' &&
-        filter?.getAttribute('data-overlay-regional-full-target') === 'false' &&
-        filter?.getAttribute('data-overlay-regional-mask-count') === '1' &&
-        gaussian?.getAttribute('edgeMode') === 'duplicate' &&
-        Math.abs(Number(gaussian?.getAttribute('stdDeviation')) - ${expected}) <= 0.01;
-      return {
-        ok: geometryStable && graphMatches,
-        presence: surface.getAttribute('data-overlay-state'),
-        first,
-        second,
-        geometryStable,
-        rootActive: root?.getAttribute('data-overlay-regional-blur') ?? null,
-        inlineFilter: root instanceof HTMLElement ? root.style.filter : null,
-        filterPresent: Boolean(filter),
-        fullTarget: filter?.getAttribute('data-overlay-regional-full-target') ?? null,
-        maskCount: filter?.getAttribute('data-overlay-regional-mask-count') ?? null,
-        sigma: gaussian?.getAttribute('stdDeviation') ?? null,
-        computedDialogBlur: getComputedStyle(document.documentElement).getPropertyValue('--glass-dialog-blur').trim()
-      };
-    })()`
+        const surface = document.querySelector(${JSON.stringify(surfaceSelector)});
+        const diagnostic = document.querySelector('[data-real-titlebar-edge-diagnostic="true"]');
+        const root = document.querySelector('#root');
+        if (!(surface instanceof HTMLElement) || !(diagnostic instanceof HTMLElement) || !(root instanceof HTMLElement)) {
+          return { ok: false, reason: 'required-element-missing' };
+        }
+        const read = () => {
+          const rect = surface.getBoundingClientRect();
+          return [rect.left, rect.top, rect.width, rect.height].map((value) => Math.round(value * 1000) / 1000);
+        };
+        const first = read();
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const second = read();
+        const style = getComputedStyle(surface);
+        const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+        const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
+        const graphMatches = ${expected} === 0
+          ? root.getAttribute('data-overlay-regional-blur') !== 'active' && !filter && !gaussian
+          : root.getAttribute('data-overlay-regional-blur') === 'active' &&
+            filter?.getAttribute('filterUnits') === 'userSpaceOnUse' &&
+            filter?.getAttribute('primitiveUnits') === 'userSpaceOnUse' &&
+            filter?.getAttribute('data-overlay-regional-full-target') === 'false' &&
+            filter?.getAttribute('data-overlay-regional-mask-count') === '1' &&
+            gaussian?.getAttribute('in') === 'SourceGraphic' &&
+            gaussian?.getAttribute('edgeMode') === 'duplicate' &&
+            Math.abs(Number(gaussian?.getAttribute('stdDeviation')) - ${expected}) <= 0.01;
+        return {
+          ok: surface.getAttribute('data-overlay-state') === 'open' &&
+            style.transform === 'none' &&
+            style.visibility === 'visible' &&
+            JSON.stringify(first) === JSON.stringify(second) &&
+            first[2] > 0 && first[3] > 0 && graphMatches,
+          state: surface.getAttribute('data-overlay-state'),
+          transform: style.transform,
+          visibility: style.visibility,
+          first,
+          second,
+          graphMatches,
+          rootActive: root.getAttribute('data-overlay-regional-blur'),
+          filterId: filter?.id ?? null,
+          sigma: gaussian?.getAttribute('stdDeviation') ?? null
+        };
+      })()`
     );
     if (last?.ok) return last;
-    await delay(200);
+    await delay(160);
   }
   throw new Error(
-    `Timed out waiting for real Library portal regional blur settled at sigma ${expected}; last=${JSON.stringify(last)}`
+    `Timed out waiting for ${surfaceSelector} natural geometry and regional graph at sigma ${expected}; last=${JSON.stringify(last)}`
   );
 }
 
-async function captureRealPortalBlurEvidence(client, name, expectedSigma) {
-  await waitForRealPortalBlurSettled(client, expectedSigma);
-  await evaluate(client, `document.body.setAttribute('data-real-portal-blur-sampling', 'true')`);
-  await delay(80);
+function popupEdgeMaterialInvariant(snapshot) {
+  return {
+    surfaceRect: snapshot.surfaceRect,
+    rootRect: snapshot.rootRect,
+    state: snapshot.surface.state,
+    transform: snapshot.surface.transform,
+    style: snapshot.surface.style,
+    before: snapshot.surface.before,
+    after: snapshot.surface.after,
+    portal: snapshot.portal
+  };
+}
+
+async function captureRealTitlebarPopupEdgeFrame(client, surfaceSelector, name, expectedSigma, waitForGraph = true) {
+  if (waitForGraph) {
+    await waitForRealTitlebarPopupEdgeSettled(client, surfaceSelector, expectedSigma);
+  } else {
+    await delay(80);
+  }
+  const screenshotPath = await rendererScreenshot(client, name);
   const snapshot = await evaluate(
     client,
     `(() => {
-      const surface = document.querySelector('#notifications-root');
-      const reference = document.querySelector('[data-real-portal-blur-reference="true"]');
-      const child = surface?.querySelector(':scope > .liquid-glass-backdrop') ?? null;
+      const surface = document.querySelector(${JSON.stringify(surfaceSelector)});
       const root = document.querySelector('#root');
+      const diagnostic = document.querySelector('[data-real-titlebar-edge-diagnostic="true"]');
       const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
-      const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
-      const saturation = filter?.querySelector('feColorMatrix[in="blurred"][type="saturate"]') ?? null;
-      const mask = filter?.querySelector('[data-overlay-regional-mask-primitive="true"]') ?? null;
-      if (!(surface instanceof HTMLElement) || !(reference instanceof HTMLElement)) return null;
-      const style = getComputedStyle(surface);
-      const childStyle = child ? getComputedStyle(child) : null;
+      if (!(surface instanceof HTMLElement) || !(root instanceof HTMLElement) || !(diagnostic instanceof HTMLElement)) return null;
       const rect = (element) => {
         const value = element.getBoundingClientRect();
-        return { left: value.left, top: value.top, width: value.width, height: value.height };
+        return {
+          left: Math.round(value.left * 1000) / 1000,
+          top: Math.round(value.top * 1000) / 1000,
+          width: Math.round(value.width * 1000) / 1000,
+          height: Math.round(value.height * 1000) / 1000
+        };
       };
-      const probeRect = rect(surface);
-      const referenceRect = rect(reference);
-      const probeRight = probeRect.left + probeRect.width;
-      const probeBottom = probeRect.top + probeRect.height;
-      const referenceRight = referenceRect.left + referenceRect.width;
-      const referenceBottom = referenceRect.top + referenceRect.height;
-      const separationX = Math.max(0, Math.max(referenceRect.left - probeRight, probeRect.left - referenceRight));
-      const separationY = Math.max(0, Math.max(referenceRect.top - probeBottom, probeRect.top - referenceBottom));
-      const samples = [
-        ...[...document.querySelectorAll('.media-tile .tile-thumb-image')].map((element, index) => ({ element, kind: 'image', id: 'real-image-' + index })),
-        ...[...document.querySelectorAll('.media-tile .tile-label')].map((element, index) => ({ element, kind: 'text', id: 'real-text-' + index }))
-      ].filter(({ element }) => element instanceof HTMLElement);
+      const styleSnapshot = (style) => ({
+        backgroundColor: style.backgroundColor,
+        backgroundImage: style.backgroundImage,
+        backgroundClip: style.backgroundClip,
+        borderTop: style.borderTop,
+        borderRight: style.borderRight,
+        borderBottom: style.borderBottom,
+        borderLeft: style.borderLeft,
+        borderRadius: style.borderRadius,
+        boxShadow: style.boxShadow
+      });
+      const surfaceRect = rect(surface);
+      const rootRect = rect(root);
+      const expectedOuterBorderBox = {
+        left: Math.round((surfaceRect.left - rootRect.left) * 1000) / 1000,
+        top: Math.round((surfaceRect.top - rootRect.top) * 1000) / 1000,
+        width: surfaceRect.width,
+        height: surfaceRect.height
+      };
+      const surfaceStyle = getComputedStyle(surface);
+      const scrollViewport = surface.querySelector(':scope > .overlay-scroll-viewport');
+      const scrollViewportStyle = scrollViewport instanceof HTMLElement ? getComputedStyle(scrollViewport) : null;
+      const sourceFlood = filter?.querySelector('feFlood[data-overlay-regional-mask-primitive="true"]') ?? null;
+      const sourceFloodRect = sourceFlood ? {
+        left: Number(sourceFlood.getAttribute('x')),
+        top: Number(sourceFlood.getAttribute('y')),
+        width: Number(sourceFlood.getAttribute('width')),
+        height: Number(sourceFlood.getAttribute('height'))
+      } : null;
+      const clips = filter ? [...filter.querySelectorAll('feComposite[operator="in"]')].filter((node) =>
+        node.getAttribute('result')?.endsWith('-clipped')
+      ) : [];
+      const clip = clips[0] ?? null;
+      const clipResult = clip?.getAttribute('result') ?? null;
+      const roundedResult = clip?.getAttribute('in') ?? null;
+      const consumers = filter ? [...filter.querySelectorAll('*')].filter((node) => node !== clip) : [];
+      const countConsumers = (result) => result ? consumers.filter((node) =>
+        node.getAttribute('in') === result || node.getAttribute('in2') === result
+      ).length : 0;
+      const sourceFloodMatchesExpected = sourceFloodRect ? ['left', 'top', 'width', 'height'].every((key) =>
+        Math.abs(sourceFloodRect[key] - expectedOuterBorderBox[key]) <= 0.01
+      ) : null;
+      const diagnosticRect = rect(diagnostic);
+      const centreX = Math.min(window.innerWidth - 1, Math.max(0, surfaceRect.left + surfaceRect.width / 2));
+      const centreY = Math.min(window.innerHeight - 1, Math.max(0, surfaceRect.top + surfaceRect.height / 2));
+      const centreStack = document.elementsFromPoint(centreX, centreY);
       return {
         viewport: { width: window.innerWidth, height: window.innerHeight },
         renderer: { devicePixelRatio: window.devicePixelRatio, visualViewportScale: window.visualViewport?.scale ?? null },
-        probeRect,
-        referenceRect,
-        referenceClearance: Math.hypot(separationX, separationY),
-        sampleRects: samples.map(({ element, kind, id }) => ({ kind, id, rect: rect(element) })),
+        surfaceRect,
+        rootRect,
+        expectedOuterBorderBox,
+        radius: Number.parseFloat(surfaceStyle.borderTopLeftRadius),
+        dialogBlur: getComputedStyle(document.documentElement).getPropertyValue('--glass-dialog-blur').trim(),
+        surface: {
+          state: surface.getAttribute('data-overlay-state'),
+          transform: surfaceStyle.transform,
+          visibility: surfaceStyle.visibility,
+          style: styleSnapshot(surfaceStyle),
+          before: styleSnapshot(getComputedStyle(surface, '::before')),
+          after: styleSnapshot(getComputedStyle(surface, '::after')),
+          inlineGeometry: {
+            left: surface.style.left,
+            top: surface.style.top,
+            width: surface.style.width,
+            height: surface.style.height,
+            transform: surface.style.transform
+          },
+          harnessGeometryOverride: surface.hasAttribute('data-real-titlebar-edge-geometry-override'),
+          frameAndShadowRetained: Number.parseFloat(surfaceStyle.borderTopWidth) > 0 && surfaceStyle.boxShadow !== 'none',
+          contentRetained: surface.childElementCount > 0 && scrollViewportStyle?.display !== 'none' &&
+            scrollViewportStyle?.visibility !== 'hidden' && Number(scrollViewportStyle?.opacity ?? '1') > 0
+        },
+        portal: {
+          surfaceOutsideRoot: !root.contains(surface),
+          surfaceParent: surface.parentElement?.tagName ?? null,
+          surfaceAboveRootAtCentre: centreStack.indexOf(surface) >= 0 &&
+            centreStack.indexOf(root) >= 0 && centreStack.indexOf(surface) < centreStack.indexOf(root)
+        },
+        diagnostic: {
+          parentIsRoot: diagnostic.parentElement === root,
+          pointerEvents: getComputedStyle(diagnostic).pointerEvents,
+          rect: diagnosticRect,
+          coversSurface: diagnosticRect.left <= surfaceRect.left && diagnosticRect.top <= surfaceRect.top &&
+            diagnosticRect.left + diagnosticRect.width >= surfaceRect.left + surfaceRect.width &&
+            diagnosticRect.top + diagnosticRect.height >= surfaceRect.top + surfaceRect.height
+        },
         regional: {
-          rootFiltered: root?.getAttribute('data-overlay-regional-blur') === 'active',
-          inlineFilter: root instanceof HTMLElement ? root.style.filter : '',
-          defsCount: document.querySelectorAll('svg[data-overlay-regional-blur-defs="true"]').length,
           present: Boolean(filter),
           id: filter?.id ?? null,
-          target: filter?.getAttribute('data-overlay-regional-blur-target') ?? null,
-          filterUnits: filter?.getAttribute('filterUnits') ?? null,
-          primitiveUnits: filter?.getAttribute('primitiveUnits') ?? null,
+          rootFiltered: root.getAttribute('data-overlay-regional-blur') === 'active',
           fullTarget: filter?.getAttribute('data-overlay-regional-full-target') ?? null,
           maskCount: filter?.getAttribute('data-overlay-regional-mask-count') ?? null,
-          maskRect: mask ? {
-            left: Number(mask.getAttribute('x')),
-            top: Number(mask.getAttribute('y')),
-            width: Number(mask.getAttribute('width')),
-            height: Number(mask.getAttribute('height'))
-          } : null,
-          expectedOuterBorderBox: filter ? {
-            left: probeRect.left - root.getBoundingClientRect().left,
-            top: probeRect.top - root.getBoundingClientRect().top,
-            width: probeRect.width,
-            height: probeRect.height
-          } : null,
-          gaussian: gaussian ? { input: gaussian.getAttribute('in'), stdDeviation: gaussian.getAttribute('stdDeviation'), edgeMode: gaussian.getAttribute('edgeMode') } : null,
-          saturation: saturation ? { input: saturation.getAttribute('in'), type: saturation.getAttribute('type'), values: saturation.getAttribute('values') } : null
-        },
-        surface: {
-          backgroundImage: style.backgroundImage,
-          backdropFilter: style.backdropFilter,
-          webkitBackdropFilter: style.webkitBackdropFilter
-        },
-        child: {
-          present: Boolean(child),
-          backgroundColor: childStyle?.backgroundColor ?? null,
-          backgroundImage: childStyle?.backgroundImage ?? null,
-          backdropFilter: childStyle?.backdropFilter ?? null,
-          webkitBackdropFilter: childStyle?.webkitBackdropFilter ?? null
+          sourceFloodRect,
+          expectedOuterBorderBox,
+          sourceFloodEquality: sourceFloodRect
+            ? { applicable: true, passed: sourceFloodMatchesExpected }
+            : { applicable: false, passed: true, reason: 'sigma-zero-graph-disabled' },
+          clipCount: clips.length,
+          clipResult,
+          roundedResult,
+          downstreamClippedConsumers: countConsumers(clipResult),
+          downstreamRoundedConsumers: countConsumers(roundedResult)
         }
       };
     })()`
   );
+  if (!snapshot) throw new Error(`${surfaceSelector} disappeared during real edge capture`);
+  return { screenshotPath, ...snapshot };
+}
+
+async function mutateRealTitlebarPopupMaskToUnclipped(client) {
+  const mutation = await evaluate(
+    client,
+    `(() => {
+      if (window.__megleRealPopupMaskMutation) return { ok: false, reason: 'mutation-already-active' };
+      const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+      if (!filter) return { ok: false, reason: 'filter-missing' };
+      const clips = [...filter.querySelectorAll('feComposite[operator="in"]')].filter((node) =>
+        node.getAttribute('result')?.endsWith('-clipped')
+      );
+      const changes = [];
+      for (const clip of clips) {
+        const clipped = clip.getAttribute('result');
+        const rounded = clip.getAttribute('in');
+        if (!clipped || !rounded) continue;
+        for (const node of filter.querySelectorAll('*')) {
+          if (node === clip) continue;
+          for (const attribute of ['in', 'in2']) {
+            if (node.getAttribute(attribute) !== clipped) continue;
+            changes.push({ node, attribute, previous: clipped, replacement: rounded });
+            node.setAttribute(attribute, rounded);
+          }
+        }
+      }
+      window.__megleRealPopupMaskMutation = { filter, changes };
+      return {
+        ok: clips.length === 1 && changes.length >= 2,
+        filterId: filter.id,
+        clipCount: clips.length,
+        changedConsumerCount: changes.length,
+        changes: changes.map(({ node, attribute, previous, replacement }) => ({
+          node: node.tagName,
+          result: node.getAttribute('result'),
+          attribute,
+          previous,
+          replacement
+        }))
+      };
+    })()`
+  );
+  if (!mutation?.ok) throw new Error(`could not rewire real popup mask oracle: ${JSON.stringify(mutation)}`);
+  await delay(80);
+  return mutation;
+}
+
+async function restoreRealTitlebarPopupMaskClip(client) {
+  const restoration = await evaluate(
+    client,
+    `(() => {
+      const mutation = window.__megleRealPopupMaskMutation;
+      if (!mutation) return { restored: 0, active: false };
+      let restored = 0;
+      for (const change of mutation.changes) {
+        if (!change.node?.isConnected) continue;
+        change.node.setAttribute(change.attribute, change.previous);
+        restored++;
+      }
+      delete window.__megleRealPopupMaskMutation;
+      return { restored, active: false, filterConnected: mutation.filter?.isConnected === true };
+    })()`
+  );
+  await delay(80);
+  return restoration;
+}
+
+async function dismissRealTitlebarPopupEdgeCase(client, popupCase) {
+  await pressKey(client, "Escape", "Escape", 27);
+  await waitFor(
+    client,
+    `!document.querySelector(${JSON.stringify(popupCase.surfaceSelector)}) &&
+      document.querySelector(${JSON.stringify(popupCase.triggerSelector)})?.getAttribute('aria-expanded') !== 'true' &&
+      document.querySelector(${JSON.stringify(popupCase.triggerSelector)})?.getAttribute('aria-pressed') !== 'true' &&
+      document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') !== 'active' &&
+      !document.querySelector('filter[data-overlay-regional-blur-target="app-root"]')`,
+    10000,
+    `${popupCase.id} real dismissal and regional graph cleanup`
+  );
+  return evaluate(
+    client,
+    `(() => ({
+      surfacePresent: Boolean(document.querySelector(${JSON.stringify(popupCase.surfaceSelector)})),
+      triggerExpanded: document.querySelector(${JSON.stringify(popupCase.triggerSelector)})?.getAttribute('aria-expanded') ?? null,
+      triggerPressed: document.querySelector(${JSON.stringify(popupCase.triggerSelector)})?.getAttribute('aria-pressed') ?? null,
+      rootFiltered: document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') === 'active',
+      filterPresent: Boolean(document.querySelector('filter[data-overlay-regional-blur-target="app-root"]'))
+    }))()`
+  );
+}
+
+function popupEdgeFramePasses(edges) {
+  return edges?.length === 4 && edges.every((edge) =>
+    edge.inside?.mean >= 4 && edge.inside?.ratio >= 0.6 && edge.outside?.classified === 0
+  );
+}
+
+function popupEdgeControlPasses(edges) {
+  return edges?.length === 4 && edges.every((edge) =>
+    edge.inside?.mean <= 0.5 && edge.inside?.classified === 0 &&
+    edge.outside?.mean <= 0.5 && edge.outside?.classified === 0
+  );
+}
+
+async function captureRealTitlebarPopupEdgeCase(client, popupCase, configuredSigma) {
+  let mutationActive = false;
+  let cleanup = null;
+  await setRendererDialogBlurOverride(client, 0);
+  const diagnostic = await installRealTitlebarPopupDiagnostic(client);
   try {
-    if (!snapshot) throw new Error("real Library portal blur probe is missing");
-    const screenshotPath = await rendererScreenshot(client, name);
+    await client.send("Page.bringToFront");
+    await pressKey(client, "Escape", "Escape", 27);
+    await clickSelector(client, popupCase.triggerSelector);
+    await waitForRealTitlebarPopupEdgeSettled(client, popupCase.surfaceSelector, 0);
+
+    const zeroBefore = await captureRealTitlebarPopupEdgeFrame(
+      client,
+      popupCase.surfaceSelector,
+      `ui-real-titlebar-edge-${popupCase.id}-zero-before.png`,
+      0
+    );
+    await setRendererDialogBlurOverride(client, configuredSigma);
+    const configured = await captureRealTitlebarPopupEdgeFrame(
+      client,
+      popupCase.surfaceSelector,
+      `ui-real-titlebar-edge-${popupCase.id}-default.png`,
+      configuredSigma
+    );
+    await setRendererDialogBlurOverride(client, 0);
+    const zeroAfter = await captureRealTitlebarPopupEdgeFrame(
+      client,
+      popupCase.surfaceSelector,
+      `ui-real-titlebar-edge-${popupCase.id}-zero-after.png`,
+      0
+    );
+
+    await setRendererDialogBlurOverride(client, configuredSigma);
+    await waitForRealTitlebarPopupEdgeSettled(client, popupCase.surfaceSelector, configuredSigma);
+    const mutation = await mutateRealTitlebarPopupMaskToUnclipped(client);
+    mutationActive = true;
+    const legacyUnclipped = await captureRealTitlebarPopupEdgeFrame(
+      client,
+      popupCase.surfaceSelector,
+      `ui-real-titlebar-edge-${popupCase.id}-legacy-unclipped.png`,
+      configuredSigma,
+      false
+    );
+    const restoration = await restoreRealTitlebarPopupMaskClip(client);
+    mutationActive = false;
+    const restoredClipped = await captureRealTitlebarPopupEdgeFrame(
+      client,
+      popupCase.surfaceSelector,
+      `ui-real-titlebar-edge-${popupCase.id}-restored-clipped.png`,
+      configuredSigma,
+      false
+    );
+
+    const analysis = await analyzeRealTitlebarPopupEdgeFrames(
+      {
+        zeroBefore: zeroBefore.screenshotPath,
+        default: configured.screenshotPath,
+        zeroAfter: zeroAfter.screenshotPath,
+        legacyUnclipped: legacyUnclipped.screenshotPath,
+        restoredClipped: restoredClipped.screenshotPath
+      },
+      configured.viewport,
+      configured.surfaceRect,
+      configured.radius
+    );
+    const invariants = [zeroBefore, configured, zeroAfter].map((frame) => popupEdgeMaterialInvariant(frame));
+    const invariantSnapshotsEqual = invariants.every((value) =>
+      JSON.stringify(value) === JSON.stringify(invariants[0])
+    );
+    const blurSequencePassed =
+      near(Number.parseFloat(zeroBefore.dialogBlur), 0, 0.01) &&
+      near(Number.parseFloat(configured.dialogBlur), configuredSigma, 0.01) &&
+      near(Number.parseFloat(zeroAfter.dialogBlur), 0, 0.01);
+    const mutationDetected = analysis.legacyUnclippedVsZeroAfter?.some((edge) =>
+      edge.outside?.classified > 0
+    ) === true;
+    const restoredOutsideClean = analysis.restoredClippedVsZeroAfter?.every((edge) =>
+      edge.outside?.classified === 0
+    ) === true;
+    const sourceFloodEquality = [configured, legacyUnclipped, restoredClipped].every((frame) =>
+      frame.regional?.sourceFloodEquality?.passed === true
+    );
+    const topologyPassed =
+      configured.regional?.clipCount === 1 &&
+      configured.regional?.downstreamClippedConsumers >= 2 &&
+      configured.regional?.downstreamRoundedConsumers === 0 &&
+      legacyUnclipped.regional?.downstreamClippedConsumers === 0 &&
+      legacyUnclipped.regional?.downstreamRoundedConsumers >= 2 &&
+      restoredClipped.regional?.downstreamClippedConsumers >= 2 &&
+      restoredClipped.regional?.downstreamRoundedConsumers === 0 &&
+      restoration?.restored >= 2;
+    const frameContractPassed = [zeroBefore, configured, zeroAfter, legacyUnclipped, restoredClipped].every((frame) =>
+      near(frame.renderer?.devicePixelRatio, 1, 0.001) &&
+      near(frame.renderer?.visualViewportScale ?? 1, 1, 0.001) &&
+      frame.surface?.state === "open" &&
+      frame.surface?.transform === "none" &&
+      frame.surface?.harnessGeometryOverride === false &&
+      frame.surface?.frameAndShadowRetained === true &&
+      frame.surface?.contentRetained === true &&
+      frame.portal?.surfaceOutsideRoot === true &&
+      frame.portal?.surfaceAboveRootAtCentre === true &&
+      frame.diagnostic?.parentIsRoot === true &&
+      frame.diagnostic?.pointerEvents === "none" &&
+      frame.diagnostic?.coversSurface === true
+    );
+    cleanup = await dismissRealTitlebarPopupEdgeCase(client, popupCase);
+    const passed =
+      configuredSigma > 0 &&
+      blurSequencePassed &&
+      invariantSnapshotsEqual &&
+      sourceFloodEquality &&
+      topologyPassed &&
+      frameContractPassed &&
+      near(analysis.inferredScale?.x, 1, 0.001) &&
+      near(analysis.inferredScale?.y, 1, 0.001) &&
+      popupEdgeFramePasses(analysis.defaultVsZeroBefore) &&
+      popupEdgeControlPasses(analysis.zeroBeforeVsZeroAfter) &&
+      mutationDetected &&
+      restoredOutsideClean &&
+      cleanup.surfacePresent === false &&
+      cleanup.rootFiltered === false &&
+      cleanup.filterPresent === false;
     return {
-      screenshotPath,
-      ...snapshot,
-      analysis: await analyzeOverlayBlurScreenshot(
-        screenshotPath,
-        snapshot.viewport,
-        snapshot.probeRect,
-        snapshot.referenceRect,
-        snapshot.sampleRects
-      )
+      id: popupCase.id,
+      triggerSelector: popupCase.triggerSelector,
+      surfaceSelector: popupCase.surfaceSelector,
+      configuredSigma,
+      diagnostic,
+      frames: { zeroBefore, default: configured, zeroAfter, legacyUnclipped, restoredClipped },
+      mutation,
+      restoration,
+      cleanup,
+      blurSequencePassed,
+      invariantSnapshotsEqual,
+      sourceFloodEquality,
+      topologyPassed,
+      frameContractPassed,
+      mutationDetected,
+      restoredOutsideClean,
+      analysis,
+      passed
     };
   } finally {
-    await evaluate(client, `document.body.removeAttribute('data-real-portal-blur-sampling')`).catch(() => undefined);
+    if (mutationActive) await restoreRealTitlebarPopupMaskClip(client).catch(() => undefined);
+    if (!cleanup) await dismissRealTitlebarPopupEdgeCase(client, popupCase).catch(() => undefined);
+    await removeRealTitlebarPopupDiagnostic(client).catch(() => undefined);
   }
 }
 
-async function closeRealPortalBlurProbe(client) {
-  await pressKey(client, "Escape", "Escape", 27);
-  await waitForCompactPopoverState(client, null);
-  await evaluate(
+async function captureRealTitlebarPopupEdgeEvidence(client, configuredSigma, baselineDimensions) {
+  const previousDialogBlur = await evaluate(
     client,
-    `(() => {
-      document.querySelector('[data-real-portal-blur-reference="true"]')?.remove();
-      document.querySelector('style[data-real-portal-blur-sampling-style="true"]')?.remove();
-      document.body.removeAttribute('data-real-portal-blur-sampling');
-    })()`
+    `(() => ({
+      value: document.documentElement.style.getPropertyValue('--glass-dialog-blur'),
+      priority: document.documentElement.style.getPropertyPriority('--glass-dialog-blur')
+    }))()`
   );
-  await waitFor(
+  const cases = {};
+  await setRendererDeviceScale(
     client,
-    `document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') !== 'active' &&
-      !document.querySelector('filter[data-overlay-regional-blur-target="app-root"]')`,
-    10000,
-    "real Library portal regional graph cleanup"
+    1,
+    baselineDimensions,
+    "100 percent real titlebar popup edge device scale did not take effect"
   );
+  try {
+    for (const popupCase of [
+      {
+        id: "library-left",
+        triggerSelector: '[data-titlebar-control="library-switcher"]',
+        surfaceSelector: "#library-root"
+      },
+      {
+        id: "notifications-right",
+        triggerSelector: '[data-titlebar-control="notifications"]',
+        surfaceSelector: "#notifications-root"
+      }
+    ]) {
+      cases[popupCase.id] = await captureRealTitlebarPopupEdgeCase(
+        client,
+        popupCase,
+        configuredSigma
+      );
+    }
+  } finally {
+    await evaluate(client, `delete window.__megleRealPopupMaskMutation`).catch(() => undefined);
+    await removeRealTitlebarPopupDiagnostic(client).catch(() => undefined);
+    await restoreRendererDialogBlurOverride(client, previousDialogBlur).catch(() => undefined);
+    await clearRendererDeviceScale(client);
+  }
+  return {
+    scale: 1,
+    threshold: 3,
+    insideBandPhysicalPixels: [2, 5],
+    outsideBandPhysicalPixels: [1, 1],
+    configuredSigma,
+    cases,
+    passed: Object.keys(cases).length === 2 && Object.values(cases).every((entry) => entry.passed === true)
+  };
 }
 
 async function setRendererDialogBlurOverride(client, sigma) {
@@ -3960,69 +4408,26 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
           } finally {
             await clearRendererDeviceScale(appearanceClient);
           }
-          let realPortal = null;
-          const previousRealPortalBlur = await evaluate(
+          const realConfiguredState = await setSlider(id, initialSlider.value);
+          const realConfiguredSigma = sigmaFromState(realConfiguredState);
+          const mainBaselineDimensions = await evaluate(
             mainClient,
-            `(() => ({
-              value: document.documentElement.style.getPropertyValue('--glass-dialog-blur'),
-              priority: document.documentElement.style.getPropertyPriority('--glass-dialog-blur')
-            }))()`
+            `({ width: window.innerWidth, height: window.innerHeight })`
           );
-          try {
-            const realZeroState = await setSlider(id, initialSlider.min);
-            const realZeroSigma = sigmaFromState(realZeroState);
-            await setRendererDialogBlurOverride(mainClient, realZeroSigma);
-            await openRealPortalBlurProbe(mainClient);
-            const realZero = await captureRealPortalBlurEvidence(
-              mainClient,
-              "ui-real-portal-regional-zero.png",
-              realZeroSigma
-            );
-            await closeRealPortalBlurProbe(mainClient);
-            const realConfiguredState = await setSlider(id, initialSlider.value);
-            const realConfiguredSigma = sigmaFromState(realConfiguredState);
-            await setRendererDialogBlurOverride(mainClient, realConfiguredSigma);
-            await openRealPortalBlurProbe(mainClient);
-            const realConfigured = await captureRealPortalBlurEvidence(
-              mainClient,
-              "ui-real-portal-regional-default.png",
-              realConfiguredSigma
-            );
-            await closeRealPortalBlurProbe(mainClient);
-            const realMaximumState = await setSlider(id, initialSlider.max);
-            const realMaximumSigma = sigmaFromState(realMaximumState);
-            await setRendererDialogBlurOverride(mainClient, realMaximumSigma);
-            await openRealPortalBlurProbe(mainClient);
-            const realMaximum = await captureRealPortalBlurEvidence(
-              mainClient,
-              "ui-real-portal-regional-maximum.png",
-              realMaximumSigma
-            );
-            await closeRealPortalBlurProbe(mainClient);
-            realPortal = evaluateBlurScaleTriplet(
-              realZero.renderer.devicePixelRatio,
-              realZero,
-              realConfigured,
-              realMaximum,
-              {
-                zero: realZeroSigma,
-                configured: realConfiguredSigma,
-                maximum: realMaximumSigma
-              }
-            );
-          } finally {
-            await closeRealPortalBlurProbe(mainClient).catch(() => undefined);
-            await restoreRendererDialogBlurOverride(mainClient, previousRealPortalBlur).catch(() => undefined);
-          }
+          const realTitlebarEdges = await captureRealTitlebarPopupEdgeEvidence(
+            mainClient,
+            realConfiguredSigma,
+            mainBaselineDimensions
+          );
           defaultState = await setSlider(id, initialSlider.value);
           maxState = await setSlider(id, initialSlider.max);
           blurPixels = {
             scales: scaleTriplets,
             modalScales,
-            realPortal,
+            realTitlebarEdges,
             passed: ["100", "125", "150"].every((label) =>
               scaleTriplets[label]?.passed === true && modalScales[label]?.passed === true
-            ) && realPortal?.passed === true
+            ) && realTitlebarEdges?.passed === true
           };
         } else {
           defaultState = await setSlider(id, initialSlider.value);
@@ -6612,19 +7017,44 @@ try {
       hardFailures.push(`production modal did not preserve full-root regional blur at ${label}%`);
     }
   }
-  const realPortal = blurPixels?.realPortal;
+  const realTitlebarEdges = blurPixels?.realTitlebarEdges;
+  const realTitlebarCases = Object.values(realTitlebarEdges?.cases ?? {});
   if (
-    !realPortal?.passed ||
-    !realPortal.zero?.screenshotPath ||
-    !realPortal.default?.screenshotPath ||
-    !realPortal.maximum?.screenshotPath ||
-    realPortal.zero?.analysis?.independentImages?.rectCount < 2 ||
-    realPortal.zero?.analysis?.independentText?.rectCount < 2 ||
-    !regionalGraphMatchesForSummary(realPortal.zero, 0) ||
-    !regionalGraphMatchesForSummary(realPortal.default, realPortal.sigmas?.configured) ||
-    !regionalGraphMatchesForSummary(realPortal.maximum, realPortal.sigmas?.maximum)
+    realTitlebarEdges?.scale !== 1 ||
+    realTitlebarEdges?.threshold !== 3 ||
+    realTitlebarEdges?.passed !== true ||
+    realTitlebarCases.length !== 2 ||
+    realTitlebarCases.some((popupCase) => {
+      const frames = popupCase.frames;
+      const positiveFrames = [frames?.default, frames?.legacyUnclipped, frames?.restoredClipped];
+      return popupCase.passed !== true ||
+        popupCase.blurSequencePassed !== true ||
+        popupCase.invariantSnapshotsEqual !== true ||
+        popupCase.sourceFloodEquality !== true ||
+        popupCase.topologyPassed !== true ||
+        popupCase.frameContractPassed !== true ||
+        popupCase.mutationDetected !== true ||
+        popupCase.restoredOutsideClean !== true ||
+        !frames?.zeroBefore?.screenshotPath ||
+        !frames?.default?.screenshotPath ||
+        !frames?.zeroAfter?.screenshotPath ||
+        !frames?.legacyUnclipped?.screenshotPath ||
+        !frames?.restoredClipped?.screenshotPath ||
+        positiveFrames.some((frame) => frame?.regional?.sourceFloodEquality?.passed !== true) ||
+        !popupEdgeFramePasses(popupCase.analysis?.defaultVsZeroBefore) ||
+        !popupEdgeControlPasses(popupCase.analysis?.zeroBeforeVsZeroAfter) ||
+        popupCase.analysis?.legacyUnclippedVsZeroAfter?.some((edge) =>
+          edge.outside?.classified > 0
+        ) !== true ||
+        popupCase.analysis?.restoredClippedVsZeroAfter?.some((edge) =>
+          edge.outside?.classified !== 0
+        ) !== false ||
+        popupCase.cleanup?.surfacePresent !== false ||
+        popupCase.cleanup?.rootFiltered !== false ||
+        popupCase.cleanup?.filterPresent !== false;
+    })
   ) {
-    hardFailures.push("real Library portal did not prove flattened image and text blur");
+    hardFailures.push("real 100% left/right titlebar popups did not prove exact four-edge regional mask containment and mutation sensitivity");
   }
   for (const [group, ids] of Object.entries(appearanceMatrix?.groups ?? {})) {
     for (const id of ids) {
