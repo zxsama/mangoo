@@ -340,6 +340,13 @@ test("thumbnail priority scope changes coalesce without scenario request aborts"
   );
   assert.doesNotMatch(flush, /thumbnailPriorityScopeSyncControllerRef\.current\?\.abort\(\)/);
   assert.match(source, /if \(thumbnailPriorityScopeSyncTimerRef\.current === null\) \{\s*openThumbnailScopeSyncWindow\(\);/);
+  const reloadStart = source.indexOf("const reloadCurrentMedia");
+  const reloadEnd = source.indexOf("const refreshCurrentScanView", reloadStart);
+  const reload = source.slice(reloadStart, reloadEnd);
+  assert.ok(reloadStart >= 0 && reloadEnd > reloadStart);
+  assert.match(reload, /const requestGeneration = \+\+mediaPageGeneration\.current;\s*retireStaleMediaPageRequests\(\)/);
+  assert.match(source, /mediaPageGeneration\.current[\s\S]*?return;/);
+  assert.match(source, /abortAllControllers\(mediaPageControllersRef\.current\)/);
 });
 
 test("departed preview consumers keep the shared cacheable request alive", async () => {

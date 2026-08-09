@@ -707,6 +707,16 @@ export function useLibraryData(
     }
   }, []);
 
+  const retireStaleMediaPageRequests = useCallback(() => {
+    // Same-library refreshes already fence late results with
+    // mediaPageGeneration. Detach those requests from the active viewport and
+    // let their bounded HTTP responses finish; hard cancellation remains for
+    // library switches and unmount teardown.
+    mediaPageControllersRef.current.clear();
+    inFlightMediaPageKeys.current.clear();
+    setLoadingMoreMedia(false);
+  }, []);
+
   const abortStaleFolderRequests = useCallback(() => {
     abortAllControllers(folderChildControllersRef.current);
     abortAllControllers(folderDescendantControllersRef.current);
@@ -1922,7 +1932,7 @@ export function useLibraryData(
       }
 
       const requestGeneration = ++mediaPageGeneration.current;
-      abortStaleMediaPageRequests();
+      retireStaleMediaPageRequests();
       const rootId = scope?.rootId ?? selectedRootId;
       const setLoadingState = scope?.setLoadingState ?? false;
       if (setLoadingState) {
@@ -1996,7 +2006,7 @@ export function useLibraryData(
       isCurrentScanRefreshSelection,
       loadMediaPage,
       loadMediaWindow,
-      abortStaleMediaPageRequests,
+      retireStaleMediaPageRequests,
       roots,
       selectedFolderId,
       selectedRootId
