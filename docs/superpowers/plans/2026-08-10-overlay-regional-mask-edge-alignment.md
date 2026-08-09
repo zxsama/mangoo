@@ -84,7 +84,14 @@
 
 ## Task 5: Commit and hand off safely
 
-- [ ] Inspect `git status --short` and stage only the files listed in this plan.
-- [ ] Commit with `fix(web): clip regional overlay mask edges`.
-- [ ] Verify the user's unrelated dirty changes in `D:\Megle` are unchanged, then cherry-pick only this commit onto the active branch.
-- [ ] Re-run the focused overlay lifecycle test from the active workspace and report the physical-monitor check still recommended for final AA confirmation.
+- [x] Inspect `git status --short` and stage only the files listed in this plan.
+- [x] Preserve the six reviewed implementation/test/documentation commits from the isolated branch instead of squashing their TDD history.
+- [x] Verify the user's 29 unrelated dirty entries do not overlap the nine touched paths, then cherry-pick only `e166bb5..53b2399` onto `perf/million-thumbnail-hotloop`.
+- [x] Verify the integrated commit tree equals the fully tested isolated tree and re-run the focused overlay lifecycle test (`12/12`); retain physical-monitor inspection as the final anti-aliasing confirmation.
+
+### Handoff record
+
+- Integrated commits: `701cb43`, `59bf9c6`, `fe9f681`, `f8a33b5`, `18bd1ce`, `44387b0`.
+- Isolated and integrated committed trees both resolve to `cca106b5452eefe89a03402c8ec2a570f44395ce`.
+- The active workspace remains on `perf/million-thumbnail-hotloop`; its pre-existing 29 dirty entries are unchanged and none overlap this change.
+- Post-integration focused lifecycle verification: exit `0`, `12/12` passed.
