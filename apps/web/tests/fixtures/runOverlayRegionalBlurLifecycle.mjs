@@ -28,6 +28,69 @@ async function setPhase(fixtureWindow, phase) {
   );
 }
 
+async function captureMaskContract(fixtureWindow, surfaceSelector) {
+  return await evaluate(fixtureWindow, `(() => {
+    const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+    const number = (element, name) => Number(element?.getAttribute(name) ?? NaN);
+    const rect = (element) => element ? {
+      left: number(element, 'x'),
+      top: number(element, 'y'),
+      width: number(element, 'width'),
+      height: number(element, 'height')
+    } : null;
+    const surface = document.querySelector(${JSON.stringify(surfaceSelector)});
+    const root = document.querySelector('#root');
+    const outerBorderBox = surface instanceof HTMLElement && root instanceof HTMLElement ? {
+      left: surface.offsetLeft - root.getBoundingClientRect().left,
+      top: surface.offsetTop - root.getBoundingClientRect().top,
+      width: surface.offsetWidth,
+      height: surface.offsetHeight
+    } : null;
+    const masks = [...(filter?.querySelectorAll('[data-overlay-regional-mask-primitive="true"]') ?? [])]
+      .map((source, index) => {
+        const sourceResult = source.getAttribute('result') ?? null;
+        const rounding = sourceResult
+          ? filter?.querySelector('feGaussianBlur[data-overlay-regional-mask-rounding="true"][in="' + sourceResult + '"]') ?? null
+          : null;
+        const roundedAlpha = rounding
+          ? filter?.querySelector('feComponentTransfer[in="' + rounding.getAttribute('result') + '"]') ?? null
+          : null;
+        const clipResult = 'regional-mask-' + index + '-clipped';
+        const sourceClip = filter?.querySelector('feComposite[result="' + clipResult + '"]') ?? null;
+        return {
+          source: { result: sourceResult, rect: rect(source) },
+          rounding: rounding ? {
+            result: rounding.getAttribute('result') ?? null,
+            rect: rect(rounding),
+            stdDeviation: rounding.getAttribute('stdDeviation') ?? null
+          } : null,
+          roundedAlphaResult: roundedAlpha?.getAttribute('result') ?? null,
+          sourceClip: sourceClip ? {
+            in: sourceClip.getAttribute('in') ?? null,
+            in2: sourceClip.getAttribute('in2') ?? null,
+            operator: sourceClip.getAttribute('operator') ?? null,
+            result: sourceClip.getAttribute('result') ?? null
+          } : null
+        };
+      });
+    const union = filter?.querySelector('feMerge[result="regional-mask-union"]') ?? null;
+    const downstreamMaskInputs = [...(filter?.querySelectorAll('feComposite') ?? [])]
+      .filter((primitive) => ['blurred-inside', 'clear-outside'].includes(primitive.getAttribute('result') ?? ''))
+      .map((primitive) => ({
+        result: primitive.getAttribute('result') ?? null,
+        in2: primitive.getAttribute('in2') ?? null
+      }));
+    return {
+      outerBorderBox,
+      masks,
+      unionInputs: union
+        ? [...union.querySelectorAll(':scope > feMergeNode')].map((node) => node.getAttribute('in') ?? null)
+        : null,
+      downstreamMaskInputs
+    };
+  })()`);
+}
+
 async function main() {
   await app.whenReady();
   const fixtureWindow = new BrowserWindow({
@@ -197,6 +260,7 @@ async function main() {
         surfaceAfterBoxShadow: surfaceAfterStyle?.boxShadow ?? null
       };
     })()`);
+    const rootMaskContract = await captureMaskContract(fixtureWindow, '#regional-lifecycle-root');
     const stableFilterId = await evaluate(
       fixtureWindow,
       `document.querySelector('filter[data-overlay-regional-blur-target="app-root"]')?.id ?? ''`
@@ -278,6 +342,7 @@ async function main() {
       lowerSurfaceFiltered: document.querySelector('#regional-lifecycle-root')?.getAttribute('data-overlay-regional-blur') === 'active',
       topSurfaceFiltered: document.querySelector('#regional-lifecycle-nested')?.getAttribute('data-overlay-regional-blur') === 'active'
     }))()`);
+    const nestedMaskContract = await captureMaskContract(fixtureWindow, '#regional-lifecycle-root');
 
     await setPhase(fixtureWindow, "modal");
     await waitFor(
@@ -289,6 +354,7 @@ async function main() {
       rootMaskCoversTarget: document.querySelector('filter[data-overlay-regional-blur-target="app-root"]')?.getAttribute('data-overlay-regional-full-target') === 'true',
       modalSurfaceFiltered: document.querySelector('#regional-lifecycle-modal')?.getAttribute('data-overlay-regional-blur') === 'active'
     }))()`);
+    const modalMaskContract = await captureMaskContract(fixtureWindow, '#root');
 
     const modalPoppedByNextFrame = await evaluate(fixtureWindow, `(async () => {
       window.dispatchEvent(new CustomEvent("megle-regional-blur-phase", { detail: "nested" }));
@@ -379,7 +445,21 @@ async function main() {
       rootFiltered: document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') === 'active'
     })`);
 
-    return { ok: true, root, firstFrame, nested, modal, cleanup, fallback, zeroBlur, stability, atomic };
+    return {
+      ok: true,
+      root,
+      rootMaskContract,
+      firstFrame,
+      nested,
+      nestedMaskContract,
+      modal,
+      modalMaskContract,
+      cleanup,
+      fallback,
+      zeroBlur,
+      stability,
+      atomic
+    };
   } finally {
     fixtureWindow.destroy();
   }

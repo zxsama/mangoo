@@ -27,6 +27,7 @@ interface RegionalBlurLifecycleResult {
     surfaceBorderStyle: string | null;
     surfaceBorderWidth: string | null;
   };
+  rootMaskContract: MaskContract;
   firstFrame: {
     activeCount: number;
     everyActiveMaskUsesOuterBorderBox: boolean;
@@ -43,10 +44,12 @@ interface RegionalBlurLifecycleResult {
     lowerSurfaceFiltered: boolean;
     topSurfaceFiltered: boolean;
   };
+  nestedMaskContract: MaskContract;
   modal: {
     modalSurfaceFiltered: boolean;
     rootMaskCoversTarget: boolean;
   };
+  modalMaskContract: MaskContract;
   cleanup: {
     defsPresent: boolean;
     rootInlineFilter: string;
@@ -67,6 +70,30 @@ interface RegionalBlurLifecycleResult {
     nestedPoppedByNextFrame: boolean;
     rapidStackMatchesLatestByNextFrame: boolean;
   };
+}
+
+interface MaskContract {
+  outerBorderBox: { left: number; top: number; width: number; height: number } | null;
+  masks: Array<{
+    source: {
+      result: string | null;
+      rect: { left: number; top: number; width: number; height: number } | null;
+    };
+    rounding: {
+      result: string | null;
+      rect: { left: number; top: number; width: number; height: number } | null;
+      stdDeviation: string | null;
+    } | null;
+    roundedAlphaResult: string | null;
+    sourceClip: {
+      in: string | null;
+      in2: string | null;
+      operator: string | null;
+      result: string | null;
+    } | null;
+  }>;
+  unionInputs: Array<string | null> | null;
+  downstreamMaskInputs: Array<{ result: string | null; in2: string | null }>;
 }
 
 const webRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -139,6 +166,30 @@ after(async () => {
 });
 
 describe("mounted overlay regional blur lifecycle", () => {
+  it("clips each rounded alpha back to its complete source outer border box", () => {
+    const [mask] = result.rootMaskContract.masks;
+    assert.deepEqual(mask?.source.rect, result.rootMaskContract.outerBorderBox);
+    assert.ok(mask?.rounding, JSON.stringify(result.rootMaskContract));
+    assert.ok(
+      mask.rounding.rect.left < mask.source.rect.left &&
+        mask.rounding.rect.top < mask.source.rect.top &&
+        mask.rounding.rect.width > mask.source.rect.width &&
+        mask.rounding.rect.height > mask.source.rect.height,
+      JSON.stringify(result.rootMaskContract)
+    );
+    assert.equal(mask.roundedAlphaResult, "regional-mask-0-rounded");
+    assert.deepEqual(mask.sourceClip, {
+      in: "regional-mask-0-rounded",
+      in2: "regional-mask-0-source",
+      operator: "in",
+      result: "regional-mask-0-clipped"
+    });
+    assert.deepEqual(result.rootMaskContract.downstreamMaskInputs, [
+      { result: "blurred-inside", in2: "regional-mask-0-clipped" },
+      { result: "clear-outside", in2: "regional-mask-0-clipped" }
+    ]);
+  });
+
   it("flattens SourceGraphic through a synchronous rounded Gaussian mask", () => {
     assert.equal(result.root.rootFiltered, true);
     assert.equal(result.root.gaussianInput, "SourceGraphic");
@@ -183,9 +234,44 @@ describe("mounted overlay regional blur lifecycle", () => {
     assert.equal(result.nested.topSurfaceFiltered, false);
   });
 
+  it("clips every rounded mask before union and feeds the union downstream", () => {
+    const { masks, unionInputs, downstreamMaskInputs } = result.nestedMaskContract;
+    assert.equal(masks.length, 2, JSON.stringify(result.nestedMaskContract));
+    for (const [index, mask] of masks.entries()) {
+      assert.equal(mask.source.result, `regional-mask-${index}-source`);
+      assert.equal(mask.roundedAlphaResult, `regional-mask-${index}-rounded`);
+      assert.deepEqual(mask.sourceClip, {
+        in: `regional-mask-${index}-rounded`,
+        in2: `regional-mask-${index}-source`,
+        operator: "in",
+        result: `regional-mask-${index}-clipped`
+      });
+    }
+    assert.deepEqual(unionInputs, ["regional-mask-0-clipped", "regional-mask-1-clipped"]);
+    assert.deepEqual(downstreamMaskInputs, [
+      { result: "blurred-inside", in2: "regional-mask-union" },
+      { result: "clear-outside", in2: "regional-mask-union" }
+    ]);
+  });
+
   it("expands a modal mask to every complete lower target", () => {
     assert.equal(result.modal.rootMaskCoversTarget, true);
     assert.equal(result.modal.modalSurfaceFiltered, false);
+  });
+
+  it("uses the exact source flood for a radius-zero full-target mask", () => {
+    const [mask] = result.modalMaskContract.masks;
+    assert.equal(result.modalMaskContract.masks.length, 1, JSON.stringify(result.modalMaskContract));
+    assert.deepEqual(mask?.source.rect, result.modalMaskContract.outerBorderBox);
+    assert.equal(mask?.source.result, "regional-mask-0-source");
+    assert.equal(mask?.rounding, null);
+    assert.equal(mask?.roundedAlphaResult, null);
+    assert.equal(mask?.sourceClip, null);
+    assert.equal(result.modalMaskContract.unionInputs, null);
+    assert.deepEqual(result.modalMaskContract.downstreamMaskInputs, [
+      { result: "blurred-inside", in2: "regional-mask-0-source" },
+      { result: "clear-outside", in2: "regional-mask-0-source" }
+    ]);
   });
 
   it("restores prior inline filters and removes generated definitions", () => {
