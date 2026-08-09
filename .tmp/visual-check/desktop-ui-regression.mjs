@@ -2816,11 +2816,34 @@ async function settingsInterfaceStyleEvidence(client) {
     const evidenceBefore = await evaluate(settingsClient, settingsInterfaceStyleEvidenceExpression());
     const appearanceMatrix = await settingsAppearanceMatrix(settingsClient, client);
     await settingsClient.send("Page.bringToFront");
+    await waitFor(
+      settingsClient,
+      `document.hasFocus()`,
+      5000,
+      "Settings window focus before pointer probe"
+    );
     const pointSettingsSlider = await moveToSelector(
       settingsClient,
       '[data-settings-slider-control="side-blur"]',
       0.27,
       0.5
+    );
+    await waitFor(
+      settingsClient,
+      `(() => {
+        const element = document.querySelector('[data-settings-slider-control="side-blur"]');
+        if (!element) return false;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        const x = Number.parseFloat(style.getPropertyValue("--interactive-pointer-x"));
+        const y = Number.parseFloat(style.getPropertyValue("--interactive-pointer-y"));
+        return element.getAttribute("data-interactive-pointer-target") === "true" &&
+          Number(style.getPropertyValue("--interactive-pointer-opacity")) > 0 &&
+          Math.abs(x - (${pointSettingsSlider.x} - rect.left)) <= 1 &&
+          Math.abs(y - (${pointSettingsSlider.y} - rect.top)) <= 1;
+      })()`,
+      5000,
+      "Settings slider production pointer driver"
     );
     const pointerSettingsSlider = await evaluate(settingsClient, pointerEvidenceExpression());
     const beforeSideBlur = evidenceBefore.sideBlur;
