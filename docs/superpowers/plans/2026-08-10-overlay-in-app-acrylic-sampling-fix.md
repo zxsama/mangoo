@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Implemented and automated real-window verification green on 2026-08-10. A final physical-monitor appearance check remains user-verifiable because CDP captures do not reproduce on-display anti-aliasing.
+**Status:** Task 4 complete on 2026-08-10; automated verification green and same-reviewer Spec/Quality review passed.
 
 **Goal:** Make renderer popups and Rename/Move To modals blur the final, flattened application scene so independent images, clipped boxes, and text boundaries become uniformly frosted while content outside the overlay stays sharp.
 
@@ -22,6 +22,9 @@
 - Reduced transparency, unsupported SVG filters, forced visual fallback, and `0px` blur remove every generated filter; fallback fill stays `rgba(18, 24, 30, 0.98)` on the overlay surface.
 - Stack and direct surface/root mutations update synchronously before paint; resize and captured-scroll work is event-driven and coalesced with animation frames. No continuous polling or screenshot/capture IPC is added.
 - The current checkout contains unrelated user work and the earlier interrupted overlay attempt. Work in place because this is a continuation, preserve unrelated changes, and stage only files named by this plan.
+- A regional popup mask always uses the complete outer border box and outer radius. Do not inset it for the new real border.
+- The frame target is the exact historical `backdrop` probe: gradient and `1px solid rgba(255, 255, 255, 0.3)` border on the same element, with no overlay `::after` border or inset edge shadow.
+- The 100% renderer capture is independently mandatory for frame alignment; 125% and 150% remain additional scale coverage, not the reason this defect is detectable.
 
 ---
 
@@ -330,6 +333,48 @@ Expected: every command exits 0; only plan-named overlay files are staged; unrel
 git commit -m "test(ui): verify flattened overlay frost on real content"
 ```
 
+---
+
+### Task 4: Stabilize the First Frame and Reproduce the Historical Popup Frame
+
+**Files:**
+- Modify: `apps/web/src/design/overlays/overlayRegionalBlur.ts`
+- Modify: `apps/web/src/design/overlays/overlay.css`
+- Modify: `apps/web/tests/fixtures/runOverlayRegionalBlurLifecycle.mjs`
+- Modify: `apps/web/tests/overlayRegionalBlurLifecycle.test.mts`
+- Modify: `apps/web/tests/overlayContract.test.mts`
+- Modify: `tools/checks/validate-ui-design.mjs`
+- Modify: `apps/web/tests/fixtures/overlayAppearanceVisualFixture.tsx`
+- Modify: `apps/web/tests/fixtures/overlayAppearanceVisualFixture.css`
+- Modify: `.tmp/visual-check/desktop-ui-regression.mjs`
+- Modify: this spec and plan
+
+**Historical reference:** `.tmp/regional-filter-probe/main.cjs` captured `baseline`, `backdrop`, and `regional` in that order. The requested second image is `backdrop.png`; its source frame is `border: 1px solid rgba(255,255,255,.3)` and the 108-degree gradient on the same `#surface` element.
+
+- [x] **Step 1: Write and run the first-frame lifecycle regression RED**
+
+Install a mutation/animation-frame trace before opening the real `AnchoredOverlay`. Every active root-filter snapshot must have a visible, finite, positive surface box at its final non-origin position, and its first mask must equal the complete outer surface border box. The current implementation must fail because it registers the hidden `left:0; top:0` pre-layout surface.
+
+- [x] **Step 2: Write and run the frame contract RED**
+
+Require the mounted surface to report a real `1px solid rgba(255, 255, 255, 0.3)` border on the gradient owner, while `::after` reports no border and no inset edge shadow. Add a controlled real-popup renderer capture at device scale `1.0`; its hard pass must confirm a visible one-physical-pixel stroke and no classified fill pixels outside the stroke envelope. Keep the existing 1.25/1.5 matrix as secondary coverage. The current pseudo-plane implementation must fail.
+
+- [x] **Step 3: Reject hidden or invalid geometry without changing mask bounds**
+
+In `collectGeometry`, read each surface style and border box once. Exclude disconnected surfaces, `visibility:hidden`, `display:none`, non-finite boxes, and boxes whose width or height is not positive. Let the existing surface `style` observer synchronously rebuild when the positioned visible style lands. Continue passing the unmodified outer `getBoundingClientRect()` and computed outer radius to the planner; do not subtract the border.
+
+- [x] **Step 4: Move the historical frame onto the real surface**
+
+Paint `border: 1px solid rgba(255, 255, 255, 0.3)` on `.overlay-surface` itself, keep the approved gradient on that same element, and suppress the generic overlay `::after` border and inset edge shadow. Remove or override feature `border:0` rules that would erase the shared frame. Do not add `background-clip: padding-box` or a regional-mask inset; neither exists in the approved historical probe.
+
+- [x] **Step 5: Run focused and full verification GREEN**
+
+Run the lifecycle/contract tests first, then `npm run check:ui-design`, `npm run check:web`, `npm run check:desktop`, the OS-backdrop harness, `npm test`, and `git diff --check`. Verify the 100% frame result separately in the harness summary and ensure no Electron process remains.
+
+- [x] **Step 6: Same-reviewer Spec and Quality review, then commit**
+
+Use the existing overlay reviewer for both verdicts. Stage only Task 4 files and create one focused commit without touching unrelated user work.
+
 ## Self-Review
 
 - Spec coverage: regional root/nested masks, modal full-target masks, cleanup/fallback, right-pane material, zero/default/maximum blur, real replaced-image boundaries, and 100/125/150 scale evidence all map to Tasks 1-3.
@@ -343,3 +388,6 @@ git commit -m "test(ui): verify flattened overlay frost on real content"
 - Real Library popup at `34px`: independent image-boundary energy `40.3865 -> 0.3793` (`0.94%` retained), DOM label energy `19.2672 -> 0.3324` (`1.73%` retained), boundary/interior ratio `1.1035`, outside-reference MAD `0`.
 - `100%`, `125%`, and `150%` popup captures inferred physical scales `1`, `1.25`, and `1.5`; all image/text, graph, cleanup, and outside-reference checks passed.
 - The shared production modal reported `fullTarget="true"`, `stdDeviation="34"`, inert surface/direct-backdrop filters, and a sharp foreground at all three scales.
+- Task 4 RED trace: the first graph used a hidden surface at `0,-4,166.78125 x 190`; the final graph was `160,96,280 x 190`. The new gate removes every hidden/invalid active entry without changing outer mask geometry.
+- Task 4 100% outline result: historical reference and production surface have identical `548 x 274` outer rectangles; all four edge shifts, fill/full/stroke residuals, and four corner residuals are `0`; background outside the reference stroke is `0` pixels.
+- Task 4 verification: focused lifecycle `9/9`, overlay contract `10/10`, `check:ui-design`, `check:web`, `check:desktop`, OS-backdrop desktop harness, `git diff --check`, and `npm test` all passed; Rust reported `479 passed, 0 failed, 2 ignored`.

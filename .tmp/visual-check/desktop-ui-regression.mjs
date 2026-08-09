@@ -577,6 +577,200 @@ function referencePixelDelta(left, right) {
   return Number((total / leftPixels.length).toFixed(4));
 }
 
+async function analyzeOverlaySurfaceOutlineFrames(paths, viewport, surfaceRect) {
+  const escapedPaths = Object.fromEntries(Object.entries(paths).map(([key, value]) => [
+    key,
+    value.replace(/'/g, "''")
+  ]));
+  const serializedRect = JSON.stringify(surfaceRect).replace(/'/g, "''");
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+$paths = @{
+  base = '${escapedPaths.base}'
+  referenceFill = '${escapedPaths.referenceFill}'
+  referenceFull = '${escapedPaths.referenceFull}'
+  productionFill = '${escapedPaths.productionFill}'
+  productionFull = '${escapedPaths.productionFull}'
+}
+$rect = '${serializedRect}' | ConvertFrom-Json
+$bitmaps = @{}
+foreach ($entry in $paths.GetEnumerator()) {
+  $bitmaps[$entry.Key] = [System.Drawing.Bitmap]::FromFile($entry.Value)
+}
+try {
+  $base = $bitmaps.base
+  $scaleX = $base.Width / ${Math.round(viewport.width)}
+  $scaleY = $base.Height / ${Math.round(viewport.height)}
+  $left = [Math]::Round($rect.left * $scaleX)
+  $top = [Math]::Round($rect.top * $scaleY)
+  $right = [Math]::Round(($rect.left + $rect.width) * $scaleX)
+  $bottom = [Math]::Round(($rect.top + $rect.height) * $scaleY)
+
+  function PixelDelta($leftPixel, $rightPixel) {
+    return ([Math]::Abs([double]$leftPixel.R - $rightPixel.R) +
+      [Math]::Abs([double]$leftPixel.G - $rightPixel.G) +
+      [Math]::Abs([double]$leftPixel.B - $rightPixel.B)) / 3.0
+  }
+
+  function RegionResidual($leftBitmap, $rightBitmap, $x1, $y1, $x2, $y2, $shiftX, $shiftY) {
+    $sum = 0.0
+    $count = 0
+    for ($y = $y1; $y -lt $y2; $y++) {
+      for ($x = $x1; $x -lt $x2; $x++) {
+        $rx = $x + $shiftX
+        $ry = $y + $shiftY
+        if ($x -lt 0 -or $y -lt 0 -or $x -ge $leftBitmap.Width -or $y -ge $leftBitmap.Height) { continue }
+        if ($rx -lt 0 -or $ry -lt 0 -or $rx -ge $rightBitmap.Width -or $ry -ge $rightBitmap.Height) { continue }
+        $sum += PixelDelta ($leftBitmap.GetPixel($x, $y)) ($rightBitmap.GetPixel($rx, $ry))
+        $count += 1
+      }
+    }
+    if ($count -gt 0) { return $sum / $count }
+    return 9999
+  }
+
+  function StrokeResidual($x1, $y1, $x2, $y2, $shiftX, $shiftY) {
+    $sum = 0.0
+    $count = 0
+    for ($y = $y1; $y -lt $y2; $y++) {
+      for ($x = $x1; $x -lt $x2; $x++) {
+        $rx = $x + $shiftX
+        $ry = $y + $shiftY
+        if ($x -lt 0 -or $y -lt 0 -or $x -ge $base.Width -or $y -ge $base.Height) { continue }
+        if ($rx -lt 0 -or $ry -lt 0 -or $rx -ge $base.Width -or $ry -ge $base.Height) { continue }
+        $referenceFull = $bitmaps.referenceFull.GetPixel($rx, $ry)
+        $referenceFill = $bitmaps.referenceFill.GetPixel($rx, $ry)
+        $productionFull = $bitmaps.productionFull.GetPixel($x, $y)
+        $productionFill = $bitmaps.productionFill.GetPixel($x, $y)
+        $sum += ([Math]::Abs(([double]$productionFull.R - $productionFill.R) - ([double]$referenceFull.R - $referenceFill.R)) +
+          [Math]::Abs(([double]$productionFull.G - $productionFill.G) - ([double]$referenceFull.G - $referenceFill.G)) +
+          [Math]::Abs(([double]$productionFull.B - $productionFill.B) - ([double]$referenceFull.B - $referenceFill.B))) / 3.0
+        $count += 1
+      }
+    }
+    if ($count -gt 0) { return $sum / $count }
+    return 9999
+  }
+
+  function SideResult($name, $x1, $y1, $x2, $y2, $axis) {
+    $candidates = @()
+    foreach ($shift in -2..2) {
+      $shiftX = if ($axis -eq 'x') { $shift } else { 0 }
+      $shiftY = if ($axis -eq 'y') { $shift } else { 0 }
+      $candidates += [pscustomobject]@{
+        shift = $shift
+        fullMad = [Math]::Round((RegionResidual $bitmaps.productionFull $bitmaps.referenceFull $x1 $y1 $x2 $y2 $shiftX $shiftY), 4)
+        strokeMad = [Math]::Round((StrokeResidual $x1 $y1 $x2 $y2 $shiftX $shiftY), 4)
+      }
+    }
+    $best = $candidates | Sort-Object @{ Expression = { $_.fullMad + $_.strokeMad } }, @{ Expression = { [Math]::Abs($_.shift) } } | Select-Object -First 1
+    $zero = $candidates | Where-Object { $_.shift -eq 0 } | Select-Object -First 1
+    return [pscustomobject]@{
+      name = $name
+      bestShift = $best.shift
+      bestFullMad = $best.fullMad
+      bestStrokeMad = $best.strokeMad
+      zeroFullMad = $zero.fullMad
+      zeroStrokeMad = $zero.strokeMad
+    }
+  }
+
+  $cut = [Math]::Round(32 * [Math]::Min($scaleX, $scaleY))
+  $band = [Math]::Max(4, [Math]::Round(5 * [Math]::Min($scaleX, $scaleY)))
+  $sides = @(
+    (SideResult 'top' ($left + $cut) ($top - $band) ($right - $cut) ($top + $band) 'y'),
+    (SideResult 'right' ($right - $band) ($top + $cut) ($right + $band) ($bottom - $cut) 'x'),
+    (SideResult 'bottom' ($left + $cut) ($bottom - $band) ($right - $cut) ($bottom + $band) 'y'),
+    (SideResult 'left' ($left - $band) ($top + $cut) ($left + $band) ($bottom - $cut) 'x')
+  )
+
+  $cornerSize = [Math]::Round(32 * [Math]::Min($scaleX, $scaleY))
+  $cornerMargin = [Math]::Max(3, [Math]::Round(3 * [Math]::Min($scaleX, $scaleY)))
+  $cornerRegions = @(
+    [pscustomobject]@{ x1 = $left - $cornerMargin; y1 = $top - $cornerMargin; x2 = $left + $cornerSize; y2 = $top + $cornerSize }
+    [pscustomobject]@{ x1 = $right - $cornerSize; y1 = $top - $cornerMargin; x2 = $right + $cornerMargin; y2 = $top + $cornerSize }
+    [pscustomobject]@{ x1 = $right - $cornerSize; y1 = $bottom - $cornerSize; x2 = $right + $cornerMargin; y2 = $bottom + $cornerMargin }
+    [pscustomobject]@{ x1 = $left - $cornerMargin; y1 = $bottom - $cornerSize; x2 = $left + $cornerSize; y2 = $bottom + $cornerMargin }
+  )
+  $corners = @()
+  foreach ($region in $cornerRegions) {
+    $corners += [pscustomobject]@{
+      fullMad = [Math]::Round((RegionResidual $bitmaps.productionFull $bitmaps.referenceFull $region.x1 $region.y1 $region.x2 $region.y2 0 0), 4)
+      strokeMad = [Math]::Round((StrokeResidual $region.x1 $region.y1 $region.x2 $region.y2 0 0), 4)
+    }
+  }
+
+  $ringLeft = $left - $cornerMargin
+  $ringTop = $top - $cornerMargin
+  $ringRight = $right + $cornerMargin
+  $ringBottom = $bottom + $cornerMargin
+  $outsideCount = 0
+  $referenceSignalSum = 0.0
+  $productionSignalSum = 0.0
+  $strokeSignalSum = 0.0
+  $signalCount = 0
+  for ($y = $ringTop; $y -lt $ringBottom; $y++) {
+    for ($x = $ringLeft; $x -lt $ringRight; $x++) {
+      $nearEdge = $x -lt $left + $band -or $x -ge $right - $band -or $y -lt $top + $band -or $y -ge $bottom - $band
+      if (-not $nearEdge -or $x -lt 0 -or $y -lt 0 -or $x -ge $base.Width -or $y -ge $base.Height) { continue }
+      $basePixel = $bitmaps.base.GetPixel($x, $y)
+      $referenceSignal = PixelDelta ($bitmaps.referenceFull.GetPixel($x, $y)) $basePixel
+      $productionSignal = PixelDelta ($bitmaps.productionFull.GetPixel($x, $y)) $basePixel
+      $strokeSignal = PixelDelta ($bitmaps.productionFull.GetPixel($x, $y)) ($bitmaps.productionFill.GetPixel($x, $y))
+      if ($referenceSignal -le 2 -and $productionSignal -gt 3) { $outsideCount += 1 }
+      $referenceSignalSum += $referenceSignal
+      $productionSignalSum += $productionSignal
+      $strokeSignalSum += $strokeSignal
+      $signalCount += 1
+    }
+  }
+
+  [pscustomobject]@{
+    image = @{ width = $base.Width; height = $base.Height }
+    inferredScale = @{ x = [Math]::Round($scaleX, 3); y = [Math]::Round($scaleY, 3) }
+    physicalRect = @{ left = $left; top = $top; width = $right - $left; height = $bottom - $top }
+    sides = $sides
+    corners = $corners
+    backgroundOutsideReferencePixelCount = $outsideCount
+    backgroundOutsideStrokePx = ($sides | ForEach-Object { [Math]::Abs([int]$_.bestShift) } | Measure-Object -Maximum).Maximum
+    referenceEdgeSignal = if ($signalCount -gt 0) { [Math]::Round($referenceSignalSum / $signalCount, 4) } else { 0 }
+    productionEdgeSignal = if ($signalCount -gt 0) { [Math]::Round($productionSignalSum / $signalCount, 4) } else { 0 }
+    productionStrokeSignal = if ($signalCount -gt 0) { [Math]::Round($strokeSignalSum / $signalCount, 4) } else { 0 }
+    fillMad = [Math]::Round((RegionResidual $bitmaps.productionFill $bitmaps.referenceFill $ringLeft $ringTop $ringRight $ringBottom 0 0), 4)
+    fullMad = [Math]::Round((RegionResidual $bitmaps.productionFull $bitmaps.referenceFull $ringLeft $ringTop $ringRight $ringBottom 0 0), 4)
+    strokeMad = [Math]::Round((StrokeResidual $ringLeft $ringTop $ringRight $ringBottom 0 0), 4)
+  } | ConvertTo-Json -Depth 10 -Compress
+} finally {
+  foreach ($bitmap in $bitmaps.Values) { $bitmap.Dispose() }
+}
+`;
+
+  return new Promise((resolve, reject) => {
+    const ps = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+    );
+    let output = "";
+    let errorText = "";
+    ps.stdout.on("data", (chunk) => { output += chunk.toString(); });
+    ps.stderr.on("data", (chunk) => { errorText += chunk.toString(); });
+    ps.on("error", reject);
+    ps.on("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(errorText.trim() || `Overlay outline screenshot analysis failed with exit code ${code}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(output));
+      } catch (error) {
+        reject(new Error(`Overlay outline screenshot analysis did not return JSON: ${String(error)}; output=${output}`));
+      }
+    });
+  });
+}
+
 async function waitForOverlayBlurSettled(client, expectedSigma) {
   const expected = Number(expectedSigma);
   await waitFor(
@@ -629,6 +823,7 @@ async function captureOverlayBlurEvidence(client, name, expectedSigma) {
       const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
       const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
       const saturation = filter?.querySelector('feColorMatrix[in="blurred"][type="saturate"]') ?? null;
+      const mask = filter?.querySelector('[data-overlay-regional-mask-primitive="true"]') ?? null;
       if (!(surface instanceof HTMLElement) || !(reference instanceof HTMLElement)) return null;
       const style = getComputedStyle(surface);
       const childStyle = child ? getComputedStyle(child) : null;
@@ -671,6 +866,18 @@ async function captureOverlayBlurEvidence(client, name, expectedSigma) {
           primitiveUnits: filter?.getAttribute('primitiveUnits') ?? null,
           fullTarget: filter?.getAttribute('data-overlay-regional-full-target') ?? null,
           maskCount: filter?.getAttribute('data-overlay-regional-mask-count') ?? null,
+          maskRect: mask ? {
+            left: Number(mask.getAttribute('x')),
+            top: Number(mask.getAttribute('y')),
+            width: Number(mask.getAttribute('width')),
+            height: Number(mask.getAttribute('height'))
+          } : null,
+          expectedOuterBorderBox: filter ? {
+            left: probeRect.left - root.getBoundingClientRect().left,
+            top: probeRect.top - root.getBoundingClientRect().top,
+            width: probeRect.width,
+            height: probeRect.height
+          } : null,
           gaussian: gaussian ? {
             input: gaussian.getAttribute('in'),
             stdDeviation: gaussian.getAttribute('stdDeviation'),
@@ -714,6 +921,125 @@ async function captureOverlayBlurEvidence(client, name, expectedSigma) {
   } finally {
     await evaluate(client, `document.body.removeAttribute("data-overlay-blur-sampling")`).catch(() => undefined);
   }
+}
+
+async function captureOverlaySurfaceOutlineEvidence(client, baselineDimensions) {
+  const modes = ["base", "reference-fill", "reference-full", "production-fill", "production-full"];
+  const screenshots = {};
+  const snapshots = {};
+  await setRendererDeviceScale(
+    client,
+    1,
+    baselineDimensions,
+    "100 percent overlay outline device scale did not take effect"
+  );
+  try {
+    for (const mode of modes) {
+      snapshots[mode] = await evaluate(
+        client,
+        `(async () => {
+          document.body.setAttribute('data-overlay-outline-mode', ${JSON.stringify(mode)});
+          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          const reference = document.querySelector('[data-appearance-outline-reference="true"]');
+          const production = document.querySelector('[data-appearance-outline-production="true"]');
+          const target = ${JSON.stringify(mode)}.startsWith('reference') ? reference : production;
+          const rect = (element) => {
+            if (!(element instanceof HTMLElement)) return null;
+            const value = element.getBoundingClientRect();
+            return { left: value.left, top: value.top, width: value.width, height: value.height };
+          };
+          const style = target instanceof HTMLElement ? getComputedStyle(target) : null;
+          const after = target instanceof HTMLElement ? getComputedStyle(target, '::after') : null;
+          return {
+            viewport: { width: window.innerWidth, height: window.innerHeight },
+            renderer: {
+              devicePixelRatio: window.devicePixelRatio,
+              visualViewportScale: window.visualViewport?.scale ?? null
+            },
+            referenceRect: rect(reference),
+            productionRect: rect(production),
+            targetRect: rect(target),
+            style: style ? {
+              backgroundClip: style.backgroundClip,
+              backgroundImage: style.backgroundImage,
+              borderTopColor: style.borderTopColor,
+              borderTopStyle: style.borderTopStyle,
+              borderTopWidth: style.borderTopWidth,
+              borderRadius: style.borderTopLeftRadius,
+              boxShadow: style.boxShadow
+            } : null,
+            after: after ? {
+              borderTopWidth: after.borderTopWidth,
+              boxShadow: after.boxShadow
+            } : null
+          };
+        })()`
+      );
+      screenshots[mode] = await rendererScreenshot(
+        client,
+        `ui-overlay-outline-100-${mode}.png`
+      );
+    }
+  } finally {
+    await evaluate(client, `document.body.removeAttribute('data-overlay-outline-mode')`).catch(() => undefined);
+    await clearRendererDeviceScale(client);
+  }
+
+  const reference = snapshots["reference-full"];
+  const production = snapshots["production-full"];
+  const referenceRect = reference?.targetRect;
+  const productionRect = production?.targetRect;
+  if (!referenceRect || !productionRect) {
+    throw new Error("overlay outline reference or production surface is missing");
+  }
+  const rectsMatch = ["left", "top", "width", "height"].every((key) =>
+    near(referenceRect[key], productionRect[key], 0.01)
+  );
+  const analysis = await analyzeOverlaySurfaceOutlineFrames(
+    {
+      base: screenshots.base,
+      referenceFill: screenshots["reference-fill"],
+      referenceFull: screenshots["reference-full"],
+      productionFill: screenshots["production-fill"],
+      productionFull: screenshots["production-full"]
+    },
+    production.viewport,
+    productionRect
+  );
+  const topologyPassed =
+    production.style?.borderTopWidth === "1px" &&
+    production.style?.borderTopStyle === "solid" &&
+    production.style?.borderTopColor === "rgba(255, 255, 255, 0.3)" &&
+    production.style?.backgroundClip === "border-box" &&
+    String(production.style?.backgroundImage ?? "").startsWith("linear-gradient(108deg") &&
+    production.after?.borderTopWidth === "0px" &&
+    production.after?.boxShadow === "none";
+  const pixelPassed =
+    near(production.renderer?.devicePixelRatio, 1, 0.001) &&
+    near(production.renderer?.visualViewportScale ?? 1, 1, 0.001) &&
+    near(analysis?.inferredScale?.x, 1, 0.001) &&
+    near(analysis?.inferredScale?.y, 1, 0.001) &&
+    analysis?.backgroundOutsideStrokePx === 0 &&
+    analysis?.backgroundOutsideReferencePixelCount === 0 &&
+    analysis?.referenceEdgeSignal > 1 &&
+    analysis?.productionEdgeSignal > 1 &&
+    analysis?.productionStrokeSignal > 1 &&
+    analysis?.fillMad <= 2.5 &&
+    analysis?.fullMad <= 2.5 &&
+    analysis?.strokeMad <= 2.5 &&
+    analysis?.sides?.every((side) =>
+      side.bestShift === 0 && side.zeroFullMad <= 2.5 && side.zeroStrokeMad <= 2.5
+    ) &&
+    analysis?.corners?.every((corner) => corner.fullMad <= 2.5 && corner.strokeMad <= 2.5);
+  return {
+    screenshots,
+    snapshots,
+    analysis,
+    rectsMatch,
+    topologyPassed,
+    pixelPassed,
+    passed: rectsMatch && topologyPassed && pixelPassed
+  };
 }
 
 async function openRealPortalBlurProbe(client) {
@@ -868,6 +1194,7 @@ async function captureRealPortalBlurEvidence(client, name, expectedSigma) {
       const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
       const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
       const saturation = filter?.querySelector('feColorMatrix[in="blurred"][type="saturate"]') ?? null;
+      const mask = filter?.querySelector('[data-overlay-regional-mask-primitive="true"]') ?? null;
       if (!(surface instanceof HTMLElement) || !(reference instanceof HTMLElement)) return null;
       const style = getComputedStyle(surface);
       const childStyle = child ? getComputedStyle(child) : null;
@@ -905,6 +1232,18 @@ async function captureRealPortalBlurEvidence(client, name, expectedSigma) {
           primitiveUnits: filter?.getAttribute('primitiveUnits') ?? null,
           fullTarget: filter?.getAttribute('data-overlay-regional-full-target') ?? null,
           maskCount: filter?.getAttribute('data-overlay-regional-mask-count') ?? null,
+          maskRect: mask ? {
+            left: Number(mask.getAttribute('x')),
+            top: Number(mask.getAttribute('y')),
+            width: Number(mask.getAttribute('width')),
+            height: Number(mask.getAttribute('height'))
+          } : null,
+          expectedOuterBorderBox: filter ? {
+            left: probeRect.left - root.getBoundingClientRect().left,
+            top: probeRect.top - root.getBoundingClientRect().top,
+            width: probeRect.width,
+            height: probeRect.height
+          } : null,
           gaussian: gaussian ? { input: gaussian.getAttribute('in'), stdDeviation: gaussian.getAttribute('stdDeviation'), edgeMode: gaussian.getAttribute('edgeMode') } : null,
           saturation: saturation ? { input: saturation.getAttribute('in'), type: saturation.getAttribute('type'), values: saturation.getAttribute('values') } : null
         },
@@ -3232,28 +3571,15 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
       required: [
         "center.centerSurface.mapped.glassBorderCurrent",
         "center.fieldControl.effects.borderTopColor",
-        "center.selectControl.effects.borderTopColor",
-        "dialog.modal.mapped.glassBorderCurrent"
+        "center.selectControl.effects.borderTopColor"
       ],
       allowed: [
         "center.centerSurface.mapped.glassBorderCurrent",
         "center.centerSurface.effects.backdrop.borderTopColor",
         "center.fieldControl.effects.borderTopColor",
-        "center.selectControl.effects.borderTopColor",
-        "dialog.popover.mapped.glassBorderCurrent",
-        "dialog.popover.effects.borderTopColor",
-        "dialog.popover.effects.backdrop.borderTopColor",
-        "dialog.nested.mapped.glassBorderCurrent",
-        "dialog.nested.effects.borderTopColor",
-        "dialog.nested.effects.backdrop.borderTopColor",
-        "dialog.context.mapped.glassBorderCurrent",
-        "dialog.context.effects.borderTopColor",
-        "dialog.context.effects.backdrop.borderTopColor",
-        "dialog.modal.mapped.glassBorderCurrent",
-        "dialog.modal.effects.borderTopColor",
-        "dialog.modal.effects.backdrop.borderTopColor"
+        "center.selectControl.effects.borderTopColor"
       ],
-      stableGroups: ["side", "shared", "unaffected"]
+      stableGroups: ["side", "dialog", "shared", "unaffected"]
     },
     "dialog-blur": {
       required: [
@@ -3399,6 +3725,9 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
       regional?.primitiveUnits === "userSpaceOnUse" &&
       regional?.fullTarget === "false" &&
       regional?.maskCount === "1" &&
+      ["left", "top", "width", "height"].every((key) =>
+        near(regional?.maskRect?.[key], regional?.expectedOuterBorderBox?.[key], 0.01)
+      ) &&
       regional?.gaussian?.input === "SourceGraphic" &&
       regional?.gaussian?.edgeMode === "duplicate" &&
       near(Number(regional?.gaussian?.stdDeviation), sigma, 0.01) &&
@@ -3482,6 +3811,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     ]));
     const matrix = {};
     let blurPixels = null;
+    let surfaceOutlinePixels = null;
     for (const [group, ids] of Object.entries(groups)) {
       matrix[group] = {};
       for (const id of ids) {
@@ -3510,6 +3840,10 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
               document.querySelector('[data-appearance-blur-scene="true"]')?.scrollIntoView({ block: 'start' });
               return { width: window.innerWidth, height: window.innerHeight };
             })()`
+          );
+          surfaceOutlinePixels = await captureOverlaySurfaceOutlineEvidence(
+            appearanceClient,
+            baselineDimensions
           );
           await clickSelector(appearanceClient, '[data-appearance-blur-trigger="true"]');
           await waitFor(
@@ -3753,6 +4087,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
       },
       solidFallback,
       blurPixels,
+      surfaceOutlinePixels,
       initial,
       matrix,
       final: await readState()
@@ -5194,6 +5529,9 @@ function regionalGraphMatchesForSummary(evidence, sigma) {
     regional?.primitiveUnits === "userSpaceOnUse" &&
     regional?.fullTarget === "false" &&
     regional?.maskCount === "1" &&
+    ["left", "top", "width", "height"].every((key) =>
+      near(regional?.maskRect?.[key], regional?.expectedOuterBorderBox?.[key], 0.01)
+    ) &&
     regional?.gaussian?.input === "SourceGraphic" &&
     regional?.gaussian?.edgeMode === "duplicate" &&
     near(Number(regional?.gaussian?.stdDeviation), Number(sigma), 0.01) &&
@@ -6206,6 +6544,22 @@ try {
   }
   const solidFallback = appearanceMatrix?.solidFallback;
   const blurPixels = appearanceMatrix?.blurPixels;
+  const surfaceOutlinePixels = appearanceMatrix?.surfaceOutlinePixels;
+  if (
+    !surfaceOutlinePixels?.passed ||
+    surfaceOutlinePixels.rectsMatch !== true ||
+    surfaceOutlinePixels.topologyPassed !== true ||
+    surfaceOutlinePixels.pixelPassed !== true ||
+    surfaceOutlinePixels.analysis?.backgroundOutsideStrokePx !== 0 ||
+    surfaceOutlinePixels.analysis?.backgroundOutsideReferencePixelCount !== 0 ||
+    !surfaceOutlinePixels.screenshots?.base ||
+    !surfaceOutlinePixels.screenshots?.["reference-fill"] ||
+    !surfaceOutlinePixels.screenshots?.["reference-full"] ||
+    !surfaceOutlinePixels.screenshots?.["production-fill"] ||
+    !surfaceOutlinePixels.screenshots?.["production-full"]
+  ) {
+    hardFailures.push("100% popup frame does not match the historical same-element one-pixel border");
+  }
   const fallbackSurfaces = Object.values(solidFallback?.styles?.surfaces ?? {});
   const fallbackKeyboard = Object.values(solidFallback?.keyboard ?? {});
   if (

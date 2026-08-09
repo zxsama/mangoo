@@ -152,3 +152,69 @@ body[data-overlay-blur-sampling="true"] #appearance-blur-popover > .overlay-scro
 .overlay-appearance-modal {
   width: min(420px, calc(100vw - 32px));
 }
+
+.overlay-appearance-outline-backplate,
+.overlay-appearance-outline-reference,
+.overlay-appearance-outline-production {
+  position: fixed;
+  display: none;
+  pointer-events: none;
+}
+
+.overlay-appearance-outline-backplate {
+  z-index: 498;
+  top: 144px;
+  left: 182px;
+  width: 612px;
+  height: 338px;
+  background: rgb(9, 17, 25);
+}
+
+.overlay-appearance-outline-reference,
+.overlay-appearance-outline-production {
+  z-index: 499;
+  top: 176px;
+  left: 214px;
+  width: 548px;
+  height: 274px;
+  overflow: hidden;
+  border-radius: 18px;
+  box-shadow: none !important;
+}
+
+.overlay-appearance-outline-reference {
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: linear-gradient(
+    108deg,
+    rgba(52, 56, 59, 0.2),
+    rgba(8, 12, 16, 0.38) 52%,
+    rgba(7, 11, 14, 0.48)
+  );
+}
+
+body[data-overlay-outline-mode] .overlay-appearance-outline-backplate,
+body[data-overlay-outline-mode="reference-fill"] .overlay-appearance-outline-reference,
+body[data-overlay-outline-mode="reference-full"] .overlay-appearance-outline-reference,
+body[data-overlay-outline-mode="production-fill"] .overlay-appearance-outline-production,
+body[data-overlay-outline-mode="production-full"] .overlay-appearance-outline-production {
+  display: block;
+}
+
+body[data-overlay-outline-mode="reference-fill"] .overlay-appearance-outline-reference,
+body[data-overlay-outline-mode="production-fill"] .overlay-appearance-outline-production {
+  border-color: transparent !important;
+}
+
+body[data-overlay-outline-mode="production-fill"] .overlay-appearance-outline-production::after {
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+body[data-overlay-outline-mode] .overlay-appearance-outline-production > .liquid-glass-backdrop,
+body[data-overlay-outline-mode] .overlay-appearance-outline-production > .liquid-glass-lens,
+body[data-overlay-outline-mode] .overlay-appearance-outline-production > .liquid-glass-dither,
+body[data-overlay-outline-mode] .overlay-appearance-outline-production > .liquid-glass-dim,
+body[data-overlay-outline-mode] .overlay-appearance-outline-production > .liquid-glass-edge,
+body[data-overlay-outline-mode] .overlay-appearance-outline-production > .liquid-glass-content {
+  opacity: 0 !important;
+}

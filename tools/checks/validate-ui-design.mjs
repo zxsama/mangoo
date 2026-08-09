@@ -1913,9 +1913,32 @@ if (!floatingPopoverBlocks.some((block) =>
   latestDeclarationValue(block, "backdrop-filter") === "none" &&
   !/blur\(var\(--glass-dialog-blur\)\)/.test(block) &&
   /--overlay-solid-fallback-fill/.test(block) &&
+  /--glass-border-current:\s*rgba\(255,\s*255,\s*255,\s*0\.3\)/.test(block) &&
   hasNonNoneDeclaration(block, "box-shadow")
 )) {
   fail("shared overlay surface must paint the Settings-content gradient without owning backdrop blur");
+}
+
+const floatingPopoverFrameBlocks = cssBlocksForExactSelector(
+  overlayStylesForChecks,
+  ".liquid-glass.overlay-surface"
+);
+if (!floatingPopoverFrameBlocks.some((block) =>
+  /border:\s*1px\s+solid\s+var\(--glass-border-current\)/.test(block) &&
+  latestDeclarationValue(block, "background-clip") === "border-box" &&
+  !/background-clip:\s*padding-box/.test(block)
+)) {
+  fail("shared overlay frame must paint the historical one-pixel border on the gradient owner");
+}
+const floatingPopoverRetiredFrameBlocks = cssBlocksForExactSelector(
+  overlayStylesForChecks,
+  ".liquid-glass.overlay-surface::after"
+);
+if (!floatingPopoverRetiredFrameBlocks.some((block) =>
+  latestDeclarationValue(block, "border") === "0" &&
+  latestDeclarationValue(block, "box-shadow") === "none"
+)) {
+  fail("shared overlay frame must not retain a second pseudo-element border or inset edge shadow");
 }
 
 for (const value of [

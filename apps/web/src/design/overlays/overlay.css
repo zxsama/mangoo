@@ -2,7 +2,7 @@
 .overlay-surface {
   --glass-fill: var(--glass-dialog-fill);
   --glass-blur-current: var(--glass-dialog-blur);
-  --glass-border-current: var(--glass-center-stroke);
+  --glass-border-current: rgba(255, 255, 255, 0.3);
   color: var(--text-soft);
   border-radius: var(--radius-overlay);
   background: var(
@@ -17,6 +17,16 @@
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   box-shadow: var(--glass-shadow);
+}
+
+.liquid-glass.overlay-surface {
+  border: 1px solid var(--glass-border-current);
+  background-clip: border-box;
+}
+
+.liquid-glass.overlay-surface::after {
+  border: 0;
+  box-shadow: none;
 }
 
 [data-overlay-layer-kind="root"] {

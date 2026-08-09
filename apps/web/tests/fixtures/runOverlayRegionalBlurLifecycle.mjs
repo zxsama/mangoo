@@ -62,6 +62,64 @@ async function main() {
       };
     })()`);
 
+    await evaluate(fixtureWindow, `(() => {
+      const trace = [];
+      const number = (element, name) => Number(element?.getAttribute(name) ?? NaN);
+      const rect = (value) => value ? {
+        left: value.left,
+        top: value.top,
+        width: value.width,
+        height: value.height
+      } : null;
+      const record = (reason) => {
+        const root = document.querySelector('#root');
+        const surface = document.querySelector('#regional-lifecycle-root');
+        const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
+        const mask = filter?.querySelector('[data-overlay-regional-mask-primitive="true"]') ?? null;
+        const inlineFilter = root instanceof HTMLElement ? root.style.filter : '';
+        const referencedId = inlineFilter.match(/url\\(["']?#([^"')]+)["']?\\)/)?.[1] ?? null;
+        const surfaceStyle = surface instanceof HTMLElement ? getComputedStyle(surface) : null;
+        trace.push({
+          reason,
+          rootActive: root?.getAttribute('data-overlay-regional-blur') === 'active',
+          inlineFilter,
+          referencedId,
+          referencedFilterConnected: referencedId
+            ? document.getElementById(referencedId)?.isConnected === true
+            : false,
+          filterId: filter?.id ?? null,
+          surfacePresent: surface instanceof HTMLElement,
+          surfaceVisibility: surfaceStyle?.visibility ?? null,
+          surfaceDisplay: surfaceStyle?.display ?? null,
+          surfaceRect: surface instanceof HTMLElement ? rect(surface.getBoundingClientRect()) : null,
+          surfaceLayoutRect: surface instanceof HTMLElement ? {
+            left: surface.offsetLeft,
+            top: surface.offsetTop,
+            width: surface.offsetWidth,
+            height: surface.offsetHeight
+          } : null,
+          rootRect: root instanceof HTMLElement ? rect(root.getBoundingClientRect()) : null,
+          maskRect: mask ? {
+            left: number(mask, 'x'),
+            top: number(mask, 'y'),
+            width: number(mask, 'width'),
+            height: number(mask, 'height')
+          } : null
+        });
+      };
+      const observer = new MutationObserver(() => record('mutation'));
+      observer.observe(document.documentElement, {
+        attributes: true,
+        childList: true,
+        subtree: true,
+        attributeFilter: ['style', 'class', 'data-overlay-state', 'data-overlay-regional-blur']
+      });
+      window.__regionalBlurFirstFrameTrace = trace;
+      window.__regionalBlurFirstFrameObserver = observer;
+      record('installed');
+      requestAnimationFrame(() => record('raf-1'));
+    })()`);
+
     await setPhase(fixtureWindow, "root");
     await waitFor(
       fixtureWindow,
@@ -73,6 +131,35 @@ async function main() {
       `document.querySelector("#root")?.getAttribute("data-overlay-regional-blur") === "active" && getComputedStyle(document.querySelector("#regional-lifecycle-root")).visibility === "visible" && document.querySelector('filter[data-overlay-regional-blur-target="app-root"] [data-overlay-regional-mask-primitive="true"]')?.getAttribute("width") === "280"`,
       "positioned root regional filter"
     );
+    await settle();
+    const firstFrame = await evaluate(fixtureWindow, `(() => {
+      window.__regionalBlurFirstFrameObserver?.disconnect();
+      const trace = window.__regionalBlurFirstFrameTrace ?? [];
+      delete window.__regionalBlurFirstFrameObserver;
+      delete window.__regionalBlurFirstFrameTrace;
+      const active = trace.filter((entry) => entry.rootActive || entry.filterId);
+      const close = (left, right) => Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) <= 0.01;
+      const ready = (entry) => entry.surfacePresent === true &&
+        entry.surfaceVisibility === 'visible' &&
+        entry.surfaceDisplay !== 'none' &&
+        Number.isFinite(entry.surfaceRect?.left) &&
+        Number.isFinite(entry.surfaceRect?.top) &&
+        entry.surfaceRect.width > 0 &&
+        entry.surfaceRect.height > 0 &&
+        entry.referencedFilterConnected === true;
+      const outerMask = (entry) => ready(entry) && entry.maskRect && entry.surfaceLayoutRect && entry.rootRect &&
+        close(entry.maskRect.left, entry.surfaceLayoutRect.left - entry.rootRect.left) &&
+        close(entry.maskRect.top, entry.surfaceLayoutRect.top - entry.rootRect.top) &&
+        close(entry.maskRect.width, entry.surfaceLayoutRect.width) &&
+        close(entry.maskRect.height, entry.surfaceLayoutRect.height);
+      return {
+        trace,
+        activeCount: active.length,
+        firstActive: active[0] ?? null,
+        everyActiveSurfaceReady: active.length > 0 && active.every(ready),
+        everyActiveMaskUsesOuterBorderBox: active.length > 0 && active.every(outerMask)
+      };
+    })()`);
     const root = await evaluate(fixtureWindow, `(() => {
       const defs = document.querySelector('svg[data-overlay-regional-blur-defs="true"]');
       const filter = defs?.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
@@ -83,6 +170,8 @@ async function main() {
       const number = (element, name) => Number(element?.getAttribute(name) ?? NaN);
       const surface = document.querySelector('#regional-lifecycle-root');
       const child = surface?.querySelector(':scope > .liquid-glass-backdrop');
+      const surfaceStyle = surface ? getComputedStyle(surface) : null;
+      const surfaceAfterStyle = surface ? getComputedStyle(surface, '::after') : null;
       return {
         rootFiltered: document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') === 'active',
         gaussianInput: gaussian?.getAttribute('in') ?? null,
@@ -99,10 +188,15 @@ async function main() {
           number(maskGaussian, 'height') >= number(maskSource, 'height') + number(maskGaussian, 'stdDeviation') * 6,
         roundedMaskPrimitiveCount: filter?.querySelectorAll('[data-overlay-regional-mask-primitive="true"]').length ?? 0,
         surfaceBackdropFilter: surface ? getComputedStyle(surface).backdropFilter : '',
-        childBackdropFilter: child ? getComputedStyle(child).backdropFilter : ''
+        childBackdropFilter: child ? getComputedStyle(child).backdropFilter : '',
+        surfaceBackgroundImage: surfaceStyle?.backgroundImage ?? null,
+        surfaceBorderWidth: surfaceStyle?.borderTopWidth ?? null,
+        surfaceBorderStyle: surfaceStyle?.borderTopStyle ?? null,
+        surfaceBorderColor: surfaceStyle?.borderTopColor ?? null,
+        surfaceAfterBorderWidth: surfaceAfterStyle?.borderTopWidth ?? null,
+        surfaceAfterBoxShadow: surfaceAfterStyle?.boxShadow ?? null
       };
     })()`);
-    await settle();
     const stableFilterId = await evaluate(
       fixtureWindow,
       `document.querySelector('filter[data-overlay-regional-blur-target="app-root"]')?.id ?? ''`
@@ -285,7 +379,7 @@ async function main() {
       rootFiltered: document.querySelector('#root')?.getAttribute('data-overlay-regional-blur') === 'active'
     })`);
 
-    return { ok: true, root, nested, modal, cleanup, fallback, zeroBlur, stability, atomic };
+    return { ok: true, root, firstFrame, nested, modal, cleanup, fallback, zeroBlur, stability, atomic };
   } finally {
     fixtureWindow.destroy();
   }

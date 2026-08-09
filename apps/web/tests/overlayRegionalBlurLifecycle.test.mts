@@ -19,7 +19,24 @@ interface RegionalBlurLifecycleResult {
     roundedMaskPrimitiveCount: number;
     rootFiltered: boolean;
     stdDeviation: string | null;
+    surfaceAfterBorderWidth: string | null;
+    surfaceAfterBoxShadow: string | null;
+    surfaceBackgroundImage: string | null;
     surfaceBackdropFilter: string;
+    surfaceBorderColor: string | null;
+    surfaceBorderStyle: string | null;
+    surfaceBorderWidth: string | null;
+  };
+  firstFrame: {
+    activeCount: number;
+    everyActiveMaskUsesOuterBorderBox: boolean;
+    everyActiveSurfaceReady: boolean;
+    firstActive: {
+      maskRect: { left: number; top: number; width: number; height: number } | null;
+      surfaceRect: { left: number; top: number; width: number; height: number } | null;
+      surfaceVisibility: string | null;
+    } | null;
+    trace: unknown[];
   };
   nested: {
     filterCount: number;
@@ -135,6 +152,29 @@ describe("mounted overlay regional blur lifecycle", () => {
     assert.equal(result.root.maskBoundsExpanded, true);
     assert.equal(result.root.surfaceBackdropFilter, "none");
     assert.equal(result.root.childBackdropFilter, "none");
+  });
+
+  it("never activates a regional mask for the hidden pre-layout popup", () => {
+    assert.ok(result.firstFrame.activeCount > 0, JSON.stringify(result.firstFrame));
+    assert.equal(
+      result.firstFrame.everyActiveSurfaceReady,
+      true,
+      JSON.stringify(result.firstFrame)
+    );
+    assert.equal(
+      result.firstFrame.everyActiveMaskUsesOuterBorderBox,
+      true,
+      JSON.stringify(result.firstFrame)
+    );
+  });
+
+  it("paints the historical border and gradient on the same mounted surface", () => {
+    assert.match(result.root.surfaceBackgroundImage ?? "", /linear-gradient\(108deg/);
+    assert.equal(result.root.surfaceBorderWidth, "1px");
+    assert.equal(result.root.surfaceBorderStyle, "solid");
+    assert.equal(result.root.surfaceBorderColor, "rgba(255, 255, 255, 0.3)");
+    assert.equal(result.root.surfaceAfterBorderWidth, "0px");
+    assert.equal(result.root.surfaceAfterBoxShadow, "none");
   });
 
   it("filters lower render planes without filtering the top nested surface", () => {

@@ -206,6 +206,23 @@ function OverlayAppearanceVisualFixture() {
         <div className="preview-canvas overlay-appearance-unaffected" data-appearance-surface="preview-canvas">
           Preview canvas invariant
         </div>
+
+        <div
+          aria-hidden="true"
+          className="overlay-appearance-outline-backplate"
+          data-appearance-outline-backplate="true"
+        />
+        <div
+          aria-hidden="true"
+          className="overlay-appearance-outline-reference"
+          data-appearance-outline-reference="true"
+        />
+        <OverlaySurface
+          aria-hidden="true"
+          className="overlay-appearance-outline-production"
+          data-appearance-outline-production="true"
+          surfaceRole="popover"
+        />
       </main>
 
       <AnchoredOverlay

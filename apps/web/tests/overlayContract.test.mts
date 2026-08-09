@@ -114,6 +114,14 @@ describe("shared overlay source contract", () => {
 
   it("keeps popup material on the portal-mounted surface", () => {
     const surface = cssDeclarationsForExactSelector(overlayCss, ".overlay-surface").join("\n");
+    const frame = cssDeclarationsForExactSelector(
+      overlayCss,
+      ".liquid-glass.overlay-surface"
+    ).join("\n");
+    const retiredFramePlane = cssDeclarationsForExactSelector(
+      overlayCss,
+      ".liquid-glass.overlay-surface::after"
+    ).join("\n");
     const child = cssDeclarationsForExactSelector(
       overlayCss,
       ".overlay-surface > .liquid-glass-backdrop"
@@ -127,6 +135,13 @@ describe("shared overlay source contract", () => {
     assert.match(surface, /-webkit-backdrop-filter:\s*none/);
     assert.match(surface, /(?:^|\s)backdrop-filter:\s*none/);
     assert.doesNotMatch(surface, /blur\(var\(--glass-dialog-blur\)\)/);
+    assert.match(surface, /--glass-border-current:\s*rgba\(255,\s*255,\s*255,\s*0\.3\)/);
+
+    assert.match(frame, /border:\s*1px\s+solid\s+var\(--glass-border-current\)/);
+    assert.match(frame, /background-clip:\s*border-box/);
+    assert.doesNotMatch(frame, /background-clip:\s*padding-box/);
+    assert.match(retiredFramePlane, /border:\s*0/);
+    assert.match(retiredFramePlane, /box-shadow:\s*none/);
 
     assert.match(child, /background:\s*transparent/);
     assert.match(child, /-webkit-backdrop-filter:\s*none/);

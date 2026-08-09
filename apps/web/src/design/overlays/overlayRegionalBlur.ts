@@ -217,9 +217,12 @@ function buildFilterElement(
   return filter;
 }
 
-function stableSurfaceRect(element: HTMLElement, view: Window): OverlayRegionalRect {
+function stableSurfaceRect(
+  element: HTMLElement,
+  view: Window,
+  style = view.getComputedStyle(element)
+): OverlayRegionalRect {
   const rect = element.getBoundingClientRect();
-  const style = view.getComputedStyle(element);
   const transform = style.transform;
   if (!transform || transform === "none") return toRegionalRect(rect);
   try {
@@ -370,35 +373,67 @@ export function createOverlayRegionalBlurController(
   const collectGeometry = () => {
     const appRoot = ownerDocument.getElementById("root");
     if (!(appRoot instanceof view.HTMLElement)) return null;
-    const visibleLayers = currentLayers.filter(
-      (layer): layer is OverlayLayerRegistration & { surface: HTMLElement } => (
-        layer.surface instanceof view.HTMLElement && layer.surface.isConnected
-      )
-    );
+    const visibleLayers: Array<{
+      layer: OverlayLayerRegistration & { surface: HTMLElement };
+      rect: OverlayRegionalRect;
+      style: CSSStyleDeclaration;
+    }> = [];
+    for (const layer of currentLayers) {
+      const surface = layer.surface;
+      if (!(surface instanceof view.HTMLElement) || !surface.isConnected) continue;
+      const style = view.getComputedStyle(surface);
+      if (style.visibility === "hidden" || style.display === "none") continue;
+      const rect = stableSurfaceRect(surface, view, style);
+      if (
+        !Number.isFinite(rect.left) ||
+        !Number.isFinite(rect.top) ||
+        !Number.isFinite(rect.right) ||
+        !Number.isFinite(rect.bottom) ||
+        !Number.isFinite(rect.width) ||
+        !Number.isFinite(rect.height) ||
+        rect.width <= 0 ||
+        rect.height <= 0
+      ) {
+        continue;
+      }
+      visibleLayers.push({
+        layer: layer as OverlayLayerRegistration & { surface: HTMLElement },
+        rect,
+        style
+      });
+    }
     if (visibleLayers.length === 0) return null;
 
-    const layerGeometry: OverlayRegionalLayerGeometry[] = visibleLayers.map((layer) => {
-      const style = view.getComputedStyle(layer.surface);
-      return {
-        id: layer.id,
-        kind: layer.kind,
-        radius: Math.max(0, cssNumber(style.borderTopLeftRadius, 0)),
-        rect: stableSurfaceRect(layer.surface, view)
-      };
-    });
+    const appRootRect = toRegionalRect(appRoot.getBoundingClientRect());
+    if (
+      !Number.isFinite(appRootRect.left) ||
+      !Number.isFinite(appRootRect.top) ||
+      !Number.isFinite(appRootRect.right) ||
+      !Number.isFinite(appRootRect.bottom) ||
+      appRootRect.width <= 0 ||
+      appRootRect.height <= 0
+    ) {
+      return null;
+    }
+    const layerGeometry: OverlayRegionalLayerGeometry[] = visibleLayers.map(({ layer, rect, style }) => ({
+      id: layer.id,
+      kind: layer.kind,
+      radius: Math.max(0, cssNumber(style.borderTopLeftRadius, 0)),
+      rect
+    }));
     const targets: RegionalTarget[] = [{
       id: APP_ROOT_TARGET_ID,
       layerIndex: -1,
-      rect: toRegionalRect(appRoot.getBoundingClientRect()),
+      rect: appRootRect,
       element: appRoot
     }];
     for (let index = 0; index < visibleLayers.length - 1; index += 1) {
-      const surface = visibleLayers[index].surface;
+      const { layer, rect } = visibleLayers[index];
       targets.push({
-        id: `layer:${visibleLayers[index].id}`,
+        id: `layer:${layer.id}`,
         layerIndex: index,
-        rect: stableSurfaceRect(surface, view),
-        element: surface
+        rect,
+        element: layer.surface
       });
     }
     return { layerGeometry, targets };

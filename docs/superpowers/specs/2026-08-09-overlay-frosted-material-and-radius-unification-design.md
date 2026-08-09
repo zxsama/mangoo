@@ -1,6 +1,6 @@
 # Overlay Frosted Material and Radius Unification Design
 
-**Status:** Implemented; automated real-window and 100%/125%/150% renderer verification green on 2026-08-10; physical-monitor confirmation pending
+**Status:** Implemented; first-frame, same-element frame, and automated 100%/125%/150% renderer verification green on 2026-08-10; physical-monitor confirmation pending
 
 ## 1. Goal
 
@@ -77,7 +77,7 @@ linear-gradient(
 
 `OverlayProvider` owns one regional-blur controller for the main renderer. It consumes the already-authoritative ordered `OverlayLayerRegistration[]`; feature overlays do not implement material capture themselves.
 
-For every visible root or nested overlay, the controller reads the surface border box and computed radius in CSS pixels. It applies an SVG filter to `#root` with the following fixed pipeline:
+For every visible, laid-out root or nested overlay, the controller reads the surface border box and computed radius in CSS pixels. A connected surface is not sufficient: `visibility:hidden`, `display:none`, non-finite geometry, and a zero-sized border box are excluded. This prevents an `AnchoredOverlay` from contributing its temporary pre-layout `left:0; top:0` box to the regional graph. The first active filter for a newly opened popup must therefore already reference its final visible geometry. It applies an SVG filter to `#root` with the following fixed pipeline:
 
 1. use the target's complete `SourceGraphic`, which forces the renderer content into one offscreen image;
 2. run `feGaussianBlur` with `stdDeviation` equal to `--glass-dialog-blur` and `edgeMode="duplicate"`;
@@ -89,7 +89,7 @@ The Gaussian primitive subregion is the union of active masks expanded by `3 * s
 
 Nested overlays preserve visual depth. `#root` receives masks for every active overlay. Each lower overlay surface receives a separate regional filter only for intersections with layers above it; the top surface remains unfiltered and sharp. This makes a nested menu blur both the application and the root popup beneath it without blurring its own content.
 
-The portal-mounted `.overlay-surface` paints only the approved 108-degree dialog gradient, border, dither, and elevation. Both of its backdrop-filter declarations are `none`, and its direct `.liquid-glass-backdrop` child stays transparent and unfiltered. Feature classes such as `.context-menu`, `.library-switcher`, and their headers, lists, footers, or confirmation surfaces may lay out and separate content, but must not repaint sidebar or dialog material.
+The portal-mounted `.overlay-surface` paints only the approved 108-degree dialog gradient, border, dither, and elevation. Its frame reproduces the exact successful `backdrop` probe from `.tmp/regional-filter-probe`: the gradient and `1px solid rgba(255, 255, 255, 0.3)` border are painted by the same surface element. The generic `.liquid-glass::after` plane must not paint a second border or inset edge shadow on overlay surfaces. The regional rounded mask continues to use the complete outer border box and computed outer radius; it is not inset to the padding box. Both surface backdrop-filter declarations are `none`, and its direct `.liquid-glass-backdrop` child stays transparent and unfiltered. Feature classes such as `.context-menu`, `.library-switcher`, and their headers, lists, footers, or confirmation surfaces may lay out and separate content, but must not repaint sidebar or dialog material.
 
 Stack changes and direct surface/root mutations rebuild the self-contained filter graph synchronously during the same layout or mutation phase, so a removed modal/nested mask cannot survive into the next painted frame. Window resize and captured scroll are event-driven and coalesced into one animation frame. The graph has no `feImage`, data URL, or image-decode dependency. Closing the final layer removes generated SVG definitions and restores every target's prior inline `filter` value.
 
@@ -125,8 +125,10 @@ Automated coverage must prove:
 - dialog pane colors follow the declared light/mid/end derivation and become transparent when dialog opacity or strength is zero;
 - feature-specific inner surfaces do not repaint dialog or sidebar material;
 - a normal popup surface is the sole gradient owner and has no backdrop filter, while its direct backdrop child is transparent and unfiltered;
+- the mounted popup reports a real `1px solid rgba(255, 255, 255, 0.3)` border on the same element as the gradient, while its `::after` border and inset edge shadow are absent;
 - the provider builds one root regional filter from the ordered overlay stack, using `SourceGraphic`, Gaussian blur, saturation, rounded masks, and untouched output outside each mask;
-- the rounded mask graph is synchronous, does not decode an image resource, follows stack pops and geometry changes before the next painted frame, and does not hide a focusable modal surface while focus is assigned;
+- the rounded mask graph is synchronous, does not decode an image resource, follows stack pops and geometry changes before the next painted frame, and never becomes active for a hidden pre-layout surface at the viewport origin;
+- every popup mask rectangle remains equal to the surface's complete outer border box; no border-width or padding-box inset is permitted;
 - a nested layer adds its rounded mask to the app root and applies only its intersection mask to every lower overlay surface;
 - a modal viewport has no fill, filter, or opacity animation; a modal registration expands lower-target masks to the full viewport, and its dim shadow does not paint inside the dialog border;
 - the modal center remains within the same luminance family as a normal popup and preserves visibly blurred background texture instead of collapsing to a flat dark fill;
@@ -135,6 +137,8 @@ Automated coverage must prove:
 - a real Library portal-popover crop repeats the same boundary measurement so a single-layer fixture cannot hide a compositor regression;
 - generated filter definitions and inline target filters are removed after the final overlay closes, reduced-transparency/fallback disables them, and the maximum blur path does not leak observers or animation frames.
 
-Required final checks are the focused interface/overlay tests, `npm run check:ui-design`, `npm run check:web`, `npm run check:desktop`, `npm test`, and the OS-backdrop desktop visual harness. The harness must exercise zero, default, and maximum dialog blur against the independent-image fixture and the real Library portal crop, report real boundary/interior pixel deltas, and show no interaction timeout or material-topology regression. It must use device-scale-only `1`, `1.25`, and `1.5` captures for a real registered popup and the shared production `ModalSurface`; mounted file-operation coverage must prove Rename and Move To consume that primitive, and the lifecycle fixture must prove nested lower-surface and full-target modal topology. The real window must still be inspected by the user for final material layering because CDP screenshots cannot validate physical compositor anti-aliasing.
+Required final checks are the focused interface/overlay tests, `npm run check:ui-design`, `npm run check:web`, `npm run check:desktop`, `npm test`, and the OS-backdrop desktop visual harness. The harness must exercise zero, default, and maximum dialog blur against the independent-image fixture and the real Library portal crop, report real boundary/interior pixel deltas, and show no interaction timeout or material-topology regression. It must use device-scale-only `1`, `1.25`, and `1.5` captures for a real registered popup and the shared production `ModalSurface`; mounted file-operation coverage must prove Rename and Move To consume that primitive, and the lifecycle fixture must prove nested lower-surface and full-target modal topology. Independently of that scale matrix, the `1.0` capture is a hard popup-frame regression: it must prove the same-element border topology and that the translucent fill does not extend one or two physical pixels outside the visible stroke. The real window must still be inspected by the user for final material layering because CDP screenshots cannot validate physical compositor anti-aliasing.
 
 The recorded real-Library default result is image-boundary energy `40.3865 -> 0.3793` (`0.94%` retained), DOM-label energy `19.2672 -> 0.3324` (`1.73%` retained), boundary/interior ratio `1.1035`, and outside-reference MAD `0`. The three scale captures inferred `1`, `1.25`, and `1.5` physical output and all shared-modal captures reported a full-target `34px` Gaussian behind a sharp dialog surface.
+
+The follow-up first-frame trace recorded the defect before implementation as an active hidden surface at `left:0`, `top:-4`, `166.78125 x 190`, followed by the correct `160,96,280 x 190` graph. After the visibility/geometry gate, every active trace entry is visible, finite, positive, and references a connected filter; every mask remains equal to the complete un-inset outer border box. The dedicated 100% frame capture reports `0px` best shift on all four edges, `0` fill/full/stroke and corner residual, and `0` background pixels outside the historical reference stroke.
