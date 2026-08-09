@@ -26,6 +26,15 @@ const regressionPath = path.join(harnessDirectory, "desktop-ui-regression.mjs");
 const exhaustivePath = path.join(harnessDirectory, "desktop-ui-exhaustive-interaction-sweep.mjs");
 const libraryDataPath = path.join(repositoryRoot, "apps", "web", "src", "core", "useLibraryData.ts");
 const mediaResourcesPath = path.join(repositoryRoot, "apps", "web", "src", "core", "mediaResources.ts");
+const previewBitmapSourcePath = path.join(
+  repositoryRoot,
+  "apps",
+  "web",
+  "src",
+  "features",
+  "preview",
+  "previewBitmapSource.ts"
+);
 const overlayCssPath = path.join(repositoryRoot, "apps", "web", "src", "design", "overlays", "overlay.css");
 const appearanceFixturePath = path.join(
   repositoryRoot,
@@ -303,7 +312,11 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(exhaustiveSource, /await waitForNetworkIdle\(`before invoke selector/);
   assert.match(exhaustiveSource, /collectUnexpectedPhaseAwareNetworkProblems\(networkProblems\)/);
   assert.match(exhaustiveSource, /phase: networkPhase/);
-  assert.match(exhaustiveSource, /networkPhase = "teardown";\s*await stopDevApp\(\)/);
+  assert.match(exhaustiveSource, /interaction: networkInteraction/);
+  assert.match(
+    exhaustiveSource,
+    /networkPhase = "teardown";\s*networkInteraction = "shutdown";\s*await stopDevApp\(\)/
+  );
   assert.match(exhaustiveSource, /collectUnexpectedConsoleErrors\(consoleErrors\)/);
   assert.match(exhaustiveSource, /finalHardFailures\.push\("console errors"\)/);
   assert.match(exhaustiveSource, /finalHardFailures\.push\("network failures"\)/);
@@ -339,6 +352,17 @@ test("departed preview consumers keep the shared cacheable request alive", async
   assert.match(sharedAbort, /entry\.activeConsumers = Math\.max\(0, entry\.activeConsumers - 1\)/);
   assert.doesNotMatch(sharedAbort, /entry\.controller\.abort\(\)/);
   assert.match(source, /abortSharedRequests\(inFlightOriginalPreviewRequests\)/);
+});
+
+test("preview navigation cancels decode without aborting the bounded Core response", async () => {
+  const source = await readFile(previewBitmapSourcePath, "utf8");
+  const start = source.indexOf("export async function requestPreviewBitmap");
+  const end = source.indexOf("export function prefetchPreviewBitmap", start);
+  const request = source.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(request, /getPreviewResource\(media\.id, \{[\s\S]*?signal: undefined/);
+  assert.match(request, /decodeBlob\(resource\.blob, options\.signal, key\)/);
 });
 
 test("DPI, preference, and appearance checks assert effective production state", async () => {

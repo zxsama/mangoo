@@ -357,7 +357,10 @@ export async function requestPreviewBitmap(
 
   const resource = await client.getPreviewResource(media.id, {
     requestPriority: options.resourcePriority === "ahead" ? "resource" : "interactive",
-    signal: options.signal,
+    // Complete the bounded network response even if this view moves on. The
+    // caller signal still cancels decode/paint below, while Core and the browser
+    // avoid surfacing a scenario-phase ERR_ABORTED request.
+    signal: undefined,
     viewportLongPx: options.original ? undefined : options.viewportLongPx
   });
 

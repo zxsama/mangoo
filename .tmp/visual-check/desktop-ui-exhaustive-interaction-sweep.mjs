@@ -43,6 +43,7 @@ let invokedTree = null;
 let child;
 let stoppingChild = false;
 let networkPhase = "scenario";
+let networkInteraction = "startup";
 
 await mkdir(logDir, { recursive: true });
 await mkdir(dataDir, { recursive: true });
@@ -265,6 +266,7 @@ class CdpClient {
       if ((response.status ?? 0) >= 400) {
         networkProblems.push({
           phase: networkPhase,
+          interaction: networkInteraction,
           requestId: message.params?.requestId,
           url: response.url ?? requestUrls.get(message.params?.requestId) ?? null,
           status: response.status,
@@ -275,6 +277,7 @@ class CdpClient {
     if (message.method === "Network.loadingFailed" && message.params?.type !== "WebSocket") {
       networkProblems.push({
         phase: networkPhase,
+        interaction: networkInteraction,
         requestId: message.params?.requestId,
         url: requestUrls.get(message.params?.requestId) ?? null,
         status: "loadingFailed",
@@ -409,6 +412,7 @@ async function mouse(client, type, point, extra = {}) {
 }
 
 async function clickSelector(client, selector, xRatio = 0.5, yRatio = 0.5) {
+  networkInteraction = `click selector ${selector}`;
   await waitForNetworkIdle(`before click selector ${selector}`);
   await client.send("Page.bringToFront").catch(() => undefined);
   await evaluate(client, "window.focus(); true").catch(() => undefined);
@@ -421,6 +425,7 @@ async function clickSelector(client, selector, xRatio = 0.5, yRatio = 0.5) {
 }
 
 async function clickContains(client, selector, text) {
+  networkInteraction = `click ${text}`;
   await waitForNetworkIdle(`before click ${text}`);
   const point = await pointForContains(client, selector, text);
   await mouse(client, "mouseMoved", point);
@@ -431,6 +436,7 @@ async function clickContains(client, selector, text) {
 }
 
 async function invokeContains(client, selector, text) {
+  networkInteraction = `invoke ${text}`;
   await waitForNetworkIdle(`before invoke ${text}`);
   const outcome = await evaluate(
     client,
@@ -452,6 +458,7 @@ async function invokeContains(client, selector, text) {
 }
 
 async function invokeSelector(client, selector) {
+  networkInteraction = `invoke selector ${selector}`;
   await waitForNetworkIdle(`before invoke selector ${selector}`);
   const outcome = await evaluate(
     client,
@@ -472,6 +479,7 @@ async function invokeSelector(client, selector) {
 }
 
 async function dispatchContextMenuContains(client, selector, text) {
+  networkInteraction = `context menu ${text}`;
   await waitForNetworkIdle(`before context menu ${text}`);
   const result = await evaluate(
     client,
@@ -502,6 +510,7 @@ async function dispatchContextMenuContains(client, selector, text) {
 }
 
 async function dispatchContextMenuFirstMediaTile(client) {
+  networkInteraction = "media context menu";
   await waitForNetworkIdle("before media context menu");
   const result = await evaluate(
     client,
@@ -531,6 +540,7 @@ async function dispatchContextMenuFirstMediaTile(client) {
 }
 
 async function doubleClickFirstTile(client) {
+  networkInteraction = "preview open";
   await waitForNetworkIdle("before preview open");
   const outcome = await evaluate(
     client,
@@ -558,6 +568,7 @@ async function doubleClickFirstTile(client) {
 }
 
 async function pressKey(client, key) {
+  networkInteraction = `key ${key}`;
   await waitForNetworkIdle(`before key ${key}`);
   await client.send("Input.dispatchKeyEvent", { type: "keyDown", key });
   await client.send("Input.dispatchKeyEvent", { type: "keyUp", key });
@@ -566,6 +577,7 @@ async function pressKey(client, key) {
 }
 
 async function setSearch(client, value) {
+  networkInteraction = `search ${value}`;
   await waitForNetworkIdle(`before search ${value}`);
   await evaluate(
     client,
@@ -1127,6 +1139,7 @@ try {
   failures.push(String(error));
 } finally {
   networkPhase = "teardown";
+  networkInteraction = "shutdown";
   await stopDevApp();
   await delay(250);
   client?.close();
