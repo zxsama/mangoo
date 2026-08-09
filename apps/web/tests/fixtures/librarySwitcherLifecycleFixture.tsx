@@ -88,6 +88,13 @@ interface LibrarySwitcherLifecycleResult {
     unmountReports: number;
     unmountUnhandledRejections: number;
   };
+  hardMediaCancellation?: {
+    activeFetchAbortedOnUnmount: boolean;
+    retiredFetchAbortedOnUnmount: boolean;
+    retiredFetchStayedLiveDuringRefresh: boolean;
+    staleResponseIgnored: boolean;
+    unhandledRejections: number;
+  };
   mutationFailures?: {
     reports: number;
     unhandledRejections: number;
@@ -106,6 +113,10 @@ interface ScenarioControl {
 interface AdapterRemoveControl {
   removeResult: unknown;
   rootCount: number;
+}
+
+interface HardMediaCancellationControl {
+  library: LibraryState | null;
 }
 
 interface Deferred<T> {
@@ -376,6 +387,19 @@ function HookBackedLibrarySwitcherScenario({
     },
   };
   return <ProductionLibrarySwitcherScenario control={control} library={observedLibrary} />;
+}
+
+function HardMediaCancellationScenario({
+  control,
+}: {
+  control: HardMediaCancellationControl;
+}) {
+  control.library = useLibraryData({
+    activeLibraryId: ACTIVE_LIBRARY.id,
+    activeLibraryName: ACTIVE_LIBRARY.name,
+    persistentThumbnailCacheAutoRefresh: false,
+  });
+  return null;
 }
 
 async function openFromTitlebar(): Promise<HTMLButtonElement> {
@@ -834,6 +858,118 @@ async function runRequestOwnershipScenario() {
   };
 }
 
+async function runHardMediaCancellationScenario() {
+  const originalFetch = window.fetch;
+  const coreUrl = "http://hard-media-cancel.fixture/api";
+  const mediaSignals: AbortSignal[] = [];
+  const mediaRequests: Array<Deferred<Response>> = [];
+  let unhandledRejections = 0;
+  const handleUnhandled = (event: PromiseRejectionEvent) => {
+    unhandledRejections += 1;
+    event.preventDefault();
+  };
+  window.addEventListener("unhandledrejection", handleUnhandled);
+  const root = {
+    createdAt: 1,
+    displayName: "Pictures",
+    enabled: true,
+    id: 7,
+    lastScanAt: null,
+    mediaCount: 0,
+    path: "C:\\Fixture\\Pictures",
+    reachable: true,
+    rootFolderId: null,
+  };
+  const jsonResponse = (body: unknown) =>
+    new Response(JSON.stringify(body), {
+      headers: { "content-type": "application/json" },
+      status: 200,
+    });
+  window.fetch = (async (input, init) => {
+    const requestUrl =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    const url = new URL(requestUrl);
+    if (!url.href.startsWith(coreUrl)) return originalFetch(input, init);
+    if (url.pathname === "/api/roots") {
+      return jsonResponse({ items: [root], nextCursor: null, totalCount: 1 });
+    }
+    if (url.pathname === "/api/media") {
+      if (!init?.signal) throw new Error("production media fetch must own an AbortSignal");
+      mediaSignals.push(init.signal);
+      const request = deferred<Response>();
+      mediaRequests.push(request);
+      init.signal.addEventListener(
+        "abort",
+        () => request.reject(new DOMException("The operation was aborted.", "AbortError")),
+        { once: true },
+      );
+      return request.promise;
+    }
+    return jsonResponse({ items: [], nextCursor: null, totalCount: 0 });
+  }) as typeof window.fetch;
+  installBridge({
+    coreUrl,
+    notifications: {
+      reportError: async () => true,
+    } as unknown as MegleDesktopBridge["notifications"],
+    sessionToken: "fixture-token",
+  });
+  const control: HardMediaCancellationControl = { library: null };
+  let mounted: MountedScenario | null = null;
+  const refreshPromises: Promise<void>[] = [];
+  try {
+    mounted = await mountScenario(<HardMediaCancellationScenario control={control} />);
+    await waitFor(() => mediaSignals.length === 1, "initial media request");
+    if (!control.library) throw new Error("useLibraryData control was not mounted");
+    const library = control.library;
+    refreshPromises.push(library.refresh());
+    await waitFor(() => mediaSignals.length === 2, "same-library retired media replacement");
+    mediaRequests[0].resolve(jsonResponse({
+      items: [{
+        ext: "jpg",
+        folderId: null,
+        height: 10,
+        id: 99,
+        kind: "image",
+        mtime: 1,
+        name: "stale.jpg",
+        rootId: 7,
+        size: 1,
+        width: 10,
+      }],
+      nextCursor: null,
+      totalCount: 1,
+    }));
+    await settle(20);
+    const staleResponseIgnored = control.library?.media.length === 0;
+
+    refreshPromises.push(library.refresh());
+    await waitFor(() => mediaSignals.length === 3, "second retired media replacement");
+    const retiredFetchStayedLiveDuringRefresh = mediaSignals[1].aborted === false;
+
+    await unmountScenario(mounted);
+    mounted = null;
+    await Promise.all(refreshPromises);
+    await delay(20);
+    return {
+      activeFetchAbortedOnUnmount: mediaSignals[2].aborted,
+      retiredFetchAbortedOnUnmount: mediaSignals[1].aborted,
+      retiredFetchStayedLiveDuringRefresh,
+      staleResponseIgnored,
+      unhandledRejections,
+    };
+  } finally {
+    if (mounted) await unmountScenario(mounted);
+    await Promise.all(refreshPromises.map((request) => request.catch(() => undefined)));
+    window.removeEventListener("unhandledrejection", handleUnhandled);
+    window.fetch = originalFetch;
+  }
+}
+
 async function runMutationFailureScenario() {
   let reports = 0;
   let unhandledRejections = 0;
@@ -931,6 +1067,7 @@ async function run(): Promise<void> {
       }),
       iconMenu: await runIconMenuScenario(),
       requestOwnership: await runRequestOwnershipScenario(),
+      hardMediaCancellation: await runHardMediaCancellationScenario(),
       mutationFailures: await runMutationFailureScenario(),
       ok: true,
     };

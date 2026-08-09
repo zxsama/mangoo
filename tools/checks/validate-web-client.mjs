@@ -867,6 +867,13 @@ if (
   fail("core-client JSON and blob helpers must both route through the global request scheduler");
 }
 if (
+  !/CORE_REQUEST_TIMEOUT_MS\s*=\s*60_000/.test(coreClient) ||
+  !/requestController\.abort\(new Error\("Core request timed out"\)\)/.test(coreClient) ||
+  !/Promise\.race\(\[fetchRequest,\s*abortRequest\]\)/.test(coreClient)
+) {
+  fail("core-client requests must abort and settle at the bounded 60s network ceiling");
+}
+if (
   !/listFolderChildren:\s*\(\s*folderId:\s*number,\s*params:\s*ListFolderChildrenParams\s*=\s*\{\},\s*options:\s*CoreRequestOptions\s*=\s*\{\}\s*\)\s*=>[\s\S]*?request<Page<FolderRecord>>\([\s\S]*?\{[\s\S]*?signal:\s*options\.signal[\s\S]*?\}\s*\)/.test(
     coreClient
   )
@@ -1046,10 +1053,15 @@ if (!/mediaTotalCount/.test(useLibraryData) || !/loadedMediaRanges/.test(useLibr
 }
 if (
   !/mediaPageControllersRef\s*=\s*useRef<Map<string,\s*AbortController>>/.test(useLibraryData) ||
-  !/abortStaleMediaPageRequests/.test(useLibraryData) ||
-  !/abortAllControllers\(mediaPageControllersRef\.current\)/.test(useLibraryData)
+  !/retiredMediaPageControllersRef\s*=\s*useRef<Set<AbortController>>/.test(useLibraryData) ||
+  !/retireStaleMediaPageRequests/.test(useLibraryData) ||
+  !/abortAllMediaPageRequests/.test(useLibraryData) ||
+  !/abortAllControllers\(mediaPageControllersRef\.current\)/.test(useLibraryData) ||
+  !/for\s*\(const controller of retiredMediaPageControllersRef\.current\)[\s\S]*?controller\.abort\(\)/.test(
+    useLibraryData
+  )
 ) {
-  fail("useLibraryData must abort stale media page requests so the current viewport can preempt old windows");
+  fail("useLibraryData must retain stale media owners and hard-abort active/retired requests at boundaries");
 }
 if (
   !/thumbnailStateControllersRef\s*=\s*useRef<Map<ThumbnailRequestPriority,\s*AbortController>>/.test(

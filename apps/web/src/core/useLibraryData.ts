@@ -275,6 +275,7 @@ export function useLibraryData(
   const loadedFolderChildPageKeys = useRef<Set<string>>(new Set());
   const inFlightFolderDescendantIds = useRef<Set<number>>(new Set());
   const mediaPageControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const retiredMediaPageControllersRef = useRef<Set<AbortController>>(new Set());
   const folderChildControllersRef = useRef<Map<string, AbortController>>(new Map());
   const folderDescendantControllersRef = useRef<Map<number, AbortController>>(new Map());
   const folderChildInitialRequestsRef = useRef<Map<number, Promise<FolderRecord[]>>>(
@@ -690,29 +691,27 @@ export function useLibraryData(
     [client, createReportingAttempt, refreshThumbnailCacheStats, reportLibraryFailure]
   );
 
-  const abortStaleMediaPageRequests = useCallback((keepRequestKey?: string) => {
-    if (!keepRequestKey) {
-      abortAllControllers(mediaPageControllersRef.current);
-      inFlightMediaPageKeys.current.clear();
-      return;
-    }
-
+  const retireStaleMediaPageRequests = useCallback((keepRequestKey?: string) => {
+    // Same-library churn detaches stale callers without canceling their network
+    // requests. Generation/retired fences prevent late state writes, while the
+    // retained controllers preserve hard ownership for switch and unmount.
     for (const [requestKey, controller] of mediaPageControllersRef.current) {
       if (requestKey === keepRequestKey) {
         continue;
       }
-      controller.abort();
+      retiredMediaPageControllersRef.current.add(controller);
       mediaPageControllersRef.current.delete(requestKey);
       inFlightMediaPageKeys.current.delete(requestKey);
     }
+    setLoadingMoreMedia(mediaPageControllersRef.current.size > 0);
   }, []);
 
-  const retireStaleMediaPageRequests = useCallback(() => {
-    // Same-library refreshes already fence late results with
-    // mediaPageGeneration. Detach those requests from the active viewport and
-    // let their bounded HTTP responses finish; hard cancellation remains for
-    // library switches and unmount teardown.
-    mediaPageControllersRef.current.clear();
+  const abortAllMediaPageRequests = useCallback(() => {
+    abortAllControllers(mediaPageControllersRef.current);
+    for (const controller of retiredMediaPageControllersRef.current) {
+      controller.abort();
+    }
+    retiredMediaPageControllersRef.current.clear();
     inFlightMediaPageKeys.current.clear();
     setLoadingMoreMedia(false);
   }, []);
@@ -1749,7 +1748,7 @@ export function useLibraryData(
         scope.includeDescendants,
         scope.requestGeneration
       );
-      abortStaleMediaPageRequests(requestKey);
+      retireStaleMediaPageRequests(requestKey);
       if (
         inFlightMediaPageKeys.current.has(requestKey) ||
         loadedMediaPageKeys.current.has(requestKey)
@@ -1776,7 +1775,11 @@ export function useLibraryData(
           rootId: scope.rootId,
           signal: controller.signal
         });
-        if (scope.signal?.aborted || scope.requestGeneration !== mediaPageGeneration.current) {
+        if (
+          retiredMediaPageControllersRef.current.has(controller) ||
+          scope.signal?.aborted ||
+          scope.requestGeneration !== mediaPageGeneration.current
+        ) {
           return;
         }
         const totalCount = Math.max(
@@ -1807,7 +1810,7 @@ export function useLibraryData(
         }
         await yieldToBrowser();
       } catch (cause) {
-        if (isAbortError(cause)) {
+        if (retiredMediaPageControllersRef.current.has(controller) || isAbortError(cause)) {
           return;
         }
         if (scope.requestGeneration === mediaPageGeneration.current) {
@@ -1824,13 +1827,14 @@ export function useLibraryData(
         if (mediaPageControllersRef.current.get(requestKey) === controller) {
           mediaPageControllersRef.current.delete(requestKey);
         }
+        retiredMediaPageControllersRef.current.delete(controller);
         inFlightMediaPageKeys.current.delete(requestKey);
         if (scope.requestGeneration === mediaPageGeneration.current) {
           setLoadingMoreMedia(mediaPageControllersRef.current.size > 0);
         }
       }
     },
-    [abortStaleMediaPageRequests, createReportingAttempt, loadMediaPage, reportLibraryFailure]
+    [createReportingAttempt, loadMediaPage, reportLibraryFailure, retireStaleMediaPageRequests]
   );
 
   const requestMediaWindow = useCallback(
@@ -2092,7 +2096,7 @@ export function useLibraryData(
     if (scope?.signal?.aborted) return;
     const reportingAttempt = createReportingAttempt();
     const requestGeneration = ++mediaPageGeneration.current;
-    abortStaleMediaPageRequests();
+    retireStaleMediaPageRequests();
     abortStaleFolderRequests();
     inFlightMediaPageKeys.current.clear();
     loadedMediaPageKeys.current.clear();
@@ -2169,12 +2173,12 @@ export function useLibraryData(
   }, [
     loadMediaWindow,
     abortStaleFolderRequests,
-    abortStaleMediaPageRequests,
     createReportingAttempt,
     loadFolderChildren,
     loadRoots,
     loadTasksSafely,
-    reportLibraryFailure
+    reportLibraryFailure,
+    retireStaleMediaPageRequests
   ]);
 
   const locateMedia = useCallback(async (
@@ -2268,6 +2272,7 @@ export function useLibraryData(
         libraryRequestGenerationRef.current += 1;
         setSwitching(true);
         resetMediaCachesForLibrarySwitch();
+        abortAllMediaPageRequests();
         prepareNavigationMediaReloadRef.current?.();
         selectedRootIdRef.current = null;
         selectedFolderIdRef.current = null;
@@ -2299,7 +2304,7 @@ export function useLibraryData(
       setSwitching(false);
     });
     return unsubscribe;
-  }, [loadLibrary, replaceRoots]);
+  }, [abortAllMediaPageRequests, loadLibrary, replaceRoots]);
 
   useEffect(() => {
     seenThumbnailPersistActiveRef.current = true;
@@ -2318,6 +2323,10 @@ export function useLibraryData(
       seenThumbnailPersistControllerRef.current?.abort();
       seenThumbnailPersistControllerRef.current = null;
       abortAllControllers(mediaPageControllersRef.current);
+      for (const controller of retiredMediaPageControllersRef.current) {
+        controller.abort();
+      }
+      retiredMediaPageControllersRef.current.clear();
       abortAllControllers(folderChildControllersRef.current);
       abortAllControllers(folderDescendantControllersRef.current);
       abortAllControllers(folderAncestorControllersRef.current);
@@ -2838,7 +2847,7 @@ export function useLibraryData(
   const prepareNavigationMediaReload = useCallback(() => {
     mediaPageGeneration.current += 1;
     scanRefreshSelectionVersionRef.current += 1;
-    abortStaleMediaPageRequests();
+    retireStaleMediaPageRequests();
     abortStaleFolderRequests();
     abortAllControllers(thumbnailStateControllersRef.current);
     thumbnailPriorityScopeSyncControllerRef.current?.abort();
@@ -2857,7 +2866,7 @@ export function useLibraryData(
     selectMedia(null);
     thumbnailPriorityScopeRef.current = emptyThumbnailPriorityScope();
     thumbnailPriorityScopeSyncKeyRef.current = null;
-  }, [abortStaleFolderRequests, abortStaleMediaPageRequests]);
+  }, [abortStaleFolderRequests, retireStaleMediaPageRequests]);
   // Latest-value ref so the library-phase subscriber effect (declared earlier)
   // can invoke the current prepareNavigationMediaReload without a use-before-
   // assignment cycle.

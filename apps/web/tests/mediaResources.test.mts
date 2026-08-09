@@ -13,6 +13,7 @@ const {
   adoptThumbnailObjectUrl,
   captureOriginalFallbackObjectUrlToken,
   createOriginalFallbackObjectUrl,
+  inFlightOriginalPreviewRequests,
   originalPreviewBlobCache,
   readCachedOriginalFallbackObjectUrl,
   readCachedThumbnailObjectUrl,
@@ -201,6 +202,67 @@ describe("media resource library isolation", () => {
       assert.equal(fetchCount, 1, "the completed shared request must satisfy the next consumer from cache");
     } finally {
       resetMediaCachesForLibrarySwitch();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("bounds an abandoned shared original request and releases its scheduler slot", async (context) => {
+    const originalFetch = globalThis.fetch;
+    const consumerControllers = Array.from({ length: 3 }, () => new AbortController());
+    const requestSignals: AbortSignal[] = [];
+    let fetchCount = 0;
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+      fetchCount += 1;
+      assert.ok(init?.signal);
+      requestSignals.push(init.signal);
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("The operation was aborted.", "AbortError")),
+          { once: true }
+        );
+      });
+    }) as typeof fetch;
+
+    try {
+      resetMediaCachesForLibrarySwitch();
+      const callerOutcomes = consumerControllers.map((consumer, index) =>
+        requestOriginalPreviewBlob(media(100 + index), { signal: consumer.signal }).then(
+          () => ({ error: null }),
+          (error: unknown) => ({ error })
+        )
+      );
+      assert.equal(fetchCount, 2, "the third preview request must wait for an interactive slot");
+
+      consumerControllers.forEach((consumer) => consumer.abort());
+      const callerResults = await Promise.all(callerOutcomes);
+      assert.equal(
+        callerResults.every(({ error }) => (error as Error | null)?.name === "AbortError"),
+        true,
+        "every departed caller must settle immediately"
+      );
+      assert.equal(requestSignals.some((signal) => signal.aborted), false);
+
+      context.mock.timers.tick(59_999);
+      await Promise.resolve();
+      assert.equal(requestSignals.some((signal) => signal.aborted), false);
+
+      context.mock.timers.tick(1);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+      assert.equal(
+        requestSignals.slice(0, 2).every((signal) => signal.aborted),
+        true,
+        "the production 60s ceiling must terminate every abandoned fetch"
+      );
+      assert.equal(fetchCount, 3, "a timed-out request must release the queued scheduler slot");
+
+      context.mock.timers.tick(60_000);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+      assert.equal(inFlightOriginalPreviewRequests.size, 0, "timed-out cache entries must be removed");
+    } finally {
+      resetMediaCachesForLibrarySwitch();
+      context.mock.timers.reset();
       globalThis.fetch = originalFetch;
     }
   });

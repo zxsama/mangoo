@@ -84,7 +84,6 @@ export interface PreviewResource {
 export interface CoreRequestOptions {
   signal?: AbortSignal;
   requestPriority?: CoreRequestPriority;
-  completeOnAbort?: boolean;
 }
 
 export type CoreRequestPriority =
@@ -96,7 +95,6 @@ export type CoreRequestPriority =
 
 type ScheduledRequestInit = RequestInit & {
   requestPriority?: CoreRequestPriority;
-  completeOnAbort?: boolean;
 };
 
 type QueuedCoreRequest = {
@@ -178,7 +176,6 @@ export function createCoreClient(config: CoreClientConfig) {
   async function request<T>(path: string, init: ScheduledRequestInit = {}): Promise<T> {
     const {
       requestPriority = "metadata",
-      completeOnAbort = false,
       signal,
       ...fetchInit
     } = init;
@@ -190,22 +187,17 @@ export function createCoreClient(config: CoreClientConfig) {
       headers.set("x-megle-session", config.sessionToken);
     }
 
-    const callerSignal = signal ?? undefined;
-    const networkSignal = completeOnAbort ? undefined : callerSignal;
-    const responseRequest = scheduleCoreRequest(
+    const response = await scheduleCoreRequest(
       requestPriority,
-      networkSignal,
+      signal,
       () =>
         fetchWithTimeout(
           resolveUrl(config.baseUrl, path),
           { ...fetchInit, headers },
-          networkSignal
+          signal
         ),
       path
     );
-    const response = await (completeOnAbort
-      ? settleCallerOnAbort(responseRequest, callerSignal)
-      : responseRequest);
     if (!response.ok) {
       const body = await readResponseBody(response);
       throw new CoreApiError(response.status, body);
@@ -368,7 +360,6 @@ export function createCoreClient(config: CoreClientConfig) {
     listMedia: (params: ListMediaParams = {}, options: CoreRequestOptions = {}) =>
       request<Page<MediaRecord>>(`/media${query(params)}`, {
         requestPriority: options.requestPriority ?? "navigation",
-        completeOnAbort: options.completeOnAbort ?? true,
         signal: options.signal
       }),
     getMedia: (fileId: number) =>
@@ -460,7 +451,6 @@ export function createCoreClient(config: CoreClientConfig) {
     searchMedia: (params: SearchParams = {}, options: CoreRequestOptions = {}) =>
       request<Page<MediaRecord>>(`/search${searchQuery(params)}`, {
         requestPriority: options.requestPriority ?? "navigation",
-        completeOnAbort: options.completeOnAbort ?? true,
         signal: options.signal
       }),
     renameFileOp: (body: RenameRequest) =>
@@ -702,27 +692,32 @@ function fetchWithTimeout(
   init: RequestInit,
   callerSignal: AbortSignal | null | undefined
 ): Promise<Response> {
-  if (callerSignal) {
-    // Owner-managed lifetime: forward the caller's signal as-is.
-    return fetch(url, { ...init, signal: callerSignal });
+  const requestController = new AbortController();
+  const forwardCallerAbort = () => {
+    requestController.abort(callerSignal?.reason ?? createAbortError());
+  };
+  if (callerSignal?.aborted) {
+    forwardCallerAbort();
+  } else {
+    callerSignal?.addEventListener("abort", forwardCallerAbort, { once: true });
   }
-  // No owner: bound the request so a hung connection can't pin its slot forever.
-  const timeoutController = new AbortController();
   const timer = setTimeout(() => {
-    timeoutController.abort(new Error("Core request timed out"));
+    requestController.abort(new Error("Core request timed out"));
   }, CORE_REQUEST_TIMEOUT_MS);
-  return fetch(url, { ...init, signal: timeoutController.signal }).finally(() => {
-    clearTimeout(timer);
+  const abortRequest = new Promise<Response>((_resolve, reject) => {
+    const rejectOnAbort = () => {
+      reject(requestController.signal.reason ?? createAbortError());
+    };
+    if (requestController.signal.aborted) {
+      rejectOnAbort();
+      return;
+    }
+    requestController.signal.addEventListener("abort", rejectOnAbort, { once: true });
   });
-}
-
-function settleCallerOnAbort<T>(request: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return request;
-  if (signal.aborted) return Promise.reject(createAbortError());
-  return new Promise<T>((resolve, reject) => {
-    const abort = () => reject(createAbortError());
-    signal.addEventListener("abort", abort, { once: true });
-    request.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  const fetchRequest = fetch(url, { ...init, signal: requestController.signal });
+  return Promise.race([fetchRequest, abortRequest]).finally(() => {
+    clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", forwardCallerAbort);
   });
 }
 

@@ -152,6 +152,15 @@ function requestPath(request: RecordedRequest) {
   return new URL(request.url).pathname;
 }
 
+function assertBoundedFetchSignal(
+  actual: AbortSignal | null | undefined,
+  caller: AbortSignal
+): void {
+  assert.ok(actual, "the fetch must receive a bounded signal");
+  assert.notEqual(actual, caller, "the timeout wrapper must not reuse the caller signal");
+  assert.equal(actual.aborted, false);
+}
+
 beforeEach(() => {
   recorded = [];
   originalFetch = globalThis.fetch;
@@ -177,7 +186,7 @@ describe("createCoreClient", () => {
     mockFetch({ items: [] });
     const controller = new AbortController();
     await client().listTasks({ signal: controller.signal });
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("navigation requests preempt queued background resources across clients", async () => {
@@ -407,7 +416,7 @@ describe("createCoreClient", () => {
     assert.equal(page.totalCount, 1234);
   });
 
-  test("listMedia keeps its bounded network response independent from the caller signal", async () => {
+  test("listMedia wraps the caller signal with the bounded network lifetime", async () => {
     mockFetch({ items: [], nextCursor: null, totalCount: 0 });
     const controller = new AbortController();
     await client().listMedia({ rootId: 7, limit: 50 }, { signal: controller.signal });
@@ -415,7 +424,7 @@ describe("createCoreClient", () => {
     assert.equal(recorded[0].signal?.aborted, false);
   });
 
-  test("listMedia can reject a stale caller while its bounded response completes", async () => {
+  test("listMedia aborts its bounded network response with the caller", async () => {
     const requests = mockDeferredFetch();
     const controller = new AbortController();
     const page = client().listMedia(
@@ -431,10 +440,7 @@ describe("createCoreClient", () => {
 
     controller.abort();
     assert.equal((await outcome).error instanceof Error, true);
-    assert.equal(requests[0].signal?.aborted, false);
-
-    requests[0].resolveJson({ items: [], nextCursor: null, totalCount: 0 });
-    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(requests[0].signal?.aborted, true);
     assert.equal(requests[0].settled, true);
   });
 
@@ -451,7 +457,7 @@ describe("createCoreClient", () => {
     mockFetch({ items: [], nextCursor: null });
     const controller = new AbortController();
     await client().listFolderChildren(42, { limit: 25 }, { signal: controller.signal });
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("listFolderAncestors requests the ordered folder path", async () => {
@@ -466,7 +472,7 @@ describe("createCoreClient", () => {
     mockFetch({ items: [], nextCursor: null });
     const controller = new AbortController();
     await client().listFolderAncestors(42, { signal: controller.signal });
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("searchMedia repeats tagId for AND filtering and offset windows", async () => {
@@ -484,7 +490,7 @@ describe("createCoreClient", () => {
     assert.equal(url.searchParams.get("offset"), "250");
   });
 
-  test("searchMedia keeps its bounded network response independent from the caller signal", async () => {
+  test("searchMedia wraps the caller signal with the bounded network lifetime", async () => {
     mockFetch({ items: [], nextCursor: null });
     const controller = new AbortController();
     await client().searchMedia({ rootId: 1, q: "cat" }, { signal: controller.signal });
@@ -551,7 +557,7 @@ describe("createCoreClient", () => {
     assert.equal(url.searchParams.get("afterSequence"), "41");
     assert.equal(url.searchParams.get("limit"), "100");
     assert.equal(url.searchParams.get("waitMs"), "20000");
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("ackNotificationOutbox posts the acknowledged sequence", async () => {
@@ -623,7 +629,7 @@ describe("createCoreClient", () => {
     mockFetch("original bytes");
     const controller = new AbortController();
     await client().getPreviewBlob(42, { signal: controller.signal });
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("getPreviewBlob attaches version cache buster", async () => {
@@ -726,14 +732,14 @@ describe("createCoreClient", () => {
     });
     const controller = new AbortController();
     await client().getThumbnail(42, "grid_320", "visible", { signal: controller.signal });
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("enqueueInteractiveFolderScan forwards abort signal", async () => {
     mockFetch({ taskId: 1 });
     const controller = new AbortController();
     await client().enqueueInteractiveFolderScan(42, { signal: controller.signal });
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("syncThumbnailPriorityScope forwards abort signal", async () => {
@@ -748,7 +754,7 @@ describe("createCoreClient", () => {
       },
       { signal: controller.signal }
     );
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("getThumbnailCacheStats serializes scope query and forwards abort signal", async () => {
@@ -771,7 +777,7 @@ describe("createCoreClient", () => {
       recorded[0].url,
       `${BASE_URL}/thumbnails/cache/stats?rootId=1&folderId=2&includeDescendants=true`
     );
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("lists bounded thumbnail failure diagnostics", async () => {
@@ -780,7 +786,7 @@ describe("createCoreClient", () => {
     await client().listThumbnailCacheFailures(75, { signal: controller.signal });
     assert.equal(recorded[0].method, "GET");
     assert.equal(recorded[0].url, `${BASE_URL}/thumbnails/cache/failures?limit=75`);
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("gets the media position in a scoped sorted folder", async () => {
@@ -832,7 +838,7 @@ describe("createCoreClient", () => {
         limit: 256
       })
     );
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("enqueueThumbnailCache serializes observed file ids for seen thumbnail persistence", async () => {
@@ -881,7 +887,7 @@ describe("createCoreClient", () => {
     mockFetch("thumbnail bytes");
     const controller = new AbortController();
     await client().getThumbnailBlob(42, "grid_320", { signal: controller.signal });
-    assert.equal(recorded[0].signal, controller.signal);
+    assertBoundedFetchSignal(recorded[0].signal, controller.signal);
   });
 
   test("getThumbnailBlob attaches version cache buster", async () => {
