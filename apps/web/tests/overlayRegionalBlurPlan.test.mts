@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   buildOverlayRegionalBlurPlans,
-  buildOverlayRegionalMaskSvg,
   type OverlayRegionalRect
 } from "../src/design/overlays/overlayRegionalBlurPlan.ts";
 
@@ -99,20 +98,14 @@ describe("overlay regional blur planning", () => {
     }), []);
   });
 
-  it("serializes rounded masks independently from the filter implementation", () => {
-    const markup = buildOverlayRegionalMaskSvg({
-      targetId: "app-root",
-      targetRect: rect(0, 0, 640, 480),
-      masks: [
-        { left: 12, top: 18, width: 240, height: 144, radius: 8 },
-        { left: 300, top: 210, width: 180, height: 120, radius: 16 }
-      ],
-      blurBounds: { left: 0, top: 0, width: 640, height: 480 }
+  it("clamps a clipped rounded mask to half its smallest dimension", () => {
+    const [plan] = buildOverlayRegionalBlurPlans({
+      sigma: 4,
+      targets: [{ id: "small", layerIndex: -1, rect: rect(0, 0, 20, 20) }],
+      layers: [{ id: "large-radius", kind: "root", radius: 100, rect: rect(10, 10, 30, 30) }]
     });
-
-    assert.match(markup, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" viewBox="0 0 640 480">/);
-    assert.match(markup, /<rect x="12" y="18" width="240" height="144" rx="8" ry="8" fill="white"\/>/);
-    assert.match(markup, /<rect x="300" y="210" width="180" height="120" rx="16" ry="16" fill="white"\/>/);
-    assert.equal((markup.match(/<rect /g) ?? []).length, 2);
+    assert.deepEqual(plan.masks, [
+      { left: 10, top: 10, width: 10, height: 10, radius: 5 }
+    ]);
   });
 });

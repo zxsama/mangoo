@@ -75,6 +75,8 @@ describe("shared overlay source contract", () => {
   const legacyStyles = read("src/styles.css");
   const overlayCss = read("src/design/overlays/overlay.css");
   const anchoredOverlaySource = read("src/design/overlays/AnchoredOverlay.tsx");
+  const overlayProviderSource = read("src/design/overlays/OverlayProvider.tsx");
+  const regionalBlurSource = read("src/design/overlays/overlayRegionalBlur.ts");
   const overlayPositionSource = read("src/design/overlays/overlayPosition.ts");
   const overlaySourceBundle = [
     "overlayTypes.ts",
@@ -82,6 +84,8 @@ describe("shared overlay source contract", () => {
     "overlayPosition.ts",
     "overlayStack.ts",
     "overlayRuntime.ts",
+    "overlayRegionalBlurPlan.ts",
+    "overlayRegionalBlur.ts",
     "overlayMenuNavigation.ts",
     "overlayPresence.ts",
     "useOverlayPresence.ts",
@@ -108,41 +112,43 @@ describe("shared overlay source contract", () => {
     assert.doesNotMatch(overlaySourceBundle, /fetch\s*\(|node:fs|@radix|@floating-ui/);
   });
 
-  it("keeps popup material on one direct frosted backdrop", () => {
-    const directBackdrop = cssDeclarationsForExactSelector(
+  it("keeps popup material on the portal-mounted surface", () => {
+    const surface = cssDeclarationsForExactSelector(overlayCss, ".overlay-surface").join("\n");
+    const child = cssDeclarationsForExactSelector(
       overlayCss,
       ".overlay-surface > .liquid-glass-backdrop"
     ).join("\n");
 
-    assert.match(directBackdrop, /linear-gradient\(\s*108deg/s);
-    assert.match(directBackdrop, /var\(--glass-dialog-pane-light\)\s+0%/);
-    assert.match(directBackdrop, /var\(--glass-dialog-pane-mid\)\s+52%/);
-    assert.match(directBackdrop, /var\(--glass-dialog-pane-end\)\s+100%/);
-    assert.match(directBackdrop, /blur\(var\(--glass-dialog-blur\)\)/);
-    assert.match(directBackdrop, /var\(\s*--overlay-solid-fallback-fill,/);
+    assert.match(surface, /linear-gradient\(\s*108deg/s);
+    assert.match(surface, /var\(--glass-dialog-pane-light\)\s+0%/);
+    assert.match(surface, /var\(--glass-dialog-pane-mid\)\s+52%/);
+    assert.match(surface, /var\(--glass-dialog-pane-end\)\s+100%/);
+    assert.match(surface, /var\(\s*--overlay-solid-fallback-fill,/);
+    assert.match(surface, /-webkit-backdrop-filter:\s*none/);
+    assert.match(surface, /(?:^|\s)backdrop-filter:\s*none/);
+    assert.doesNotMatch(surface, /blur\(var\(--glass-dialog-blur\)\)/);
 
-    const outerSurface = cssDeclarationsForExactSelector(overlayCss, ".overlay-surface").join("\n");
-    assert.match(outerSurface, /background:\s*transparent/);
+    assert.match(child, /background:\s*transparent/);
+    assert.match(child, /-webkit-backdrop-filter:\s*none/);
+    assert.match(child, /(?:^|\s)backdrop-filter:\s*none/);
+    assert.doesNotMatch(child, /glass-dialog-pane|glass-dialog-blur|overlay-solid-fallback/);
 
     for (const selector of [
       ".overlay-surface-popover",
       ".overlay-surface-nested",
       ".library-switcher",
-      ".library-switcher-header",
-      ".library-switcher-list",
-      ".library-switcher-footer",
       "#library-remove-confirm",
       ".context-menu",
       ".file-operation-dialog"
     ]) {
       const declarations = cssDeclarationsForExactSelector(overlayCss, selector).join("\n");
       assert.notEqual(declarations, "", `${selector} must have a production rule`);
-      assert.match(declarations, /background:\s*transparent/);
+      assert.doesNotMatch(declarations, /(?:^|;)\s*background\s*:/);
       assert.doesNotMatch(declarations, /--glass-side-fill|--glass-dialog-fill/);
     }
   });
 
-  it("dims only outside a modal while its bounded surface owns the blur", () => {
+  it("dims only outside a modal while the regional scene owns the blur", () => {
     const modalViewport = cssDeclarationsForExactSelector(
       overlayCss,
       ".overlay-modal-backdrop"
@@ -151,7 +157,8 @@ describe("shared overlay source contract", () => {
       overlayCss,
       ".overlay-modal-surface"
     ).join("\n");
-    const directBackdrop = cssDeclarationsForExactSelector(
+    const surface = cssDeclarationsForExactSelector(overlayCss, ".overlay-surface").join("\n");
+    const child = cssDeclarationsForExactSelector(
       overlayCss,
       ".overlay-surface > .liquid-glass-backdrop"
     ).join("\n");
@@ -161,7 +168,34 @@ describe("shared overlay source contract", () => {
     assert.match(modalViewport, /(?:^|\s)backdrop-filter:\s*none/);
     assert.match(modalSurface, /0\s+0\s+0\s+100vmax\s+var\(--dialog-backdrop-dim\)/);
     assert.match(modalSurface, /var\(--glass-shadow\)/);
-    assert.match(directBackdrop, /blur\(var\(--glass-dialog-blur\)\)/);
+    assert.match(surface, /backdrop-filter:\s*none/);
+    assert.match(child, /backdrop-filter:\s*none/);
+    assert.doesNotMatch(
+      overlayCss,
+      /\.overlay-modal-backdrop\[data-overlay-state="(?:opening|closing)"\]\s*\{[^}]*animation:/s
+    );
+    assert.match(
+      overlayCss,
+      /\.overlay-modal-surface\[data-overlay-state="opening"\][\s\S]*?160ms/
+    );
+    assert.match(
+      overlayCss,
+      /\.overlay-modal-surface\[data-overlay-state="closing"\][\s\S]*?160ms/
+    );
+  });
+
+  it("binds the ordered overlay stack to the regional SourceGraphic filter", () => {
+    assert.match(overlayProviderSource, /createOverlayRegionalBlurController/);
+    assert.match(overlayProviderSource, /regionalBlurControllerRef\.current\?\.setLayers\(state\.layers\)/);
+    assert.match(regionalBlurSource, /buildOverlayRegionalBlurPlans/);
+    assert.match(regionalBlurSource, /SourceGraphic/);
+    assert.match(regionalBlurSource, /feGaussianBlur/);
+    assert.match(regionalBlurSource, /feColorMatrix/);
+    assert.match(regionalBlurSource, /feFlood/);
+    assert.match(regionalBlurSource, /feComponentTransfer/);
+    assert.match(regionalBlurSource, /feComposite/);
+    assert.match(regionalBlurSource, /feMerge/);
+    assert.doesNotMatch(regionalBlurSource, /feImage|image\.decode|data:image\/svg\+xml/);
   });
 
   it("keeps migrated overlay ownership in overlay.css", () => {
@@ -237,8 +271,10 @@ describe("shared overlay source contract", () => {
       overlayCss,
       /overlay-surface-nested\[data-overlay-state="closing"\][\s\S]*?110ms/
     );
-    assert.match(overlayCss, /overlay-modal-backdrop\[data-overlay-state="opening"\]/);
-    assert.match(overlayCss, /overlay-modal-backdrop\[data-overlay-state="closing"\]/);
+    assert.doesNotMatch(
+      overlayCss,
+      /\.overlay-modal-backdrop\[data-overlay-state="(?:opening|closing)"\]\s*\{[^}]*animation:/s
+    );
     assert.match(overlayCss, /prefers-reduced-motion:\s*reduce[\s\S]*?animation:\s*none/);
   });
 });

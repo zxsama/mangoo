@@ -5,7 +5,17 @@
   --glass-border-current: var(--glass-center-stroke);
   color: var(--text-soft);
   border-radius: var(--radius-overlay);
-  background: transparent;
+  background: var(
+    --overlay-solid-fallback-fill,
+    linear-gradient(
+      108deg,
+      var(--glass-dialog-pane-light) 0%,
+      var(--glass-dialog-pane-mid) 52%,
+      var(--glass-dialog-pane-end) 100%
+    )
+  );
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
   box-shadow: var(--glass-shadow);
 }
 
@@ -24,27 +34,12 @@
 .overlay-surface-popover,
 .overlay-surface-nested {
   overflow: hidden;
-  background: transparent;
 }
 
 .overlay-surface > .liquid-glass-backdrop {
-  background: var(
-    --overlay-solid-fallback-fill,
-    linear-gradient(
-      108deg,
-      var(--glass-dialog-pane-light) 0%,
-      var(--glass-dialog-pane-mid) 52%,
-      var(--glass-dialog-pane-end) 100%
-    )
-  );
-  -webkit-backdrop-filter: var(
-    --overlay-solid-fallback-filter,
-    blur(var(--glass-dialog-blur)) saturate(var(--glass-center-saturation))
-  );
-  backdrop-filter: var(
-    --overlay-solid-fallback-filter,
-    blur(var(--glass-dialog-blur)) saturate(var(--glass-center-saturation))
-  );
+  background: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
 
 .overlay-scroll-viewport {
@@ -54,7 +49,6 @@
 }
 
 .overlay-surface-nested {
-  background: transparent;
   box-shadow: var(--glass-shadow-tight);
 }
 
@@ -340,7 +334,6 @@
   display: flex;
   overflow: hidden;
   border-radius: var(--radius-overlay);
-  background: transparent;
   color: var(--text-soft);
 }
 
@@ -641,7 +634,6 @@
   max-width: calc(100vw - 32px);
   padding: 16px;
   border-radius: var(--radius-overlay);
-  background: transparent;
   color: var(--text-soft);
 }
 
@@ -693,7 +685,6 @@
   padding: 6px;
   border: 0;
   border-radius: var(--radius-overlay);
-  background: transparent;
   box-shadow: var(--glass-shadow);
 }
 
@@ -767,7 +758,6 @@
   flex-direction: column;
   overflow: hidden;
   border-radius: var(--radius-overlay);
-  background: transparent;
 }
 
 .file-operation-dialog.overlay-dialog-wide {
@@ -2015,18 +2005,6 @@
   }
 }
 
-@keyframes overlay-modal-backdrop-enter {
-  from {
-    opacity: 0;
-  }
-}
-
-@keyframes overlay-modal-backdrop-exit {
-  to {
-    opacity: 0;
-  }
-}
-
 @keyframes overlay-modal-surface-enter {
   from {
     opacity: 0;
@@ -2152,13 +2130,6 @@
     animation: overlay-nested-exit 110ms ease-in both;
     pointer-events: none;
   }
-  .overlay-modal-backdrop[data-overlay-state="opening"] {
-    animation: overlay-modal-backdrop-enter 160ms ease-out both;
-  }
-  .overlay-modal-backdrop[data-overlay-state="closing"] {
-    animation: overlay-modal-backdrop-exit 160ms ease-in both;
-    pointer-events: none;
-  }
   .overlay-modal-surface[data-overlay-state="opening"] {
     animation: overlay-modal-surface-enter 160ms ease-out both;
   }
@@ -2170,7 +2141,6 @@
 @media (prefers-reduced-motion: reduce) {
   .overlay-surface-popover,
   .overlay-surface-nested,
-  .overlay-modal-backdrop,
   .overlay-modal-surface {
     animation: none;
     transform: none;
@@ -2184,7 +2154,7 @@
   }
 }
 
-@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+@supports not (filter: url("#megle-overlay-regional-blur-support")) {
   :root {
     --overlay-solid-fallback-fill: rgba(18, 24, 30, 0.98);
     --overlay-solid-fallback-filter: none;

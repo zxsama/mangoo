@@ -145,17 +145,3 @@ export function buildOverlayRegionalBlurPlans({
   }
   return plans;
 }
-
-function serializeNumber(value: number): string {
-  return String(Number(value.toFixed(3)));
-}
-
-export function buildOverlayRegionalMaskSvg(plan: OverlayRegionalBlurPlan): string {
-  const width = serializeNumber(plan.targetRect.width);
-  const height = serializeNumber(plan.targetRect.height);
-  const rectangles = plan.masks.map((mask) => {
-    const radius = serializeNumber(mask.radius);
-    return `<rect x="${serializeNumber(mask.left)}" y="${serializeNumber(mask.top)}" width="${serializeNumber(mask.width)}" height="${serializeNumber(mask.height)}" rx="${radius}" ry="${radius}" fill="white"/>`;
-  }).join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}">${rectangles}</svg>`;
-}

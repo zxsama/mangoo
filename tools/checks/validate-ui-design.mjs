@@ -125,6 +125,8 @@ const overlayStyles = read("apps/web/src/design/overlays/overlay.css");
 const overlayStylesForChecks = stripCssComments(overlayStyles);
 const overlayPosition = read("apps/web/src/design/overlays/overlayPosition.ts");
 const overlayStack = read("apps/web/src/design/overlays/overlayStack.ts");
+const overlayProvider = read("apps/web/src/design/overlays/OverlayProvider.tsx");
+const overlayRegionalBlur = read("apps/web/src/design/overlays/overlayRegionalBlur.ts");
 const overlayPrimitives = [
   overlayPosition,
   overlayStack,
@@ -1902,16 +1904,47 @@ if (cssBlocksForExactSelector(stylesForChecks, ".notification-status-dot").lengt
 }
 
 const floatingPopoverBlocks = cssBlocksForExactSelector(overlayStylesForChecks, ".overlay-surface");
-if (
-  !floatingPopoverBlocks.some(
-    (block) =>
-      /--glass-fill:\s*var\(--glass-dialog-fill\)/.test(block) &&
-      /--glass-blur-current:\s*var\(--glass-dialog-blur\)/.test(block) &&
-      /background:\s*transparent/.test(block) &&
-      hasNonNoneDeclaration(block, "box-shadow")
-  )
-) {
-  fail("shared overlay surfaces must use dialog glass tokens instead of feature-local material styling");
+if (!floatingPopoverBlocks.some((block) =>
+  /linear-gradient\(\s*108deg/s.test(block) &&
+  /var\(--glass-dialog-pane-light\)\s+0%/.test(block) &&
+  /var\(--glass-dialog-pane-mid\)\s+52%/.test(block) &&
+  /var\(--glass-dialog-pane-end\)\s+100%/.test(block) &&
+  latestDeclarationValue(block, "-webkit-backdrop-filter") === "none" &&
+  latestDeclarationValue(block, "backdrop-filter") === "none" &&
+  !/blur\(var\(--glass-dialog-blur\)\)/.test(block) &&
+  /--overlay-solid-fallback-fill/.test(block) &&
+  hasNonNoneDeclaration(block, "box-shadow")
+)) {
+  fail("shared overlay surface must paint the Settings-content gradient without owning backdrop blur");
+}
+
+for (const value of [
+  "createOverlayRegionalBlurController",
+  "regionalBlurControllerRef.current?.setLayers(state.layers)"
+]) {
+  if (!overlayProvider.includes(value)) {
+    fail(`OverlayProvider regional blur binding missing ${value}`);
+  }
+}
+for (const value of [
+  "buildOverlayRegionalBlurPlans",
+  "SourceGraphic",
+  "feGaussianBlur",
+  "feColorMatrix",
+  "feFlood",
+  "feComponentTransfer",
+  "feComposite",
+  "feMerge"
+]) {
+  if (!overlayRegionalBlur.includes(value)) {
+    fail(`regional SourceGraphic filter pipeline missing ${value}`);
+  }
+}
+if (/feImage|image\.decode|data:image\/svg\+xml/.test(overlayRegionalBlur)) {
+  fail("regional overlay masks must be built synchronously from SVG filter primitives");
+}
+if (/capturePage|desktopCapturer|captureVisibleTab/.test(overlayRegionalBlur)) {
+  fail("regional overlay blur must not capture screenshots or use desktop capture APIs");
 }
 
 const directOverlayBackdropBlocks = cssBlocksForExactSelector(
@@ -1919,26 +1952,20 @@ const directOverlayBackdropBlocks = cssBlocksForExactSelector(
   ".overlay-surface > .liquid-glass-backdrop"
 );
 if (
-  !directOverlayBackdropBlocks.some(
-    (block) =>
-      /linear-gradient\(\s*108deg/s.test(block) &&
-      /var\(--glass-dialog-pane-light\)\s+0%/.test(block) &&
-      /var\(--glass-dialog-pane-mid\)\s+52%/.test(block) &&
-      /var\(--glass-dialog-pane-end\)\s+100%/.test(block) &&
-      /blur\(var\(--glass-dialog-blur\)\)/.test(block) &&
-      /--overlay-solid-fallback-fill/.test(block)
+  !directOverlayBackdropBlocks.some((block) =>
+    /background:\s*transparent/.test(block) &&
+    latestDeclarationValue(block, "-webkit-backdrop-filter") === "none" &&
+    latestDeclarationValue(block, "backdrop-filter") === "none" &&
+    !/glass-dialog-pane|glass-dialog-blur|overlay-solid-fallback/.test(block)
   )
 ) {
-  fail("shared overlay direct backdrop must own the Settings-content gradient and dialog blur");
+  fail("shared overlay direct backdrop must stay transparent and unfiltered");
 }
 
 for (const selector of [
   ".overlay-surface-popover",
   ".overlay-surface-nested",
   ".library-switcher",
-  ".library-switcher-header",
-  ".library-switcher-list",
-  ".library-switcher-footer",
   "#library-remove-confirm",
   ".context-menu",
   ".file-operation-dialog"
@@ -1946,10 +1973,24 @@ for (const selector of [
   const blocks = cssBlocksForExactSelector(overlayStylesForChecks, selector);
   if (
     blocks.length === 0 ||
-    !blocks.some((block) => /background:\s*transparent/.test(block)) ||
-    blocks.some((block) => /--glass-side-fill|--glass-dialog-fill/.test(block))
+    blocks.some(
+      (block) =>
+        /(?:^|;)\s*background\s*:/.test(block) ||
+        /--glass-side-fill|--glass-dialog-fill/.test(block)
+    )
   ) {
-    fail(`overlay feature surface ${selector} must stay transparent and avoid repainting material`);
+    fail(`overlay feature surface ${selector} must avoid repainting material`);
+  }
+}
+
+for (const selector of [
+  ".library-switcher-header",
+  ".library-switcher-list",
+  ".library-switcher-footer"
+]) {
+  const blocks = cssBlocksForExactSelector(overlayStylesForChecks, selector);
+  if (blocks.length === 0 || !blocks.some((block) => /background:\s*transparent/.test(block))) {
+    fail(`library switcher inner surface ${selector} must stay transparent`);
   }
 }
 
@@ -1980,6 +2021,15 @@ if (
   )
 ) {
   fail("modal surface must dim only outside its border while preserving the glass elevation shadow");
+}
+
+for (const selector of [
+  '.overlay-modal-backdrop[data-overlay-state="opening"]',
+  '.overlay-modal-backdrop[data-overlay-state="closing"]'
+]) {
+  if (cssBlocksForExactSelector(overlayStylesForChecks, selector).some((block) => /animation\s*:/.test(block))) {
+    fail(`modal viewport ${selector} must not animate`);
+  }
 }
 
 for (const value of [

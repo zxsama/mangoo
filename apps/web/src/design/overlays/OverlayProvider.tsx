@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -26,6 +27,10 @@ import {
   shouldRestoreOverlayFocus,
   type OverlayDismissReason
 } from "./overlayRuntime";
+import {
+  createOverlayRegionalBlurController,
+  type OverlayRegionalBlurController
+} from "./overlayRegionalBlur";
 import type {
   OverlayLayerRegistration,
   OverlayRootId,
@@ -53,6 +58,23 @@ function restoreLayerFocus(layer: OverlayLayerRegistration, reason: OverlayDismi
 export function OverlayProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<OverlayStackState>(createOverlayStackState);
   const stateRef = useRef(state);
+  const regionalBlurControllerRef = useRef<OverlayRegionalBlurController | null>(null);
+
+  useLayoutEffect(() => {
+    const controller = createOverlayRegionalBlurController(document);
+    regionalBlurControllerRef.current = controller;
+    controller.setLayers(stateRef.current.layers);
+    return () => {
+      controller.destroy();
+      if (regionalBlurControllerRef.current === controller) {
+        regionalBlurControllerRef.current = null;
+      }
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    regionalBlurControllerRef.current?.setLayers(state.layers);
+  }, [state.layers]);
 
   const commitState = useCallback((next: OverlayStackState) => {
     stateRef.current = next;
