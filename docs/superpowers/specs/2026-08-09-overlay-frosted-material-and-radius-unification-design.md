@@ -1,6 +1,6 @@
 # Overlay Frosted Material and Radius Unification Design
 
-**Status:** Approved for implementation on 2026-08-09
+**Status:** Revised after physical-window validation on 2026-08-10; written revision pending user review
 
 ## 1. Goal
 
@@ -19,11 +19,11 @@ This document supersedes the independent `surfaceCornerRadius` and `controlCorne
 
 ## 3. Root Cause
 
-The shared `OverlaySurface` already renders a direct `.liquid-glass-backdrop` with a real `backdrop-filter`. The apparent lack of frost comes from painting an opaque-looking dialog fill twice: once on the outer overlay container and again on the inner backdrop. With the default alpha values, those two layers combine into a much darker surface that hides the texture the blur sampled.
+The first implementation removed duplicate dark fills, but physical-window validation showed that its blur owner was still wrong. `OverlaySurface` placed `backdrop-filter` on a direct `.liquid-glass-backdrop` child. That child sits inside a `LiquidGlassSurface`, while root, nested, and modal opening animations temporarily apply `opacity < 1` to the surface or one of its ancestors. Under the CSS Backdrop Root rules, an ancestor with partial opacity bounds the pixels available to descendant backdrop filters. The child can therefore receive an empty transparent intermediate surface even though its computed `backdrop-filter` reports `blur(34px)`.
 
-Modal dialogs add a second problem. The full-screen modal backdrop currently applies dimming and blur, while the nested dialog surface applies another dark fill and another blur. Rename and Move To therefore render through two blur planes and three dark layers, producing a muddy result instead of the Settings window's clear acrylic hierarchy.
+Computed-style evidence was insufficient because it proved only that Chromium accepted the property, not that the filtered input contained application pixels. The previous fixture also lacked a high-frequency background that would make successful blur measurable.
 
-The Settings window is the working reference: a transparent outer shell, one material backdrop, a dark navigation pane, and a lighter 108-degree content gradient.
+The Settings window is not evidence that the child-backdrop topology works. Settings is a separate Electron `BrowserWindow` with native Windows acrylic applied to the whole window. Its right content pane only paints the lighter 108-degree translucent gradient over that already-blurred native material. Renderer popups remain DOM elements in the main window, so they need in-app acrylic: the popup element itself must sample already-painted application content with CSS `backdrop-filter`.
 
 ## 4. Radius Model
 
@@ -71,23 +71,25 @@ linear-gradient(
 
 ### 6.1 Root and nested popups
 
-The outer `.overlay-surface`, `.overlay-surface-popover`, and `.overlay-surface-nested` containers are transparent. Their direct `.liquid-glass-backdrop` owns the dialog gradient and `--glass-dialog-blur`. Feature classes such as `.context-menu`, `.library-switcher`, and their headers, lists, footers, or confirmation surfaces may lay out and separate content, but must not repaint sidebar or dialog material behind the shared backdrop.
+The portal-mounted `.overlay-surface` element is the only in-app acrylic owner. It paints the dialog gradient and applies `blur(var(--glass-dialog-blur)) saturate(var(--glass-center-saturation))` to its own backdrop. Its direct `.liquid-glass-backdrop` child is transparent and has no backdrop filter, so the generic Liquid Glass DOM structure cannot introduce a nested filtering pass.
+
+Root and nested popup opacity/transform motion may remain on the surface itself. The filtered backdrop is produced by that same element before the element's final opacity is composited; there is no partially opaque ancestor between the portal target and the blur owner. Feature classes such as `.context-menu`, `.library-switcher`, and their headers, lists, footers, or confirmation surfaces may lay out and separate content, but must not repaint sidebar or dialog material.
 
 ### 6.2 Modal dialogs
 
-`.overlay-modal-backdrop` remains transparent and has no backdrop filter; it owns only viewport layout, pointer capture, and open/close animation. The modal surface paints a large spread shadow using `--dialog-backdrop-dim`, so the application is dimmed outside the dialog border while the dialog interior remains free of that dark layer.
+`.overlay-modal-backdrop` remains transparent and has no backdrop filter. It owns only viewport layout and pointer capture; it must not animate opacity because that would create a transient Backdrop Root above the dialog. Modal entrance/exit motion stays on `.overlay-modal-surface` itself.
 
-The modal surface's direct `.liquid-glass-backdrop` owns the same right-content gradient and one `--glass-dialog-blur` pass as a normal popup. This keeps the blur area bounded to the dialog instead of expanding the dialog slider's default 34px and maximum 68px radius across the full viewport. Rename, Move To, library removal confirmation, and all other `ModalSurface` consumers inherit this topology without feature JSX changes.
+The modal surface itself owns the same right-content gradient and one `--glass-dialog-blur` pass as a normal popup. Its direct `.liquid-glass-backdrop` is inert. This keeps the blur area bounded to the dialog instead of expanding the dialog slider's default 34px and maximum 68px radius across the full viewport. Rename, Move To, library removal confirmation, and all other `ModalSurface` consumers inherit this topology without feature JSX changes.
 
 The outside-only dim is implemented with a spread shadow on `.overlay-modal-surface`, equivalent to `0 0 0 100vmax var(--dialog-backdrop-dim)`, followed by the normal glass elevation shadow. A full-screen filtered pseudo-element, mask, or dark background beneath the translucent dialog is not permitted because it would either reintroduce a second blur plane or contaminate the dialog material.
 
 ### 6.3 Reduced-transparency and unsupported-filter fallback
 
-The outer surface and modal viewport container remain transparent in every mode. When transparency is reduced, unsupported, or force-disabled by the visual harness, the direct backdrop becomes `rgba(18, 24, 30, 0.98)` and all overlay filters become `none`. The outside-only modal dim shadow remains available for hierarchy, while no blur is attempted.
+The modal viewport container remains transparent in every mode. When transparency is reduced, unsupported, or force-disabled by the visual harness, the overlay surface itself becomes `rgba(18, 24, 30, 0.98)` and its backdrop filter becomes `none`; the direct backdrop child remains inert. The outside-only modal dim shadow remains available for hierarchy, while no blur is attempted.
 
 ## 7. Preserved Behavior
 
-- Overlay stack ownership, focus trapping, Escape/outside-pointer dismissal, portals, z-index levels, and open/close motion remain unchanged.
+- Overlay stack ownership, focus trapping, Escape/outside-pointer dismissal, portals, and z-index levels remain unchanged. Root/nested and modal-surface motion remain; only the modal viewport opacity animation is removed.
 - The global pointer-highlight system remains the only hover system.
 - Settings and Plugins keep native Windows acrylic; no Electron window lifecycle changes are required.
 - Media grids, preview canvases, Core APIs, and filesystem operations are outside this change.
@@ -103,10 +105,11 @@ Automated coverage must prove:
 - retired preference keys, retired slider ids, and the undefined `--surface-corner-radius` / `--control-corner-radius` aliases are absent from production source;
 - representative Settings panel and control elements report `0px`, `8px`, and `16px` computed radii when the combined slider is exercised;
 - dialog pane colors follow the declared light/mid/end derivation and become transparent when dialog opacity or strength is zero;
-- outer overlay and feature surfaces are transparent;
-- a normal popup has one direct-backdrop blur owner;
-- a modal viewport has no fill or filter, its surface backdrop is the sole blur owner, and its dim shadow does not paint inside the dialog border;
+- feature-specific inner surfaces do not repaint dialog or sidebar material;
+- a normal popup surface is the sole gradient and blur owner, while its direct backdrop child is transparent and unfiltered;
+- a modal viewport has no fill, filter, or opacity animation; its modal surface is the sole blur owner, and its dim shadow does not paint inside the dialog border;
 - the modal center remains within the same luminance family as a normal popup and preserves visibly blurred background texture instead of collapsing to a flat dark fill;
-- solid fallback is opaque on the direct backdrop and disables every filter without repainting the outer surface.
+- solid fallback is opaque on the overlay surface and disables every filter without reactivating the direct backdrop child;
+- a deterministic visual fixture places a high-frequency checkerboard and fine text behind the popup, captures zero-blur and configured-blur states, and verifies that edge energy inside the popup decreases while the outside reference crop remains stable.
 
-Required final checks are the focused interface/overlay tests, `npm run check:ui-design`, `npm run check:web`, `npm run check:desktop`, `npm test`, and the OS-backdrop desktop visual harness. The harness must exercise the dialog blur slider at its maximum and report no interaction timeout or material-topology regression. The new build must be checked at 100%, 125%, and 150% display scale for a normal popup, a nested popup, Rename, and Move To. The real window must be inspected for material layering because CDP screenshots cannot validate physical compositor anti-aliasing.
+Required final checks are the focused interface/overlay tests, `npm run check:ui-design`, `npm run check:web`, `npm run check:desktop`, `npm test`, and the OS-backdrop desktop visual harness. The harness must exercise zero, default, and maximum dialog blur against the patterned fixture, report a real pixel-level blur delta, and show no interaction timeout or material-topology regression. The new build must be checked at 100%, 125%, and 150% display scale for a normal popup, a nested popup, Rename, and Move To. The real window must be inspected for material layering because CDP screenshots cannot validate physical compositor anti-aliasing.
