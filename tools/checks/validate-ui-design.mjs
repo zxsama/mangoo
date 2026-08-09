@@ -1963,6 +1963,22 @@ for (const value of [
     fail(`regional SourceGraphic filter pipeline missing ${value}`);
   }
 }
+const roundedMaskPrimitivesBody = extractFunctionBody(overlayRegionalBlur, "appendRoundedMaskPrimitives");
+if (!roundedMaskPrimitivesBody) {
+  fail("regional rounded-mask primitive builder missing");
+} else {
+  const roundedMaskSourceClipChecks = [
+    /const\s+roundedUnclippedResult\s*=\s*`regional-mask-\$\{index\}-rounded`;/,
+    /setAttributes\(rounded,\s*\{\s*in:\s*softenedResult,\s*\.\.\.bounds,\s*result:\s*roundedUnclippedResult\s*\}\);/,
+    /const\s+clippedResult\s*=\s*`regional-mask-\$\{index\}-clipped`;/,
+    /setAttributes\(clipped,\s*\{\s*in:\s*roundedUnclippedResult,\s*in2:\s*sourceResult,\s*operator:\s*"in",\s*result:\s*clippedResult\s*\}\);/,
+    /filter\.append\(softened,\s*rounded,\s*clipped\);/,
+    /return\s+clippedResult;/
+  ];
+  if (!roundedMaskSourceClipChecks.every((check) => check.test(roundedMaskPrimitivesBody))) {
+    fail("each rounded regional mask must threshold alpha, source-clip it, and return the clipped result");
+  }
+}
 if (/feImage|image\.decode|data:image\/svg\+xml/.test(overlayRegionalBlur)) {
   fail("regional overlay masks must be built synchronously from SVG filter primitives");
 }

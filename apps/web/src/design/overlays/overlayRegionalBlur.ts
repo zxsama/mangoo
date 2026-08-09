@@ -114,9 +114,9 @@ function appendRoundedMaskPrimitives(
       "data-overlay-regional-mask-rounding": "true"
     });
 
-    const roundedResult = `regional-mask-${index}-rounded`;
+    const roundedUnclippedResult = `regional-mask-${index}-rounded`;
     const rounded = svgElement(ownerDocument, "feComponentTransfer");
-    setAttributes(rounded, { in: softenedResult, ...bounds, result: roundedResult });
+    setAttributes(rounded, { in: softenedResult, ...bounds, result: roundedUnclippedResult });
     const alpha = svgElement(ownerDocument, "feFuncA");
     setAttributes(alpha, {
       type: "linear",
@@ -124,8 +124,16 @@ function appendRoundedMaskPrimitives(
       intercept: -(ROUNDED_MASK_ALPHA_SLOPE - 1) / 2
     });
     rounded.append(alpha);
-    filter.append(softened, rounded);
-    return roundedResult;
+    const clippedResult = `regional-mask-${index}-clipped`;
+    const clipped = svgElement(ownerDocument, "feComposite");
+    setAttributes(clipped, {
+      in: roundedUnclippedResult,
+      in2: sourceResult,
+      operator: "in",
+      result: clippedResult
+    });
+    filter.append(softened, rounded, clipped);
+    return clippedResult;
   });
 
   if (maskResults.length === 1) return maskResults[0];
