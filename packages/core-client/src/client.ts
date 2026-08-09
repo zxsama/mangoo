@@ -84,6 +84,7 @@ export interface PreviewResource {
 export interface CoreRequestOptions {
   signal?: AbortSignal;
   requestPriority?: CoreRequestPriority;
+  completeOnAbort?: boolean;
 }
 
 export type CoreRequestPriority =
@@ -95,6 +96,7 @@ export type CoreRequestPriority =
 
 type ScheduledRequestInit = RequestInit & {
   requestPriority?: CoreRequestPriority;
+  completeOnAbort?: boolean;
 };
 
 type QueuedCoreRequest = {
@@ -174,7 +176,12 @@ if (typeof window !== "undefined") {
 
 export function createCoreClient(config: CoreClientConfig) {
   async function request<T>(path: string, init: ScheduledRequestInit = {}): Promise<T> {
-    const { requestPriority = "metadata", ...fetchInit } = init;
+    const {
+      requestPriority = "metadata",
+      completeOnAbort = false,
+      signal,
+      ...fetchInit
+    } = init;
     const headers = new Headers(init.headers);
     if (init.body && !headers.has("content-type")) {
       headers.set("content-type", "application/json");
@@ -183,17 +190,22 @@ export function createCoreClient(config: CoreClientConfig) {
       headers.set("x-megle-session", config.sessionToken);
     }
 
-    const response = await scheduleCoreRequest(
+    const callerSignal = signal ?? undefined;
+    const networkSignal = completeOnAbort ? undefined : callerSignal;
+    const responseRequest = scheduleCoreRequest(
       requestPriority,
-      init.signal,
+      networkSignal,
       () =>
         fetchWithTimeout(
           resolveUrl(config.baseUrl, path),
           { ...fetchInit, headers },
-          init.signal
+          networkSignal
         ),
       path
     );
+    const response = await (completeOnAbort
+      ? settleCallerOnAbort(responseRequest, callerSignal)
+      : responseRequest);
     if (!response.ok) {
       const body = await readResponseBody(response);
       throw new CoreApiError(response.status, body);
@@ -356,6 +368,7 @@ export function createCoreClient(config: CoreClientConfig) {
     listMedia: (params: ListMediaParams = {}, options: CoreRequestOptions = {}) =>
       request<Page<MediaRecord>>(`/media${query(params)}`, {
         requestPriority: options.requestPriority ?? "navigation",
+        completeOnAbort: options.completeOnAbort ?? true,
         signal: options.signal
       }),
     getMedia: (fileId: number) =>
@@ -447,6 +460,7 @@ export function createCoreClient(config: CoreClientConfig) {
     searchMedia: (params: SearchParams = {}, options: CoreRequestOptions = {}) =>
       request<Page<MediaRecord>>(`/search${searchQuery(params)}`, {
         requestPriority: options.requestPriority ?? "navigation",
+        completeOnAbort: options.completeOnAbort ?? true,
         signal: options.signal
       }),
     renameFileOp: (body: RenameRequest) =>
@@ -699,6 +713,16 @@ function fetchWithTimeout(
   }, CORE_REQUEST_TIMEOUT_MS);
   return fetch(url, { ...init, signal: timeoutController.signal }).finally(() => {
     clearTimeout(timer);
+  });
+}
+
+function settleCallerOnAbort<T>(request: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return request;
+  if (signal.aborted) return Promise.reject(createAbortError());
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(createAbortError());
+    signal.addEventListener("abort", abort, { once: true });
+    request.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
   });
 }
 

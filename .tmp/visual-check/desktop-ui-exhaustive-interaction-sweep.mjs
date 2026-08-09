@@ -691,8 +691,14 @@ async function openContextMenuForMedia(client) {
 }
 
 async function openContextMenuForTreeNode(client, text) {
-  await dispatchContextMenuContains(client, ".tree-item .tree-label", text);
-  await waitFor(client, `Boolean(document.querySelector('.context-menu'))`, 10_000, `context menu ${text}`);
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await dispatchContextMenuContains(client, ".tree-item .tree-label", text);
+    await waitFor(client, `Boolean(document.querySelector('.context-menu'))`, 10_000, `context menu ${text}`);
+    if ((await contextMenuItems(client)).length > 0) return;
+    await pressKey(client, "Escape").catch(() => undefined);
+    await delay(500);
+  }
+  throw new Error(`Context menu ${text} did not remain mounted after three stable retries`);
 }
 
 function assertMenuLabels(actualItems, expectedLabels, label) {

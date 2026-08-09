@@ -345,6 +345,7 @@ test("thumbnail priority scope changes coalesce without scenario request aborts"
   const reload = source.slice(reloadStart, reloadEnd);
   assert.ok(reloadStart >= 0 && reloadEnd > reloadStart);
   assert.match(reload, /const requestGeneration = \+\+mediaPageGeneration\.current;\s*retireStaleMediaPageRequests\(\)/);
+  assert.match(source, /signal: scope\.signal\s*\}/);
   assert.match(source, /mediaPageGeneration\.current[\s\S]*?return;/);
   assert.match(source, /abortAllControllers\(mediaPageControllersRef\.current\)/);
 });

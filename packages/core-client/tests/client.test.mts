@@ -407,11 +407,35 @@ describe("createCoreClient", () => {
     assert.equal(page.totalCount, 1234);
   });
 
-  test("listMedia forwards abort signal", async () => {
+  test("listMedia keeps its bounded network response independent from the caller signal", async () => {
     mockFetch({ items: [], nextCursor: null, totalCount: 0 });
     const controller = new AbortController();
     await client().listMedia({ rootId: 7, limit: 50 }, { signal: controller.signal });
-    assert.equal(recorded[0].signal, controller.signal);
+    assert.notEqual(recorded[0].signal, controller.signal);
+    assert.equal(recorded[0].signal?.aborted, false);
+  });
+
+  test("listMedia can reject a stale caller while its bounded response completes", async () => {
+    const requests = mockDeferredFetch();
+    const controller = new AbortController();
+    const page = client().listMedia(
+      { rootId: 7, limit: 50 },
+      { signal: controller.signal }
+    );
+    const outcome = page.then(
+      () => ({ error: null }),
+      (error: unknown) => ({ error })
+    );
+    await waitForRequestCount(requests, 1);
+    assert.notEqual(requests[0].signal, controller.signal);
+
+    controller.abort();
+    assert.equal((await outcome).error instanceof Error, true);
+    assert.equal(requests[0].signal?.aborted, false);
+
+    requests[0].resolveJson({ items: [], nextCursor: null, totalCount: 0 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(requests[0].settled, true);
   });
 
   test("listFolderChildren serializes recursive descendant mode", async () => {
@@ -460,11 +484,12 @@ describe("createCoreClient", () => {
     assert.equal(url.searchParams.get("offset"), "250");
   });
 
-  test("searchMedia forwards abort signal", async () => {
+  test("searchMedia keeps its bounded network response independent from the caller signal", async () => {
     mockFetch({ items: [], nextCursor: null });
     const controller = new AbortController();
     await client().searchMedia({ rootId: 1, q: "cat" }, { signal: controller.signal });
-    assert.equal(recorded[0].signal, controller.signal);
+    assert.notEqual(recorded[0].signal, controller.signal);
+    assert.equal(recorded[0].signal?.aborted, false);
   });
 
   test("createTag posts JSON body", async () => {
