@@ -167,3 +167,42 @@ describe("secondary window pane colors", () => {
     );
   });
 });
+
+describe("dialog content pane colors", () => {
+  const dialogPaneVariables = [
+    "--glass-dialog-pane-light",
+    "--glass-dialog-pane-mid",
+    "--glass-dialog-pane-end"
+  ] as const;
+
+  test("derives the Settings-content gradient from the center color", () => {
+    const variables = interfaceStyleToCssVariables({ ...DEFAULT_INTERFACE_STYLE });
+
+    assert.equal(variables["--glass-dialog-pane-light"], "rgb(52 56 59 / 0.2)");
+    assert.equal(variables["--glass-dialog-pane-mid"], "rgb(8 12 16 / 0.38)");
+    assert.equal(variables["--glass-dialog-pane-end"], "rgb(7 11 14 / 0.48)");
+    assert.equal(variables["--glass-dialog-fill"], variables["--glass-dialog-pane-mid"]);
+  });
+
+  test("makes every dialog pane transparent when dialog opacity is zero", () => {
+    const variables = interfaceStyleToCssVariables({
+      ...DEFAULT_INTERFACE_STYLE,
+      dialogOpacity: 0
+    });
+
+    for (const variable of dialogPaneVariables) {
+      assert.match(variables[variable], / \/ 0\)$/);
+    }
+  });
+
+  test("makes every dialog pane transparent when dialog overlay strength is zero", () => {
+    const variables = interfaceStyleToCssVariables({
+      ...DEFAULT_INTERFACE_STYLE,
+      dialogOverlayStrength: 0
+    });
+
+    for (const variable of dialogPaneVariables) {
+      assert.match(variables[variable], / \/ 0\)$/);
+    }
+  });
+});

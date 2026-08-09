@@ -337,9 +337,27 @@ export function interfaceStyleToCssVariables(
     normalized.pointerFalloff,
     "transparent"
   );
-  const dialogFill = colorWithAlpha(
+  const dialogPaneLightColor = mixHexColors(
     normalized.centerOverlayColor,
-    0.5 * normalized.dialogOverlayStrength * normalized.dialogOpacity
+    "#ffffff",
+    0.18
+  );
+  const dialogPaneEndColor = mixHexColors(
+    normalized.centerOverlayColor,
+    "#000000",
+    0.12
+  );
+  const dialogPaneLight = colorWithAlpha(
+    dialogPaneLightColor,
+    0.2 * normalized.dialogOverlayStrength * normalized.dialogOpacity
+  );
+  const dialogPaneMid = colorWithAlpha(
+    normalized.centerOverlayColor,
+    0.38 * normalized.dialogOverlayStrength * normalized.dialogOpacity
+  );
+  const dialogPaneEnd = colorWithAlpha(
+    dialogPaneEndColor,
+    0.48 * normalized.dialogOverlayStrength * normalized.dialogOpacity
   );
   const ditherOpacity = 0.055 * normalized.ditherOpacity;
   return {
@@ -369,8 +387,10 @@ export function interfaceStyleToCssVariables(
       roundCssNumber(normalized.edgeHighlightBrightness)
     ),
     "--glass-dialog-blur": `${roundCssNumber(34 * normalized.dialogBlur)}px`,
-    "--glass-dialog-fill": dialogFill,
-    "--dialog-blur": `${roundCssNumber(18 * normalized.dialogBlur)}px`,
+    "--glass-dialog-fill": dialogPaneMid,
+    "--glass-dialog-pane-light": dialogPaneLight,
+    "--glass-dialog-pane-mid": dialogPaneMid,
+    "--glass-dialog-pane-end": dialogPaneEnd,
     "--dialog-backdrop-dim": rgbWithAlpha(2, 5, 8, normalized.dialogBackdropDim),
     "--glass-blur": `${roundCssNumber(26 * normalized.centerBlur)}px`,
     "--glass-elevated-blur": `${roundCssNumber(34 * normalized.dialogBlur)}px`,

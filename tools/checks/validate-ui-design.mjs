@@ -480,6 +480,9 @@ for (const value of [
   ".overlay-surface",
   ".context-menu",
   ".file-operation-dialog",
+  "var(--glass-dialog-pane-light)",
+  "var(--glass-dialog-pane-mid)",
+  "var(--glass-dialog-pane-end)",
   "var(--glass-dialog-blur)"
 ]) {
   if (!overlayStylesForChecks.includes(value)) {
@@ -1577,6 +1580,9 @@ for (const value of ["useOverlayStack", "OverlayRootId", "setRootOpen"]) {
 
 for (const token of [
   "--glass-dialog-fill",
+  "--glass-dialog-pane-light",
+  "--glass-dialog-pane-mid",
+  "--glass-dialog-pane-end",
   "--glass-dialog-blur",
   "--glass-center-fill",
   "--secondary-window-pane-dark",
@@ -1901,10 +1907,79 @@ if (
     (block) =>
       /--glass-fill:\s*var\(--glass-dialog-fill\)/.test(block) &&
       /--glass-blur-current:\s*var\(--glass-dialog-blur\)/.test(block) &&
+      /background:\s*transparent/.test(block) &&
       hasNonNoneDeclaration(block, "box-shadow")
   )
 ) {
   fail("shared overlay surfaces must use dialog glass tokens instead of feature-local material styling");
+}
+
+const directOverlayBackdropBlocks = cssBlocksForExactSelector(
+  overlayStylesForChecks,
+  ".overlay-surface > .liquid-glass-backdrop"
+);
+if (
+  !directOverlayBackdropBlocks.some(
+    (block) =>
+      /linear-gradient\(\s*108deg/s.test(block) &&
+      /var\(--glass-dialog-pane-light\)\s+0%/.test(block) &&
+      /var\(--glass-dialog-pane-mid\)\s+52%/.test(block) &&
+      /var\(--glass-dialog-pane-end\)\s+100%/.test(block) &&
+      /blur\(var\(--glass-dialog-blur\)\)/.test(block) &&
+      /--overlay-solid-fallback-fill/.test(block)
+  )
+) {
+  fail("shared overlay direct backdrop must own the Settings-content gradient and dialog blur");
+}
+
+for (const selector of [
+  ".overlay-surface-popover",
+  ".overlay-surface-nested",
+  ".library-switcher",
+  ".library-switcher-header",
+  ".library-switcher-list",
+  ".library-switcher-footer",
+  "#library-remove-confirm",
+  ".context-menu",
+  ".file-operation-dialog"
+]) {
+  const blocks = cssBlocksForExactSelector(overlayStylesForChecks, selector);
+  if (
+    blocks.length === 0 ||
+    !blocks.some((block) => /background:\s*transparent/.test(block)) ||
+    blocks.some((block) => /--glass-side-fill|--glass-dialog-fill/.test(block))
+  ) {
+    fail(`overlay feature surface ${selector} must stay transparent and avoid repainting material`);
+  }
+}
+
+const modalViewportBlocks = cssBlocksForExactSelector(
+  overlayStylesForChecks,
+  ".overlay-modal-backdrop"
+);
+if (
+  !modalViewportBlocks.some(
+    (block) =>
+      /background:\s*transparent/.test(block) &&
+      latestDeclarationValue(block, "-webkit-backdrop-filter") === "none" &&
+      latestDeclarationValue(block, "backdrop-filter") === "none"
+  )
+) {
+  fail("modal viewport must stay transparent and unfiltered");
+}
+
+const modalSurfaceBlocks = cssBlocksForExactSelector(
+  overlayStylesForChecks,
+  ".overlay-modal-surface"
+);
+if (
+  !modalSurfaceBlocks.some(
+    (block) =>
+      /0\s+0\s+0\s+100vmax\s+var\(--dialog-backdrop-dim\)/.test(block) &&
+      /var\(--glass-shadow\)/.test(block)
+  )
+) {
+  fail("modal surface must dim only outside its border while preserving the glass elevation shadow");
 }
 
 for (const value of [
@@ -1965,7 +2040,9 @@ for (const value of [
   "--glass-edge-highlight-brightness",
   "--glass-dialog-blur",
   "--glass-dialog-fill",
-  "--dialog-blur",
+  "--glass-dialog-pane-light",
+  "--glass-dialog-pane-mid",
+  "--glass-dialog-pane-end",
   "--dialog-backdrop-dim",
   "--glass-blur",
   "--glass-elevated-blur",
@@ -1988,6 +2065,14 @@ if (!/panelControlCornerRadius:\s*8\b/.test(defaultInterfaceStyleBody)) {
   fail("combined panel and control corner radius must default to 8");
 }
 
+if (
+  [stylesForChecks, interfaceStyle, overlayStylesForChecks].some((source) =>
+    source.includes("--dialog-blur")
+  )
+) {
+  fail("retired --dialog-blur must not remain in production style sources");
+}
+
 const rootRadiusDefaults = cssBlocksForExactSelector(stylesForChecks, ":root");
 if (
   !rootRadiusDefaults.some(
@@ -2000,6 +2085,17 @@ if (
   )
 ) {
   fail("static interface radius defaults must use the combined 8px radius and 4px tight radius");
+}
+
+if (
+  !rootRadiusDefaults.some(
+    (block) =>
+      /--glass-dialog-pane-light:\s*[^;]+;/.test(block) &&
+      /--glass-dialog-pane-mid:\s*[^;]+;/.test(block) &&
+      /--glass-dialog-pane-end:\s*[^;]+;/.test(block)
+  )
+) {
+  fail("static interface defaults must define all dialog content-pane material tokens");
 }
 
 if (!/haloBrightness:\s*(?:1\.[2-9]\d*|[2-9](?:\.\d+)?)\b/.test(defaultInterfaceStyleBody)) {

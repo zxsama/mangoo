@@ -26,8 +26,10 @@
   --glass-center-saturation: 1.55;
   --glass-center-stroke: rgba(255, 255, 255, 0.14);
   --glass-dialog-blur: 34px;
-  --glass-dialog-fill: rgba(8, 12, 16, 0.5);
-  --dialog-blur: 18px;
+  --glass-dialog-fill: rgba(8, 12, 16, 0.38);
+  --glass-dialog-pane-light: rgba(52, 56, 59, 0.2);
+  --glass-dialog-pane-mid: rgba(8, 12, 16, 0.38);
+  --glass-dialog-pane-end: rgba(7, 11, 14, 0.48);
   --dialog-backdrop-dim: rgba(2, 5, 8, 0.52);
   --scrollbar-thumb: rgba(244, 247, 249, 0.34);
   --scrollbar-thumb-hover: rgba(244, 247, 249, 0.52);

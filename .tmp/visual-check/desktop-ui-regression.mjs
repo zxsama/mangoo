@@ -2420,7 +2420,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
   const groupVariables = {
     side: ["--glass-side-blur", "--glass-side-fill", "--glass-side-saturation", "--glass-side-stroke"],
     center: ["--glass-center-blur", "--glass-center-fill", "--glass-center-saturation", "--glass-center-stroke"],
-    dialog: ["--glass-dialog-blur", "--glass-dialog-fill", "--dialog-blur", "--dialog-backdrop-dim"]
+    dialog: ["--glass-dialog-blur", "--glass-dialog-fill", "--dialog-backdrop-dim"]
   };
   const sliderVariables = {
     "side-blur": "--glass-side-blur",
@@ -2519,7 +2519,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     "center-saturation": {
       required: [
         "center.centerSurface.mapped.glassSaturation",
-        "dialog.modalBackdrop.effects.elementBackdrop.saturation"
+        "dialog.modal.effects.backdrop.saturation"
       ],
       allowed: [
         "center.centerSurface.mapped.glassSaturation",
@@ -2531,8 +2531,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
         "dialog.context.mapped.glassSaturation",
         "dialog.context.effects.backdrop.saturation",
         "dialog.modal.mapped.glassSaturation",
-        "dialog.modal.effects.backdrop.saturation",
-        "dialog.modalBackdrop.effects.elementBackdrop.saturation"
+        "dialog.modal.effects.backdrop.saturation"
       ],
       stableGroups: ["side", "shared", "unaffected"]
     },
@@ -2565,11 +2564,10 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     },
     "dialog-blur": {
       required: [
-        "dialog.popover.mapped.glassBlurCurrent",
-        "dialog.nested.mapped.glassBlurCurrent",
-        "dialog.context.mapped.glassBlurCurrent",
-        "dialog.modal.mapped.glassBlurCurrent",
-        "dialog.modalBackdrop.effects.elementBackdrop.blur"
+        "dialog.popover.effects.backdrop.blur",
+        "dialog.nested.effects.backdrop.blur",
+        "dialog.context.effects.backdrop.blur",
+        "dialog.modal.effects.backdrop.blur"
       ],
       allowed: ["dialog"],
       stableGroups: ["side", "center", "shared", "unaffected"]
@@ -5098,6 +5096,33 @@ try {
   if (missingAppearanceSurfaces.length) {
     hardFailures.push(`Settings appearance matrix missing production surfaces: ${missingAppearanceSurfaces.join(", ")}`);
   }
+  const dialogMaterial = appearanceMatrix?.initial?.production?.dialog;
+  const maxBlurDialogMaterial =
+    appearanceMatrix?.matrix?.dialog?.["dialog-blur"]?.production?.max?.dialog;
+  for (const surfaceName of ["popover", "nested", "context", "modal"]) {
+    const surface = dialogMaterial?.[surfaceName];
+    const maxBlurSurface = maxBlurDialogMaterial?.[surfaceName];
+    if (
+      !surface?.present ||
+      !transparent(surface.effects?.backgroundColor) ||
+      surface.effects?.backgroundImage !== "none" ||
+      surface.effects?.backdrop?.present !== true ||
+      !String(surface.effects?.backdrop?.backgroundImage).includes("linear-gradient") ||
+      !positiveCssNumber(maxBlurSurface?.effects?.backdrop?.blur)
+    ) {
+      hardFailures.push(`production ${surfaceName} overlay does not use one transparent-outer frosted backdrop`);
+    }
+  }
+  if (
+    !dialogMaterial?.modalBackdrop?.present ||
+    !transparent(dialogMaterial.modalBackdrop.effects?.backgroundColor) ||
+    dialogMaterial.modalBackdrop.effects?.backgroundImage !== "none" ||
+    dialogMaterial.modalBackdrop.effects?.elementBackdrop?.blur !== "none" ||
+    dialogMaterial.modalBackdrop.effects?.elementBackdrop?.saturation !== "none" ||
+    dialogMaterial.modal?.effects?.boxShadow === "none"
+  ) {
+    hardFailures.push("production modal viewport is filtered or its outside-only dim shadow is missing");
+  }
   if (
     appearanceMatrix?.relationships?.notificationNavInsideBody !== true ||
     appearanceMatrix?.relationships?.notificationContentInsideBody !== true ||
@@ -5120,6 +5145,8 @@ try {
     fallbackSurfaces.length !== 4 ||
     fallbackSurfaces.some((surface) =>
       !surface.present || !surface.opaque || !surface.readable ||
+      surface.backgroundAlpha > 0.01 ||
+      surface.backdrop?.backgroundAlpha < 0.95 ||
       !noBackdropFilter(surface.backdrop?.backdropFilter) ||
       !noBackdropFilter(surface.backdrop?.webkitBackdropFilter)
     ) ||

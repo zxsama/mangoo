@@ -5,6 +5,7 @@
   --glass-border-current: var(--glass-center-stroke);
   color: var(--text-soft);
   border-radius: var(--radius-overlay);
+  background: transparent;
   box-shadow: var(--glass-shadow);
 }
 
@@ -23,22 +24,26 @@
 .overlay-surface-popover,
 .overlay-surface-nested {
   overflow: hidden;
-  background: var(
-    --overlay-solid-fallback-fill,
-    linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.018)),
-    var(--glass-dialog-fill)
-  );
+  background: transparent;
 }
 
 .overlay-surface > .liquid-glass-backdrop {
-  background: var(--overlay-solid-fallback-fill, var(--glass-fill));
+  background: var(
+    --overlay-solid-fallback-fill,
+    linear-gradient(
+      108deg,
+      var(--glass-dialog-pane-light) 0%,
+      var(--glass-dialog-pane-mid) 52%,
+      var(--glass-dialog-pane-end) 100%
+    )
+  );
   -webkit-backdrop-filter: var(
     --overlay-solid-fallback-filter,
-    blur(var(--glass-blur-current)) saturate(var(--glass-saturation))
+    blur(var(--glass-dialog-blur)) saturate(var(--glass-center-saturation))
   );
   backdrop-filter: var(
     --overlay-solid-fallback-filter,
-    blur(var(--glass-blur-current)) saturate(var(--glass-saturation))
+    blur(var(--glass-dialog-blur)) saturate(var(--glass-center-saturation))
   );
 }
 
@@ -49,11 +54,7 @@
 }
 
 .overlay-surface-nested {
-  background: var(
-    --overlay-solid-fallback-fill,
-    linear-gradient(rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.04)),
-    var(--glass-dialog-fill)
-  );
+  background: transparent;
   box-shadow: var(--glass-shadow-tight);
 }
 
@@ -65,15 +66,15 @@
   inset: 0;
   display: grid;
   place-items: center;
-  background: var(--dialog-backdrop-dim);
-  -webkit-backdrop-filter: var(
-    --overlay-solid-fallback-filter,
-    blur(var(--dialog-blur)) saturate(var(--glass-center-saturation))
-  );
-  backdrop-filter: var(
-    --overlay-solid-fallback-filter,
-    blur(var(--dialog-blur)) saturate(var(--glass-center-saturation))
-  );
+  background: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.overlay-modal-surface {
+  box-shadow:
+    0 0 0 100vmax var(--dialog-backdrop-dim),
+    var(--glass-shadow);
 }
 
 /* Menu and field controls */
@@ -336,13 +337,10 @@
 
 /* Library switcher */
 .library-switcher {
-  --glass-fill: var(--glass-side-fill);
-  --glass-blur-current: var(--glass-side-blur);
-  --glass-border-current: var(--glass-side-stroke);
   display: flex;
   overflow: hidden;
   border-radius: var(--radius-overlay);
-  background: var(--glass-side-fill);
+  background: transparent;
   color: var(--text-soft);
 }
 
@@ -361,8 +359,8 @@
   align-items: center;
   gap: 8px;
   padding: 6px 8px 6px 12px;
-  border-bottom: 1px solid var(--glass-side-stroke);
-  background: var(--glass-side-fill);
+  border-bottom: 1px solid var(--glass-center-stroke);
+  background: transparent;
 }
 
 .library-switcher-search {
@@ -416,7 +414,7 @@
   margin: 0;
   padding: 6px;
   overflow-y: auto;
-  background: var(--glass-dialog-fill);
+  background: transparent;
   list-style: none;
 }
 
@@ -500,8 +498,8 @@
   flex-direction: column;
   gap: 2px;
   padding: 8px;
-  border-top: 1px solid var(--glass-side-stroke);
-  background: linear-gradient(180deg, var(--glass-center-fill), var(--glass-side-fill));
+  border-top: 1px solid var(--glass-center-stroke);
+  background: transparent;
 }
 
 .library-switcher-footer button {
@@ -643,7 +641,7 @@
   max-width: calc(100vw - 32px);
   padding: 16px;
   border-radius: var(--radius-overlay);
-  background: var(--glass-dialog-fill);
+  background: transparent;
   color: var(--text-soft);
 }
 
@@ -695,9 +693,7 @@
   padding: 6px;
   border: 0;
   border-radius: var(--radius-overlay);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.018)),
-    var(--glass-dialog-fill);
+  background: transparent;
   box-shadow: var(--glass-shadow);
 }
 
@@ -771,9 +767,7 @@
   flex-direction: column;
   overflow: hidden;
   border-radius: var(--radius-overlay);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.014)),
-    var(--glass-dialog-fill);
+  background: transparent;
 }
 
 .file-operation-dialog.overlay-dialog-wide {

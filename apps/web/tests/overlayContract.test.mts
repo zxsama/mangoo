@@ -43,6 +43,11 @@ const hasCompleteSelector = (source: string, selector: string) =>
     .flatMap((rule) => rule.split(","))
     .some((candidate) => new RegExp(`^${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[\\s:.#[>+~]|$)`).test(candidate.trim()));
 
+const cssDeclarationsForExactSelector = (source: string, selector: string) =>
+  [...stripCssComments(source).matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter((match) => match[1].split(",").some((item) => item.trim() === selector))
+    .map((match) => match[2]);
+
 const overlaySectionMarkers = [
   "/* Core variables and surfaces */",
   "/* Anchored positioning and modal shell */",
@@ -101,6 +106,62 @@ describe("shared overlay source contract", () => {
     assert.match(overlayCss, /var\(--glass-dialog-fill\)/);
     assert.match(overlayCss, /var\(--glass-center-stroke\)/);
     assert.doesNotMatch(overlaySourceBundle, /fetch\s*\(|node:fs|@radix|@floating-ui/);
+  });
+
+  it("keeps popup material on one direct frosted backdrop", () => {
+    const directBackdrop = cssDeclarationsForExactSelector(
+      overlayCss,
+      ".overlay-surface > .liquid-glass-backdrop"
+    ).join("\n");
+
+    assert.match(directBackdrop, /linear-gradient\(\s*108deg/s);
+    assert.match(directBackdrop, /var\(--glass-dialog-pane-light\)\s+0%/);
+    assert.match(directBackdrop, /var\(--glass-dialog-pane-mid\)\s+52%/);
+    assert.match(directBackdrop, /var\(--glass-dialog-pane-end\)\s+100%/);
+    assert.match(directBackdrop, /blur\(var\(--glass-dialog-blur\)\)/);
+    assert.match(directBackdrop, /var\(\s*--overlay-solid-fallback-fill,/);
+
+    const outerSurface = cssDeclarationsForExactSelector(overlayCss, ".overlay-surface").join("\n");
+    assert.match(outerSurface, /background:\s*transparent/);
+
+    for (const selector of [
+      ".overlay-surface-popover",
+      ".overlay-surface-nested",
+      ".library-switcher",
+      ".library-switcher-header",
+      ".library-switcher-list",
+      ".library-switcher-footer",
+      "#library-remove-confirm",
+      ".context-menu",
+      ".file-operation-dialog"
+    ]) {
+      const declarations = cssDeclarationsForExactSelector(overlayCss, selector).join("\n");
+      assert.notEqual(declarations, "", `${selector} must have a production rule`);
+      assert.match(declarations, /background:\s*transparent/);
+      assert.doesNotMatch(declarations, /--glass-side-fill|--glass-dialog-fill/);
+    }
+  });
+
+  it("dims only outside a modal while its bounded surface owns the blur", () => {
+    const modalViewport = cssDeclarationsForExactSelector(
+      overlayCss,
+      ".overlay-modal-backdrop"
+    ).join("\n");
+    const modalSurface = cssDeclarationsForExactSelector(
+      overlayCss,
+      ".overlay-modal-surface"
+    ).join("\n");
+    const directBackdrop = cssDeclarationsForExactSelector(
+      overlayCss,
+      ".overlay-surface > .liquid-glass-backdrop"
+    ).join("\n");
+
+    assert.match(modalViewport, /background:\s*transparent/);
+    assert.match(modalViewport, /-webkit-backdrop-filter:\s*none/);
+    assert.match(modalViewport, /(?:^|\s)backdrop-filter:\s*none/);
+    assert.match(modalSurface, /0\s+0\s+0\s+100vmax\s+var\(--dialog-backdrop-dim\)/);
+    assert.match(modalSurface, /var\(--glass-shadow\)/);
+    assert.match(directBackdrop, /blur\(var\(--glass-dialog-blur\)\)/);
   });
 
   it("keeps migrated overlay ownership in overlay.css", () => {
