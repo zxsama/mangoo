@@ -1092,15 +1092,14 @@ try {
     client,
     `(() => {
       const tiles = [...document.querySelectorAll('.media-tile')];
-      return tiles.length > 0 && tiles.every((tile) => {
-        const image = tile.querySelector('.tile-thumb-ready img');
-        return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0;
-      });
+      return document.querySelector('.virtual-grid')?.getAttribute('aria-busy') === 'false' &&
+        tiles.length > 0 &&
+        !tiles.some((tile) => tile.classList.contains('skeleton'));
     })()`,
     120_000,
-    "initial thumbnails ready before scenario telemetry"
+    "initial library interaction readiness before scenario telemetry"
   );
-  await delay(1000);
+  await delay(3000);
   await client.send("Network.enable");
   invokedTree = {
     harnessPath: fileURLToPath(import.meta.url),
