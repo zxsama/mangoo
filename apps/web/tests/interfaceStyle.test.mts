@@ -3,7 +3,9 @@ import { describe, test } from "node:test";
 
 import {
   DEFAULT_INTERFACE_STYLE,
-  interfaceStyleToCssVariables
+  INTERFACE_STYLE_LIMITS,
+  interfaceStyleToCssVariables,
+  normalizeInterfaceStyle
 } from "../src/features/settings/interfaceStyle.ts";
 
 const paneVariables = [
@@ -15,6 +17,56 @@ const paneVariables = [
 function rgbChannels(color: string) {
   return color.slice(0, color.indexOf(" / "));
 }
+
+describe("unified panel and control radius", () => {
+  test("starts from 8 and ignores every retired radius key", () => {
+    const normalized = normalizeInterfaceStyle({
+      surfaceCornerRadius: 16,
+      controlCornerRadius: 14,
+      panelRadius: 12,
+      controlRadius: 10
+    });
+
+    assert.equal(normalized.panelControlCornerRadius, 8);
+    assert.equal("surfaceCornerRadius" in normalized, false);
+    assert.equal("controlCornerRadius" in normalized, false);
+  });
+
+  test("clamps the combined setting to 0 through 16", () => {
+    assert.deepEqual(INTERFACE_STYLE_LIMITS.panelControlCornerRadius, {
+      min: 0,
+      max: 16,
+      step: 1
+    });
+    assert.equal(
+      normalizeInterfaceStyle({ panelControlCornerRadius: -1 }).panelControlCornerRadius,
+      0
+    );
+    assert.equal(
+      normalizeInterfaceStyle({ panelControlCornerRadius: 20 }).panelControlCornerRadius,
+      16
+    );
+  });
+
+  test("maps panels controls surfaces and overlays to the same radius", () => {
+    for (const radius of [0, 8, 16]) {
+      const variables = interfaceStyleToCssVariables({
+        ...DEFAULT_INTERFACE_STYLE,
+        panelControlCornerRadius: radius
+      });
+
+      for (const token of [
+        "--radius-overlay",
+        "--radius-panel",
+        "--radius-surface",
+        "--radius-control"
+      ]) {
+        assert.equal(variables[token], `${radius}px`);
+      }
+      assert.equal(variables["--radius-tight"], `${Math.max(radius - 4, 0)}px`);
+    }
+  });
+});
 
 describe("secondary window pane colors", () => {
   test("derives distinct pane tints from the default side color", () => {

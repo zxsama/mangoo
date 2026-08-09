@@ -524,24 +524,14 @@ function AppearanceTab({
           value={value.windowCornerRadius}
         />
         <StyleSlider
-          id="surface-corner-radius"
-          label="面板圆角"
-          max={limits.surfaceCornerRadius.max}
-          min={limits.surfaceCornerRadius.min}
-          onChange={(surfaceCornerRadius) => setInterfaceStyle({ surfaceCornerRadius })}
-          step={limits.surfaceCornerRadius.step}
+          id="panel-control-corner-radius"
+          label="面板与控件圆角"
+          max={limits.panelControlCornerRadius.max}
+          min={limits.panelControlCornerRadius.min}
+          onChange={(panelControlCornerRadius) => setInterfaceStyle({ panelControlCornerRadius })}
+          step={limits.panelControlCornerRadius.step}
           unit="px"
-          value={value.surfaceCornerRadius}
-        />
-        <StyleSlider
-          id="control-corner-radius"
-          label="控件圆角"
-          max={limits.controlCornerRadius.max}
-          min={limits.controlCornerRadius.min}
-          onChange={(controlCornerRadius) => setInterfaceStyle({ controlCornerRadius })}
-          step={limits.controlCornerRadius.step}
-          unit="px"
-          value={value.controlCornerRadius}
+          value={value.panelControlCornerRadius}
         />
         <StyleSlider
           id="content-corner-radius"

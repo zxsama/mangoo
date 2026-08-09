@@ -7,12 +7,12 @@ export const workbenchLayout = {
 } as const;
 
 export const radiusTokens = {
-  window: 28,
-  overlay: 22,
-  panel: 18,
-  surface: 14,
-  control: 10,
+  window: 8,
+  overlay: 8,
+  panel: 8,
+  surface: 8,
+  control: 8,
   content: 8,
-  tight: 6,
+  tight: 4,
   pill: 999
 } as const;

@@ -12,8 +12,7 @@ export const POINTER_SENSING_DISTANCE_BASE_PX = 80;
 
 export interface InterfaceStylePreference {
   windowCornerRadius: number;
-  surfaceCornerRadius: number;
-  controlCornerRadius: number;
+  panelControlCornerRadius: number;
   contentCornerRadius: number;
   sideBlur: number;
   sideOpacity: number;
@@ -45,8 +44,7 @@ export const DEFAULT_INTERFACE_STYLE: InterfaceStylePreference = {
   // windows at 8px). The CSS content clip must equal the native radius, else a
   // larger CSS radius curves inside the native corner and shows a double corner.
   windowCornerRadius: 8,
-  surfaceCornerRadius: 18,
-  controlCornerRadius: 10,
+  panelControlCornerRadius: 8,
   contentCornerRadius: 8,
   sideBlur: 1,
   sideOpacity: 1,
@@ -75,8 +73,7 @@ export const DEFAULT_INTERFACE_STYLE: InterfaceStylePreference = {
 
 export const INTERFACE_STYLE_LIMITS = {
   windowCornerRadius: { min: 0, max: 16, step: 1 },
-  surfaceCornerRadius: { min: 10, max: 28, step: 1 },
-  controlCornerRadius: { min: 6, max: 20, step: 1 },
+  panelControlCornerRadius: { min: 0, max: 16, step: 1 },
   contentCornerRadius: { min: 0, max: 18, step: 1 },
   sideBlur: { min: 0, max: 2, step: 0.05 },
   sideOpacity: { min: 0, max: 2, step: 0.05 },
@@ -118,15 +115,10 @@ export function normalizeInterfaceStyle(input: unknown): InterfaceStylePreferenc
       INTERFACE_STYLE_LIMITS.windowCornerRadius,
       DEFAULT_INTERFACE_STYLE.windowCornerRadius
     ),
-    surfaceCornerRadius: clampNumber(
-      legacyValue(source, "surfaceCornerRadius", "panelRadius"),
-      INTERFACE_STYLE_LIMITS.surfaceCornerRadius,
-      DEFAULT_INTERFACE_STYLE.surfaceCornerRadius
-    ),
-    controlCornerRadius: clampNumber(
-      legacyValue(source, "controlCornerRadius", "controlRadius"),
-      INTERFACE_STYLE_LIMITS.controlCornerRadius,
-      DEFAULT_INTERFACE_STYLE.controlCornerRadius
+    panelControlCornerRadius: clampNumber(
+      source.panelControlCornerRadius,
+      INTERFACE_STYLE_LIMITS.panelControlCornerRadius,
+      DEFAULT_INTERFACE_STYLE.panelControlCornerRadius
     ),
     contentCornerRadius: clampNumber(
       legacyValue(source, "contentCornerRadius", "contentRadius"),
@@ -268,20 +260,10 @@ export function interfaceStyleToCssVariables(
   value: InterfaceStylePreference
 ): Record<string, string> {
   const normalized = normalizeInterfaceStyle(value);
-  const overlayRadius = clampRounded(
-    normalized.surfaceCornerRadius + 4,
-    12,
-    40
-  );
-  const insetSurfaceRadius = clampRounded(
-    normalized.surfaceCornerRadius - 4,
-    6,
-    normalized.surfaceCornerRadius
-  );
   const tightRadius = clampRounded(
-    normalized.controlCornerRadius - 4,
+    normalized.panelControlCornerRadius - 4,
     0,
-    normalized.controlCornerRadius
+    normalized.panelControlCornerRadius
   );
   const sideOverlay = colorWithAlpha(
     normalized.sideOverlayColor,
@@ -362,10 +344,10 @@ export function interfaceStyleToCssVariables(
   const ditherOpacity = 0.055 * normalized.ditherOpacity;
   return {
     "--radius-window": `${roundCssNumber(normalized.windowCornerRadius)}px`,
-    "--radius-overlay": `${roundCssNumber(overlayRadius)}px`,
-    "--radius-panel": `${roundCssNumber(normalized.surfaceCornerRadius)}px`,
-    "--radius-surface": `${roundCssNumber(insetSurfaceRadius)}px`,
-    "--radius-control": `${roundCssNumber(normalized.controlCornerRadius)}px`,
+    "--radius-overlay": `${roundCssNumber(normalized.panelControlCornerRadius)}px`,
+    "--radius-panel": `${roundCssNumber(normalized.panelControlCornerRadius)}px`,
+    "--radius-surface": `${roundCssNumber(normalized.panelControlCornerRadius)}px`,
+    "--radius-control": `${roundCssNumber(normalized.panelControlCornerRadius)}px`,
     "--radius-content": `${roundCssNumber(normalized.contentCornerRadius)}px`,
     "--radius-tight": `${roundCssNumber(tightRadius)}px`,
     "--glass-side-blur": `${roundCssNumber(26 * normalized.sideBlur)}px`,

@@ -2814,6 +2814,78 @@ async function settingsInterfaceStyleEvidence(client) {
     );
     const screenshotPath = await screenshot(settingsClient, "ui-settings-interface-style.png");
     const evidenceBefore = await evaluate(settingsClient, settingsInterfaceStyleEvidenceExpression());
+    const radiusSliderState = await evaluate(
+      settingsClient,
+      `(() => {
+        const input = document.querySelector("#panel-control-corner-radius");
+        return input instanceof HTMLInputElement
+          ? { present: true, value: input.value }
+          : { present: false, value: null };
+      })()`
+    );
+    const radiusSamples = {};
+    if (radiusSliderState.present) {
+      for (const radius of [0, 8, 16]) {
+        await evaluate(
+          settingsClient,
+          `(() => {
+            const input = document.querySelector("#panel-control-corner-radius");
+            if (!(input instanceof HTMLInputElement)) return false;
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+            setter?.call(input, ${JSON.stringify(String(radius))});
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            return true;
+          })()`
+        );
+        await waitFor(
+          settingsClient,
+          `(() => {
+            const root = getComputedStyle(document.documentElement);
+            const panel = document.querySelector(".settings-section");
+            const control = document.querySelector(".settings-action");
+            return root.getPropertyValue("--radius-panel").trim() === ${JSON.stringify(`${radius}px`)} &&
+              root.getPropertyValue("--radius-control").trim() === ${JSON.stringify(`${radius}px`)} &&
+              panel && getComputedStyle(panel).borderRadius === ${JSON.stringify(`${radius}px`)} &&
+              control && getComputedStyle(control).borderRadius === ${JSON.stringify(`${radius}px`)};
+          })()`,
+          5000,
+          `Settings combined radius consumer sample ${radius}px`
+        );
+        radiusSamples[String(radius)] = await evaluate(
+          settingsClient,
+          `(() => {
+            const root = getComputedStyle(document.documentElement);
+            const panel = document.querySelector(".settings-section");
+            const control = document.querySelector(".settings-action");
+            return {
+              panelVariable: root.getPropertyValue("--radius-panel").trim(),
+              controlVariable: root.getPropertyValue("--radius-control").trim(),
+              panelBorderRadius: panel ? getComputedStyle(panel).borderRadius : null,
+              controlBorderRadius: control ? getComputedStyle(control).borderRadius : null
+            };
+          })()`
+        );
+      }
+      await evaluate(
+        settingsClient,
+        `(() => {
+          const input = document.querySelector("#panel-control-corner-radius");
+          if (!(input instanceof HTMLInputElement)) return false;
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+          setter?.call(input, ${JSON.stringify(radiusSliderState.value)});
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        })()`
+      );
+      await waitFor(
+        settingsClient,
+        `getComputedStyle(document.documentElement).getPropertyValue("--radius-panel").trim() === ${JSON.stringify(`${radiusSliderState.value}px`)}`,
+        5000,
+        "Settings combined radius restoration"
+      );
+    }
     await settingsClient.send("Page.bringToFront");
     await waitFor(
       settingsClient,
@@ -2898,6 +2970,7 @@ async function settingsInterfaceStyleEvidence(client) {
         after: evidenceAfter,
         pointerPoint: pointSettingsSlider,
         pointerSlider: pointerSettingsSlider,
+        radiusSamples,
         sliderChange,
         materialBefore,
         materialAfter,
@@ -3548,8 +3621,7 @@ function settingsInterfaceStyleEvidenceExpression() {
     const section = document.querySelector(".settings-dialog-content");
     const rangeIds = [
       "window-corner-radius",
-      "surface-corner-radius",
-      "control-corner-radius",
+      "panel-control-corner-radius",
       "content-corner-radius",
       "side-blur",
       "side-opacity",
@@ -3609,7 +3681,7 @@ function settingsInterfaceStyleEvidenceExpression() {
       windowCornerRadius: getComputedStyle(document.documentElement)
         .getPropertyValue("--radius-window")
         .trim(),
-      surfaceCornerRadius: getComputedStyle(document.documentElement)
+      panelControlCornerRadius: getComputedStyle(document.documentElement)
         .getPropertyValue("--radius-panel")
         .trim(),
       sideBlur: getComputedStyle(document.documentElement)
@@ -4938,11 +5010,10 @@ try {
   }
   if (
     !summary.evidence.settingsInterfaceStyle.present ||
-    summary.evidence.settingsInterfaceStyle.rangeSliderCount < 29 ||
+    summary.evidence.settingsInterfaceStyle.rangeSliderCount < 28 ||
     summary.evidence.settingsInterfaceStyle.colorInputCount < 2 ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["window-corner-radius"]?.present ||
-    !summary.evidence.settingsInterfaceStyle.sliders?.["surface-corner-radius"]?.present ||
-    !summary.evidence.settingsInterfaceStyle.sliders?.["control-corner-radius"]?.present ||
+    !summary.evidence.settingsInterfaceStyle.sliders?.["panel-control-corner-radius"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["content-corner-radius"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["side-blur"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["side-opacity"]?.present ||
@@ -4968,8 +5039,7 @@ try {
     !summary.evidence.settingsInterfaceStyle.sliders?.["dialog-overlay-strength"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["dialog-backdrop-dim"]?.present ||
     summary.evidence.settingsInterfaceStyle.sliders?.["window-corner-radius"]?.type !== "range" ||
-    summary.evidence.settingsInterfaceStyle.sliders?.["surface-corner-radius"]?.type !== "range" ||
-    summary.evidence.settingsInterfaceStyle.sliders?.["control-corner-radius"]?.type !== "range" ||
+    summary.evidence.settingsInterfaceStyle.sliders?.["panel-control-corner-radius"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["content-corner-radius"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["side-blur"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["side-opacity"]?.type !== "range" ||
@@ -4996,6 +5066,18 @@ try {
     summary.evidence.settingsInterfaceStyle.sliders?.["dialog-backdrop-dim"]?.type !== "range"
   ) {
     hardFailures.push("Settings Interface style range sliders are missing or miswired");
+  }
+  for (const radius of [0, 8, 16]) {
+    const expected = `${radius}px`;
+    const sample = summary.evidence.settingsInterfaceStyle.radiusSamples?.[String(radius)];
+    if (
+      sample?.panelVariable !== expected ||
+      sample?.controlVariable !== expected ||
+      sample?.panelBorderRadius !== expected ||
+      sample?.controlBorderRadius !== expected
+    ) {
+      hardFailures.push(`Settings combined radius did not reach panel/control consumers at ${expected}`);
+    }
   }
   if (!summary.evidence.settingsInterfaceStyle.resetButtonPresent) {
     hardFailures.push("Settings Interface style reset button is missing");

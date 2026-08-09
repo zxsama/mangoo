@@ -1911,8 +1911,7 @@ for (const value of [
   "megle.interfaceStyle",
   "DEFAULT_INTERFACE_STYLE",
   "windowCornerRadius",
-  "surfaceCornerRadius",
-  "controlCornerRadius",
+  "panelControlCornerRadius",
   "contentCornerRadius",
   "sideBlur",
   "sideOpacity",
@@ -1948,6 +1947,8 @@ for (const value of [
 
 for (const value of [
   "--radius-window",
+  "--radius-overlay",
+  "--radius-panel",
   "--radius-surface",
   "--radius-control",
   "--radius-content",
@@ -1983,6 +1984,24 @@ if (!/windowCornerRadius:\s*8\b/.test(defaultInterfaceStyleBody)) {
   fail("default window corner radius must default to 8 to match Windows DWM's native host radius (user-adjustable at runtime)");
 }
 
+if (!/panelControlCornerRadius:\s*8\b/.test(defaultInterfaceStyleBody)) {
+  fail("combined panel and control corner radius must default to 8");
+}
+
+const rootRadiusDefaults = cssBlocksForExactSelector(stylesForChecks, ":root");
+if (
+  !rootRadiusDefaults.some(
+    (block) =>
+      /--radius-overlay:\s*8px;/.test(block) &&
+      /--radius-panel:\s*8px;/.test(block) &&
+      /--radius-surface:\s*8px;/.test(block) &&
+      /--radius-control:\s*8px;/.test(block) &&
+      /--radius-tight:\s*4px;/.test(block)
+  )
+) {
+  fail("static interface radius defaults must use the combined 8px radius and 4px tight radius");
+}
+
 if (!/haloBrightness:\s*(?:1\.[2-9]\d*|[2-9](?:\.\d+)?)\b/.test(defaultInterfaceStyleBody)) {
   fail("default halo brightness must be visibly stronger than the old 1x baseline");
 }
@@ -2002,9 +2021,9 @@ for (const value of [
   "玻璃平滑度",
   "交互高光",
   "对话框材质",
+  "面板与控件圆角",
   'id="window-corner-radius"',
-  'id="surface-corner-radius"',
-  'id="control-corner-radius"',
+  'id="panel-control-corner-radius"',
   'id="content-corner-radius"',
   'id="side-blur"',
   'id="side-opacity"',
@@ -2033,6 +2052,39 @@ for (const value of [
   if (!settingsView.includes(value)) {
     fail(`settings Interface style must expose approved material-family controls: missing ${value}`);
   }
+}
+
+for (const retired of [
+  "surfaceCornerRadius",
+  "controlCornerRadius",
+  "panelRadius",
+  "controlRadius"
+]) {
+  if (interfaceStyle.includes(retired)) {
+    fail(`retired radius preference key must not remain in the interface style model: ${retired}`);
+  }
+}
+
+for (const retiredSlider of ['id="surface-corner-radius"', 'id="control-corner-radius"']) {
+  if (settingsView.includes(retiredSlider)) {
+    fail(`retired radius slider must not remain in Settings: ${retiredSlider}`);
+  }
+}
+
+for (const retiredAlias of ["--surface-corner-radius", "--control-corner-radius"]) {
+  if (stylesForChecks.includes(retiredAlias)) {
+    fail(`undefined radius CSS alias must not remain in production styles: ${retiredAlias}`);
+  }
+}
+
+const settingsPanelRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-section");
+if (!settingsPanelRadiusBlocks.some((block) => /border-radius:\s*var\(--radius-panel\)/.test(block))) {
+  fail("Settings panel surfaces must consume --radius-panel");
+}
+
+const settingsControlRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-action");
+if (!settingsControlRadiusBlocks.some((block) => /border-radius:\s*var\(--radius-control\)/.test(block))) {
+  fail("Settings controls must consume --radius-control");
 }
 
 const settingsWindow = read("apps/web/src/features/settings/SettingsWindow.tsx");
