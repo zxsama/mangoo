@@ -290,11 +290,11 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(regressionSource, /window\.clearTimeout\(fallback\)/);
   assert.match(
     regressionSource,
-    /const appearanceMatrix = await settingsAppearanceMatrix\(settingsClient, client\);\s*await settingsClient\.send\("Page\.bringToFront"\);\s*await waitFor\(\s*settingsClient,\s*`document\.hasFocus\(\)`[\s\S]*?const pointSettingsSlider = await moveToSelector/
+    /const evidenceBefore = await evaluate[\s\S]*?await settingsClient\.send\("Page\.bringToFront"\);\s*await waitFor\(\s*settingsClient,\s*`document\.hasFocus\(\)`[\s\S]*?const pointSettingsSlider = await moveToSelector/
   );
   assert.match(
     regressionSource,
-    /const pointSettingsSlider = await moveToSelector[\s\S]*?"Settings slider production pointer driver"[\s\S]*?const pointerSettingsSlider = await evaluate/
+    /const pointSettingsSlider = await moveToSelector[\s\S]*?"Settings slider production pointer driver"[\s\S]*?const pointerSettingsSlider = await evaluate[\s\S]*?const appearanceMatrix = await settingsAppearanceMatrix\(settingsClient, client\)/
   );
 
   assert.doesNotMatch(exhaustiveSource, /buildSummary\(true\)/);

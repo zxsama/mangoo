@@ -2814,7 +2814,6 @@ async function settingsInterfaceStyleEvidence(client) {
     );
     const screenshotPath = await screenshot(settingsClient, "ui-settings-interface-style.png");
     const evidenceBefore = await evaluate(settingsClient, settingsInterfaceStyleEvidenceExpression());
-    const appearanceMatrix = await settingsAppearanceMatrix(settingsClient, client);
     await settingsClient.send("Page.bringToFront");
     await waitFor(
       settingsClient,
@@ -2846,6 +2845,14 @@ async function settingsInterfaceStyleEvidence(client) {
       "Settings slider production pointer driver"
     );
     const pointerSettingsSlider = await evaluate(settingsClient, pointerEvidenceExpression());
+    const appearanceMatrix = await settingsAppearanceMatrix(settingsClient, client);
+    await settingsClient.send("Page.bringToFront");
+    await waitFor(
+      settingsClient,
+      `document.hasFocus()`,
+      5000,
+      "Settings window focus after appearance matrix"
+    );
     const beforeSideBlur = evidenceBefore.sideBlur;
     const sliderChange = await evaluate(
       settingsClient,
