@@ -1,6 +1,6 @@
 # Unified Notification Center Verification
 
-Date: 2026-07-22 (Asia/Shanghai)
+Date: 2026-07-22, updated 2026-07-24 (Asia/Shanghai)
 
 ## Scope and Fixed Revisions
 
@@ -193,21 +193,21 @@ Cleanup evidence:
 
 ## OS Backdrop Harness
 
-The required harness was run during the first findings follow-up with `MEGLE_VISUAL_OS_BACKDROP=1` and an explicit temporary `MEGLE_ELECTRON_USER_DATA_DIR`; both variables were removed in `finally` while preserving the Node exit code. It was not rerun for the later benchmark-only Rust/Node changes.
+The required harness was rerun on 2026-07-24 with `MEGLE_VISUAL_OS_BACKDROP=1`. The final run completed in 35.9 seconds with exit 0, zero hard failures, no fatal error, no startup problems, and an explicit `required-os-composited` backdrop PASS.
 
-**Overall harness status: FAIL (exit 1).** The captured summary contains 24 hard failures: two network/startup-warning groups, five main-titlebar hover/drag/pointer checks, seven non-notification preview checks, and ten shared pointer-highlight checks. No base-commit harness comparison was run, so these failures are non-notification/unattributed and are not assigned an origin. No visual baseline was changed.
+**Overall harness status: PASS.** The earlier report grouped 24 hard failures as non-notification and unattributed; a fresh reproduction exposed 25 before cleanup. They were stale harness assumptions rather than 25 product regressions: retired pointer attributes and halo geometry, an obsolete preview selector, outdated preview-pane coordinates, attempting a CDP double-click on a native drag region, and broad error matching that counted exact canceled `net::ERR_ABORTED` requests and expected Electron auxiliary-renderer close messages as failures. The harness now checks the current shared pointer system and native drag contract, uses current preview geometry, and classifies only those exact expected cancellation/close cases. The real Rust startup warning found in the same pass came from three test-only database helpers compiled into production and was removed by gating them with `#[cfg(test)]`. No visual baseline was weakened or changed.
 
-**Notification-specific assertions: PASS.** None of the 24 hard failures is notification-specific. The summary confirms one icon-only notification titlebar control, no legacy Tasks/Recent controls, valid compact anchoring before/maximized/restored, one reused notification window target, three full-window pages, five history filters, bounded history rows, shared secondary-window material, native reveal without fallback, and process-log source/level/pause/follow/copy/clear/export controls. Full, empty, degraded, narrow, status, history, and log fixtures rendered and passed the notification assertions.
+**Notification-specific assertions: PASS.** The summary confirms one icon-only notification titlebar control, no legacy Tasks/Recent controls, valid compact anchoring before/maximized/restored, one reused notification window target, three full-window pages, five history filters, bounded history rows, shared secondary-window material, native reveal without fallback, and process-log source/level/pause/follow/copy/clear/export controls. Full, empty, degraded, narrow, status, history, and log fixtures rendered and passed the notification assertions.
 
 | Evidence | Repository-relative path | Absolute path |
 | --- | --- | --- |
-| Harness summary | `.tmp/visual-check/logs/desktop-ui-regression-summary.json` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\logs\desktop-ui-regression-summary.json` |
-| Real notification window | `.tmp/visual-check/screenshots/ui-notifications-secondary-window.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notifications-secondary-window.png` |
-| Real process-log page | `.tmp/visual-check/screenshots/ui-notifications-secondary-window-logs.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notifications-secondary-window-logs.png` |
-| Compact fixture | `.tmp/visual-check/screenshots/ui-notification-compact-fixture-full.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notification-compact-fixture-full.png` |
-| Full status fixture | `.tmp/visual-check/screenshots/ui-notification-window-fixture-status.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notification-window-fixture-status.png` |
-| Full history fixture | `.tmp/visual-check/screenshots/ui-notification-window-fixture-history.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notification-window-fixture-history.png` |
-| Full logs fixture | `.tmp/visual-check/screenshots/ui-notification-window-fixture-logs.png` | `C:\Users\84460\.config\superpowers\worktrees\Megle\unified-notification-center\.tmp\visual-check\screenshots\ui-notification-window-fixture-logs.png` |
+| Harness summary | `.tmp/visual-check/logs/desktop-ui-regression-summary.json` | `D:\Megle\.tmp\visual-check\logs\desktop-ui-regression-summary.json` |
+| Real notification window | `.tmp/visual-check/screenshots/ui-notifications-secondary-window.png` | `D:\Megle\.tmp\visual-check\screenshots\ui-notifications-secondary-window.png` |
+| Real process-log page | `.tmp/visual-check/screenshots/ui-notifications-secondary-window-logs.png` | `D:\Megle\.tmp\visual-check\screenshots\ui-notifications-secondary-window-logs.png` |
+| Compact fixture | `.tmp/visual-check/screenshots/ui-notification-compact-fixture-full.png` | `D:\Megle\.tmp\visual-check\screenshots\ui-notification-compact-fixture-full.png` |
+| Full status fixture | `.tmp/visual-check/screenshots/ui-notification-window-fixture-status.png` | `D:\Megle\.tmp\visual-check\screenshots\ui-notification-window-fixture-status.png` |
+| Full history fixture | `.tmp/visual-check/screenshots/ui-notification-window-fixture-history.png` | `D:\Megle\.tmp\visual-check\screenshots\ui-notification-window-fixture-history.png` |
+| Full logs fixture | `.tmp/visual-check/screenshots/ui-notification-window-fixture-logs.png` | `D:\Megle\.tmp\visual-check\screenshots\ui-notification-window-fixture-logs.png` |
 
 ## Real Electron Interaction
 
@@ -223,14 +223,20 @@ The required harness was run during the first findings follow-up with `MEGLE_VIS
 | Broad error dedupe/no banner | PARTIAL | One real `renderer_error` and no broad center error strip were observed. Controlled duplicate injection through the real renderer was not performed; automated Desktop/Web tests cover dedupe. |
 | Process logs | VERIFIED WITH LIMIT | The OS harness exercised source/level filters, pause, follow, copy, clear, and export. Simultaneously visible Main/Core/Renderer lines were not independently observed. |
 | Layout/scroll/resize during scan | VERIFIED WITH LIMIT | The controlled notification interaction switched all four layouts, scrolled, and resized with no console errors; no media tile was available for preview in that run. |
-| Broad Artists browse/scroll/preview follow-up | NOT VERIFIED | The fresh run used `.tmp/task16-followup-artists-user-data` but exceeded the 184-second outer timeout before producing a new summary. Its exact process tree was terminated. No pass or stall/request-amplification claim is made. |
+| Broad Artists browse/scroll/preview follow-up | VERIFIED | A strict 500-operation run completed 500/500 with all four layouts, 116 distinct selected folders, 52 clicked media labels, 19 preview opens, 36 preview navigations, zero required skips, zero console errors, and zero unexpected network failures. All 3,000 network failures were exact canceled `net::ERR_ABORTED` requests. |
 
 Authoritative controlled interaction evidence remains under `.tmp/task16-notification-1784641021852` and `.tmp/task16-fsops-1784641292966`, each with its own `electron-user-data`. The old `.tmp/interaction-test/summary.json` from the default-profile run is not authoritative notification-isolation evidence.
 
+The Artists follow-up harness was corrected before drawing a product conclusion. Its old `button.media-tile` selector no longer matched the current role-based tile markup, and nested random searches repeatedly selected empty folders. It now uses bounded Core-index-driven media selection, expands the real ancestor chain, and distinguishes exact canceled requests from unexpected network errors. This produced a reproducible interaction run instead of increasing timeouts around a stale driver.
+
+The corrected driver then exposed a real MediaGrid blob lifecycle race: when concurrent thumbnail consumers populated the shared object-URL cache, the losing consumer revoked its duplicate URL and immediately attempted to preload that revoked URL. A 30-operation diagnostic produced 700 `ERR_FILE_NOT_FOUND` failures from this path. MediaGrid now re-reads and adopts the durable shared URL before creating or preloading a duplicate; the final 500-operation run produced zero such failures.
+
+The final run used the isolated persistent database at `.tmp/task16-followup-artists-20260724-2224`, with `resetData=false` after its cold scan, and ran from `2026-07-24T15:25:37.347Z` through `15:45:34.787Z`. Preview readiness was complete for all 34 measured waits (p95 440 ms, max 589 ms), selected-thumbnail waits were complete for all 19 opens (p95/max 1,288 ms), and preview navigation p95 was 1,154 ms. The authoritative summary is `.tmp/visual-check/logs/artists-million-desktop-sweep-summary.json` (`D:\Megle\.tmp\visual-check\logs\artists-million-desktop-sweep-summary.json`).
+
 ## Residual Risk
 
-- The OS backdrop harness is overall failing on 24 non-notification/unattributed checks; without a base-commit run their origin is not assigned.
-- The fresh broad Artists follow-up timed out, so stall-free browsing, preview readiness, and absence of request amplification are not verified by that run.
+- The strict Artists run is functionally complete, but broad browsing still has visible performance outliers: recursive deep-scroll p95 was 10,085 ms (max 11,509 ms), the slowest indexed media-preparation operation was 16,310 ms, and 41 of 378 general visible-thumbnail waits did not complete within the harness observation window. Preview readiness itself had no incomplete samples.
+- The final 500-operation run exercised a warm persistent isolated database. The earlier reset/cold-scan run reached only 21 interactions before the stale harness path stalled, so this evidence does not claim a separate 500-operation cold-start pass.
 - Root purge running determinate progress was too fast to sample before terminal.
 - Controlled real-renderer duplicate-error injection and simultaneous visible Main/Core/Renderer log content remain unverified.
 - Screenshot evidence covers layout/state/rendering, not human judgment of physical-display anti-aliasing.
@@ -259,7 +265,14 @@ Fresh verification at that endpoint:
 - A final read-only integration review reported no remaining integration
   findings after `2559f42`.
 
-The OS-backdrop harness and broad Artists interaction were not rerun for these
-non-visual integration fixes. Their overall FAIL / NOT VERIFIED status and the
-residual risks above remain unchanged; this section does not promote them to
-PASS.
+The OS-backdrop harness and broad Artists interaction were subsequently rerun
+on 2026-07-24. The OS harness passed with zero hard failures, and the strict
+Artists run completed all 500 operations with zero console errors and zero
+unexpected network failures. The measured browsing outliers and cold-start
+coverage limit remain recorded above rather than being promoted away by the
+functional PASS.
+
+After the harness and MediaGrid corrections, the current working tree also
+passed `npm run check:web`, `npm run check:desktop`, `npm run check:ui-design`,
+`cargo test -p megle-core` (395 passed, 2 ignored), and the full `npm test`
+repository gate in 64.9 seconds.
