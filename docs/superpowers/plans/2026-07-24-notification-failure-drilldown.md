@@ -237,4 +237,3 @@ $env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.
 - [ ] **Step 4: Perform a real desktop interaction pass**
 
 Verify: clean launch logs are non-empty; Settings failure click opens filtered logs; notification failure click reuses the same window; clicking a failure row focuses and selects the exact file without preview; simultaneous folder scans render one card with live path removal; long paths ellipsize with full tooltip; Bell dot centers correctly.
-
