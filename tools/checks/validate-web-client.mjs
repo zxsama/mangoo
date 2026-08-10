@@ -2336,11 +2336,17 @@ if (!/const previewItemCount\s*=/.test(app)) {
 // A preview landing must request a SPAN, never a single item. Requesting one
 // slot stranded the user on an island: after scrubbing ahead you could step
 // back but not forward, because nothing after the landing existed.
-if (/requestMediaWindow\(\s*(index|targetIndex)\s*,\s*\s*\+\s*1\s*\)/.test(app)) {
+if (/requestMediaWindow\(\s*(index|targetIndex)\s*,\s*\1\s*\+\s*1\s*\)/.test(app)) {
   fail("Preview landings must request a window with neighbours, not a single item");
 }
 if (!/previewLandingWindow/.test(app)) {
   fail("App must size preview landing requests through previewLandingWindow");
+}
+if (/orderedMediaSlots/.test(app) || /orderedWindowMedia\.length\s*>\s*0\s*\?\s*orderedWindowMedia\s*:\s*library\.media/.test(app)) {
+  fail("Preview navigation must preserve mediaSlots absolute indexes and never switch to library.media");
+}
+if (!/data-media-index=\{mediaIndex\}/.test(mediaGrid) || !/mediaIndex=\{mediaIndex\}/.test(mediaGrid) || !/mediaIndex=\{placement\.itemIndex\}/.test(mediaGrid)) {
+  fail("Every loaded MediaGrid tile must expose its absolute media index for diagnostics");
 }
 if (
   !/onPreviewNext\??:\s*\(\)\s*=>\s*void/.test(useShortcuts) ||

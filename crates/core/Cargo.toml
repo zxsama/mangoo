@@ -12,6 +12,8 @@ axum-extra = { version = "0.9", features = ["query"] }
 base64 = "0.22"
 image = "0.25"
 notify = "8.2.0"
+psd = "0.3.5"
+rawler = "0.7.2"
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

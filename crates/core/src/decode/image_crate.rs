@@ -5,7 +5,7 @@
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader};
 
-use super::{DecodePurpose, DecodeRequest, DecodedImage, MediaDecoder};
+use super::{ensure_decode_pixel_budget, DecodePurpose, DecodeRequest, DecodedImage, MediaDecoder};
 
 /// Extensions `image` 0.25 with DEFAULT features can actually decode.
 ///
@@ -17,28 +17,10 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".qoi", ".tga", ".tif", ".tiff", ".webp",
 ];
 
-/// Hard ceiling on how many pixels this decoder will allocate for, checked from
-/// the file HEADER before a single pixel is read.
-///
-/// Decoding is `width * height * 4` bytes of RGBA plus, historically, a second
-/// buffer of the same size. A 20000x20000 scanned TIFF is ~1.2 GB + a ~1.6 GB
-/// clone live at once, which on the preview route's unbounded blocking pool is
-/// an OOM abort — and a Rust OOM kills the whole Core process, not just the
-/// request.
-///
-/// The rejection message deliberately avoids every substring in
-/// `classify_thumbnail_failure`'s transient list. An oversized image is a
-/// PERMANENT property of the file: classifying it transient would arm the 60s
-/// retry sweep to re-attempt a doomed gigapixel decode forever.
-const MAX_DECODE_PIXELS: u64 = 268_000_000;
-
 pub struct ImageCrateDecoder;
 
 fn rejects_zero_dimensions(width: u32, height: u32) -> anyhow::Result<()> {
-    if width == 0 || height == 0 {
-        return Err(anyhow::anyhow!("zero-sized source image"));
-    }
-    Ok(())
+    ensure_decode_pixel_budget("image_crate", u64::from(width), u64::from(height))
 }
 
 /// Header-only guard. Returns the source dimensions when they are decodable
@@ -46,15 +28,7 @@ fn rejects_zero_dimensions(width: u32, height: u32) -> anyhow::Result<()> {
 fn checked_source_dimensions(path: &std::path::Path) -> anyhow::Result<(u32, u32)> {
     let (width, height) = image::image_dimensions(path)
         .map_err(|error| anyhow::anyhow!("image_crate dimensions: {error}"))?;
-    rejects_zero_dimensions(width, height)
-        .map_err(|error| anyhow::anyhow!("image_crate dimensions: {error}"))?;
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_DECODE_PIXELS {
-        return Err(anyhow::anyhow!(
-            "image_crate decode: source is too large to decode ({width}x{height}, \
-             {pixels} pixels exceeds the {MAX_DECODE_PIXELS} pixel budget)"
-        ));
-    }
+    ensure_decode_pixel_budget("image_crate", u64::from(width), u64::from(height))?;
     Ok((width, height))
 }
 
@@ -324,16 +298,16 @@ mod tests {
 
     #[test]
     fn rejects_an_oversized_source_from_the_header_without_decoding() {
-        // A 20000x20000 TIFF is ~1.2 GB decoded plus a same-size clone; on the
-        // preview route's unbounded blocking pool that is an OOM abort, which
-        // kills the whole Core process rather than failing one request.
-        assert!(super::MAX_DECODE_PIXELS < 20000u64 * 20000u64);
+        // A 20000x20000 TIFF is ~1.2 GB decoded plus a same-size clone. Even a
+        // semaphore cannot catch allocator aborts, which kill the whole Core
+        // process rather than failing one request.
+        assert!(crate::decode::MAX_DECODE_PIXELS < 20000u64 * 20000u64);
 
         // And the rejection must NOT read as transient, or the 60s retry sweep
         // would re-attempt a doomed gigapixel decode forever.
         let message = format!(
             "image_crate decode: source is too large to decode (20000x20000,              400000000 pixels exceeds the {} pixel budget)",
-            super::MAX_DECODE_PIXELS
+            crate::decode::MAX_DECODE_PIXELS
         );
         assert!(matches!(
             crate::thumbnails::classify_thumbnail_failure(&message),

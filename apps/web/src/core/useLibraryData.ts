@@ -124,6 +124,7 @@ export interface LibraryState {
   folders: FolderRecord[];
   media: MediaRecord[];
   mediaSlots: Map<number, MediaRecord>;
+  mediaGeneration: number;
   mediaTotalCount: number;
   loadedMediaRanges: Array<{ start: number; end: number }>;
   showChildFolderContents: boolean;
@@ -3681,6 +3682,7 @@ export function useLibraryData(
     folders,
     media,
     mediaSlots,
+    mediaGeneration: mediaPageGeneration.current,
     mediaTotalCount,
     loadedMediaRanges,
     showChildFolderContents,

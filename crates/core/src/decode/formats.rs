@@ -7,12 +7,11 @@
 
 use std::path::Path;
 
-/// Extensions indexed as `media.kind = "image"`. Indexing is deliberately wider
-/// than decoding: a `.psd` or `.raw` is still a real picture the user expects to
-/// SEE in the grid, even while the decode chain can only report why it failed.
+/// Extensions indexed as `media.kind = "image"`. The decode registry mirrors
+/// this set across browser-native, PSD, camera RAW, and ffmpeg-backed decoders.
 pub const IMAGE_EXTENSIONS: &[&str] = &[
-    ".avif", ".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".psd", ".raw", ".tif",
-    ".tiff", ".webp",
+    ".arw", ".avif", ".bmp", ".cr2", ".dng", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".nef",
+    ".orf", ".png", ".psd", ".raw", ".rw2", ".tif", ".tiff", ".webp",
 ];
 
 /// Extensions indexed as `media.kind = "video"`.
@@ -81,7 +80,8 @@ mod tests {
     fn classifies_indexed_image_and_video_extensions() {
         for name in [
             "a.avif", "a.bmp", "a.gif", "a.heic", "a.heif", "a.jpeg", "a.jpg", "a.png", "a.psd",
-            "a.raw", "a.tif", "a.tiff", "a.webp",
+            "a.raw", "a.cr2", "a.nef", "a.arw", "a.dng", "a.orf", "a.rw2", "a.tif", "a.tiff",
+            "a.webp",
         ] {
             assert_eq!(
                 media_kind_for_path(Path::new(name)),
@@ -122,7 +122,10 @@ mod tests {
         for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"] {
             assert!(is_browser_renderable_image(ext), "{ext} should render");
         }
-        for ext in [".heic", ".heif", ".psd", ".raw", ".tif", ".tiff"] {
+        for ext in [
+            ".heic", ".heif", ".psd", ".raw", ".cr2", ".nef", ".arw", ".dng", ".orf", ".rw2",
+            ".tif", ".tiff",
+        ] {
             assert!(!is_browser_renderable_image(ext), "{ext} must transcode");
         }
     }

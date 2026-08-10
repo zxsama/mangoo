@@ -1,18 +1,73 @@
-# Handoff: open issues on `perf/million-thumbnail-hotloop`
+# Handoff resolution audit: `perf/million-thumbnail-hotloop`
 
 Date: 2026-08-05
 Branch: `perf/million-thumbnail-hotloop` (380 commits ahead of `master`, not merged)
 Author of this note: the agent that built the media decode/preview pipeline, the
 render-settings panel, the preview scrubber, and the navigation-gate fix.
 
-This lists **only unresolved items**. Everything else on the branch is committed,
-gated by `npm test`, and recorded in `docs/benchmarks/`.
+This document began as an unresolved-issue inventory. The resolution summary
+below is authoritative for the current worktree; the original issue detail is
+retained afterward as historical context and reproduction evidence.
 
 One item is deliberately excluded per the requester's instruction and is tracked
 elsewhere: an unrecoverable revert of another agent's uncommitted
 `apps/web/src/features/file-ops/MoveDialog.tsx` edits.
 
 ---
+
+## Resolution summary (2026-08-05)
+
+| # | Status | Resolution / evidence |
+|---|---|---|
+| 1 | Fixed | Replaced the literal SOH byte with regex backreference `\1`. A mutation to `requestMediaWindow(index, index + 1)` now makes `check:web` fail with the intended message; restoring the neighbourhood request passes. Control-byte count is zero. |
+| 2 | Fixed | All preview-side landings now go through `ensurePreviewMediaAtIndex`, which resolves an absolute slot or requests a clamped 49-item neighbourhood. Step navigation and scrubber jumps share this loader. |
+| 3 | Fixed | `resolvePreviewMediaWindow` preserves the absolute `mediaSlots` index and never substitutes `library.media`; the loaded-array index is kept separately for prefetch only. Tests cover a loaded window at slots 124–126 with selection at absolute slot 125. |
+| 4 | Fixed | Every grid tile now exposes `data-media-index` in both linear and positioned render paths. `check:web` guards both prop paths and the DOM attribute. |
+| 5 | Implemented; real camera sample still needs acceptance | Added the pure-Rust `psd` and `rawler` decoders. Camera extensions `.cr2/.nef/.arw/.dng/.orf/.rw2` are indexed and routed; `.raw` remains supported. A generated valid PSD decodes to RGBA. No redistributable real camera RAW binary was available locally, so real-file colour/output acceptance is not claimed. `rawler 0.7.2` is LGPL-2.1 and needs release-license review before distribution. |
+| 6 | Fixed | Migration 26 adds a separate `preview_failures` negative-cache table. Permanent failures are keyed by file/profile/source size/source mtime; changed sources retry. Successful blobs and failures replace one another. Transient network, lock, OOM, Windows sharing-violation, and stat/decode race errors are not cached. Preview decoding was already bounded by the Core semaphore; the original “unbounded” statement was stale. |
+| 7 | Automated integration verified | A test now fills the real process-wide `previewBitmapPool`, invokes the production library-switch cache-reset entrypoint, and proves the `ImageBitmap` is closed and pool bytes drop to zero. Removing the production listener registration makes the test fail. A physical GPU-memory observation across two user libraries remains optional manual evidence, not a known code defect. |
+| 8 | Manual visual acceptance only | No code defect was found: the renderer state and CSS mode remain covered by the existing browser checks. Chromium screenshots cannot judge realtime resampling on the physical display, so 800% nearest-vs-bilinear appearance remains a human acceptance item. |
+| 9 | Far-jump defect fixed; feel remains manual | A missing scrubber target is now recorded and selected when its absolute slot arrives; far jumps request neighbours through the same loader as step navigation. Pure tests cover 20,000-item mapping and slot-125/220 landing. Flattened mode uses the same `mediaTotalCount`/`mediaSlots` contract. Long-drag smoothness remains subjective physical-display acceptance. |
+
+The automated changes are covered by focused Web/Rust/schema tests and the
+repository gates recorded in the final branch-state section. Items 5, 8, and 9
+retain only the explicitly stated external-sample or human-judgement checks.
+The general desktop visual harness starts the isolated application successfully
+but is currently blocked before its preview pass by stale selectors from the
+`SearchBar`/compact-popover refactors; this is not counted as a visual pass.
+
+## Follow-up hardening (2026-08-10)
+
+A later review found three gaps in the repaired implementation. They are now
+closed in the current worktree:
+
+1. The in-process decoder pixel ceiling is shared by `image_crate`, PSD, and
+   Rawler. PSD checks parsed dimensions before `document.rgba()`. Rawler performs
+   a dummy metadata decode, rejects an unsafe raster before the full raw decode,
+   and checks the decoded dimensions again before development.
+2. A matching `preview_failures` row suppresses repeated preview work for at
+   most five minutes. After 300 seconds the unchanged source is tried again, so
+   decoder installation, permission recovery, and other environment changes no
+   longer leave the preview permanently poisoned; thumbnail-task retry policy is
+   intentionally unchanged.
+3. Pending far-jump preview selections now carry the media-page generation from
+   `useLibraryData`. Closing preview clears the pending selection immediately,
+   while a closed preview or a mismatched media generation discards any late
+   arrival instead of changing the current grid selection.
+
+Regression coverage observes each missing behavior before the fix and then
+passes with the implementation: decoder budget tests, fresh-versus-expired
+preview failure reuse, and closed/mismatched/waiting/arrived preview-selection
+states. Focused decoder, preview-route, and Web gates are green. `npm test`,
+`cargo fmt --all --check`, and `git diff --check` also exit 0 on the follow-up
+worktree; the final branch verification is recorded below.
+
+---
+
+## Historical issue detail
+
+> The sections below preserve the original handoff wording. Treat commands and
+> “still broken” statements as historical; current status is the table above.
 
 ## 1. Dead structural guard — `tools/checks/validate-web-client.mjs:1997`
 
@@ -178,12 +233,18 @@ differently from `auto`.
 
 ## Branch state
 
-- `npm test` passes on my work. Two `file-operation overlay` test failures in the
-  working tree belong to a concurrent agent's in-progress migration, not to this
-  branch's committed code.
-- The branch has **not** been merged or pushed. It carries ~327 commits of the
-  repo owner's prior work plus this session's; the merge/PR decision is still
-  open.
-- The repo owner keeps uncommitted probe scripts (`tools/dev/_*.mjs`) and two
-  docs in the working tree. **Never `git add -A`**, and never `git checkout` a
-  file you did not personally modify — the second rule exists because I broke it.
+- The branch has not been merged, pushed, staged, or committed by this repair.
+- `npm test` exits 0 on the repaired worktree. The Rust gate reports 481 passed,
+  0 failed, and 2 ignored; structure, contracts, Core client, notification
+  contract, Desktop, Web, UI design, schema, formatting, and workspace tests all
+  complete successfully.
+- `git diff --check` and `cargo fmt --all --check` exit 0. Serena reports no
+  error/warning diagnostics in the touched App, MediaGrid, preview-window, Core
+  route/DB, PSD, or Rawler files. The SOH-byte count in
+  `validate-web-client.mjs` is zero.
+- The isolated desktop harness proves Electron, Core, the renderer, and CDP
+  start, but it then stops on stale `.search-bar-input` and compact-popover DOM
+  selectors before the preview scenario. Its result is **blocked**, not passed;
+  800% resampling and large-folder drag remain the manual checks stated above.
+- Unrelated pre-existing edits and untracked probe scripts remain untouched.
+  Do not use `git add -A` or restore files outside this repair's explicit scope.

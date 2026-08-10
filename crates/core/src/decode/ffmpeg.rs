@@ -80,7 +80,8 @@ impl MediaDecoder for FfmpegDecoder {
         let source_path = request.source.path();
         // ffmpeg's stderr is its own English prose and carries none of
         // `classify_thumbnail_failure`'s transient signatures. Because this
-        // decoder is the ONLY chain link for .avif/.heic/.heif/.psd, an
+        // decoder is the only chain link for .avif/.heic/.heif and the fallback
+        // chain link for .psd, so an
         // unreachable NAS would otherwise produce an aggregate error with no
         // transient signature at all and be marked permanently failed. Stat
         // first so the OS error (e.g. `os error 53`, 找不到网络路径) is the leaf,
@@ -470,6 +471,9 @@ mod tests {
     #[test]
     fn default_registry_puts_the_cheap_decoder_first() {
         let registry = crate::decode::default_registry();
-        assert_eq!(registry.decoder_names(), vec!["image_crate", "ffmpeg"]);
+        assert_eq!(
+            registry.decoder_names(),
+            vec!["image_crate", "psd", "rawler", "ffmpeg"]
+        );
     }
 }

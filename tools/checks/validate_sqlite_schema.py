@@ -30,6 +30,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0023_file_operation_recovery_metadata.sql",
     ROOT / "crates" / "core" / "migrations" / "0024_file_operation_object_binding.sql",
     ROOT / "crates" / "core" / "migrations" / "0025_preview_blobs.sql",
+    ROOT / "crates" / "core" / "migrations" / "0026_preview_failures.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -58,6 +59,7 @@ REQUIRED_TABLES = {
     "media_fts",
     "thumb_blobs",
     "preview_blobs",
+    "preview_failures",
     "notification_operation_heads",
     "notification_outbox",
 }
@@ -140,6 +142,17 @@ EXPECTED_PREVIEW_BLOBS_COLUMNS = {
     "height",
     "byte_size",
     "output_format",
+    "source_size",
+    "source_mtime",
+    "created_at",
+    "updated_at",
+}
+
+EXPECTED_PREVIEW_FAILURES_COLUMNS = {
+    "file_id",
+    "profile",
+    "failure_kind",
+    "error",
     "source_size",
     "source_mtime",
     "created_at",
@@ -394,6 +407,11 @@ def main() -> None:
             ).fetchone()
             if version is None:
                 fail("migration version 25 was not recorded")
+            version = conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 26"
+            ).fetchone()
+            if version is None:
+                fail("migration version 26 was not recorded")
 
             media_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(media)").fetchall()
@@ -432,6 +450,18 @@ def main() -> None:
                     "moving data earlier costs ~1.3 ms per MB of cache (measured "
                     "1852 ms vs 2.6 ms at 800 rows / 1.2 GB) inside a write "
                     f"transaction. Declared order: {preview_blobs_column_order}"
+                )
+
+            preview_failures_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(preview_failures)").fetchall()
+            }
+            missing_preview_failures_columns = (
+                EXPECTED_PREVIEW_FAILURES_COLUMNS - preview_failures_columns
+            )
+            if missing_preview_failures_columns:
+                fail(
+                    "missing preview failure columns: "
+                    f"{sorted(missing_preview_failures_columns)}"
                 )
 
             task_columns = {

@@ -1602,6 +1602,7 @@ export function MediaGrid({
                     labelGap={gridPreferences.labelGap}
                     item={item}
                     layoutMode={layoutMode}
+                    mediaIndex={mediaIndex}
                     onContextMenu={onContextMenu}
                     onLocateFolder={onLocateFolder}
                     onOpenPreview={onOpenPreview}
@@ -1679,6 +1680,7 @@ export function MediaGrid({
                   labelGap={gridPreferences.labelGap}
                   item={item}
                   layoutMode={layoutMode}
+                  mediaIndex={placement.itemIndex}
                   onContextMenu={onContextMenu}
                   onLocateFolder={onLocateFolder}
                   onOpenPreview={onOpenPreview}
@@ -1723,6 +1725,7 @@ function MediaTile({
   labelGap,
   item,
   layoutMode,
+  mediaIndex,
   onSelect,
   onOpenPreview,
   onRequestThumbnailStates,
@@ -1737,6 +1740,7 @@ function MediaTile({
   labelGap: number;
   item: MediaRecord;
   layoutMode: LibraryLayoutMode;
+  mediaIndex: number;
   onSelect: (mediaId: number) => void;
   onOpenPreview: (mediaId: number) => void;
   onRequestThumbnailStates: (mediaIds: number[], priority: ThumbnailRequestPriority) => void;
@@ -1764,6 +1768,7 @@ function MediaTile({
       aria-label={`Select ${item.name}; press Enter or Space, or double-click, to open preview`}
       className={selected ? `media-tile media-tile--${layoutMode} selected` : `media-tile media-tile--${layoutMode}`}
       data-media-id={item.id}
+      data-media-index={mediaIndex}
       data-thumb-state={thumbnailState}
       data-interactive-pointer-target-selector=".tile-thumb"
       role="button"

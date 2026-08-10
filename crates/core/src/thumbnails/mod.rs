@@ -621,6 +621,9 @@ impl ThumbnailFailureKind {
 /// permanent and is never auto-retried.
 pub fn classify_thumbnail_failure(error: &str) -> ThumbnailFailureKind {
     const TRANSIENT_SIGNATURES: &[&str] = &[
+        "os error 2",     // Windows: file disappeared between stat and decode
+        "os error 3",     // Windows: parent path disappeared
+        "os error 32",    // Windows: sharing violation / writer still owns file
         "os error 53",    // Windows: network path not found
         "找不到网络路径", // localized "network path not found"
         "网络",           // bare "network" (zh) — broader Windows network-error catch-all
@@ -651,6 +654,9 @@ mod tests {
             "thumbnail decode failed: Memory limit exceeded",
             "read failed: network path not found",
             "thumbnail decode failed: 网络名不再可用。 (os error 64)",
+            "read failed: The process cannot access the file because it is being used by another process. (os error 32)",
+            "read failed: The system cannot find the file specified. (os error 2)",
+            "read failed: The system cannot find the path specified. (os error 3)",
         ] {
             assert!(
                 matches!(classify_thumbnail_failure(e), Transient),
@@ -788,10 +794,11 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        let source = dir.join("camera.raw");
-        std::fs::write(&source, b"raw sensor bytes").expect("write fixture");
+        let source = dir.join("camera.unclaimed");
+        std::fs::write(&source, b"unknown sensor bytes").expect("write fixture");
 
-        let error = generate_image_thumbnail_bytes(&source).expect_err("no decoder claims .raw");
+        let error =
+            generate_image_thumbnail_bytes(&source).expect_err("no decoder claims .unclaimed");
 
         assert!(
             error.to_string().contains(crate::decode::NO_DECODER_MARKER),
@@ -1302,10 +1309,13 @@ mod tests {
         let source = dir.join("sensor.raw");
         std::fs::write(&source, b"not decodable").expect("write fixture");
 
-        let error = generate_preview_webp(&source, 2048).expect_err("no decoder for .raw");
+        let error = generate_preview_webp(&source, 2048).expect_err("invalid RAW is rejected");
 
         assert!(
-            error.to_string().contains(crate::decode::NO_DECODER_MARKER),
+            error
+                .to_string()
+                .contains("all decoders failed for \".raw\"")
+                && error.to_string().contains("rawler:"),
             "{error}"
         );
         let _ = std::fs::remove_dir_all(&dir);

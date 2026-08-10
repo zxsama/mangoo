@@ -45,3 +45,5 @@ pub const FILE_OPERATION_RECOVERY_METADATA_MIGRATION: &str =
 pub const FILE_OPERATION_OBJECT_BINDING_MIGRATION: &str =
     include_str!("../../migrations/0024_file_operation_object_binding.sql");
 pub const PREVIEW_BLOBS_MIGRATION: &str = include_str!("../../migrations/0025_preview_blobs.sql");
+pub const PREVIEW_FAILURES_MIGRATION: &str =
+    include_str!("../../migrations/0026_preview_failures.sql");

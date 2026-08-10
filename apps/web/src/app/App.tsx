@@ -88,6 +88,12 @@ import {
 } from "../features/shortcuts/useShortcuts";
 import { formatPreviewTitle, resolvePreviewTitlePosition } from "./previewTitle";
 import { buildPreviewPrefetchWindow } from "./previewPrefetchWindow";
+import {
+  previewLandingWindow,
+  resolvePendingPreviewSelection,
+  type PendingPreviewSelection,
+  resolvePreviewMediaWindow
+} from "./previewMediaWindow";
 import { canNavigatePreview, canStartPreviewNavigation } from "./previewNavigationGate";
 import { PreviewRenderMenu } from "../features/preview/PreviewRenderMenu";
 import {
@@ -140,8 +146,8 @@ export function App() {
   // including PreviewCanvas's error path, so a media that fails to decode
   // releases the navigation gate instead of trapping it forever.
   const paintedMediaIdRef = useRef<number | null>(null);
-  // Index of a step that ran past the loaded window; selected once it loads.
-  const pendingPreviewStepIndexRef = useRef<number | null>(null);
+  // Latest preview index requested outside the loaded window; selected on arrival.
+  const pendingPreviewSelectionRef = useRef<PendingPreviewSelection | null>(null);
   const [sidebarsHidden, setSidebarsHidden] = useState(false);
   const [locateRequest, setLocateRequest] =
     useState<LibrarySidebarLocateRequest | undefined>(undefined);
@@ -208,13 +214,12 @@ export function App() {
     return () => unsubscribers.forEach((off) => off());
   }, [interfaceStyle]);
   const fileOps = useFileOpsController(library);
-  const orderedPreviewMedia = useMemo(() => {
-    const orderedWindowMedia = orderedMediaSlots(library.mediaSlots);
-    return orderedWindowMedia.length > 0 ? orderedWindowMedia : library.media;
-  }, [library.media, library.mediaSlots]);
-  const selectedMediaIndex = orderedPreviewMedia.findIndex(
-    (item) => item.id === library.selectedMediaId
+  const previewMediaWindow = useMemo(
+    () => resolvePreviewMediaWindow(library.mediaSlots, library.selectedMediaId),
+    [library.mediaSlots, library.selectedMediaId]
   );
+  const orderedPreviewMedia = previewMediaWindow.loadedMedia;
+  const selectedMediaIndex = previewMediaWindow.selectedAbsoluteIndex;
   const previewTitlePosition = resolvePreviewTitlePosition({
     media: library.media,
     mediaSlots: library.mediaSlots,
@@ -228,10 +233,7 @@ export function App() {
   // happened to have fetched — while the title and scrubber correctly showed
   // "124/220". MediaGrid already bounds this way (`Math.max(items.length,
   // totalCount)`); the preview did not, and nothing asked for the next window.
-  const previewItemCount = Math.max(
-    orderedPreviewMedia.length,
-    library.mediaTotalCount
-  );
+  const previewItemCount = library.mediaTotalCount;
   const canPreviewPrevious = canNavigatePreview({
     previewOpen,
     selectedMediaIndex,
@@ -260,7 +262,7 @@ export function App() {
     // fetched, decoded, and was evicted before it could ever be painted.
     const prefetchWindow = buildPreviewPrefetchWindow(
       orderedPreviewMedia,
-      selectedMediaIndex,
+      previewMediaWindow.selectedLoadedIndex,
       previewPrefetchBudgetBytes(bufferBytes, viewportLongPx)
     );
     for (const neighbor of prefetchWindow) {
@@ -284,10 +286,11 @@ export function App() {
     orderedPreviewMedia,
     previewOpen,
     previewPreferences.previewBufferLimitMb,
-    selectedMediaIndex
+    previewMediaWindow.selectedLoadedIndex
   ]);
 
   const handleClosePreview = useCallback(() => {
+    pendingPreviewSelectionRef.current = null;
     setPreviewOpen(false);
     setPreviewDisplayedMediaId(null);
     setPreviewViewCommands(null);
@@ -700,6 +703,28 @@ export function App() {
     library.setSelectedMediaId(target.id);
   }
 
+  // The preview window is the single loader for every preview-side consumer.
+  // Callers receive a loaded slot immediately or leave one absolute index to
+  // be selected by the arrival effect below.
+  const ensurePreviewMediaAtIndex = useCallback(
+    (index: number): MediaRecord | undefined => {
+      if (index < 0 || index >= library.mediaTotalCount) return undefined;
+      const loaded = library.mediaSlots.get(index);
+      if (loaded) {
+        pendingPreviewSelectionRef.current = null;
+        return loaded;
+      }
+      pendingPreviewSelectionRef.current = {
+        index,
+        mediaGeneration: library.mediaGeneration
+      };
+      const [start, end] = previewLandingWindow(index, library.mediaTotalCount);
+      library.requestMediaWindow(start, end);
+      return undefined;
+    },
+    [library]
+  );
+
   // Steps to an adjacent index. When that index is inside the loaded window the
   // media is already in hand; when it is past the edge there is nothing to
   // select yet, so request that window and let the arriving slot be selected by
@@ -709,27 +734,30 @@ export function App() {
       if (selectedMediaIndex < 0) return;
       const targetIndex = selectedMediaIndex + (direction === "next" ? 1 : -1);
       if (targetIndex < 0 || targetIndex > previewItemCount - 1) return;
-      const target = orderedPreviewMedia[targetIndex];
+      const target = ensurePreviewMediaAtIndex(targetIndex);
       if (target) {
         startPreviewNavigation(target, direction);
-        return;
       }
-      pendingPreviewStepIndexRef.current = targetIndex;
-      const [start, end] = previewLandingWindow(targetIndex, previewItemCount);
-      library.requestMediaWindow(start, end);
     },
-    [library, orderedPreviewMedia, previewItemCount, selectedMediaIndex]
+    [ensurePreviewMediaAtIndex, previewItemCount, selectedMediaIndex]
   );
 
-  // Completes a step that crossed the loaded edge, once the slot arrives.
+  // Completes the latest step or scrub that crossed the loaded edge.
   useEffect(() => {
-    const pendingIndex = pendingPreviewStepIndexRef.current;
-    if (pendingIndex === null) return;
-    const arrived = orderedPreviewMedia[pendingIndex];
-    if (!arrived) return;
-    pendingPreviewStepIndexRef.current = null;
-    library.setSelectedMediaId(arrived.id);
-  }, [library, orderedPreviewMedia]);
+    const resolution = resolvePendingPreviewSelection({
+      pending: pendingPreviewSelectionRef.current,
+      previewOpen,
+      mediaGeneration: library.mediaGeneration,
+      mediaSlots: library.mediaSlots
+    });
+    if (resolution.status === "discard") {
+      pendingPreviewSelectionRef.current = null;
+      return;
+    }
+    if (resolution.status !== "apply") return;
+    pendingPreviewSelectionRef.current = null;
+    library.setSelectedMediaId(resolution.media.id);
+  }, [library, previewOpen]);
 
   const handlePreviewPrevious = useCallback(() => {
     stepPreview("previous");
@@ -744,18 +772,12 @@ export function App() {
       // Deliberately NOT startPreviewNavigation: the first-paint gate exists to
       // stop the keyboard and wheel outrunning the display, but a drag must
       // keep the thumb and the image in agreement, so it commits immediately.
-      const slotMedia = library.mediaSlots.get(index);
+      const slotMedia = ensurePreviewMediaAtIndex(index);
       if (slotMedia) {
         library.setSelectedMediaId(slotMedia.id);
-        return;
       }
-      // Outside the loaded window: ask for that region, WITH neighbours, so the
-      // landing is not an island you cannot step forward out of. The thumb and
-      // tooltip have already moved; the image follows when the slot resolves.
-      const [start, end] = previewLandingWindow(index, library.mediaTotalCount);
-      library.requestMediaWindow(start, end);
     },
-    [library]
+    [ensurePreviewMediaAtIndex, library]
   );
 
   const handleToggleScrubberPinned = useCallback(() => {
@@ -1120,21 +1142,6 @@ export function App() {
 // slot existed. Requesting a span around the target means a landing always
 // arrives with room to keep moving. MediaGrid does the equivalent with a row's
 // worth of columns.
-const PREVIEW_LANDING_SPAN = 24;
-
-/** The window to request so a landing at `index` has neighbours on both sides. */
-function previewLandingWindow(index: number, itemCount: number): [number, number] {
-  const start = Math.max(0, index - PREVIEW_LANDING_SPAN);
-  const end = itemCount > 0 ? Math.min(itemCount, index + PREVIEW_LANDING_SPAN + 1) : index + 1;
-  return [start, Math.max(end, index + 1)];
-}
-
-function orderedMediaSlots(mediaSlots: Map<number, MediaRecord>): MediaRecord[] {
-  return Array.from(mediaSlots.entries())
-    .sort(([leftIndex], [rightIndex]) => leftIndex - rightIndex)
-    .map(([, item]) => item);
-}
-
 function previewBufferLimitMbToBytes(limitMb: number): number {
   return Math.max(0, Math.round(limitMb * 1024 * 1024));
 }

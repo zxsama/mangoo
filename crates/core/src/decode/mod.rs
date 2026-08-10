@@ -11,10 +11,39 @@
 pub mod ffmpeg;
 pub mod formats;
 pub mod image_crate;
+pub mod psd;
+pub mod rawler;
 pub mod subprocess;
 
 use std::fmt::Write as _;
 use std::path::Path;
+
+/// Hard ceiling on source pixels any in-process decoder may expand.
+///
+/// The check must run before allocating a full RGBA/developed raster. Rust OOM
+/// aborts the whole Core process, so a blocking task or semaphore cannot turn an
+/// unbounded allocation into an ordinary decode error.
+pub(super) const MAX_DECODE_PIXELS: u64 = 268_000_000;
+
+pub(super) fn ensure_decode_pixel_budget(
+    decoder: &str,
+    width: u64,
+    height: u64,
+) -> anyhow::Result<()> {
+    if width == 0 || height == 0 {
+        anyhow::bail!("{decoder} decode: zero-sized source image");
+    }
+    let pixels = width.checked_mul(height).ok_or_else(|| {
+        anyhow::anyhow!("{decoder} decode: source dimensions overflow ({width}x{height})")
+    })?;
+    if pixels > MAX_DECODE_PIXELS {
+        anyhow::bail!(
+            "{decoder} decode: source is too large to decode ({width}x{height}, \
+             {pixels} pixels exceeds the {MAX_DECODE_PIXELS} pixel budget)"
+        );
+    }
+    Ok(())
+}
 
 /// Why the caller wants pixels. A decoder may claim an extension for one
 /// purpose and not the other (a video decoder produces a `Thumbnail` poster
@@ -164,6 +193,8 @@ impl DecoderRegistry {
 pub fn default_registry() -> DecoderRegistry {
     DecoderRegistry::new(vec![
         Box::new(image_crate::ImageCrateDecoder),
+        Box::new(psd::PsdDecoder),
+        Box::new(rawler::RawlerDecoder),
         Box::new(ffmpeg::FfmpegDecoder),
     ])
 }
@@ -181,6 +212,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn production_registry_includes_native_psd_and_raw_before_ffmpeg() {
+        assert_eq!(
+            default_registry().decoder_names(),
+            vec!["image_crate", "psd", "rawler", "ffmpeg"]
+        );
+    }
 
     struct FakeDecoder {
         name: &'static str,
@@ -219,6 +258,31 @@ mod tests {
             target_max_px: None,
             purpose: DecodePurpose::Thumbnail,
         }
+    }
+
+    #[test]
+    fn decode_pixel_budget_rejects_zero_sized_and_oversized_rasters() {
+        let zero = ensure_decode_pixel_budget("test", 0, 10)
+            .expect_err("zero-sized rasters must be rejected before allocation");
+        assert!(
+            zero.to_string().contains("zero-sized source image"),
+            "{zero}"
+        );
+
+        let oversized = ensure_decode_pixel_budget("test", 268_000_001, 1)
+            .expect_err("over-budget rasters must be rejected before allocation");
+        assert!(
+            oversized
+                .to_string()
+                .contains("source is too large to decode"),
+            "{oversized}"
+        );
+    }
+
+    #[test]
+    fn decode_pixel_budget_accepts_the_existing_ceiling() {
+        ensure_decode_pixel_budget("test", 268_000_000, 1)
+            .expect("the established maximum pixel budget remains decodable");
     }
 
     #[test]

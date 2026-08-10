@@ -8,12 +8,17 @@ register("./resolve-source-imports.mjs", import.meta.url);
 };
 
 const {
+  configurePreviewBitmapBudget,
   createDecodeDispatcher,
   createDispatcherHolder,
   decodeBlobOnMainThread,
+  previewBitmapPool,
   previewPrefetchBudgetBytes
 } = await import(
   "../src/features/preview/previewBitmapSource.ts"
+);
+const { resetMediaCachesForLibrarySwitch } = await import(
+  "../src/core/mediaResources.ts"
 );
 
 type FakeBitmap = { width: number; height: number; close(): void; closed: boolean };
@@ -288,5 +293,22 @@ describe("abandoned decode adoption", () => {
     reply({ id: sent[0].id, ok: true, bitmap: late });
 
     assert.equal(late.closed, true, "an unadoptable bitmap must not leak");
+  });
+});
+
+// Last on purpose: the real reset advances the process-wide media-cache epoch,
+// which is exactly what a library switch must do and must not be undone for tests.
+describe("library-switch bitmap release wiring", () => {
+  it("closes pooled ImageBitmaps through the real media-cache reset entrypoint", () => {
+    previewBitmapPool.clear();
+    configurePreviewBitmapBudget(1024 * 1024);
+    const bitmap = fakeBitmap();
+    previewBitmapPool.set("old-library-frame", bitmap as never);
+
+    resetMediaCachesForLibrarySwitch();
+
+    assert.equal(bitmap.closed, true);
+    assert.equal(previewBitmapPool.size, 0);
+    assert.equal(previewBitmapPool.sizeBytes, 0);
   });
 });

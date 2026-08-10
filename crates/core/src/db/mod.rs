@@ -474,6 +474,18 @@ pub struct PreviewBlobRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreviewFailureRecord {
+    pub file_id: i64,
+    pub profile: String,
+    pub failure_kind: String,
+    pub error: String,
+    pub source_size: i64,
+    pub source_mtime: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskRecord {
@@ -1076,6 +1088,10 @@ impl Database {
         if !self.migration_applied(25)? {
             self.connection
                 .execute_batch(migrations::PREVIEW_BLOBS_MIGRATION)?;
+        }
+        if !self.migration_applied(26)? {
+            self.connection
+                .execute_batch(migrations::PREVIEW_FAILURES_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
@@ -4726,6 +4742,7 @@ impl Database {
         // Preview tiers are regenerable from the same originals; clearing the
         // thumbnail cache must not leave a second stale blob store behind.
         transaction.execute("DELETE FROM preview_blobs", [])?;
+        transaction.execute("DELETE FROM preview_failures", [])?;
         let reset_thumbnail_count = transaction.execute(
             r#"
             UPDATE thumbs
@@ -6078,6 +6095,58 @@ impl Database {
         Ok(rows.next()?.map(preview_blob_from_row).transpose()?)
     }
 
+    pub fn get_preview_failure(
+        &self,
+        file_id: i64,
+        profile: &str,
+    ) -> anyhow::Result<Option<PreviewFailureRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT file_id, profile, failure_kind, error, source_size, source_mtime,
+                   created_at, updated_at
+            FROM preview_failures
+            WHERE file_id = ?1 AND profile = ?2
+            "#,
+        )?;
+        let mut rows = statement.query((file_id, profile))?;
+        Ok(rows.next()?.map(preview_failure_from_row).transpose()?)
+    }
+
+    pub fn upsert_preview_failure(&self, failure: PreviewFailureRecord) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            r#"
+            INSERT INTO preview_failures(
+                file_id, profile, failure_kind, error, source_size, source_mtime,
+                created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(file_id, profile) DO UPDATE SET
+                failure_kind = excluded.failure_kind,
+                error = excluded.error,
+                source_size = excluded.source_size,
+                source_mtime = excluded.source_mtime,
+                updated_at = excluded.updated_at
+            "#,
+            (
+                failure.file_id,
+                &failure.profile,
+                &failure.failure_kind,
+                &failure.error,
+                failure.source_size,
+                failure.source_mtime,
+                failure.created_at,
+                failure.updated_at,
+            ),
+        )?;
+        transaction.execute(
+            "DELETE FROM preview_blobs WHERE file_id = ?1 AND profile = ?2",
+            (failure.file_id, &failure.profile),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn upsert_preview_blob(&self, blob: PreviewBlobRecord) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
@@ -6110,6 +6179,10 @@ impl Database {
                 blob.created_at,
                 blob.updated_at,
             ),
+        )?;
+        transaction.execute(
+            "DELETE FROM preview_failures WHERE file_id = ?1 AND profile = ?2",
+            (blob.file_id, &blob.profile),
         )?;
         // Evict least-recently-used tiers until the cache is inside budget:
         // walk newest-first and drop everything past the point where the
@@ -8200,6 +8273,19 @@ fn preview_blob_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PreviewBlo
     })
 }
 
+fn preview_failure_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PreviewFailureRecord> {
+    Ok(PreviewFailureRecord {
+        file_id: row.get(0)?,
+        profile: row.get(1)?,
+        failure_kind: row.get(2)?,
+        error: row.get(3)?,
+        source_size: row.get(4)?,
+        source_mtime: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
 fn thumb_blob_exists_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     file_id: i64,
@@ -8364,6 +8450,19 @@ pub(crate) fn cleanup_inactive_thumbnail_artifacts_in_transaction(
           FROM files
           JOIN roots ON roots.id = files.root_id
           WHERE files.id = preview_blobs.file_id
+            AND (files.status <> 'active' OR roots.enabled = 0)
+        )
+        "#,
+        [],
+    )?;
+    transaction.execute(
+        r#"
+        DELETE FROM preview_failures
+        WHERE EXISTS (
+          SELECT 1
+          FROM files
+          JOIN roots ON roots.id = files.root_id
+          WHERE files.id = preview_failures.file_id
             AND (files.status <> 'active' OR roots.enabled = 0)
         )
         "#,
@@ -16651,6 +16750,60 @@ mod tests {
     }
 
     #[test]
+    fn preview_success_and_negative_cache_rows_replace_each_other() {
+        let database = migrated_database();
+        let file_id = seed_single_media_file(&database);
+        let blob = PreviewBlobRecord {
+            file_id,
+            profile: "preview_native".to_string(),
+            data: vec![1, 2, 3],
+            width: 100,
+            height: 50,
+            byte_size: 3,
+            output_format: "image/webp".to_string(),
+            source_size: 99,
+            source_mtime: 100,
+            created_at: 10,
+            updated_at: 10,
+        };
+        database
+            .upsert_preview_blob(blob.clone())
+            .expect("seed blob");
+
+        database
+            .upsert_preview_failure(PreviewFailureRecord {
+                file_id,
+                profile: "preview_native".to_string(),
+                failure_kind: "permanent".to_string(),
+                error: "unsupported camera".to_string(),
+                source_size: 99,
+                source_mtime: 100,
+                created_at: 20,
+                updated_at: 20,
+            })
+            .expect("store failure");
+        assert!(database
+            .get_preview_blob(file_id, "preview_native")
+            .expect("query blob")
+            .is_none());
+        let failure = database
+            .get_preview_failure(file_id, "preview_native")
+            .expect("query failure")
+            .expect("failure row");
+        assert_eq!(failure.failure_kind, "permanent");
+        assert_eq!(failure.error, "unsupported camera");
+        assert_eq!(failure.source_size, 99);
+
+        database
+            .upsert_preview_blob(blob)
+            .expect("replace with blob");
+        assert!(database
+            .get_preview_failure(file_id, "preview_native")
+            .expect("query cleared failure")
+            .is_none());
+    }
+
+    #[test]
     fn preview_blob_upsert_replaces_the_same_profile_in_place() {
         let database = migrated_database();
         let file_id = seed_single_media_file(&database);
@@ -16788,12 +16941,28 @@ mod tests {
             .get_preview_blob(file_id, "preview_2048")
             .expect("query seeded tier")
             .is_some());
+        database
+            .upsert_preview_failure(PreviewFailureRecord {
+                file_id,
+                profile: "preview_native".to_string(),
+                failure_kind: "permanent".to_string(),
+                error: "unsupported".to_string(),
+                source_size: 1,
+                source_mtime: 1,
+                created_at: 10,
+                updated_at: 10,
+            })
+            .expect("seed failure");
 
         database.clear_thumbnail_cache().expect("clear");
 
         assert!(database
             .get_preview_blob(file_id, "preview_2048")
             .expect("query")
+            .is_none());
+        assert!(database
+            .get_preview_failure(file_id, "preview_native")
+            .expect("query failure")
             .is_none());
     }
 

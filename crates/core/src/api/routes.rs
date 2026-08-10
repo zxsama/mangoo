@@ -17,11 +17,12 @@ use crate::api::AppState;
 use crate::db::notification_outbox::NotificationOutboxEvent;
 use crate::db::{
     Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot,
-    NotificationOrigin, PluginRecord, PreviewBlobRecord, RootRecord, SearchQuery, TagError,
-    TagRecord, TaskRecord, ThumbBlobRecord, ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult,
-    ThumbnailCacheRefreshMode, ThumbnailCacheScope, ThumbnailCacheSnapshot, ThumbnailCacheStats,
-    ThumbnailFailureRecord, ThumbnailRecord, ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority,
-    UserMetadataPatch, UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
+    NotificationOrigin, PluginRecord, PreviewBlobRecord, PreviewFailureRecord, RootRecord,
+    SearchQuery, TagError, TagRecord, TaskRecord, ThumbBlobRecord, ThumbnailCacheClearResult,
+    ThumbnailCacheEnqueueResult, ThumbnailCacheRefreshMode, ThumbnailCacheScope,
+    ThumbnailCacheSnapshot, ThumbnailCacheStats, ThumbnailFailureRecord, ThumbnailRecord,
+    ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority, UserMetadataPatch, UserMetadataRecord,
+    THUMBNAIL_BULK_PRIORITY,
 };
 use crate::fsops::{
     self, DeleteRequest, FileOperationRecord, FsOpsError, FsOpsErrorCode, MoveRequest,
@@ -30,8 +31,9 @@ use crate::fsops::{
 use crate::plugins;
 use crate::scan::ScanSummary;
 use crate::thumbnails::{
-    generate_preview_webp, is_pending_status, normalize_profile, preview_profile_max_px,
-    select_preview_profile, PREVIEW_NATIVE_MAX_PX, PREVIEW_NATIVE_PROFILE,
+    classify_thumbnail_failure, generate_preview_webp, is_pending_status, normalize_profile,
+    preview_profile_max_px, select_preview_profile, ThumbnailFailureKind, PREVIEW_NATIVE_MAX_PX,
+    PREVIEW_NATIVE_PROFILE,
 };
 
 const THUMBNAIL_TASK_WAKE_DEDUPE_WINDOW: Duration = Duration::from_millis(750);
@@ -39,6 +41,7 @@ const INVALID_NOTIFICATION_OUTBOX_QUERY: &str = "invalid notification outbox que
 const INVALID_NOTIFICATION_OUTBOX_ACKNOWLEDGEMENT: &str =
     "invalid notification outbox acknowledgement";
 const MAX_SAFE_NOTIFICATION_SEQUENCE: i64 = 9_007_199_254_740_991;
+const PREVIEW_FAILURE_CACHE_TTL_SECONDS: i64 = 5 * 60;
 static RECENT_THUMBNAIL_TASK_WAKEUPS: LazyLock<Mutex<HashMap<(usize, i64, i64), Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -299,9 +302,9 @@ fn resolve_preview_plan(
     // The transcode branch requires a REPORTED viewport. A client that sends no
     // `viewportLongPx` is asking for the pre-pipeline behaviour — the original
     // bytes, verbatim — and that request must keep succeeding. Transcoding here
-    // instead would route every `.raw` (no decoder claims it at all) and every
-    // `.heic`/`.heif`/`.psd` (ffmpeg-only, and ffmpeg may not be on PATH) into a
-    // decode that fails, turning a 200 into a 500 for a URL that used to work.
+    // instead would route every non-browser format into a decode that can fail
+    // for corrupt data or an unavailable external decoder, turning a 200 into a
+    // 500 for a URL that used to work.
     if viewport_long_px > 0 && !crate::decode::formats::is_browser_renderable_image(ext) {
         // Small enough that no tier applies, but the browser still cannot paint
         // it — transcode at (bounded) native resolution.
@@ -1394,6 +1397,18 @@ const PREVIEW_TIER_HEADER: &str = "x-megle-preview-tier";
 /// and values above it are clamped rather than rejected.
 const MAX_VIEWPORT_LONG_PX: u32 = 16384;
 
+fn preview_failure_is_fresh(
+    failure: &PreviewFailureRecord,
+    source_size: i64,
+    source_mtime: i64,
+    now: i64,
+) -> bool {
+    failure.failure_kind == "permanent"
+        && failure.source_size == source_size
+        && failure.source_mtime == source_mtime
+        && now.saturating_sub(failure.updated_at) <= PREVIEW_FAILURE_CACHE_TTL_SECONDS
+}
+
 /// Serve one cached-or-generated WebP preview representation.
 ///
 /// `Ok(None)` is the DEGRADE signal: the plan was valid but the representation
@@ -1416,11 +1431,35 @@ async fn serve_cached_preview_webp(
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
 
-    let cached = run_read_database(state.clone(), move |database| {
-        Ok(database.get_preview_blob(file_id, plan.profile)?)
+    let (cached, cached_failure) = run_read_database(state.clone(), move |database| {
+        Ok((
+            database.get_preview_blob(file_id, plan.profile)?,
+            database.get_preview_failure(file_id, plan.profile)?,
+        ))
     })
-    .await?
-    .filter(|blob| blob.source_size == source_size && blob.source_mtime == source_mtime);
+    .await?;
+    let cached =
+        cached.filter(|blob| blob.source_size == source_size && blob.source_mtime == source_mtime);
+    let now = crate::db::unix_timestamp();
+    // A permanent classification suppresses hot-loop retries, while the TTL
+    // lets decoder installation and environmental recovery take effect without
+    // requiring a source-file mutation or a manual cache clear.
+    let cached_failure = cached_failure
+        .filter(|failure| preview_failure_is_fresh(failure, source_size, source_mtime, now));
+
+    // A successful representation wins defensively if a damaged or manually
+    // edited database contains both rows. Normal writes keep the tables
+    // mutually exclusive, but serving known-good bytes is the safest recovery.
+    if cached.is_none() {
+        if let Some(failure) = cached_failure {
+            crate::debug_log!(
+                "preview tier negative-cache hit (file {file_id}, profile {}): {}",
+                plan.profile,
+                failure.error
+            );
+            return Ok(None);
+        }
+    }
 
     let blob = match cached {
         Some(blob) => blob,
@@ -1455,10 +1494,40 @@ async fn serve_cached_preview_webp(
                     // perfectly servable, and those are what this route returned
                     // before the preview pipeline existed. A 500 here would blank
                     // out a picture that used to display fine.
+                    let error_text = format!("{error:#}");
                     crate::debug_log!(
                         "preview tier generation failed (file {file_id}, profile {}): {error:#}",
                         plan.profile
                     );
+                    if matches!(
+                        classify_thumbnail_failure(&error_text),
+                        ThumbnailFailureKind::Permanent
+                    ) {
+                        let now = crate::db::unix_timestamp();
+                        let failure = PreviewFailureRecord {
+                            file_id,
+                            profile: plan.profile.to_string(),
+                            failure_kind: "permanent".to_string(),
+                            error: error_text,
+                            source_size,
+                            source_mtime,
+                            created_at: now,
+                            updated_at: now,
+                        };
+                        if let Err(cache_error) =
+                            run_shared_database(state.clone(), move |database| {
+                                database.upsert_preview_failure(failure)?;
+                                Ok(())
+                            })
+                            .await
+                        {
+                            crate::debug_log!(
+                                "preview failure cache write failed (file {file_id}, profile {}): {}",
+                                plan.profile,
+                                cache_error.message
+                            );
+                        }
+                    }
                     return Ok(None);
                 }
             };
@@ -3168,11 +3237,9 @@ mod tests {
         }
     }
 
-    /// Bytes for the one fixture NO decoder can read. `.raw` is indexed as an
-    /// image (the user still expects to see it in the grid) but is claimed by
-    /// neither `ImageCrateDecoder` nor `FfmpegDecoder`, so every generation
-    /// attempt fails with `NO_DECODER_MARKER`. That is the degradation path the
-    /// route has to survive without turning a working 200 into a 500.
+    /// Bytes for a corrupt camera RAW fixture. Rawler claims the extension but
+    /// rejects the payload. That is the degradation path the route has to
+    /// survive without turning a working original-byte 200 into a 500.
     const UNDECODABLE_SOURCE_BYTES: &[u8] =
         b"megle-test-raw-sensor-payload-no-decoder-handles-this";
 
@@ -3330,9 +3397,8 @@ mod tests {
         // `viewportLongPx` gets byte-identical behaviour to the pre-pipeline
         // route. `select_preview_profile` already returns `None` for viewport 0,
         // so without an explicit gate control simply falls through into the
-        // transcode branch — and every one of these extensions then 500s.
-        // `.raw` is claimed by no decoder at all; `.heic`/`.heif`/`.psd` are
-        // ffmpeg-only and fail whenever ffmpeg is not on PATH.
+        // transcode branch — and corrupt files or a missing ffmpeg can then
+        // fail generation. The no-viewport request must remain byte-identical.
         assert!(resolve_preview_plan(Some("image"), ".heic", 2000, 0).is_none());
         assert!(resolve_preview_plan(Some("image"), ".raw", 2000, 0).is_none());
         assert!(resolve_preview_plan(Some("image"), ".heif", 12000, 0).is_none());
@@ -3446,7 +3512,8 @@ mod tests {
     async fn preview_route_falls_back_to_original_bytes_when_generation_fails() {
         // A `.raw` is indexed as an image and is not browser-renderable, so with
         // a reported viewport the resolver legitimately plans a native
-        // transcode — but no decoder claims `.raw`, so generation always fails.
+        // transcode. Rawler claims it, then rejects this intentionally corrupt
+        // fixture as a permanent decode failure.
         // The route must DEGRADE to the original bytes instead of 500ing; the
         // same degradation covers a NAS blip or a locked file on an ordinary
         // large JPEG that genuinely earned a tier.
@@ -3479,6 +3546,94 @@ mod tests {
             .get_preview_blob(harness.file_id, PREVIEW_NATIVE_PROFILE)
             .expect("query")
             .is_none());
+
+        let mut failure = harness
+            .database()
+            .get_preview_failure(harness.file_id, PREVIEW_NATIVE_PROFILE)
+            .expect("query failure")
+            .expect("permanent decode failure is cached");
+        assert_eq!(failure.failure_kind, "permanent");
+        assert_eq!(failure.source_size, UNDECODABLE_SOURCE_BYTES.len() as i64);
+
+        // A fresh failure suppresses immediate repeated decoder work.
+        failure.error = "fresh preview failure sentinel".to_string();
+        failure.updated_at = crate::db::unix_timestamp();
+        harness
+            .database()
+            .upsert_preview_failure(failure)
+            .expect("stamp fresh failure sentinel");
+        let cached_response = harness
+            .get(&format!(
+                "/api/media/{}/preview?viewportLongPx=1366",
+                harness.file_id
+            ))
+            .await;
+        assert_eq!(cached_response.status(), StatusCode::OK);
+        assert_eq!(
+            harness
+                .database()
+                .get_preview_failure(harness.file_id, PREVIEW_NATIVE_PROFILE)
+                .expect("query cached failure")
+                .expect("failure remains")
+                .error,
+            "fresh preview failure sentinel"
+        );
+
+        // A stale failure must not poison an unchanged source forever. Retrying
+        // this still-corrupt fixture overwrites the sentinel with the real
+        // decoder failure.
+        let mut stale_failure = harness
+            .database()
+            .get_preview_failure(harness.file_id, PREVIEW_NATIVE_PROFILE)
+            .expect("query fresh failure")
+            .expect("fresh failure remains");
+        stale_failure.error = "stale preview failure sentinel".to_string();
+        stale_failure.updated_at = crate::db::unix_timestamp() - 301;
+        harness
+            .database()
+            .upsert_preview_failure(stale_failure)
+            .expect("stamp stale failure sentinel");
+        let stale_response = harness
+            .get(&format!(
+                "/api/media/{}/preview?viewportLongPx=1366",
+                harness.file_id
+            ))
+            .await;
+        assert_eq!(stale_response.status(), StatusCode::OK);
+        let refreshed_after_expiry = harness
+            .database()
+            .get_preview_failure(harness.file_id, PREVIEW_NATIVE_PROFILE)
+            .expect("query refreshed failure")
+            .expect("retry still records the permanent decode failure");
+        assert_ne!(
+            refreshed_after_expiry.error, "stale preview failure sentinel",
+            "expired negative-cache rows must be retried"
+        );
+
+        // A source fingerprint change invalidates the negative row and retries
+        // generation. This fixture is still corrupt, so the retry stores a new
+        // permanent failure and degrades to the new original bytes.
+        let changed_source = b"changed but still undecodable camera raw";
+        fs::write(harness.temp_root.join("camera.raw"), changed_source)
+            .expect("replace undecodable source");
+        let changed_response = harness
+            .get(&format!(
+                "/api/media/{}/preview?viewportLongPx=1366",
+                harness.file_id
+            ))
+            .await;
+        assert_eq!(changed_response.status(), StatusCode::OK);
+        let changed_bytes = to_bytes(changed_response.into_body(), usize::MAX)
+            .await
+            .expect("read changed degraded preview body");
+        assert_eq!(&changed_bytes[..], changed_source);
+        let changed_failure = harness
+            .database()
+            .get_preview_failure(harness.file_id, PREVIEW_NATIVE_PROFILE)
+            .expect("query refreshed failure")
+            .expect("refreshed failure remains cached");
+        assert_eq!(changed_failure.source_size, changed_source.len() as i64);
+        assert!(changed_failure.updated_at >= refreshed_after_expiry.updated_at);
     }
 
     #[tokio::test]
