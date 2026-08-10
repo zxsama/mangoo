@@ -143,5 +143,4 @@ PRs or review notes should include scope, touched subsystems, verification comma
 - Preserve user changes already present in the worktree; do not revert unrelated dirty files.
 - Prefer global primitives and validators over local one-off CSS/logic patches, especially for acrylic/frosted-glass materials, shell, titlebar, dialog, and pointer-highlight work.
 - Do not claim success without fresh verification evidence. If checks are skipped or blocked, say so directly.
-- When subagent workflow is explicitly requested, use one subagent at a time unless the user explicitly allows parallel dispatch.
 - For desktop acrylic/interface work, treat `npm run check:ui-design`, `npm run check:web`, `npm run check:desktop`, and the OS-backdrop visual harness as the expected verification set.
