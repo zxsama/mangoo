@@ -13772,7 +13772,9 @@ mod tests {
                     "failedCount": stats.failed_count,
                     "pendingCandidateCount": stats.pending_candidate_count,
                     "totalBlobBytes": stats.total_blob_bytes,
-                    "activeBulkTaskCount": stats.active_bulk_task_count
+                    "activeBulkTaskCount": stats.active_bulk_task_count,
+                    "failureDetails": [],
+                    "failureDetailsTruncated": false
                 }
             }));
         }

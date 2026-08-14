@@ -307,7 +307,9 @@ function runCoreProbe() {
       failedCount: 0,
       pendingCandidateCount: 0,
       totalBlobBytes: THUMBNAIL_BLOB_BYTES_PER_LIBRARY,
-      activeBulkTaskCount: 0
+      activeBulkTaskCount: 0,
+      failureDetails: [],
+      failureDetailsTruncated: false
     });
   }
 
@@ -433,7 +435,10 @@ async function runCleanupSelfTest() {
           pendingCount: 0,
           activeBulkTaskCount: 0,
           totalCacheBytes: 1,
-          completionPercent: 100
+          completionPercent: 100,
+          failureDetails: [],
+          failureDetailsTruncated: false,
+          failureDetailsUnavailable: false
         });
         sidecarsObservedBeforeFailure = [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]
           .filter((candidate) => fs.existsSync(candidate))
@@ -593,7 +598,10 @@ function expectedThumbnailSummary(library, observedAt) {
     pendingCount: 0,
     activeBulkTaskCount: 0,
     totalCacheBytes: THUMBNAIL_BLOB_BYTES_PER_LIBRARY,
-    completionPercent: 100
+    completionPercent: 100,
+    failureDetails: [],
+    failureDetailsTruncated: false,
+    failureDetailsUnavailable: false
   };
 }
 
