@@ -19,6 +19,8 @@ tools/bench/preview-switch/public/thumbs/
 tools/bench/preview-switch/results/
 .superpowers/
 .serena/
+.trellis/
+.agents/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
