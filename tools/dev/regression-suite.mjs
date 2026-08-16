@@ -8,7 +8,7 @@
 // Usage:
 //   1. Launch the app with the CDP port open (a warm, already-scanned DB is best
 //      so thumbnails exist to load):
-//        MEGLE_DB_PATH=... MEGLE_REMOTE_DEBUG=1 npm run dev
+//        MEGLE_HOST_DB_PATH=... MEGLE_LIBRARIES_DIR=... MEGLE_REMOTE_DEBUG=1 npm run dev
 //   2. Run this suite:  node tools/dev/regression-suite.mjs
 //      (optional: REG_PORT=9500 to override the CDP port)
 //

@@ -9,7 +9,7 @@ const parsedWebUrl = new URL(webUrl);
 const webHost = parsedWebUrl.hostname;
 const webPort = parsedWebUrl.port || (parsedWebUrl.protocol === "https:" ? "443" : "80");
 const dataDir = path.join(root, ".data");
-const dbPath = process.env.MEGLE_DB_PATH ?? path.join(dataDir, "megle-dev.sqlite");
+const hostDir = path.join(dataDir, "host");
 
 fs.mkdirSync(dataDir, { recursive: true });
 
@@ -21,7 +21,8 @@ function spawnChild(command, args, options = {}) {
     env: {
       ...process.env,
       MEGLE_WEB_URL: webUrl,
-      MEGLE_DB_PATH: dbPath
+      MEGLE_HOST_DB_PATH: process.env.MEGLE_HOST_DB_PATH ?? path.join(hostDir, "host.sqlite"),
+      MEGLE_LIBRARIES_DIR: process.env.MEGLE_LIBRARIES_DIR ?? path.join(hostDir, "libraries")
     },
     stdio: "inherit",
     shell: process.platform === "win32",

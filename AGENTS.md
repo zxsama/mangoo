@@ -10,7 +10,7 @@ Megle is a Windows-first, contract-first local media browser. The main stack is 
 - `contracts/plugins/`: plugin manifest and permission contract.
 - `crates/core/`: single Phase 1 Rust Core crate. Keep API, DB, roots, scan, thumbnails, fsops, plugins, watch, and tasks as internal modules until boundaries are proven.
 - `packages/core-client/`: TypeScript Core API client/types boundary.
-- Multi-library: a library = one `.sqlite` file (with N roots inside); switching restarts Core at a new `MEGLE_DB_PATH` reusing the same port+token (no renderer reload). Registry in `apps/desktop/src/library-registry.ts` → `userData/libraries.json`; bridge/types in `apps/web/src/core/desktop.ts` + `libraryTypes.ts`. Core is DB-path-driven and unchanged. See CLAUDE.md → "Multi-Library".
+- Multi-library: Desktop starts one Host Core from `MEGLE_HOST_DB_PATH` + `MEGLE_LIBRARIES_DIR`. Core owns the registry, managed-root identity/journals, and atomic active-Library runtime; switching uses the `/libraries/{libraryUuid}/activate` API without restarting Core or reloading the renderer. Web uses `@megle/core-client` for Library lifecycle and ordinary mutations carry the active context revision.
 - `tools/checks/`: fast structure, contract, schema, desktop, web, and UI-design checks.
 - `tools/bench/`: heavier benchmark harnesses and generated-data tooling.
 - `docs/`: durable architecture, product, design, plans, benchmark reports, and release documentation.

@@ -52,7 +52,7 @@ Rust Core (crates/core)
   axum router + sqlite + scan/thumbnails/fsops/plugins/watch modules
 ```
 
-The desktop shell (`apps/desktop/src/main.ts`, `core-process.ts`, `core-session.ts`) generates a session token, allocates a bind address, sets `MEGLE_SESSION_TOKEN` / `MEGLE_CORE_ADDR` / `MEGLE_DB_PATH` / `MEGLE_ALLOWED_ORIGIN`, then spawns Core. `tools/dev/run-dev.mjs` is the dev orchestrator: it starts Vite (forced to `127.0.0.1:5173 --strictPort`), builds the desktop TS, then launches Electron against `apps/desktop/dist/main.js`.
+The desktop shell (`apps/desktop/src/main.ts`, `core-process.ts`, `core-session.ts`) generates a session token, allocates a bind address, sets `MEGLE_SESSION_TOKEN` / `MEGLE_CORE_ADDR` / `MEGLE_HOST_DB_PATH` / `MEGLE_LIBRARIES_DIR` / `MEGLE_ALLOWED_ORIGIN`, then spawns one long-lived Host Core. `tools/dev/run-dev.mjs` is the dev orchestrator: it starts Vite (forced to `127.0.0.1:5173 --strictPort`), builds the desktop TS, then launches Electron against `apps/desktop/dist/main.js`.
 
 ### Security Boundary
 
@@ -77,7 +77,7 @@ When adding an API path, plugin capability, table, or index, update the contract
 
 `crates/core/src` keeps `api`, `db`, `decode`, `roots`, `scan`, `thumbnails`, `fsops`, `plugins`, `watch`, and `tasks` as **modules inside one crate**. Do not pre-split them into separate workspace crates — `validate-structure.mjs` actively rejects `crates/indexer` and `crates/thumbnails`. Crate-splitting comes only after module boundaries stabilize.
 
-`main.rs` reads `MEGLE_DB_PATH`, `MEGLE_CORE_ADDR`, `MEGLE_SESSION_TOKEN` (required), and `MEGLE_ALLOWED_ORIGIN`, opens the database, applies migrations, and serves `api::router_with_config` on the bind address.
+`main.rs` reads `MEGLE_HOST_DB_PATH` (required), `MEGLE_LIBRARIES_DIR`, `MEGLE_CORE_ADDR`, `MEGLE_SESSION_TOKEN` (required), and `MEGLE_ALLOWED_ORIGIN`, opens the Host registry, recovers managed Library journals, and serves one router whose active Library runtime is switched atomically by the Core API.
 
 ### Web UI Layout
 

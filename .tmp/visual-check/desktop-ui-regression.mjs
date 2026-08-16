@@ -6,6 +6,7 @@ import path from "node:path";
 import process from "node:process";
 import WebSocket from "ws";
 import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-browser-window-options.mjs";
+import { managedLibraryHostEnv } from "../../tools/dev/managed-library-harness.mjs";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
 import {
   finalizeNormalOsDiagnostics,
@@ -25,6 +26,7 @@ const mediaDir = controlledMedia.root;
 const screenshotDir = path.join(visualRoot, "screenshots");
 const logDir = path.join(visualRoot, "logs");
 const dataDir = path.join(visualRoot, `data-desktop-ui-${visualRunId}`);
+const managedRoot = path.join(dataDir, "library");
 const electronUserDataDir = path.join(dataDir, "electron-user-data");
 const webUrl = "http://127.0.0.1:5179";
 const debugPort = Number(process.env.MEGLE_VISUAL_DEBUG_PORT ?? process.env.MEGLE_REMOTE_DEBUG_PORT ?? 9500);
@@ -84,9 +86,10 @@ function startDevApp() {
     env: {
       ...process.env,
       MEGLE_WEB_URL: webUrl,
-      MEGLE_DB_PATH: path.join(dataDir, "megle.sqlite"),
+      ...managedLibraryHostEnv(dataDir),
       MEGLE_ELECTRON_USER_DATA_DIR: electronUserDataDir,
       MEGLE_AUTO_ADD_ROOT: mediaDir,
+      MEGLE_AUTO_LIBRARY_ROOT: managedRoot,
       MEGLE_REMOTE_DEBUG: "1",
       MEGLE_REMOTE_DEBUG_PORT: String(debugPort),
       MEGLE_VISUAL_HARNESS: "1",

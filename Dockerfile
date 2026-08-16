@@ -45,7 +45,8 @@ RUN groupadd --system --gid 10001 megle \
 COPY --from=core-builder /src/target/release/megle-core /usr/local/bin/megle-core
 COPY --from=web-builder  /web/apps/web/dist             /opt/megle/web
 
-ENV MEGLE_DB_PATH=/data/megle.sqlite \
+ENV MEGLE_HOST_DB_PATH=/data/host/host.sqlite \
+    MEGLE_LIBRARIES_DIR=/data/host/libraries \
     MEGLE_PLUGINS_DIR=/data/plugins \
     MEGLE_WEB_DIR=/opt/megle/web \
     MEGLE_SERVE_WEB=1 \

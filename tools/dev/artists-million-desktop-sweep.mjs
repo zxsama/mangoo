@@ -1,18 +1,19 @@
 import { spawn } from "node:child_process";
-import { createWriteStream, statSync } from "node:fs";
+import { createWriteStream, readdirSync, statSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import WebSocket from "ws";
+import { managedLibraryHostEnv } from "./managed-library-harness.mjs";
 
 const root = "D:\\Megle";
 const visualRoot = path.join(root, ".tmp", "visual-check");
 const logDir = path.join(visualRoot, "logs");
 const dataDir =
   process.env.MEGLE_ARTISTS_SWEEP_DATA_DIR ?? path.join(visualRoot, "data-artists-million");
-const dbPath = path.join(dataDir, "megle.sqlite");
+const managedRoot = path.join(dataDir, "library");
 const electronUserDataDir = path.join(dataDir, "electron-user-data");
 const startDesktopCommand = path.join(root, "start-desktop.cmd");
 const autoRoot = process.env.MEGLE_ARTISTS_SWEEP_ROOT ?? "Y:\\Repository\\Billfish\\Artists";
@@ -97,10 +98,23 @@ function fileStats(filePath) {
 }
 
 function collectDatabaseFileStats() {
+  const librariesDir = path.join(dataDir, "host", "libraries");
+  let libraryDirs = [];
+  try {
+    libraryDirs = readdirSync(librariesDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && !entry.name.includes(".staging."))
+      .map((entry) => path.join(librariesDir, entry.name));
+  } catch {
+    // The summary below reports an empty catalog list when Host creation did
+    // not reach the local-data phase; startup diagnostics retain the cause.
+  }
   return {
-    sqlite: fileStats(dbPath),
-    wal: fileStats(`${dbPath}-wal`),
-    shm: fileStats(`${dbPath}-shm`)
+    host: fileStats(path.join(dataDir, "host", "host.sqlite")),
+    catalogs: libraryDirs.map((libraryDir) => ({
+      sqlite: fileStats(path.join(libraryDir, "catalog.sqlite")),
+      wal: fileStats(path.join(libraryDir, "catalog.sqlite-wal")),
+      shm: fileStats(path.join(libraryDir, "catalog.sqlite-shm"))
+    }))
   };
 }
 
@@ -114,9 +128,10 @@ function startDevApp() {
     env: {
       ...process.env,
       MEGLE_WEB_URL: webUrl,
-      MEGLE_DB_PATH: dbPath,
+      ...managedLibraryHostEnv(dataDir),
       MEGLE_ELECTRON_USER_DATA_DIR: electronUserDataDir,
       MEGLE_AUTO_ADD_ROOT: autoRoot,
+      MEGLE_AUTO_LIBRARY_ROOT: managedRoot,
       MEGLE_REMOTE_DEBUG: "1",
       MEGLE_REMOTE_DEBUG_PORT: String(debugPort)
     },

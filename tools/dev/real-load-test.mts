@@ -15,6 +15,11 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import {
+  addExistingMediaRoot,
+  createAndActivateManagedLibrary,
+  managedLibraryHostEnv
+} from "./managed-library-harness.mjs";
 
 const TOKEN = "real-load-test-token";
 const ADDR = process.env.MEGLE_REAL_LOAD_CORE_ADDR ?? "127.0.0.1:47391";
@@ -740,14 +745,14 @@ async function main() {
   log(`Source dir: ${ROOT_PATH} (${expectedFiles} supported media files, recursive)`);
 
   const dataDir = await mkdtemp(path.join(tmpdir(), "megle-real-load-"));
-  const dbPath = path.join(dataDir, "megle.sqlite");
+  const managedRoot = path.join(dataDir, "library");
   log(`Data dir: ${dataDir}`);
 
   const env = {
     ...process.env,
     MEGLE_SESSION_TOKEN: TOKEN,
     MEGLE_CORE_ADDR: ADDR,
-    MEGLE_DB_PATH: dbPath,
+    ...managedLibraryHostEnv(dataDir),
     RUST_LOG: "warn"
   };
 
@@ -779,11 +784,20 @@ async function main() {
     await waitForHealth();
     log("Core is healthy");
 
+    const library = await createAndActivateManagedLibrary({
+      baseUrl: BASE,
+      token: TOKEN,
+      name: "Real load test",
+      managedRoot
+    });
+
     log(`addRoot ${ROOT_PATH}`);
     const addRootStartedAt = Date.now();
-    const root = await fetchJson<AcceptedRoot>("/roots", {
-      method: "POST",
-      body: JSON.stringify({ path: ROOT_PATH })
+    const root = await addExistingMediaRoot({
+      baseUrl: BASE,
+      token: TOKEN,
+      contextRevision: library.contextRevision,
+      mediaRoot: ROOT_PATH
     });
     if (!root.accepted || !root.taskId || !root.rootId) {
       throw new Error(`addRoot did not produce a scan task: ${JSON.stringify(root)}`);

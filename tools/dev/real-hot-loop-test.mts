@@ -27,6 +27,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import {
+  addExistingMediaRoot,
+  createAndActivateManagedLibrary,
+  managedLibraryHostEnv
+} from "./managed-library-harness.mjs";
 
 import { buildOperationPlan, type Operation } from "./hot-loop/operationPlan.mts";
 import { summarize, checkBudgets, type Budgets, type Summary } from "./hot-loop/metrics.mts";
@@ -297,10 +302,12 @@ async function waitForRootRecord(rootId: number, timeoutMs = 30_000): Promise<Ro
   throw new Error(`root ${rootId} did not expose a rootFolderId`);
 }
 
-async function addRoot(): Promise<AcceptedRoot> {
-  const root = await fetchJson<AcceptedRoot>("/roots", {
-    method: "POST",
-    body: JSON.stringify({ path: ROOT_PATH })
+async function addRoot(contextRevision: number): Promise<AcceptedRoot> {
+  const root = await addExistingMediaRoot({
+    baseUrl: BASE,
+    token: TOKEN,
+    contextRevision,
+    mediaRoot: ROOT_PATH
   });
   if (!root.accepted || !root.taskId || !root.rootId) {
     throw new Error(`addRoot did not produce a scan task: ${JSON.stringify(root)}`);
@@ -518,7 +525,7 @@ async function main() {
   }
 
   const dataDir = await mkdtemp(path.join(tmpdir(), "megle-hotloop-"));
-  const dbPath = path.join(dataDir, "megle.sqlite");
+  const managedRoot = path.join(dataDir, "library");
   log(`Source dir: ${ROOT_PATH}`);
   log(`Data dir: ${dataDir}`);
 
@@ -526,7 +533,7 @@ async function main() {
     ...process.env,
     MEGLE_SESSION_TOKEN: TOKEN,
     MEGLE_CORE_ADDR: ADDR,
-    MEGLE_DB_PATH: dbPath,
+    ...managedLibraryHostEnv(dataDir),
     RUST_LOG: "warn"
   };
 
@@ -558,8 +565,15 @@ async function main() {
     await waitForHealth();
     log("Core is healthy");
 
+    const library = await createAndActivateManagedLibrary({
+      baseUrl: BASE,
+      token: TOKEN,
+      name: "Real hot loop test",
+      managedRoot
+    });
+
     log(`addRoot ${ROOT_PATH}`);
-    const root = await addRoot();
+    const root = await addRoot(library.contextRevision);
     log(`scan task ${root.taskId} queued for root ${root.rootId}`);
     const rootId = root.rootId!;
     const scanTaskId = root.taskId!;

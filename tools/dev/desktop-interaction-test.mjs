@@ -18,6 +18,7 @@ import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { connectCdp, resolvePageWsUrl } from "./cdp-client.mjs";
+import { managedLibraryHostEnv } from "./managed-library-harness.mjs";
 
 const ROOT = (process.env.MEGLE_INTERACTION_ROOT ?? "Y:/Repository/Billfish/Artists").replace(/\\/g, "/");
 const OPS = Number(process.env.MEGLE_INTERACTION_OPS ?? 60);
@@ -25,7 +26,7 @@ const PORT = Number(process.env.MEGLE_INTERACTION_PORT ?? 9240);
 const WARMUP_MS = Number(process.env.MEGLE_INTERACTION_WARMUP_MS ?? 18000);
 const KEEP = process.env.MEGLE_KEEP_DATA === "1";
 const DATA_DIR = path.join(process.cwd(), ".tmp", "interaction-test");
-const DB_PATH = path.join(DATA_DIR, "megle.sqlite");
+const MANAGED_ROOT = path.join(DATA_DIR, "library");
 const SHOT_DIR = path.join(DATA_DIR, "shots");
 
 // Per-operation budgets (ms). A folder switch or preview open slower than this,
@@ -45,7 +46,8 @@ const dev = spawn("npm", ["run", "dev"], {
     MEGLE_REMOTE_DEBUG: "1",
     MEGLE_REMOTE_DEBUG_PORT: String(PORT),
     MEGLE_AUTO_ADD_ROOT: ROOT,
-    MEGLE_DB_PATH: DB_PATH
+    MEGLE_AUTO_LIBRARY_ROOT: MANAGED_ROOT,
+    ...managedLibraryHostEnv(DATA_DIR)
   },
   stdio: ["ignore", "pipe", "pipe"],
   shell: true,

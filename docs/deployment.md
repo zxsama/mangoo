@@ -95,7 +95,8 @@ you remove the `:ro` flag.
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `MEGLE_CORE_ADDR` | Bind address. | `0.0.0.0:47321` |
-| `MEGLE_DB_PATH` | SQLite path. | `/data/megle.sqlite` |
+| `MEGLE_HOST_DB_PATH` | Host registry SQLite path. | `/data/host/host.sqlite` |
+| `MEGLE_LIBRARIES_DIR` | Local catalog/cache storage owned by the Host. | `/data/host/libraries` |
 | `MEGLE_PLUGINS_DIR` | Plugin discovery root. | `/data/plugins` |
 | `MEGLE_SERVE_WEB` | Serve the bundled UI when `1`. | `1` |
 | `MEGLE_WEB_DIR` | Directory containing `index.html` + `assets/`. | `/opt/megle/web` |

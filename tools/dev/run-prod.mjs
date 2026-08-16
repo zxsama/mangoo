@@ -21,7 +21,7 @@ import process from "node:process";
 
 const root = process.cwd();
 const dataDir = path.join(root, ".data");
-const dbPath = process.env.MEGLE_DB_PATH ?? path.join(dataDir, "megle-dev.sqlite");
+const hostDir = path.join(dataDir, "host");
 const previewUrl = "http://127.0.0.1:4173";
 const hashFile = path.join(root, ".data", ".prod-build-hash");
 
@@ -200,7 +200,8 @@ console.log("[prod] launching desktop…");
 const electronArgs = ["apps/desktop/dist/main.js"];
 const electron = spawnChild(electronCommand(), electronArgs, {
   MEGLE_WEB_URL: previewUrl,
-  MEGLE_DB_PATH: dbPath,
+  MEGLE_HOST_DB_PATH: process.env.MEGLE_HOST_DB_PATH ?? path.join(hostDir, "host.sqlite"),
+  MEGLE_LIBRARIES_DIR: process.env.MEGLE_LIBRARIES_DIR ?? path.join(hostDir, "libraries"),
   MEGLE_CORE_PROFILE: "release"
 });
 electron.on("exit", (code) => {
