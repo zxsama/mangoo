@@ -3634,8 +3634,13 @@ export function useLibraryData(
       return;
     }
     cancelledBulkForModeRef.current = generationMode;
+    // A fresh renderer may reach this effect before any ordinary API response
+    // has taught core-client the active context revision. Prime that revision
+    // explicitly so this background mutation obeys the same stale-write fence
+    // as user-driven mutations instead of producing a noisy startup 409.
     void client
-      .cancelBulkThumbnailCache({ requestPriority: "background" })
+      .getActiveLibrary({ requestPriority: "background" })
+      .then(() => client.cancelBulkThumbnailCache({ requestPriority: "background" }))
       .then(() => {
         void refreshThumbnailCacheStats();
       })

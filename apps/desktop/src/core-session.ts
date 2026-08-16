@@ -1,11 +1,11 @@
 import crypto from "node:crypto";
 import net from "node:net";
-import path from "node:path";
 
 export interface CoreSession {
   baseUrl: string;
   bindAddress: string;
-  dbPath: string;
+  hostDbPath?: string;
+  librariesDir?: string;
   sessionToken: string;
   allowedOrigin: string;
 }
@@ -22,7 +22,8 @@ export async function createCoreSession(): Promise<CoreSession> {
     return {
       baseUrl: requireEnv("MEGLE_CORE_URL", "MEGLE_CORE_URL is required when MEGLE_CORE_EXTERNAL=1"),
       bindAddress: configuredBindAddress ?? "external",
-      dbPath: process.env.MEGLE_DB_PATH ?? path.join(process.cwd(), "megle-dev.sqlite"),
+      hostDbPath: process.env.MEGLE_HOST_DB_PATH,
+      librariesDir: process.env.MEGLE_LIBRARIES_DIR,
       sessionToken,
       allowedOrigin:
         process.env.MEGLE_ALLOWED_ORIGIN ?? process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173"
@@ -43,7 +44,8 @@ export async function createCoreSession(): Promise<CoreSession> {
   return {
     baseUrl,
     bindAddress,
-    dbPath: process.env.MEGLE_DB_PATH ?? path.join(process.cwd(), "megle-dev.sqlite"),
+    hostDbPath: process.env.MEGLE_HOST_DB_PATH,
+    librariesDir: process.env.MEGLE_LIBRARIES_DIR,
     sessionToken,
     allowedOrigin:
       process.env.MEGLE_ALLOWED_ORIGIN ?? process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173"
@@ -136,26 +138,6 @@ function endpointKey(bindAddress: string): string {
 function isLoopbackOrIpLiteral(host: string): boolean {
   const ipVersion = net.isIP(host);
   return ipVersion !== 0;
-}
-
-// Build a session for a different database file that reuses the same bind
-// address + session token, so a Core restart does not require the renderer to
-// re-read its coreUrl/token (spec Decision 6).
-export function sessionForDbPath(
-  base: CoreSession,
-  dbPath: string,
-  candidate?: CoreSession | null
-): CoreSession {
-  if (
-    candidate?.dbPath === dbPath &&
-    candidate.baseUrl === base.baseUrl &&
-    candidate.bindAddress === base.bindAddress &&
-    candidate.sessionToken === base.sessionToken &&
-    candidate.allowedOrigin === base.allowedOrigin
-  ) {
-    return candidate;
-  }
-  return { ...base, dbPath };
 }
 
 function requireEnv(name: string, message: string): string {

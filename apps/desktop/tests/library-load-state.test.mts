@@ -74,9 +74,10 @@ it("publishes loading-media for a normal cold start with no auto-add work", asyn
 
 it("uses the replayable cold-start boundary before creating the renderer", async () => {
   const mainSource = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
-  const coldStartup = mainSource.slice(
-    mainSource.indexOf("app\n  .whenReady()"),
-    mainSource.indexOf("function handleDesktopStartupFailure")
+  const normalizedSource = mainSource.replace(/\r\n/g, "\n");
+  const coldStartup = normalizedSource.slice(
+    normalizedSource.indexOf("app\n  .whenReady()"),
+    normalizedSource.indexOf("function handleDesktopStartupFailure")
   );
 
   assert.match(coldStartup, /await prepareColdLibraryStartup\(\{/);

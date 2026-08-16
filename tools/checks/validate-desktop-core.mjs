@@ -49,9 +49,7 @@ const main = read("apps/desktop/src/main.ts");
 const session = read("apps/desktop/src/core-session.ts");
 const processFile = read("apps/desktop/src/core-process.ts");
 const lifecycleQueue = read("apps/desktop/src/core-lifecycle-queue.ts");
-const coreSwitchTransaction = read("apps/desktop/src/core-switch-transaction.ts");
 const libraryLoadState = read("apps/desktop/src/library-load-state.ts");
-const libraryRegistry = read("apps/desktop/src/library-registry.ts");
 const preload = read("apps/desktop/src/preload.cjs");
 const notificationIpc = readOptional("apps/desktop/src/notification-ipc.ts");
 const notificationRuntime = readOptional("apps/desktop/src/notification-runtime.ts");
@@ -68,6 +66,17 @@ const secondaryReveal = read("apps/desktop/src/secondary-window-reveal.ts");
 const desktopPackage = read("apps/desktop/package.json");
 const rootPackage = read("package.json");
 const devRunner = read("tools/dev/run-dev.mjs");
+const prodRunner = read("tools/dev/run-prod.mjs");
+const managedLibraryHarness = read("tools/dev/managed-library-harness.mjs");
+const managedLibraryBench = read("tools/bench/managed-library-lifecycle-bench.mjs");
+const migratedHostHarnesses = [
+  [read("tools/dev/real-load-test.mts"), "real-load harness"],
+  [read("tools/dev/real-hot-loop-test.mts"), "real-hot-loop harness"],
+  [read("tools/dev/desktop-interaction-test.mjs"), "desktop interaction harness"],
+  [read("tools/dev/artists-million-desktop-sweep.mjs"), "Artists sweep harness"],
+  [read(".tmp/visual-check/desktop-ui-regression.mjs"), "desktop visual harness"],
+  [managedLibraryBench, "managed Library lifecycle benchmark"]
+];
 
 for (const value of [
   "startCoreProcess",
@@ -89,7 +98,7 @@ for (const value of [
   }
 }
 
-for (const value of ["baseUrl", "bindAddress", "dbPath", "sessionToken", "MEGLE_CORE_ADDR"]) {
+for (const value of ["baseUrl", "bindAddress", "hostDbPath", "librariesDir", "sessionToken", "MEGLE_CORE_ADDR"]) {
   if (!session.includes(value)) {
     fail(`core session missing ${value}`);
   }
@@ -113,7 +122,8 @@ for (const value of [
 
 for (const value of [
   "MEGLE_CORE_EXTERNAL",
-  "MEGLE_DB_PATH",
+  "MEGLE_HOST_DB_PATH",
+  "MEGLE_LIBRARIES_DIR",
   "MEGLE_CORE_ADDR",
   "MEGLE_SESSION_TOKEN",
   "MEGLE_ALLOWED_ORIGIN",
@@ -409,7 +419,7 @@ for (const value of [
 for (const value of [
   "canAccessDesktopIpc",
   "PRIVILEGED_WINDOW_ROLES",
-  '"megle:switch-library"',
+  '"megle:pick-new-library-path"',
   '"megle:shell-open-path"'
 ]) {
   if (!desktopIpcPermissions.includes(value)) {
@@ -418,10 +428,7 @@ for (const value of [
 }
 for (const channel of [
   "megle:retry-library-load",
-  "megle:switch-library",
-  "megle:create-library",
-  "megle:remove-library-from-list",
-  "megle:delete-library-file",
+  "megle:pick-new-library-path",
   "megle:shell-reveal-path",
   "megle:shell-open-path"
 ]) {
@@ -597,7 +604,7 @@ if (!rootPackage.includes('"dev"')) {
   fail("root package missing dev script");
 }
 
-for (const value of ["@megle/web", "@megle/desktop", "MEGLE_WEB_URL", "MEGLE_DB_PATH", "electron"]) {
+for (const value of ["@megle/web", "@megle/desktop", "MEGLE_WEB_URL", "MEGLE_HOST_DB_PATH", "MEGLE_LIBRARIES_DIR", "electron"]) {
   if (!devRunner.includes(value)) {
     fail(`dev runner missing ${value}`);
   }
@@ -619,110 +626,32 @@ if (!/run\(\s*findCargoCommand\(\)\s*,\s*\[\s*"build"\s*,\s*"-p"\s*,\s*"megle-co
 // Core is started from exactly two call sites: the initial cold-start/retry
 // loop and the shared healthy-replacement helper used by target and recovery
 // transactions. Any other count means a stray/duplicate startup path snuck in.
-const startCoreCalls = [...main.matchAll(/\bstartCoreProcess\(/g)].length;
-if (startCoreCalls !== 2) {
+const executableMain = main.replace(/\/\*[\s\S]*?\*\//g, "");
+const startCoreCalls = [...executableMain.matchAll(/\bstartCoreProcess\(/g)].length;
+if (startCoreCalls !== 1) {
   fail(
-    `desktop main must start Core from exactly two call sites (cold start + healthy replacement); found ${startCoreCalls} calls`
+    `desktop main must start the long-lived Core Host from exactly one call site; found ${startCoreCalls} calls`
   );
 }
 if (processFile.includes('process.stdout.write("[core stdout] ")') || processFile.includes('process.stderr.write("[core stderr] ")')) {
   fail("Core output must use the line-based desktop logger path without duplicate raw chunk console writes");
 }
 const lifecycleEnqueueCalls = [...main.matchAll(/coreLifecycleQueue\.enqueue\(/g)].length;
-if (lifecycleEnqueueCalls < 4) {
-  fail("desktop library/startup lifecycle operations must all enter the shared Core lifecycle queue");
+if (lifecycleEnqueueCalls < 2) {
+  fail("desktop Host startup/retry lifecycle operations must enter the shared Core lifecycle queue");
 }
-const restartCoreForLibraryBody = functionBody(
-  main,
-  "async function restartCoreForLibrary("
-);
-if (!restartCoreForLibraryBody) {
-  fail("desktop main must expose restartCoreForLibrary to restart Core for a library switch");
-} else {
-  if (!restartCoreForLibraryBody.includes("runCoreSwitchTransaction(")) {
-    fail("desktop main restartCoreForLibrary must use the recoverable Core switch transaction");
-  }
-  if (!restartCoreForLibraryBody.includes("startHealthyReplacementCore(")) {
-    fail("desktop main restartCoreForLibrary must start target and recovery Core processes through the healthy replacement helper");
-  }
-  if (!restartCoreForLibraryBody.includes("waitForPortFree(")) {
-    fail("desktop main restartCoreForLibrary must wait for the old Core's port to free before rebinding");
-  }
-  if (!restartCoreForLibraryBody.includes("sessionForDbPath(")) {
-    fail("desktop main restartCoreForLibrary must reuse the existing bind address/session token via sessionForDbPath");
-  }
-  for (const value of ["pendingCoreSession", "assertCurrentCoreGeneration(generation, signal)"]) {
-    if (!restartCoreForLibraryBody.includes(value)) {
-      fail(`desktop main restartCoreForLibrary must preserve candidate session lifecycle state: ${value}`);
-    }
-  }
-  if (restartCoreForLibraryBody.includes("coreSession = null")) {
-    fail("desktop main must retain the last-known coreSession while a library candidate is unhealthy");
-  }
-  if (restartCoreForLibraryBody.includes("persistRegistry(previousRegistry)")) {
-    fail("desktop library recovery must not restore a stale whole-registry snapshot");
-  }
-  for (const value of [
-    "CoreSwitchRecoveryError",
-    "activateCurrentRegistryLibrary(target)",
-    "activateCurrentRegistryLibrary({"
-  ]) {
-    if (!restartCoreForLibraryBody.includes(value)) {
-      fail(`desktop library recovery missing transactional consistency guard: ${value}`);
-    }
-  }
+for (const forbidden of ["libraries.json", "sessionForDbPath(", "restartCoreForLibrary(", 'ipcMain.handle("megle:open-library"', 'ipcMain.handle("megle:pick-library-file"']) {
+  if (executableMain.includes(forbidden)) fail(`desktop Host must not retain legacy Library product path: ${forbidden}`);
 }
-for (const value of [
-  "CoreSwitchRecoveryError",
-  'outcome: "target-fallback"',
-  'recoveryStage: CoreSwitchRecoveryStage',
-  "systemHealthy"
-]) {
-  if (!coreSwitchTransaction.includes(value)) {
-    fail(`Core switch transaction missing independent recovery outcome: ${value}`);
-  }
+for (const [source, label] of [[processFile, "desktop Core process"], [devRunner, "dev runner"], [prodRunner, "prod runner"]]) {
+  if (source.includes("MEGLE_DB_PATH")) fail(`${label} must not retain the retired single-Library MEGLE_DB_PATH input`);
 }
-for (const value of [
-  "activateLibraryIfCurrent",
-  'reason: "missing" | "db-path-changed"',
-  "path.resolve(entry.dbPath)",
-  "setActive(registry, expected.id, expected.now)"
-]) {
-  if (!libraryRegistry.includes(value)) {
-    fail(`library registry missing latest-state conditional activation: ${value}`);
-  }
+for (const [source, label] of migratedHostHarnesses) {
+  if (source.includes("MEGLE_DB_PATH")) fail(`${label} must not retain the retired single-Library MEGLE_DB_PATH input`);
+  if (!source.includes("managedLibraryHostEnv")) fail(`${label} must launch through the shared managed Library Host environment`);
 }
-for (const value of [
-  "RemoveLibraryResult",
-  "removeLibraryIfInactive",
-  'reason: "missing" | "active"',
-  "registry.activeLibraryId === id"
-]) {
-  if (!libraryRegistry.includes(value)) {
-    fail(`library registry missing active-library removal guard: ${value}`);
-  }
-}
-if (/export function removeLibrary\(/.test(libraryRegistry)) {
-  fail("library registry must not export an unguarded removal bypass");
-}
-const currentRegistryRemovalBody = functionBody(
-  main,
-  "function removeLibraryFromCurrentRegistry("
-);
-if (
-  !currentRegistryRemovalBody ||
-  !currentRegistryRemovalBody.includes("removeLibraryIfInactive(getRegistry(), libraryId)") ||
-  !currentRegistryRemovalBody.includes("persistRegistry(removal.registry)")
-) {
-  fail("desktop library deletion must guard and persist one latest-registry snapshot");
-}
-for (const value of [
-  "return removeLibraryFromCurrentRegistry(libraryId);",
-  "return removeLibraryFromCurrentRegistry(libraryId, (target) => {"
-]) {
-  if (!main.includes(value)) {
-    fail(`desktop library deletion entry point bypasses the shared active guard: ${value}`);
-  }
+for (const marker of ["MEGLE_HOST_DB_PATH", "MEGLE_LIBRARIES_DIR", "createAndActivateManagedLibrary", "addExistingMediaRoot"]) {
+  if (!managedLibraryHarness.includes(marker)) fail(`managed Library harness missing ${marker}`);
 }
 for (const value of ["publish(phase", "snapshot()", "this.current = phase"]) {
   if (!libraryLoadState.includes(value)) {
@@ -737,24 +666,6 @@ for (const value of [
 ]) {
   if (!main.includes(value)) {
     fail(`desktop library retry/reload recovery missing ${value}`);
-  }
-}
-const commitStartedCoreBody = functionBody(main, "async function commitStartedCore(");
-if (!commitStartedCoreBody) {
-  fail("desktop main must centralize Core handle/session commits");
-} else {
-  for (const value of ["coreProcess = replacement.handle", "pendingCoreProcess = null", "pendingCoreSession = null"]) {
-    if (!commitStartedCoreBody.includes(value)) {
-      fail(`desktop Core commit helper must atomically publish replacement state: ${value}`);
-    }
-  }
-  const processCommitIndex = commitStartedCoreBody.indexOf("coreProcess = replacement.handle");
-  const generationFenceIndex = commitStartedCoreBody.lastIndexOf(
-    "assertCurrentCoreGeneration(generation, signal)",
-    processCommitIndex
-  );
-  if (processCommitIndex === -1 || generationFenceIndex === -1) {
-    fail("desktop Core commit helper must compare lifecycle generation before committing its handle");
   }
 }
 if (!main.includes("ensureCoreReady")) {

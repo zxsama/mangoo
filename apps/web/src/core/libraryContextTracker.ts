@@ -24,7 +24,7 @@ export function createLibraryContextTracker(
       if (disposed || generation !== requestGeneration) return;
       const active = libraries.find((library) => library.active);
       options.onContext(
-        active ? { libraryId: active.id, libraryName: active.name } : null
+        active ? { libraryId: active.libraryUuid, libraryName: active.name } : null
       );
     } catch {
       if (!disposed && generation === requestGeneration) {

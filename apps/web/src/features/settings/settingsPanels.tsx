@@ -3,8 +3,6 @@ import {
   CheckCircle2,
   Database,
   FolderCog,
-  FolderMinus,
-  FolderPlus,
   Gauge,
   Images,
   Keyboard,
@@ -18,15 +16,9 @@ import {
 } from "lucide-react";
 import { useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
-  createLibrary,
   deleteLibraryFile,
   listLibraries,
   openNotificationsWindow,
-  openLibrary,
-  pickLibraryFile,
-  pickNativeFolder,
-  pickNewLibraryPath,
-  removeLibraryFromList,
   renameLibraryEntry,
   setLibraryIcon,
   switchLibrary
@@ -36,6 +28,7 @@ import type { LibraryState } from "../../core/useLibraryData";
 import type { InterfaceStyleController } from "../../design/liquid-glass";
 import { thumbnailFailureLogIntentForLibrary } from "../notifications/notificationModel";
 import { LibraryGlyph, LibraryIconPicker } from "../library/libraryGlyph";
+import { ManagedLibraryWizard } from "../library/ManagedLibraryWizard";
 import {
   LIBRARY_GRID_PREFERENCE_LIMITS,
   type LibraryGridPreferences
@@ -654,6 +647,7 @@ function LibrariesTab({ library }: { library: LibraryState }) {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
 
   const reload = () => void listLibraries().then(setLibs);
   useEffect(() => {
@@ -661,16 +655,16 @@ function LibrariesTab({ library }: { library: LibraryState }) {
   }, []);
 
   async function onSwitch(l: LibrarySummary) {
-    if (l.active || !l.available) return;
+    if (l.active || l.availability !== "available") return;
     setIconMenuId(null);
     setConfirmDeleteId(null);
-    const res = await switchLibrary(l.id);
+    const res = await switchLibrary(l.libraryUuid);
     if (!res.ok) setError(res.error ?? "切换失败");
     reload();
   }
 
   async function onIconPick(l: LibrarySummary, icon: string, color: string) {
-    await setLibraryIcon(l.id, icon, color);
+    await setLibraryIcon(l.libraryUuid, icon, color);
     setIconMenuId(null);
     reload();
   }
@@ -678,48 +672,19 @@ function LibrariesTab({ library }: { library: LibraryState }) {
   async function commitRename(l: LibrarySummary) {
     const name = renameValue.trim();
     if (name && name !== l.name) {
-      await renameLibraryEntry(l.id, name);
+      await renameLibraryEntry(l.libraryUuid, name);
     }
     setRenamingId(null);
     reload();
   }
 
-  async function onRemove(l: LibrarySummary) {
-    if (l.active) return;
-    const res = await removeLibraryFromList(l.id);
-    if (!res.ok) setError(res.error ?? "移除失败");
-    reload();
-  }
-
   async function onDeleteFile(l: LibrarySummary) {
     if (l.active) return;
-    const res = await deleteLibraryFile(l.id);
+    const res = await deleteLibraryFile(l.libraryUuid);
     if (!res.ok) setError(res.error ?? "删除失败");
     setConfirmDeleteId(null);
     setDeleteConfirmText("");
     reload();
-  }
-
-  async function onCreate() {
-    const p = await pickNewLibraryPath("library");
-    if (!p) return;
-    const name = p.split(/[\\/]/).pop()?.replace(/\.sqlite$/i, "") ?? "library";
-    const res = await createLibrary({ name, dbPath: p });
-    if (!res.ok) setError(res.error ?? "创建失败");
-    reload();
-  }
-
-  async function onOpen() {
-    const p = await pickLibraryFile();
-    if (!p) return;
-    const res = await openLibrary(p);
-    if (!res.ok) setError(res.error ?? "打开失败");
-    reload();
-  }
-
-  async function onAddFolder() {
-    const folder = await pickNativeFolder();
-    if (folder) await library.addRoot(folder);
   }
 
   return (
@@ -729,9 +694,9 @@ function LibrariesTab({ library }: { library: LibraryState }) {
         <ul className="settings-library-list">
           {libs.map((l) => (
             <li
-              key={l.id}
+              key={l.libraryUuid}
               className={`settings-library-row${l.active ? " active" : ""}${
-                l.available ? "" : " unavailable"
+                l.availability === "available" ? "" : " unavailable"
               }`}
             >
               <div className="settings-library-main">
@@ -740,20 +705,20 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                     type="button"
                     className="settings-library-icon"
                     aria-label="更改图标"
-                    onClick={() => setIconMenuId((cur) => (cur === l.id ? null : l.id))}
+                    onClick={() => setIconMenuId((cur) => (cur === l.libraryUuid ? null : l.libraryUuid))}
                   >
-                    <LibraryGlyph icon={l.icon} color={l.color} size={18} />
+                    <LibraryGlyph icon={l.icon ?? undefined} color={l.color ?? undefined} size={18} />
                   </button>
-                  {iconMenuId === l.id ? (
+                  {iconMenuId === l.libraryUuid ? (
                     <LibraryIconPicker
-                      icon={l.icon}
-                      color={l.color}
+                      icon={l.icon ?? undefined}
+                      color={l.color ?? undefined}
                       onPick={(icon, color) => void onIconPick(l, icon, color)}
                     />
                   ) : null}
                 </div>
                 <div className="settings-library-info">
-                  {renamingId === l.id ? (
+                  {renamingId === l.libraryUuid ? (
                     <input
                       className="settings-library-rename"
                       autoFocus
@@ -773,19 +738,19 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                           <Check size={12} aria-hidden="true" /> 当前
                         </span>
                       ) : null}
-                      {!l.available ? (
+                      {l.availability !== "available" ? (
                         <span className="settings-library-badge missing">文件缺失</span>
                       ) : null}
                     </div>
                   )}
-                  <div className="settings-library-path" title={l.dbPath}>
-                    {l.dbPath}
+                  <div className="settings-library-path" title={l.managedRoot}>
+                    {l.managedRoot}
                   </div>
                 </div>
                 <div className="settings-library-actions">
                   <button
                     type="button"
-                    disabled={l.active || !l.available}
+                    disabled={l.active || l.availability !== "available"}
                     onClick={() => void onSwitch(l)}
                   >
                     切换
@@ -795,19 +760,11 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                     aria-label="重命名"
                     title="重命名"
                     onClick={() => {
-                      setRenamingId(l.id);
+                      setRenamingId(l.libraryUuid);
                       setRenameValue(l.name);
                     }}
                   >
                     <Pencil size={14} aria-hidden="true" />
-                  </button>
-                  <button
-                    type="button"
-                    disabled={l.active}
-                    title={l.active ? "无法移除当前资源库" : "从列表移除（保留文件）"}
-                    onClick={() => void onRemove(l)}
-                  >
-                    移除
                   </button>
                   <button
                     type="button"
@@ -816,7 +773,7 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                     aria-label="删除库文件"
                     title={l.active ? "无法删除当前资源库" : "删除库文件（不可撤销）"}
                     onClick={() => {
-                      setConfirmDeleteId((cur) => (cur === l.id ? null : l.id));
+                      setConfirmDeleteId((cur) => (cur === l.libraryUuid ? null : l.libraryUuid));
                       setDeleteConfirmText("");
                     }}
                   >
@@ -824,7 +781,7 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                   </button>
                 </div>
               </div>
-              {confirmDeleteId === l.id ? (
+              {confirmDeleteId === l.libraryUuid ? (
                 <div className="settings-library-delete-confirm">
                   <p>
                     永久删除库文件并从磁盘移除，此操作不可撤销。输入库名{" "}
@@ -861,43 +818,17 @@ function LibrariesTab({ library }: { library: LibraryState }) {
           ))}
         </ul>
         <div className="settings-library-footer">
-          <button type="button" onClick={() => void onCreate()}>
+          <button type="button" onClick={() => setWizardOpen(true)}>
             创建资源库…
-          </button>
-          <button type="button" onClick={() => void onOpen()}>
-            打开其它资源库…
           </button>
         </div>
       </SettingsGroup>
-
-      <SettingsGroup title="当前资源库的文件夹">
-        <ul className="settings-root-list">
-          {library.roots.length === 0 ? (
-            <li className="settings-root-empty">当前资源库还没有文件夹</li>
-          ) : (
-            library.roots.map((root) => (
-              <li key={root.id} className="settings-root-row">
-                <div className="settings-root-info">
-                  <div className="settings-root-name">{root.displayName}</div>
-                  <div className="settings-root-path" title={root.path}>
-                    {root.path}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  className="settings-root-remove"
-                  onClick={() => void library.removeRoot(root.id)}
-                >
-                  <FolderMinus size={14} aria-hidden="true" /> 移除
-                </button>
-              </li>
-            ))
-          )}
-        </ul>
-        <button type="button" className="settings-root-add" onClick={() => void onAddFolder()}>
-          <FolderPlus size={14} aria-hidden="true" /> 添加文件夹…
-        </button>
-      </SettingsGroup>
+      <ManagedLibraryWizard
+        onClose={() => setWizardOpen(false)}
+        onCreated={reload}
+        onFailure={(cause) => setError(cause instanceof Error ? cause.message : String(cause))}
+        open={wizardOpen}
+      />
     </>
   );
 }

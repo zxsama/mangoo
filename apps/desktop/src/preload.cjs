@@ -171,19 +171,8 @@ const fullBridge = {
     openPath: (path) => ipcRenderer.invoke("megle:shell-open-path", path),
     copyText: (text) => ipcRenderer.invoke("megle:clipboard-write-text", text)
   },
-  listLibraries: () => ipcRenderer.invoke("megle:list-libraries"),
-  getActiveLibraryId: () => ipcRenderer.invoke("megle:get-active-library-id"),
   getLibraryPhase: () => ipcRenderer.invoke("megle:get-library-load-phase"),
   retryLibraryLoad: () => ipcRenderer.invoke("megle:retry-library-load"),
-  switchLibrary: (libraryId, mediaFocusRequestId) =>
-    ipcRenderer.invoke("megle:switch-library", libraryId, mediaFocusRequestId),
-  createLibrary: (input) => ipcRenderer.invoke("megle:create-library", input),
-  openLibrary: (dbPath) => ipcRenderer.invoke("megle:open-library", dbPath),
-  removeLibraryFromList: (libraryId) => ipcRenderer.invoke("megle:remove-library-from-list", libraryId),
-  renameLibrary: (libraryId, name) => ipcRenderer.invoke("megle:rename-library", libraryId, name),
-  setLibraryIcon: (libraryId, icon, color) => ipcRenderer.invoke("megle:set-library-icon", libraryId, icon, color),
-  deleteLibraryFile: (libraryId) => ipcRenderer.invoke("megle:delete-library-file", libraryId),
-  pickLibraryFile: () => ipcRenderer.invoke("megle:pick-library-file"),
   pickNewLibraryPath: (defaultName) => ipcRenderer.invoke("megle:pick-new-library-path", defaultName),
   onLibraryPhase: (cb) => {
     const listener = (_event, phase) => cb(phase);

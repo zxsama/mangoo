@@ -6,11 +6,17 @@ import type { LibrarySummary } from "../src/core/libraryTypes.ts";
 
 function library(id: string, active = true): LibrarySummary {
   return {
-    id,
+    libraryUuid: id,
+    rootUuid: `root-${id}`,
     name: `Library ${id.toUpperCase()}`,
-    dbPath: `${id}.sqlite`,
-    available: true,
-    active
+    icon: null,
+    color: null,
+    managedRoot: `C:/Megle/${id}`,
+    active,
+    availability: "available",
+    lifecycleState: "ready",
+    bindingState: "local-only",
+    contextRevision: 1
   };
 }
 

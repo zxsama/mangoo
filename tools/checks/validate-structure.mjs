@@ -650,6 +650,7 @@ const requiredDirs = [
   "contracts/plugins",
   "crates/core/src",
   "crates/core/migrations",
+  "crates/core/host_migrations",
   "docs/performance-results/raw/2026-05-16",
   "packages/core-client",
   "packages/notification-contract",
@@ -693,10 +694,14 @@ const requiredFiles = [
   "contracts/plugins/manifest.schema.json",
   "crates/core/Cargo.toml",
   "crates/core/migrations/0001_initial.sql",
+  "crates/core/host_migrations/0001_host_registry.sql",
   "crates/core/migrations/0021_notification_outbox.sql",
   "crates/core/src/db/notification_outbox.rs",
   "docs/project-structure.md",
+  "docs/performance-results/managed-library-lifecycle-2026-08-16.md",
   "docs/testing-strategy.md",
+  "tools/bench/managed-library-lifecycle-bench.mjs",
+  "tools/dev/managed-library-harness.mjs",
   "tools/dev/run-dev.mjs"
 ];
 

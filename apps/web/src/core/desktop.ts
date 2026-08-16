@@ -1,4 +1,11 @@
-import type { LibrarySummary, LibraryLoadPhase } from "./libraryTypes";
+import type {
+  CreateLibraryRequest,
+  LibraryLoadPhase,
+  LibraryPreflightRequest,
+  LibraryPreflightResponse,
+  LibrarySummary,
+} from "./libraryTypes";
+import { createCoreClient } from "./client.ts";
 import type {
   DesktopNotificationsBridge,
   MediaFocusCommand,
@@ -104,21 +111,8 @@ export interface MegleDesktopBridge {
   notifications?: DesktopNotificationsBridge;
   windowControls?: DesktopWindowControls;
   shell?: DesktopShellActions;
-  listLibraries?: () => Promise<LibrarySummary[]>;
-  getActiveLibraryId?: () => Promise<string | null>;
   getLibraryPhase?: () => Promise<LibraryLoadPhase>;
   retryLibraryLoad?: () => Promise<{ ok: boolean; error?: string }>;
-  switchLibrary?: (
-    libraryId: string,
-    mediaFocusRequestId?: string
-  ) => Promise<{ ok: boolean; error?: string }>;
-  createLibrary?: (input: { name: string; dbPath: string }) => Promise<{ ok: boolean; library?: LibrarySummary; error?: string }>;
-  openLibrary?: (dbPath: string) => Promise<{ ok: boolean; library?: LibrarySummary; error?: string }>;
-  removeLibraryFromList?: (libraryId: string) => Promise<{ ok: boolean; error?: string }>;
-  renameLibrary?: (libraryId: string, name: string) => Promise<{ ok: boolean }>;
-  setLibraryIcon?: (libraryId: string, icon: string, color: string) => Promise<{ ok: boolean }>;
-  deleteLibraryFile?: (libraryId: string) => Promise<{ ok: boolean; error?: string }>;
-  pickLibraryFile?: () => Promise<string | null>;
   pickNewLibraryPath?: (defaultName?: string) => Promise<string | null>;
   onLibraryPhase?: (cb: (phase: LibraryLoadPhase) => void) => () => void;
 }
@@ -260,52 +254,46 @@ export async function readDesktopDiagnostics(): Promise<DesktopDiagnostics | nul
 }
 
 export async function listLibraries(): Promise<LibrarySummary[]> {
-  return (await getDesktopBridge()?.listLibraries?.()) ?? [];
+  return (await createCoreClient().listLibraries()).items;
 }
 export async function getActiveLibraryId(): Promise<string | null> {
-  return (await getDesktopBridge()?.getActiveLibraryId?.()) ?? null;
+  return (await createCoreClient().getActiveLibrary()).library?.libraryUuid ?? null;
 }
 export async function switchLibrary(
   libraryId: string,
   mediaFocusRequestId?: string
 ): Promise<{ ok: boolean; error?: string }> {
-  return (await getDesktopBridge()?.switchLibrary?.(libraryId, mediaFocusRequestId)) ?? {
-    ok: false,
-    error: "no desktop bridge"
-  };
+  void mediaFocusRequestId;
+  const { contextRevision } = await createCoreClient().getActiveLibrary();
+  await createCoreClient().activateLibrary(libraryId, contextRevision);
+  return { ok: true };
 }
 export async function createLibrary(
-  input: { name: string; dbPath: string }
+  input: CreateLibraryRequest
 ): Promise<{ ok: boolean; library?: LibrarySummary; error?: string }> {
-  return (await getDesktopBridge()?.createLibrary?.(input)) ?? { ok: false, error: "no desktop bridge" };
-}
-export async function openLibrary(
-  dbPath: string
-): Promise<{ ok: boolean; library?: LibrarySummary; error?: string }> {
-  return (await getDesktopBridge()?.openLibrary?.(dbPath)) ?? { ok: false, error: "no desktop bridge" };
-}
-export async function removeLibraryFromList(
-  libraryId: string
-): Promise<{ ok: boolean; error?: string }> {
-  return (await getDesktopBridge()?.removeLibraryFromList?.(libraryId)) ?? {
-    ok: false,
-    error: "no desktop bridge"
-  };
+  const result = await createCoreClient().createLibrary(input);
+  return { ok: true, library: result.library };
 }
 export async function renameLibraryEntry(libraryId: string, name: string): Promise<{ ok: boolean }> {
-  return (await getDesktopBridge()?.renameLibrary?.(libraryId, name)) ?? { ok: false };
+  const { contextRevision } = await createCoreClient().getActiveLibrary();
+  await createCoreClient().updateLibrary(libraryId, contextRevision, { name });
+  return { ok: true };
 }
 export async function setLibraryIcon(libraryId: string, icon: string, color: string): Promise<{ ok: boolean }> {
-  return (await getDesktopBridge()?.setLibraryIcon?.(libraryId, icon, color)) ?? { ok: false };
+  const { contextRevision } = await createCoreClient().getActiveLibrary();
+  await createCoreClient().updateLibrary(libraryId, contextRevision, { icon, color });
+  return { ok: true };
 }
 export async function deleteLibraryFile(libraryId: string): Promise<{ ok: boolean; error?: string }> {
-  return (await getDesktopBridge()?.deleteLibraryFile?.(libraryId)) ?? { ok: false, error: "no desktop bridge" };
-}
-export async function pickLibraryFile(): Promise<string | null> {
-  return (await getDesktopBridge()?.pickLibraryFile?.()) ?? null;
+  const { contextRevision } = await createCoreClient().getActiveLibrary();
+  await createCoreClient().removeLocalLibrary(libraryId, contextRevision);
+  return { ok: true };
 }
 export async function pickNewLibraryPath(defaultName?: string): Promise<string | null> {
   return (await getDesktopBridge()?.pickNewLibraryPath?.(defaultName)) ?? null;
+}
+export async function preflightLibrary(input: LibraryPreflightRequest): Promise<LibraryPreflightResponse> {
+  return createCoreClient().preflightLibrary(input);
 }
 export async function retryLibraryLoad(): Promise<boolean> {
   try {

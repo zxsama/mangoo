@@ -1,8 +1,11 @@
 import { createCoreClient as createCorePackageClient } from "@megle/core-client";
-import { getDesktopBridge } from "./desktop";
+import { getDesktopBridge } from "./desktop.ts";
 
 export { CoreApiError } from "@megle/core-client";
 export type { CoreClientConfig } from "@megle/core-client";
+
+let cachedClient: ReturnType<typeof createCorePackageClient> | null = null;
+let cachedClientKey = "";
 
 export function getCoreClientConfig() {
   const desktop = getDesktopBridge();
@@ -17,5 +20,10 @@ export function getCoreClientConfig() {
 }
 
 export function createCoreClient(config = getCoreClientConfig()) {
-  return createCorePackageClient(config);
+  const key = `${config.baseUrl}\n${config.sessionToken ?? ""}`;
+  if (!cachedClient || cachedClientKey !== key) {
+    cachedClient = createCorePackageClient(config);
+    cachedClientKey = key;
+  }
+  return cachedClient;
 }

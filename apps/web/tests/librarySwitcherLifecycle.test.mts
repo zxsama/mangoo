@@ -274,9 +274,9 @@ describe("mounted LibrarySwitcher lifecycle", () => {
     });
   });
 
-  it("reports rejected switch, create, open, add, and icon mutations", () => {
+  it("reports rejected switch, add, and icon mutations", () => {
     assert.deepEqual(result.mutationFailures, {
-      reports: 5,
+      reports: 3,
       unhandledRejections: 0,
     });
   });

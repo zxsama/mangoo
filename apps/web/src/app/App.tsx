@@ -493,10 +493,10 @@ export function App() {
     void listLibraries().then((libraries) => {
       if (cancelled) return;
       const active = libraries.find((entry) => entry.active);
-      setActiveLibraryId(active?.id ?? null);
+      setActiveLibraryId(active?.libraryUuid ?? null);
       setActiveLibraryName(active?.name ?? "Library");
-      setActiveLibraryIcon(active?.icon);
-      setActiveLibraryColor(active?.color);
+      setActiveLibraryIcon(active?.icon ?? undefined);
+      setActiveLibraryColor(active?.color ?? undefined);
     });
     return () => {
       cancelled = true;

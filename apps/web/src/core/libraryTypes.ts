@@ -1,14 +1,16 @@
-export interface LibrarySummary {
-  id: string;
-  name: string;
-  dbPath: string;
-  available: boolean;
-  active: boolean;
-  // Optional visual identity (preset Lucide icon name + color) shown left of the
-  // library name; absent → a default icon/color.
-  icon?: string;
-  color?: string;
-}
+export type {
+  ActiveLibraryResponse,
+  CreateLibraryRequest,
+  CreateLibraryResponse,
+  LibraryAvailability,
+  LibraryBindingState,
+  LibraryLifecycleState,
+  LibraryListResponse,
+  LibraryPreflightReason,
+  LibraryPreflightRequest,
+  LibraryPreflightResponse,
+  LibrarySummary,
+} from "@megle/core-client";
 
 export type LibraryLoadPhase =
   | "starting-core"

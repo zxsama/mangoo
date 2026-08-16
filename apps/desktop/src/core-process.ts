@@ -186,7 +186,12 @@ export function startCoreProcess(
     env: {
       ...process.env,
       MEGLE_CORE_ADDR: session.bindAddress,
-      MEGLE_DB_PATH: session.dbPath,
+      ...(session.hostDbPath
+        ? {
+            MEGLE_HOST_DB_PATH: session.hostDbPath,
+            MEGLE_LIBRARIES_DIR: session.librariesDir
+          }
+        : {}),
       MEGLE_SESSION_TOKEN: session.sessionToken,
       MEGLE_ALLOWED_ORIGIN: session.allowedOrigin
     },

@@ -7,7 +7,6 @@ import {
   LifecycleCancelledError,
   LifecycleClosedError
 } from "../src/core-lifecycle-queue.ts";
-import { sessionForDbPath } from "../src/core-session.ts";
 import { waitForCoreHealth } from "../src/core-process.ts";
 
 function deferred<T = void>(): {
@@ -417,57 +416,4 @@ test("health polling aborts promptly when shutdown cancels the active lifecycle"
   } finally {
     await closeHttpServer(server);
   }
-});
-
-test("candidate library session retries with the same URL, port, and token", () => {
-  const base = {
-    baseUrl: "http://127.0.0.1:47000/api",
-    bindAddress: "127.0.0.1:47000",
-    dbPath: "C:/old.sqlite",
-    sessionToken: "tok123",
-    allowedOrigin: "http://127.0.0.1:5173"
-  };
-  const candidate = sessionForDbPath(base, "C:/candidate.sqlite");
-  const retry = sessionForDbPath(base, "C:/candidate.sqlite", candidate);
-
-  assert.equal(retry, candidate);
-  assert.equal(retry.baseUrl, base.baseUrl);
-  assert.equal(retry.bindAddress, base.bindAddress);
-  assert.equal(retry.sessionToken, base.sessionToken);
-  assert.equal(retry.dbPath, "C:/candidate.sqlite");
-});
-
-test("health failure keeps the candidate session for a same-port retry", async () => {
-  const queue = new CoreLifecycleQueue();
-  const base = {
-    baseUrl: "http://127.0.0.1:47001/api",
-    bindAddress: "127.0.0.1:47001",
-    dbPath: "C:/old.sqlite",
-    sessionToken: "tok-reused",
-    allowedOrigin: "http://127.0.0.1:5173"
-  };
-  let candidate: typeof base | null = null;
-  let healthAttempts = 0;
-  const started: Array<typeof base> = [];
-
-  const switchAttempt = () => queue.enqueue(async () => {
-    candidate = sessionForDbPath(base, "C:/next.sqlite", candidate);
-    started.push(candidate);
-    healthAttempts += 1;
-    if (healthAttempts === 1) {
-      throw new Error("candidate health failed");
-    }
-    return candidate;
-  });
-
-  await assert.rejects(switchAttempt(), /candidate health failed/);
-  const firstCandidate = candidate;
-  const retried = await switchAttempt();
-
-  assert.equal(retried, firstCandidate);
-  assert.equal(started.length, 2);
-  assert.deepEqual(started.map((session) => [session.baseUrl, session.bindAddress, session.sessionToken]), [
-    [base.baseUrl, base.bindAddress, base.sessionToken],
-    [base.baseUrl, base.bindAddress, base.sessionToken]
-  ]);
 });

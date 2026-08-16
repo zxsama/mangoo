@@ -14,7 +14,6 @@ import {
 import { spawn } from "node:child_process";
 import { promises as fsp } from "node:fs";
 import fsSync from "node:fs";
-import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -36,18 +35,10 @@ import {
   throwIfLifecycleAborted
 } from "./core-lifecycle-queue.js";
 import {
-  CoreSwitchRecoveryError,
-  runCoreSwitchTransaction,
-  startHealthyCoreWithRetry,
-  type CoreSwitchTransactionResult
-} from "./core-switch-transaction.js";
-import * as libraryRegistry from "./library-registry.js";
-import {
   LibraryLoadState,
   prepareColdLibraryStartup,
   type DesktopLibraryLoadPhase
 } from "./library-load-state.js";
-import { sessionForDbPath } from "./core-session.js";
 import {
   LatestValueBroadcastQueue,
   NOTIFICATION_IPC_CHANNELS,
@@ -163,9 +154,7 @@ const SECONDARY_WINDOW_CONFIGS: Record<SecondaryWindowRole, SecondaryWindowConfi
 let coreProcess: CoreProcessHandle | null = null;
 let pendingCoreProcess: CoreProcessHandle | null = null;
 let coreSession: CoreSession | null = null;
-let pendingCoreSession: CoreSession | null = null;
 let coreReadyPromise: Promise<CoreSession> | null = null;
-let cachedRegistry: libraryRegistry.LibraryRegistry | null = null;
 const libraryLoadState = new LibraryLoadState();
 let cachedFfmpegAvailable: boolean | null = null;
 let persisted = false;
@@ -240,21 +229,11 @@ const DEFAULT_WINDOW_STATE: WindowState = {
 function userDataDir(): string {
   return app.getPath("userData");
 }
-function getRegistry(): libraryRegistry.LibraryRegistry {
-  if (!cachedRegistry) cachedRegistry = libraryRegistry.loadRegistry(userDataDir());
-  return cachedRegistry;
-}
-function libraryIdForDbPath(dbPath: string): string | null {
-  const resolved = path.resolve(dbPath);
-  return getRegistry().libraries.find((library) => path.resolve(library.dbPath) === resolved)?.id ?? null;
-}
 function coreLogHandlerForSession(session: CoreSession) {
-  const libraryId = libraryIdForDbPath(session.dbPath);
   const emitCoreStartupReady = createStartupLogEmitter(
     desktopLogger,
     "core",
-    "Megle Core ready",
-    libraryId ? { libraryId } : {}
+    "Megle Core ready"
   );
   return (source: "core", level: Parameters<typeof desktopLogger.log>[1], message: string, metadata?: Readonly<Record<string, unknown>>) => {
     if (level === "info" && message === "Megle Core ready" && metadata?.eventKind === "startup_ready") {
@@ -262,37 +241,9 @@ function coreLogHandlerForSession(session: CoreSession) {
       return;
     }
     desktopLogger.structured(source, level, message, {
-      ...(metadata ?? {}),
-      ...(libraryId ? { libraryId } : {})
+      ...(metadata ?? {})
     });
   };
-}
-function persistRegistry(next: libraryRegistry.LibraryRegistry): void {
-  cachedRegistry = next;
-  libraryRegistry.saveRegistry(userDataDir(), next);
-}
-type LibraryRemovalIpcResult = { ok: boolean; error?: string };
-function removeLibraryFromCurrentRegistry(
-  libraryId: string,
-  beforePersist?: (entry: libraryRegistry.LibraryEntry) => void
-): LibraryRemovalIpcResult {
-  const removal = libraryRegistry.removeLibraryIfInactive(getRegistry(), libraryId);
-  if (!removal.ok) {
-    return {
-      ok: false,
-      error:
-        removal.reason === "active"
-          ? "cannot remove the active library"
-          : "library not found"
-    };
-  }
-  try {
-    beforePersist?.(removal.entry);
-    persistRegistry(removal.registry);
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: String(error) };
-  }
 }
 function pushLibraryPhase(phase: DesktopLibraryLoadPhase): void {
   libraryLoadState.publish(phase);
@@ -387,14 +338,11 @@ async function attachNotificationServiceForSession(
   if (coreSession !== session) {
     throw new LifecycleCancelledError("Core session changed before notification attach");
   }
-  const registry = getRegistry();
-  const active = registry.libraries.find((library) => library.id === registry.activeLibraryId);
-  if (!active || path.resolve(active.dbPath) !== path.resolve(session.dbPath)) {
-    throw new LifecycleCancelledError("Active library changed before notification attach");
-  }
+  const active = await activeHostLibrary(session);
+  if (!active) return;
   assertCurrentCoreGeneration(generation, signal);
   await service.attachLibrary(
-    { id: active.id, name: active.name },
+    active,
     { baseUrl: session.baseUrl, sessionToken: session.sessionToken }
   );
   assertCurrentCoreGeneration(generation, signal);
@@ -436,9 +384,8 @@ async function restoreNotificationsAfterFailedCoreStop(
     await service.detachLibrary();
     return;
   }
-  const registry = getRegistry();
-  const active = registry.libraries.find((library) => library.id === registry.activeLibraryId);
-  if (!active || path.resolve(active.dbPath) !== path.resolve(session.dbPath)) return;
+  const active = await activeHostLibrary(session);
+  if (!active) return;
   await service.attachLibrary(
     { id: active.id, name: active.name },
     { baseUrl: session.baseUrl, sessionToken: session.sessionToken }
@@ -451,10 +398,27 @@ async function restoreNotificationsAfterFailedCoreStop(
   }
 }
 
-function registeredNotificationLibrary(libraryId: string): { id: string; name: string } {
-  const library = getRegistry().libraries.find((candidate) => candidate.id === libraryId);
-  if (!library) throw new Error("notification library not found");
-  return { id: library.id, name: library.name };
+async function activeHostLibrary(
+  session: CoreSession
+): Promise<{ id: string; name: string } | null> {
+  const response = await fetch(`${session.baseUrl}/libraries/active`, {
+    headers: { "x-megle-session": session.sessionToken }
+  });
+  if (!response.ok) throw new Error(`Core active Library lookup failed: ${response.status}`);
+  const body = await response.json() as {
+    library?: { libraryUuid?: string; name?: string } | null;
+  };
+  const library = body.library;
+  return library?.libraryUuid && library.name
+    ? { id: library.libraryUuid, name: library.name }
+    : null;
+}
+
+async function registeredNotificationLibrary(libraryId: string): Promise<{ id: string; name: string }> {
+  const session = coreSession ?? await ensureCoreReady();
+  const active = await activeHostLibrary(session);
+  if (!active || active.id !== libraryId) throw new Error("notification library is not active");
+  return active;
 }
 
 function formatProcessLogExport(
@@ -475,19 +439,6 @@ function formatProcessLogExport(
     .join("\r\n");
 }
 
-function toSummaries(reg: libraryRegistry.LibraryRegistry): Array<{
-  id: string; name: string; dbPath: string; available: boolean; active: boolean; icon?: string; color?: string;
-}> {
-  return reg.libraries.map((l) => ({
-    id: l.id,
-    name: l.name,
-    dbPath: l.dbPath,
-    available: fsSync.existsSync(l.dbPath),
-    active: l.id === reg.activeLibraryId,
-    icon: l.icon,
-    color: l.color
-  }));
-}
 
 ipcMain.handle("megle:pick-folder", async (event) => {
   requireDesktopIpcAccess(event, "megle:pick-folder");
@@ -504,8 +455,8 @@ ipcMain.handle("megle:diagnostics", async (event) => {
   const session = coreSession;
   return {
     ffmpegAvailable: await detectFfmpeg(),
-    dbPath: session?.dbPath ?? null,
-    pluginsDir: session ? resolvePluginsDir(session.dbPath) : null
+    dbPath: null,
+    pluginsDir: session ? resolvePluginsDir() : null
   };
 });
 
@@ -759,12 +710,8 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.compact, async (event) => {
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.historyFacets, async (event) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.historyFacets);
   const facets = await (await ensureNotificationService()).historyFacets();
-  const libraries = new Map(facets.libraries.map(({ id, name }) => [id, name]));
-  for (const { id, name } of getRegistry().libraries) libraries.set(id, name);
   return {
-    libraries: [...libraries]
-      .map(([id, name]) => ({ id, name }))
-      .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id)),
+    libraries: facets.libraries,
     kinds: facets.kinds
   };
 });
@@ -801,7 +748,7 @@ ipcMain.handle(
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.reportError, async (event, input: unknown) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.reportError);
   const report = parseRendererErrorReport(input);
-  const library = registeredNotificationLibrary(report.libraryId);
+  const library = await registeredNotificationLibrary(report.libraryId);
   await (await ensureNotificationService()).reportRendererError({
     ...report,
     libraryName: library.name
@@ -812,10 +759,7 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.reportError, async (event, input: unkno
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.thumbnailSummary, async (event, input: unknown) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.thumbnailSummary);
   const summary = parseThumbnailCacheSummary(input);
-  const library = registeredNotificationLibrary(summary.libraryId);
-  if (getRegistry().activeLibraryId !== library.id) {
-    throw new Error("thumbnail summary must belong to the active library");
-  }
+  const library = await registeredNotificationLibrary(summary.libraryId);
   await (await ensureNotificationService()).publishThumbnailSummary({
     ...summary,
     libraryName: library.name
@@ -961,14 +905,6 @@ ipcMain.handle("megle:visual-capture-page", async (event) => {
   return image.toPNG().toString("base64");
 });
 
-ipcMain.handle("megle:list-libraries", (event) => {
-  requireDesktopIpcAccess(event, "megle:list-libraries");
-  return toSummaries(getRegistry());
-});
-ipcMain.handle("megle:get-active-library-id", (event) => {
-  requireDesktopIpcAccess(event, "megle:get-active-library-id");
-  return getRegistry().activeLibraryId;
-});
 ipcMain.handle("megle:get-library-load-phase", (event) => {
   requireDesktopIpcAccess(event, "megle:get-library-load-phase");
   return libraryLoadState.snapshot();
@@ -997,173 +933,25 @@ ipcMain.handle("megle:retry-library-load", async (event) => {
   }
 });
 
-ipcMain.handle("megle:switch-library", async (
-  event,
-  libraryId: string,
-  mediaFocusRequestId?: unknown
-) => {
-  requireDesktopIpcAccess(event, "megle:switch-library");
-  if (
-    mediaFocusRequestId !== undefined &&
-    (typeof mediaFocusRequestId !== "string" ||
-      mediaFocusRequestId.length === 0 ||
-      mediaFocusRequestId.length > 128)
-  ) {
-    return { ok: false, error: "invalid media focus operation" };
-  }
-  const operationId = mediaFocusRequestId;
-  const operationSignal = operationId
-    ? mediaFocusCoordinator.operationSignal(operationId) ?? undefined
-    : undefined;
-  if (operationId && !operationSignal) {
-    return { ok: false, error: "media focus operation is no longer active" };
-  }
-  try {
-    return await coreLifecycleQueue.enqueue(async (signal) => {
-      const operationCancelled = () => {
-        if (!operationId) return false;
-        return Boolean(
-          operationSignal?.aborted ||
-            !mediaFocusCoordinator.refreshSwitching(operationId)
-        );
-      };
-      const generation = coreLifecycleQueue.beginGeneration();
-      const reg = getRegistry();
-      const target = reg.libraries.find((l) => l.id === libraryId);
-      if (!target) return { ok: false, error: "library not found" };
-      if (!fsSync.existsSync(target.dbPath)) return { ok: false, error: "library file missing" };
-      const switchResult = await restartCoreForLibrary(
-        { id: target.id, dbPath: target.dbPath },
-        signal,
-        generation,
-        operationCancelled
-      );
-      pushLibraryPhase("loading-media"); // renderer takes over from here
-      if (switchResult.cancelled) {
-        return { ok: false, error: "media focus operation was cancelled" };
-      }
-      return { ok: true };
-    }, { signal: operationSignal, activeCancellation: "defer" });
-  } catch (error) {
-    if (
-      !(error instanceof CoreSwitchRecoveryError) &&
-      !(error instanceof LifecycleCancelledError) &&
-      !operationSignal?.aborted
-    ) {
-      pushLibraryPhase({ kind: "error", message: String(error) });
-    }
-    return { ok: false, error: String(error) };
-  }
-});
-
-ipcMain.handle("megle:create-library", async (event, input: { name: string; dbPath: string }) => {
-  requireDesktopIpcAccess(event, "megle:create-library");
-  try {
-    return await coreLifecycleQueue.enqueue(async (signal) => {
-      const generation = coreLifecycleQueue.beginGeneration();
-      throwIfLifecycleAborted(signal);
-      const reg = getRegistry();
-      // A brand-new empty file: Core builds the schema on first open. Never
-      // silently degrade "create" into "open" of an existing file — that would
-      // discard the typed name via addLibrary's dbPath dedupe.
-      if (fsSync.existsSync(input.dbPath)) {
-        return { ok: false, error: 'A file already exists at that path; use "Open other library" instead.' };
-      }
-      fsSync.writeFileSync(input.dbPath, ""); // touch; Core opens + migrates
-      const added = libraryRegistry.addLibrary(reg, { name: input.name, dbPath: input.dbPath, now: Date.now() });
-      // Keep the candidate discoverable while its Core is starting, but do
-      // not change activeLibraryId until health succeeds.
-      persistRegistry(added.registry);
-      await restartCoreForLibrary(
-        { id: added.entry.id, dbPath: added.entry.dbPath },
-        signal,
-        generation
-      );
-      pushLibraryPhase("loading-media");
-      const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
-      return { ok: true, library: summary };
-    });
-  } catch (error) {
-    pushLibraryPhase({ kind: "error", message: String(error) });
-    return { ok: false, error: String(error) };
-  }
-});
-
-ipcMain.handle("megle:open-library", async (event, dbPath: string) => {
-  requireDesktopIpcAccess(event, "megle:open-library");
-  try {
-    return await coreLifecycleQueue.enqueue(async (signal) => {
-      const generation = coreLifecycleQueue.beginGeneration();
-      throwIfLifecycleAborted(signal);
-      const reg = getRegistry();
-      if (!fsSync.existsSync(dbPath)) return { ok: false, error: "file not found" };
-      const name = path.basename(dbPath).replace(/\.sqlite$/i, "");
-      const added = libraryRegistry.addLibrary(reg, { name, dbPath, now: Date.now() });
-      // Keep the candidate discoverable while its Core is starting, but do
-      // not change activeLibraryId until health succeeds.
-      persistRegistry(added.registry);
-      await restartCoreForLibrary(
-        { id: added.entry.id, dbPath: added.entry.dbPath },
-        signal,
-        generation
-      );
-      pushLibraryPhase("loading-media");
-      const summary = toSummaries(getRegistry()).find((s) => s.id === added.entry.id);
-      return { ok: true, library: summary };
-    });
-  } catch (error) {
-    pushLibraryPhase({ kind: "error", message: String(error) });
-    return { ok: false, error: String(error) };
-  }
-});
-
-ipcMain.handle("megle:remove-library-from-list", (event, libraryId: string) => {
-  requireDesktopIpcAccess(event, "megle:remove-library-from-list");
-  return removeLibraryFromCurrentRegistry(libraryId);
-});
-
-ipcMain.handle("megle:rename-library", (event, libraryId: string, name: string) => {
-  requireDesktopIpcAccess(event, "megle:rename-library");
-  persistRegistry(libraryRegistry.renameLibrary(getRegistry(), libraryId, name));
-  return { ok: true };
-});
-
-ipcMain.handle("megle:set-library-icon", (event, libraryId: string, icon: string, color: string) => {
-  requireDesktopIpcAccess(event, "megle:set-library-icon");
-  persistRegistry(libraryRegistry.setLibraryIcon(getRegistry(), libraryId, icon, color));
-  return { ok: true };
-});
-
-// Destructive: delete the library's .sqlite (plus its WAL/SHM sidecars) from
-// disk AND drop it from the registry. Forbidden on the active library — Core
-// holds that file open (Windows would fail the unlink anyway), and the UI greys
-// the action. The renderer performs its own second confirmation before calling.
-ipcMain.handle("megle:delete-library-file", (event, libraryId: string) => {
-  requireDesktopIpcAccess(event, "megle:delete-library-file");
-  return removeLibraryFromCurrentRegistry(libraryId, (target) => {
-    for (const suffix of ["", "-wal", "-shm"]) {
-      const filePath = target.dbPath + suffix;
-      if (fsSync.existsSync(filePath)) {
-        fsSync.rmSync(filePath, { force: true });
-      }
-    }
-  });
-});
-
-ipcMain.handle("megle:pick-library-file", async (event) => {
-  requireDesktopIpcAccess(event, "megle:pick-library-file");
-  const result = mainWindow
-    ? await dialog.showOpenDialog(mainWindow, { properties: ["openFile"], filters: [{ name: "Megle Library", extensions: ["sqlite"] }] })
-    : await dialog.showOpenDialog({ properties: ["openFile"], filters: [{ name: "Megle Library", extensions: ["sqlite"] }] });
-  return result.canceled ? null : (result.filePaths[0] ?? null);
-});
-
 ipcMain.handle("megle:pick-new-library-path", async (event, defaultName?: string) => {
   requireDesktopIpcAccess(event, "megle:pick-new-library-path");
+  const safeName = (defaultName ?? "Library")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+    .replace(/[. ]+$/g, "")
+    .trim() || "Library";
+  // Documents may be redirected into OneDrive by Known Folder Move. Keep the
+  // managed-library default outside that implicit sync root; Core still owns
+  // the authoritative cloud-root/reparse validation at preflight and commit.
+  const suggestedRoot = path.join(app.getPath("home"), "Megle Libraries", safeName);
+  const options = {
+    title: "Choose an empty folder for this Megle library",
+    defaultPath: suggestedRoot,
+    properties: ["openDirectory", "createDirectory"] as ("openDirectory" | "createDirectory")[]
+  };
   const result = mainWindow
-    ? await dialog.showSaveDialog(mainWindow, { defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Megle Library", extensions: ["sqlite"] }] })
-    : await dialog.showSaveDialog({ defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Megle Library", extensions: ["sqlite"] }] });
-  return result.canceled ? null : (result.filePath ?? null);
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options);
+  return result.canceled ? null : (result.filePaths[0] ?? null);
 });
 
 async function createWindow(): Promise<void> {
@@ -1771,24 +1559,15 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
   throw new Error("Core startup retry loop exited without a session");
 }
 
-// On cold start, point Core at the active library from the registry (if any),
-// otherwise fall back to createCoreSession()'s default dbPath (first-run / dev).
+// The Desktop owns one long-lived Host process; library activation is a Core API mutation.
 async function createColdStartSession(): Promise<CoreSession> {
   const base = await createCoreSession();
-  const reg = getRegistry();
-  const active = reg.libraries.find((l) => l.id === reg.activeLibraryId);
-  if (active && fsSync.existsSync(active.dbPath)) {
-    return sessionForDbPath(base, active.dbPath);
-  }
-  // No active library yet: register the default dbPath as the first library so
-  // the switcher has something to show, and make it active.
-  const added = libraryRegistry.addLibrary(reg, {
-    name: "Default",
-    dbPath: base.dbPath,
-    now: Date.now()
-  });
-  persistRegistry(libraryRegistry.setActive(added.registry, added.entry.id, Date.now()));
-  return base;
+  const hostRoot = path.join(userDataDir(), "host");
+  return {
+    ...base,
+    hostDbPath: path.join(hostRoot, "host.sqlite"),
+    librariesDir: path.join(hostRoot, "libraries")
+  };
 }
 
 // Gracefully restart Core pointed at a new database file, reusing the same
@@ -1814,268 +1593,6 @@ async function stopDesktopCoreProcesses(): Promise<void> {
       if (coreProcess === current) coreProcess = null;
     }
   );
-}
-
-type StartedCoreReplacement = {
-  handle: CoreProcessHandle;
-  session: CoreSession;
-};
-
-async function startHealthyReplacementCore(
-  session: CoreSession,
-  signal: AbortSignal,
-  generation: number,
-  label: "target" | "recovery"
-): Promise<StartedCoreReplacement> {
-  const maxAttempts = shouldRetryAutoCoreStartup() ? AUTO_CORE_STARTUP_MAX_ATTEMPTS : 1;
-  let attemptHandle: CoreProcessHandle | null = null;
-  return startHealthyCoreWithRetry({
-    maxAttempts,
-    assertLifecycleCurrent: () => assertCurrentCoreGeneration(generation, signal),
-    start: async (attempt) => {
-      assertCurrentCoreGeneration(generation, signal);
-      attemptHandle = startCoreProcess(session, coreLogHandlerForSession(session));
-      pendingCoreProcess = attemptHandle;
-      pendingCoreSession = session;
-      if (attempt === 1) pushLibraryPhase("opening-library");
-      await waitForCoreHealth(session.baseUrl, session.sessionToken, 12_000, signal);
-      assertCurrentCoreGeneration(generation, signal);
-      if (coreProcess && coreProcess !== attemptHandle) {
-        throw new LifecycleCancelledError(
-          "A newer Core process was committed before library replacement completed"
-        );
-      }
-      if (attempt > 1) {
-        desktopLogger.info(
-          "main",
-          `[megle] ${label} library Core became healthy on attempt ${attempt}/${maxAttempts}`
-        );
-      }
-      return { handle: attemptHandle, session };
-    },
-    cleanupFailedAttempt: async () => {
-      if (attemptHandle && pendingCoreProcess === attemptHandle) {
-        await stopPendingCoreProcess();
-      }
-      attemptHandle = null;
-      if (!signal.aborted && coreLifecycleQueue.isCurrentGeneration(generation)) {
-        await waitForPortFree(session.bindAddress, signal);
-      }
-    },
-    onRetry: (attempt, error) => {
-      desktopLogger.warn(
-        "main",
-        `[megle] ${label} library Core health attempt ${attempt}/${maxAttempts} failed; retrying:`,
-        error
-      );
-    }
-  });
-}
-
-async function commitStartedCore(
-  replacement: StartedCoreReplacement,
-  signal: AbortSignal,
-  generation: number,
-  commitRegistry: () => void | Promise<void>
-): Promise<void> {
-  assertCurrentCoreGeneration(generation, signal);
-  if (pendingCoreProcess !== replacement.handle) {
-    throw new LifecycleCancelledError("Candidate Core changed before library commit");
-  }
-  await commitRegistry();
-  assertCurrentCoreGeneration(generation, signal);
-  if (pendingCoreProcess !== replacement.handle) {
-    throw new LifecycleCancelledError("Candidate Core changed while committing the library");
-  }
-  coreProcess = replacement.handle;
-  pendingCoreProcess = null;
-  coreSession = replacement.session;
-  pendingCoreSession = null;
-}
-
-type LibrarySwitchIdentity = {
-  id: string;
-  dbPath: string;
-};
-
-function activateCurrentRegistryLibrary(identity: LibrarySwitchIdentity): void {
-  const result = libraryRegistry.activateLibraryIfCurrent(getRegistry(), {
-    ...identity,
-    now: Date.now()
-  });
-  if (!result.ok) {
-    throw new Error(
-      result.reason === "missing"
-        ? `Library ${identity.id} was removed during the switch`
-        : `Library ${identity.id} changed database path during the switch`
-    );
-  }
-  persistRegistry(result.registry);
-}
-
-async function restartCoreForLibrary(
-  target: LibrarySwitchIdentity,
-  signal: AbortSignal,
-  generation: number,
-  operationCancelled?: () => boolean
-): Promise<CoreSwitchTransactionResult<CoreSession>> {
-  const assertLifecycleCurrent = () => assertCurrentCoreGeneration(generation, signal);
-  assertLifecycleCurrent();
-  pushLibraryPhase("starting-core");
-  const registryAtStart = getRegistry();
-  const previousSession = coreProcess && coreSession ? coreSession : null;
-  const previousLibrary = previousSession
-    ? registryAtStart.libraries.find(
-        (library) =>
-          library.id === registryAtStart.activeLibraryId &&
-          path.resolve(library.dbPath) === path.resolve(previousSession.dbPath)
-      ) ?? null
-    : null;
-  const previousIdentity = previousLibrary
-    ? { id: previousLibrary.id, dbPath: previousLibrary.dbPath }
-    : null;
-  const base = coreSession ?? pendingCoreSession ?? (await createCoreSession());
-  assertLifecycleCurrent();
-  const targetSession = sessionForDbPath(base, target.dbPath, pendingCoreSession);
-  let targetReplacement: StartedCoreReplacement | null = null;
-  let recoveredReplacement: StartedCoreReplacement | null = null;
-  try {
-    return await runCoreSwitchTransaction({
-      previousSession,
-      assertLifecycleCurrent,
-      isCancellationRequested: () => operationCancelled?.() ?? false,
-      detachNotifications: detachNotificationServiceForCoreReplacement,
-      attachNotifications: (session) =>
-        attachNotificationServiceForSession(session, generation, signal),
-      stopCurrentCore: async () => {
-        await stopDesktopCoreProcesses();
-        assertLifecycleCurrent();
-        await waitForPortFree(base.bindAddress, signal);
-        assertLifecycleCurrent();
-        if (coreProcess) {
-          throw new LifecycleCancelledError("Tracked Core changed before library restart");
-        }
-      },
-      startTargetCore: async () => {
-        pendingCoreSession = targetSession;
-        targetReplacement = await startHealthyReplacementCore(
-          targetSession,
-          signal,
-          generation,
-          "target"
-        );
-        return targetSession;
-      },
-      commitTargetCore: async (healthySession) => {
-        if (!targetReplacement || targetReplacement.session !== healthySession) {
-          throw new LifecycleCancelledError("Healthy target Core was lost before commit");
-        }
-        await commitStartedCore(targetReplacement, signal, generation, () => {
-          activateCurrentRegistryLibrary(target);
-        });
-      },
-      recoverPreviousCore: async () => {
-        if (!previousSession || !previousIdentity) {
-          throw new Error("No previous Core session is available for switch recovery");
-        }
-        await stopDesktopCoreProcesses();
-        assertLifecycleCurrent();
-        await waitForPortFree(base.bindAddress, signal);
-        assertLifecycleCurrent();
-        pendingCoreSession = previousSession;
-        recoveredReplacement = await startHealthyReplacementCore(
-          previousSession,
-          signal,
-          generation,
-          "recovery"
-        );
-        return previousSession;
-      },
-      commitPreviousCore: async (restoredSession) => {
-        if (!previousIdentity) {
-          throw new Error("Previous library was not registered when recovery began");
-        }
-        if (!recoveredReplacement || recoveredReplacement.session !== restoredSession) {
-          throw new LifecycleCancelledError("Recovered previous Core was lost before commit");
-        }
-        await commitStartedCore(recoveredReplacement, signal, generation, () => {
-          activateCurrentRegistryLibrary({
-            id: previousIdentity.id,
-            dbPath: previousIdentity.dbPath
-          });
-        });
-      }
-    });
-  } catch (error) {
-    if (pendingCoreProcess) {
-      try {
-        await stopPendingCoreProcess();
-      } catch (stopError) {
-        desktopLogger.warn("main", "[megle] pending Core cleanup failed after library switch; retaining process:", stopError);
-      }
-    }
-    if (error instanceof CoreSwitchRecoveryError) {
-      desktopLogger.error(
-        "main",
-        "[megle] library Core recovery failed after switch cancellation or failure:",
-        error
-      );
-      pushLibraryPhase({
-        kind: "error",
-        message: error.systemHealthy
-          ? `Library recovery is incomplete: ${error.message}. Retry or switch library.`
-          : `Library recovery failed and Core is unavailable: ${error.message}. Retry or switch library.`
-      });
-    } else if (!signal.aborted && !(operationCancelled?.() ?? false)) {
-      desktopLogger.error("main", "[megle] library Core replacement failed; retaining session metadata for retry:", error);
-    }
-    throw error;
-  }
-}
-
-// Poll until the host:port can be bound again (Core's listener has closed),
-// guarding the known probe-and-close race. Bounded; throws on timeout.
-async function waitForPortFree(bindAddress: string, signal: AbortSignal): Promise<void> {
-  const [host, portStr] = bindAddress.split(":");
-  const port = Number(portStr);
-  const deadline = Date.now() + 5000;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    throwIfLifecycleAborted(signal);
-    const free = await new Promise<boolean>((resolve) => {
-      const probe = net.createServer();
-      probe.once("error", () => resolve(false));
-      probe.listen(port, host, () => probe.close(() => resolve(true)));
-    });
-    if (free) return;
-    if (Date.now() > deadline) throw new Error(`Port ${bindAddress} did not free up`);
-    await waitWithLifecycleSignal(80, signal);
-  }
-}
-
-function waitWithLifecycleSignal(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let timer: NodeJS.Timeout;
-    const cleanup = () => signal.removeEventListener("abort", onAbort);
-    timer = setTimeout(() => {
-      settled = true;
-      cleanup();
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      cleanup();
-      reject(new LifecycleCancelledError());
-    };
-    if (signal.aborted) {
-      onAbort();
-      return;
-    }
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 function shouldRetryAutoCoreStartup(): boolean {
@@ -2475,16 +1992,12 @@ async function detectFfmpeg(): Promise<boolean> {
   return cachedFfmpegAvailable;
 }
 
-function resolvePluginsDir(dbPath: string): string {
+function resolvePluginsDir(): string {
   const fromEnv = process.env.MEGLE_PLUGINS_DIR;
   if (fromEnv && fromEnv.length > 0) {
     return fromEnv;
   }
-  const parent = path.dirname(dbPath);
-  if (parent && parent !== "." && parent !== "") {
-    return path.join(parent, "plugins");
-  }
-  return path.join(".", "plugins");
+  return path.join(userDataDir(), "plugins");
 }
 
 app
@@ -2523,7 +2036,6 @@ function requestDesktopShutdown(exitCode: number): void {
     await desktopLogger.close();
     pendingCoreProcess = null;
     coreProcess = null;
-    pendingCoreSession = null;
     coreReadyPromise = null;
     coreSession = null;
     shutdownFinalized = true;
@@ -2540,11 +2052,119 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
   const target = process.env.MEGLE_AUTO_ADD_ROOT?.trim();
   if (!target) return;
   try {
+    let bootstrapRootId: number | null = null;
+    const activeResponse = await fetch(`${session.baseUrl}/libraries/active`, {
+      headers: {
+        "x-megle-session": session.sessionToken
+      }
+    });
+    if (!activeResponse.ok) {
+      const text = await activeResponse.text();
+      desktopLogger.warn(
+        "main",
+        `[megle] MEGLE_AUTO_ADD_ROOT could not read active Library (${activeResponse.status}): ${text}`
+      );
+      return;
+    }
+    const active = (await activeResponse.json()) as {
+      library?: unknown;
+      contextRevision?: unknown;
+    };
+    if (typeof active.contextRevision !== "number") {
+      desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT active Library revision is unavailable");
+      return;
+    }
+    let contextRevision = active.contextRevision;
+    if (active.library == null) {
+      // MEGLE_AUTO_ADD_ROOT is a development/visual-harness seam. Host mode no
+      // longer creates an implicit Default catalog, so establish an explicit
+      // managed Library before adding the fixture's existing media directory.
+      const managedRoot =
+        process.env.MEGLE_AUTO_LIBRARY_ROOT?.trim() ||
+        path.join(path.dirname(target), ".megle-managed-library");
+      const libraryName = path.basename(target) || "Development Library";
+      const preflightResponse = await fetch(`${session.baseUrl}/libraries/preflight`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-megle-session": session.sessionToken
+        },
+        body: JSON.stringify({ name: libraryName, managedRoot })
+      });
+      if (!preflightResponse.ok) {
+        const text = await preflightResponse.text();
+        desktopLogger.warn(
+          "main",
+          `[megle] MEGLE_AUTO_ADD_ROOT preflight failed (${preflightResponse.status}): ${text}`
+        );
+        return;
+      }
+      const preflight = (await preflightResponse.json()) as {
+        ok?: unknown;
+        preflightToken?: unknown;
+      };
+      if (preflight.ok !== true) {
+        desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT managed Library preflight was rejected");
+        return;
+      }
+      const createResponse = await fetch(`${session.baseUrl}/libraries`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-megle-session": session.sessionToken
+        },
+        body: JSON.stringify({
+          name: libraryName,
+          managedRoot,
+          initialMode: "local-only",
+          preflightToken:
+            typeof preflight.preflightToken === "string" ? preflight.preflightToken : null,
+          activate: true
+        })
+      });
+      if (!createResponse.ok) {
+        const text = await createResponse.text();
+        desktopLogger.warn(
+          "main",
+          `[megle] MEGLE_AUTO_ADD_ROOT Library creation failed (${createResponse.status}): ${text}`
+        );
+        return;
+      }
+      await createResponse.json();
+      const refreshedActiveResponse = await fetch(`${session.baseUrl}/libraries/active`, {
+        headers: { "x-megle-session": session.sessionToken }
+      });
+      if (!refreshedActiveResponse.ok) {
+        desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT could not refresh created Library context");
+        return;
+      }
+      const refreshedActive = (await refreshedActiveResponse.json()) as { contextRevision?: unknown };
+      if (typeof refreshedActive.contextRevision !== "number") {
+        desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT created Library revision is unavailable");
+        return;
+      }
+      contextRevision = refreshedActive.contextRevision;
+      const rootsResponse = await fetch(`${session.baseUrl}/roots`, {
+        headers: { "x-megle-session": session.sessionToken }
+      });
+      if (rootsResponse.ok) {
+        const roots = (await rootsResponse.json()) as { items?: Array<{ id?: unknown; path?: unknown }> };
+        const normalizedManagedRoot = path.resolve(managedRoot).toLowerCase();
+        const bootstrapRoot = roots.items?.find(
+          (item) =>
+            typeof item.id === "number" &&
+            typeof item.path === "string" &&
+            path.resolve(item.path).toLowerCase() === normalizedManagedRoot
+        );
+        bootstrapRootId = typeof bootstrapRoot?.id === "number" ? bootstrapRoot.id : null;
+      }
+    }
     const response = await fetch(`${session.baseUrl}/roots`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-megle-session": session.sessionToken
+        "x-megle-session": session.sessionToken,
+        "x-megle-context-revision": String(contextRevision)
       },
       body: JSON.stringify({ path: target, displayName: path.basename(target) })
     });
@@ -2552,7 +2172,51 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
       const text = await response.text();
       desktopLogger.warn("main", `[megle] MEGLE_AUTO_ADD_ROOT addRoot failed (${response.status}): ${text}`);
     } else {
+      const addedRoot = (await response.json()) as { rootId?: unknown };
       desktopLogger.info("main", `[megle] auto-added root ${target}`);
+      // A managed Library owns an initial root at its storage directory. The
+      // development harness adds an existing media tree instead; retire the
+      // empty bootstrap root before the renderer loads so it opens the fixture
+      // users asked the harness to exercise, not an empty storage directory.
+      if (bootstrapRootId === null && typeof addedRoot.rootId === "number") {
+        const rootsResponse = await fetch(`${session.baseUrl}/roots`, {
+          headers: { "x-megle-session": session.sessionToken }
+        });
+        if (rootsResponse.ok) {
+          const roots = (await rootsResponse.json()) as { items?: Array<{ id?: unknown }> };
+          const onlyOtherRoot = roots.items?.find(
+            (item) => typeof item.id === "number" && item.id !== addedRoot.rootId
+          );
+          bootstrapRootId = typeof onlyOtherRoot?.id === "number" ? onlyOtherRoot.id : null;
+        }
+      }
+      if (bootstrapRootId !== null) {
+        const retireResponse = await fetch(`${session.baseUrl}/roots/${bootstrapRootId}`, {
+          method: "DELETE",
+          headers: {
+            "x-megle-session": session.sessionToken,
+            "x-megle-context-revision": String(contextRevision)
+          }
+        });
+        if (!retireResponse.ok) {
+          desktopLogger.warn(
+            "main",
+            `[megle] MEGLE_AUTO_ADD_ROOT could not retire bootstrap root (${retireResponse.status})`
+          );
+        } else {
+          const deadline = Date.now() + 10_000;
+          while (Date.now() < deadline) {
+            const rootsResponse = await fetch(`${session.baseUrl}/roots`, {
+              headers: { "x-megle-session": session.sessionToken }
+            });
+            if (rootsResponse.ok) {
+              const roots = (await rootsResponse.json()) as { items?: Array<{ id?: unknown }> };
+              if (!roots.items?.some((item) => item.id === bootstrapRootId)) break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+      }
     }
   } catch (error) {
     desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT request failed:", error);

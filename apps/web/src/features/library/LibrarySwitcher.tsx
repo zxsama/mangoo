@@ -1,12 +1,8 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { Check, FolderMinus, FolderPlus, Search, X } from "lucide-react";
 import {
-  createLibrary,
   listLibraries,
-  openLibrary,
-  pickLibraryFile,
   pickNativeFolder,
-  pickNewLibraryPath,
   setLibraryIcon,
   switchLibrary,
 } from "../../core/desktop";
@@ -35,6 +31,7 @@ import {
   LibraryGlyph,
   LibraryIconPicker,
 } from "./libraryGlyph";
+import { ManagedLibraryWizard } from "./ManagedLibraryWizard";
 import {
   INITIAL_LIBRARY_SWITCHER_INTERACTION_STATE,
   librarySwitcherInteractionReducer,
@@ -78,6 +75,8 @@ export function LibrarySwitcher({
 }: LibrarySwitcherProps) {
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [query, setQuery] = useState("");
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [firstRun, setFirstRun] = useState(false);
   const [interaction, dispatch] = useReducer(
     librarySwitcherInteractionReducer,
     INITIAL_LIBRARY_SWITCHER_INTERACTION_STATE,
@@ -92,6 +91,7 @@ export function LibrarySwitcher({
 
   useEffect(() => {
     mountedRef.current = true;
+    void reload(true);
     return () => {
       mountedRef.current = false;
       reloadGenerationRef.current += 1;
@@ -124,12 +124,16 @@ export function LibrarySwitcher({
     });
   }
 
-  async function reload(): Promise<void> {
+  async function reload(detectFirstRun = false): Promise<void> {
     const generation = ++reloadGenerationRef.current;
     try {
       const nextLibraries = await listLibraries();
       if (!mountedRef.current || generation !== reloadGenerationRef.current) return;
       setLibs(nextLibraries);
+      if (detectFirstRun && nextLibraries.length === 0) {
+        setFirstRun(true);
+        setWizardOpen(true);
+      }
     } catch (cause) {
       if (!mountedRef.current || generation !== reloadGenerationRef.current) return;
       await reportFailure("library-list", "library-registry", cause);
@@ -153,51 +157,23 @@ export function LibrarySwitcher({
   const filtered = libs.filter(
     (item) =>
       item.name.toLowerCase().includes(query.toLowerCase()) ||
-      item.dbPath.toLowerCase().includes(query.toLowerCase()),
+      item.managedRoot.toLowerCase().includes(query.toLowerCase()),
   );
   const removeTarget = interaction.remove.kind === "closed" ? null : interaction.remove;
   const removePending = interaction.remove.kind === "pending";
 
   async function onSwitch(item: LibrarySummary) {
-    if (item.active || !item.available) return;
+    if (item.active || item.availability !== "available") return;
     onClose();
-    await runMutation("library-switch", item.id, async () => {
-      ensureDesktopMutationSucceeded(await switchLibrary(item.id), "Library switch failed");
+    await runMutation("library-switch", item.libraryUuid, async () => {
+      ensureDesktopMutationSucceeded(await switchLibrary(item.libraryUuid), "Library switch failed");
     });
   }
 
   async function onCreate() {
-    let path: string | null;
-    try {
-      path = await pickNewLibraryPath("library");
-    } catch (cause) {
-      await reportFailure("library-create", "new-library-path", cause);
-      return;
-    }
-    if (!path) return;
-    const name = path.split(/[\\/]/).pop()?.replace(/\.sqlite$/i, "") ?? "library";
+    setFirstRun(false);
     onClose();
-    await runMutation("library-create", path, async () => {
-      ensureDesktopMutationSucceeded(
-        await createLibrary({ name, dbPath: path }),
-        "Library creation failed",
-      );
-    });
-  }
-
-  async function onOpen() {
-    let path: string | null;
-    try {
-      path = await pickLibraryFile();
-    } catch (cause) {
-      await reportFailure("library-open", "library-file-picker", cause);
-      return;
-    }
-    if (!path) return;
-    onClose();
-    await runMutation("library-open", path, async () => {
-      ensureDesktopMutationSucceeded(await openLibrary(path), "Library open failed");
-    });
+    window.requestAnimationFrame(() => setWizardOpen(true));
   }
 
   async function onAddFolder() {
@@ -241,9 +217,9 @@ export function LibrarySwitcher({
 
   async function applyIcon(item: LibrarySummary, icon: string, color: string) {
     const session = sessionGenerationRef.current;
-    const succeeded = await runMutation("library-set-icon", item.id, async () => {
+    const succeeded = await runMutation("library-set-icon", item.libraryUuid, async () => {
       ensureDesktopMutationSucceeded(
-        await setLibraryIcon(item.id, icon, color),
+        await setLibraryIcon(item.libraryUuid, icon, color),
         "Library icon update failed",
       );
     });
@@ -279,27 +255,27 @@ export function LibrarySwitcher({
     const icon = item.icon ?? DEFAULT_LIBRARY_ICON;
     const color = item.color ?? DEFAULT_LIBRARY_COLOR;
     const iconMenuOpen =
-      interaction.nested.kind === "icon" && interaction.nested.libraryId === item.id;
+      interaction.nested.kind === "icon" && interaction.nested.libraryId === item.libraryUuid;
     const removeMenuOpen =
       item.active &&
       interaction.nested.kind === "remove" &&
-      interaction.nested.libraryId === item.id;
+      interaction.nested.libraryId === item.libraryUuid;
     const iconMenuAnchor =
-      interaction.nested.kind === "icon" && interaction.nested.libraryId === item.id
+      interaction.nested.kind === "icon" && interaction.nested.libraryId === item.libraryUuid
         ? interaction.nested.anchor
         : null;
     const removeMenuAnchor =
-      interaction.nested.kind === "remove" && interaction.nested.libraryId === item.id
+      interaction.nested.kind === "remove" && interaction.nested.libraryId === item.libraryUuid
         ? interaction.nested.anchor
         : null;
     return (
       <li
-        className={`library-switcher-row${item.active ? " active" : ""}${item.available ? "" : " unavailable"}`}
-        key={item.id}
+        className={`library-switcher-row${item.active ? " active" : ""}${item.availability === "available" ? "" : " unavailable"}`}
+        key={item.libraryUuid}
       >
         <div className="library-switcher-icon-anchor">
           <button
-            aria-controls={`library-icon-${item.id}`}
+            aria-controls={`library-icon-${item.libraryUuid}`}
             aria-expanded={iconMenuOpen}
             aria-haspopup="menu"
             aria-label="更改图标"
@@ -309,18 +285,18 @@ export function LibrarySwitcher({
               dispatch({
                 anchor: event.currentTarget,
                 kind: "icon",
-                libraryId: item.id,
+                libraryId: item.libraryUuid,
                 type: "toggle-nested",
               })
             }
             type="button"
           >
-            <LibraryGlyph icon={item.icon} color={item.color} size={16} />
+            <LibraryGlyph icon={item.icon ?? undefined} color={item.color ?? undefined} size={16} />
           </button>
           <AnchoredOverlay
             anchor={iconMenuAnchor}
             ariaLabel="选择资源库图标"
-            id={`library-icon-${item.id}`}
+            id={`library-icon-${item.libraryUuid}`}
             onDismiss={() => dispatch({ kind: "icon", type: "dismiss-nested" })}
             open={iconMenuOpen}
             parentId="library-root"
@@ -340,12 +316,12 @@ export function LibrarySwitcher({
         </div>
         <button
           className="library-switcher-main"
-          data-interactive-pointer-target={!item.active && item.available ? "true" : undefined}
+          data-interactive-pointer-target={!item.active && item.availability === "available" ? "true" : undefined}
           onClick={() => void onSwitch(item)}
           type="button"
         >
           <span className="library-switcher-name">{item.name}</span>
-          <span className="library-switcher-path">{item.dbPath}</span>
+          <span className="library-switcher-path">{item.managedRoot}</span>
         </button>
         {item.active ? (
           <Check aria-hidden="true" className="library-switcher-check" size={14} />
@@ -372,7 +348,7 @@ export function LibrarySwitcher({
                 dispatch({
                   anchor: event.currentTarget,
                   kind: "remove",
-                  libraryId: item.id,
+                  libraryId: item.libraryUuid,
                   type: "toggle-nested",
                 })
               }
@@ -427,9 +403,6 @@ export function LibrarySwitcher({
     <>
       <button data-interactive-pointer-target="true" onClick={() => void onCreate()} type="button">
         创建资源库…
-      </button>
-      <button data-interactive-pointer-target="true" onClick={() => void onOpen()} type="button">
-        打开其它资源库…
       </button>
     </>
   );
@@ -498,6 +471,16 @@ export function LibrarySwitcher({
           </LiquidGlassButton>
         </OverlayDialogActions>
       </ModalSurface>
+      <ManagedLibraryWizard
+        firstRun={firstRun}
+        onClose={() => setWizardOpen(false)}
+        onCreated={() => {
+          setFirstRun(false);
+          void reload();
+        }}
+        onFailure={(cause) => void reportFailure("library-create", "managed-root", cause)}
+        open={wizardOpen}
+      />
     </>
   );
 }

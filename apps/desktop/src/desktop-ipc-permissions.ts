@@ -35,18 +35,8 @@ const PRIVILEGED_CHANNELS = new Set([
   "megle:close-settings-window",
   "megle:open-plugins-window",
   "megle:close-plugins-window",
-  "megle:list-libraries",
-  "megle:get-active-library-id",
   "megle:get-library-load-phase",
   "megle:retry-library-load",
-  "megle:switch-library",
-  "megle:create-library",
-  "megle:open-library",
-  "megle:remove-library-from-list",
-  "megle:rename-library",
-  "megle:set-library-icon",
-  "megle:delete-library-file",
-  "megle:pick-library-file",
   "megle:pick-new-library-path"
 ]);
 

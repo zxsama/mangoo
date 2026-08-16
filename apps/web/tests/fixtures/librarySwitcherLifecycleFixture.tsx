@@ -144,18 +144,26 @@ const lifecycleWindow = window as Window & {
 
 const ACTIVE_LIBRARY: LibrarySummary = {
   active: true,
-  available: true,
-  dbPath: "C:\\Fixture\\library.sqlite",
-  id: "fixture-library",
+  availability: "available",
+  bindingState: "local-only",
+  contextRevision: 1,
+  libraryUuid: "fixture-library",
+  lifecycleState: "ready",
+  managedRoot: "C:\\Fixture\\library",
   name: "Alpha Library",
+  rootUuid: "fixture-root",
 };
 
 const INACTIVE_LIBRARY: LibrarySummary = {
   active: false,
-  available: true,
-  dbPath: "C:\\Fixture\\beta.sqlite",
-  id: "beta-library",
+  availability: "available",
+  bindingState: "local-only",
+  contextRevision: 1,
+  libraryUuid: "beta-library",
+  lifecycleState: "ready",
+  managedRoot: "C:\\Fixture\\beta",
   name: "Beta Library",
+  rootUuid: "beta-root",
 };
 
 const delay = (milliseconds = 0) =>
@@ -180,11 +188,80 @@ function createLibraryState(overrides: Partial<LibraryState> = {}): LibraryState
   } as unknown as LibraryState;
 }
 
-function installBridge(overrides: Partial<MegleDesktopBridge> = {}): void {
+type FixtureBridgeOverrides = Partial<MegleDesktopBridge> & {
+  createLibrary?: () => Promise<unknown>;
+  listLibraries?: () => Promise<LibrarySummary[]> | LibrarySummary[];
+  openLibrary?: () => Promise<unknown>;
+  pickLibraryFile?: () => Promise<string | null>;
+  setLibraryIcon?: () => Promise<unknown>;
+  switchLibrary?: () => Promise<unknown>;
+};
+
+const fixtureCoreUrl = "http://library-fixture.test/api";
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    headers: { "content-type": "application/json" },
+    status,
+  });
+}
+
+function installBridge(overrides: FixtureBridgeOverrides = {}): void {
+  const {
+    createLibrary: createLibraryOverride,
+    listLibraries: listLibrariesOverride,
+    openLibrary: _openLibraryOverride,
+    pickLibraryFile: _pickLibraryFileOverride,
+    setLibraryIcon: setLibraryIconOverride,
+    switchLibrary: switchLibraryOverride,
+    ...desktopOverrides
+  } = overrides;
   window.megleDesktop = {
-    listLibraries: async () => [ACTIVE_LIBRARY, INACTIVE_LIBRARY],
-    ...overrides,
+    coreUrl: fixtureCoreUrl,
+    sessionToken: "fixture-session-token",
+    ...desktopOverrides,
   } as MegleDesktopBridge;
+
+  if (desktopOverrides.coreUrl && desktopOverrides.coreUrl !== fixtureCoreUrl) return;
+
+  window.fetch = (async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (!url.href.startsWith(fixtureCoreUrl)) {
+      throw new Error(`Unexpected fixture request: ${url.href}`);
+    }
+    const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+    if (url.pathname === "/api/libraries" && method === "GET") {
+      const items = await (listLibrariesOverride?.() ?? [ACTIVE_LIBRARY, INACTIVE_LIBRARY]);
+      return jsonResponse({ items });
+    }
+    if (url.pathname === "/api/libraries/active" && method === "GET") {
+      return jsonResponse({ contextRevision: ACTIVE_LIBRARY.contextRevision, library: ACTIVE_LIBRARY });
+    }
+    if (url.pathname === "/api/libraries" && method === "POST") {
+      await createLibraryOverride?.();
+      return jsonResponse({ library: ACTIVE_LIBRARY }, 201);
+    }
+    if (url.pathname.endsWith("/activate") && method === "POST") {
+      await switchLibraryOverride?.();
+      return jsonResponse({ contextRevision: ACTIVE_LIBRARY.contextRevision + 1, library: ACTIVE_LIBRARY });
+    }
+    if (/\/api\/libraries\/[^/]+$/.test(url.pathname) && method === "PATCH") {
+      await setLibraryIconOverride?.();
+      return jsonResponse({ library: ACTIVE_LIBRARY });
+    }
+    if (/\/api\/libraries\/[^/]+\/local-copy$/.test(url.pathname) && method === "DELETE") {
+      return jsonResponse({ ok: true });
+    }
+    if (url.pathname === "/api/libraries/preflight" && method === "POST") {
+      return jsonResponse({
+        normalizedRoot: "C:\\Fixture\\library",
+        ok: true,
+        preflightToken: "fixture-preflight-token",
+        reason: null,
+      });
+    }
+    throw new Error(`Unhandled fixture request: ${method} ${url.pathname}`);
+  }) as typeof window.fetch;
 }
 
 async function settle(milliseconds = 0): Promise<void> {
@@ -351,7 +428,7 @@ function ProductionLibrarySwitcherScenario({
         autoFocus={openSource.autoFocus}
         library={library}
         notificationContext={{
-          libraryId: ACTIVE_LIBRARY.id,
+          libraryId: ACTIVE_LIBRARY.libraryUuid,
           libraryName: ACTIVE_LIBRARY.name,
         }}
         onClose={() => overlays.closeRoot("library")}
@@ -370,7 +447,7 @@ function HookBackedLibrarySwitcherScenario({
   control: ScenarioControl;
 }) {
   const library = useLibraryData({
-    activeLibraryId: ACTIVE_LIBRARY.id,
+    activeLibraryId: ACTIVE_LIBRARY.libraryUuid,
     activeLibraryName: ACTIVE_LIBRARY.name,
     persistentThumbnailCacheAutoRefresh: false,
   });
@@ -397,7 +474,7 @@ function HardMediaCancellationScenario({
   control: HardMediaCancellationControl;
 }) {
   control.library = useLibraryData({
-    activeLibraryId: ACTIVE_LIBRARY.id,
+    activeLibraryId: ACTIVE_LIBRARY.libraryUuid,
     activeLibraryName: ACTIVE_LIBRARY.name,
     persistentThumbnailCacheAutoRefresh: false,
   });
@@ -659,6 +736,9 @@ async function runAdapterRemoveScenario({
     const method = init?.method ?? (input instanceof Request ? input.method : "GET");
     const url = new URL(requestUrl);
     if (!url.href.startsWith(coreUrl)) return originalFetch(input, init);
+    if (method === "GET" && url.pathname === "/api/libraries") {
+      return jsonResponse({ items: [ACTIVE_LIBRARY, INACTIVE_LIBRARY], contextRevision: 1 });
+    }
     if (method === "DELETE" && url.pathname === "/api/roots/7") {
       deleteCalls += 1;
       return deleteFails
@@ -745,7 +825,7 @@ async function runIconMenuScenario() {
   await openFromTitlebar();
   const iconTrigger = await findElement('button[aria-label="更改图标"]');
   await requestNativeClick(iconTrigger);
-  const surface = await findOpenSurface(`library-icon-${ACTIVE_LIBRARY.id}`);
+  const surface = await findOpenSurface(`library-icon-${ACTIVE_LIBRARY.libraryUuid}`);
   if (!surface) throw new Error("Library icon menu did not open");
   await settle(50);
   const menus = surface.querySelectorAll('[role="menu"]');
@@ -806,6 +886,10 @@ async function runRequestOwnershipScenario() {
     </OverlayProvider>,
   );
   const trigger = await findElement('[data-titlebar-control="library-switcher"]');
+  await waitFor(() => listRequests.length === 1, "initial first-run library request");
+  listRequests[0].resolve([ACTIVE_LIBRARY, INACTIVE_LIBRARY]);
+  await settle(20);
+  listRequests.length = 0;
   await act(async () => trigger.click());
   await waitFor(() => listRequests.length === 1, "first library request");
   await requestNativeKey("Escape");
@@ -823,7 +907,7 @@ async function runRequestOwnershipScenario() {
     !(document.body.textContent?.includes("Stale Library") ?? false);
 
   await requestNativeClick(await findElement('button[aria-label="更改图标"]'));
-  const iconSurface = await findOpenSurface(`library-icon-${ACTIVE_LIBRARY.id}`);
+  const iconSurface = await findOpenSurface(`library-icon-${ACTIVE_LIBRARY.libraryUuid}`);
   if (!iconSurface) throw new Error("Icon menu did not open for ownership test");
   await requestNativeClick(await findElement(".library-icon-picker-cell", iconSurface));
   await requestNativeKey("Escape");
@@ -1105,13 +1189,8 @@ async function runMutationFailureScenario() {
   await requestNativeClick(await findButton("创建资源库…", createRoot));
   await settle(40);
   await waitForLayerRemoval("library-root");
-
-  await act(async () => trigger.click());
-  const openRoot = await findOpenSurface("library-root");
-  if (!openRoot) throw new Error("Library root did not reopen for open failure");
-  await requestNativeClick(await findButton("打开其它资源库…", openRoot));
+  await requestNativeKey("Escape");
   await settle(40);
-  await waitForLayerRemoval("library-root");
 
   await act(async () => trigger.click());
   const addRoot = await findOpenSurface("library-root");
@@ -1120,7 +1199,7 @@ async function runMutationFailureScenario() {
   await settle(40);
 
   await requestNativeClick(await findElement('button[aria-label="更改图标"]', addRoot));
-  const iconSurface = await findOpenSurface(`library-icon-${ACTIVE_LIBRARY.id}`);
+  const iconSurface = await findOpenSurface(`library-icon-${ACTIVE_LIBRARY.libraryUuid}`);
   if (!iconSurface) throw new Error("Icon menu did not open for icon failure");
   await requestNativeClick(await findElement(".library-icon-picker-cell", iconSurface));
   await settle(60);

@@ -356,12 +356,12 @@ test("notifications preload exposes only notification, log, and common window ca
 
   const mainBridge = evaluatePreload("main").bridge;
   const settingsBridge = evaluatePreload("settings").bridge;
-  assert.equal(typeof mainBridge.switchLibrary, "function");
+  assert.equal("switchLibrary" in mainBridge, false);
   assert.equal(typeof mainBridge.getLibraryPhase, "function");
   assert.equal(typeof mainBridge.retryLibraryLoad, "function");
   assert.equal(typeof mainBridge.updateMediaFocusStage, "function");
   assert.equal(typeof mainBridge.shell, "object");
-  assert.equal(typeof settingsBridge.switchLibrary, "function");
+  assert.equal("switchLibrary" in settingsBridge, false);
   assert.equal(typeof settingsBridge.shell, "object");
 
   const unknownBridge = evaluatePreload("unknown").bridge;
@@ -372,11 +372,7 @@ test("Main role permissions reject notification senders for library and shell IP
   assert.ok(permissionsModule, "desktop IPC role permissions must exist");
   for (const channel of [
     "megle:retry-library-load",
-    "megle:switch-library",
-    "megle:create-library",
-    "megle:open-library",
-    "megle:remove-library-from-list",
-    "megle:delete-library-file",
+    "megle:pick-new-library-path",
     "megle:shell-reveal-path",
     "megle:shell-open-path"
   ]) {
@@ -458,22 +454,12 @@ test("shutdown stop failure restores live notifications and a later retry can fi
   assert.equal(stopAttempts, 2);
 });
 
-test("every library deletion IPC uses the same latest-registry active guard", () => {
+test("Library lifecycle is absent from Desktop IPC and owned by Core Host", () => {
   const root = fileURLToPath(new URL("../../..", import.meta.url));
   const main = readFileSync(`${root}/apps/desktop/src/main.ts`, "utf8");
-  const removeHandler = main.slice(
-    main.indexOf('ipcMain.handle("megle:remove-library-from-list"'),
-    main.indexOf('ipcMain.handle("megle:rename-library"')
-  );
-  const deleteHandler = main.slice(
-    main.indexOf('ipcMain.handle("megle:delete-library-file"'),
-    main.indexOf('ipcMain.handle("megle:pick-library-file"')
-  );
-
-  assert.match(main, /function removeLibraryFromCurrentRegistry\(/);
-  assert.match(removeHandler, /removeLibraryFromCurrentRegistry\(libraryId\)/);
-  assert.match(deleteHandler, /removeLibraryFromCurrentRegistry\(libraryId,/);
-  assert.doesNotMatch(main, /libraryRegistry\.removeLibrary\(/);
+  const executableMain = main.replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.doesNotMatch(executableMain, /libraries\.json|restartCoreForLibrary|megle:open-library|megle:delete-library-file/);
+  assert.match(main, /megle:pick-new-library-path/);
 });
 
 test("hardening source contract uses shared DTOs, sender authorization, and failed-window cleanup", () => {
@@ -496,9 +482,7 @@ test("hardening source contract uses shared DTOs, sender authorization, and fail
 
   assert.match(main, /`--megle-window=main`/);
   for (const channel of [
-    "megle:switch-library",
-    "megle:create-library",
-    "megle:remove-library-from-list",
+    "megle:pick-new-library-path",
     "megle:shell-reveal-path",
     "megle:shell-open-path"
   ]) {
