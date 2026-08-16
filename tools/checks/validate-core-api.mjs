@@ -23,6 +23,7 @@ const notificationOutboxRs = read("crates/core/src/db/notification_outbox.rs");
 const tasksRs = read("crates/core/src/tasks.rs");
 const dbMigrationsRs = read("crates/core/src/db/migrations.rs");
 const mainRs = read("crates/core/src/main.rs");
+const libraryManagerRs = read("crates/core/src/library_manager.rs");
 const migrationSql = read("crates/core/migrations/0001_initial.sql");
 const thumbnailMigrationSql = read("crates/core/migrations/0004_thumbnail_state.sql");
 const thumbnailSourceMigrationSql = read("crates/core/migrations/0005_thumbnail_source_fingerprint.sql");
@@ -174,8 +175,8 @@ if (!dbMigrationsRs.includes('include_str!("../../migrations/0025_preview_blobs.
 if (!dbModRs.includes("pub fn apply_migrations")) {
   fail("Database::apply_migrations is missing");
 }
-if (!mainRs.includes("database.apply_migrations()?")) {
-  fail("main.rs must apply migrations before serving");
+if (!mainRs.includes("AppState::new_host") || !libraryManagerRs.includes("database.apply_migrations()?")) {
+  fail("Core Host must apply per-Library migrations before serving");
 }
 if (!mainRs.includes("axum::serve")) {
   fail("main.rs must start the Axum server");

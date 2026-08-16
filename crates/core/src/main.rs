@@ -4,6 +4,9 @@ mod decode;
 #[macro_use]
 mod debug;
 mod fsops;
+mod host_registry;
+mod library_manager;
+mod library_path;
 mod plugins;
 mod roots;
 mod scan;
@@ -32,11 +35,14 @@ fn initialize_tracing() {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     initialize_tracing();
-    let db_path = std::env::var("MEGLE_DB_PATH")
+    let host_path = std::env::var("MEGLE_HOST_DB_PATH")
         .ok()
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("megle.sqlite"));
+        .map(PathBuf::from);
+    let libraries_dir = std::env::var("MEGLE_LIBRARIES_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
     let bind_addr: SocketAddr = std::env::var("MEGLE_CORE_ADDR")
         .ok()
         .filter(|s| !s.is_empty())
@@ -69,30 +75,13 @@ async fn main() -> anyhow::Result<()> {
         .map(|origin| origin.parse::<HeaderValue>())
         .transpose()?;
 
-    let database = db::Database::open(&db_path)?;
-    database.apply_migrations()?;
-    match database.import_legacy_thumbnail_cache() {
-        Ok(imported) if imported > 0 => {
-            tracing::info!(
-                imported,
-                "imported legacy thumbnail-cache entries into thumb_blobs"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(%error, "legacy thumbnail-cache import failed at startup");
-        }
-    }
-
-    let plugins_dir = plugins::resolve_plugins_dir(&db_path);
-    if let Err(error) = plugins::discover_and_persist(&database, &plugins_dir) {
-        tracing::warn!(
-            "plugin discovery failed at startup ({}): {}",
-            plugins_dir.display(),
-            error
-        );
-    }
-
+    let host_path = host_path.ok_or_else(|| {
+        anyhow::anyhow!("MEGLE_HOST_DB_PATH must be set before starting Megle Core")
+    })?;
+    let libraries_dir = libraries_dir
+        .or_else(|| host_path.parent().map(|parent| parent.join("libraries")))
+        .ok_or_else(|| anyhow::anyhow!("MEGLE_LIBRARIES_DIR is required for Core Host mode"))?;
+    let state = api::AppState::new_host(host_path, libraries_dir).await?;
     let web_dir = resolve_web_dir();
 
     let listener = bind_with_retry(bind_addr).await?;
@@ -104,14 +93,13 @@ async fn main() -> anyhow::Result<()> {
     );
     axum::serve(
         listener,
-        api::router_with_config(
-            database,
+        api::router_with_state(
+            state,
             api::ApiConfig {
                 session_token,
                 allowed_origin,
                 web_dir,
                 basic_auth,
-                plugins_dir: Some(plugins_dir),
             },
         ),
     )

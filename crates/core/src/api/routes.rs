@@ -1,6 +1,6 @@
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -63,6 +63,7 @@ pub const MEDIA_KIND_VALUES: &[&str] = &["image", "video", "other"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteGroup {
     Health,
+    Libraries,
     Roots,
     Folders,
     Media,
@@ -76,6 +77,7 @@ pub enum RouteGroup {
 #[allow(dead_code)]
 pub const PHASE1_ROUTE_GROUPS: &[RouteGroup] = &[
     RouteGroup::Health,
+    RouteGroup::Libraries,
     RouteGroup::Roots,
     RouteGroup::Folders,
     RouteGroup::Media,
@@ -89,6 +91,12 @@ pub const PHASE1_ROUTE_GROUPS: &[RouteGroup] = &[
 #[allow(dead_code)]
 pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/health",
+    "/api/libraries",
+    "/api/libraries/active",
+    "/api/libraries/preflight",
+    "/api/libraries/{libraryUuid}/activate",
+    "/api/libraries/{libraryUuid}",
+    "/api/libraries/{libraryUuid}/local-copy",
     "/api/roots",
     "/api/roots/{rootId}",
     "/api/folders/{folderId}/children",
@@ -597,6 +605,21 @@ type ApiResult<T> = Result<T, CoreError>;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(get_health))
+        .route("/api/libraries", get(list_libraries).post(create_library))
+        .route("/api/libraries/active", get(get_active_library))
+        .route("/api/libraries/preflight", post(preflight_library))
+        .route(
+            "/api/libraries/:library_uuid/activate",
+            post(activate_library),
+        )
+        .route(
+            "/api/libraries/:library_uuid",
+            axum::routing::patch(update_library),
+        )
+        .route(
+            "/api/libraries/:library_uuid/local-copy",
+            axum::routing::delete(remove_local_library),
+        )
         .route("/api/roots", get(list_roots).post(add_root))
         .route("/api/roots/:root_id", axum::routing::delete(remove_root))
         .route(
@@ -677,6 +700,300 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryPreflightRequest {
+    name: String,
+    managed_root: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryPreflightResponse {
+    ok: bool,
+    reason: String,
+    normalized_root: String,
+    preflight_token: Option<String>,
+    available_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateLibraryRequest {
+    name: String,
+    managed_root: String,
+    icon: Option<String>,
+    color: Option<String>,
+    initial_mode: String,
+    preflight_token: Option<String>,
+    activate: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibrarySummaryResponse {
+    library_uuid: String,
+    root_uuid: String,
+    name: String,
+    icon: Option<String>,
+    color: Option<String>,
+    managed_root: String,
+    active: bool,
+    availability: String,
+    lifecycle_state: String,
+    binding_state: String,
+    context_revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryListResponse {
+    items: Vec<LibrarySummaryResponse>,
+    context_revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveLibraryResponse {
+    library: Option<LibrarySummaryResponse>,
+    context_revision: u64,
+    runtime_generation: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateLibraryResponse {
+    library: LibrarySummaryResponse,
+    activated: bool,
+    activation_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateLibraryRequest {
+    name: Option<String>,
+    icon: Option<Option<String>>,
+    color: Option<Option<String>>,
+}
+
+fn require_context_revision(headers: &HeaderMap) -> ApiResult<u64> {
+    headers
+        .get("x-megle-context-revision")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "stale_library_context",
+                "Missing active Library context revision".to_string(),
+            )
+        })
+}
+
+fn library_manager(state: &AppState) -> ApiResult<Arc<crate::library_manager::LibraryManager>> {
+    state.library_manager.clone().ok_or_else(|| {
+        CoreError::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_mode_required",
+            "Library management is unavailable outside Core Host mode".to_string(),
+        )
+    })
+}
+
+fn library_summary(
+    descriptor: crate::host_registry::LibraryDescriptor,
+    active_library_uuid: Option<&str>,
+    context_revision: u64,
+) -> LibrarySummaryResponse {
+    LibrarySummaryResponse {
+        active: active_library_uuid == Some(descriptor.library_uuid.as_str()),
+        library_uuid: descriptor.library_uuid,
+        root_uuid: descriptor.root_uuid,
+        name: descriptor.name,
+        icon: descriptor.icon,
+        color: descriptor.color,
+        managed_root: descriptor.managed_root.to_string_lossy().into_owned(),
+        availability: descriptor.availability,
+        lifecycle_state: descriptor.lifecycle_state,
+        binding_state: descriptor.binding_state,
+        context_revision,
+    }
+}
+
+async fn list_libraries(State(state): State<AppState>) -> ApiResult<Json<LibraryListResponse>> {
+    let manager = library_manager(&state)?;
+    let _gate = state.request_gate().read_owned().await;
+    let snapshot = manager.registry().snapshot()?;
+    let active_snapshot = manager.active_snapshot();
+    let active = active_snapshot.library_uuid.clone();
+    Ok(Json(LibraryListResponse {
+        context_revision: active_snapshot.context_revision,
+        items: snapshot
+            .libraries
+            .into_iter()
+            .map(|descriptor| {
+                library_summary(
+                    descriptor,
+                    active.as_deref(),
+                    active_snapshot.context_revision,
+                )
+            })
+            .collect(),
+    }))
+}
+
+async fn get_active_library(
+    State(state): State<AppState>,
+) -> ApiResult<Json<ActiveLibraryResponse>> {
+    let manager = library_manager(&state)?;
+    let _gate = state.request_gate().read_owned().await;
+    let snapshot = manager.active_snapshot();
+    let library = snapshot
+        .library_uuid
+        .as_deref()
+        .and_then(|uuid| manager.registry().library(uuid).transpose())
+        .transpose()?
+        .map(|descriptor| {
+            library_summary(
+                descriptor,
+                snapshot.library_uuid.as_deref(),
+                snapshot.context_revision,
+            )
+        });
+    Ok(Json(ActiveLibraryResponse {
+        library,
+        context_revision: snapshot.context_revision,
+        runtime_generation: snapshot.runtime_generation,
+    }))
+}
+
+async fn preflight_library(
+    State(state): State<AppState>,
+    Json(request): Json<LibraryPreflightRequest>,
+) -> ApiResult<Json<LibraryPreflightResponse>> {
+    let result =
+        library_manager(&state)?.preflight(&request.name, FilePath::new(&request.managed_root))?;
+    Ok(Json(LibraryPreflightResponse {
+        ok: result.ok,
+        reason: result.reason.as_str().to_string(),
+        normalized_root: result.normalized_root.to_string_lossy().into_owned(),
+        preflight_token: result.token,
+        available_bytes: result.available_bytes,
+    }))
+}
+
+async fn create_library(
+    State(state): State<AppState>,
+    Json(request): Json<CreateLibraryRequest>,
+) -> ApiResult<(StatusCode, Json<CreateLibraryResponse>)> {
+    if request.initial_mode != "local-only" {
+        return Err(CoreError::bad_request(
+            "initialMode must be local-only".to_string(),
+        ));
+    }
+    let manager = library_manager(&state)?;
+    let (descriptor, activated, activation_error) = manager
+        .create_library(
+            request.name,
+            request.icon,
+            request.color,
+            std::path::PathBuf::from(request.managed_root),
+            request.preflight_token,
+            request.activate.unwrap_or(true),
+        )
+        .await
+        .map_err(map_library_error)?;
+    let snapshot = manager.registry().snapshot()?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateLibraryResponse {
+            library: library_summary(
+                descriptor,
+                snapshot.active_library_uuid.as_deref(),
+                snapshot.context_revision,
+            ),
+            activated,
+            activation_error,
+        }),
+    ))
+}
+
+async fn activate_library(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ActiveLibraryResponse>> {
+    let expected_revision = require_context_revision(&headers)?;
+    let manager = library_manager(&state)?;
+    manager
+        .activate_with_revision(&library_uuid, expected_revision)
+        .await
+        .map_err(map_library_error)?;
+    get_active_library(State(state)).await
+}
+
+async fn update_library(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateLibraryRequest>,
+) -> ApiResult<Json<LibrarySummaryResponse>> {
+    let expected_revision = require_context_revision(&headers)?;
+    if request
+        .name
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(CoreError::bad_request(
+            "Library name cannot be empty".to_string(),
+        ));
+    }
+    let manager = library_manager(&state)?;
+    let descriptor = manager
+        .update_library_metadata_with_revision(
+            &library_uuid,
+            expected_revision,
+            request.name.as_deref(),
+            request.icon.as_ref().map(|value| value.as_deref()),
+            request.color.as_ref().map(|value| value.as_deref()),
+        )
+        .await
+        .map_err(map_library_error)?
+        .ok_or_else(|| CoreError::not_found("library-not-found".to_string()))?;
+    let snapshot = manager.registry().snapshot()?;
+    Ok(Json(library_summary(
+        descriptor,
+        snapshot.active_library_uuid.as_deref(),
+        snapshot.context_revision,
+    )))
+}
+
+async fn remove_local_library(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let expected_revision = require_context_revision(&headers)?;
+    library_manager(&state)?
+        .remove_local_library_with_revision(&library_uuid, expected_revision)
+        .await
+        .map_err(map_library_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn map_library_error(error: anyhow::Error) -> CoreError {
+    let message = error.to_string();
+    let status = if message.contains("not-found") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("invalid") || message.contains("not-empty") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::CONFLICT
+    };
+    let code = message.replace('-', "_");
+    CoreError::coded(status, &code, message)
+}
+
 thread_local! {
     /// Per-blocking-thread cached read connection. Read handlers run on
     /// Tokio's blocking pool, whose threads are reused across requests, so
@@ -717,7 +1034,8 @@ where
         // In-memory / test database: no separate read connection exists, so run
         // the read on the single writer connection (the only connection there is).
         let inner = state
-            .writer
+            .writer()
+            .expect("active library writer")
             .write(move |database: &mut Database| Ok(operation(database)))
             .await;
         return match inner {
@@ -742,7 +1060,8 @@ where
     // `anyhow::Result` as an inner `Ok(ApiResult<T>)` so a `CoreError` (with its
     // HTTP status) survives the boundary intact.
     let inner = state
-        .writer
+        .writer()
+        .expect("active library writer")
         .write(move |database: &mut Database| Ok(operation(database)))
         .await;
     match inner {
@@ -770,7 +1089,9 @@ async fn get_health() -> Json<HealthResponse> {
 }
 
 async fn list_roots(State(state): State<AppState>) -> ApiResult<Json<ListResponse<RootRecord>>> {
-    let reach = state.root_reachability.clone();
+    let reach = state
+        .root_reachability()
+        .expect("active library reachability");
     let mut items = run_read_database(state, |database| Ok(database.list_roots()?)).await?;
     if let Ok(map) = reach.lock() {
         for item in items.iter_mut() {
@@ -1008,7 +1329,8 @@ async fn get_thumbnail(
     // construction (the old code ran this on a separate connection that fought
     // ~14 other writers for the lock). The enqueue is idempotent; an
     // already-pending task is returned so its worker gets a (deduped) wakeup.
-    let (thumbnail, queued_task) = state
+    let resources = state.resources().expect("active library resources");
+    let (thumbnail, queued_task) = resources
         .writer
         .write(move |database| {
             let thumbnail = database
@@ -1200,7 +1522,8 @@ async fn enqueue_thumbnail_cache(
     if refresh_mode == ThumbnailCacheRefreshMode::RetryFailedAndStale {
         if let Some(root_id) = scope.root_id {
             let is_reachable = state
-                .root_reachability
+                .root_reachability()
+                .expect("active library reachability")
                 .lock()
                 .map(|guard| *guard.get(&root_id).unwrap_or(&true))
                 .unwrap_or(true);
@@ -1474,8 +1797,8 @@ async fn serve_cached_preview_webp(
             // using that pool. Acquired BEFORE the spawn so waiters queue on a
             // cheap future rather than on a thread.
             let _decode_permit = state
-                .preview_decode_gate
-                .clone()
+                .preview_decode_gate()
+                .expect("active library preview gate")
                 .acquire_owned()
                 .await
                 .map_err(|_| CoreError::internal("preview decode gate closed".to_string()))?;
@@ -1764,7 +2087,7 @@ async fn rename_file(
     Json(payload): Json<RenameRequestBody>,
 ) -> ApiResult<Json<FileOperationRecord>> {
     let database = fsops_database(&state)?.clone();
-    let writer = state.writer.clone();
+    let writer = state.writer().expect("active library writer");
     let record = tokio::task::spawn_blocking(move || {
         fsops::rename_with_writer(
             &database,
@@ -1787,7 +2110,7 @@ async fn move_files(
     Json(payload): Json<MoveRequestBody>,
 ) -> ApiResult<Json<FileOperationsResponse>> {
     let database = fsops_database(&state)?.clone();
-    let writer = state.writer.clone();
+    let writer = state.writer().expect("active library writer");
     let operations = tokio::task::spawn_blocking(move || {
         fsops::move_items_with_writer(
             &database,
@@ -1810,7 +2133,7 @@ async fn delete_files(
     Json(payload): Json<DeleteRequestBody>,
 ) -> ApiResult<Json<FileOperationsResponse>> {
     let database = fsops_database(&state)?.clone();
-    let writer = state.writer.clone();
+    let writer = state.writer().expect("active library writer");
     let operations = tokio::task::spawn_blocking(move || {
         fsops::delete_with_writer(
             &database,
@@ -1838,7 +2161,8 @@ async fn list_file_operations(
             "limit must be between 1 and 200: {limit}"
         )));
     }
-    let page = fsops::list_recent(fsops_database(&state)?, limit, query.cursor.as_deref())
+    let database = fsops_database(&state)?;
+    let page = fsops::list_recent(database.as_ref(), limit, query.cursor.as_deref())
         .map_err(map_fsops_error)?;
     Ok(Json(ListResponse {
         items: page.items,
@@ -1885,7 +2209,10 @@ async fn list_notification_outbox(
     // `notify_waiters` does not retain a permit. Register first, then repeat the
     // read to close the commit window between the initial empty query and this
     // waiter becoming visible to producers.
-    let notified = state.notification_outbox_wake.notified();
+    let notification_outbox_wake = state
+        .notification_outbox_wake()
+        .expect("active library outbox wake");
+    let notified = notification_outbox_wake.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
     let items = read_notification_outbox(&state, after_sequence, limit).await?;
@@ -1910,7 +2237,9 @@ async fn read_notification_outbox(
     after_sequence: i64,
     limit: i64,
 ) -> ApiResult<Vec<NotificationOutboxEvent>> {
-    let read_permit = Arc::clone(&state.notification_outbox_read_gate)
+    let read_permit = state
+        .notification_outbox_read_gate()
+        .expect("active library outbox gate")
         .acquire_owned()
         .await
         .map_err(|_| {
@@ -2004,7 +2333,8 @@ async fn discover_plugins(
     // The locked variant performs the disk walk before acquiring the
     // mutex, then reacquires per upsert. This keeps other API endpoints
     // responsive while a large `plugins/` directory is enumerated.
-    let report = plugins::discover_and_persist_locked(fsops_database(&state)?, &plugins_dir)?;
+    let database = fsops_database(&state)?;
+    let report = plugins::discover_and_persist_locked(database.as_ref(), &plugins_dir)?;
     let errors = report
         .errors
         .into_iter()
@@ -2097,20 +2427,23 @@ fn not_found_plugin(plugin_id: &str) -> CoreError {
 /// The dedicated write connection for the infrequent file-operations and
 /// plugin-discovery paths (which take a `&Mutex<Database>`). Absent only for
 /// in-memory/test databases; those tests don't exercise fsops.
-fn fsops_database(state: &AppState) -> ApiResult<&std::sync::Arc<std::sync::Mutex<Database>>> {
-    state.fsops_database.as_ref().ok_or_else(|| {
-        CoreError::from(anyhow::anyhow!(
-            "file operations are unavailable without a file-backed database"
-        ))
-    })
+fn fsops_database(state: &AppState) -> ApiResult<std::sync::Arc<std::sync::Mutex<Database>>> {
+    state
+        .fsops_database()
+        .map_err(CoreError::from)?
+        .ok_or_else(|| {
+            CoreError::from(anyhow::anyhow!(
+                "file operations are unavailable without a file-backed database"
+            ))
+        })
 }
 
 fn resolve_plugins_dir(state: &AppState) -> std::path::PathBuf {
     // Prefer the directory the startup code already resolved against the
     // active database path. Falling back to the env var or `./plugins`
     // would diverge from `main.rs` and was the root cause of Batch G HIGH 1.
-    if let Some(configured) = state.plugins_dir.as_ref() {
-        return configured.clone();
+    if let Ok(Some(configured)) = state.plugins_dir() {
+        return configured;
     }
     // Defensive fallback for callers that built `AppState` without going
     // through `router_with_config` (test helpers, the deprecated `router`
@@ -2496,7 +2829,11 @@ fn thumbnail_task_wakeup_key(
     _attempt_generation: i64,
     task_priority: i64,
 ) -> (usize, i64, i64) {
-    (state.writer.instance_id(), task_id, task_priority)
+    (
+        state.writer().expect("active library writer").instance_id(),
+        task_id,
+        task_priority,
+    )
 }
 
 fn claim_thumbnail_task_wakeup(key: (usize, i64, i64)) -> bool {
@@ -2673,7 +3010,11 @@ fn parse_user_metadata_patch(value: &serde_json::Value) -> ApiResult<UserMetadat
 }
 
 async fn enqueue_task(state: &AppState, task_id: i64, attempt_generation: i64) -> ApiResult<()> {
-    match state.task_queue.try_send(task_id) {
+    match state
+        .task_queue()
+        .expect("active library task queue")
+        .try_send(task_id)
+    {
         Ok(()) => Ok(()),
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             // The task row is already durable. If the worker channel is full,
@@ -2682,7 +3023,13 @@ async fn enqueue_task(state: &AppState, task_id: i64, attempt_generation: i64) -
             // on later incidental drain ticks to start.
             let state = state.clone();
             tokio::spawn(async move {
-                if state.task_queue.send(task_id).await.is_err() {
+                if state
+                    .task_queue()
+                    .expect("active library task queue")
+                    .send(task_id)
+                    .await
+                    .is_err()
+                {
                     let error = anyhow::anyhow!("background task queue is closed");
                     let _ = run_shared_database(state, move |database| {
                         database
@@ -2765,10 +3112,9 @@ fn fallback_display_name(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Method, Request, StatusCode};
@@ -3001,7 +3347,9 @@ mod tests {
 
         // A fresh probe of the real (existing) path reports reachable.
         crate::roots::reachability::refresh_root_reachability(
-            &state.root_reachability,
+            &state
+                .root_reachability()
+                .expect("active library reachability"),
             &[(root_id, real_path)],
         );
         let body = get_roots_json(&app).await;
@@ -3011,10 +3359,10 @@ mod tests {
         // Force the cache to report unreachable (simulating an offline probe)
         // and confirm `list_roots` overlays it onto the DB-default `true`.
         {
-            let mut guard = state
-                .root_reachability
-                .lock()
-                .expect("lock reachability cache");
+            let reachability = state
+                .root_reachability()
+                .expect("active reachability cache");
+            let mut guard = reachability.lock().expect("lock reachability cache");
             guard.insert(root_id, false);
         }
         let body = get_roots_json(&app).await;
@@ -3058,23 +3406,7 @@ mod tests {
         let (root_id, file_ids) = seed_media_files_in_one_root(&database, &["a.jpg"]);
         let file_id = file_ids[0];
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-        let state = AppState {
-            writer: crate::db::DbWriter::spawn(database),
-            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::api::PREVIEW_DECODE_CONCURRENCY,
-            )),
-            notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue: sender,
-            plugins_dir: None,
-            read_database_path: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = AppState::new_with_task_queue(database, sender);
         let app = router(state.clone());
 
         // GET /thumbnail on a pending row requests generation through the single
@@ -3101,7 +3433,8 @@ mod tests {
         let _ = root_id;
 
         let tasks = state
-            .writer
+            .writer()
+            .expect("active library writer")
             .write(|database| Ok(database.list_tasks()?))
             .await
             .expect("list tasks");
@@ -3860,23 +4193,7 @@ mod tests {
             .task_id
             .expect("pending task id");
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-        let state = AppState {
-            writer: crate::db::DbWriter::spawn(database),
-            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::api::PREVIEW_DECODE_CONCURRENCY,
-            )),
-            notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue: sender,
-            plugins_dir: None,
-            read_database_path: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = AppState::new_with_task_queue(database, sender);
         let app = router(state.clone());
 
         let response = app
@@ -3942,23 +4259,7 @@ mod tests {
             .task_id
             .expect("visible task id");
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-        let state = AppState {
-            writer: crate::db::DbWriter::spawn(database),
-            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::api::PREVIEW_DECODE_CONCURRENCY,
-            )),
-            notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue: sender,
-            plugins_dir: None,
-            read_database_path: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = AppState::new_with_task_queue(database, sender);
         let app = router(state.clone());
 
         let response = app
@@ -4482,7 +4783,8 @@ mod tests {
             .expect("classify seeded failure as transient");
         let state = AppState::new(database);
         state
-            .root_reachability
+            .root_reachability()
+            .expect("active reachability cache")
             .lock()
             .expect("lock reachability cache")
             .insert(root_id, false);
@@ -4529,7 +4831,8 @@ mod tests {
         // probe's next 30s tick clearing a transient NAS blip). The same
         // request now falls through to the existing enqueue behavior.
         state
-            .root_reachability
+            .root_reachability()
+            .expect("active reachability cache")
             .lock()
             .expect("lock reachability cache")
             .insert(root_id, true);
@@ -4586,7 +4889,8 @@ mod tests {
         );
         let state = AppState::new(database);
         state
-            .root_reachability
+            .root_reachability()
+            .expect("active reachability cache")
             .lock()
             .expect("lock reachability cache")
             .insert(root_id, false);
@@ -4936,23 +5240,7 @@ mod tests {
             })
             .expect("insert stale fingerprint failed thumbnail");
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-        let state = AppState {
-            writer: crate::db::DbWriter::spawn(database),
-            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::api::PREVIEW_DECODE_CONCURRENCY,
-            )),
-            notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue: sender,
-            plugins_dir: None,
-            read_database_path: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = AppState::new_with_task_queue(database, sender);
         let app = router(state);
 
         for file_id in [null_failed_file_id, stale_failed_file_id] {
@@ -5063,23 +5351,7 @@ mod tests {
             .expect("add root");
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         sender.try_send(-1).expect("fill worker queue");
-        let state = AppState {
-            writer: crate::db::DbWriter::spawn(database),
-            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::api::PREVIEW_DECODE_CONCURRENCY,
-            )),
-            notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue: sender,
-            plugins_dir: None,
-            read_database_path: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = AppState::new_with_task_queue(database, sender);
         let app = router(state);
 
         let response = tokio::time::timeout(
@@ -5435,7 +5707,8 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let (roots, tasks) = state
-            .writer
+            .writer()
+            .expect("active library writer")
             .write(|database| Ok((database.list_roots(), database.list_tasks())))
             .await
             .expect("read state for assertion");
@@ -5482,23 +5755,7 @@ mod tests {
         // here: for an in-memory database it drops the receiver immediately,
         // which closes the channel and makes enqueue fail hard.
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        let state = AppState {
-            writer: crate::db::DbWriter::spawn(database),
-            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::api::PREVIEW_DECODE_CONCURRENCY,
-            )),
-            notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue: sender,
-            plugins_dir: None,
-            read_database_path: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = AppState::new_with_task_queue(database, sender);
         let app = router(state);
 
         let response = app
@@ -5579,23 +5836,7 @@ mod tests {
         // above, so the enqueued tasks are created and accepted but never run
         // and the removed root stays pending-delete for the duration of the test.
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        let state = AppState {
-            writer: crate::db::DbWriter::spawn(database),
-            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::api::PREVIEW_DECODE_CONCURRENCY,
-            )),
-            notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue: sender,
-            plugins_dir: None,
-            read_database_path: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = AppState::new_with_task_queue(database, sender);
         let app = router(state);
 
         let response = app
@@ -5833,23 +6074,7 @@ mod tests {
             .expect("add root");
         let (_sender, receiver) = tokio::sync::mpsc::channel(1);
         drop(receiver);
-        let state = AppState {
-            writer: crate::db::DbWriter::spawn(database),
-            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::api::PREVIEW_DECODE_CONCURRENCY,
-            )),
-            notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue: _sender,
-            plugins_dir: None,
-            read_database_path: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = AppState::new_with_task_queue(database, _sender);
         let app = router(state.clone());
 
         let response = app
@@ -5868,7 +6093,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         let tasks = state
-            .writer
+            .writer()
+            .expect("active library writer")
             .write(|database| Ok(database.list_tasks()?))
             .await
             .expect("list tasks");
@@ -5895,23 +6121,7 @@ mod tests {
             .create_root_scan_task(root_id)
             .expect("create task");
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-        let state = AppState {
-            writer: crate::db::DbWriter::spawn(database),
-            notification_outbox_wake: Arc::new(tokio::sync::Notify::new()),
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(
-                crate::api::PREVIEW_DECODE_CONCURRENCY,
-            )),
-            notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue: sender,
-            plugins_dir: None,
-            read_database_path: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = AppState::new_with_task_queue(database, sender);
         let app = router(state.clone());
 
         let cancel_response = app
@@ -5950,7 +6160,8 @@ mod tests {
         assert_eq!(receiver.try_recv().expect("retry enqueued task"), task_id);
 
         let task = state
-            .writer
+            .writer()
+            .expect("active library writer")
             .write(move |database| {
                 database
                     .get_task(task_id)?
@@ -6150,7 +6361,7 @@ mod tests {
                     .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
                     .header(
                         header::ACCESS_CONTROL_REQUEST_HEADERS,
-                        "content-type,x-megle-session",
+                        "content-type,x-megle-session,x-megle-context-revision",
                     )
                     .body(Body::empty())
                     .expect("build request"),
@@ -6171,6 +6382,7 @@ mod tests {
             .to_ascii_lowercase();
         assert!(allow_headers.contains("content-type"));
         assert!(allow_headers.contains("x-megle-session"));
+        assert!(allow_headers.contains("x-megle-context-revision"));
         let allow_methods = response
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_METHODS)
@@ -6763,10 +6975,9 @@ mod tests {
             .expect("upsert file");
         let state = AppState::new(database);
         let fsops_database = state
-            .fsops_database
-            .as_ref()
-            .expect("file-backed fsops database")
-            .clone();
+            .fsops_database()
+            .expect("read fsops database")
+            .expect("file-backed fsops database");
         let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
         let lock_holder = std::thread::spawn(move || {
@@ -7638,8 +7849,10 @@ mod tests {
     async fn notification_outbox_route_bounds_one_hundred_waiters_and_wakes_every_page() {
         const WAITER_COUNT: usize = 100;
         let mut state = AppState::new(test_database());
-        let writer = state.writer.clone();
-        let read_gate = Arc::clone(&state.notification_outbox_read_gate);
+        let writer = state.writer().expect("active library writer");
+        let read_gate = state
+            .notification_outbox_read_gate()
+            .expect("active library outbox gate");
         let (probe, mut read_started, mut waiter_registered) =
             NotificationOutboxTestProbe::new(true);
         state.notification_outbox_test_probe = Some(Arc::clone(&probe));
@@ -7759,7 +7972,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn notification_outbox_route_cancellation_releases_read_gate_permit() {
         let mut state = AppState::new(test_database());
-        let read_gate = Arc::clone(&state.notification_outbox_read_gate);
+        let read_gate = state
+            .notification_outbox_read_gate()
+            .expect("active library outbox gate");
         let (probe, mut read_started, _waiter_registered) = NotificationOutboxTestProbe::new(true);
         state.notification_outbox_test_probe = Some(Arc::clone(&probe));
         let app = router(state);
@@ -7797,7 +8012,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn notification_outbox_route_cancellation_unregisters_waiter_without_holding_read_gate() {
         let mut state = AppState::new(test_database());
-        let read_gate = Arc::clone(&state.notification_outbox_read_gate);
+        let read_gate = state
+            .notification_outbox_read_gate()
+            .expect("active library outbox gate");
         let (probe, _read_started, mut waiter_registered) = NotificationOutboxTestProbe::new(false);
         state.notification_outbox_test_probe = Some(Arc::clone(&probe));
         let app = router(state);
@@ -8164,6 +8381,56 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = response_json(response).await;
         assert_eq!(body["code"], "plugin_not_found");
+    }
+
+    #[tokio::test]
+    async fn ordinary_active_library_mutations_reject_missing_and_stale_revision() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
+            .await
+            .unwrap();
+        let manager = state.library_manager.clone().unwrap();
+        let created = manager
+            .create_library(
+                "Revision fence".to_string(),
+                None,
+                None,
+                base.join("managed"),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(created.1);
+        let revision = manager.active_snapshot().context_revision;
+        let app = crate::api::router_with_state(state, crate::api::ApiConfig::default());
+        let request = |revision_header: Option<u64>| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/api/tags")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(revision) = revision_header {
+                builder = builder.header("x-megle-context-revision", revision.to_string());
+            }
+            builder
+                .body(Body::from(r#"{"name":"fenced","color":null}"#))
+                .unwrap()
+        };
+        for stale in [None, Some(revision.saturating_sub(1))] {
+            let response = app.clone().oneshot(request(stale)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response_json(response).await["code"],
+                "stale_library_context"
+            );
+        }
+        let response = app.clone().oneshot(request(Some(revision))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        if let Some(runtime) = manager.active_snapshot().runtime {
+            runtime.shutdown().await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]

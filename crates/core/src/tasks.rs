@@ -41,6 +41,29 @@ const IDLE_PENDING_TASK_DRAIN_INTERVAL_MS: u64 = 250;
 
 pub type TaskSender = mpsc::Sender<i64>;
 
+pub struct TaskWorkerHandle {
+    sender: TaskSender,
+    cancellation: tokio_util::sync::CancellationToken,
+    join_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl TaskWorkerHandle {
+    pub fn sender(&self) -> TaskSender {
+        self.sender.clone()
+    }
+
+    /// Close intake and wait for already-dispatched work to reach its durable
+    /// completion boundary before the owning Library runtime is released.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.cancellation.cancel();
+        if let Some(join) = self.join_handle.lock().await.take() {
+            join.await
+                .map_err(|error| anyhow::anyhow!("task worker join failed: {error}"))?;
+        }
+        Ok(())
+    }
+}
+
 struct ThumbnailWorkerPermits {
     selected: Arc<Semaphore>,
     foreground: Arc<Semaphore>,
@@ -200,6 +223,8 @@ fn invoke_thumbnail_processing_checkpoint_hook(_task_id: i64, _database_path: Op
 #[cfg(not(test))]
 fn invoke_worker_task_hook(_kind: &str, _task_id: i64, _database_path: Option<&Path>) {}
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn start_worker(worker_database: Database, writer: DbWriter) -> TaskSender {
     start_worker_with_ffmpeg(
         worker_database,
@@ -211,11 +236,28 @@ pub fn start_worker(worker_database: Database, writer: DbWriter) -> TaskSender {
 /// Variant that lets callers (and tests) decide whether the worker should
 /// attempt video poster generation. Used by Core startup to detect ffmpeg
 /// once and forward the result without re-spawning per task.
+#[cfg(test)]
 pub fn start_worker_with_ffmpeg(
     worker_database: Database,
     writer: DbWriter,
     ffmpeg_available: bool,
 ) -> TaskSender {
+    start_managed_worker_with_ffmpeg(worker_database, writer, ffmpeg_available).sender()
+}
+
+pub fn start_managed_worker(worker_database: Database, writer: DbWriter) -> TaskWorkerHandle {
+    start_managed_worker_with_ffmpeg(
+        worker_database,
+        writer,
+        crate::thumbnails::ffmpeg_available(),
+    )
+}
+
+fn start_managed_worker_with_ffmpeg(
+    worker_database: Database,
+    writer: DbWriter,
+    ffmpeg_available: bool,
+) -> TaskWorkerHandle {
     if !ffmpeg_available {
         tracing::warn!(
             "ffmpeg binary not found on PATH; video thumbnail tasks will fail with \"{FFMPEG_NOT_AVAILABLE_ERROR}\""
@@ -280,7 +322,9 @@ pub fn start_worker_with_ffmpeg(
         background: Arc::new(Semaphore::new(THUMBNAIL_BACKGROUND_WORKER_CONCURRENCY)),
     };
     let non_thumbnail_permit = Arc::new(Semaphore::new(1));
-    tokio::spawn(async move {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let join_handle = tokio::spawn(async move {
         let mut in_flight_thumbnail_task_ids = HashSet::new();
         let mut in_flight_non_thumbnail_task_ids = HashSet::new();
         schedule_pending_worker_tasks_with_concurrency(
@@ -308,6 +352,10 @@ pub fn start_worker_with_ffmpeg(
             }
 
             tokio::select! {
+                _ = worker_cancellation.cancelled(), if !receiver_closed => {
+                    receiver.close();
+                    receiver_closed = true;
+                }
                 maybe_completed_task_id = task_completion_receiver.recv() => {
                     if let Some(completed_task_id) = maybe_completed_task_id {
                         in_flight_thumbnail_task_ids.remove(&completed_task_id);
@@ -369,7 +417,11 @@ pub fn start_worker_with_ffmpeg(
             }
         }
     });
-    sender
+    TaskWorkerHandle {
+        sender,
+        cancellation,
+        join_handle: tokio::sync::Mutex::new(Some(join_handle)),
+    }
 }
 
 #[cfg(test)]

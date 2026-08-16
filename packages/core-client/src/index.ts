@@ -1,13 +1,16 @@
-export { CoreApiError, createCoreClient } from "./client";
+export { CoreApiError, createCoreClient } from "./client.ts";
 export type {
   CoreClientConfig,
   CoreRequestPriority,
   PreviewResource,
   PreviewResourceOptions
-} from "./client";
+} from "./client.ts";
 export type {
   AcceptedRootResponse,
+  ActiveLibraryResponse,
   AddFileTagRequest,
+  CreateLibraryRequest,
+  CreateLibraryResponse,
   CreateTagRequest,
   DeletePluginResponse,
   ThumbnailCacheCancelBulkResponse,
@@ -29,6 +32,15 @@ export type {
   FileOperationsResponse,
   FileTagsResponse,
   FolderRecord,
+  LibraryAvailability,
+  LibraryBindingState,
+  LibraryErrorResponse,
+  LibraryLifecycleState,
+  LibraryListResponse,
+  LibraryPreflightReason,
+  LibraryPreflightRequest,
+  LibraryPreflightResponse,
+  LibrarySummary,
   ListFileOperationsParams,
   ListFolderChildrenParams,
   ListMediaParams,
@@ -67,5 +79,6 @@ export type {
   ThumbnailPriorityScopeSyncRequest,
   ThumbnailResponse,
   UserMetadataRecord,
-  UserMetadataUpdate
-} from "./generated-contract";
+  UserMetadataUpdate,
+  UpdateLibraryRequest
+} from "./generated-contract.ts";

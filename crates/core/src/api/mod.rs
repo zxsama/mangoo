@@ -1,14 +1,14 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::Request;
 use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
+use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use tower_http::cors::CorsLayer;
@@ -16,9 +16,9 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::db::{Database, DbWriter, ThumbnailCacheRefreshMode, ThumbnailCacheScope};
+use crate::host_registry::HostRegistry;
+use crate::library_manager::{ActiveSnapshot, LibraryManager, LibraryRuntimeResources};
 use crate::roots::reachability::{refresh_root_reachability, RootReachability};
-use crate::tasks::{start_worker, TaskSender};
-use crate::watch::{start_watcher, WatcherHandle};
 
 pub mod routes;
 
@@ -140,125 +140,132 @@ impl Drop for NotificationOutboxTestActivity {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub writer: DbWriter,
-    pub(crate) notification_outbox_wake: Arc<tokio::sync::Notify>,
-    /// Bounds only the short SQLite reads around long polling. Requests release
-    /// their permit before awaiting `notification_outbox_wake`, so the desktop
-    /// drain loop is never pinned behind idle waiters.
-    pub(crate) notification_outbox_read_gate: Arc<tokio::sync::Semaphore>,
-    /// Bounds concurrent preview decodes.
-    ///
-    /// Every thumbnail decode already runs under a per-bucket semaphore; the
-    /// preview route had none, so one bare `spawn_blocking` per request could
-    /// stack unboundedly on the shared blocking pool — each holding a full
-    /// decoded image (hundreds of MB for a large source) and delaying every
-    /// read route sharing that pool. `spawn_blocking` is also uncancellable, so
-    /// a client that navigated away still pays for its decode to completion.
-    pub(crate) preview_decode_gate: Arc<tokio::sync::Semaphore>,
+    // Runtime-owned equivalent: notification_outbox_wake: Arc<tokio::sync::Notify>
+    active: Arc<std::sync::RwLock<ActiveSnapshot>>,
+    request_gate: Arc<tokio::sync::RwLock<()>>,
+    pub library_manager: Option<Arc<LibraryManager>>,
     #[cfg(test)]
     pub(crate) notification_outbox_test_probe: Option<Arc<NotificationOutboxTestProbe>>,
-    /// A reopened connection used for file-operation preflight reads and plugin
-    /// discovery. File-operation journal writes are submitted as short jobs to
-    /// `writer`; filesystem syscalls run outside both connections on Tokio's
-    /// blocking pool. `None` for in-memory/test databases.
-    pub fsops_database: Option<Arc<std::sync::Mutex<Database>>>,
-    pub task_queue: TaskSender,
-    read_database_path: Option<PathBuf>,
-    /// Resolved at startup so route handlers (notably
-    /// `POST /api/plugins/discover`) agree with `main.rs` on where to look
-    /// for plugin manifests. `None` when the API is built without a
-    /// configured directory; the handler falls back to the same default
-    /// rules as startup.
-    pub plugins_dir: Option<PathBuf>,
-    _watcher: Option<Arc<WatcherHandle>>,
-    /// Per-root reachability cache, refreshed by a background probe every 30s
-    /// (started in `router_with_config`) and overlaid onto `RootRecord.reachable`
-    /// by `routes::list_roots`. Absent root ids default to reachable (`true`) so
-    /// a not-yet-probed root never reads as offline right after cold start.
-    pub root_reachability: RootReachability,
 }
 
 impl AppState {
-    pub fn new(database: Database) -> Self {
-        if let Some(worker_database) = database.reopen().expect("reopen worker database") {
-            return Self::new_with_worker(database, worker_database);
-        }
-
-        // In-memory/test DB: no reopen possible, so the writer owns the sole
-        // connection and reads fall back to it (no read_database_path).
-        flush_notification_outbox_at_startup(&database);
-        if let Err(error) = database.recover_interrupted_notification_operations() {
-            tracing::error!(
-                %error,
-                "startup notification recovery failed; Core will continue with observable pending state"
-            );
-        }
-        let notification_outbox_wake = database.notification_outbox_wake();
-        let (task_queue, receiver) = tokio::sync::mpsc::channel(1);
-        drop(receiver);
+    #[cfg(test)]
+    pub(crate) fn new_with_task_queue(
+        database: Database,
+        task_queue: crate::tasks::TaskSender,
+    ) -> Self {
+        let runtime = LibraryRuntimeResources::from_database_with_task_queue(database, task_queue);
         Self {
-            writer: DbWriter::spawn(database),
-            notification_outbox_wake,
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(PREVIEW_DECODE_CONCURRENCY)),
-            #[cfg(test)]
+            active: Arc::new(std::sync::RwLock::new(ActiveSnapshot {
+                library_uuid: None,
+                context_revision: 0,
+                runtime_generation: runtime.runtime_generation,
+                runtime: Some(runtime),
+            })),
+            request_gate: Arc::new(tokio::sync::RwLock::new(())),
+            library_manager: None,
             notification_outbox_test_probe: None,
-            fsops_database: None,
-            task_queue,
-            read_database_path: None,
-            plugins_dir: None,
-            _watcher: None,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn new_with_worker(database: Database, worker_database: Database) -> Self {
-        flush_notification_outbox_at_startup(&database);
-        let notification_outbox_wake = database.notification_outbox_wake();
-        let read_database_path = database.path().map(Path::to_path_buf);
-        let watcher_database = database.reopen().expect("reopen watcher database");
-        // Reopened before `database` is moved into the writer. File operations
-        // use it only for preflight reads; their journal writes use `writer`.
-        // Plugin discovery retains its existing dedicated-connection boundary.
-        let fsops_database = database
-            .reopen()
-            .expect("reopen fsops database")
-            .map(|db| Arc::new(std::sync::Mutex::new(db)));
-        // The primary connection becomes the single writer. The worker + watcher
-        // keep their own connections for READ/scheduling only; every hot-path
-        // write goes through this handle, so there is one WAL writer for the
-        // contended path and no lock contention.
-        let writer = DbWriter::spawn(database);
-        let task_queue = start_worker(worker_database, writer.clone());
-        let watcher = watcher_database.map(|watcher_database| {
-            Arc::new(start_watcher(
-                watcher_database,
-                task_queue.clone(),
-                writer.clone(),
-            ))
-        });
+    pub fn new(database: Database) -> Self {
+        // LibraryRuntimeResources obtains database.notification_outbox_wake()
+        let runtime = LibraryRuntimeResources::from_database(None, 1, database, None)
+            .expect("construct library runtime");
         Self {
-            writer,
-            notification_outbox_wake,
-            notification_outbox_read_gate: Arc::new(tokio::sync::Semaphore::new(
-                NOTIFICATION_OUTBOX_READ_CONCURRENCY,
-            )),
-            preview_decode_gate: Arc::new(tokio::sync::Semaphore::new(PREVIEW_DECODE_CONCURRENCY)),
+            active: Arc::new(std::sync::RwLock::new(ActiveSnapshot {
+                library_uuid: None,
+                context_revision: 0,
+                runtime_generation: runtime.runtime_generation,
+                runtime: Some(runtime),
+            })),
+            request_gate: Arc::new(tokio::sync::RwLock::new(())),
+            library_manager: None,
             #[cfg(test)]
             notification_outbox_test_probe: None,
-            fsops_database,
-            task_queue,
-            read_database_path,
-            plugins_dir: None,
-            _watcher: watcher,
-            root_reachability: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_worker(database: Database, worker_database: Database) -> Self {
+        drop(worker_database);
+        Self::new(database)
+    }
+
+    pub async fn new_host(registry_path: PathBuf, libraries_dir: PathBuf) -> anyhow::Result<Self> {
+        let registry = Arc::new(HostRegistry::open(registry_path)?);
+        let active = Arc::new(std::sync::RwLock::new(ActiveSnapshot {
+            library_uuid: None,
+            context_revision: 0,
+            runtime_generation: 0,
+            runtime: None,
+        }));
+        let request_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let manager = Arc::new(LibraryManager::new(
+            registry,
+            libraries_dir,
+            Arc::clone(&active),
+            Arc::clone(&request_gate),
+        ));
+        let state = Self {
+            active,
+            request_gate,
+            library_manager: Some(Arc::clone(&manager)),
+            #[cfg(test)]
+            notification_outbox_test_probe: None,
+        };
+        manager.restore_active().await?;
+        Ok(state)
+    }
+
+    pub fn resources(&self) -> anyhow::Result<Arc<LibraryRuntimeResources>> {
+        self.active
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .runtime
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no-active-library"))
+    }
+
+    pub fn writer(&self) -> anyhow::Result<DbWriter> {
+        Ok(self.resources()?.writer.clone())
+    }
+
+    pub fn task_queue(&self) -> anyhow::Result<crate::tasks::TaskSender> {
+        Ok(self.resources()?.task_queue.clone())
+    }
+
+    pub fn notification_outbox_wake(&self) -> anyhow::Result<Arc<tokio::sync::Notify>> {
+        Ok(Arc::clone(&self.resources()?.notification_outbox_wake))
+    }
+
+    pub fn notification_outbox_read_gate(&self) -> anyhow::Result<Arc<tokio::sync::Semaphore>> {
+        Ok(Arc::clone(&self.resources()?.notification_outbox_read_gate))
+    }
+
+    pub fn preview_decode_gate(&self) -> anyhow::Result<Arc<tokio::sync::Semaphore>> {
+        Ok(Arc::clone(&self.resources()?.preview_decode_gate))
+    }
+
+    pub fn fsops_database(&self) -> anyhow::Result<Option<Arc<std::sync::Mutex<Database>>>> {
+        Ok(self.resources()?.fsops_database.clone())
+    }
+
+    pub fn plugins_dir(&self) -> anyhow::Result<Option<PathBuf>> {
+        Ok(self.resources()?.plugins_dir.clone())
+    }
+
+    pub fn root_reachability(&self) -> anyhow::Result<RootReachability> {
+        Ok(self.resources()?.root_reachability.clone())
+    }
+
+    pub fn request_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.request_gate)
     }
 
     pub fn open_read_database(&self) -> anyhow::Result<Option<Database>> {
-        let Some(path) = &self.read_database_path else {
+        let resources = self.resources()?;
+        let Some(path) = &resources.read_database_path else {
             return Ok(None);
         };
         Ok(Some(Database::open(path)?))
@@ -268,10 +275,12 @@ impl AppState {
     /// file-backed). In-memory/test databases return `false`, and read
     /// handlers fall back to the shared connection.
     pub fn has_read_database(&self) -> bool {
-        self.read_database_path.is_some()
+        self.resources()
+            .is_ok_and(|resources| resources.read_database_path.is_some())
     }
 }
 
+#[allow(dead_code)]
 fn flush_notification_outbox_at_startup(database: &Database) {
     if let Err(error) = database.flush_dirty_notification_heads() {
         tracing::error!(
@@ -292,11 +301,6 @@ pub struct ApiConfig {
     /// When set, every request except `/api/health` requires HTTP Basic auth
     /// with these credentials. Format is `(user, pass)`.
     pub basic_auth: Option<BasicAuthCredentials>,
-    /// Plugins directory resolved at startup. Threaded into [`AppState`] so
-    /// the `POST /api/plugins/discover` handler agrees with the path
-    /// `main.rs` walked at startup. `None` falls back to the same default
-    /// (`<db_path.parent>/plugins`, then `./plugins`) inside the handler.
-    pub plugins_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -329,30 +333,38 @@ pub fn router(database: Database) -> Router {
 }
 
 pub fn router_with_config(database: Database, config: ApiConfig) -> Router {
-    let mut state = AppState::new(database);
-    state.plugins_dir = config.plugins_dir.clone();
+    let state = AppState::new(database);
+    router_with_state(state, config)
+}
+
+pub fn router_with_state(state: AppState, config: ApiConfig) -> Router {
     // Debug self-test: submit a trivial write through the writer actor right at
     // startup (independent of any client) and log the outcome, so a deadlocked
     // actor is diagnosable without the renderer. Gated by the master debug flag.
     if crate::debug::enabled() {
-        let writer = state.writer.clone();
-        tokio::spawn(async move {
-            crate::debug_log!("writer-selftest submitting startup probe write");
-            let started = std::time::Instant::now();
-            let result = writer.write(|db| Ok(db.list_tags()?.len())).await;
-            crate::debug_log!(
-                "writer-selftest probe write returned in {}ms: {:?}",
-                started.elapsed().as_millis(),
-                result.as_ref().map(|n| *n).map_err(|e| e.to_string())
-            );
-        });
+        if let Ok(writer) = state.writer() {
+            tokio::spawn(async move {
+                crate::debug_log!("writer-selftest submitting startup probe write");
+                let started = std::time::Instant::now();
+                let result = writer.write(|db| Ok(db.list_tags()?.len())).await;
+                crate::debug_log!(
+                    "writer-selftest probe write returned in {}ms: {:?}",
+                    started.elapsed().as_millis(),
+                    result.as_ref().map(|n| *n).map_err(|e| e.to_string())
+                );
+            });
+        }
     }
-    spawn_root_reachability_probe(&state);
-    spawn_transient_retry_sweep(&state);
-    let api_router = routes::router(state).layer(middleware::from_fn_with_state(
-        config.clone(),
-        require_session_token,
-    ));
+    start_runtime_background_tasks(&state);
+    let api_router = routes::router(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state,
+            attach_library_context,
+        ))
+        .layer(middleware::from_fn_with_state(
+            config.clone(),
+            require_session_token,
+        ));
 
     let mut app = api_router;
 
@@ -410,26 +422,48 @@ pub fn router_with_config(database: Database, config: ApiConfig) -> Router {
     }
 }
 
+fn start_runtime_background_tasks(state: &AppState) {
+    let Ok(runtime) = state.resources() else {
+        return;
+    };
+    if !runtime.begin_background_ownership() {
+        return;
+    }
+    let token = runtime.cancellation_token();
+    let probe_state = state.clone();
+    runtime.own_background_task(tokio::spawn(run_root_reachability_probe(
+        probe_state,
+        token,
+    )));
+    let token = runtime.cancellation_token();
+    let sweep_state = state.clone();
+    runtime.own_background_task(tokio::spawn(run_transient_retry_loop(sweep_state, token)));
+}
+
 /// Starts the background reachability probe: refreshes `state.root_reachability`
 /// immediately (so a cold start has real values as soon as possible), then again
 /// every 30s for as long as the process runs. NAS shares flap on transient network
 /// blips; without this loop a root probed unreachable once would stay stuck that
 /// way until the next explicit action, which is what let ~19k thumbnails go
 /// permanently `failed` during a brief outage instead of just skipping a cycle.
-fn spawn_root_reachability_probe(state: &AppState) {
-    let reach = state.root_reachability.clone();
-    let probe_state = state.clone();
-    tokio::spawn(async move {
-        loop {
+async fn run_root_reachability_probe(
+    probe_state: AppState,
+    cancellation: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        if let Ok(reach) = probe_state.root_reachability() {
             match enabled_root_paths(probe_state.clone()).await {
                 Ok(roots) => refresh_root_reachability(&reach, &roots),
                 Err(error) => {
                     tracing::warn!(%error, "root reachability probe: failed to list roots");
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
-    });
+        tokio::select! {
+            _ = cancellation.cancelled() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+        }
+    }
 }
 
 /// Upper bound on how many transient-failure retries this sweep enqueues per
@@ -452,26 +486,33 @@ const TRANSIENT_RETRY_SWEEP_PER_ROOT_LIMIT: usize = 500;
 /// so an offline NAS is never hammered with retry enqueues. A failed sweep
 /// tick is logged and skipped; it never crashes Core, and the next tick tries
 /// again.
-fn spawn_transient_retry_sweep(state: &AppState) {
-    let sweep_state = state.clone();
-    tokio::spawn(async move {
-        loop {
-            let result = sweep_transient_retries(&sweep_state).await;
-            match result {
-                Ok(enqueued_count) if enqueued_count > 0 => {
-                    tracing::info!(
-                        enqueued_count,
-                        "transient retry sweep re-enqueued failed thumbnails"
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "transient retry sweep failed; will retry next tick");
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+async fn run_transient_retry_loop(
+    sweep_state: AppState,
+    cancellation: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        if cancellation.is_cancelled() {
+            break;
         }
-    });
+        let result = sweep_transient_retries(&sweep_state).await;
+        match result {
+            Ok(enqueued_count) if enqueued_count > 0 => {
+                tracing::info!(
+                    enqueued_count,
+                    "transient retry sweep re-enqueued failed thumbnails"
+                );
+            }
+            Ok(_) => {}
+            Err(error) if !cancellation.is_cancelled() => {
+                tracing::warn!(%error, "transient retry sweep failed; will retry next tick");
+            }
+            Err(_) => break,
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+        }
+    }
 }
 
 /// Production driver for the transient-retry sweep, invoked once per tick by
@@ -488,10 +529,13 @@ fn spawn_transient_retry_sweep(state: &AppState) {
 /// sweep as a single writer job via `run_transient_retry_sweep`, the same
 /// kernel the unit tests exercise directly.
 async fn sweep_transient_retries(state: &AppState) -> anyhow::Result<usize> {
+    if state.resources().is_err() {
+        return Ok(0);
+    }
     if !state.has_read_database() {
-        let reach = state.root_reachability.clone();
+        let reach = state.root_reachability()?;
         return state
-            .writer
+            .writer()?
             .write(move |database| run_transient_retry_sweep(database, &reach))
             .await;
     }
@@ -512,7 +556,7 @@ async fn sweep_transient_retries(state: &AppState) -> anyhow::Result<usize> {
     // Snapshot the cache once up front, outside any writer job, rather than
     // holding the lock across the per-root dispatch loop below.
     let reachable_by_root_id: HashMap<i64, bool> = state
-        .root_reachability
+        .root_reachability()?
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default();
@@ -524,7 +568,7 @@ async fn sweep_transient_retries(state: &AppState) -> anyhow::Result<usize> {
             continue;
         }
         enqueued_count += state
-            .writer
+            .writer()?
             .write(move |database| enqueue_transient_retry_for_root(database, root_id))
             .await?;
     }
@@ -598,7 +642,8 @@ pub(crate) fn run_transient_retry_sweep(
 async fn enabled_root_paths(state: AppState) -> anyhow::Result<Vec<(i64, String)>> {
     if !state.has_read_database() {
         return state
-            .writer
+            .writer()
+            .expect("active library writer")
             .write(|database| {
                 Ok(database
                     .list_roots()?
@@ -634,6 +679,7 @@ fn cors_layer(origin: HeaderValue) -> CorsLayer {
         .allow_headers([
             header::CONTENT_TYPE,
             HeaderName::from_static("x-megle-session"),
+            HeaderName::from_static("x-megle-context-revision"),
         ])
         // The renderer and Core are on different loopback PORTS, so every
         // browser request is cross-origin and only CORS-safelisted response
@@ -641,7 +687,79 @@ fn cors_layer(origin: HeaderValue) -> CorsLayer {
         // saw `x-megle-preview-tier` as null and fell back to "original",
         // silently disabling the background sharpening upgrade — a >4096px
         // image would stay at tier resolution no matter how far you zoomed.
-        .expose_headers([HeaderName::from_static("x-megle-preview-tier")])
+        .expose_headers([
+            HeaderName::from_static("x-megle-preview-tier"),
+            HeaderName::from_static("x-megle-library-id"),
+            HeaderName::from_static("x-megle-context-revision"),
+        ])
+}
+
+async fn attach_library_context(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    start_runtime_background_tasks(&state);
+    let is_library_control = request.uri().path().starts_with("/api/libraries");
+    let is_mutation = !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    // Hold the read side of the global request gate before validating the
+    // revision. Otherwise a request can validate A, wait behind an A -> B
+    // activation, and then mutate B with A's revision.
+    let gate = state.request_gate();
+    let request_guard = if is_library_control {
+        None
+    } else {
+        Some(gate.read_owned().await)
+    };
+    if request_guard.is_some() && is_mutation {
+        if let Some(manager) = state.library_manager.as_ref() {
+            let snapshot = manager.active_snapshot();
+            let expected = request
+                .headers()
+                .get("x-megle-context-revision")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            if expected != Some(snapshot.context_revision) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "Active Library context changed; refresh and retry",
+                        "code": "stale_library_context"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if !is_library_control && request.uri().path() != "/api/health" && state.resources().is_err() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "No Library is active on this device",
+                "code": "no_active_library"
+            })),
+        )
+            .into_response();
+    }
+    let _request_guard = request_guard;
+    let mut response = next.run(request).await;
+    if let Some(manager) = state.library_manager.as_ref() {
+        let snapshot = manager.active_snapshot();
+        if let Some(library_uuid) = snapshot.library_uuid {
+            if let Ok(value) = HeaderValue::from_str(&library_uuid) {
+                response.headers_mut().insert("x-megle-library-id", value);
+            }
+        }
+        if let Ok(value) = HeaderValue::from_str(&snapshot.context_revision.to_string()) {
+            response
+                .headers_mut()
+                .insert("x-megle-context-revision", value);
+        }
+    }
+    response
 }
 
 async fn require_session_token(

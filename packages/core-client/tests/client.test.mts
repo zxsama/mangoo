@@ -30,7 +30,7 @@ let originalFetch: typeof fetch;
 let recorded: RecordedRequest[] = [];
 let deferredFetchKeepAlive: ReturnType<typeof setInterval> | null = null;
 
-function mockFetch(responseBody: unknown, status = 200) {
+function mockFetch(responseBody: unknown, status = 200, responseHeaders: Record<string, string> = {}) {
   globalThis.fetch = (async (input: Request | string | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const method = init?.method ?? "GET";
@@ -46,7 +46,7 @@ function mockFetch(responseBody: unknown, status = 200) {
     recorded.push({ url, method, headers, body, signal: init?.signal ?? null });
     return new Response(JSON.stringify(responseBody), {
       status,
-      headers: { "content-type": "application/json" }
+      headers: { "content-type": "application/json", ...responseHeaders }
     });
   }) as typeof fetch;
 }
@@ -759,6 +759,28 @@ describe("createCoreClient", () => {
     assert.deepEqual(JSON.parse(recorded[1].body!), {
       maxSequence: Number.MAX_SAFE_INTEGER
     });
+  });
+
+  test("library mutations attach the observed context revision", async () => {
+    mockFetch({ contextRevision: 8, library: null });
+    await client().activateLibrary("alpha/library", 7);
+    await client().updateLibrary("alpha/library", 8, { name: "Renamed" });
+    await client().removeLocalLibrary("alpha/library", 9);
+
+    assert.deepEqual(recorded.map((request) => request.method), ["POST", "PATCH", "DELETE"]);
+    assert.deepEqual(recorded.map((request) => request.headers["x-megle-context-revision"]), ["7", "8", "9"]);
+    assert.ok(recorded.every((request) => request.url.includes("alpha%2Flibrary")));
+    assert.deepEqual(JSON.parse(recorded[1].body!), { name: "Renamed" });
+  });
+
+  test("ordinary active-library mutations reuse the latest response revision fence", async () => {
+    mockFetch({ items: [] }, 200, { "x-megle-context-revision": "42" });
+    const core = client();
+    await core.listTags();
+    await core.createTag({ name: "fenced", color: null });
+
+    assert.equal(recorded[0].headers["x-megle-context-revision"], undefined);
+    assert.equal(recorded[1].headers["x-megle-context-revision"], "42");
   });
 
   test("plugin endpoints encode the id", async () => {

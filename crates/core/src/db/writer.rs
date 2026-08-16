@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
@@ -17,6 +18,11 @@ struct QueuedJob {
     reply: oneshot::Sender<BoxedResult>,
 }
 
+enum WriterMessage {
+    Job(QueuedJob),
+    Shutdown(oneshot::Sender<()>),
+}
+
 /// Handle to the single-writer actor. Cheap to clone; all clones feed the same
 /// actor thread. Every SQLite write in Core goes through here so the one WAL
 /// writer lock is never contended — `database is locked` becomes impossible and
@@ -27,11 +33,14 @@ pub struct DbWriter {
 }
 
 struct DbWriterInner {
-    sender: mpsc::UnboundedSender<QueuedJob>,
+    sender: mpsc::UnboundedSender<WriterMessage>,
     /// Process-stable identity for this actor (shared across clones), used for
     /// per-Core-instance bookkeeping like wakeup de-duplication.
     instance_id: usize,
     notification_flush_signal: Arc<NotificationFlushSignal>,
+    closed: AtomicBool,
+    join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    scheduler_join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Drop for DbWriterInner {
@@ -102,8 +111,8 @@ impl DbWriter {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT_INSTANCE_ID: AtomicUsize = AtomicUsize::new(1);
         let notification_flush_signal = database.notification_flush_signal();
-        let (sender, receiver) = mpsc::unbounded_channel::<QueuedJob>();
-        std::thread::Builder::new()
+        let (sender, receiver) = mpsc::unbounded_channel::<WriterMessage>();
+        let join_handle = std::thread::Builder::new()
             .name("megle-db-writer".to_string())
             .spawn(move || run_writer_actor(database, receiver))
             .expect("spawn db writer thread");
@@ -112,15 +121,23 @@ impl DbWriter {
                 sender,
                 instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
                 notification_flush_signal: Arc::clone(&notification_flush_signal),
+                closed: AtomicBool::new(false),
+                join_handle: Mutex::new(Some(join_handle)),
+                scheduler_join_handle: Mutex::new(None),
             }),
         };
         let scheduler_writer = Arc::downgrade(&writer.inner);
-        std::thread::Builder::new()
+        let scheduler_join_handle = std::thread::Builder::new()
             .name("megle-notification-flush".to_string())
             .spawn(move || {
                 run_notification_flush_scheduler(scheduler_writer, notification_flush_signal)
             })
             .expect("spawn notification flush scheduler");
+        *writer
+            .inner
+            .scheduler_join_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(scheduler_join_handle);
         writer
     }
 
@@ -128,6 +145,44 @@ impl DbWriter {
     /// Clones share it; distinct actors differ.
     pub fn instance_id(&self) -> usize {
         self.inner.instance_id
+    }
+
+    /// Stop accepting writes, drain all writes queued before this call, flush,
+    /// and join the actor thread. Safe to call repeatedly from runtime teardown.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        if !self.inner.closed.swap(true, Ordering::AcqRel) {
+            self.inner.notification_flush_signal.notify();
+            let (reply, reply_rx) = oneshot::channel();
+            self.inner
+                .sender
+                .send(WriterMessage::Shutdown(reply))
+                .map_err(|_| anyhow::anyhow!("database writer is unavailable during shutdown"))?;
+            let _ = reply_rx.await;
+        }
+        self.inner.notification_flush_signal.notify();
+        let join = self
+            .inner
+            .join_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(join) = join {
+            tokio::task::spawn_blocking(move || join.join())
+                .await?
+                .map_err(|_| anyhow::anyhow!("database writer thread panicked"))?;
+        }
+        let scheduler_join = self
+            .inner
+            .scheduler_join_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(join) = scheduler_join {
+            tokio::task::spawn_blocking(move || join.join())
+                .await?
+                .map_err(|_| anyhow::anyhow!("notification flush scheduler thread panicked"))?;
+        }
+        Ok(())
     }
 
     /// Submit a write job and await its typed result. The closure runs on the
@@ -169,9 +224,12 @@ impl DbWriter {
         let job: WriteJob = Box::new(move |database| {
             op(database).map(|value| Box::new(value) as Box<dyn Any + Send>)
         });
+        if self.inner.closed.load(Ordering::Acquire) {
+            anyhow::bail!("database writer is closed");
+        }
         self.inner
             .sender
-            .send(QueuedJob { job, reply })
+            .send(WriterMessage::Job(QueuedJob { job, reply }))
             .map_err(|_| anyhow::anyhow!("database writer is unavailable"))
     }
 }
@@ -183,13 +241,27 @@ fn downcast<T: 'static>(boxed: Box<dyn Any + Send>) -> anyhow::Result<T> {
         .map_err(|_| anyhow::anyhow!("database writer returned an unexpected type"))
 }
 
-fn run_writer_actor(mut database: Database, mut receiver: mpsc::UnboundedReceiver<QueuedJob>) {
+fn run_writer_actor(mut database: Database, mut receiver: mpsc::UnboundedReceiver<WriterMessage>) {
     crate::debug_log!("writer actor started");
-    while let Some(first) = receiver.blocking_recv() {
+    while let Some(message) = receiver.blocking_recv() {
+        let first = match message {
+            WriterMessage::Job(job) => job,
+            WriterMessage::Shutdown(reply) => {
+                let _ = reply.send(());
+                break;
+            }
+        };
         crate::debug_log!("writer running a job");
         run_one(&mut database, first);
+        let mut shutdown_reply = None;
         while let Ok(next) = receiver.try_recv() {
-            run_one(&mut database, next);
+            match next {
+                WriterMessage::Job(job) => run_one(&mut database, job),
+                WriterMessage::Shutdown(reply) => {
+                    shutdown_reply = Some(reply);
+                    break;
+                }
+            }
         }
         let checkpoint_start = std::time::Instant::now();
         if let Err(error) = database.run_wal_checkpoint_pass() {
@@ -201,6 +273,10 @@ fn run_writer_actor(mut database: Database, mut receiver: mpsc::UnboundedReceive
             elapsed.as_millis(),
             database.wal_size_bytes()
         );
+        if let Some(reply) = shutdown_reply {
+            let _ = reply.send(());
+            break;
+        }
     }
     if let Err(error) = database.flush_dirty_notification_heads() {
         tracing::warn!(%error, "writer shutdown notification flush failed");
@@ -217,6 +293,9 @@ fn run_notification_flush_scheduler(
         let Some(inner) = writer.upgrade() else {
             break;
         };
+        if inner.closed.load(Ordering::Acquire) {
+            break;
+        }
         let handle = DbWriter { inner };
         let next_due =
             handle.write_blocking(|database| database.next_dirty_notification_flush_at());
@@ -245,6 +324,9 @@ fn run_notification_flush_scheduler(
         let Some(inner) = writer.upgrade() else {
             break;
         };
+        if inner.closed.load(Ordering::Acquire) {
+            break;
+        }
         let handle = DbWriter { inner };
         let flush_at = crate::db::unix_timestamp_millis();
         let flush_result =
@@ -504,6 +586,29 @@ mod tests {
             .await
             .expect("write should succeed");
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_writer_and_notification_scheduler_threads() {
+        let database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        let writer = DbWriter::spawn(database);
+
+        writer.shutdown().await.expect("shutdown writer runtime");
+
+        assert!(writer
+            .inner
+            .join_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert!(writer
+            .inner
+            .scheduler_join_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert!(writer.write(|_| Ok(())).await.is_err());
     }
 
     #[tokio::test]

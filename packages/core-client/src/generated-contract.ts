@@ -13,6 +13,87 @@ export interface ScanSummary {
   skippedFiles: number;
 }
 
+export type LibraryLifecycleState = "creating" | "ready" | "removing" | "error" | "recovery-required";
+export type LibraryBindingState = "local-only";
+export type LibraryAvailability = "available" | "unavailable";
+export type LibraryPreflightReason =
+  | "ok"
+  | "invalid-path"
+  | "invalid-name"
+  | "cloud-sync-root"
+  | "reparse-point"
+  | "nested-library-root"
+  | "not-empty"
+  | "marker-mismatch"
+  | "not-writable"
+  | "insufficient-space"
+  | "path-changed";
+
+export interface LibrarySummary {
+  libraryUuid: string;
+  rootUuid: string;
+  name: string;
+  icon?: string | null;
+  color?: string | null;
+  managedRoot: string;
+  active: boolean;
+  availability: LibraryAvailability;
+  lifecycleState: LibraryLifecycleState;
+  bindingState: LibraryBindingState;
+  contextRevision: number;
+}
+
+export interface LibraryListResponse {
+  items: LibrarySummary[];
+  contextRevision: number;
+}
+
+export interface ActiveLibraryResponse {
+  library: LibrarySummary | null;
+  contextRevision: number;
+  runtimeGeneration: number;
+}
+
+export interface LibraryPreflightRequest {
+  name: string;
+  managedRoot: string;
+}
+
+export interface LibraryPreflightResponse {
+  ok: boolean;
+  reason: LibraryPreflightReason;
+  normalizedRoot: string;
+  preflightToken: string | null;
+  availableBytes?: number | null;
+}
+
+export interface CreateLibraryRequest {
+  name: string;
+  managedRoot: string;
+  icon?: string | null;
+  color?: string | null;
+  initialMode: "local-only";
+  preflightToken?: string | null;
+  activate?: boolean;
+}
+
+export interface CreateLibraryResponse {
+  library: LibrarySummary;
+  activated: boolean;
+  activationError?: string | null;
+}
+
+export interface UpdateLibraryRequest {
+  name?: string;
+  icon?: string | null;
+  color?: string | null;
+}
+
+export interface LibraryErrorResponse {
+  code: string;
+  message: string;
+}
+
 export interface AcceptedRootResponse {
   accepted: boolean;
   taskId: number | null;

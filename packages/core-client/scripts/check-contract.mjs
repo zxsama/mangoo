@@ -285,6 +285,15 @@ for (const name of [
 }
 
 assertInterfaceMatchesSchema("ScanSummary");
+assertInterfaceMatchesSchema("LibrarySummary");
+assertInterfaceMatchesSchema("LibraryListResponse");
+assertInterfaceMatchesSchema("ActiveLibraryResponse");
+assertInterfaceMatchesSchema("LibraryPreflightRequest");
+assertInterfaceMatchesSchema("LibraryPreflightResponse");
+assertInterfaceMatchesSchema("CreateLibraryRequest");
+assertInterfaceMatchesSchema("UpdateLibraryRequest");
+assertInterfaceMatchesSchema("CreateLibraryResponse");
+assertInterfaceMatchesSchema("LibraryErrorResponse");
 assertInterfaceMatchesSchema("AcceptedRootResponse");
 assertInterfaceMatchesSchema("ScanTaskRequest");
 assertInterfaceMatchesSchema("InteractiveFolderScanTaskRequest");
@@ -380,6 +389,12 @@ assertOperationParameters("listMedia", ["rootId", "folderId", "limit", "offset",
 assertOperationParameters("getMedia", ["fileId"]);
 assertOperationParameters("getMediaPosition", ["fileId", "rootId", "folderId", "includeDescendants", "sort"]);
 assertOperationRoute("getMediaPosition", "get", "/media/{fileId}/position");
+assertOperationRoute("listLibraries", "get", "/libraries");
+assertOperationRoute("createLibrary", "post", "/libraries");
+assertOperationRoute("getActiveLibrary", "get", "/libraries/active");
+assertOperationRoute("preflightLibrary", "post", "/libraries/preflight");
+assertOperationRoute("activateLibrary", "post", "/libraries/{libraryUuid}/activate");
+assertOperationRoute("removeLocalLibrary", "delete", "/libraries/{libraryUuid}/local-copy");
 assertOperationParameters("listThumbnailCacheFailures", ["limit"]);
 assertOperationParameters("getThumbnail", ["fileId", "target", "priority"]);
 assertOperationParameters("getThumbnailBlob", ["fileId", "target"]);

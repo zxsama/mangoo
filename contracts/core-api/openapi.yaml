@@ -16,6 +16,146 @@ paths:
       responses:
         "200":
           description: Core is alive.
+  /libraries:
+    get:
+      operationId: listLibraries
+      responses:
+        "200":
+          description: Libraries registered on this device.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryListResponse"
+    post:
+      operationId: createLibrary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateLibraryRequest"
+      responses:
+        "201":
+          description: Managed local-only library created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateLibraryResponse"
+        "400":
+          description: Invalid name or managed-root selection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+        "409":
+          description: The root conflicts with an existing library or changed after preflight.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+  /libraries/active:
+    get:
+      operationId: getActiveLibrary
+      responses:
+        "200":
+          description: Active library context, or null when first-run has no library.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActiveLibraryResponse"
+  /libraries/preflight:
+    post:
+      operationId: preflightLibrary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LibraryPreflightRequest"
+      responses:
+        "200":
+          description: Authoritative managed-root preflight result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryPreflightResponse"
+  /libraries/{libraryUuid}/activate:
+    post:
+      operationId: activateLibrary
+      parameters:
+        - $ref: "#/components/parameters/libraryUuid"
+        - $ref: "#/components/parameters/contextRevision"
+      responses:
+        "200":
+          description: Library activated without restarting Core.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActiveLibraryResponse"
+        "404":
+          description: Library not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+        "409":
+          description: Library unavailable or lifecycle transition already in progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+  /libraries/{libraryUuid}/local-copy:
+    delete:
+      operationId: removeLocalLibrary
+      parameters:
+        - $ref: "#/components/parameters/libraryUuid"
+        - $ref: "#/components/parameters/contextRevision"
+      responses:
+        "204":
+          description: Local-only managed library quarantined and removed from the registry.
+        "404":
+          description: Library not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+        "409":
+          description: Identity mismatch, non-local binding, or lifecycle conflict.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+  /libraries/{libraryUuid}:
+    patch:
+      operationId: updateLibrary
+      parameters:
+        - $ref: "#/components/parameters/libraryUuid"
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateLibraryRequest"
+      responses:
+        "200":
+          description: Library display metadata updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibrarySummary"
+        "404":
+          description: Library not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+        "409":
+          description: Stale active Library context.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
   /roots:
     get:
       operationId: listRoots
@@ -1126,8 +1266,22 @@ components:
       required: true
       schema:
         type: string
+    libraryUuid:
+      name: libraryUuid
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
         minLength: 1
         maxLength: 128
+    contextRevision:
+      name: X-Megle-Context-Revision
+      in: header
+      required: true
+      schema:
+        type: integer
+        minimum: 0
     rootIdQuery:
       name: rootId
       in: query
@@ -1173,6 +1327,164 @@ components:
       schema:
         $ref: "#/components/schemas/ThumbnailPriority"
   schemas:
+    LibraryLifecycleState:
+      type: string
+      enum: [creating, ready, removing, error, recovery-required]
+    LibraryBindingState:
+      type: string
+      enum: [local-only]
+    LibraryAvailability:
+      type: string
+      enum: [available, unavailable]
+    LibraryPreflightReason:
+      type: string
+      enum: [ok, invalid-path, invalid-name, cloud-sync-root, reparse-point, nested-library-root, not-empty, marker-mismatch, not-writable, insufficient-space, path-changed]
+    LibrarySummary:
+      type: object
+      required: [libraryUuid, rootUuid, name, managedRoot, active, availability, lifecycleState, bindingState, contextRevision]
+      properties:
+        libraryUuid:
+          type: string
+          format: uuid
+        rootUuid:
+          type: string
+          format: uuid
+        name:
+          type: string
+        icon:
+          anyOf:
+            - type: string
+            - type: "null"
+        color:
+          anyOf:
+            - type: string
+            - type: "null"
+        managedRoot:
+          type: string
+        active:
+          type: boolean
+        availability:
+          $ref: "#/components/schemas/LibraryAvailability"
+        lifecycleState:
+          $ref: "#/components/schemas/LibraryLifecycleState"
+        bindingState:
+          $ref: "#/components/schemas/LibraryBindingState"
+        contextRevision:
+          type: integer
+          minimum: 0
+    LibraryListResponse:
+      type: object
+      required: [items, contextRevision]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LibrarySummary"
+        contextRevision:
+          type: integer
+          minimum: 0
+    ActiveLibraryResponse:
+      type: object
+      required: [library, contextRevision, runtimeGeneration]
+      properties:
+        library:
+          anyOf:
+            - $ref: "#/components/schemas/LibrarySummary"
+            - type: "null"
+        contextRevision:
+          type: integer
+          minimum: 0
+        runtimeGeneration:
+          type: integer
+          minimum: 0
+    LibraryPreflightRequest:
+      type: object
+      required: [name, managedRoot]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        managedRoot:
+          type: string
+    LibraryPreflightResponse:
+      type: object
+      required: [ok, reason, normalizedRoot, preflightToken]
+      properties:
+        ok:
+          type: boolean
+        reason:
+          $ref: "#/components/schemas/LibraryPreflightReason"
+        normalizedRoot:
+          type: string
+        preflightToken:
+          anyOf:
+            - type: string
+            - type: "null"
+        availableBytes:
+          anyOf:
+            - type: integer
+            - type: "null"
+    CreateLibraryRequest:
+      type: object
+      required: [name, managedRoot, initialMode]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        managedRoot:
+          type: string
+        icon:
+          anyOf:
+            - type: string
+            - type: "null"
+        color:
+          anyOf:
+            - type: string
+            - type: "null"
+        initialMode:
+          type: string
+          enum: [local-only]
+        preflightToken:
+          anyOf:
+            - type: string
+            - type: "null"
+        activate:
+          type: boolean
+    UpdateLibraryRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        icon:
+          anyOf:
+            - type: string
+            - type: "null"
+        color:
+          anyOf:
+            - type: string
+            - type: "null"
+          default: true
+    CreateLibraryResponse:
+      type: object
+      required: [library, activated]
+      properties:
+        library:
+          $ref: "#/components/schemas/LibrarySummary"
+        activated:
+          type: boolean
+        activationError:
+          anyOf:
+            - type: string
+            - type: "null"
+    LibraryErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
     ErrorResponse:
       type: object
       required: [error]

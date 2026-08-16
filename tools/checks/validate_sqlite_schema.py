@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+HOST_MIGRATION = ROOT / "crates" / "core" / "host_migrations" / "0001_host_registry.sql"
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
     ROOT / "crates" / "core" / "migrations" / "0002_task_progress.sql",
@@ -279,6 +280,47 @@ def main() -> None:
             fail(f"missing migration: {migration}")
 
     verify_scan_reconciliation_repair_path()
+
+    if not HOST_MIGRATION.exists():
+        fail(f"missing Host Registry migration: {HOST_MIGRATION}")
+    host_conn = sqlite3.connect(":memory:")
+    try:
+        host_conn.executescript(HOST_MIGRATION.read_text(encoding="utf-8"))
+        host_tables = {
+            row[0]
+            for row in host_conn.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            )
+        }
+        required_host_tables = {
+            "host_meta",
+            "libraries",
+            "library_creation_journal",
+            "library_removal_journal",
+        }
+        missing_host_tables = required_host_tables - host_tables
+        if missing_host_tables:
+            fail(f"missing Host Registry tables: {sorted(missing_host_tables)}")
+        meta = host_conn.execute(
+            "SELECT schema_version, active_library_uuid, context_revision FROM host_meta WHERE singleton = 1"
+        ).fetchone()
+        if meta != (1, None, 0):
+            fail(f"unexpected Host Registry metadata seed: {meta}")
+        creation_columns = {
+            row[1]
+            for row in host_conn.execute(
+                "PRAGMA table_info(library_creation_journal)"
+            )
+        }
+        required_creation_columns = {"root_identity", "staging_identity", "marker_identity"}
+        missing_creation_columns = required_creation_columns - creation_columns
+        if missing_creation_columns:
+            fail(
+                "missing Host creation-journal identity columns: "
+                f"{sorted(missing_creation_columns)}"
+            )
+    finally:
+        host_conn.close()
 
     with tempfile.TemporaryDirectory(prefix="megle_schema_") as temp_dir:
         db_path = Path(temp_dir) / "schema.sqlite"

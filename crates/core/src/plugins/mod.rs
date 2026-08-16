@@ -134,6 +134,7 @@ pub struct DiscoveryReport {
 /// 3. Else fall back to `./plugins` (CWD-relative) when the DB path has no
 ///    parent. This matches the previous behavior of the API handler so
 ///    existing dev setups keep working.
+#[cfg(test)]
 pub fn resolve_plugins_dir(db_path: &Path) -> PathBuf {
     if let Some(value) = std::env::var("MEGLE_PLUGINS_DIR")
         .ok()
@@ -158,6 +159,7 @@ pub fn resolve_plugins_dir(db_path: &Path) -> PathBuf {
 /// `discover_and_persist_locked` variant exists for the API path that shares
 /// the database with concurrent request handlers via `Mutex<Database>` and
 /// must release the lock between filesystem operations.
+#[cfg(test)]
 pub fn discover_and_persist(
     database: &Database,
     plugins_dir: &Path,

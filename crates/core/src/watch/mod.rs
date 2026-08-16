@@ -54,16 +54,23 @@ impl WatcherHandle {
             .thread()
             .id()
     }
-}
 
-impl Drop for WatcherHandle {
-    fn drop(&mut self) {
+    pub fn shutdown(&mut self) -> anyhow::Result<()> {
         if let Some(sender) = self.shutdown_sender.take() {
             let _ = sender.send(());
         }
         if let Some(join_handle) = self.join_handle.take() {
-            let _ = join_handle.join();
+            join_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("watcher thread panicked"))?;
         }
+        Ok(())
+    }
+}
+
+impl Drop for WatcherHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 

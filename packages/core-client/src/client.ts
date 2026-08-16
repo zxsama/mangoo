@@ -1,6 +1,9 @@
 import type {
   AcceptedRootResponse,
   AddFileTagRequest,
+  ActiveLibraryResponse,
+  CreateLibraryRequest,
+  CreateLibraryResponse,
   CreateTagRequest,
   DeletePluginResponse,
   ThumbnailCacheCancelBulkResponse,
@@ -18,6 +21,10 @@ import type {
   FileTagsResponse,
   FolderRecord,
   InteractiveFolderScanTaskRequest,
+  LibraryListResponse,
+  LibraryPreflightRequest,
+  LibraryPreflightResponse,
+  LibrarySummary,
   ListNotificationOutboxParams,
   ListFileOperationsParams,
   ListFolderChildrenParams,
@@ -42,6 +49,7 @@ import type {
   TaskRecord,
   ThumbnailPriority,
   ThumbnailPriorityScopeSyncRequest,
+  UpdateLibraryRequest,
   ThumbnailResponse,
   UserMetadataRecord,
   UserMetadataUpdate
@@ -173,6 +181,7 @@ if (typeof window !== "undefined") {
 }
 
 export function createCoreClient(config: CoreClientConfig) {
+  let observedContextRevision: string | null = null;
   async function request<T>(path: string, init: ScheduledRequestInit = {}): Promise<T> {
     const {
       requestPriority = "metadata",
@@ -186,6 +195,10 @@ export function createCoreClient(config: CoreClientConfig) {
     if (config.sessionToken) {
       headers.set("x-megle-session", config.sessionToken);
     }
+    const method = (fetchInit.method ?? "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && !headers.has("x-megle-context-revision") && observedContextRevision) {
+      headers.set("x-megle-context-revision", observedContextRevision);
+    }
 
     return scheduleCoreRequest(
       requestPriority,
@@ -196,12 +209,46 @@ export function createCoreClient(config: CoreClientConfig) {
           { ...fetchInit, headers },
           signal,
           async (response) => {
+            observedContextRevision = response.headers.get("x-megle-context-revision") ?? observedContextRevision;
             if (!response.ok) {
               const body = await readResponseBody(response);
               throw new CoreApiError(response.status, body);
             }
             const body = await readJson(response);
             return body as T;
+          }
+        ),
+      path
+    );
+  }
+
+  async function requestNoContent(
+    path: string,
+    init: ScheduledRequestInit = {}
+  ): Promise<void> {
+    const { requestPriority = "metadata", signal, ...fetchInit } = init;
+    const headers = new Headers(init.headers);
+    if (config.sessionToken) {
+      headers.set("x-megle-session", config.sessionToken);
+    }
+    const method = (fetchInit.method ?? "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && !headers.has("x-megle-context-revision") && observedContextRevision) {
+      headers.set("x-megle-context-revision", observedContextRevision);
+    }
+    await scheduleCoreRequest(
+      requestPriority,
+      signal,
+      () =>
+        fetchWithTimeout<void>(
+          resolveUrl(config.baseUrl, path),
+          { ...fetchInit, headers },
+          signal,
+          async (response) => {
+            observedContextRevision = response.headers.get("x-megle-context-revision") ?? observedContextRevision;
+            if (!response.ok) {
+              const body = await readResponseBody(response);
+              throw new CoreApiError(response.status, body);
+            }
           }
         ),
       path
@@ -265,6 +312,52 @@ export function createCoreClient(config: CoreClientConfig) {
   }
 
   return {
+    listLibraries: (options: CoreRequestOptions = {}) =>
+      request<LibraryListResponse>("/libraries", {
+        requestPriority: options.requestPriority ?? "navigation",
+        signal: options.signal
+      }),
+    getActiveLibrary: (options: CoreRequestOptions = {}) =>
+      request<ActiveLibraryResponse>("/libraries/active", {
+        requestPriority: options.requestPriority ?? "navigation",
+        signal: options.signal
+      }),
+    preflightLibrary: (body: LibraryPreflightRequest, options: CoreRequestOptions = {}) =>
+      request<LibraryPreflightResponse>("/libraries/preflight", {
+        method: "POST",
+        requestPriority: options.requestPriority ?? "interactive",
+        body: JSON.stringify(body),
+        signal: options.signal
+      }),
+    createLibrary: (body: CreateLibraryRequest, options: CoreRequestOptions = {}) =>
+      request<CreateLibraryResponse>("/libraries", {
+        method: "POST",
+        requestPriority: options.requestPriority ?? "interactive",
+        body: JSON.stringify(body),
+        signal: options.signal
+      }),
+    activateLibrary: (libraryUuid: string, contextRevision: number, options: CoreRequestOptions = {}) =>
+      request<ActiveLibraryResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/activate`, {
+        method: "POST",
+        headers: { "x-megle-context-revision": String(contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive",
+        signal: options.signal
+      }),
+    updateLibrary: (libraryUuid: string, contextRevision: number, body: UpdateLibraryRequest, options: CoreRequestOptions = {}) =>
+      request<LibrarySummary>(`/libraries/${encodeURIComponent(libraryUuid)}`, {
+        method: "PATCH",
+        headers: { "x-megle-context-revision": String(contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive",
+        body: JSON.stringify(body),
+        signal: options.signal
+      }),
+    removeLocalLibrary: (libraryUuid: string, contextRevision: number, options: CoreRequestOptions = {}) =>
+      requestNoContent(`/libraries/${encodeURIComponent(libraryUuid)}/local-copy`, {
+        method: "DELETE",
+        headers: { "x-megle-context-revision": String(contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive",
+        signal: options.signal
+      }),
     listRoots: () => request<Page<RootRecord>>("/roots", { requestPriority: "navigation" }),
     listTasks: (options: CoreRequestOptions = {}) =>
       request<Page<TaskRecord>>("/tasks", {

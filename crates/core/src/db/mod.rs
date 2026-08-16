@@ -5971,6 +5971,7 @@ impl Database {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub fn upsert_thumb_blob(&self, blob: ThumbBlobRecord) -> anyhow::Result<()> {
         self.connection.execute(
             r#"
@@ -6213,6 +6214,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn import_legacy_thumbnail_cache(&self) -> anyhow::Result<usize> {
         let cache_root = self.default_thumbnail_cache_dir();
         if !cache_root.is_dir() {
@@ -8333,10 +8335,12 @@ fn upsert_thumb_blob_in_transaction(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn is_safe_thumbnail_cache_key(cache_key: &str) -> bool {
     is_safe_cache_key(cache_key)
 }
 
+#[allow(dead_code)]
 fn is_importable_webp(data: &[u8]) -> bool {
     // Validate the RIFF/WebP container and that the header parses (dimensions
     // are readable) WITHOUT a full pixel decode. The legacy cache was written
@@ -8378,6 +8382,7 @@ fn thumbnail_scope_priority_for_file(
     }
 }
 
+#[allow(dead_code)]
 fn invalidate_legacy_thumbnail_import_candidate(
     connection: &rusqlite::Connection,
     file_id: i64,
@@ -9352,6 +9357,7 @@ fn build_thumbnail_cache_stats_with_active_count(
     }
 }
 
+#[allow(dead_code)]
 fn cleanup_legacy_thumbnail_cache_tree(cache_root: &Path) {
     if let Err(error) = std::fs::remove_dir_all(cache_root) {
         tracing::debug!(
