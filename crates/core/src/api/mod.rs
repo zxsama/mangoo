@@ -170,7 +170,7 @@ impl AppState {
 
     pub fn new(database: Database) -> Self {
         // LibraryRuntimeResources obtains database.notification_outbox_wake()
-        let runtime = LibraryRuntimeResources::from_database(None, 1, database, None)
+        let runtime = LibraryRuntimeResources::from_database(None, 1, database, None, None)
             .expect("construct library runtime");
         Self {
             active: Arc::new(std::sync::RwLock::new(ActiveSnapshot {
@@ -215,6 +215,7 @@ impl AppState {
             notification_outbox_test_probe: None,
         };
         manager.restore_active().await?;
+        manager.start_sync_coordinator();
         Ok(state)
     }
 

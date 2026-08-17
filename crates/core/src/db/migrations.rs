@@ -47,3 +47,5 @@ pub const FILE_OPERATION_OBJECT_BINDING_MIGRATION: &str =
 pub const PREVIEW_BLOBS_MIGRATION: &str = include_str!("../../migrations/0025_preview_blobs.sql");
 pub const PREVIEW_FAILURES_MIGRATION: &str =
     include_str!("../../migrations/0026_preview_failures.sql");
+pub const SYNC_PROTOCOL_FOUNDATION_MIGRATION: &str =
+    include_str!("../../migrations/0027_sync_protocol_foundation.sql");

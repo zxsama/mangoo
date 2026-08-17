@@ -10,6 +10,7 @@ export type {
   ActiveLibraryResponse,
   AddFileTagRequest,
   CreateLibraryRequest,
+  EnableLibrarySyncRequest,
   CreateLibraryResponse,
   CreateTagRequest,
   DeletePluginResponse,

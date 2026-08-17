@@ -296,15 +296,118 @@ fn upsert_media_file(
         size: metadata.len() as i64,
         mtime: metadata_time(Some(metadata)),
         ctime: metadata_created_time(Some(metadata)),
-        file_key: None,
+        file_key: crate::library_path::local_file_identity(path).ok(),
     };
     let kind_owned = kind.to_owned();
+    let path_owned = path.to_path_buf();
+    let volume_identity = crate::library_path::local_file_identity(Path::new(&root.path))
+        .unwrap_or_else(|_| root.path.clone())
+        .into_bytes();
+    let file_identity = crate::library_path::local_file_identity(path)
+        .unwrap_or_default()
+        .into_bytes();
+    let fingerprint = crate::sync::identity::stable_content_fingerprint(path).ok();
     state.writer.write_blocking(move |db| {
-        let file_id = db.upsert_file(file_upsert)?;
-        db.upsert_media_kind(file_id, &kind_owned)?;
+        let file_id = db.upsert_external_media_file(
+            file_upsert,
+            &kind_owned,
+            &volume_identity,
+            &file_identity,
+            fingerprint.as_deref(),
+            &path_owned,
+        )?;
         Ok(file_id)
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod sync_identity_tests {
+    use crate::db::{Database, FileUpsert, FolderUpsert, NewRoot};
+    use crate::sync::identity::stable_content_fingerprint;
+
+    #[test]
+    fn watcher_fingerprint_rename_reuses_missing_asset_before_new_row_is_inserted() {
+        let base =
+            std::env::temp_dir().join(format!("megle-watch-identity-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let old_path = base.join("old.jpg");
+        std::fs::write(&old_path, b"stable full fingerprint").unwrap();
+        let fingerprint = stable_content_fingerprint(&old_path).unwrap();
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root = database
+            .add_root(NewRoot {
+                path: base.to_string_lossy().into_owned(),
+                display_name: "root".into(),
+            })
+            .unwrap();
+        let folder = database
+            .upsert_folder(FolderUpsert {
+                root_id: root,
+                parent_id: None,
+                name: "folder".into(),
+                path_hash: "folder".into(),
+                mtime: Some(1),
+            })
+            .unwrap();
+        let old = database
+            .upsert_external_media_file(
+                FileUpsert {
+                    root_id: root,
+                    folder_id: folder,
+                    name: "old.jpg".into(),
+                    ext: ".jpg".into(),
+                    size: 23,
+                    mtime: 1,
+                    ctime: None,
+                    file_key: None,
+                },
+                "image",
+                b"volume",
+                b"old-file",
+                Some(&fingerprint),
+                &old_path,
+            )
+            .unwrap();
+        database
+            .connection_for_fsops()
+            .execute("UPDATE files SET status='missing' WHERE id=?1", [old])
+            .unwrap();
+        let new_path = base.join("new.jpg");
+        std::fs::rename(&old_path, &new_path).unwrap();
+        let moved = database
+            .upsert_external_media_file(
+                FileUpsert {
+                    root_id: root,
+                    folder_id: folder,
+                    name: "new.jpg".into(),
+                    ext: ".jpg".into(),
+                    size: 23,
+                    mtime: 2,
+                    ctime: None,
+                    file_key: None,
+                },
+                "image",
+                b"volume",
+                b"new-file",
+                Some(&fingerprint),
+                &new_path,
+            )
+            .unwrap();
+        assert_eq!(moved, old);
+        let count: i64 = database
+            .connection_for_fsops()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let name: String = database
+            .connection_for_fsops()
+            .query_row("SELECT name FROM files WHERE id=?1", [old], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "new.jpg");
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
 
 fn sync_enabled_roots(state: &mut WatcherState) -> anyhow::Result<()> {

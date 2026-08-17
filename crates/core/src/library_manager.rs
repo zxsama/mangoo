@@ -16,6 +16,7 @@ use crate::library_path::{
     MARKER_FILE_NAME,
 };
 use crate::roots::reachability::RootReachability;
+use crate::sync::runtime::{RuntimeLease, RuntimeLeases};
 use crate::tasks::{start_managed_worker, TaskSender, TaskWorkerHandle};
 use crate::watch::{start_watcher, WatcherHandle};
 
@@ -37,6 +38,7 @@ pub struct LibraryRuntimeResources {
     cancellation: CancellationToken,
     background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     background_started: AtomicBool,
+    runtime_lease: Mutex<Option<RuntimeLease>>,
 }
 
 #[derive(Clone)]
@@ -72,18 +74,8 @@ impl LibraryRuntimeResources {
             cancellation: CancellationToken::new(),
             background_tasks: Mutex::new(Vec::new()),
             background_started: AtomicBool::new(false),
+            runtime_lease: Mutex::new(None),
         })
-    }
-
-    pub fn open(
-        library_uuid: Option<String>,
-        runtime_generation: u64,
-        database_path: &Path,
-        plugins_dir: Option<PathBuf>,
-    ) -> anyhow::Result<Arc<Self>> {
-        let database = Database::open(database_path)?;
-        database.apply_migrations()?;
-        Self::from_database(library_uuid, runtime_generation, database, plugins_dir)
     }
 
     pub fn from_database(
@@ -91,6 +83,7 @@ impl LibraryRuntimeResources {
         runtime_generation: u64,
         database: Database,
         plugins_dir: Option<PathBuf>,
+        runtime_lease: Option<RuntimeLease>,
     ) -> anyhow::Result<Arc<Self>> {
         let notification_outbox_wake = database.notification_outbox_wake();
         let read_database_path = database.path().map(Path::to_path_buf);
@@ -133,6 +126,7 @@ impl LibraryRuntimeResources {
             cancellation: CancellationToken::new(),
             background_tasks: Mutex::new(Vec::new()),
             background_started: AtomicBool::new(false),
+            runtime_lease: Mutex::new(runtime_lease),
         }))
     }
 
@@ -161,6 +155,10 @@ impl LibraryRuntimeResources {
             worker.shutdown().await?;
         }
         self.writer.shutdown().await?;
+        self.runtime_lease
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         Ok(())
     }
 
@@ -187,6 +185,9 @@ pub struct LibraryManager {
     operation: AsyncMutex<()>,
     runtime_generation: AtomicU64,
     libraries_dir: PathBuf,
+    runtime_leases: RuntimeLeases,
+    sync_coordinator: crate::sync::coordinator::SyncCoordinator,
+    sync_scheduler: Mutex<Option<crate::sync::coordinator::SyncSchedulerHandle>>,
 }
 
 impl LibraryManager {
@@ -196,6 +197,11 @@ impl LibraryManager {
         active: Arc<RwLock<ActiveSnapshot>>,
         request_gate: Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
+        let runtime_leases = RuntimeLeases::default();
+        let sync_coordinator = crate::sync::coordinator::SyncCoordinator::new(
+            Arc::clone(&registry),
+            runtime_leases.clone(),
+        );
         Self {
             registry,
             active,
@@ -203,7 +209,43 @@ impl LibraryManager {
             operation: AsyncMutex::new(()),
             runtime_generation: AtomicU64::new(0),
             libraries_dir,
+            runtime_leases,
+            sync_coordinator,
+            sync_scheduler: Mutex::new(None),
         }
+    }
+
+    pub fn start_sync_coordinator(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let scheduler = self.sync_coordinator.spawn_scheduler(
+            crate::sync::coordinator::PRODUCTION_SYNC_POLL_INTERVAL,
+            crate::sync::coordinator::PRODUCTION_SYNC_CONCURRENCY,
+            move || {
+                let manager = weak.upgrade()?;
+                let snapshot = manager.active_snapshot();
+                let library_uuid = snapshot.library_uuid?;
+                let runtime = snapshot.runtime?;
+                let path = runtime.read_database_path.clone()?;
+                Some((library_uuid, path, runtime.writer.clone()))
+            },
+        );
+        *self
+            .sync_scheduler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(scheduler);
+    }
+
+    #[allow(dead_code)]
+    pub async fn shutdown_sync_coordinator(&self) -> anyhow::Result<()> {
+        let scheduler = self
+            .sync_scheduler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(scheduler) = scheduler {
+            scheduler.shutdown().await?;
+        }
+        Ok(())
     }
 
     pub fn registry(&self) -> &Arc<HostRegistry> {
@@ -615,6 +657,11 @@ impl LibraryManager {
                 path: descriptor.managed_root.to_string_lossy().into_owned(),
                 display_name: name.clone(),
             })?;
+            catalog.initialize_sync_identity(
+                Uuid::parse_str(&library_uuid)?,
+                Uuid::parse_str(&root_uuid)?,
+                self.registry.device_uuid()?,
+            )?;
         }
         self.registry.update_creation_phase(
             &txn_uuid,
@@ -952,6 +999,105 @@ impl LibraryManager {
             .update_library_metadata(library_uuid, name, icon, color)
     }
 
+    /// Provider-neutral production lifecycle entry point. Provider/account are
+    /// identities only; network descriptor publication remains in the provider child.
+    pub async fn enable_library_sync_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+        provider_id: &str,
+        account_identity: &str,
+    ) -> anyhow::Result<()> {
+        let _operation = self.operation.lock().await;
+        self.ensure_context_revision(expected_revision)?;
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        if descriptor.binding_state != "local-only" {
+            anyhow::bail!("library-already-synchronized");
+        }
+        let (binding_epoch, actor_epoch) =
+            self.registry
+                .begin_sync_binding(library_uuid, provider_id, account_identity)?;
+        let active = self.active_snapshot();
+        let result: anyhow::Result<i64> = if active.library_uuid.as_deref() == Some(library_uuid) {
+            let runtime = active
+                .runtime
+                .ok_or_else(|| anyhow::anyhow!("library-runtime-unavailable"))?;
+            runtime
+                .writer
+                .write_authoritative(move |database| {
+                    database.begin_sync_capture(binding_epoch, actor_epoch)
+                })
+                .await
+        } else {
+            let runtime = crate::sync::runtime::DormantSyncRuntime::new(
+                library_uuid,
+                descriptor.local_data_dir.join("catalog.sqlite"),
+                self.runtime_leases.clone(),
+            );
+            runtime
+                .run_turn(move |database| database.begin_sync_capture(binding_epoch, actor_epoch))
+                .await
+        };
+        if let Err(error) = result {
+            self.registry
+                .abort_sync_binding(library_uuid, binding_epoch)?;
+            return Err(error);
+        }
+        // The Catalog transaction returns the exact immutable generation
+        // boundary. Persisting it in Host makes restart resume the same seed
+        // rather than silently capturing a later projection.
+        self.registry.set_sync_capture_generation(
+            library_uuid,
+            binding_epoch,
+            result.expect("handled error above"),
+        )?;
+        Ok(())
+    }
+
+    /// Stops local transport/capture without deleting the remote Library. The
+    /// shared runtime lease/DbWriter is the cutover fence: all earlier turns
+    /// finish first and late work sees capture disabled/old binding archived.
+    pub async fn unbind_library_sync_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+    ) -> anyhow::Result<()> {
+        let _operation = self.operation.lock().await;
+        self.ensure_context_revision(expected_revision)?;
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        if descriptor.binding_state == "local-only" {
+            return Ok(());
+        }
+        let published = self.registry.sync_published_frontier(library_uuid)?;
+        let active = self.active_snapshot();
+        if active.library_uuid.as_deref() == Some(library_uuid) {
+            let runtime = active
+                .runtime
+                .ok_or_else(|| anyhow::anyhow!("library-runtime-unavailable"))?;
+            runtime
+                .writer
+                .write_authoritative(move |database| database.unbind_sync_capture(published))
+                .await?;
+        } else {
+            let runtime = crate::sync::runtime::DormantSyncRuntime::new(
+                library_uuid,
+                descriptor.local_data_dir.join("catalog.sqlite"),
+                self.runtime_leases.clone(),
+            );
+            runtime
+                .run_turn(move |database| database.unbind_sync_capture(published))
+                .await?;
+        }
+        self.registry.commit_local_unbind(library_uuid)?;
+        Ok(())
+    }
+
     fn ensure_context_revision(&self, expected_revision: u64) -> anyhow::Result<()> {
         let actual = self.active_snapshot().context_revision;
         if expected_revision != actual {
@@ -966,11 +1112,19 @@ impl LibraryManager {
     ) -> anyhow::Result<Arc<LibraryRuntimeResources>> {
         verify_descriptor_identity(descriptor)?;
         let generation = self.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        LibraryRuntimeResources::open(
+        let database = Database::open(descriptor.local_data_dir.join("catalog.sqlite"))?;
+        database.apply_migrations()?;
+        database.initialize_sync_identity(
+            Uuid::parse_str(&descriptor.library_uuid)?,
+            Uuid::parse_str(&descriptor.root_uuid)?,
+            self.registry.device_uuid()?,
+        )?;
+        LibraryRuntimeResources::from_database(
             Some(descriptor.library_uuid.clone()),
             generation,
-            &descriptor.local_data_dir.join("catalog.sqlite"),
+            database,
             Some(descriptor.local_data_dir.join("plugins")),
+            Some(self.runtime_leases.try_acquire(&descriptor.library_uuid)?),
         )
     }
 }

@@ -1,0 +1,1621 @@
+use rusqlite::OptionalExtension;
+use std::path::{Path, PathBuf};
+
+use super::runtime::{DormantSyncRuntime, RuntimeLeases};
+use crate::host_registry::HostRegistry;
+
+pub const PRODUCTION_SYNC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+pub const PRODUCTION_SYNC_CONCURRENCY: usize = 4;
+
+/// Joinable ownership for the production dormant-Library polling loop.
+/// Cancellation aborts any turn waiting for a lease; completed turns always
+/// drain their writer before returning from `shutdown`.
+pub struct SyncSchedulerHandle {
+    cancellation: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SyncSchedulerHandle {
+    pub async fn shutdown(self) -> anyhow::Result<()> {
+        self.cancellation.cancel();
+        self.task
+            .await
+            .map_err(|error| anyhow::anyhow!("sync scheduler task failed: {error}"))
+    }
+}
+
+#[derive(Clone)]
+pub struct SyncCoordinator {
+    registry: std::sync::Arc<HostRegistry>,
+    leases: RuntimeLeases,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncTurnResult {
+    pub applied_events: usize,
+    pub checkpoint_built: bool,
+    /// Wall time spent in the bounded authoritative ledger/truth/projection
+    /// transaction. Spool enumeration and writer scheduling are reported
+    /// separately by benchmarks and are not part of the transaction SLO.
+    pub apply_transaction_micros: u64,
+    pub seed_checkpoint: Option<(uuid::Uuid, i64)>,
+}
+
+impl SyncCoordinator {
+    pub fn new(registry: std::sync::Arc<HostRegistry>, leases: RuntimeLeases) -> Self {
+        Self { registry, leases }
+    }
+
+    /// Start the provider-neutral production scheduler for synced Libraries.
+    /// Each poll rotates inactive Libraries for fairness while the active
+    /// Catalog uses its existing writer. A global semaphore bounds dormant
+    /// writers and per-Library leases provide the single-writer fence.
+    pub fn spawn_scheduler<F>(
+        &self,
+        interval: std::time::Duration,
+        concurrency: usize,
+        active_runtime: F,
+    ) -> SyncSchedulerHandle
+    where
+        F: Fn() -> Option<(String, PathBuf, crate::db::DbWriter)> + Send + Sync + 'static,
+    {
+        let coordinator = self.clone();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let child_cancellation = cancellation.clone();
+        let active_runtime = std::sync::Arc::new(active_runtime);
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let concurrency = concurrency.max(1);
+            let mut rotation = 0usize;
+            loop {
+                tokio::select! {
+                    _ = child_cancellation.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+                let mut libraries = match coordinator.registry.sync_bound_libraries() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(%error, "sync coordinator registry poll failed");
+                        continue;
+                    }
+                };
+                let active = active_runtime();
+                libraries.retain(|library| {
+                    active.as_ref().map(|value| value.0.as_str()) != Some(&library.library_uuid)
+                });
+                let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+                let mut turns = tokio::task::JoinSet::new();
+                if let Some((library_uuid, path, writer)) = active {
+                    let coordinator = coordinator.clone();
+                    let gate = std::sync::Arc::clone(&gate);
+                    let cancellation = child_cancellation.clone();
+                    turns.spawn(async move {
+                        let permit = tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            permit = gate.acquire_owned() => permit.ok(),
+                        };
+                        let Some(_permit) = permit else { return };
+                        if let Err(error) = coordinator.run_active_turn(&path, &writer).await {
+                            tracing::warn!(%error,%library_uuid,"active sync turn failed");
+                        }
+                    });
+                }
+                if libraries.is_empty() && turns.is_empty() {
+                    continue;
+                }
+                libraries.sort_by(|left, right| left.library_uuid.cmp(&right.library_uuid));
+                if !libraries.is_empty() {
+                    let offset = rotation % libraries.len();
+                    libraries.rotate_left(offset);
+                    rotation = (rotation + 1) % libraries.len();
+                }
+                for library in libraries {
+                    let coordinator = coordinator.clone();
+                    let gate = std::sync::Arc::clone(&gate);
+                    let cancellation = child_cancellation.clone();
+                    turns.spawn(async move {
+                        let permit = tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            permit = gate.acquire_owned() => permit.ok(),
+                        };
+                        let Some(_permit) = permit else { return };
+                        let path = library.local_data_dir.join("catalog.sqlite");
+                        if let Err(error) = coordinator
+                            .run_library_turn(&library.library_uuid, &path)
+                            .await
+                        {
+                            tracing::warn!(%error,library_uuid=%library.library_uuid,"dormant sync turn failed");
+                        }
+                    });
+                }
+                loop {
+                    tokio::select! {
+                        _ = child_cancellation.cancelled() => {
+                            // Do not abort a turn after it opened a writer.
+                            // Waiters observe cancellation at the semaphore;
+                            // already-running turns drain and release their
+                            // per-Library lease before shutdown joins us.
+                            while turns.join_next().await.is_some() {}
+                            return;
+                        }
+                        result = turns.join_next() => match result {
+                            Some(Err(error)) => tracing::warn!(%error, "dormant sync task failed"),
+                            Some(Ok(())) => {},
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+        SyncSchedulerHandle { cancellation, task }
+    }
+
+    /// Production provider-neutral turn. Provider adapters only place verified
+    /// immutable segment bytes in this Library's spool; this coordinator owns
+    /// registration, bounded apply, checkpoint recovery/build and writer lease.
+    pub async fn run_library_turn(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+    ) -> anyhow::Result<SyncTurnResult> {
+        if !catalog_path.exists() {
+            self.bootstrap_missing_catalog(library_uuid, catalog_path)?;
+        }
+        let runtime = DormantSyncRuntime::new(library_uuid, catalog_path, self.leases.clone());
+        let (host_vector, host_metadata) = self.registry.host_checkpoint_snapshot(library_uuid)?;
+        let spool_dir = catalog_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("sync-spool");
+        self.apply_host_spool(&spool_dir)?;
+        let result = runtime
+            .run_turn(move |database| {
+                let connection = database.connection_for_fsops();
+                super::persistence::recover_interrupted_checkpoints(connection)?;
+                register_unindexed_segments(connection, &spool_dir)?;
+                let apply_started = std::time::Instant::now();
+                let applied_events = super::spool::apply_next_durable_segment(connection)?;
+                let apply_transaction_micros = apply_started.elapsed().as_micros() as u64;
+                advance_bulk_turn(connection)?;
+                let ready: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM sync_checkpoints WHERE state='ready'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let (checkpoint_built, seed_checkpoint) = if ready == 0 {
+                    let fence = super::persistence::capture_checkpoint_fence(
+                        connection,
+                        host_vector,
+                        host_metadata,
+                    )?;
+                    super::persistence::build_checkpoint(
+                        connection,
+                        &fence,
+                        &spool_dir.join("checkpoints"),
+                    )?;
+                    let ready = super::persistence::descriptor_ready(connection, fence.checkpoint_uuid)?;
+                    (true, ready.then_some((fence.checkpoint_uuid.0, fence.local_generation)))
+                } else {
+                    let seed = connection.query_row(
+                        "SELECT checkpoint_uuid,capture_local_mutation_generation FROM sync_checkpoints WHERE state='ready' ORDER BY ready_at DESC LIMIT 1",
+                        [], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?)),
+                    ).optional()?.and_then(|(id,generation)| uuid::Uuid::from_slice(&id).ok().map(|id|(id,generation)));
+                    (false, seed)
+                };
+                Ok(SyncTurnResult {
+                    applied_events,
+                    checkpoint_built,
+                    apply_transaction_micros,
+                    seed_checkpoint,
+                })
+            })
+            .await?;
+        self.finish_seed_if_ready(library_uuid, &result)?;
+        Ok(result)
+    }
+
+    fn bootstrap_missing_catalog(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+    ) -> anyhow::Result<()> {
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("sync Library is missing from Host Registry"))?;
+        let checkpoint_dir = catalog_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("sync-spool")
+            .join("checkpoints");
+        let mut candidates = Vec::new();
+        if checkpoint_dir.exists() {
+            for entry in std::fs::read_dir(&checkpoint_dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|v| v.to_str()) == Some("checkpoint") {
+                    let checkpoint: super::checkpoint::Checkpoint =
+                        serde_json::from_slice(&std::fs::read(&path)?)?;
+                    checkpoint.verify()?;
+                    candidates.push(checkpoint);
+                }
+            }
+        }
+        let checkpoint = super::checkpoint::maximal_checkpoints(&candidates)
+            .into_iter()
+            .max_by_key(|value| value.catalog_vector.values().sum::<u64>())
+            .ok_or_else(|| {
+                anyhow::anyhow!("synchronized Library is awaiting a valid checkpoint")
+            })?;
+        let staging = catalog_path.with_extension("sqlite.sync-staging");
+        super::persistence::materialize_staging_catalog(
+            checkpoint,
+            &staging,
+            uuid::Uuid::parse_str(&descriptor.root_uuid)?,
+            self.registry.device_uuid()?,
+        )?;
+        self.registry
+            .restore_host_checkpoint_metadata(&checkpoint.host_metadata)?;
+        super::persistence::promote_new_staging_catalog(&staging, catalog_path)
+    }
+
+    pub async fn run_active_turn(
+        &self,
+        catalog_path: &Path,
+        writer: &crate::db::DbWriter,
+    ) -> anyhow::Result<SyncTurnResult> {
+        let descriptor = self
+            .registry
+            .snapshot()?
+            .active_library_uuid
+            .ok_or_else(|| anyhow::anyhow!("active sync turn has no active Library"))?;
+        let (host_vector, host_metadata) = self.registry.host_checkpoint_snapshot(&descriptor)?;
+        let spool_dir = catalog_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("sync-spool");
+        self.apply_host_spool(&spool_dir)?;
+        let result = writer
+            .write_authoritative(move |database| {
+                perform_turn(database, host_vector, host_metadata, spool_dir)
+            })
+            .await?;
+        self.finish_seed_if_ready(&descriptor, &result)?;
+        Ok(result)
+    }
+
+    fn finish_seed_if_ready(
+        &self,
+        library_uuid: &str,
+        result: &SyncTurnResult,
+    ) -> anyhow::Result<()> {
+        if let Some((checkpoint, generation)) = result.seed_checkpoint {
+            if let Some(capture_generation) = self
+                .registry
+                .pending_sync_capture_generation(library_uuid)?
+            {
+                // A later coherent checkpoint may cover edits made after the
+                // original capture boundary. Those events remain in outbox and
+                // replay idempotently; the descriptor continues to record the
+                // original enable boundary rather than silently moving it.
+                if generation < capture_generation {
+                    return Ok(());
+                }
+                self.registry.mark_sync_seed_ready(
+                    library_uuid,
+                    checkpoint,
+                    capture_generation,
+                    true,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_host_spool(&self, spool_dir: &Path) -> anyhow::Result<usize> {
+        let directory = spool_dir.join("host");
+        if !directory.exists() {
+            return Ok(0);
+        }
+        let mut paths = std::fs::read_dir(directory)?
+            .map(|entry| entry.map(|v| v.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+        let mut applied = 0;
+        for path in paths {
+            if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                continue;
+            }
+            let segment: super::segment::SealedSegment =
+                serde_json::from_slice(&std::fs::read(&path)?)?;
+            applied += self.registry.apply_host_segment(&segment)?;
+        }
+        Ok(applied)
+    }
+}
+
+fn perform_turn(
+    database: &mut crate::db::Database,
+    host_vector: super::checkpoint::StreamVector,
+    host_metadata: super::checkpoint::HostMetadataSnapshot,
+    spool_dir: PathBuf,
+) -> anyhow::Result<SyncTurnResult> {
+    let connection = database.connection_for_fsops();
+    super::persistence::recover_interrupted_checkpoints(connection)?;
+    register_unindexed_segments(connection, &spool_dir)?;
+    let apply_started = std::time::Instant::now();
+    let applied_events = super::spool::apply_next_durable_segment(connection)?;
+    let apply_transaction_micros = apply_started.elapsed().as_micros() as u64;
+    advance_bulk_turn(connection)?;
+    let ready: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sync_checkpoints WHERE state='ready'",
+        [],
+        |r| r.get(0),
+    )?;
+    let (checkpoint_built, seed_checkpoint) = if ready == 0 {
+        let fence =
+            super::persistence::capture_checkpoint_fence(connection, host_vector, host_metadata)?;
+        super::persistence::build_checkpoint(connection, &fence, &spool_dir.join("checkpoints"))?;
+        let ready = super::persistence::descriptor_ready(connection, fence.checkpoint_uuid)?;
+        (
+            true,
+            ready.then_some((fence.checkpoint_uuid.0, fence.local_generation)),
+        )
+    } else {
+        let seed = connection.query_row(
+            "SELECT checkpoint_uuid,capture_local_mutation_generation FROM sync_checkpoints WHERE state='ready' ORDER BY ready_at DESC LIMIT 1",
+            [], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?)),
+        ).optional()?.and_then(|(id,generation)| uuid::Uuid::from_slice(&id).ok().map(|id|(id,generation)));
+        (false, seed)
+    };
+    Ok(SyncTurnResult {
+        applied_events,
+        checkpoint_built,
+        apply_transaction_micros,
+        seed_checkpoint,
+    })
+}
+
+fn advance_bulk_turn(connection: &rusqlite::Connection) -> anyhow::Result<()> {
+    use rusqlite::OptionalExtension;
+    let row:Option<(Vec<u8>,String)>=connection.query_row("SELECT bulk_operation_uuid,state FROM sync_bulk_operations WHERE state IN ('pending','building','publishing') ORDER BY created_at LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((id, state)) = row else {
+        return Ok(());
+    };
+    let operation = uuid::Uuid::from_slice(&id)?;
+    let transaction = connection.unchecked_transaction()?;
+    if state == "pending" || state == "building" {
+        super::bulk::build_subtree_delete_turn(
+            &transaction,
+            operation,
+            super::bulk::MAX_BULK_ITEMS_PER_TURN,
+        )?;
+    } else {
+        super::bulk::publish_subtree_delete_turn(
+            &transaction,
+            operation,
+            super::bulk::MAX_BULK_ITEMS_PER_TURN,
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn register_unindexed_segments(
+    connection: &rusqlite::Connection,
+    spool_dir: &Path,
+) -> anyhow::Result<usize> {
+    if !spool_dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in std::fs::read_dir(spool_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let segment: super::segment::SealedSegment = serde_json::from_slice(&bytes)?;
+        super::segment::verify_segment(&segment, segment.header.predecessor_hash)?;
+        let mut id = [0; 16];
+        id.copy_from_slice(&segment.segment_hash[..16]);
+        let record = super::spool::DurableInboxSegment {
+            segment_uuid: id,
+            stream_uuid: *segment.header.actor.stream_uuid.0.as_bytes(),
+            device_uuid: *segment.header.actor.device_uuid.0.as_bytes(),
+            actor_epoch: *segment.header.actor.actor_epoch.0.as_bytes(),
+            segment_hash: segment.segment_hash,
+            payload_hash: segment.header.payload_hash,
+            spool_path: PathBuf::from(&path),
+            first_seq: segment.header.first_seq,
+            last_seq: segment.header.last_seq,
+            event_count: segment.header.count,
+        };
+        if super::spool::register_durable_segment(connection, &record)? {
+            count += 1
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{
+        Database, DbWriter, FileUpsert, MediaPageQuery, NewRoot, SearchQuery, ThumbBlobRecord,
+        ThumbnailStateUpsert, UserMetadataPatch,
+    };
+    use crate::host_registry::{CreationIntent, LibraryDescriptor};
+    use crate::sync::segment::seal_segment;
+    use crate::sync::types::Operation;
+    use rusqlite::params;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    };
+
+    #[tokio::test]
+    async fn inactive_scheduler_is_cancellable_and_joinable() {
+        let base = std::env::temp_dir().join(format!(
+            "megle-sync-scheduler-cancel-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let registry = Arc::new(HostRegistry::open(base.join("host.sqlite")).unwrap());
+        let coordinator = SyncCoordinator::new(registry, RuntimeLeases::default());
+        let handle = coordinator.spawn_scheduler(std::time::Duration::from_secs(5), 2, || None);
+        tokio::time::timeout(std::time::Duration::from_millis(250), handle.shutdown())
+            .await
+            .expect("scheduler shutdown waited for its five-second tick")
+            .unwrap();
+        drop(coordinator);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingProvider {
+        calls: Arc<AtomicU64>,
+        objects: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+    impl CountingProvider {
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::Relaxed)
+        }
+        fn push(&self, bytes: Vec<u8>) {
+            self.objects.lock().unwrap().push(bytes);
+        }
+    }
+    impl crate::sync::provider::SegmentProvider for CountingProvider {
+        fn pending_segments(&self) -> anyhow::Result<Vec<Vec<u8>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(std::mem::take(&mut *self.objects.lock().unwrap()))
+        }
+    }
+
+    fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
+        assert!(!values.is_empty());
+        values.sort_by(|a, b| a.total_cmp(b));
+        values[((values.len() - 1) as f64 * p).round() as usize]
+    }
+
+    #[derive(Clone, Copy)]
+    struct ProcessMetrics {
+        cpu_ms: f64,
+        private_bytes: u64,
+    }
+
+    #[cfg(windows)]
+    fn process_metrics() -> ProcessMetrics {
+        #[repr(C)]
+        #[derive(Default, Clone, Copy)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct ProcessMemoryCountersEx {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+            private_usage: usize,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn GetProcessTimes(
+                process: isize,
+                creation: *mut FileTime,
+                exit: *mut FileTime,
+                kernel: *mut FileTime,
+                user: *mut FileTime,
+            ) -> i32;
+        }
+        #[link(name = "psapi")]
+        extern "system" {
+            fn GetProcessMemoryInfo(
+                process: isize,
+                counters: *mut ProcessMemoryCountersEx,
+                size: u32,
+            ) -> i32;
+        }
+        fn ticks(value: FileTime) -> u64 {
+            ((value.high as u64) << 32) | value.low as u64
+        }
+        unsafe {
+            let process = GetCurrentProcess();
+            let (mut creation, mut exit, mut kernel, mut user) = Default::default();
+            assert_ne!(
+                GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user),
+                0
+            );
+            let mut memory = ProcessMemoryCountersEx::default();
+            memory.cb = std::mem::size_of::<ProcessMemoryCountersEx>() as u32;
+            assert_ne!(GetProcessMemoryInfo(process, &mut memory, memory.cb), 0);
+            ProcessMetrics {
+                cpu_ms: (ticks(kernel) + ticks(user)) as f64 / 10_000.0,
+                private_bytes: memory.private_usage as u64,
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn process_metrics() -> ProcessMetrics {
+        let stat = std::fs::read_to_string("/proc/self/stat").expect("read process stat");
+        let fields: Vec<&str> = stat.split_whitespace().collect();
+        let ticks: f64 =
+            fields[13].parse::<u64>().unwrap() as f64 + fields[14].parse::<u64>().unwrap() as f64;
+        let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
+        let private_kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmData:"))
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        ProcessMetrics {
+            cpu_ms: ticks * 10.0,
+            private_bytes: private_kib * 1024,
+        }
+    }
+
+    fn explain_details(connection: &rusqlite::Connection, sql: &str) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn seed_browse_fixture(
+        database: &Database,
+        count: usize,
+        existing_scope: Option<(i64, i64)>,
+    ) -> (i64, i64, i64) {
+        assert!(count > 0);
+        let (root_id, folder_id) = existing_scope.unwrap_or_else(|| {
+            let root_id = database
+                .add_root(NewRoot {
+                    path: "D:/SyncBench".into(),
+                    display_name: "SyncBench".into(),
+                })
+                .unwrap();
+            let folder_id = database
+                .upsert_folder(crate::db::FolderUpsert {
+                    root_id,
+                    parent_id: None,
+                    name: "Bench".into(),
+                    path_hash: "sync-bench".into(),
+                    mtime: Some(1),
+                })
+                .unwrap();
+            (root_id, folder_id)
+        });
+        let mut first = 0;
+        if count >= 100_000 {
+            let connection = database.connection_for_fsops();
+            let fixture_started = std::time::Instant::now();
+            let report = |name: &str, started: std::time::Instant| {
+                eprintln!(
+                    "SYNC_FIXTURE_STAGE {name} {:.3}s",
+                    started.elapsed().as_secs_f64()
+                );
+            };
+            // Fixture construction is disposable benchmark setup, not an
+            // authoritative write. Disable journaling only while populating;
+            // production WAL/FULL semantics are restored before any measured
+            // capture/apply/query begins.
+            connection
+                .execute_batch("PRAGMA synchronous=OFF; PRAGMA journal_mode=OFF")
+                .unwrap();
+            let production_indexes = {
+                let mut statement = connection.prepare("SELECT name,sql FROM sqlite_schema WHERE type='index' AND tbl_name IN ('files','media','user_metadata','file_tags') AND sql IS NOT NULL ORDER BY name").unwrap();
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            for (name, _) in &production_indexes {
+                connection
+                    .execute_batch(&format!(
+                        "DROP INDEX IF EXISTS \"{}\"",
+                        name.replace('"', "\"\"")
+                    ))
+                    .unwrap();
+            }
+            report("drop-indexes", fixture_started);
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let started = std::time::Instant::now();
+            connection.execute(
+                "WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM n WHERE x+1<?1) INSERT INTO files(root_id,folder_id,name,ext,size,mtime,file_key,status,asset_uuid) SELECT ?2,?3,printf('bench-image-%07d.jpg',x),'.jpg',1024,x+1,printf('bench-%d',x),'active',randomblob(16) FROM n",
+                params![count as i64,root_id,folder_id],
+            ).unwrap();
+            report("files", started);
+            first = database
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT MIN(id) FROM files WHERE folder_id=?1",
+                    [folder_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let started = std::time::Instant::now();
+            connection.execute("INSERT INTO media(file_id,kind,metadata_status) SELECT id,'image','pending' FROM files WHERE folder_id=?1",[folder_id]).unwrap();
+            report("media", started);
+            // Metadata/tag/search projections are intentionally sparse like a
+            // real library: every tenth of the one million assets has user
+            // metadata and an FTS/tag entry. The production search still joins
+            // those rows against the full million-row files/media projection.
+            let started = std::time::Instant::now();
+            connection.execute("INSERT INTO user_metadata(file_id,rating,favorite,note,updated_at) SELECT id,id%6,id%2,printf('bench note %d',id),1 FROM files WHERE folder_id=?1 AND id%10=0",[folder_id]).unwrap();
+            report("metadata", started);
+            connection
+                .execute(
+                    "INSERT INTO tags(name,color) VALUES ('benchmark-tag','#abcdef')",
+                    [],
+                )
+                .unwrap();
+            let tag_id = connection.last_insert_rowid();
+            let started = std::time::Instant::now();
+            connection.execute("INSERT INTO file_tags(file_id,tag_id) SELECT id,?1 FROM files WHERE folder_id=?2 AND id%10=0",params![tag_id,folder_id]).unwrap();
+            report("file-tags", started);
+            let started = std::time::Instant::now();
+            connection.execute("INSERT INTO media_fts(rowid,name,note,tags) SELECT f.id,f.name,u.note,'benchmark-tag' FROM files f JOIN user_metadata u ON u.file_id=f.id WHERE f.folder_id=?1",[folder_id]).unwrap();
+            report("fts", started);
+            connection.execute_batch("COMMIT").unwrap();
+            for (name, sql) in production_indexes {
+                let started = std::time::Instant::now();
+                connection.execute_batch(&sql).unwrap();
+                report(&format!("index:{name}"), started);
+            }
+            connection
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL")
+                .unwrap();
+            report("fixture-total", fixture_started);
+        } else {
+            for index in 0..count {
+                let file_id = database
+                    .upsert_file(FileUpsert {
+                        root_id,
+                        folder_id,
+                        name: format!("bench-image-{index:05}.jpg"),
+                        ext: ".jpg".into(),
+                        size: 1024,
+                        mtime: index as i64 + 1,
+                        ctime: None,
+                        file_key: Some(format!("bench-{index}")),
+                    })
+                    .unwrap();
+                database.upsert_media_kind(file_id, "image").unwrap();
+                if index == 0 {
+                    first = file_id;
+                }
+            }
+            database.backfill_media_fts_if_empty().unwrap();
+        }
+        database
+            .upsert_thumbnail_state(ThumbnailStateUpsert {
+                file_id: first,
+                profile: crate::thumbnails::GRID_320_PROFILE.into(),
+                state: "ready".into(),
+                cache_key: Some("sync-bench-thumb.webp".into()),
+                width: Some(320),
+                height: Some(180),
+                byte_size: Some(4),
+                error: None,
+                source_fingerprint: Some("bench".into()),
+            })
+            .unwrap();
+        database
+            .upsert_thumb_blob(ThumbBlobRecord {
+                file_id: first,
+                profile: crate::thumbnails::GRID_320_PROFILE.into(),
+                data: vec![1, 2, 3, 4],
+                width: 320,
+                height: 180,
+                byte_size: 4,
+                output_format: "image/webp".into(),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        (root_id, folder_id, first)
+    }
+
+    /// Invoked by tools/bench/sync-protocol-bench.mjs. This intentionally uses
+    /// the production coordinator turn, DbWriter durability, browse query and
+    /// dormant runtime rather than the pure reference model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "invoked by tools/bench/sync-protocol-bench.mjs"]
+    async fn sync_protocol_acceptance_probe() {
+        let base = std::env::temp_dir().join(format!("megle-sync-bench-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let host = Arc::new(HostRegistry::open(base.join("host.sqlite")).unwrap());
+        let leases = RuntimeLeases::default();
+
+        // Eight runtime descriptors are intentionally retained while idle. A
+        // DormantSyncRuntime owns only paths and the shared lease map; the DB,
+        // writer, cache and mmap disappear at the end of each bounded turn.
+        let resource_before = process_metrics();
+        let mut dormant = Vec::new();
+        for index in 0..8 {
+            let library = uuid::Uuid::from_u128(100 + index as u128);
+            let library_dir = base.join(format!("library-{index}"));
+            std::fs::create_dir_all(&library_dir).unwrap();
+            let path = library_dir.join("catalog.sqlite");
+            let descriptor = LibraryDescriptor {
+                library_uuid: library.to_string(),
+                root_uuid: uuid::Uuid::from_u128(200 + index as u128).to_string(),
+                name: format!("Dormant {index}"),
+                icon: None,
+                color: None,
+                local_data_dir: library_dir.clone(),
+                managed_root: library_dir.join("managed"),
+                lifecycle_state: "ready".into(),
+                binding_state: "local-only".into(),
+                availability: "available".into(),
+                marker_identity: format!("marker-{index}"),
+            };
+            let creation = uuid::Uuid::now_v7().to_string();
+            host.begin_creation(&CreationIntent {
+                txn_uuid: creation.clone(),
+                descriptor: descriptor.clone(),
+                requested_root: descriptor.managed_root.clone(),
+                staging_dir: library_dir.join("staging"),
+            })
+            .unwrap();
+            host.commit_creation(&creation, &descriptor).unwrap();
+            let (binding, _) = host
+                .begin_sync_binding(&descriptor.library_uuid, "benchmark", "local")
+                .unwrap();
+            host.set_sync_capture_generation(&descriptor.library_uuid, binding, 1)
+                .unwrap();
+            let database = Database::open(&path).unwrap();
+            database.apply_migrations().unwrap();
+            database
+                .add_root(NewRoot {
+                    path: descriptor.managed_root.to_string_lossy().into_owned(),
+                    display_name: descriptor.name.clone(),
+                })
+                .unwrap();
+            database
+                .initialize_sync_identity(
+                    library,
+                    uuid::Uuid::from_u128(300 + index as u128),
+                    uuid::Uuid::from_u128(400 + index as u128),
+                )
+                .unwrap();
+            let mut event = crate::sync::test_model::event(
+                1,
+                50_000 + index as u128,
+                Operation::SetField {
+                    field: "rating".into(),
+                    value: 1.into(),
+                },
+            );
+            event.library_uuid = crate::sync::types::LibraryUuid(library);
+            event = crate::sync::codec::seal_event(event).unwrap();
+            let segment = seal_segment(vec![event], None).unwrap();
+            crate::sync::spool::intake_segment(
+                &library_dir.join("sync-spool"),
+                &serde_json::to_vec(&segment).unwrap(),
+                None,
+                |_| Ok(()),
+            )
+            .unwrap();
+            drop(database);
+            dormant.push(DormantSyncRuntime::new(
+                library.to_string(),
+                path,
+                leases.clone(),
+            ));
+        }
+        let resource_after = process_metrics();
+        let dormant_private_mib = resource_after
+            .private_bytes
+            .saturating_sub(resource_before.private_bytes) as f64
+            / 1_048_576.0;
+        let coordinator_before = process_metrics();
+        // Keep the real production scheduler running throughout intake/apply
+        // and the idle observation window. Its only benchmark-specific input
+        // is no benchmark-specific scheduling path: the same five-second
+        // cadence, fairness, leases, bounded concurrency and writer lifecycle
+        // used by the Host process remain active here.
+        let dormant_coordinator = SyncCoordinator::new(Arc::clone(&host), leases.clone());
+        let dormant_scheduler = dormant_coordinator.spawn_scheduler(
+            PRODUCTION_SYNC_POLL_INTERVAL,
+            PRODUCTION_SYNC_CONCURRENCY,
+            || None,
+        );
+        let scheduler_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let applied = dormant
+                .iter()
+                .filter(|runtime| {
+                    Database::open(&runtime.catalog_path)
+                        .and_then(|database| {
+                            database.connection_for_fsops().query_row(
+                                "SELECT EXISTS(SELECT 1 FROM sync_actor_frontiers WHERE applied_through_seq>=1)",
+                                [],
+                                |row| row.get::<_, i64>(0),
+                            ).map_err(Into::into)
+                        })
+                        .is_ok_and(|value| value == 1)
+                })
+                .count();
+            if applied == 8 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < scheduler_deadline,
+                "production scheduler did not fairly service all eight Libraries"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let coordinator_after = process_metrics();
+        let coordinator_cpu_ms = (coordinator_after.cpu_ms - coordinator_before.cpu_ms).max(0.0);
+        let idle_before = process_metrics();
+        let idle_started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        let idle_after = process_metrics();
+        let idle_cpu_percent = ((idle_after.cpu_ms - idle_before.cpu_ms).max(0.0)
+            / idle_started.elapsed().as_secs_f64()
+            / 10.0)
+            .min(100.0);
+        assert!(dormant.len() == 8);
+        dormant_scheduler.shutdown().await.unwrap();
+
+        let path = base.join("production.sqlite");
+        let library_uuid = uuid::Uuid::from_u128(1).to_string();
+        let descriptor = LibraryDescriptor {
+            library_uuid: library_uuid.clone(),
+            root_uuid: uuid::Uuid::from_u128(10).to_string(),
+            name: "Sync benchmark".into(),
+            icon: None,
+            color: None,
+            local_data_dir: base.clone(),
+            managed_root: base.join("managed"),
+            lifecycle_state: "ready".into(),
+            binding_state: "local-only".into(),
+            availability: "available".into(),
+            marker_identity: "sync-benchmark-marker".into(),
+        };
+        let creation_txn = uuid::Uuid::now_v7().to_string();
+        host.begin_creation(&CreationIntent {
+            txn_uuid: creation_txn.clone(),
+            descriptor: descriptor.clone(),
+            requested_root: descriptor.managed_root.clone(),
+            staging_dir: base.join("staging"),
+        })
+        .unwrap();
+        host.commit_creation(&creation_txn, &descriptor).unwrap();
+        let activation_txn = uuid::Uuid::now_v7().to_string();
+        let revision = host
+            .begin_activation(&activation_txn, Some(&library_uuid))
+            .unwrap();
+        host.commit_activation(&activation_txn, Some(&library_uuid), revision)
+            .unwrap();
+        let database = Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        let asset_count = std::env::var("MEGLE_SYNC_BENCH_ASSETS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/SyncBench".into(),
+                display_name: "SyncBench".into(),
+            })
+            .unwrap();
+        let folder_id = database
+            .upsert_folder(crate::db::FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: "Bench".into(),
+                path_hash: "sync-bench".into(),
+                mtime: Some(1),
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::from_u128(1),
+                uuid::Uuid::from_u128(2),
+                uuid::Uuid::from_u128(4),
+            )
+            .unwrap();
+        database.enable_fake_sync_capture_for_test().unwrap();
+
+        // Build the seed through the production checkpoint pipeline before the
+        // million-row performance fixture. The million fixture is for hot-path
+        // query and concurrent apply measurement, not checkpoint throughput.
+        let seed_writer = DbWriter::spawn(database);
+        let coordinator = SyncCoordinator::new(Arc::clone(&host), leases.clone());
+        assert!(
+            coordinator
+                .run_active_turn(&path, &seed_writer)
+                .await
+                .unwrap()
+                .checkpoint_built
+        );
+        seed_writer.shutdown().await.unwrap();
+        let database = Database::open(&path).unwrap();
+        let (_, _, thumb_file_id) =
+            seed_browse_fixture(&database, asset_count, Some((root_id, folder_id)));
+
+        // Plans must remain local projection/index reads and may not touch the
+        // sync ledger. Provider calls are structurally impossible on these DB
+        // APIs; count the only provider boundary exercised by this probe.
+        let browse_plan = explain_details(database.connection_for_fsops(),
+            "SELECT id FROM files INDEXED BY idx_files_root_status_mtime_id WHERE root_id=1 AND status='active' ORDER BY mtime DESC,id DESC LIMIT 101");
+        let search_plan = explain_details(database.connection_for_fsops(),
+            "SELECT files.id FROM files,media_fts WHERE media_fts.rowid=files.id AND media_fts MATCH 'bench' LIMIT 100");
+        let thumb_plan = explain_details(
+            database.connection_for_fsops(),
+            "SELECT b.data FROM thumb_blobs b WHERE b.file_id=1 AND b.profile='grid_320'",
+        );
+        let joined_plan = browse_plan
+            .iter()
+            .chain(search_plan.iter())
+            .chain(thumb_plan.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            browse_plan
+                .iter()
+                .any(|v| v.contains("idx_files_root_status_mtime_id")),
+            "browse plan: {browse_plan:?}"
+        );
+        assert!(
+            search_plan.iter().any(|v| v.contains("media_fts")),
+            "search plan: {search_plan:?}"
+        );
+        assert!(
+            thumb_plan
+                .iter()
+                .any(|v| v.contains("sqlite_autoindex_thumb_blobs") || v.contains("PRIMARY KEY")),
+            "thumb plan: {thumb_plan:?}"
+        );
+        assert!(
+            !joined_plan.iter().any(|v| v.contains("sync_")),
+            "hot query joined sync tables: {joined_plan:?}"
+        );
+
+        let provider = CountingProvider::default();
+        let hot_calls_before = provider.calls();
+        database
+            .list_media_page(MediaPageQuery {
+                root_id: None,
+                folder_id: None,
+                include_descendants: false,
+                limit: 10,
+                offset: None,
+                cursor: None,
+                sort: "mtime_desc".into(),
+                kind: None,
+            })
+            .unwrap();
+        database
+            .search_media_page(SearchQuery {
+                q: None,
+                root_id: None,
+                folder_id: None,
+                include_descendants: false,
+                kind: None,
+                min_rating: None,
+                favorite: None,
+                tag_ids: vec![],
+                sort: "relevance".into(),
+                limit: 10,
+                offset: None,
+                cursor: None,
+            })
+            .unwrap();
+        assert!(database
+            .get_thumb_blob(thumb_file_id, crate::thumbnails::GRID_320_PROFILE)
+            .unwrap()
+            .is_some());
+        let hot_provider_calls = provider.calls() - hot_calls_before;
+        assert_eq!(
+            hot_provider_calls, 0,
+            "browse/search/thumb reached provider boundary"
+        );
+        let reader_path = path.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let browse_samples = Arc::new(Mutex::new(Vec::new()));
+        let search_samples = Arc::new(Mutex::new(Vec::new()));
+        let thumb_samples = Arc::new(Mutex::new(Vec::new()));
+        let reader_stop = Arc::clone(&stop);
+        let reader_browse = Arc::clone(&browse_samples);
+        let reader_search = Arc::clone(&search_samples);
+        let reader_thumb = Arc::clone(&thumb_samples);
+        let reader = std::thread::spawn(move || {
+            let db = Database::open(reader_path).unwrap();
+            while !reader_stop.load(Ordering::Acquire) {
+                let started = std::time::Instant::now();
+                db.list_media_page(MediaPageQuery {
+                    root_id: None,
+                    folder_id: None,
+                    include_descendants: false,
+                    limit: 100,
+                    offset: Some(1),
+                    cursor: None,
+                    sort: "mtime_desc".into(),
+                    kind: None,
+                })
+                .unwrap();
+                reader_browse
+                    .lock()
+                    .unwrap()
+                    .push(started.elapsed().as_secs_f64() * 1000.0);
+                let started = std::time::Instant::now();
+                db.search_media_page(SearchQuery {
+                    q: None,
+                    root_id: None,
+                    folder_id: None,
+                    include_descendants: false,
+                    kind: None,
+                    min_rating: None,
+                    favorite: None,
+                    tag_ids: vec![],
+                    sort: "relevance".into(),
+                    limit: 100,
+                    offset: Some(1),
+                    cursor: None,
+                })
+                .unwrap();
+                reader_search
+                    .lock()
+                    .unwrap()
+                    .push(started.elapsed().as_secs_f64() * 1000.0);
+                let started = std::time::Instant::now();
+                assert!(db
+                    .get_thumb_blob(thumb_file_id, crate::thumbnails::GRID_320_PROFILE)
+                    .unwrap()
+                    .is_some());
+                reader_thumb
+                    .lock()
+                    .unwrap()
+                    .push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        });
+
+        let writer = DbWriter::spawn(database);
+        let mut local_capture_ms = Vec::new();
+        for index in 0..200 {
+            let started = std::time::Instant::now();
+            writer
+                .write_authoritative(move |db| {
+                    db.upsert_user_metadata_partial(
+                        thumb_file_id,
+                        UserMetadataPatch {
+                            rating: None,
+                            favorite: Some(index % 2 != 0),
+                            note: None,
+                        },
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            local_capture_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let coordinator = SyncCoordinator::new(host, leases);
+        let spool = base.join("sync-spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let mut apply_ms = Vec::new();
+        let mut max_events = 0usize;
+        let mut max_decoded = 0u64;
+        const TURNS: u64 = 50;
+        const EVENTS_PER_TURN: u64 = 10;
+        for segment_index in 0..TURNS {
+            let first_seq = segment_index * EVENTS_PER_TURN + 1;
+            let events = (first_seq..first_seq + EVENTS_PER_TURN)
+                .map(|seq| {
+                    crate::sync::test_model::event(
+                        seq,
+                        10_000 + seq as u128,
+                        Operation::SetField {
+                            field: "rating".into(),
+                            value: (seq % 5).into(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let segment = seal_segment(events, None).unwrap();
+            max_decoded = max_decoded.max(segment.header.decoded_bytes);
+            provider.push(serde_json::to_vec(&segment).unwrap());
+            crate::sync::provider::intake_provider_segments(&provider, &spool).unwrap();
+            let started = std::time::Instant::now();
+            let result = coordinator.run_active_turn(&path, &writer).await.unwrap();
+            let _coordinator_turn_ms = started.elapsed().as_secs_f64() * 1000.0;
+            apply_ms.push(result.apply_transaction_micros as f64 / 1000.0);
+            max_events = max_events.max(result.applied_events);
+            assert_eq!(result.applied_events, EVENTS_PER_TURN as usize);
+        }
+        // Exercise the hard event budget once without mixing that saturation
+        // sample into the ordinary-turn latency distribution.
+        let first_seq = TURNS * EVENTS_PER_TURN + 1;
+        let budget_events = (first_seq..first_seq + 100)
+            .map(|seq| {
+                crate::sync::test_model::event(
+                    seq,
+                    20_000 + seq as u128,
+                    Operation::SetField {
+                        field: "rating".into(),
+                        value: (seq % 5).into(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let budget_segment = seal_segment(budget_events, None).unwrap();
+        max_decoded = max_decoded.max(budget_segment.header.decoded_bytes);
+        provider.push(serde_json::to_vec(&budget_segment).unwrap());
+        crate::sync::provider::intake_provider_segments(&provider, &spool).unwrap();
+        let budget_result = coordinator.run_active_turn(&path, &writer).await.unwrap();
+        max_events = max_events.max(budget_result.applied_events);
+        assert_eq!(budget_result.applied_events, 100);
+        stop.store(true, Ordering::Release);
+        reader.join().unwrap();
+        writer.shutdown().await.unwrap();
+
+        // Reopen after every durable writer has been joined and prove the
+        // ledger/frontier survived the close boundary.
+        let reopened = Database::open(&path).unwrap();
+        let (events, frontier): (i64, i64) = reopened.connection_for_fsops().query_row(
+            "SELECT (SELECT COUNT(*) FROM sync_events),(SELECT MAX(applied_through_seq) FROM sync_actor_frontiers)", [],
+            |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!((events, frontier), (800, 600));
+        assert!(max_events <= super::super::inbox::MAX_APPLY_EVENTS);
+        assert!(max_decoded <= super::super::inbox::MAX_APPLY_DECODED_BYTES as u64);
+
+        let apply_p95 = percentile(apply_ms.clone(), 0.95);
+        let apply_p99 = percentile(apply_ms, 0.99);
+        let browse = browse_samples.lock().unwrap().clone();
+        let search = search_samples.lock().unwrap().clone();
+        let thumb = thumb_samples.lock().unwrap().clone();
+        assert!(
+            !browse.is_empty(),
+            "contention probe collected no browse samples"
+        );
+        let browse_p95 = percentile(browse, 0.95);
+        let search_p95 = percentile(search, 0.95);
+        let thumb_p95 = percentile(thumb, 0.95);
+        let local_capture_p95 = percentile(local_capture_ms.clone(), 0.95);
+        let local_capture_p99 = percentile(local_capture_ms, 0.99);
+        assert_eq!(
+            provider.calls(),
+            TURNS + 1,
+            "fake provider boundary was not exercised"
+        );
+        println!("SYNC_BENCH_JSON={{\"libraries\":8,\"assets\":{asset_count},\"applyP95Ms\":{apply_p95:.3},\"applyP99Ms\":{apply_p99:.3},\"localCaptureP95Ms\":{local_capture_p95:.3},\"localCaptureP99Ms\":{local_capture_p99:.3},\"maxAppliedEvents\":{max_events},\"maxDecodedBytes\":{max_decoded},\"idleCpuPercent\":{idle_cpu_percent:.3},\"coordinatorCpuMs\":{coordinator_cpu_ms:.3},\"dormantPrivateMiB\":{dormant_private_mib:.3},\"browseP95Ms\":{browse_p95:.3},\"searchP95Ms\":{search_p95:.3},\"thumbP95Ms\":{thumb_p95:.3},\"providerCalls\":{hot_provider_calls},\"providerIntakeCalls\":{},\"reopenEvents\":{events},\"reopenFrontier\":{frontier}}}",provider.calls());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for abrupt kill probe"]
+    fn sync_protocol_kill_child() {
+        let Some(path) = std::env::var_os("MEGLE_SYNC_KILL_DB").map(PathBuf::from) else {
+            return;
+        };
+        let marker = PathBuf::from(std::env::var_os("MEGLE_SYNC_KILL_MARKER").unwrap());
+        let stop_at = std::env::var("MEGLE_SYNC_KILL_STOP_AT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let database = Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        if database.list_roots().unwrap().is_empty() {
+            database
+                .add_root(NewRoot {
+                    path: "D:/KillProbe".into(),
+                    display_name: "KillProbe".into(),
+                })
+                .unwrap();
+        }
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::from_u128(1),
+                uuid::Uuid::from_u128(2),
+                uuid::Uuid::from_u128(4),
+            )
+            .unwrap();
+        let current: u64 = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT COALESCE(MAX(applied_through_seq),0) FROM sync_actor_frontiers",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            .max(0) as u64;
+        for first in ((current + 1)..=100_000).step_by(100) {
+            let last = (first + 99).min(100_000);
+            let events = (first..=last)
+                .map(|seq| {
+                    crate::sync::test_model::event(
+                        seq,
+                        1_000_000 + seq as u128,
+                        Operation::SetField {
+                            field: "rating".into(),
+                            value: (seq % 5).into(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            database.apply_remote_sync_events(&events).unwrap();
+            if stop_at.is_some_and(|stop| last >= stop) {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&marker).unwrap();
+                file.write_all(last.to_string().as_bytes()).unwrap();
+                file.sync_all().unwrap();
+                loop {
+                    std::thread::park_timeout(std::time::Duration::from_secs(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for deterministic sync fault matrix"]
+    fn sync_protocol_fault_child() {
+        let Some(path) = std::env::var_os("MEGLE_SYNC_FAULT_DB").map(PathBuf::from) else {
+            return;
+        };
+        let scenario = std::env::var("MEGLE_SYNC_FAULT_SCENARIO").unwrap();
+        let database = Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        let root = database
+            .add_root(NewRoot {
+                path: "D:/Fault".into(),
+                display_name: "Fault".into(),
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::from_u128(1),
+                uuid::Uuid::from_u128(2),
+                uuid::Uuid::from_u128(4),
+            )
+            .unwrap();
+        match scenario.as_str() {
+            "capture" | "publication" => {
+                let folder = database
+                    .upsert_folder(crate::db::FolderUpsert {
+                        root_id: root,
+                        parent_id: None,
+                        name: "Fault".into(),
+                        path_hash: "fault-folder".into(),
+                        mtime: Some(1),
+                    })
+                    .unwrap();
+                let file = database
+                    .upsert_file(FileUpsert {
+                        root_id: root,
+                        folder_id: folder,
+                        name: "fault.jpg".into(),
+                        ext: ".jpg".into(),
+                        size: 1,
+                        mtime: 1,
+                        ctime: None,
+                        file_key: Some("fault".into()),
+                    })
+                    .unwrap();
+                database.enable_fake_sync_capture_for_test().unwrap();
+                if scenario == "capture" {
+                    database
+                        .upsert_user_metadata_partial(
+                            file,
+                            UserMetadataPatch {
+                                rating: None,
+                                favorite: Some(true),
+                                note: None,
+                            },
+                        )
+                        .unwrap();
+                } else {
+                    let intent = database
+                        .create_sync_publication_intent(file, "D:/Fault/fault.jpg", 1)
+                        .unwrap();
+                    database.bind_fake_sync_manifest(intent, [7; 32]).unwrap();
+                }
+            }
+            "remote" => {
+                database
+                    .apply_remote_sync_events(&[crate::sync::test_model::event(
+                        1,
+                        999,
+                        Operation::SetField {
+                            field: "rating".into(),
+                            value: 4.into(),
+                        },
+                    )])
+                    .unwrap();
+            }
+            "spool" => {
+                let segment = seal_segment(
+                    vec![crate::sync::test_model::event(
+                        1,
+                        999,
+                        Operation::SetField {
+                            field: "rating".into(),
+                            value: 4.into(),
+                        },
+                    )],
+                    None,
+                )
+                .unwrap();
+                crate::sync::spool::intake_segment(
+                    path.parent().unwrap().join("sync-spool").as_path(),
+                    &serde_json::to_vec(&segment).unwrap(),
+                    None,
+                    |record| {
+                        crate::sync::spool::register_durable_segment(
+                            database.connection_for_fsops(),
+                            record,
+                        )?;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            "bulk" => {
+                let operation = uuid::Uuid::now_v7();
+                let root = uuid::Uuid::from_u128(700);
+                database.connection_for_fsops().execute(
+                    "INSERT INTO sync_bulk_operations(bulk_operation_uuid,operation_kind,root_entity_uuid,observed_local_mutation_generation,observed_frontier,state,item_count,created_at,updated_at) VALUES (?1,'delete-subtree',?2,1,?3,'pending',0,1,1)",
+                    params![operation.as_bytes().as_slice(),root.as_bytes().as_slice(),serde_json::to_vec(&Vec::<(Vec<u8>,Vec<u8>,Vec<u8>,i64)>::new()).unwrap()],
+                ).unwrap();
+                let transaction = database
+                    .connection_for_fsops()
+                    .unchecked_transaction()
+                    .unwrap();
+                crate::sync::bulk::build_subtree_delete_turn(&transaction, operation, 100).unwrap();
+                transaction.commit().unwrap();
+            }
+            "checkpoint" => {
+                let host = crate::sync::checkpoint::HostMetadataSnapshot {
+                    library_uuid: uuid::Uuid::from_u128(1).to_string(),
+                    name: "Fault".into(),
+                    icon: None,
+                    binding_state: "synchronized".into(),
+                    events: vec![],
+                };
+                let fence = crate::sync::persistence::capture_checkpoint_fence(
+                    database.connection_for_fsops(),
+                    Default::default(),
+                    host,
+                )
+                .unwrap();
+                crate::sync::persistence::build_checkpoint(
+                    database.connection_for_fsops(),
+                    &fence,
+                    &path.parent().unwrap().join("checkpoints"),
+                )
+                .unwrap();
+            }
+            "promotion" => {
+                let staging = path.with_extension("staging");
+                std::fs::write(&staging, b"validated staging").unwrap();
+                crate::sync::persistence::promote_new_staging_catalog(
+                    &staging,
+                    &path.with_extension("promoted"),
+                )
+                .unwrap();
+            }
+            _ => panic!("unknown sync fault scenario"),
+        }
+    }
+
+    #[test]
+    fn process_kill_fault_matrix_preserves_atomic_boundaries_and_recovery() {
+        let cases = [
+            ("capture", "capture.after-ledger-truth-frontier"),
+            ("capture", "capture.after-outbox"),
+            ("publication", "publication.after-intent"),
+            ("publication", "publication.after-manifest"),
+            ("publication", "publication.after-canonicalization"),
+            ("remote", "remote.after-ledger"),
+            ("remote", "remote.after-truth-projection"),
+            ("remote", "remote.after-frontier"),
+            ("spool", "spool.after-durable-publish"),
+            ("spool", "spool.after-registration"),
+            ("bulk", "bulk.after-page-cursor"),
+            ("checkpoint", "checkpoint.after-payload-publish"),
+            ("checkpoint", "checkpoint.after-descriptor-watermarks"),
+            ("promotion", "checkpoint.before-staging-promotion"),
+        ];
+        let exe = std::env::current_exe().unwrap();
+        for (scenario, point) in cases {
+            let base = std::env::temp_dir().join(format!(
+                "megle-sync-fault-{scenario}-{}",
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&base).unwrap();
+            let db_path = base.join("catalog.sqlite");
+            let marker = base.join("fault.marker");
+            let mut child = std::process::Command::new(&exe)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "sync::coordinator::tests::sync_protocol_fault_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("MEGLE_SYNC_FAULT_DB", &db_path)
+                .env("MEGLE_SYNC_FAULT_SCENARIO", scenario)
+                .env("MEGLE_SYNC_FAULTPOINT", point)
+                .env("MEGLE_SYNC_FAULT_MARKER", &marker)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "fault child exited at {point}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(marker.exists(), "faultpoint was not reached: {point}");
+            child.kill().unwrap();
+            child.wait().unwrap();
+            if scenario != "promotion" {
+                let reopened = Database::open(&db_path).unwrap();
+                reopened.apply_migrations().unwrap();
+                let connection = reopened.connection_for_fsops();
+                match scenario {
+                    "capture" => {
+                        let counts: (i64, i64, i64) = connection.query_row(
+                            "SELECT (SELECT COUNT(*) FROM user_metadata),(SELECT COUNT(*) FROM sync_events),(SELECT COUNT(*) FROM sync_outbox)", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+                        assert_eq!(
+                            counts,
+                            (0, 0, 0),
+                            "partial authoritative capture at {point}"
+                        );
+                    }
+                    "publication" => {
+                        let canonical: i64 = connection.query_row("SELECT COUNT(*) FROM sync_publication_intents WHERE state='canonicalized'",[],|row|row.get(0)).unwrap();
+                        assert_eq!(canonical, 0, "partial publication at {point}");
+                    }
+                    "remote" => {
+                        let counts: (i64, i64) = connection.query_row("SELECT (SELECT COUNT(*) FROM sync_events),(SELECT COUNT(*) FROM sync_actor_frontiers)",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+                        assert_eq!(counts, (0, 0), "partial remote apply at {point}");
+                    }
+                    "spool" => {
+                        let files = std::fs::read_dir(base.join("sync-spool"))
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|entry| {
+                                entry.path().extension().and_then(|v| v.to_str()) == Some("json")
+                            })
+                            .count();
+                        assert_eq!(files, 1);
+                        register_unindexed_segments(connection, &base.join("sync-spool")).unwrap();
+                        register_unindexed_segments(connection, &base.join("sync-spool")).unwrap();
+                        let registered: i64 = connection
+                            .query_row("SELECT COUNT(*) FROM sync_inbox_segments", [], |row| {
+                                row.get(0)
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            registered, 1,
+                            "spool recovery was not idempotent at {point}"
+                        );
+                    }
+                    "bulk" => {
+                        let counts: (i64, i64) = connection.query_row("SELECT (SELECT COUNT(*) FROM sync_bulk_items),(SELECT COUNT(*) FROM sync_bulk_operations WHERE cursor_entity_uuid IS NOT NULL)",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+                        assert_eq!(counts, (0, 0), "partial bulk page at {point}");
+                    }
+                    "checkpoint" => {
+                        crate::sync::persistence::recover_interrupted_checkpoints(connection)
+                            .unwrap();
+                        let partial: i64 = connection.query_row("SELECT COUNT(*) FROM sync_checkpoints WHERE state='ready' AND NOT EXISTS (SELECT 1 FROM sync_checkpoint_watermarks w WHERE w.checkpoint_uuid=sync_checkpoints.checkpoint_uuid)",[],|row|row.get(0)).unwrap();
+                        assert_eq!(partial, 0, "partial checkpoint descriptor at {point}");
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                assert!(db_path.with_extension("staging").exists());
+                assert!(!db_path.with_extension("promoted").exists());
+                crate::sync::persistence::promote_new_staging_catalog(
+                    &db_path.with_extension("staging"),
+                    &db_path.with_extension("promoted"),
+                )
+                .unwrap();
+                assert!(db_path.with_extension("promoted").exists());
+            }
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "invoked by tools/bench/sync-protocol-bench.mjs"]
+    fn sync_protocol_abrupt_kill_replay_probe() {
+        let base = std::env::temp_dir().join(format!("megle-sync-kill-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("catalog.sqlite");
+        let marker = base.join("committed.marker");
+        let exe = std::env::current_exe().unwrap();
+        let spawn = |stop: Option<u64>| {
+            let mut command = std::process::Command::new(&exe);
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "sync::coordinator::tests::sync_protocol_kill_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("MEGLE_SYNC_KILL_DB", &path)
+                .env("MEGLE_SYNC_KILL_MARKER", &marker);
+            if let Some(stop) = stop {
+                command.env("MEGLE_SYNC_KILL_STOP_AT", stop.to_string());
+            }
+            command.spawn().unwrap()
+        };
+        let mut child = spawn(Some(50_000));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "kill child exited before marker"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            marker.exists(),
+            "kill child did not reach committed frontier"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let reopened = Database::open(&path).unwrap();
+        reopened.apply_migrations().unwrap();
+        let (events, frontier): (i64,i64) = reopened.connection_for_fsops().query_row(
+            "SELECT (SELECT COUNT(*) FROM sync_events),(SELECT MAX(applied_through_seq) FROM sync_actor_frontiers)", [],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(events, frontier);
+        assert!((50_000..50_100).contains(&events));
+        drop(reopened);
+        let status = spawn(None).wait().unwrap();
+        assert!(status.success());
+        let final_db = Database::open(&path).unwrap();
+        let (events, frontier): (i64,i64) = final_db.connection_for_fsops().query_row(
+            "SELECT (SELECT COUNT(*) FROM sync_events),(SELECT MAX(applied_through_seq) FROM sync_actor_frontiers)", [],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!((events, frontier), (100_000, 100_000));
+        println!("SYNC_KILL_JSON={{\"killEvents\":{events},\"killFrontier\":{frontier},\"abruptKill\":1}}");
+        let _ = std::fs::remove_dir_all(base);
+    }
+}

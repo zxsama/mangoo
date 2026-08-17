@@ -13,8 +13,18 @@ use crate::db::Database;
 type BoxedResult = anyhow::Result<Box<dyn Any + Send>>;
 type WriteJob = Box<dyn FnOnce(&mut Database) -> BoxedResult + Send>;
 
+/// Durability promised by a writer turn. Regenerable cache/index work remains
+/// on SQLite WAL `NORMAL`; user-authored and synchronization truth must commit
+/// under `FULL` so an acknowledged mutation survives a power loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteDurability {
+    Derived,
+    Authoritative,
+}
+
 struct QueuedJob {
     job: WriteJob,
+    durability: WriteDurability,
     reply: oneshot::Sender<BoxedResult>,
 }
 
@@ -194,7 +204,22 @@ impl DbWriter {
         F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
     {
         let (reply, reply_rx) = oneshot::channel();
-        self.enqueue(op, reply)?;
+        self.enqueue(op, WriteDurability::Derived, reply)?;
+        let boxed = reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("database writer dropped the job"))??;
+        downcast(boxed)
+    }
+
+    /// Submit a user/sync truth mutation. The writer changes the connection's
+    /// durability before the closure starts and restores `NORMAL` afterwards.
+    pub async fn write_authoritative<T, F>(&self, op: F) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
+    {
+        let (reply, reply_rx) = oneshot::channel();
+        self.enqueue(op, WriteDurability::Authoritative, reply)?;
         let boxed = reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("database writer dropped the job"))??;
@@ -209,14 +234,32 @@ impl DbWriter {
         F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
     {
         let (reply, reply_rx) = oneshot::channel();
-        self.enqueue(op, reply)?;
+        self.enqueue(op, WriteDurability::Derived, reply)?;
         let boxed = reply_rx
             .blocking_recv()
             .map_err(|_| anyhow::anyhow!("database writer dropped the job"))??;
         downcast(boxed)
     }
 
-    fn enqueue<T, F>(&self, op: F, reply: oneshot::Sender<BoxedResult>) -> anyhow::Result<()>
+    pub fn write_authoritative_blocking<T, F>(&self, op: F) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
+    {
+        let (reply, reply_rx) = oneshot::channel();
+        self.enqueue(op, WriteDurability::Authoritative, reply)?;
+        let boxed = reply_rx
+            .blocking_recv()
+            .map_err(|_| anyhow::anyhow!("database writer dropped the job"))??;
+        downcast(boxed)
+    }
+
+    fn enqueue<T, F>(
+        &self,
+        op: F,
+        durability: WriteDurability,
+        reply: oneshot::Sender<BoxedResult>,
+    ) -> anyhow::Result<()>
     where
         T: Send + 'static,
         F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
@@ -229,7 +272,11 @@ impl DbWriter {
         }
         self.inner
             .sender
-            .send(WriterMessage::Job(QueuedJob { job, reply }))
+            .send(WriterMessage::Job(QueuedJob {
+                job,
+                durability,
+                reply,
+            }))
             .map_err(|_| anyhow::anyhow!("database writer is unavailable"))
     }
 }
@@ -346,7 +393,24 @@ fn run_notification_flush_scheduler(
 
 fn run_one(database: &mut Database, queued: QueuedJob) {
     let started = std::time::Instant::now();
-    let result = (queued.job)(database);
+    let result = match queued.durability {
+        WriteDurability::Derived => database
+            .set_write_durability(WriteDurability::Derived)
+            .and_then(|_| (queued.job)(database)),
+        WriteDurability::Authoritative => {
+            let result = database
+                .set_write_durability(WriteDurability::Authoritative)
+                .and_then(|_| (queued.job)(database));
+            let restore = database.set_write_durability(WriteDurability::Derived);
+            match (result, restore) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error.context(
+                    "authoritative write committed but failed to restore derived durability",
+                )),
+            }
+        }
+    };
     crate::debug_log!(
         "writer job closure returned in {}ms (ok={})",
         started.elapsed().as_millis(),
@@ -361,6 +425,364 @@ mod tests {
     use super::*;
     use crate::db::notification_outbox::{NotificationOperation, PublishMode};
     use crate::db::Database;
+
+    #[tokio::test]
+    async fn authoritative_turn_runs_full_and_restores_normal() {
+        let database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        let writer = DbWriter::spawn(database);
+        let observed = writer
+            .write_authoritative(|database| database.write_durability_for_test())
+            .await
+            .expect("authoritative turn");
+        assert_eq!(observed, 2);
+        let restored = writer
+            .write(|database| database.write_durability_for_test())
+            .await
+            .expect("derived turn");
+        assert_eq!(restored, 1);
+        writer.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn authoritative_failure_still_restores_normal() {
+        let database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        let writer = DbWriter::spawn(database);
+        let failure = writer
+            .write_authoritative::<(), _>(|database| {
+                assert_eq!(database.write_durability_for_test()?, 2);
+                anyhow::bail!("failpoint")
+            })
+            .await;
+        assert!(failure.is_err());
+        assert_eq!(
+            writer
+                .write(|database| database.write_durability_for_test())
+                .await
+                .unwrap(),
+            1
+        );
+        writer.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn captured_user_mutation_commits_event_and_outbox_together() {
+        let database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        database
+            .add_root(crate::db::NewRoot {
+                path: "C:\\managed".into(),
+                display_name: "Managed".into(),
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        database.enable_fake_sync_capture_for_test().unwrap();
+        let writer = DbWriter::spawn(database);
+        writer
+            .write_authoritative(|database| {
+                database
+                    .create_tag("captured", None)
+                    .map_err(anyhow::Error::from)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            writer
+                .write(|database| database.sync_capture_counts_for_test())
+                .await
+                .unwrap(),
+            (2, 2, 3)
+        );
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_intent_does_not_consume_actor_sequence_until_manifest_bound() {
+        let database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "C:\\managed-content".into(),
+                display_name: "Managed".into(),
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        database
+            .execute_batch_for_test(&format!(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status) VALUES ({root_id},NULL,'','root','active');\
+                 INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status) VALUES ({root_id},last_insert_rowid(),'a.jpg','jpg',12,1,'active');"
+            ))
+            .unwrap();
+        database.enable_fake_sync_capture_for_test().unwrap();
+        let writer = DbWriter::spawn(database);
+        let intent = writer
+            .write_authoritative(|database| {
+                database.create_sync_publication_intent(1, "C:\\managed-content\\a.jpg", 12)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            writer
+                .write(|database| database.sync_capture_counts_for_test())
+                .await
+                .unwrap(),
+            (0, 0, 1)
+        );
+        writer
+            .write_authoritative(move |database| database.bind_fake_sync_manifest(intent, [7; 32]))
+            .await
+            .unwrap();
+        assert_eq!(
+            writer
+                .write(|database| database.sync_capture_counts_for_test())
+                .await
+                .unwrap(),
+            (1, 1, 2)
+        );
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_apply_is_bounded_idempotent_and_never_echoes() {
+        use crate::sync::test_model::event;
+        use crate::sync::types::{EventUuid, Operation};
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        database
+            .add_root(crate::db::NewRoot {
+                path: "C:\\remote".into(),
+                display_name: "Remote".into(),
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        let first = event(
+            1,
+            10,
+            Operation::Delete {
+                token: EventUuid::new(),
+            },
+        );
+        assert_eq!(
+            database.apply_remote_sync_events(&[first.clone()]).unwrap(),
+            1
+        );
+        assert_eq!(database.apply_remote_sync_events(&[first]).unwrap(), 0);
+        let counts: (i64, i64) = database
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sync_events),(SELECT COUNT(*) FROM sync_outbox)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 0));
+    }
+
+    #[test]
+    fn remote_scalar_projection_materializes_the_lww_winner_not_arrival_order() {
+        use crate::sync::test_model::event;
+        use crate::sync::types::{DeviceUuid, Operation};
+
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "C:\\remote-lww".into(),
+                display_name: "Remote LWW".into(),
+            })
+            .unwrap();
+        let folder_id = database
+            .upsert_folder(crate::db::FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: "Remote LWW".into(),
+                path_hash: "remote-lww-root".into(),
+                mtime: None,
+            })
+            .unwrap();
+        let file_id = database
+            .upsert_file(crate::db::FileUpsert {
+                root_id,
+                folder_id,
+                name: "image.jpg".into(),
+                ext: ".jpg".into(),
+                size: 10,
+                mtime: 1,
+                ctime: None,
+                file_key: None,
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        let asset_uuid: Vec<u8> = database
+            .connection
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE id=?1",
+                [file_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let entity = u128::from_be_bytes(asset_uuid.try_into().unwrap());
+
+        let mut winner = event(
+            1,
+            entity,
+            Operation::SetField {
+                field: "rating".into(),
+                value: 5.into(),
+            },
+        );
+        winner.hlc.wall_ms = 20;
+        winner = crate::sync::codec::seal_event(winner).unwrap();
+        database.apply_remote_sync_events(&[winner]).unwrap();
+
+        let mut loser = event(
+            1,
+            entity,
+            Operation::SetField {
+                field: "rating".into(),
+                value: 1.into(),
+            },
+        );
+        loser.actor.device_uuid = DeviceUuid::new();
+        loser.event_uuid = crate::sync::types::EventUuid::new();
+        loser.hlc.wall_ms = 10;
+        loser = crate::sync::codec::seal_event(loser).unwrap();
+        database.apply_remote_sync_events(&[loser]).unwrap();
+
+        let rating: i64 = database
+            .connection
+            .query_row(
+                "SELECT rating FROM user_metadata WHERE file_id=?1",
+                [file_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rating, 5);
+    }
+
+    #[tokio::test]
+    async fn unknown_remote_schema_sets_compatibility_lock_without_advancing() {
+        use crate::sync::test_model::event;
+        use crate::sync::types::{EventUuid, Operation};
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        database
+            .add_root(crate::db::NewRoot {
+                path: "C:\\future".into(),
+                display_name: "Future".into(),
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        let mut future = event(
+            1,
+            10,
+            Operation::Delete {
+                token: EventUuid::new(),
+            },
+        );
+        future.wire_version = 2;
+        future = crate::sync::codec::seal_event(future).unwrap();
+        assert!(database.apply_remote_sync_events(&[future]).is_err());
+        let state: String = database
+            .connection
+            .query_row(
+                "SELECT compatibility_state FROM sync_local_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "compatibility-lock");
+        let count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM sync_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(database.create_tag("blocked", None).is_err());
+        let tags: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tags, 0);
+    }
+
+    #[test]
+    fn unbind_archives_unpublished_suffix_and_never_reuses_actor_epoch() {
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        database
+            .add_root(crate::db::NewRoot {
+                path: "C:\\unbind".into(),
+                display_name: "Unbind".into(),
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        let binding = uuid::Uuid::now_v7();
+        let actor = uuid::Uuid::now_v7();
+        database.begin_sync_capture(binding, actor).unwrap();
+        database.create_tag("pending", None).unwrap();
+        database.unbind_sync_capture(0).unwrap();
+        let state: String = database
+            .connection
+            .query_row("SELECT state FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "archived");
+        let epoch_state: String = database
+            .connection
+            .query_row(
+                "SELECT state FROM sync_actor_epochs WHERE actor_epoch=?1",
+                [actor.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(epoch_state, "closed");
+        let active: Option<Vec<u8>> = database
+            .connection
+            .query_row(
+                "SELECT active_actor_epoch FROM sync_local_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(active.is_none());
+    }
 
     fn notification_operation(operation_id: &str, updated_at: i64) -> NotificationOperation {
         NotificationOperation {

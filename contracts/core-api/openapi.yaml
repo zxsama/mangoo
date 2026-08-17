@@ -125,6 +125,35 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/LibraryErrorResponse"
+  /libraries/{libraryUuid}/sync-binding:
+    post:
+      operationId: enableLibrarySync
+      parameters:
+        - $ref: "#/components/parameters/libraryUuid"
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnableLibrarySyncRequest"
+      responses:
+        "200":
+          description: Provider-neutral local capture enabled and fenced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibrarySummary"
+        "409":
+          description: Stale context or an existing binding.
+    delete:
+      operationId: unbindLibrarySync
+      parameters:
+        - $ref: "#/components/parameters/libraryUuid"
+        - $ref: "#/components/parameters/contextRevision"
+      responses:
+        "204":
+          description: Local capture and transport binding removed; remote data remains.
   /libraries/{libraryUuid}:
     patch:
       operationId: updateLibrary
@@ -1332,7 +1361,7 @@ components:
       enum: [creating, ready, removing, error, recovery-required]
     LibraryBindingState:
       type: string
-      enum: [local-only]
+      enum: [local-only, synchronizing, synchronized]
     LibraryAvailability:
       type: string
       enum: [available, unavailable]
@@ -1465,6 +1494,16 @@ components:
             - type: string
             - type: "null"
           default: true
+    EnableLibrarySyncRequest:
+      type: object
+      required: [providerId, accountIdentity]
+      properties:
+        providerId:
+          type: string
+          minLength: 1
+        accountIdentity:
+          type: string
+          minLength: 1
     CreateLibraryResponse:
       type: object
       required: [library, activated]

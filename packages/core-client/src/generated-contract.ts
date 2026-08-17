@@ -14,7 +14,7 @@ export interface ScanSummary {
 }
 
 export type LibraryLifecycleState = "creating" | "ready" | "removing" | "error" | "recovery-required";
-export type LibraryBindingState = "local-only";
+export type LibraryBindingState = "local-only" | "synchronizing" | "synchronized";
 export type LibraryAvailability = "available" | "unavailable";
 export type LibraryPreflightReason =
   | "ok"
@@ -87,6 +87,11 @@ export interface UpdateLibraryRequest {
   name?: string;
   icon?: string | null;
   color?: string | null;
+}
+
+export interface EnableLibrarySyncRequest {
+  providerId: string;
+  accountIdentity: string;
 }
 
 export interface LibraryErrorResponse {

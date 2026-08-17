@@ -5,7 +5,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-HOST_MIGRATION = ROOT / "crates" / "core" / "host_migrations" / "0001_host_registry.sql"
+HOST_MIGRATIONS = [
+    ROOT / "crates" / "core" / "host_migrations" / "0001_host_registry.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0002_sync_protocol_foundation.sql",
+]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
     ROOT / "crates" / "core" / "migrations" / "0002_task_progress.sql",
@@ -32,6 +35,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0024_file_operation_object_binding.sql",
     ROOT / "crates" / "core" / "migrations" / "0025_preview_blobs.sql",
     ROOT / "crates" / "core" / "migrations" / "0026_preview_failures.sql",
+    ROOT / "crates" / "core" / "migrations" / "0027_sync_protocol_foundation.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -63,6 +67,32 @@ REQUIRED_TABLES = {
     "preview_failures",
     "notification_operation_heads",
     "notification_outbox",
+    "sync_local_state",
+    "sync_actor_epochs",
+    "sync_actor_frontiers",
+    "sync_events",
+    "sync_outbox",
+    "sync_segments",
+    "sync_inbox_segments",
+    "sync_field_versions",
+    "sync_set_adds",
+    "sync_set_removals",
+    "sync_location_revisions",
+    "sync_location_heads",
+    "sync_location_supersedes",
+    "sync_tombstone_tokens",
+    "sync_tombstone_removals",
+    "asset_content_revisions",
+    "asset_content_heads",
+    "asset_content_supersedes",
+    "sync_conflicts",
+    "sync_publication_intents",
+    "sync_checkpoints",
+    "sync_checkpoint_watermarks",
+    "sync_bulk_operations",
+    "sync_bulk_items",
+    "sync_local_file_identities",
+    "sync_identity_conflicts",
 }
 
 REQUIRED_INDEXES = {
@@ -106,6 +136,15 @@ REQUIRED_INDEXES = {
     "idx_notification_heads_status_updated",
     "idx_file_operations_group",
     "idx_file_operations_pending",
+    "ux_roots_root_uuid",
+    "ux_folders_folder_uuid",
+    "ux_files_asset_uuid",
+    "ux_tags_tag_uuid",
+    "idx_sync_outbox_pending",
+    "idx_sync_inbox_ready",
+    "idx_sync_publication_retry",
+    "idx_sync_checkpoint_watermark_actor",
+    "idx_sync_bulk_items_pending",
 }
 
 EXPECTED_MEDIA_COLUMNS = {
@@ -186,6 +225,13 @@ def index_key_columns(conn: sqlite3.Connection, index_name: str):
 
 def apply_migration(conn: sqlite3.Connection, migration: Path) -> None:
     name = migration.name
+    if name == "0027_sync_protocol_foundation.sql":
+        already_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = 27"
+        ).fetchone()
+        if already_applied is None:
+            conn.executescript(migration.read_text(encoding="utf-8"))
+        return
     if name == "0009_scan_reconciliation.sql":
         if not table_has_column(conn, "roots", "active_scan_generation"):
             conn.executescript(migration.read_text(encoding="utf-8"))
@@ -274,18 +320,109 @@ def verify_scan_reconciliation_repair_path() -> None:
         conn.close()
 
 
+def expect_integrity_error(conn: sqlite3.Connection, sql: str, params=()) -> None:
+    try:
+        conn.execute(sql, params)
+    except sqlite3.IntegrityError:
+        return
+    fail(f"expected integrity error: {sql.strip()}")
+
+
+def verify_sync_upgrade_from_populated_v26() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        for migration in MIGRATIONS[:-1]:
+            apply_migration(conn, migration)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO roots(path, display_name, enabled, created_at) VALUES ('D:/Seed', 'Seed', 1, 1)"
+        )
+        root_id = conn.execute("SELECT id FROM roots").fetchone()[0]
+        conn.execute(
+            "INSERT INTO folders(root_id,parent_id,name,path_hash,mtime) VALUES (?,NULL,'','seed-root',1)",
+            (root_id,),
+        )
+        folder_id = conn.execute("SELECT id FROM folders").fetchone()[0]
+        conn.execute(
+            "INSERT INTO files(root_id,folder_id,name,ext,size,mtime) VALUES (?,?,'seed.jpg','.jpg',1,1)",
+            (root_id, folder_id),
+        )
+        conn.execute("INSERT INTO tags(name,color) VALUES ('seed-tag','#fff')")
+        apply_migration(conn, MIGRATIONS[-1])
+        for table, column in (
+            ("roots", "root_uuid"),
+            ("folders", "folder_uuid"),
+            ("files", "asset_uuid"),
+            ("tags", "tag_uuid"),
+        ):
+            value = conn.execute(f"SELECT {column} FROM {table}").fetchone()[0]
+            if not isinstance(value, bytes) or len(value) != 16:
+                fail(f"v26 upgrade did not backfill {table}.{column}")
+        # A second application must be an idempotent no-op through the same
+        # schema_migrations gate used by Database::apply_migrations.
+        apply_migration(conn, MIGRATIONS[-1])
+        count = conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = 27"
+        ).fetchone()[0]
+        if count != 1:
+            fail("migration 27 rerun did not preserve one registration row")
+    finally:
+        conn.close()
+
+
+def assert_query_plan_uses(conn: sqlite3.Connection, sql: str, params, expected: str) -> None:
+    detail = " | ".join(
+        str(row[3]) for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", params)
+    )
+    if expected not in detail:
+        fail(f"query plan did not use {expected}: {detail}")
+
+
+def verify_sync_query_plans(conn: sqlite3.Connection) -> None:
+    # These plans are independent of row count; validating the covering access
+    # paths here is the same planner contract exercised by million-row fixtures
+    # without making the fast schema gate allocate a million records.
+    assert_query_plan_uses(
+        conn,
+        "SELECT event_uuid FROM sync_outbox WHERE state='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY next_attempt_at,created_at,event_uuid LIMIT 100",
+        (1,),
+        "idx_sync_outbox_pending",
+    )
+    assert_query_plan_uses(
+        conn,
+        "SELECT segment_uuid FROM sync_inbox_segments WHERE state='ready' ORDER BY received_at,segment_uuid LIMIT 1",
+        (),
+        "idx_sync_inbox_ready",
+    )
+    assert_query_plan_uses(
+        conn,
+        "SELECT entity_uuid FROM sync_bulk_items WHERE bulk_operation_uuid=? AND state='pending' AND entity_uuid>? ORDER BY entity_uuid LIMIT 100",
+        (b"0" * 16, b""),
+        "idx_sync_bulk_items_pending",
+    )
+    assert_query_plan_uses(
+        conn,
+        "SELECT covered_through_seq FROM sync_checkpoint_watermarks WHERE stream_uuid=? AND device_uuid=? AND actor_epoch=?",
+        (b"0" * 16, b"1" * 16, b"2" * 16),
+        "idx_sync_checkpoint_watermark_actor",
+    )
+
+
 def main() -> None:
     for migration in MIGRATIONS:
         if not migration.exists():
             fail(f"missing migration: {migration}")
 
     verify_scan_reconciliation_repair_path()
+    verify_sync_upgrade_from_populated_v26()
 
-    if not HOST_MIGRATION.exists():
-        fail(f"missing Host Registry migration: {HOST_MIGRATION}")
+    for host_migration in HOST_MIGRATIONS:
+        if not host_migration.exists():
+            fail(f"missing Host Registry migration: {host_migration}")
     host_conn = sqlite3.connect(":memory:")
     try:
-        host_conn.executescript(HOST_MIGRATION.read_text(encoding="utf-8"))
+        for host_migration in HOST_MIGRATIONS:
+            host_conn.executescript(host_migration.read_text(encoding="utf-8"))
         host_tables = {
             row[0]
             for row in host_conn.execute(
@@ -297,6 +434,13 @@ def main() -> None:
             "libraries",
             "library_creation_journal",
             "library_removal_journal",
+            "host_sync_local_state",
+            "host_sync_actor_epochs",
+            "host_sync_actor_frontiers",
+            "host_sync_events",
+            "host_sync_outbox",
+            "host_sync_field_versions",
+            "library_sync_bindings",
         }
         missing_host_tables = required_host_tables - host_tables
         if missing_host_tables:
@@ -304,7 +448,7 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (1, None, 0):
+        if meta != (2, None, 0):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         creation_columns = {
             row[1]
@@ -319,6 +463,29 @@ def main() -> None:
                 "missing Host creation-journal identity columns: "
                 f"{sorted(missing_creation_columns)}"
             )
+        host_indexes = {
+            row[0]
+            for row in host_conn.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' AND name IS NOT NULL"
+            )
+        }
+        required_host_indexes = {
+            "idx_host_sync_outbox_pending",
+            "idx_library_sync_bindings_schedule",
+            "idx_host_sync_field_winner",
+            "idx_host_sync_field_history",
+        }
+        missing_host_indexes = required_host_indexes - host_indexes
+        if missing_host_indexes:
+            fail(f"missing Host sync indexes: {sorted(missing_host_indexes)}")
+        expect_integrity_error(
+            host_conn,
+            "INSERT INTO library_sync_bindings(library_uuid,provider_id,account_identity,binding_epoch,actor_epoch,state,created_at,updated_at) VALUES ('missing','onedrive','account',randomblob(16),randomblob(16),'unknown',1,1)",
+        )
+        expect_integrity_error(
+            host_conn,
+            "INSERT INTO host_sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,state,created_at) VALUES (randomblob(15),randomblob(16),randomblob(16),'active',1)",
+        )
     finally:
         host_conn.close()
 
@@ -348,6 +515,7 @@ def main() -> None:
             missing_indexes = REQUIRED_INDEXES - indexes
             if missing_indexes:
                 fail(f"missing indexes: {sorted(missing_indexes)}")
+            verify_sync_query_plans(conn)
 
             version = conn.execute(
                 "SELECT version FROM schema_migrations WHERE version = 1"
@@ -454,6 +622,37 @@ def main() -> None:
             ).fetchone()
             if version is None:
                 fail("migration version 26 was not recorded")
+            version = conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 27"
+            ).fetchone()
+            if version is None:
+                fail("migration version 27 was not recorded")
+
+            for table, column in (
+                ("roots", "root_uuid"),
+                ("folders", "folder_uuid"),
+                ("files", "asset_uuid"),
+                ("tags", "tag_uuid"),
+            ):
+                if not table_has_column(conn, table, column):
+                    fail(f"missing synchronized identity column {table}.{column}")
+
+            expect_integrity_error(
+                conn,
+                "INSERT INTO sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,stream_kind,state,created_at) VALUES (randomblob(15),randomblob(16),randomblob(16),'catalog','active',1)",
+            )
+            expect_integrity_error(
+                conn,
+                "INSERT INTO sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,stream_kind,state,created_at) VALUES (randomblob(16),randomblob(16),randomblob(16),'catalog','unknown',1)",
+            )
+            expect_integrity_error(
+                conn,
+                "INSERT INTO sync_segments(segment_uuid,stream_uuid,stream_kind,device_uuid,actor_epoch,first_seq,last_seq,event_count,wire_version,reducer_version,compression,decoded_bytes,payload_hash,spool_path,state,created_at) VALUES (randomblob(16),randomblob(16),'catalog',randomblob(16),randomblob(16),1,2,1,1,1,'none',1,randomblob(32),'x','sealed',1)",
+            )
+            expect_integrity_error(
+                conn,
+                "INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,local_mutation_generation,source_path,state,created_at,updated_at) VALUES (randomblob(16),randomblob(16),randomblob(16),1,'x','uploading',1,1)",
+            )
 
             media_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(media)").fetchall()
@@ -833,6 +1032,14 @@ def main() -> None:
                 ("D:/Pictures", "Pictures"),
             )
             root_id = conn.execute("SELECT id FROM roots").fetchone()[0]
+            root_uuid = conn.execute(
+                "SELECT root_uuid FROM roots WHERE id = ?", (root_id,)
+            ).fetchone()[0]
+            if not isinstance(root_uuid, bytes) or len(root_uuid) != 16:
+                fail("legacy root insert did not receive a stable UUID")
+            expect_integrity_error(
+                conn, "UPDATE roots SET root_uuid = NULL WHERE id = ?", (root_id,)
+            )
             conn.execute(
                 """
                 INSERT INTO folders(root_id, parent_id, name, path_hash, mtime)

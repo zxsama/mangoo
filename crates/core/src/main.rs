@@ -10,6 +10,7 @@ mod library_path;
 mod plugins;
 mod roots;
 mod scan;
+mod sync;
 mod tasks;
 mod thumbnails;
 mod watch;
@@ -91,10 +92,10 @@ async fn main() -> anyhow::Result<()> {
         bind_addr = %ready_addr,
         "Megle Core ready"
     );
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         api::router_with_state(
-            state,
+            state.clone(),
             api::ApiConfig {
                 session_token,
                 allowed_origin,
@@ -103,7 +104,16 @@ async fn main() -> anyhow::Result<()> {
             },
         ),
     )
-    .await?;
+    .with_graceful_shutdown(async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to install Core shutdown signal");
+        }
+    })
+    .await;
+    if let Some(manager) = &state.library_manager {
+        manager.shutdown_sync_coordinator().await?;
+    }
+    serve_result?;
     Ok(())
 }
 

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::db::{
-    Database, FileUpsert, FolderUpsert, RootRecord, ScanFileUpsert, ScanWriteBatch,
-    TaskScanProgress,
+    Database, ExternalFileIdentity, FileUpsert, FolderUpsert, RootRecord, ScanFileUpsert,
+    ScanWriteBatch, TaskScanProgress,
 };
 use crate::decode::formats::{lowercase_extension as extension, media_kind_for_extension};
 
@@ -304,6 +304,7 @@ pub fn scan_root_with_options(
         };
 
         let folder_id = parent_folder_id(path, &folder_ids)?;
+        let file_identity = crate::library_path::local_file_identity(path).unwrap_or_default();
         pending_files.push(ScanFileUpsert {
             file: FileUpsert {
                 root_id: root.id,
@@ -313,9 +314,17 @@ pub fn scan_root_with_options(
                 size: metadata.len() as i64,
                 mtime: metadata_time(Some(&metadata), TimeField::Modified).unwrap_or(0),
                 ctime: metadata_time(Some(&metadata), TimeField::Created),
-                file_key: None,
+                file_key: (!file_identity.is_empty()).then(|| file_identity.clone()),
             },
             media_kind: kind.to_string(),
+            external_identity: Some(ExternalFileIdentity {
+                volume_identity: crate::library_path::local_file_identity(&root_path)
+                    .unwrap_or_else(|_| root.path.clone())
+                    .into_bytes(),
+                file_identity: file_identity.into_bytes(),
+                content_fingerprint: crate::sync::identity::stable_content_fingerprint(path).ok(),
+                path: path.to_path_buf(),
+            }),
         });
         summary.media_files_seen += 1;
         emit_progress(&mut options, items_seen, &summary);
@@ -528,6 +537,7 @@ pub fn scan_folder_with_options(
         };
 
         let parent_id = parent_folder_id(path, &folder_ids)?;
+        let file_identity = crate::library_path::local_file_identity(path).unwrap_or_default();
         pending_files.push(ScanFileUpsert {
             file: FileUpsert {
                 root_id: root.id,
@@ -537,9 +547,17 @@ pub fn scan_folder_with_options(
                 size: metadata.len() as i64,
                 mtime: metadata_time(Some(&metadata), TimeField::Modified).unwrap_or(0),
                 ctime: metadata_time(Some(&metadata), TimeField::Created),
-                file_key: None,
+                file_key: (!file_identity.is_empty()).then(|| file_identity.clone()),
             },
             media_kind: kind.to_string(),
+            external_identity: Some(ExternalFileIdentity {
+                volume_identity: crate::library_path::local_file_identity(&root_path)
+                    .unwrap_or_else(|_| root.path.clone())
+                    .into_bytes(),
+                file_identity: file_identity.into_bytes(),
+                content_fingerprint: crate::sync::identity::stable_content_fingerprint(path).ok(),
+                path: path.to_path_buf(),
+            }),
         });
         summary.media_files_seen += 1;
         emit_progress(&mut options, items_seen, &summary);
@@ -1019,6 +1037,41 @@ mod tests {
         assert_eq!(media.items.len(), 2);
 
         fs::remove_dir_all(temp_root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn full_rescan_fingerprint_rename_reuses_asset_without_outbox_echo() {
+        let temp_root = unique_temp_dir();
+        fs::create_dir_all(&temp_root).unwrap();
+        let old_path = temp_root.join("old.jpg");
+        let new_path = temp_root.join("new.jpg");
+        fs::write(&old_path, b"stable full scan fingerprint").unwrap();
+        let mut database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root_id = add_test_root(&database, &temp_root, "scan-fingerprint-rename");
+        let root = test_root(&database, root_id);
+        scan_root(&mut database, &root).unwrap();
+        let old_asset: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE name='old.jpg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        database.connection_for_fsops().execute(
+            "UPDATE sync_local_file_identities SET file_identity=randomblob(16) WHERE asset_uuid=?1",
+            [&old_asset],
+        ).unwrap();
+        fs::rename(&old_path, &new_path).unwrap();
+        scan_root(&mut database, &root).unwrap();
+        let (asset, active, total, outbox): (Vec<u8>, i64, i64, i64) = database.connection_for_fsops().query_row(
+            "SELECT (SELECT asset_uuid FROM files WHERE name='new.jpg'),(SELECT COUNT(*) FROM files WHERE status='active'),(SELECT COUNT(*) FROM files),(SELECT COUNT(*) FROM sync_outbox)", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        assert_eq!(asset, old_asset);
+        assert_eq!((active, total, outbox), (1, 1, 0));
+        fs::remove_dir_all(temp_root).unwrap();
     }
 
     #[test]

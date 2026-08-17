@@ -179,6 +179,12 @@ pub fn identity_token(path: &Path) -> io::Result<String> {
     Ok(format!("v1:{}", hex(&digest.finalize())))
 }
 
+/// Stable device-local volume/file identity used by watcher and full rescan
+/// reconciliation. It is never serialized into synchronization events.
+pub fn local_file_identity(path: &Path) -> io::Result<String> {
+    platform_identity(path)
+}
+
 pub fn verify_preflight_token(path: &Path, token: &str) -> Result<(), PreflightReason> {
     if identity_token(path).ok().as_deref() == Some(token) {
         Ok(())

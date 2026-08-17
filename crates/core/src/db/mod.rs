@@ -1,7 +1,7 @@
 pub mod migrations;
 pub mod notification_outbox;
 pub mod writer;
-pub use writer::DbWriter;
+pub use writer::{DbWriter, WriteDurability};
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -36,6 +36,7 @@ pub(crate) const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 /// this trade is safe — and it removes one fsync per commit, the dominant
 /// cost when the worker persists millions of thumbnails one row at a time.
 const SQLITE_SYNCHRONOUS_NORMAL: i64 = 1;
+const SQLITE_SYNCHRONOUS_FULL: i64 = 2;
 /// Negative values are a size in KiB. -65536 → a 64 MiB page cache per
 /// connection so hot browse/scan joins stay resident instead of re-reading
 /// pages from disk on every grid page and thumbnail lookup.
@@ -46,6 +47,16 @@ const SQLITE_MMAP_SIZE_BYTES: i64 = 256 * 1024 * 1024;
 /// Keep temp B-trees (ORDER BY / GROUP BY / the cache-stats aggregation)
 /// in memory rather than spilling to disk.
 const SQLITE_TEMP_STORE_MEMORY: i64 = 2;
+
+#[allow(dead_code)]
+fn hex_string(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
 
 pub struct Database {
     connection: Connection,
@@ -125,6 +136,15 @@ pub struct ScanWriteBatch {
 pub struct ScanFileUpsert {
     pub file: FileUpsert,
     pub media_kind: String,
+    pub external_identity: Option<ExternalFileIdentity>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalFileIdentity {
+    pub volume_identity: Vec<u8>,
+    pub file_identity: Vec<u8>,
+    pub content_fingerprint: Option<Vec<u8>>,
+    pub path: PathBuf,
 }
 
 #[allow(dead_code)]
@@ -947,6 +967,269 @@ impl Database {
         self.path.as_deref()
     }
 
+    pub(crate) fn set_write_durability(&self, durability: WriteDurability) -> anyhow::Result<()> {
+        let synchronous = match durability {
+            WriteDurability::Derived => SQLITE_SYNCHRONOUS_NORMAL,
+            WriteDurability::Authoritative => SQLITE_SYNCHRONOUS_FULL,
+        };
+        // SQLite rejects changing synchronous from inside a transaction. The
+        // single writer actor is therefore the only owner of this transition.
+        self.connection
+            .pragma_update(None, "synchronous", synchronous)?;
+        Ok(())
+    }
+
+    /// Bind the managed Host identity to this Catalog. Safe on every open; a
+    /// mismatch means the Catalog was copied under the wrong Library marker.
+    pub fn initialize_sync_identity(
+        &self,
+        library_uuid: uuid::Uuid,
+        root_uuid: uuid::Uuid,
+        device_uuid: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let root_count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM roots", [], |row| row.get(0))?;
+        if root_count != 1 {
+            anyhow::bail!("managed Catalog must contain exactly one root");
+        }
+        transaction.execute(
+            "UPDATE roots SET root_uuid=?1 WHERE id=(SELECT id FROM roots LIMIT 1) AND root_uuid != ?1",
+            [root_uuid.as_bytes().as_slice()],
+        )?;
+        let now = unix_timestamp_millis();
+        transaction.execute(
+            "INSERT OR IGNORE INTO sync_local_state(singleton,library_uuid,device_uuid,catalog_stream_uuid,next_actor_seq,next_local_mutation_generation,hlc_wall_ms,hlc_logical,capture_enabled,compatibility_state,updated_at) VALUES (1,?1,?2,?3,1,1,0,0,0,'compatible',?4)",
+            rusqlite::params![library_uuid.as_bytes().as_slice(), device_uuid.as_bytes().as_slice(), uuid::Uuid::now_v7().as_bytes().as_slice(), now],
+        )?;
+        let stored: (Vec<u8>, Vec<u8>) = transaction.query_row(
+            "SELECT library_uuid,device_uuid FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if stored.0 != library_uuid.as_bytes() || stored.1 != device_uuid.as_bytes() {
+            anyhow::bail!("Catalog sync identity does not match Host binding");
+        }
+        // Seed immutable location truth once. This is bootstrap material, not
+        // an outbox event, and gives later subtree snapshots a historical base.
+        transaction.execute(
+            "INSERT INTO sync_location_revisions(revision_uuid,entity_uuid,parent_uuid,name,local_mutation_generation,origin,created_at) SELECT randomblob(16),f.folder_uuid,COALESCE(p.folder_uuid,r.root_uuid),f.name,1,'bootstrap',?1 FROM folders f JOIN roots r ON r.id=f.root_id LEFT JOIN folders p ON p.id=f.parent_id WHERE NOT EXISTS (SELECT 1 FROM sync_location_revisions x WHERE x.entity_uuid=f.folder_uuid)",
+            [now],
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_location_revisions(revision_uuid,entity_uuid,parent_uuid,name,local_mutation_generation,origin,created_at) SELECT randomblob(16),f.asset_uuid,p.folder_uuid,f.name,1,'bootstrap',?1 FROM files f JOIN folders p ON p.id=f.folder_id WHERE NOT EXISTS (SELECT 1 FROM sync_location_revisions x WHERE x.entity_uuid=f.asset_uuid)",
+            [now],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO sync_location_heads(entity_uuid,revision_uuid,is_display_winner) SELECT entity_uuid,revision_uuid,1 FROM sync_location_revisions WHERE origin='bootstrap'",
+            [],
+        )?;
+        transaction.execute(
+            "UPDATE sync_local_state SET next_local_mutation_generation=MAX(next_local_mutation_generation,2),updated_at=?1 WHERE singleton=1",
+            [now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn begin_sync_capture(
+        &self,
+        binding_epoch: uuid::Uuid,
+        actor_epoch: uuid::Uuid,
+    ) -> anyhow::Result<i64> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (device, stream, generation): (Vec<u8>, Vec<u8>, i64) = transaction.query_row(
+            "SELECT device_uuid,catalog_stream_uuid,next_local_mutation_generation FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        )?;
+        let now = unix_timestamp_millis();
+        transaction.execute(
+            "INSERT INTO sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,stream_kind,binding_epoch,state,next_actor_seq,published_through_seq,created_at) VALUES (?1,?2,?3,'catalog',?4,'active',1,0,?5)",
+            rusqlite::params![actor_epoch.as_bytes().as_slice(),device,stream,binding_epoch.as_bytes().as_slice(),now],
+        )?;
+        transaction.execute(
+            "UPDATE sync_local_state SET active_actor_epoch=?1,active_binding_epoch=?2,next_actor_seq=1,capture_enabled=1,updated_at=?3 WHERE singleton=1",
+            rusqlite::params![actor_epoch.as_bytes().as_slice(),binding_epoch.as_bytes().as_slice(),now],
+        )?;
+        transaction.commit()?;
+        Ok(generation)
+    }
+
+    #[allow(dead_code)]
+    pub fn unbind_sync_capture(&self, published_through_seq: i64) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let actor: Vec<u8> = transaction.query_row(
+            "SELECT active_actor_epoch FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let now = unix_timestamp_millis();
+        transaction.execute(
+            "UPDATE sync_outbox SET state='archived' WHERE state IN ('pending','sealed') AND event_uuid IN (SELECT event_uuid FROM sync_events WHERE actor_epoch=?1 AND actor_seq>?2)",
+            rusqlite::params![actor,published_through_seq],
+        )?;
+        transaction.execute(
+            "UPDATE sync_actor_epochs SET state='closed',published_through_seq=?2,closed_at=?3 WHERE actor_epoch=?1",
+            rusqlite::params![actor,published_through_seq,now],
+        )?;
+        transaction.execute(
+            "UPDATE sync_local_state SET active_actor_epoch=NULL,active_binding_epoch=NULL,capture_enabled=0,updated_at=?1 WHERE singleton=1",
+            [now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_fake_sync_capture_for_test(&self) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let actor = uuid::Uuid::now_v7();
+        let binding = uuid::Uuid::now_v7();
+        let (device, stream): (Vec<u8>, Vec<u8>) = self.connection.query_row(
+            "SELECT device_uuid,catalog_stream_uuid FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        self.connection.execute(
+            "INSERT INTO sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,stream_kind,binding_epoch,state,next_actor_seq,published_through_seq,created_at) VALUES (?1,?2,?3,'catalog',?4,'active',1,0,?5)",
+            rusqlite::params![actor.as_bytes().as_slice(),device,stream,binding.as_bytes().as_slice(),now],
+        )?;
+        self.connection.execute(
+            "UPDATE sync_local_state SET active_actor_epoch=?1,active_binding_epoch=?2,capture_enabled=1,updated_at=?3 WHERE singleton=1",
+            rusqlite::params![actor.as_bytes().as_slice(),binding.as_bytes().as_slice(),now],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_capture_counts_for_test(&self) -> anyhow::Result<(i64, i64, i64)> {
+        self.connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sync_events),(SELECT COUNT(*) FROM sync_outbox),next_actor_seq FROM sync_local_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
+    pub fn create_sync_publication_intent(
+        &self,
+        file_id: i64,
+        source_path: &str,
+        byte_size: i64,
+    ) -> anyhow::Result<uuid::Uuid> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let asset_uuid: Vec<u8> = transaction.query_row(
+            "SELECT asset_uuid FROM files WHERE id=?1",
+            [file_id],
+            |row| row.get(0),
+        )?;
+        let generation: i64 = transaction.query_row(
+            "SELECT next_local_mutation_generation FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE sync_local_state SET next_local_mutation_generation=?1 WHERE singleton=1",
+            [generation + 1],
+        )?;
+        let revision = uuid::Uuid::now_v7();
+        let intent = uuid::Uuid::now_v7();
+        let now = unix_timestamp_millis();
+        transaction.execute(
+            "INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![revision.as_bytes().as_slice(),asset_uuid,byte_size,generation,now],
+        )?;
+        transaction.execute(
+            "INSERT INTO asset_content_heads(asset_uuid,content_revision_uuid,is_display_winner) VALUES (?1,?2,1)",
+            rusqlite::params![asset_uuid,revision.as_bytes().as_slice()],
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,binding_epoch,local_mutation_generation,source_path,state,attempt_count,created_at,updated_at) SELECT ?1,?2,?3,active_binding_epoch,?4,?5,'pending-hash',0,?6,?6 FROM sync_local_state WHERE singleton=1",
+            rusqlite::params![intent.as_bytes().as_slice(),asset_uuid,revision.as_bytes().as_slice(),generation,source_path,now],
+        )?;
+        crate::sync::fault::hit("publication.after-intent");
+        transaction.commit()?;
+        Ok(intent)
+    }
+
+    #[allow(dead_code)]
+    pub fn bind_fake_sync_manifest(
+        &self,
+        intent_uuid: uuid::Uuid,
+        manifest_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (asset_uuid, revision_uuid): (Vec<u8>, Vec<u8>) = transaction.query_row(
+            "SELECT asset_uuid,content_revision_uuid FROM sync_publication_intents WHERE intent_uuid=?1 AND state IN ('pending-hash','pending-manifest','ready')",
+            [intent_uuid.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        )?;
+        transaction.execute(
+            "UPDATE asset_content_revisions SET manifest_hash=?1 WHERE content_revision_uuid=?2",
+            rusqlite::params![manifest_hash.as_slice(), revision_uuid],
+        )?;
+        crate::sync::fault::hit("publication.after-manifest");
+        let capture = crate::sync::capture::capture_catalog_mutation(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            crate::sync::capture::entity_uuid(&asset_uuid)?,
+            crate::sync::types::Operation::SetContent {
+                revision_uuid: crate::sync::types::RevisionUuid(uuid::Uuid::from_slice(
+                    &revision_uuid,
+                )?),
+                manifest_id: hex_string(&manifest_hash),
+                supersedes: std::collections::BTreeSet::new(),
+            },
+        )?;
+        transaction.execute(
+            "UPDATE asset_content_revisions SET event_uuid=?1 WHERE content_revision_uuid=?2",
+            rusqlite::params![capture.event_uuid, revision_uuid],
+        )?;
+        transaction.execute(
+            "UPDATE sync_publication_intents SET event_uuid=?1,state='canonicalized',updated_at=?2 WHERE intent_uuid=?3",
+            rusqlite::params![capture.event_uuid,unix_timestamp_millis(),intent_uuid.as_bytes().as_slice()],
+        )?;
+        crate::sync::fault::hit("publication.after-canonicalization");
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn apply_remote_sync_events(
+        &self,
+        events: &[crate::sync::types::EventEnvelope],
+    ) -> anyhow::Result<usize> {
+        let transaction = self.connection.unchecked_transaction()?;
+        match crate::sync::inbox::apply_remote_batch(&transaction, events) {
+            Ok(applied) => {
+                transaction.commit()?;
+                Ok(applied)
+            }
+            Err(error)
+                if error.to_string().contains("unknown synchronization schema")
+                    || error.to_string().contains("actor gap")
+                    || error.to_string().contains("actor fork") =>
+            {
+                // Blocking diagnostics/frontiers are authoritative too. Keep
+                // them while never advancing beyond the bad event.
+                transaction.commit()?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_durability_for_test(&self) -> anyhow::Result<i64> {
+        self.connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .map_err(Into::into)
+    }
+
     pub fn default_thumbnail_cache_dir(&self) -> PathBuf {
         if let Some(path) = &self.path {
             return path
@@ -1092,6 +1375,10 @@ impl Database {
         if !self.migration_applied(26)? {
             self.connection
                 .execute_batch(migrations::PREVIEW_FAILURES_MIGRATION)?;
+        }
+        if !self.migration_applied(27)? {
+            self.connection
+                .execute_batch(migrations::SYNC_PROTOCOL_FOUNDATION_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
@@ -5387,6 +5674,10 @@ impl Database {
         Ok(updated != 0)
     }
 
+    /// Production watcher/scan reconciliation boundary. The stable platform
+    /// file identity is primary; a content fingerprint is only used when one
+    /// old missing candidate is unambiguous. This is local truth and never
+    /// emits an outbox event by itself.
     pub(crate) fn mark_folder_subtree_missing_by_path(
         &self,
         root_id: i64,
@@ -5621,9 +5912,127 @@ impl Database {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let scan_generation = active_scan_generation_in_transaction(&transaction, root_id)?;
-        let file_id = upsert_file_in_transaction(&transaction, file, scan_generation)?.id;
+        let file_id = upsert_file_in_transaction(
+            &transaction,
+            file,
+            scan_generation,
+            crate::sync::capture::MutationOrigin::ExternalFs,
+            None,
+        )?
+        .id;
         transaction.commit()?;
         Ok(file_id)
+    }
+
+    pub(crate) fn upsert_external_media_file(
+        &self,
+        file: FileUpsert,
+        media_kind: &str,
+        volume_identity: &[u8],
+        file_identity: &[u8],
+        fingerprint: Option<&[u8]>,
+        path: &Path,
+    ) -> anyhow::Result<i64> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let scan_generation = active_scan_generation_in_transaction(&transaction, file.root_id)?;
+        let id = Self::upsert_external_media_file_in_transaction(
+            &transaction,
+            file,
+            media_kind,
+            volume_identity,
+            file_identity,
+            fingerprint,
+            path,
+            scan_generation,
+            crate::sync::capture::MutationOrigin::ExternalFs,
+        )?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    fn upsert_external_media_file_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        file: FileUpsert,
+        media_kind: &str,
+        volume_identity: &[u8],
+        file_identity: &[u8],
+        fingerprint: Option<&[u8]>,
+        path: &Path,
+        scan_generation: Option<i64>,
+        origin: crate::sync::capture::MutationOrigin,
+    ) -> anyhow::Result<i64> {
+        // Resolve only against pre-existing missing identities. The provisional
+        // browse row does not exist yet, so it cannot self-match or overwrite
+        // the old identity before the decision is made.
+        // Failure to obtain an OS file ID must not turn the empty byte string
+        // into a shared identity for every file on the volume. In that case a
+        // path-scoped key keeps the fingerprint history durable without ever
+        // producing a false exact-identity match after a rename.
+        let has_stable_file_identity = !file_identity.is_empty();
+        let persisted_file_identity = has_stable_file_identity
+            .then(|| file_identity.to_vec())
+            .unwrap_or_else(|| path.to_string_lossy().as_bytes().to_vec());
+        let exact: Option<i64> = if has_stable_file_identity {
+            transaction.query_row(
+                "SELECT f.id FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid WHERE i.volume_identity=?1 AND i.file_identity=?2 AND (f.status='missing' OR (?3 IS NOT NULL AND COALESCE(f.scan_seen_at,-1)<>?3)) LIMIT 1",
+                rusqlite::params![volume_identity,file_identity,scan_generation], |row| row.get(0),
+            ).optional()?
+        } else {
+            None
+        };
+        let fingerprint_candidates = if exact.is_none() {
+            if let Some(fingerprint) = fingerprint {
+                let mut statement = transaction.prepare("SELECT f.id FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid WHERE i.content_fingerprint=?1 AND (f.status='missing' OR (?2 IS NOT NULL AND COALESCE(f.scan_seen_at,-1)<>?2)) ORDER BY f.asset_uuid")?;
+                let candidates = statement
+                    .query_map(rusqlite::params![fingerprint, scan_generation], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                candidates
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let forced_reuse = exact
+            .or_else(|| (fingerprint_candidates.len() == 1).then(|| fingerprint_candidates[0]));
+        let result =
+            upsert_file_in_transaction(transaction, file, scan_generation, origin, forced_reuse)?;
+        upsert_media_kind_in_transaction(
+            transaction,
+            result.id,
+            media_kind,
+            result.identity_changed,
+        )?;
+        let asset: Vec<u8> = transaction.query_row(
+            "SELECT asset_uuid FROM files WHERE id=?1",
+            [result.id],
+            |row| row.get(0),
+        )?;
+        let asset = uuid::Uuid::from_slice(&asset)?;
+        if fingerprint_candidates.len() > 1 {
+            for old_id in fingerprint_candidates {
+                let old: Vec<u8> = transaction.query_row(
+                    "SELECT asset_uuid FROM files WHERE id=?1",
+                    [old_id],
+                    |row| row.get(0),
+                )?;
+                transaction.execute("INSERT INTO sync_identity_conflicts(conflict_uuid,old_asset_uuid,new_asset_uuid,reason,state,created_at) VALUES (?1,?2,?3,'ambiguous-fingerprint','open',?4)",rusqlite::params![uuid::Uuid::now_v7().as_bytes().as_slice(),old,asset.as_bytes().as_slice(),unix_timestamp_millis()])?;
+            }
+        }
+        crate::sync::identity::record_identity(
+            transaction,
+            &crate::sync::capture::LocalFileIdentity {
+                asset_uuid: asset,
+                volume_identity: volume_identity.to_vec(),
+                file_identity: persisted_file_identity,
+                content_fingerprint: fingerprint.map(ToOwned::to_owned),
+            },
+            &path.to_string_lossy(),
+        )?;
+        Ok(result.id)
     }
 
     #[allow(dead_code)]
@@ -5853,14 +6262,34 @@ impl Database {
         }
 
         for file in batch.files {
-            let result = upsert_file_in_transaction(&transaction, file.file, scan_generation)?;
-            upsert_media_kind_in_transaction(
-                &transaction,
-                result.id,
-                &file.media_kind,
-                result.identity_changed,
-            )?;
-            file_ids.push(result.id);
+            if let Some(identity) = file.external_identity {
+                file_ids.push(Self::upsert_external_media_file_in_transaction(
+                    &transaction,
+                    file.file,
+                    &file.media_kind,
+                    &identity.volume_identity,
+                    &identity.file_identity,
+                    identity.content_fingerprint.as_deref(),
+                    &identity.path,
+                    scan_generation,
+                    crate::sync::capture::MutationOrigin::Bootstrap,
+                )?);
+            } else {
+                let result = upsert_file_in_transaction(
+                    &transaction,
+                    file.file,
+                    scan_generation,
+                    crate::sync::capture::MutationOrigin::Bootstrap,
+                    None,
+                )?;
+                upsert_media_kind_in_transaction(
+                    &transaction,
+                    result.id,
+                    &file.media_kind,
+                    result.identity_changed,
+                )?;
+                file_ids.push(result.id);
+            }
         }
 
         transaction.commit()?;
@@ -5905,7 +6334,27 @@ impl Database {
         }
 
         for file in batch.files {
-            let result = upsert_file_in_transaction(&transaction, file.file, scan_generation)?;
+            if let Some(identity) = file.external_identity {
+                file_ids.push(Self::upsert_external_media_file_in_transaction(
+                    &transaction,
+                    file.file,
+                    &file.media_kind,
+                    &identity.volume_identity,
+                    &identity.file_identity,
+                    identity.content_fingerprint.as_deref(),
+                    &identity.path,
+                    scan_generation,
+                    crate::sync::capture::MutationOrigin::Bootstrap,
+                )?);
+                continue;
+            }
+            let result = upsert_file_in_transaction(
+                &transaction,
+                file.file,
+                scan_generation,
+                crate::sync::capture::MutationOrigin::Bootstrap,
+                None,
+            )?;
             upsert_media_kind_in_transaction(
                 &transaction,
                 result.id,
@@ -6450,9 +6899,12 @@ impl Database {
                 return Err(TagError::InvalidColor);
             }
         }
-        let result = self.connection.execute(
-            "INSERT INTO tags(name, color) VALUES (?1, ?2)",
-            (trimmed, color),
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let tag_uuid = uuid::Uuid::now_v7();
+        let result = transaction.execute(
+            "INSERT INTO tags(name, color, tag_uuid) VALUES (?1, ?2, ?3)",
+            rusqlite::params![trimmed, color, tag_uuid.as_bytes().as_slice()],
         );
         match result {
             Ok(_) => {}
@@ -6463,7 +6915,28 @@ impl Database {
             }
             Err(error) => return Err(TagError::from(error)),
         }
-        let id = self.connection.last_insert_rowid();
+        let id = transaction.last_insert_rowid();
+        crate::sync::capture::capture_catalog_mutation_if_initialized(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            crate::sync::types::EntityUuid(tag_uuid),
+            crate::sync::types::Operation::SetField {
+                field: "name".into(),
+                value: serde_json::json!(trimmed),
+            },
+        )
+        .map_err(TagError::Other)?;
+        crate::sync::capture::capture_catalog_mutation_if_initialized(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            crate::sync::types::EntityUuid(tag_uuid),
+            crate::sync::types::Operation::SetField {
+                field: "color".into(),
+                value: serde_json::json!(color),
+            },
+        )
+        .map_err(TagError::Other)?;
+        transaction.commit()?;
         Ok(TagRecord {
             id,
             name: trimmed.to_string(),
@@ -6474,6 +6947,11 @@ impl Database {
     pub fn delete_tag(&self, id: i64) -> anyhow::Result<bool> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let tag_uuid: Option<Vec<u8>> = transaction
+            .query_row("SELECT tag_uuid FROM tags WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
         let mut affected_files: Vec<i64> = {
             let mut statement = transaction
                 .prepare("SELECT file_id FROM file_tags WHERE tag_id = ?1 ORDER BY file_id ASC")?;
@@ -6497,6 +6975,16 @@ impl Database {
         affected_files.dedup();
         for file_id in &affected_files {
             sync_media_fts_for_file_in_transaction(&transaction, *file_id)?;
+        }
+        if let Some(tag_uuid) = tag_uuid {
+            crate::sync::capture::capture_catalog_mutation_if_initialized(
+                &transaction,
+                crate::sync::capture::MutationOrigin::LocalApi,
+                crate::sync::capture::entity_uuid(&tag_uuid)?,
+                crate::sync::types::Operation::Delete {
+                    token: crate::sync::types::EventUuid::new(),
+                },
+            )?;
         }
         transaction.commit()?;
         Ok(true)
@@ -6557,11 +7045,16 @@ impl Database {
         file_id: i64,
         patch: UserMetadataPatch,
     ) -> anyhow::Result<UserMetadataRecord> {
-        if !self.file_exists(file_id)? {
-            return Err(anyhow::anyhow!("media item not found: {file_id}"));
-        }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let asset_uuid: Vec<u8> = transaction
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE id=?1",
+                [file_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?;
         let now = unix_timestamp();
         let existing: Option<(Option<i64>, i64, Option<String>)> = transaction
             .query_row(
@@ -6604,7 +7097,48 @@ impl Database {
             "#,
             (file_id, next_rating, next_favorite, &next_note, now),
         )?;
-        sync_media_fts_for_file_in_transaction(&transaction, file_id)?;
+        // Only notes participate in media_fts. Rating/favorite-only edits are
+        // authoritative metadata mutations, but rebuilding the FTS row here
+        // needlessly deletes and reinserts a large hot index entry on every
+        // capture. In a million-asset Library that index churn dominated the
+        // local capture latency without changing any searchable value.
+        if patch.note.is_some() {
+            sync_media_fts_for_file_in_transaction(&transaction, file_id)?;
+        }
+        let entity = crate::sync::capture::entity_uuid(&asset_uuid)?;
+        if patch.rating.is_some() {
+            crate::sync::capture::capture_catalog_mutation_if_initialized(
+                &transaction,
+                crate::sync::capture::MutationOrigin::LocalApi,
+                entity,
+                crate::sync::types::Operation::SetField {
+                    field: "rating".into(),
+                    value: serde_json::json!(next_rating),
+                },
+            )?;
+        }
+        if patch.favorite.is_some() {
+            crate::sync::capture::capture_catalog_mutation_if_initialized(
+                &transaction,
+                crate::sync::capture::MutationOrigin::LocalApi,
+                entity,
+                crate::sync::types::Operation::SetField {
+                    field: "favorite".into(),
+                    value: serde_json::json!(next_favorite != 0),
+                },
+            )?;
+        }
+        if patch.note.is_some() {
+            crate::sync::capture::capture_catalog_mutation_if_initialized(
+                &transaction,
+                crate::sync::capture::MutationOrigin::LocalApi,
+                entity,
+                crate::sync::types::Operation::SetField {
+                    field: "note".into(),
+                    value: serde_json::json!(next_note),
+                },
+            )?;
+        }
         transaction.commit()?;
 
         Ok(UserMetadataRecord {
@@ -6629,6 +7163,19 @@ impl Database {
         }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let asset_uuid: Vec<u8> = transaction.query_row(
+            "SELECT asset_uuid FROM files WHERE id=?1",
+            [file_id],
+            |row| row.get(0),
+        )?;
+        let current: std::collections::BTreeSet<i64> = {
+            let mut statement =
+                transaction.prepare("SELECT tag_id FROM file_tags WHERE file_id=?1")?;
+            let values = statement
+                .query_map([file_id], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            values
+        };
         for tag_id in &unique {
             let exists: i64 = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
@@ -6647,6 +7194,37 @@ impl Database {
             )?;
         }
         sync_media_fts_for_file_in_transaction(&transaction, file_id)?;
+        let owner = crate::sync::capture::entity_uuid(&asset_uuid).map_err(TagError::Other)?;
+        for tag_id in unique.difference(&current) {
+            let member = tag_entity_uuid(&transaction, *tag_id).map_err(TagError::Other)?;
+            crate::sync::capture::capture_catalog_mutation_if_initialized(
+                &transaction,
+                crate::sync::capture::MutationOrigin::LocalApi,
+                owner,
+                crate::sync::types::Operation::SetAdd {
+                    set: "tags".into(),
+                    member_uuid: member,
+                },
+            )
+            .map_err(TagError::Other)?;
+        }
+        for tag_id in current.difference(&unique) {
+            let member = tag_entity_uuid(&transaction, *tag_id).map_err(TagError::Other)?;
+            let observed_adds =
+                crate::sync::capture::observed_tag_adds(&transaction, owner, member)
+                    .map_err(TagError::Other)?;
+            crate::sync::capture::capture_catalog_mutation_if_initialized(
+                &transaction,
+                crate::sync::capture::MutationOrigin::LocalApi,
+                owner,
+                crate::sync::types::Operation::SetRemove {
+                    set: "tags".into(),
+                    member_uuid: member,
+                    observed_adds,
+                },
+            )
+            .map_err(TagError::Other)?;
+        }
         transaction.commit()?;
         Ok(unique.into_iter().collect())
     }
@@ -6659,6 +7237,11 @@ impl Database {
         }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let asset_uuid: Vec<u8> = transaction.query_row(
+            "SELECT asset_uuid FROM files WHERE id=?1",
+            [file_id],
+            |row| row.get(0),
+        )?;
         let exists: i64 = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
             [tag_id],
@@ -6667,11 +7250,25 @@ impl Database {
         if exists == 0 {
             return Err(TagError::UnknownTagId(tag_id));
         }
-        transaction.execute(
+        let inserted = transaction.execute(
             "INSERT OR IGNORE INTO file_tags(file_id, tag_id) VALUES (?1, ?2)",
             (file_id, tag_id),
         )?;
         sync_media_fts_for_file_in_transaction(&transaction, file_id)?;
+        if inserted != 0 {
+            let owner = crate::sync::capture::entity_uuid(&asset_uuid).map_err(TagError::Other)?;
+            let member = tag_entity_uuid(&transaction, tag_id).map_err(TagError::Other)?;
+            crate::sync::capture::capture_catalog_mutation_if_initialized(
+                &transaction,
+                crate::sync::capture::MutationOrigin::LocalApi,
+                owner,
+                crate::sync::types::Operation::SetAdd {
+                    set: "tags".into(),
+                    member_uuid: member,
+                },
+            )
+            .map_err(TagError::Other)?;
+        }
         transaction.commit()?;
         Ok(self.list_file_tag_ids(file_id)?)
     }
@@ -6684,6 +7281,11 @@ impl Database {
         }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let asset_uuid: Vec<u8> = transaction.query_row(
+            "SELECT asset_uuid FROM files WHERE id=?1",
+            [file_id],
+            |row| row.get(0),
+        )?;
         let removed = transaction.execute(
             "DELETE FROM file_tags WHERE file_id = ?1 AND tag_id = ?2",
             (file_id, tag_id),
@@ -6692,6 +7294,21 @@ impl Database {
             return Err(TagError::UnknownTagId(tag_id));
         }
         sync_media_fts_for_file_in_transaction(&transaction, file_id)?;
+        let owner = crate::sync::capture::entity_uuid(&asset_uuid).map_err(TagError::Other)?;
+        let member = tag_entity_uuid(&transaction, tag_id).map_err(TagError::Other)?;
+        let observed_adds = crate::sync::capture::observed_tag_adds(&transaction, owner, member)
+            .map_err(TagError::Other)?;
+        crate::sync::capture::capture_catalog_mutation_if_initialized(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            owner,
+            crate::sync::types::Operation::SetRemove {
+                set: "tags".into(),
+                member_uuid: member,
+                observed_adds,
+            },
+        )
+        .map_err(TagError::Other)?;
         transaction.commit()?;
         Ok(self.list_file_tag_ids(file_id)?)
     }
@@ -6837,16 +7454,32 @@ impl Database {
         let count_predicates = predicates.clone();
         let count_parameters = parameters.clone();
         let total_count: i64 = {
+            // Avoid materializing unused one-to-one LEFT JOINs for the count.
+            // On million-asset libraries this turns the common no-filter
+            // search count into an index-only files scan while preserving the
+            // exact same predicates and enabled-root semantics.
+            let count_media_join = query
+                .kind
+                .as_ref()
+                .map(|_| " LEFT JOIN media ON media.file_id = files.id")
+                .unwrap_or("");
+            let count_metadata_join = if query.min_rating.is_some() || query.favorite.is_some() {
+                " LEFT JOIN user_metadata ON user_metadata.file_id = files.id"
+            } else {
+                ""
+            };
             let count_sql = format!(
                 r#"
                 SELECT COUNT(*)
                 FROM files{fts_join}
-                LEFT JOIN media ON media.file_id = files.id
-                LEFT JOIN user_metadata ON user_metadata.file_id = files.id
+                {count_media_join}
+                {count_metadata_join}
                 JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
                 WHERE {where_clause}{tag_filter_clause}
                 "#,
                 fts_join = fts_join,
+                count_media_join = count_media_join,
+                count_metadata_join = count_metadata_join,
                 where_clause = count_predicates.join(" AND "),
                 tag_filter_clause = tag_filter_clause,
             );
@@ -7426,21 +8059,12 @@ fn reusable_file_id_for_content_identity_in_transaction(
             FROM files
             WHERE root_id = ?1
               AND file_key = ?2
-              AND size = ?3
-              AND mtime = ?4
               AND status IN ('active', 'missing')
-              AND (folder_id <> ?5 OR name <> ?6)
+              AND (folder_id <> ?3 OR name <> ?4)
             ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC
             LIMIT 1
             "#,
-            (
-                file.root_id,
-                file_key,
-                file.size,
-                file.mtime,
-                file.folder_id,
-                &file.name,
-            ),
+            (file.root_id, file_key, file.folder_id, &file.name),
             |row| row.get(0),
         )
         .optional()
@@ -7451,6 +8075,8 @@ fn upsert_file_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     file: FileUpsert,
     scan_generation: Option<i64>,
+    origin: crate::sync::capture::MutationOrigin,
+    forced_reusable_file_id: Option<i64>,
 ) -> anyhow::Result<FileUpsertResult> {
     let root_id = file.root_id;
     let folder_id = file.folder_id;
@@ -7475,7 +8101,10 @@ fn upsert_file_in_transaction(
         .unwrap_or(true);
 
     let reusable_file_id = if previous_identity.is_none() {
-        reusable_file_id_for_content_identity_in_transaction(transaction, &file)?
+        forced_reusable_file_id.or(reusable_file_id_for_content_identity_in_transaction(
+            transaction,
+            &file,
+        )?)
     } else {
         None
     };
@@ -7540,6 +8169,49 @@ fn upsert_file_in_transaction(
         )?;
         (id, identity_changed)
     };
+    if let Some(file_key) = file_key.as_deref().filter(|value| !value.is_empty()) {
+        let asset_uuid: Vec<u8> =
+            transaction.query_row("SELECT asset_uuid FROM files WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?;
+        crate::sync::identity::record_identity(
+            transaction,
+            &crate::sync::capture::LocalFileIdentity {
+                asset_uuid: uuid::Uuid::from_slice(&asset_uuid)?,
+                volume_identity: root_id.to_be_bytes().to_vec(),
+                file_identity: file_key.as_bytes().to_vec(),
+                content_fingerprint: None,
+            },
+            &format!("{folder_id}/{name}"),
+        )?;
+        if reusable_file_id.is_some() && origin == crate::sync::capture::MutationOrigin::ExternalFs
+        {
+            let parent_uuid: Vec<u8> = transaction.query_row(
+                "SELECT folder_uuid FROM folders WHERE id=?1",
+                [folder_id],
+                |row| row.get(0),
+            )?;
+            let mut supersedes = std::collections::BTreeSet::new();
+            let mut statement = transaction
+                .prepare("SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1")?;
+            for row in statement.query_map([&asset_uuid], |row| row.get::<_, Vec<u8>>(0))? {
+                supersedes.insert(crate::sync::types::RevisionUuid(uuid::Uuid::from_slice(
+                    &row?,
+                )?));
+            }
+            crate::sync::capture::capture_catalog_mutation_if_initialized(
+                transaction,
+                crate::sync::capture::MutationOrigin::ExternalFs,
+                crate::sync::capture::entity_uuid(&asset_uuid)?,
+                crate::sync::types::Operation::SetLocation {
+                    revision_uuid: crate::sync::types::RevisionUuid::new(),
+                    parent_uuid: Some(crate::sync::capture::entity_uuid(&parent_uuid)?),
+                    name: name.clone(),
+                    supersedes,
+                },
+            )?;
+        }
+    }
     invalidate_stale_thumbnail_states_in_transaction(
         transaction,
         CacheIdentity {
@@ -9825,6 +10497,17 @@ fn unix_timestamp_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn tag_entity_uuid(
+    transaction: &rusqlite::Transaction<'_>,
+    tag_id: i64,
+) -> anyhow::Result<crate::sync::types::EntityUuid> {
+    let bytes: Vec<u8> =
+        transaction.query_row("SELECT tag_uuid FROM tags WHERE id=?1", [tag_id], |row| {
+            row.get(0)
+        })?;
+    crate::sync::capture::entity_uuid(&bytes)
 }
 
 fn is_valid_hex_color(value: &str) -> bool {
@@ -12608,6 +13291,7 @@ mod tests {
                             file_key: None,
                         },
                         media_kind: "video".to_string(),
+                        external_identity: None,
                     },
                     ScanFileUpsert {
                         file: FileUpsert {
@@ -12621,6 +13305,7 @@ mod tests {
                             file_key: None,
                         },
                         media_kind: "image".to_string(),
+                        external_identity: None,
                     },
                 ],
                 scan_generation: None,
@@ -12649,6 +13334,7 @@ mod tests {
                         file_key: None,
                     },
                     media_kind: "image".to_string(),
+                    external_identity: None,
                 }],
                 scan_generation: None,
             })
@@ -12723,6 +13409,7 @@ mod tests {
                         file_key: None,
                     },
                     media_kind: "image".to_string(),
+                    external_identity: None,
                 }],
                 scan_generation: Some(first_generation),
             })
@@ -12829,6 +13516,7 @@ mod tests {
                         file_key: None,
                     },
                     media_kind: "image".to_string(),
+                    external_identity: None,
                 }],
                 scan_generation: Some(seed_generation),
             })
@@ -12954,6 +13642,7 @@ mod tests {
                         file_key: None,
                     },
                     media_kind: "image".to_string(),
+                    external_identity: None,
                 }],
                 scan_generation: None,
             })
@@ -20004,6 +20693,7 @@ mod tests {
         let mut expected = vec![beach, clip];
         expected.sort();
         assert_eq!(ids, expected);
+        assert_eq!(by_note.total_count, Some(by_note.items.len() as i64));
     }
 
     #[test]
@@ -20060,6 +20750,7 @@ mod tests {
             })
             .expect("search combined filters");
         assert_eq!(result.items.len(), 1);
+        assert_eq!(result.total_count, Some(result.items.len() as i64));
         assert_eq!(result.items[0].id, alpha);
         assert!(result.items[0].favorite);
         assert_eq!(result.items[0].rating, Some(5));
@@ -20151,6 +20842,7 @@ mod tests {
             .iter()
             .all(|item| item.kind.as_deref() == Some("image")));
         assert!(result.items.iter().all(|item| item.id != files[2]));
+        assert_eq!(result.total_count, Some(result.items.len() as i64));
     }
 
     #[test]

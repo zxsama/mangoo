@@ -3,6 +3,7 @@ import type {
   AddFileTagRequest,
   ActiveLibraryResponse,
   CreateLibraryRequest,
+  EnableLibrarySyncRequest,
   CreateLibraryResponse,
   CreateTagRequest,
   DeletePluginResponse,
@@ -353,6 +354,21 @@ export function createCoreClient(config: CoreClientConfig) {
       }),
     removeLocalLibrary: (libraryUuid: string, contextRevision: number, options: CoreRequestOptions = {}) =>
       requestNoContent(`/libraries/${encodeURIComponent(libraryUuid)}/local-copy`, {
+        method: "DELETE",
+        headers: { "x-megle-context-revision": String(contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive",
+        signal: options.signal
+      }),
+    enableLibrarySync: (libraryUuid: string, contextRevision: number, body: EnableLibrarySyncRequest, options: CoreRequestOptions = {}) =>
+      request<LibrarySummary>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-binding`, {
+        method: "POST",
+        headers: { "x-megle-context-revision": String(contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive",
+        body: JSON.stringify(body),
+        signal: options.signal
+      }),
+    unbindLibrarySync: (libraryUuid: string, contextRevision: number, options: CoreRequestOptions = {}) =>
+      requestNoContent(`/libraries/${encodeURIComponent(libraryUuid)}/sync-binding`, {
         method: "DELETE",
         headers: { "x-megle-context-revision": String(contextRevision) },
         requestPriority: options.requestPriority ?? "interactive",

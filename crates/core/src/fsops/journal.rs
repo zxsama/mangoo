@@ -650,7 +650,7 @@ impl JournalStore for WriterJournalStore {
         let intent = intent.clone();
         let error = error.cloned();
         self.writer
-            .write_blocking(move |database| {
+            .write_authoritative_blocking(move |database| {
                 finalize_intent(database, &intent, error.as_ref()).map_err(anyhow::Error::new)
             })
             .map_err(FsOpsError::from)
@@ -1824,6 +1824,7 @@ fn finalize_intent(
     )?;
     if error.is_none() {
         apply_success_to_index(&transaction, intent)?;
+        capture_successful_intent(&transaction, intent)?;
     }
     let status = if error.is_some() {
         "failed"
@@ -1852,6 +1853,93 @@ fn finalize_intent(
     transaction.commit()?;
     database.notification_operation_committed(appended);
     Ok(record)
+}
+
+fn capture_successful_intent(
+    transaction: &Transaction<'_>,
+    intent: &JournalIntent,
+) -> FsOpsResult<()> {
+    let entity_id = intent.entity_id.ok_or_else(|| {
+        FsOpsError::new(
+            FsOpsErrorCode::FsError,
+            "file operation is missing entity id",
+        )
+    })?;
+    let entity_uuid: Vec<u8> = match intent.entity_kind {
+        Some(EntityKind::File) => transaction.query_row(
+            "SELECT asset_uuid FROM files WHERE id=?1",
+            [entity_id],
+            |row| row.get(0),
+        )?,
+        Some(EntityKind::Folder) => transaction.query_row(
+            "SELECT folder_uuid FROM folders WHERE id=?1",
+            [entity_id],
+            |row| row.get(0),
+        )?,
+        None => return Ok(()),
+    };
+    let entity = crate::sync::capture::entity_uuid(&entity_uuid).map_err(FsOpsError::from)?;
+    let operation = match intent.kind {
+        FileOperationKind::Rename | FileOperationKind::Move => {
+            let (parent_uuid, name): (Option<Vec<u8>>, String) = match intent.entity_kind {
+                    Some(EntityKind::File) => transaction.query_row(
+                        "SELECT p.folder_uuid,f.name FROM files f JOIN folders p ON p.id=f.folder_id WHERE f.id=?1",
+                        [entity_id],
+                        |row| Ok((row.get(0)?,row.get(1)?)),
+                    )?,
+                    Some(EntityKind::Folder) => transaction.query_row(
+                        "SELECT COALESCE(p.folder_uuid,r.root_uuid),f.name FROM folders f JOIN roots r ON r.id=f.root_id LEFT JOIN folders p ON p.id=f.parent_id WHERE f.id=?1",
+                        [entity_id],
+                        |row| Ok((row.get(0)?,row.get(1)?)),
+                    )?,
+                    None => return Ok(()),
+            };
+            let mut supersedes = std::collections::BTreeSet::new();
+            let mut statement = transaction
+                .prepare("SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1")?;
+            let rows = statement.query_map([&entity_uuid], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                supersedes.insert(crate::sync::types::RevisionUuid(
+                    Uuid::from_slice(&row?).map_err(anyhow::Error::from)?,
+                ));
+            }
+            crate::sync::types::Operation::SetLocation {
+                revision_uuid: crate::sync::types::RevisionUuid::new(),
+                parent_uuid: parent_uuid
+                    .as_deref()
+                    .map(crate::sync::capture::entity_uuid)
+                    .transpose()
+                    .map_err(FsOpsError::from)?,
+                name,
+                supersedes,
+            }
+        }
+        FileOperationKind::DeleteRecycle | FileOperationKind::DeletePermanent => {
+            if intent.entity_kind == Some(EntityKind::Folder) {
+                let initialized: i64 = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sync_local_state WHERE singleton=1)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if initialized != 0 {
+                    crate::sync::bulk::begin_subtree_delete(transaction, &entity_uuid)
+                        .map_err(FsOpsError::from)?;
+                }
+                return Ok(());
+            }
+            crate::sync::types::Operation::Delete {
+                token: crate::sync::types::EventUuid::new(),
+            }
+        }
+    };
+    crate::sync::capture::capture_catalog_mutation_if_initialized(
+        transaction,
+        crate::sync::capture::MutationOrigin::LocalApi,
+        entity,
+        operation,
+    )
+    .map_err(FsOpsError::from)?;
+    Ok(())
 }
 
 fn apply_success_to_index(

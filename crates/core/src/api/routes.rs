@@ -97,6 +97,7 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/libraries/{libraryUuid}/activate",
     "/api/libraries/{libraryUuid}",
     "/api/libraries/{libraryUuid}/local-copy",
+    "/api/libraries/{libraryUuid}/sync-binding",
     "/api/roots",
     "/api/roots/{rootId}",
     "/api/folders/{folderId}/children",
@@ -620,6 +621,10 @@ pub fn router(state: AppState) -> Router {
             "/api/libraries/:library_uuid/local-copy",
             axum::routing::delete(remove_local_library),
         )
+        .route(
+            "/api/libraries/:library_uuid/sync-binding",
+            post(enable_library_sync).delete(unbind_library_sync),
+        )
         .route("/api/roots", get(list_roots).post(add_root))
         .route("/api/roots/:root_id", axum::routing::delete(remove_root))
         .route(
@@ -774,6 +779,13 @@ struct UpdateLibraryRequest {
     name: Option<String>,
     icon: Option<Option<String>>,
     color: Option<Option<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnableLibrarySyncRequest {
+    provider_id: String,
+    account_identity: String,
 }
 
 fn require_context_revision(headers: &HeaderMap) -> ApiResult<u64> {
@@ -981,6 +993,48 @@ async fn remove_local_library(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn enable_library_sync(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<EnableLibrarySyncRequest>,
+) -> ApiResult<Json<LibrarySummaryResponse>> {
+    let expected_revision = require_context_revision(&headers)?;
+    let manager = library_manager(&state)?;
+    manager
+        .enable_library_sync_with_revision(
+            &library_uuid,
+            expected_revision,
+            &request.provider_id,
+            &request.account_identity,
+        )
+        .await
+        .map_err(map_library_error)?;
+    let snapshot = manager.active_snapshot();
+    let descriptor = manager
+        .registry()
+        .library(&library_uuid)?
+        .ok_or_else(|| CoreError::not_found("library-not-found".to_string()))?;
+    Ok(Json(library_summary(
+        descriptor,
+        snapshot.library_uuid.as_deref(),
+        snapshot.context_revision,
+    )))
+}
+
+async fn unbind_library_sync(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let expected_revision = require_context_revision(&headers)?;
+    library_manager(&state)?
+        .unbind_library_sync_with_revision(&library_uuid, expected_revision)
+        .await
+        .map_err(map_library_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn map_library_error(error: anyhow::Error) -> CoreError {
     let message = error.to_string();
     let status = if message.contains("not-found") {
@@ -1063,6 +1117,25 @@ where
         .writer()
         .expect("active library writer")
         .write(move |database: &mut Database| Ok(operation(database)))
+        .await;
+    match inner {
+        Ok(api_result) => api_result,
+        Err(error) => Err(CoreError::from(error)),
+    }
+}
+
+/// Run an unrecoverable user-authored mutation under SQLite `FULL` durability.
+/// Sync capture, when enabled for the Library, executes inside the same closure
+/// and therefore the same transaction as the browse projection mutation.
+async fn run_authoritative_database<T, F>(state: AppState, operation: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Database) -> ApiResult<T> + Send + 'static,
+{
+    let inner = state
+        .writer()
+        .expect("active library writer")
+        .write_authoritative(move |database: &mut Database| Ok(operation(database)))
         .await;
     match inner {
         Ok(api_result) => api_result,
@@ -2473,7 +2546,7 @@ async fn create_tag(
     State(state): State<AppState>,
     Json(payload): Json<CreateTagRequestBody>,
 ) -> ApiResult<(StatusCode, Json<TagRecord>)> {
-    let tag = run_shared_database(state, move |database| {
+    let tag = run_authoritative_database(state, move |database| {
         let color = payload.color.as_deref();
         database
             .create_tag(payload.name.as_str(), color)
@@ -2487,7 +2560,7 @@ async fn delete_tag(
     State(state): State<AppState>,
     Path(tag_id): Path<i64>,
 ) -> ApiResult<Json<DeleteTagResponse>> {
-    run_shared_database(state, move |database| {
+    run_authoritative_database(state, move |database| {
         let deleted = database.delete_tag(tag_id)?;
         if !deleted {
             return Err(CoreError::not_found(format!("tag not found: {tag_id}")));
@@ -2524,7 +2597,7 @@ async fn update_user_metadata(
     Json(payload): Json<serde_json::Value>,
 ) -> ApiResult<Json<UserMetadataRecord>> {
     let patch = parse_user_metadata_patch(&payload)?;
-    let record = run_shared_database(state, move |database| {
+    let record = run_authoritative_database(state, move |database| {
         database
             .upsert_user_metadata_partial(file_id, patch)
             .map_err(map_metadata_error)
@@ -2538,7 +2611,7 @@ async fn set_file_tags(
     Path(file_id): Path<i64>,
     Json(payload): Json<SetFileTagsRequestBody>,
 ) -> ApiResult<Json<FileTagsResponse>> {
-    let tag_ids = run_shared_database(state, move |database| {
+    let tag_ids = run_authoritative_database(state, move |database| {
         database
             .set_file_tags(file_id, &payload.tag_ids)
             .map_err(map_tag_error)
@@ -2552,7 +2625,7 @@ async fn add_file_tag(
     Path(file_id): Path<i64>,
     Json(payload): Json<AddFileTagRequestBody>,
 ) -> ApiResult<Json<FileTagsResponse>> {
-    let tag_ids = run_shared_database(state, move |database| {
+    let tag_ids = run_authoritative_database(state, move |database| {
         database
             .add_file_tag(file_id, payload.tag_id)
             .map_err(map_tag_error)
@@ -2565,7 +2638,7 @@ async fn remove_file_tag(
     State(state): State<AppState>,
     Path((file_id, tag_id)): Path<(i64, i64)>,
 ) -> ApiResult<Json<FileTagsResponse>> {
-    let tag_ids = run_shared_database(state, move |database| {
+    let tag_ids = run_authoritative_database(state, move |database| {
         database
             .remove_file_tag(file_id, tag_id)
             .map_err(map_tag_error)
@@ -5984,9 +6057,13 @@ mod tests {
             .expect("task items")
             .iter()
             .find(|task| task["kind"] == "root_purge" && task["rootId"] == root_id)
-            .and_then(|task| task["id"].as_i64())
-            .expect("root_purge task enqueued for removed root");
-        wait_for_task_absent(&app, purge_task_id).await;
+            .and_then(|task| task["id"].as_i64());
+        // A fast worker may finish and self-delete the purge task before this
+        // diagnostic list call. Presence means wait; absence already proves
+        // the terminal state this test needs.
+        if let Some(purge_task_id) = purge_task_id {
+            wait_for_task_absent(&app, purge_task_id).await;
+        }
 
         let response = app
             .clone()
