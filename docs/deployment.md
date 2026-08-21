@@ -87,6 +87,25 @@ state into `/data`, backed by the named volume `megle-data`. The volume
 survives `docker compose down`; remove it explicitly with
 `docker volume rm megle-megle-data` if you want a clean slate.
 
+Provider runtime state lives in `/data/plugin-state`; encrypted credential
+records live separately in `/data/secrets`. Bundled executable providers are
+only loaded from the root-owned, read-only `/opt/megle/plugins` image path.
+Files placed under `/data` are never treated as executable plugins.
+
+The encrypted records require an independently mounted 32-byte master key at
+`/run/secrets/megle_secret_key`. Megle never generates this key in `/data`.
+If it is absent or has unsafe permissions, local browsing remains available
+and secret-dependent providers report `configuration-required`.
+
+Create the key once, keep it outside the data volume, and restrict access:
+
+```bash
+mkdir -p secrets
+openssl rand 32 > secrets/megle_secret_key
+chmod 600 secrets/megle_secret_key
+docker compose up --build
+```
+
 `/library` is the bind mount for your media. Nothing is written there unless
 you remove the `:ro` flag.
 
@@ -97,10 +116,14 @@ you remove the `:ro` flag.
 | `MEGLE_CORE_ADDR` | Bind address. | `0.0.0.0:47321` |
 | `MEGLE_HOST_DB_PATH` | Host registry SQLite path. | `/data/host/host.sqlite` |
 | `MEGLE_LIBRARIES_DIR` | Local catalog/cache storage owned by the Host. | `/data/host/libraries` |
-| `MEGLE_PLUGINS_DIR` | Plugin discovery root. | `/data/plugins` |
+| `MEGLE_PLUGINS_DIR` | Read-only bundled provider root. | `/opt/megle/plugins` |
+| `MEGLE_PLUGIN_STATE_DIR` | Writable non-secret Provider runtime state. | `/data/plugin-state` |
+| `MEGLE_SECRETS_DIR` | Encrypted Provider credential records. | `/data/secrets` |
+| `MEGLE_SECRET_KEY_FILE` | Read-only 32-byte master-key file. | `/run/secrets/megle_secret_key` |
+| `MEGLE_PUBLIC_URL` | Public HTTPS base used for Docker OAuth callbacks; no userinfo/query/fragment. | _(unset)_ |
 | `MEGLE_SERVE_WEB` | Serve the bundled UI when `1`. | `1` |
 | `MEGLE_WEB_DIR` | Directory containing `index.html` + `assets/`. | `/opt/megle/web` |
-| `MEGLE_BASIC_AUTH` | Optional `user:pass` for Basic auth. | _(unset)_ |
+| `MEGLE_BASIC_AUTH` | Browser/API Basic auth. Compose uses a development credential that must be overridden for production. | `megle:change-me` (Compose) |
 | `MEGLE_SESSION_TOKEN` | Optional desktop session token. | _(unset)_ |
 | `MEGLE_ALLOWED_ORIGIN` | Optional dev CORS origin (exact match). | _(unset)_ |
 | `RUST_LOG` | Tracing filter. | `info` |
@@ -148,6 +171,7 @@ The named `megle-data` volume is preserved across rebuilds.
 docker build -t megle:dev .
 docker run --rm -p 47321:47321 \
   -v megle-data:/data \
+  -v "$PWD/secrets/megle_secret_key:/run/secrets/megle_secret_key:ro" \
   -v "$PWD/library:/library:ro" \
   -e MEGLE_BASIC_AUTH=alice:s3cret \
   megle:dev

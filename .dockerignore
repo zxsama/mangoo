@@ -17,6 +17,7 @@ dist/
 
 # Local data, caches, secrets
 .data/
+secrets/
 **/*.sqlite
 **/*.sqlite-journal
 **/*.sqlite-shm

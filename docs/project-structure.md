@@ -12,8 +12,11 @@ apps/
 contracts/
   core-api/         HTTP API contract shared by UI, desktop, Core, and tests.
   plugins/          Plugin manifest and permission contracts.
+bundled-plugins/     Source manifests for trusted Providers packaged with Megle.
 crates/
   core/             Rust Core service binary and Phase 1 backend modules.
+    tests/           Cross-process Core integration and fault tests.
+  fake-provider/    Scriptable framed-process sync Provider used by conformance and benchmarks.
 packages/
   core-client/      Generated-package boundary for the TypeScript Core API client.
   notification-contract/ Shared type-only Desktop/Web notification IPC contract.
@@ -29,6 +32,8 @@ tools/
 - `apps/web` owns presentation and interaction only. It does not read or mutate the filesystem directly.
 - `contracts` owns cross-process boundaries. API paths, DTO names, plugin manifest fields, and permissions start here before implementation.
 - `crates/core` composes API, database, queues, tasks, and service lifecycle. During Phase 1, `api`, `db`, `roots`, `scan`, `thumbnails`, `fsops`, and `plugins` live as modules inside this crate.
+- `crates/core/src/plugins/runtime` owns verified plugin process launch, framed RPC/binary streams, provider adaptation, and supervision. `crates/core/tests` exercises real child-process and process-tree faults rather than replacing those boundaries with mocks.
+- `crates/fake-provider` implements the portable child-process conformance target. `bundled-plugins` supplies its manifest template; `tools/build/build-bundled-plugins.mjs` produces the executable bundle and exact build-time trust hash under Cargo's target directory.
 - Future Rust crates should be split out only after the module boundaries are stable and tests show real separation pressure.
 - `packages/core-client` owns the TypeScript Core API client/types boundary as `@megle/core-client`. Phase 1 keeps a hand-maintained generated-output placeholder aligned by a fast contract check until full generator output replaces it.
 - `packages/notification-contract` owns the type-only notification, process-log, and preload bridge DTOs shared by Desktop and Web. It reuses generated Core operation types and has no runtime Node dependency.
