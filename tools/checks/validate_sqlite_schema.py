@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0001_host_registry.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0002_sync_protocol_foundation.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0003_plugin_runtime.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -36,6 +37,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0025_preview_blobs.sql",
     ROOT / "crates" / "core" / "migrations" / "0026_preview_failures.sql",
     ROOT / "crates" / "core" / "migrations" / "0027_sync_protocol_foundation.sql",
+    ROOT / "crates" / "core" / "migrations" / "0028_remove_catalog_plugins.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -60,7 +62,6 @@ REQUIRED_TABLES = {
     "thumbs",
     "tasks",
     "file_operations",
-    "plugins",
     "media_fts",
     "thumb_blobs",
     "preview_blobs",
@@ -129,7 +130,6 @@ REQUIRED_INDEXES = {
     "idx_tasks_kind_file_status",
     "idx_tasks_kind_status_priority",
     "idx_file_operations_status_created",
-    "idx_plugins_status",
     "idx_thumb_blobs_profile_updated_at",
     "idx_preview_blobs_updated_at",
     "idx_roots_pending_delete",
@@ -331,7 +331,7 @@ def expect_integrity_error(conn: sqlite3.Connection, sql: str, params=()) -> Non
 def verify_sync_upgrade_from_populated_v26() -> None:
     conn = sqlite3.connect(":memory:")
     try:
-        for migration in MIGRATIONS[:-1]:
+        for migration in MIGRATIONS[:-2]:
             apply_migration(conn, migration)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(
@@ -348,7 +348,7 @@ def verify_sync_upgrade_from_populated_v26() -> None:
             (root_id, folder_id),
         )
         conn.execute("INSERT INTO tags(name,color) VALUES ('seed-tag','#fff')")
-        apply_migration(conn, MIGRATIONS[-1])
+        apply_migration(conn, MIGRATIONS[-2])
         for table, column in (
             ("roots", "root_uuid"),
             ("folders", "folder_uuid"),
@@ -360,12 +360,41 @@ def verify_sync_upgrade_from_populated_v26() -> None:
                 fail(f"v26 upgrade did not backfill {table}.{column}")
         # A second application must be an idempotent no-op through the same
         # schema_migrations gate used by Database::apply_migrations.
-        apply_migration(conn, MIGRATIONS[-1])
+        apply_migration(conn, MIGRATIONS[-2])
         count = conn.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE version = 27"
         ).fetchone()[0]
         if count != 1:
             fail("migration 27 rerun did not preserve one registration row")
+    finally:
+        conn.close()
+
+
+def verify_host_plugin_upgrade_from_populated_v2() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        for migration in HOST_MIGRATIONS[:2]:
+            conn.executescript(migration.read_text(encoding="utf-8"))
+        conn.execute(
+            "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','root','Library','local','managed','ready','local-only','available',1,'marker',1,1)"
+        )
+        conn.execute(
+            "INSERT INTO library_sync_bindings(library_uuid,provider_id,account_identity,binding_epoch,actor_epoch,state,created_at,updated_at) VALUES ('library','legacy','account',randomblob(16),randomblob(16),'active',1,1)"
+        )
+        conn.executescript(HOST_MIGRATIONS[2].read_text(encoding="utf-8"))
+        if conn.execute("SELECT COUNT(*) FROM libraries").fetchone()[0] != 1:
+            fail("Host 0003 removed a Library registration")
+        if conn.execute("SELECT COUNT(*) FROM library_sync_bindings").fetchone()[0] != 0:
+            fail("Host 0003 retained a development-only legacy binding")
+        if conn.execute("SELECT schema_version FROM host_meta").fetchone()[0] != 3:
+            fail("Host 0003 did not advance schema version")
+        # HostRegistry gates numbered migrations by host_meta. Reopening at v3
+        # must not execute the destructive transition a second time.
+        if conn.execute("SELECT schema_version FROM host_meta").fetchone()[0] < 3:
+            conn.executescript(HOST_MIGRATIONS[2].read_text(encoding="utf-8"))
+        if conn.execute("SELECT COUNT(*) FROM libraries").fetchone()[0] != 1:
+            fail("Host 0003 reopen gate was not idempotent")
     finally:
         conn.close()
 
@@ -415,6 +444,7 @@ def main() -> None:
 
     verify_scan_reconciliation_repair_path()
     verify_sync_upgrade_from_populated_v26()
+    verify_host_plugin_upgrade_from_populated_v2()
 
     for host_migration in HOST_MIGRATIONS:
         if not host_migration.exists():
@@ -441,6 +471,15 @@ def main() -> None:
             "host_sync_outbox",
             "host_sync_field_versions",
             "library_sync_bindings",
+            "plugin_installations",
+            "plugin_versions",
+            "plugin_runtime_state",
+            "plugin_accounts",
+            "provider_account_root_cursors",
+            "provider_binding_cursors",
+            "provider_object_receipts",
+            "plugin_activation_journal",
+            "plugin_version_journal",
         }
         missing_host_tables = required_host_tables - host_tables
         if missing_host_tables:
@@ -448,8 +487,16 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (2, None, 0):
+        if meta != (3, None, 0):
             fail(f"unexpected Host Registry metadata seed: {meta}")
+        binding_cursor_columns = {
+            row[1]
+            for row in host_conn.execute(
+                "PRAGMA table_info(provider_binding_cursors)"
+            )
+        }
+        if "page_token" not in binding_cursor_columns:
+            fail("provider_binding_cursors.page_token is required for durable pagination")
         creation_columns = {
             row[1]
             for row in host_conn.execute(
@@ -471,16 +518,27 @@ def main() -> None:
         }
         required_host_indexes = {
             "idx_host_sync_outbox_pending",
-            "idx_library_sync_bindings_schedule",
             "idx_host_sync_field_winner",
             "idx_host_sync_field_history",
+            "idx_plugin_versions_state",
+            "idx_plugin_runtime_schedule",
+            "idx_provider_binding_schedule",
+            "idx_provider_receipts_state",
         }
         missing_host_indexes = required_host_indexes - host_indexes
         if missing_host_indexes:
             fail(f"missing Host sync indexes: {sorted(missing_host_indexes)}")
         expect_integrity_error(
             host_conn,
-            "INSERT INTO library_sync_bindings(library_uuid,provider_id,account_identity,binding_epoch,actor_epoch,state,created_at,updated_at) VALUES ('missing','onedrive','account',randomblob(16),randomblob(16),'unknown',1,1)",
+            "INSERT INTO library_sync_bindings(library_uuid,plugin_id,account_uuid,binding_epoch,actor_epoch,state,created_at,updated_at) VALUES ('missing','onedrive','account',randomblob(16),randomblob(16),'unknown',1,1)",
+        )
+        expect_integrity_error(
+            host_conn,
+            "INSERT INTO plugin_installations(plugin_id,manifest_version,selected_version,enabled_intent,install_root,trust_policy_id,requested_permissions_json,granted_permissions_json,created_at,updated_at) VALUES ('invalid',1,'1.0.0',0,'root','bundled','[]','[]',1,1)",
+        )
+        expect_integrity_error(
+            host_conn,
+            "INSERT INTO plugin_runtime_state(plugin_id,state,updated_at) VALUES ('missing','ready',1)",
         )
         expect_integrity_error(
             host_conn,
@@ -735,26 +793,10 @@ def main() -> None:
             if missing_thumb_columns:
                 fail(f"missing thumbnail columns: {sorted(missing_thumb_columns)}")
 
-            plugin_columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(plugins)").fetchall()
-            }
-            required_plugin_columns = {
-                "id",
-                "name",
-                "version",
-                "description",
-                "enabled",
-                "status",
-                "capabilities_json",
-                "permissions_json",
-                "manifest_path",
-                "installed_at",
-                "updated_at",
-                "last_error",
-            }
-            missing_plugin_columns = required_plugin_columns - plugin_columns
-            if missing_plugin_columns:
-                fail(f"missing plugin columns: {sorted(missing_plugin_columns)}")
+            if conn.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='plugins'"
+            ).fetchone():
+                fail("legacy Catalog plugins table remains after migration 28")
 
             head_columns = {
                 row[1]

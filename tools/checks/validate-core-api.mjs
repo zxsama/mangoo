@@ -166,6 +166,9 @@ if (!dbMigrationsRs.includes('include_str!("../../migrations/0010_media_fts_cont
 if (!dbMigrationsRs.includes('include_str!("../../migrations/0011_plugins_extended.sql")')) {
   fail("db plugins extended migration include path changed or missing");
 }
+if (!dbMigrationsRs.includes('include_str!("../../migrations/0028_remove_catalog_plugins.sql")')) {
+  fail("db Catalog plugin removal migration include path changed or missing");
+}
 if (!dbMigrationsRs.includes('include_str!("../../migrations/0013_preview_served_by.sql")')) {
   fail("db preview served_by migration include path changed or missing");
 }
@@ -347,7 +350,7 @@ if (!routesRs.includes("StatusCode::NOT_FOUND")) {
   fail("routes must expose NOT_FOUND for missing folder/media");
 }
 
-for (const value of ["decoder", "metadata", "action", "import-provider"]) {
+for (const value of ["sync-provider.v1"]) {
   if (!pluginManifest.includes(value) || !pluginsRs.includes(value)) {
     fail(`plugin capability value is not aligned: ${value}`);
   }

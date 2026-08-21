@@ -1,0 +1,9 @@
+{
+  "id": "com.megle.legacy",
+  "name": "Legacy Plugin",
+  "version": "1.0.0",
+  "engine": "process",
+  "entry": "plugin.exe",
+  "capabilities": ["import-provider"],
+  "permissions": ["network"]
+}

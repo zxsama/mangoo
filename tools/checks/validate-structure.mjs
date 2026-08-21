@@ -648,14 +648,19 @@ const requiredDirs = [
   "apps/web/src/design/overlays",
   "contracts/core-api",
   "contracts/plugins",
+  "bundled-plugins/com.megle.fake-sync",
   "crates/core/src",
+  "crates/core/tests",
   "crates/core/migrations",
   "crates/core/host_migrations",
+  "crates/fake-provider/src",
+  "crates/fake-provider/tests",
   "docs/performance-results/raw/2026-05-16",
   "packages/core-client",
   "packages/notification-contract",
   "tests",
   "tools/bench",
+  "tools/build",
   "tools/checks",
   "tools/dev"
 ];
@@ -692,15 +697,37 @@ const requiredFiles = [
   "packages/notification-contract/src/index.ts",
   "contracts/core-api/openapi.yaml",
   "contracts/plugins/manifest.schema.json",
+  "contracts/plugins/fixtures/valid-sync-provider-v2.json",
+  "contracts/plugins/fixtures/invalid-v1-manifest.json",
+  "contracts/plugins/fixtures/invalid-entry-traversal.json",
+  "contracts/plugins/fixtures/invalid-permission-field.json",
+  "bundled-plugins/com.megle.fake-sync/plugin.template.json",
   "crates/core/Cargo.toml",
   "crates/core/migrations/0001_initial.sql",
   "crates/core/host_migrations/0001_host_registry.sql",
+  "crates/core/host_migrations/0003_plugin_runtime.sql",
+  "crates/core/src/plugins/runtime/generated_trust.rs",
   "crates/core/migrations/0021_notification_outbox.sql",
+  "crates/core/migrations/0028_remove_catalog_plugins.sql",
   "crates/core/src/db/notification_outbox.rs",
+  "crates/core/src/plugins/runtime/frame.rs",
+  "crates/core/src/plugins/runtime/process.rs",
+  "crates/core/src/plugins/runtime/provider_adapter.rs",
+  "crates/core/src/plugins/runtime/rpc.rs",
+  "crates/core/src/plugins/runtime/stream.rs",
+  "crates/core/src/plugins/runtime/supervisor.rs",
+  "crates/core/src/plugins/runtime/trust.rs",
+  "crates/core/tests/plugin_runtime_process.rs",
+  "crates/fake-provider/Cargo.toml",
+  "crates/fake-provider/src/main.rs",
+  "crates/fake-provider/tests/process_conformance.rs",
   "docs/project-structure.md",
   "docs/performance-results/managed-library-lifecycle-2026-08-16.md",
+  "docs/performance-results/plugin-runtime-sync-provider-2026-08-21.md",
   "docs/testing-strategy.md",
   "tools/bench/managed-library-lifecycle-bench.mjs",
+  "tools/bench/plugin-runtime-bench.mjs",
+  "tools/build/build-bundled-plugins.mjs",
   "tools/dev/managed-library-harness.mjs",
   "tools/dev/run-dev.mjs"
 ];
@@ -750,6 +777,9 @@ const rootCargo = readFileSync(path.join(root, "Cargo.toml"), "utf8");
 if (!rootCargo.includes('"crates/core"')) {
   fail("Cargo workspace must include crates/core");
 }
+if (!rootCargo.includes('"crates/fake-provider"')) {
+  fail("Cargo workspace must include the portable fake Provider conformance crate");
+}
 if (rootCargo.includes('"crates/indexer"') || rootCargo.includes('"crates/thumbnails"')) {
   fail("Phase 1 should not pre-split indexer/thumbnails into workspace crates");
 }
@@ -769,11 +799,32 @@ for (const pathFragment of [
 }
 
 const pluginManifest = readJson("contracts/plugins/manifest.schema.json");
-const capabilities = pluginManifest.properties?.capabilities?.items?.enum ?? [];
-for (const capability of ["decoder", "metadata", "action", "import-provider"]) {
+const capabilities = pluginManifest.$defs?.rpc?.properties?.capabilities?.items?.enum ?? [];
+for (const capability of ["sync-provider.v1"]) {
   if (!capabilities.includes(capability)) {
     fail(`plugin manifest missing capability ${capability}`);
   }
+}
+if (pluginManifest.properties?.manifestVersion?.const !== 2) {
+  fail("plugin manifest must be strict v2");
+}
+if (pluginManifest.additionalProperties !== false) {
+  fail("plugin manifest root must reject unknown fields");
+}
+
+const dockerfile = readText("Dockerfile");
+for (const marker of [
+  "cargo test --release -p megle-fake-provider --test process_conformance",
+  "cargo test --release -p megle-core --test plugin_runtime_process",
+  "MEGLE_PLUGINS_DIR=/opt/megle/plugins"
+]) {
+  if (!dockerfile.includes(marker)) {
+    fail(`Docker plugin runtime contract missing ${marker}`);
+  }
+}
+const dockerIgnore = readText(".dockerignore");
+if (!dockerIgnore.split(/\r?\n/).some((line) => line.trim() === "secrets/")) {
+  fail("Docker build context must exclude the local secrets directory");
 }
 
 requireDocumentSection("README.md", ["Unified Notification Center", "统一通知中心"]);

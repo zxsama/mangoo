@@ -74,5 +74,6 @@ if (!rustc || !cargo) {
 console.log(`PASS: ${rustc.version}`);
 console.log(`PASS: ${cargo.version}`);
 
+run(process.execPath, ["tools/build/build-bundled-plugins.mjs"]);
 run(cargo.command, ["fmt", "--all", "--check"]);
 run(cargo.command, ["test", "--workspace"]);

@@ -784,8 +784,8 @@ describe("createCoreClient", () => {
   });
 
   test("plugin endpoints encode the id", async () => {
-    mockFetch({ deleted: true });
-    await client().deletePlugin("org.example/risky");
+    mockFetch({ accepted: true });
+    await client().unregisterPlugin("org.example/risky");
     assert.equal(recorded[0].method, "DELETE");
     // encoded slash so we don't accidentally hit /plugins/org.example/risky as two path segments
     assert.match(recorded[0].url, /\/plugins\/org\.example%2Frisky$/);

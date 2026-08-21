@@ -275,11 +275,17 @@ for (const name of [
   "RenameRequest",
   "MoveRequest",
   "DeleteRequest",
-  "PluginRecord",
-  "PluginListResponse",
+  "HostPluginProjection",
+  "HostPluginListResponse",
   "PluginDiscoveryError",
   "PluginDiscoveryResponse",
-  "DeletePluginResponse"
+  "PluginCommandResponse",
+  "PluginGrantRequest",
+  "PluginVersionRequest",
+  "PluginAuthBeginResponse",
+  "PluginAuthCompleteRequest",
+  "PluginHealthResponse",
+  "PluginDiagnosticsResponse"
 ]) {
   schema(name);
 }
@@ -324,10 +330,10 @@ assertInterfaceMatchesSchema("FileOperationListResponse");
 assertInterfaceMatchesSchema("RenameRequest");
 assertInterfaceMatchesSchema("MoveRequest");
 assertInterfaceMatchesSchema("DeleteRequest");
-assertInterfaceMatchesSchema("PluginRecord");
+assertInterfaceMatchesSchema("HostPluginProjection");
 assertInterfaceMatchesSchema("PluginDiscoveryError");
 assertInterfaceMatchesSchema("PluginDiscoveryResponse");
-assertInterfaceMatchesSchema("DeletePluginResponse");
+assertInterfaceMatchesSchema("PluginCommandResponse");
 
 const fileOperationSchema = schema("FileOperationRecord");
 const operationGroupSchema = fileOperationSchema.properties?.operationGroupId;
@@ -474,7 +480,16 @@ for (const method of [
   "discoverPlugins",
   "enablePlugin",
   "disablePlugin",
-  "deletePlugin"
+  "unregisterPlugin",
+  "updatePluginGrants",
+  "retryPlugin",
+  "selectPluginVersion",
+  "rollbackPluginVersion",
+  "beginPluginAuth",
+  "completePluginAuth",
+  "signOutPlugin",
+  "getPluginHealth",
+  "getPluginDiagnostics"
 ]) {
   if (!client.includes(`${method}:`)) {
     fail(`client.ts missing operation ${method}`);
