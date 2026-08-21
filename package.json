@@ -22,6 +22,8 @@
     "check:schema": "python tools/checks/validate_sqlite_schema.py",
     "check:rust": "node tools/checks/verify-rust.mjs",
     "bench:sync-protocol": "node tools/bench/sync-protocol-bench.mjs",
+    "bench:plugin-runtime": "node tools/bench/plugin-runtime-bench.mjs",
+    "build:bundled-plugins": "node tools/build/build-bundled-plugins.mjs",
     "test": "npm run check:structure && npm run check:core-api && npm run check:core-client && npm run check:notification-contract && npm run check:desktop && npm run check:web && npm run check:ui-design && npm run check:schema && npm run check:rust"
   },
   "engines": {

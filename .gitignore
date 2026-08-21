@@ -4,6 +4,8 @@ tmp/
 .tmp/
 dist/
 build/
+!tools/build/
+!tools/build/build-bundled-plugins.mjs
 target/
 .turbo/
 .vite/

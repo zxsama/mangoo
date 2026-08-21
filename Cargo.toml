@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/core"
+  "crates/core",
+  "crates/fake-provider"
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ axum = "0.7"
 rusqlite = { version = "0.32", features = ["bundled", "backup", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

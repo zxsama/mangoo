@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 const HOST_MIGRATION_0001: &str = include_str!("../host_migrations/0001_host_registry.sql");
 const HOST_MIGRATION_0002: &str =
     include_str!("../host_migrations/0002_sync_protocol_foundation.sql");
+const HOST_MIGRATION_0003: &str = include_str!("../host_migrations/0003_plugin_runtime.sql");
 
 #[derive(Debug, Clone)]
 pub struct LibraryDescriptor {
@@ -67,11 +68,1260 @@ pub struct RemovalRecovery {
     pub phase: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostPluginProjection {
+    pub plugin_id: String,
+    pub selected_version: String,
+    pub known_good_version: Option<String>,
+    pub enabled_intent: bool,
+    pub requested_permissions: serde_json::Value,
+    pub granted_permissions: serde_json::Value,
+    pub capabilities: serde_json::Value,
+    pub permission_required: bool,
+    pub runtime_state: String,
+    pub auth_state: Option<String>,
+    pub account_uuid: Option<String>,
+    pub account_display_name: Option<String>,
+    pub backoff_until: Option<i64>,
+    pub last_healthy_at: Option<i64>,
+    pub last_error_code: Option<String>,
+    pub last_error_detail: Option<String>,
+    pub compatibility_reason: Option<String>,
+}
+
+pub struct RegisterBundledPlugin<'a> {
+    pub plugin_id: &'a str,
+    pub version: &'a str,
+    pub manifest_json: &'a str,
+    pub entry_relative_path: &'a str,
+    pub entry_sha256: &'a [u8; 32],
+    pub install_root: &'a Path,
+    pub trust_policy_id: &'a str,
+    pub requested_permissions_json: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginRuntimeLaunch {
+    pub plugin_id: String,
+    pub version: String,
+    pub manifest_json: String,
+    pub install_root: PathBuf,
+    pub entry_sha256: [u8; 32],
+    pub account_uuid: String,
+    pub account_generation: i64,
+    pub granted_permissions: Vec<crate::plugins::manifest::Permission>,
+}
+
+impl PluginRuntimeLaunch {
+    pub fn fingerprint(&self) -> String {
+        plugin_runtime_launch_fingerprint(
+            &self.version,
+            &self.account_uuid,
+            self.account_generation,
+            &self.granted_permissions,
+        )
+    }
+}
+
+fn plugin_runtime_launch_fingerprint(
+    version: &str,
+    account_uuid: &str,
+    account_generation: i64,
+    granted_permissions: &[crate::plugins::manifest::Permission],
+) -> String {
+    let grants =
+        serde_json::to_string(granted_permissions).unwrap_or_else(|_| "invalid-grants".to_owned());
+    format!("{version}:{account_uuid}:{account_generation}:{grants}")
+}
+
+fn plugin_runtime_launch_matches(
+    connection: &Connection,
+    plugin_id: &str,
+    expected_fingerprint: &str,
+) -> anyhow::Result<bool> {
+    let current = connection
+        .query_row(
+            "SELECT i.selected_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,a.account_uuid,a.generation,r.state FROM plugin_installations i JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.plugin_id=?1",
+            [plugin_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        version,
+        enabled,
+        requested_json,
+        granted_json,
+        account_uuid,
+        account_generation,
+        state,
+    )) = current
+    else {
+        return Ok(false);
+    };
+    let requested =
+        serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&requested_json)?;
+    let granted = serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&granted_json)?;
+    Ok(enabled
+        && state != "configuration-required"
+        && permissions_match(&requested, &granted)
+        && plugin_runtime_launch_fingerprint(&version, &account_uuid, account_generation, &granted)
+            == expected_fingerprint)
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginAccountSecret {
+    pub account_uuid: String,
+    pub plugin_id: String,
+    pub secret_ref: Option<String>,
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindingTransport {
+    pub plugin_id: String,
+    pub account_uuid: String,
+    pub binding_epoch: uuid::Uuid,
+    pub actor_epoch: uuid::Uuid,
+    pub transport_generation: i64,
+    pub state: String,
+    pub remote_namespace: Option<String>,
+    pub cursor: Option<String>,
+    pub page_token: Option<String>,
+    pub latest_checkpoint_uuid: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindingFence {
+    pub account_uuid: String,
+    pub binding_epoch: uuid::Uuid,
+    pub next_transport_generation: u64,
+}
+
 pub struct HostRegistry {
     connection: Mutex<Connection>,
 }
 
+fn permissions_match(
+    requested: &[crate::plugins::manifest::Permission],
+    granted: &[crate::plugins::manifest::Permission],
+) -> bool {
+    requested.len() == granted.len()
+        && requested
+            .iter()
+            .all(|permission| granted.contains(permission))
+}
+
+fn pause_plugin_bindings_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    plugin_id: &str,
+) -> anyhow::Result<Vec<BindingFence>> {
+    let now = unix_timestamp_millis();
+    transaction.execute(
+        "UPDATE library_sync_bindings SET state='paused',transport_generation=transport_generation+1,updated_at=?1 WHERE plugin_id=?2 AND state <> 'unbinding'",
+        params![now, plugin_id],
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT account_uuid,binding_epoch,transport_generation FROM library_sync_bindings WHERE plugin_id=?1 AND state='paused' ORDER BY library_uuid",
+    )?;
+    let rows = statement.query_map([plugin_id], |row| {
+        let binding_epoch: Vec<u8> = row.get(1)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            binding_epoch,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut fences = Vec::new();
+    for row in rows {
+        let (account_uuid, binding_epoch, next_transport_generation) = row?;
+        fences.push(BindingFence {
+            account_uuid,
+            binding_epoch: uuid::Uuid::from_slice(&binding_epoch)?,
+            next_transport_generation: u64::try_from(next_transport_generation)
+                .map_err(|_| anyhow::anyhow!("invalid transport generation"))?,
+        });
+    }
+    Ok(fences)
+}
+
+fn commit_plugin_probation_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    plugin_id: &str,
+) -> anyhow::Result<bool> {
+    let candidate: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT journal_uuid,to_version FROM plugin_version_journal WHERE plugin_id=?1 AND phase='probation' ORDER BY created_at DESC LIMIT 1",
+            [plugin_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((journal_uuid, version)) = candidate else {
+        return Ok(false);
+    };
+    let now = unix_timestamp_millis();
+    transaction.execute("UPDATE plugin_versions SET state=CASE WHEN version=?1 THEN 'known-good' WHEN state='known-good' THEN 'retired' ELSE state END WHERE plugin_id=?2",params![version,plugin_id])?;
+    transaction.execute("UPDATE plugin_installations SET selected_version=?1,known_good_version=?1,updated_at=?2 WHERE plugin_id=?3",params![version,now,plugin_id])?;
+    transaction.execute(
+        "UPDATE plugin_version_journal SET phase='committed',updated_at=?1 WHERE journal_uuid=?2",
+        params![now, journal_uuid],
+    )?;
+    Ok(true)
+}
+
+fn rollback_plugin_probation_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    plugin_id: &str,
+    error_code: &str,
+) -> anyhow::Result<Vec<BindingFence>> {
+    let pending: Option<(String, Option<String>, String)> = transaction.query_row(
+        "SELECT journal_uuid,from_version,to_version FROM plugin_version_journal WHERE plugin_id=?1 AND phase IN ('verifying','draining','probation') ORDER BY created_at DESC LIMIT 1",
+        [plugin_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).optional()?;
+    let Some((journal_uuid, from_version, candidate)) = pending else {
+        anyhow::bail!("plugin-probation-missing")
+    };
+    let fallback = from_version
+        .or_else(|| {
+            transaction
+                .query_row(
+                    "SELECT known_good_version FROM plugin_installations WHERE plugin_id=?1",
+                    [plugin_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+        })
+        .ok_or_else(|| anyhow::anyhow!("plugin-known-good-missing"))?;
+    let now = unix_timestamp_millis();
+    transaction.execute("UPDATE plugin_versions SET state=CASE WHEN version=?1 THEN 'rejected' WHEN version=?2 THEN 'known-good' ELSE state END WHERE plugin_id=?3",params![candidate,fallback,plugin_id])?;
+    transaction.execute("UPDATE plugin_installations SET selected_version=?1,known_good_version=?1,updated_at=?2 WHERE plugin_id=?3",params![fallback,now,plugin_id])?;
+    transaction.execute("UPDATE plugin_runtime_state SET state='starting',last_error_code=?1,updated_at=?2 WHERE plugin_id=?3",params![error_code,now,plugin_id])?;
+    transaction.execute("UPDATE plugin_version_journal SET phase='rolled-back',error_code=?1,updated_at=?2 WHERE journal_uuid=?3",params![error_code,now,journal_uuid])?;
+    pause_plugin_bindings_in_transaction(transaction, plugin_id)
+}
+
 impl HostRegistry {
+    pub fn plugin_runtime_launch_is_current(
+        &self,
+        plugin_id: &str,
+        expected_fingerprint: &str,
+    ) -> anyhow::Result<bool> {
+        plugin_runtime_launch_matches(
+            &self.connection.lock().unwrap_or_else(|p| p.into_inner()),
+            plugin_id,
+            expected_fingerprint,
+        )
+    }
+
+    pub fn require_ready_sync_provider(
+        &self,
+        plugin_id: &str,
+        account_uuid: &str,
+    ) -> anyhow::Result<()> {
+        let auth_state = self.require_runtime_provider(plugin_id, account_uuid)?;
+        if auth_state != "authenticated" {
+            anyhow::bail!("provider-account-not-authenticated");
+        }
+        Ok(())
+    }
+
+    pub fn require_runtime_provider(
+        &self,
+        plugin_id: &str,
+        account_uuid: &str,
+    ) -> anyhow::Result<String> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let row = connection
+            .query_row(
+                "SELECT i.enabled_intent,r.state,a.auth_state,r.capabilities_json FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE i.plugin_id=?1 AND a.account_uuid=?2",
+                params![plugin_id, account_uuid],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((enabled, runtime_state, auth_state, capabilities_json)) = row else {
+            anyhow::bail!("provider-account-not-found");
+        };
+        if !enabled {
+            anyhow::bail!("provider-disabled");
+        }
+        if runtime_state != "ready" {
+            anyhow::bail!("provider-not-ready");
+        }
+        let capabilities = serde_json::from_str::<Vec<String>>(&capabilities_json)?;
+        if !capabilities
+            .iter()
+            .any(|capability| capability == "sync-provider.v1")
+        {
+            anyhow::bail!("provider-incompatible");
+        }
+        Ok(auth_state)
+    }
+
+    pub fn plugin_account_secret(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<PluginAccountSecret>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection.query_row("SELECT account_uuid,plugin_id,secret_ref,generation FROM plugin_accounts WHERE plugin_id=?1", [plugin_id], |row| Ok(PluginAccountSecret { account_uuid: row.get(0)?, plugin_id: row.get(1)?, secret_ref: row.get(2)?, generation: row.get(3)? })).optional().map_err(Into::into)
+    }
+
+    pub fn set_plugin_account_secret(
+        &self,
+        plugin_id: &str,
+        secret_ref: Option<&str>,
+        auth_state: &str,
+        generation: i64,
+    ) -> anyhow::Result<()> {
+        let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute("UPDATE plugin_accounts SET secret_ref=?1,auth_state=?2,generation=?3,updated_at=?4 WHERE plugin_id=?5", params![secret_ref,auth_state,generation,unix_timestamp_millis(),plugin_id])?;
+        if changed != 1 {
+            anyhow::bail!("plugin-account-not-found");
+        }
+        Ok(())
+    }
+
+    pub fn set_plugin_account_secret_for_launch(
+        &self,
+        plugin_id: &str,
+        expected_fingerprint: &str,
+        secret_ref: Option<&str>,
+        auth_state: &str,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if !plugin_runtime_launch_matches(&transaction, plugin_id, expected_fingerprint)? {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE plugin_accounts SET secret_ref=?1,auth_state=?2,updated_at=?3 WHERE plugin_id=?4",
+            params![secret_ref,auth_state,unix_timestamp_millis(),plugin_id],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn sign_out_plugin_account(
+        &self,
+        plugin_id: &str,
+        expected_generation: i64,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE plugin_accounts SET secret_ref=NULL,auth_state='signed-out',generation=generation+1,updated_at=?1 WHERE plugin_id=?2 AND generation=?3",
+            params![unix_timestamp_millis(),plugin_id,expected_generation],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE plugin_runtime_state SET state='starting',pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",
+            params![unix_timestamp_millis(), plugin_id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn plugin_runtime_session(&self, plugin_id: &str) -> anyhow::Result<Option<String>> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT session_id FROM plugin_runtime_state WHERE plugin_id=?1 AND state='ready'",
+                [plugin_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn reset_plugin_runtime_states_for_startup(
+        &self,
+        secret_store_available: bool,
+    ) -> anyhow::Result<usize> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT plugin_id,enabled_intent,requested_permissions_json,granted_permissions_json FROM plugin_installations",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut changed = 0;
+        for (plugin_id, enabled, requested_json, granted_json) in rows {
+            let requested: Vec<crate::plugins::manifest::Permission> =
+                serde_json::from_str(&requested_json)?;
+            let granted: Vec<crate::plugins::manifest::Permission> =
+                serde_json::from_str(&granted_json)?;
+            let requires_secret = requested.iter().any(|permission| {
+                matches!(
+                    permission,
+                    crate::plugins::manifest::Permission::Secret { .. }
+                )
+            });
+            let (state, error_code, error_detail) = if !enabled {
+                ("disabled", None, None)
+            } else if !permissions_match(&requested, &granted) {
+                ("permission-required", None, None)
+            } else if requires_secret && !secret_store_available {
+                (
+                    "configuration-required",
+                    Some("secret-store-unavailable"),
+                    Some("MEGLE_SECRET_KEY_FILE is missing or invalid"),
+                )
+            } else {
+                ("starting", None, None)
+            };
+            changed += transaction.execute(
+                "UPDATE plugin_runtime_state SET state=?1,pid=NULL,session_id=NULL,started_at=NULL,crash_count=0,backoff_until=NULL,last_error_code=?2,last_error_detail=?3,updated_at=?4 WHERE plugin_id=?5",
+                params![state, error_code, error_detail, now, plugin_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn pause_plugin_bindings(&self, plugin_id: &str) -> anyhow::Result<Vec<BindingFence>> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let fences = pause_plugin_bindings_in_transaction(&transaction, plugin_id)?;
+        transaction.commit()?;
+        Ok(fences)
+    }
+    pub fn plugin_runtime_launches(&self) -> anyhow::Result<Vec<PluginRuntimeLaunch>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT i.plugin_id,i.selected_version,v.manifest_json,i.install_root,v.entry_sha256,a.account_uuid,a.generation,i.requested_permissions_json,i.granted_permissions_json FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.enabled_intent=1 AND r.state <> 'configuration-required' ORDER BY i.plugin_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let hash: Vec<u8> = row.get(4)?;
+            Ok((
+                PluginRuntimeLaunch {
+                    plugin_id: row.get(0)?,
+                    version: row.get(1)?,
+                    manifest_json: row.get(2)?,
+                    install_root: PathBuf::from(row.get::<_, String>(3)?),
+                    entry_sha256: hash.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            4,
+                            "entry_sha256".into(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })?,
+                    account_uuid: row.get(5)?,
+                    account_generation: row.get(6)?,
+                    granted_permissions: Vec::new(),
+                },
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+        let mut launches = Vec::new();
+        for row in rows {
+            let (launch, requested, granted) = row?;
+            let requested_permissions =
+                serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&requested)?;
+            let granted_permissions =
+                serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&granted)?;
+            if permissions_match(&requested_permissions, &granted_permissions) {
+                let mut launch = launch;
+                launch.granted_permissions = granted_permissions;
+                launches.push(launch);
+            }
+        }
+        Ok(launches)
+    }
+
+    pub fn register_bundled_plugin(&self, plugin: RegisterBundledPlugin<'_>) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let now = unix_timestamp_millis();
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT selected_version,install_root FROM plugin_installations WHERE plugin_id=?1",
+                [plugin.plugin_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let is_new = existing.is_none();
+        let is_selected = existing
+            .as_ref()
+            .is_none_or(|(selected_version, _)| selected_version == plugin.version);
+        if let Some((selected_version, install_root)) = &existing {
+            if Path::new(install_root) != plugin.install_root {
+                anyhow::bail!("plugin-install-root-changed");
+            }
+            if selected_version != plugin.version {
+                let selected_entry: String = transaction.query_row(
+                    "SELECT entry_relative_path FROM plugin_versions WHERE plugin_id=?1 AND version=?2",
+                    params![plugin.plugin_id, selected_version],
+                    |row| row.get(0),
+                )?;
+                if selected_entry == plugin.entry_relative_path {
+                    anyhow::bail!("plugin-version-entry-must-be-side-by-side");
+                }
+            }
+        }
+        if is_new {
+            transaction.execute(
+                "INSERT INTO plugin_installations(plugin_id,manifest_version,selected_version,enabled_intent,install_root,trust_policy_id,requested_permissions_json,granted_permissions_json,created_at,updated_at) VALUES (?1,2,?2,0,?3,?4,?5,'[]',?6,?6)",
+                params![plugin.plugin_id,plugin.version,plugin.install_root.to_string_lossy(),plugin.trust_policy_id,plugin.requested_permissions_json,now],
+            )?;
+        } else if is_selected {
+            transaction.execute(
+                "UPDATE plugin_installations SET manifest_version=2,trust_policy_id=?1,requested_permissions_json=?2,updated_at=?3 WHERE plugin_id=?4",
+                params![plugin.trust_policy_id,plugin.requested_permissions_json,now,plugin.plugin_id],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at,last_verified_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7) ON CONFLICT(plugin_id,version) DO UPDATE SET manifest_json=excluded.manifest_json,entry_relative_path=excluded.entry_relative_path,entry_sha256=excluded.entry_sha256,last_verified_at=excluded.last_verified_at",
+            params![plugin.plugin_id,plugin.version,plugin.manifest_json,plugin.entry_relative_path,plugin.entry_sha256.as_slice(),if is_selected { "selected" } else { "candidate" },now],
+        )?;
+        transaction.execute(
+            "INSERT INTO plugin_runtime_state(plugin_id,state,capabilities_json,crash_count,updated_at) VALUES (?1,'disabled','[]',0,?2) ON CONFLICT(plugin_id) DO NOTHING",
+            params![plugin.plugin_id,now],
+        )?;
+        if is_selected {
+            let (enabled, granted_json): (bool, String) = transaction.query_row(
+                "SELECT enabled_intent,granted_permissions_json FROM plugin_installations WHERE plugin_id=?1",
+                [plugin.plugin_id],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),
+            )?;
+            let requested = serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(
+                plugin.requested_permissions_json,
+            )?;
+            let granted =
+                serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&granted_json)?;
+            if enabled && !permissions_match(&requested, &granted) {
+                transaction.execute(
+                    "UPDATE plugin_runtime_state SET state='permission-required',pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",
+                    params![now, plugin.plugin_id],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_plugin_grants(
+        &self,
+        plugin_id: &str,
+        granted_permissions_json: &str,
+        secret_store_available: bool,
+    ) -> anyhow::Result<Vec<BindingFence>> {
+        let granted = serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(
+            granted_permissions_json,
+        )?;
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let requested_json: String = transaction.query_row(
+            "SELECT requested_permissions_json FROM plugin_installations WHERE plugin_id=?1",
+            [plugin_id],
+            |row| row.get(0),
+        )?;
+        let requested =
+            serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&requested_json)?;
+        let requires_secret = requested.iter().any(|permission| {
+            matches!(
+                permission,
+                crate::plugins::manifest::Permission::Secret { .. }
+            )
+        });
+        if granted
+            .iter()
+            .any(|permission| !requested.contains(permission))
+            || granted
+                .iter()
+                .enumerate()
+                .any(|(index, permission)| granted[..index].contains(permission))
+        {
+            anyhow::bail!("permission-not-requested");
+        }
+        let granted_permissions_json = serde_json::to_string(&granted)?;
+        let now = unix_timestamp_millis();
+        let changed = transaction.execute(
+            "UPDATE plugin_installations SET granted_permissions_json=?1,updated_at=?2 WHERE plugin_id=?3",
+            params![granted_permissions_json, now, plugin_id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("plugin-not-found");
+        }
+        let enabled = transaction.query_row(
+            "SELECT enabled_intent FROM plugin_installations WHERE plugin_id=?1",
+            [plugin_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        let state = if !enabled {
+            "disabled"
+        } else if !permissions_match(&requested, &granted) {
+            "permission-required"
+        } else if requires_secret && !secret_store_available {
+            "configuration-required"
+        } else {
+            "starting"
+        };
+        transaction.execute(
+            "UPDATE plugin_runtime_state SET state=?1,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=CASE WHEN ?1='configuration-required' THEN 'secret-store-unavailable' ELSE NULL END,last_error_detail=CASE WHEN ?1='configuration-required' THEN 'MEGLE_SECRET_KEY_FILE is missing or invalid' ELSE NULL END,updated_at=?2 WHERE plugin_id=?3",
+            params![state, now, plugin_id],
+        )?;
+        let fences = pause_plugin_bindings_in_transaction(&transaction, plugin_id)?;
+        transaction.commit()?;
+        Ok(fences)
+    }
+
+    pub fn upsert_plugin_account(
+        &self,
+        account_uuid: &str,
+        plugin_id: &str,
+        display_name: Option<&str>,
+        auth_state: &str,
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "INSERT INTO plugin_accounts(account_uuid,plugin_id,display_name,auth_state,generation,created_at,updated_at) VALUES (?1,?2,?3,?4,1,?5,?5) ON CONFLICT(account_uuid) DO UPDATE SET display_name=excluded.display_name,auth_state=excluded.auth_state,updated_at=excluded.updated_at",
+            params![account_uuid,plugin_id,display_name,auth_state,now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_host_plugins(&self) -> anyhow::Result<Vec<HostPluginProjection>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT i.plugin_id,i.selected_version,i.known_good_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,r.state,a.auth_state,a.account_uuid,a.display_name,r.backoff_until,r.last_healthy_at,r.last_error_code,r.last_error_detail,r.capabilities_json FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id LEFT JOIN plugin_accounts a ON a.plugin_id=i.plugin_id ORDER BY i.plugin_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let requested: String = row.get(4)?;
+            let granted: String = row.get(5)?;
+            Ok(HostPluginProjection {
+                plugin_id: row.get(0)?,
+                selected_version: row.get(1)?,
+                known_good_version: row.get(2)?,
+                enabled_intent: row.get::<_, i64>(3)? != 0,
+                requested_permissions: serde_json::from_str(&requested)
+                    .unwrap_or(serde_json::Value::Null),
+                granted_permissions: serde_json::from_str(&granted)
+                    .unwrap_or(serde_json::Value::Null),
+                capabilities: serde_json::from_str(&row.get::<_, String>(14)?)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                permission_required: row.get::<_, String>(6)? == "permission-required",
+                runtime_state: row.get(6)?,
+                auth_state: row.get(7)?,
+                account_uuid: row.get(8)?,
+                account_display_name: row.get(9)?,
+                backoff_until: row.get(10)?,
+                last_healthy_at: row.get(11)?,
+                last_error_code: row.get(12)?,
+                last_error_detail: row.get(13)?,
+                compatibility_reason: (row.get::<_, String>(6)? == "incompatible")
+                    .then(|| row.get::<_, Option<String>>(13).ok().flatten())
+                    .flatten(),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn host_plugin(&self, plugin_id: &str) -> anyhow::Result<Option<HostPluginProjection>> {
+        Ok(self
+            .list_host_plugins()?
+            .into_iter()
+            .find(|plugin| plugin.plugin_id == plugin_id))
+    }
+
+    pub fn set_plugin_intent(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+        secret_store_available: bool,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE plugin_installations SET enabled_intent=?1,updated_at=?2 WHERE plugin_id=?3",
+            params![enabled, unix_timestamp_millis(), plugin_id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("plugin-not-found");
+        }
+        if enabled {
+            let now = unix_timestamp_millis();
+            transaction.execute(
+                "INSERT INTO plugin_accounts(account_uuid,plugin_id,auth_state,generation,created_at,updated_at) SELECT ?1,?2,'authorization-required',1,?3,?3 WHERE NOT EXISTS(SELECT 1 FROM plugin_accounts WHERE plugin_id=?2)",
+                params![uuid::Uuid::now_v7().to_string(),plugin_id,now],
+            )?;
+        }
+        let (requested_json, granted_json): (String, String) = transaction.query_row(
+            "SELECT requested_permissions_json,granted_permissions_json FROM plugin_installations WHERE plugin_id=?1",
+            [plugin_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let requested =
+            serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&requested_json)?;
+        let granted =
+            serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&granted_json)?;
+        let requires_secret =
+            serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&requested_json)?
+                .iter()
+                .any(|permission| {
+                    matches!(
+                        permission,
+                        crate::plugins::manifest::Permission::Secret { .. }
+                    )
+                });
+        let state = if !enabled {
+            "disabled"
+        } else if permissions_match(&requested, &granted) {
+            if requires_secret && !secret_store_available {
+                "configuration-required"
+            } else {
+                "starting"
+            }
+        } else {
+            "permission-required"
+        };
+        transaction.execute(
+            "UPDATE plugin_runtime_state SET state=?1,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=CASE WHEN ?1='configuration-required' THEN 'secret-store-unavailable' ELSE NULL END,last_error_detail=CASE WHEN ?1='configuration-required' THEN 'MEGLE_SECRET_KEY_FILE is missing or invalid' ELSE NULL END,updated_at=?2 WHERE plugin_id=?3",
+            params![state, unix_timestamp_millis(), plugin_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn update_plugin_account_auth(
+        &self,
+        plugin_id: &str,
+        auth_state: &str,
+        display_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "UPDATE plugin_accounts SET auth_state=?1,display_name=COALESCE(?2,display_name),last_error=NULL,updated_at=?3 WHERE plugin_id=?4",
+            params![auth_state,display_name,unix_timestamp_millis(),plugin_id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("plugin-account-not-found");
+        }
+        Ok(())
+    }
+
+    pub fn update_plugin_account_auth_for_session(
+        &self,
+        plugin_id: &str,
+        expected_session: &str,
+        auth_state: &str,
+        display_name: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "UPDATE plugin_accounts SET auth_state=?1,display_name=COALESCE(?2,display_name),last_error=NULL,updated_at=?3 WHERE plugin_id=?4 AND EXISTS(SELECT 1 FROM plugin_runtime_state r WHERE r.plugin_id=plugin_accounts.plugin_id AND r.state='ready' AND r.session_id=?5)",
+            params![auth_state,display_name,unix_timestamp_millis(),plugin_id,expected_session],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn retry_plugin_runtime(
+        &self,
+        plugin_id: &str,
+        secret_store_available: bool,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let (enabled, requested_json, granted_json): (bool, String, String) = transaction
+            .query_row(
+                "SELECT enabled_intent,requested_permissions_json,granted_permissions_json FROM plugin_installations WHERE plugin_id=?1",
+                [plugin_id],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?, row.get(2)?)),
+            )?;
+        if !enabled {
+            anyhow::bail!("plugin-disabled");
+        }
+        let requested =
+            serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&requested_json)?;
+        let granted =
+            serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&granted_json)?;
+        if !permissions_match(&requested, &granted) {
+            anyhow::bail!("plugin-permission-required");
+        }
+        if !secret_store_available
+            && requested.iter().any(|permission| {
+                matches!(
+                    permission,
+                    crate::plugins::manifest::Permission::Secret { .. }
+                )
+            })
+        {
+            anyhow::bail!("plugin-configuration-required");
+        }
+        transaction.execute("UPDATE plugin_runtime_state SET state='starting',crash_count=0,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",params![unix_timestamp_millis(),plugin_id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn plugin_runtime_retry_requested(&self, plugin_id: &str) -> anyhow::Result<bool> {
+        Ok(self.connection.lock().unwrap_or_else(|p| p.into_inner()).query_row(
+            "SELECT state='starting' AND crash_count=0 FROM plugin_runtime_state WHERE plugin_id=?1",
+            [plugin_id],
+            |row| row.get::<_, i64>(0),
+        ).optional()?.unwrap_or(0) != 0)
+    }
+
+    #[cfg(test)]
+    pub fn record_plugin_runtime_ready(
+        &self,
+        plugin_id: &str,
+        session_id: &str,
+        capabilities: &[String],
+    ) -> anyhow::Result<()> {
+        let capabilities = serde_json::to_string(capabilities)?;
+        let now = unix_timestamp_millis();
+        let changed = self.connection.lock().unwrap_or_else(|p|p.into_inner()).execute(
+            "UPDATE plugin_runtime_state SET state='ready',session_id=?1,capabilities_json=?2,last_healthy_at=?3,crash_count=0,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?3 WHERE plugin_id=?4",
+            params![session_id,capabilities,now,plugin_id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("plugin-not-found")
+        }
+        Ok(())
+    }
+
+    pub fn record_plugin_runtime_ready_for_launch(
+        &self,
+        plugin_id: &str,
+        expected_fingerprint: &str,
+        session_id: &str,
+        capabilities: &[String],
+    ) -> anyhow::Result<bool> {
+        let capabilities = serde_json::to_string(capabilities)?;
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if !plugin_runtime_launch_matches(&transaction, plugin_id, expected_fingerprint)? {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE plugin_runtime_state SET state='ready',session_id=?1,capabilities_json=?2,last_healthy_at=?3,crash_count=0,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?3 WHERE plugin_id=?4",
+            params![session_id, capabilities, now, plugin_id],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn record_plugin_runtime_failure(
+        &self,
+        plugin_id: &str,
+        expected_fingerprint: &str,
+        state: &str,
+        error_code: &str,
+        detail: &str,
+        backoff_until: Option<i64>,
+    ) -> anyhow::Result<bool> {
+        if !matches!(
+            state,
+            "degraded" | "crashed-backoff" | "incompatible" | "configuration-required"
+        ) {
+            anyhow::bail!("invalid-plugin-runtime-failure-state")
+        }
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if !plugin_runtime_launch_matches(&transaction, plugin_id, expected_fingerprint)? {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE plugin_runtime_state SET state=?1,crash_count=crash_count+1,backoff_until=?2,last_error_code=?3,last_error_detail=?4,updated_at=?5 WHERE plugin_id=?6",
+            params![state,backoff_until,error_code,detail,unix_timestamp_millis(),plugin_id],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn plugin_has_pending_probation(&self, plugin_id: &str) -> anyhow::Result<bool> {
+        Ok(self.connection.lock().unwrap_or_else(|p|p.into_inner()).query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_version_journal WHERE plugin_id=?1 AND phase='probation')",
+            [plugin_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    pub fn select_plugin_version(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        secret_store_available: bool,
+    ) -> anyhow::Result<Vec<BindingFence>> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = connection.transaction()?;
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM plugin_versions WHERE plugin_id=?1 AND version=?2",
+            params![plugin_id, version],
+            |r| r.get(0),
+        )?;
+        if exists != 1 {
+            anyhow::bail!("plugin-version-not-found")
+        }
+        let (from_version, enabled, granted_json): (String, bool, String) = tx.query_row(
+            "SELECT selected_version,enabled_intent,granted_permissions_json FROM plugin_installations WHERE plugin_id=?1",
+            [plugin_id],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0, row.get(2)?)),
+        )?;
+        if from_version == version {
+            return Ok(Vec::new());
+        }
+        let switch_in_progress = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_version_journal WHERE plugin_id=?1 AND phase IN ('verifying','draining','probation'))",
+            [plugin_id],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )?;
+        if switch_in_progress {
+            anyhow::bail!("plugin-version-switch-in-progress");
+        }
+        let journal_uuid = uuid::Uuid::now_v7().to_string();
+        let now = unix_timestamp_millis();
+        let manifest_json: String = tx.query_row(
+            "SELECT manifest_json FROM plugin_versions WHERE plugin_id=?1 AND version=?2",
+            params![plugin_id, version],
+            |row| row.get(0),
+        )?;
+        let manifest: crate::plugins::manifest::ManifestRecord =
+            serde_json::from_str(&manifest_json)?;
+        let requested = manifest.requested_permissions;
+        let requested_json = serde_json::to_string(&requested)?;
+        let granted =
+            serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&granted_json)?;
+        let requires_secret = requested.iter().any(|permission| {
+            matches!(
+                permission,
+                crate::plugins::manifest::Permission::Secret { .. }
+            )
+        });
+        let runtime_state = if !enabled {
+            "disabled"
+        } else if !permissions_match(&requested, &granted) {
+            "permission-required"
+        } else if requires_secret && !secret_store_available {
+            "configuration-required"
+        } else {
+            "starting"
+        };
+        tx.execute(
+            "INSERT INTO plugin_version_journal(journal_uuid,plugin_id,from_version,to_version,phase,created_at,updated_at) VALUES (?1,?2,?3,?4,'probation',?5,?5)",
+            params![journal_uuid,plugin_id,from_version,version,now],
+        )?;
+        tx.execute("UPDATE plugin_versions SET state=CASE WHEN version=?1 THEN 'candidate' WHEN state='selected' THEN 'known-good' ELSE state END WHERE plugin_id=?2",params![version,plugin_id])?;
+        tx.execute("UPDATE plugin_installations SET known_good_version=COALESCE(known_good_version,selected_version),selected_version=?1,requested_permissions_json=?2,updated_at=?3 WHERE plugin_id=?4",params![version,requested_json,now,plugin_id])?;
+        tx.execute(
+            "UPDATE plugin_runtime_state SET state=?1,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=CASE WHEN ?1='configuration-required' THEN 'secret-store-unavailable' ELSE NULL END,last_error_detail=CASE WHEN ?1='configuration-required' THEN 'MEGLE_SECRET_KEY_FILE is missing or invalid' ELSE NULL END,updated_at=?2 WHERE plugin_id=?3",
+            params![runtime_state, now, plugin_id],
+        )?;
+        let fences = pause_plugin_bindings_in_transaction(&tx, plugin_id)?;
+        tx.commit()?;
+        Ok(fences)
+    }
+
+    pub fn rollback_plugin_version(&self, plugin_id: &str) -> anyhow::Result<Vec<BindingFence>> {
+        let known = self
+            .connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT known_good_version FROM plugin_installations WHERE plugin_id=?1",
+                [plugin_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("plugin-not-found"))?
+            .ok_or_else(|| anyhow::anyhow!("plugin-known-good-missing"))?;
+        let fences = self.rollback_plugin_probation(plugin_id, "manual-rollback")?;
+        let selected = self
+            .host_plugin(plugin_id)?
+            .ok_or_else(|| anyhow::anyhow!("plugin-not-found"))?
+            .selected_version;
+        if selected != known {
+            anyhow::bail!("plugin-known-good-rollback-failed")
+        }
+        Ok(fences)
+    }
+
+    /// Marks a candidate healthy only after the supervisor probation window.
+    /// The version switch and durable journal terminal state share one commit.
+    pub fn commit_plugin_probation(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = connection.transaction()?;
+        commit_plugin_probation_in_transaction(&tx, plugin_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn commit_plugin_probation_for_launch(
+        &self,
+        plugin_id: &str,
+        expected_fingerprint: &str,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = connection.transaction()?;
+        if !plugin_runtime_launch_matches(&tx, plugin_id, expected_fingerprint)? {
+            return Ok(false);
+        }
+        let committed = commit_plugin_probation_in_transaction(&tx, plugin_id)?;
+        tx.commit()?;
+        Ok(committed)
+    }
+
+    /// Fail closed on a candidate crash/health failure. This is idempotent and
+    /// is also used during Host startup recovery for interrupted probation.
+    pub fn rollback_plugin_probation(
+        &self,
+        plugin_id: &str,
+        error_code: &str,
+    ) -> anyhow::Result<Vec<BindingFence>> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = connection.transaction()?;
+        let fences = rollback_plugin_probation_in_transaction(&tx, plugin_id, error_code)?;
+        tx.commit()?;
+        Ok(fences)
+    }
+
+    pub fn rollback_plugin_probation_for_launch(
+        &self,
+        plugin_id: &str,
+        expected_fingerprint: &str,
+        error_code: &str,
+    ) -> anyhow::Result<Option<Vec<BindingFence>>> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = connection.transaction()?;
+        if !plugin_runtime_launch_matches(&tx, plugin_id, expected_fingerprint)? {
+            return Ok(None);
+        }
+        let fences = rollback_plugin_probation_in_transaction(&tx, plugin_id, error_code)?;
+        tx.commit()?;
+        Ok(Some(fences))
+    }
+
+    pub fn recover_plugin_version_journal(&self) -> anyhow::Result<usize> {
+        let plugin_ids = {
+            let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+            let mut statement = connection.prepare("SELECT DISTINCT plugin_id FROM plugin_version_journal WHERE phase IN ('verifying','draining','probation')")?;
+            let values = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            values
+        };
+        for plugin_id in &plugin_ids {
+            self.rollback_plugin_probation(plugin_id, "startup-recovery")?;
+        }
+        Ok(plugin_ids.len())
+    }
+
+    pub fn unregister_plugin(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let refs:i64=connection.query_row("SELECT (SELECT COUNT(*) FROM plugin_accounts WHERE plugin_id=?1)+(SELECT COUNT(*) FROM library_sync_bindings WHERE plugin_id=?1)",[plugin_id],|r|r.get(0))?;
+        if refs > 0 {
+            anyhow::bail!("plugin-in-use")
+        }
+        let changed = connection.execute(
+            "DELETE FROM plugin_installations WHERE plugin_id=?1",
+            [plugin_id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("plugin-not-found")
+        }
+        Ok(())
+    }
+
+    pub fn binding_transport(
+        &self,
+        library_uuid: &str,
+        scope: &str,
+    ) -> anyhow::Result<Option<BindingTransport>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection.query_row(
+            "SELECT b.plugin_id,b.account_uuid,b.binding_epoch,b.actor_epoch,b.transport_generation,b.state,b.remote_namespace,c.cursor,c.page_token,b.latest_checkpoint_uuid FROM library_sync_bindings b LEFT JOIN provider_binding_cursors c ON c.library_uuid=b.library_uuid AND c.binding_epoch=b.binding_epoch AND c.scope=?2 WHERE b.library_uuid=?1",
+            params![library_uuid,scope],
+            |row| {
+                let epoch: Vec<u8> = row.get(2)?;
+                let binding_epoch = uuid::Uuid::from_slice(&epoch).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Blob, Box::new(error))
+                })?;
+                let actor: Vec<u8> = row.get(3)?;
+                let actor_epoch = uuid::Uuid::from_slice(&actor).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Blob, Box::new(error))
+                })?;
+                let checkpoint: Option<Vec<u8>> = row.get(9)?;
+                Ok(BindingTransport {
+                    plugin_id: row.get(0)?,
+                    account_uuid: row.get(1)?,
+                    binding_epoch,
+                    actor_epoch,
+                    transport_generation: row.get(4)?,
+                    state: row.get(5)?,
+                    remote_namespace: row.get(6)?,
+                    cursor: row.get(7)?,
+                    page_token: row.get(8)?,
+                    latest_checkpoint_uuid: checkpoint
+                        .map(|value| uuid::Uuid::from_slice(&value))
+                        .transpose()
+                        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Blob, Box::new(error)))?,
+                })
+            },
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn commit_binding_cursor(
+        &self,
+        library_uuid: &str,
+        binding_epoch: uuid::Uuid,
+        transport_generation: i64,
+        remote_namespace: &str,
+        scope: &str,
+        cursor: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let current: Option<i64> = connection.query_row(
+            "SELECT transport_generation FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2",
+            params![library_uuid,binding_epoch.as_bytes().as_slice()],
+            |row| row.get(0),
+        ).optional()?;
+        if current != Some(transport_generation) {
+            anyhow::bail!("stale-provider-transport-generation");
+        }
+        connection.execute(
+            "INSERT INTO provider_binding_cursors(library_uuid,binding_epoch,remote_namespace,scope,cursor,page_token,transport_generation,updated_at) VALUES (?1,?2,?3,?4,?5,NULL,?6,?7) ON CONFLICT(library_uuid,binding_epoch,scope) DO UPDATE SET remote_namespace=excluded.remote_namespace,cursor=excluded.cursor,page_token=NULL,transport_generation=excluded.transport_generation,updated_at=excluded.updated_at",
+            params![library_uuid,binding_epoch.as_bytes().as_slice(),remote_namespace,scope,cursor,transport_generation,unix_timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_binding_page(
+        &self,
+        library_uuid: &str,
+        binding_epoch: uuid::Uuid,
+        transport_generation: i64,
+        remote_namespace: &str,
+        scope: &str,
+        cursor: Option<&str>,
+        page_token: &str,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let current: Option<i64> = connection
+            .query_row(
+                "SELECT transport_generation FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2",
+                params![library_uuid,binding_epoch.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current != Some(transport_generation) {
+            anyhow::bail!("stale-provider-transport-generation");
+        }
+        connection.execute(
+            "INSERT INTO provider_binding_cursors(library_uuid,binding_epoch,remote_namespace,scope,cursor,page_token,transport_generation,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(library_uuid,binding_epoch,scope) DO UPDATE SET remote_namespace=excluded.remote_namespace,cursor=excluded.cursor,page_token=excluded.page_token,transport_generation=excluded.transport_generation,updated_at=excluded.updated_at",
+            params![library_uuid,binding_epoch.as_bytes().as_slice(),remote_namespace,scope,cursor,page_token,transport_generation,unix_timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_provider_receipt(
+        &self,
+        library_uuid: &str,
+        binding_epoch: uuid::Uuid,
+        transport_generation: i64,
+        object_key: &str,
+        etag: Option<&str>,
+        sha256: &[u8; 32],
+        state: &str,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let current: Option<i64> = connection.query_row(
+            "SELECT transport_generation FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2",
+            params![library_uuid,binding_epoch.as_bytes().as_slice()],
+            |row| row.get(0),
+        ).optional()?;
+        if current != Some(transport_generation) {
+            anyhow::bail!("stale-provider-transport-generation");
+        }
+        let now = unix_timestamp_millis();
+        connection.execute(
+            "INSERT INTO provider_object_receipts(library_uuid,binding_epoch,object_key,etag,sha256,state,generation,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8) ON CONFLICT(library_uuid,binding_epoch,object_key) DO UPDATE SET etag=excluded.etag,sha256=excluded.sha256,state=excluded.state,generation=excluded.generation,updated_at=excluded.updated_at",
+            params![library_uuid,binding_epoch.as_bytes().as_slice(),object_key,etag,sha256.as_slice(),state,transport_generation,now],
+        )?;
+        Ok(())
+    }
+
+    pub fn advance_published_frontier(
+        &self,
+        library_uuid: &str,
+        binding_epoch: uuid::Uuid,
+        transport_generation: i64,
+        published_through_seq: u64,
+        object_key: &str,
+    ) -> anyhow::Result<()> {
+        let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "UPDATE library_sync_bindings SET published_through_seq=MAX(published_through_seq,?1),updated_at=?2 WHERE library_uuid=?3 AND binding_epoch=?4 AND transport_generation=?5 AND EXISTS (SELECT 1 FROM provider_object_receipts r WHERE r.library_uuid=library_sync_bindings.library_uuid AND r.binding_epoch=library_sync_bindings.binding_epoch AND r.generation=?5 AND r.object_key=?6 AND r.state IN ('created','already-exists-matching'))",
+            params![published_through_seq as i64,unix_timestamp_millis(),library_uuid,binding_epoch.as_bytes().as_slice(),transport_generation,object_key],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("published frontier generation or receipt fence failed");
+        }
+        Ok(())
+    }
+
+    pub fn begin_unbind(
+        &self,
+        library_uuid: &str,
+        binding_epoch: uuid::Uuid,
+    ) -> anyhow::Result<i64> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let generation: i64 = transaction.query_row(
+            "SELECT transport_generation FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2",
+            params![library_uuid,binding_epoch.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        let next = generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("transport generation exhausted"))?;
+        transaction.execute(
+            "UPDATE library_sync_bindings SET state='unbinding',transport_generation=?1,updated_at=?2 WHERE library_uuid=?3 AND binding_epoch=?4",
+            params![next,unix_timestamp_millis(),library_uuid,binding_epoch.as_bytes().as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
     /// Applies a verified Host-metadata segment after the currently durable
     /// frontier. The transaction owns ledger, projection and frontier so a
     /// crash can never expose only part of a Host update.
@@ -147,7 +1397,7 @@ impl HostRegistry {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let descriptor = transaction.query_row(
-            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','seeding') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.library_uuid=?1",
+            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.library_uuid=?1",
             [library_uuid],
             descriptor_from_row,
         ).optional()?.ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
@@ -244,7 +1494,7 @@ impl HostRegistry {
     }
     pub fn sync_bound_libraries(&self) -> anyhow::Result<Vec<LibraryDescriptor>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let mut statement=connection.prepare("SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','seeding') THEN 'synchronizing' ELSE 'synchronized' END,l.availability,l.marker_identity FROM libraries l JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE b.state IN ('preparing','seeding','active','paused') ORDER BY l.library_uuid")?;
+        let mut statement=connection.prepare("SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' ELSE 'synchronized' END,l.availability,l.marker_identity FROM libraries l JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE b.state IN ('preparing','capturing','seed_ready','publishing','active','paused') ORDER BY l.library_uuid")?;
         let libraries = statement
             .query_map([], descriptor_from_row)?
             .collect::<Result<_, _>>()?;
@@ -266,6 +1516,14 @@ impl HostRegistry {
         )?;
         if schema_version < 2 {
             connection.execute_batch(HOST_MIGRATION_0002)?;
+        }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 3 {
+            connection.execute_batch(HOST_MIGRATION_0003)?;
         }
         connection.execute(
             "INSERT OR IGNORE INTO host_sync_local_state(singleton,device_uuid,stream_uuid,next_actor_seq,hlc_wall_ms,hlc_logical,capture_enabled,updated_at) VALUES (1,?1,?2,1,0,0,0,?3)",
@@ -294,12 +1552,20 @@ impl HostRegistry {
     pub fn begin_sync_binding(
         &self,
         library_uuid: &str,
-        provider_id: &str,
-        account_identity: &str,
+        plugin_id: &str,
+        account_uuid: &str,
     ) -> anyhow::Result<(uuid::Uuid, uuid::Uuid)> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let now = unix_timestamp_millis();
+        let provider_ready: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE i.plugin_id=?1 AND a.account_uuid=?2 AND i.enabled_intent=1 AND r.state='ready' AND a.auth_state='authenticated' AND EXISTS (SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1')",
+            params![plugin_id, account_uuid],
+            |row| row.get(0),
+        )?;
+        if provider_ready != 1 {
+            anyhow::bail!("provider-not-ready");
+        }
         let (device, stream, host_actor): (Vec<u8>, Vec<u8>, Option<Vec<u8>>) = transaction
             .query_row(
                 "SELECT device_uuid,stream_uuid,active_actor_epoch FROM host_sync_local_state WHERE singleton=1",
@@ -320,8 +1586,8 @@ impl HostRegistry {
         let binding = uuid::Uuid::now_v7();
         let catalog_actor = uuid::Uuid::now_v7();
         transaction.execute(
-            "INSERT INTO library_sync_bindings(library_uuid,provider_id,account_identity,binding_epoch,actor_epoch,state,transport_generation,cutover_actor_seq,published_through_seq,capture_generation,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'preparing',1,0,0,NULL,?6,?6)",
-            params![library_uuid,provider_id,account_identity,binding.as_bytes().as_slice(),catalog_actor.as_bytes().as_slice(),now],
+            "INSERT INTO library_sync_bindings(library_uuid,plugin_id,account_uuid,binding_epoch,actor_epoch,state,transport_generation,cutover_actor_seq,published_through_seq,capture_generation,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'preparing',1,0,0,NULL,?6,?6)",
+            params![library_uuid,plugin_id,account_uuid,binding.as_bytes().as_slice(),catalog_actor.as_bytes().as_slice(),now],
         )?;
         transaction.commit()?;
         Ok((binding, catalog_actor))
@@ -363,7 +1629,7 @@ impl HostRegistry {
         library_uuid: &str,
     ) -> anyhow::Result<Option<i64>> {
         Ok(self.connection.lock().unwrap_or_else(|p|p.into_inner()).query_row(
-            "SELECT capture_generation FROM library_sync_bindings WHERE library_uuid=?1 AND state IN ('preparing','seeding')",
+            "SELECT capture_generation FROM library_sync_bindings WHERE library_uuid=?1 AND state IN ('preparing','capturing','seed_ready','publishing')",
             [library_uuid],|row|row.get(0),
         ).optional()?)
     }
@@ -371,7 +1637,7 @@ impl HostRegistry {
     /// Descriptor publication is fenced on a durable, validated Catalog
     /// checkpoint. Provider code may call this only after the Catalog gate has
     /// succeeded; Host then atomically exposes the seed identity.
-    pub fn mark_sync_seed_ready(
+    pub fn mark_local_seed_ready(
         &self,
         library_uuid: &str,
         checkpoint_uuid: uuid::Uuid,
@@ -383,11 +1649,28 @@ impl HostRegistry {
         }
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let changed = connection.execute(
-            "UPDATE library_sync_bindings SET state='active',latest_checkpoint_uuid=?1,capture_generation=?2,updated_at=?3 WHERE library_uuid=?4 AND state IN ('preparing','seeding') AND capture_generation=?2",
+            "UPDATE library_sync_bindings SET state='seed_ready',latest_checkpoint_uuid=?1,capture_generation=?2,updated_at=?3 WHERE library_uuid=?4 AND state IN ('preparing','capturing') AND capture_generation=?2",
             params![checkpoint_uuid.as_bytes().as_slice(),capture_generation,unix_timestamp_millis(),library_uuid],
         )?;
         if changed != 1 {
             anyhow::bail!("sync binding is not awaiting a seed checkpoint");
+        }
+        Ok(())
+    }
+
+    pub fn confirm_remote_descriptor(
+        &self,
+        library_uuid: &str,
+        binding_epoch: uuid::Uuid,
+        transport_generation: i64,
+        checkpoint_key: &str,
+    ) -> anyhow::Result<()> {
+        let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "UPDATE library_sync_bindings SET state='active',updated_at=?1 WHERE library_uuid=?2 AND binding_epoch=?3 AND transport_generation=?4 AND state IN ('seed_ready','publishing') AND EXISTS (SELECT 1 FROM provider_object_receipts r WHERE r.library_uuid=library_sync_bindings.library_uuid AND r.binding_epoch=library_sync_bindings.binding_epoch AND r.object_key='library-descriptor' AND r.generation=?4 AND r.state IN ('created','already-exists-matching')) AND EXISTS (SELECT 1 FROM provider_object_receipts r WHERE r.library_uuid=library_sync_bindings.library_uuid AND r.binding_epoch=library_sync_bindings.binding_epoch AND r.object_key=?5 AND r.generation=?4 AND r.state IN ('created','already-exists-matching'))",
+            params![unix_timestamp_millis(),library_uuid,binding_epoch.as_bytes().as_slice(),transport_generation,checkpoint_key],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("remote descriptor receipt is not durable");
         }
         Ok(())
     }
@@ -433,7 +1716,7 @@ impl HostRegistry {
             |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
         )?;
         let mut statement = connection.prepare(
-            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','seeding') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid ORDER BY COALESCE(l.last_opened_at,l.created_at) DESC,l.created_at DESC",
+            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid ORDER BY COALESCE(l.last_opened_at,l.created_at) DESC,l.created_at DESC",
         )?;
         let libraries = statement
             .query_map([], descriptor_from_row)?
@@ -449,7 +1732,7 @@ impl HostRegistry {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         connection
             .query_row(
-                "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','seeding') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.library_uuid=?1",
+                "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.library_uuid=?1",
                 [library_uuid],
                 descriptor_from_row,
             )
@@ -802,7 +2085,7 @@ fn capture_host_metadata(
     }
     let binding: Option<Vec<u8>> = transaction
         .query_row(
-            "SELECT binding_epoch FROM library_sync_bindings WHERE library_uuid=?1 AND state IN ('preparing','seeding','active','paused')",
+            "SELECT binding_epoch FROM library_sync_bindings WHERE library_uuid=?1 AND state IN ('preparing','capturing','seed_ready','publishing','active','paused')",
             [library_uuid],
             |row| row.get(0),
         )
@@ -990,9 +2273,35 @@ fn unix_timestamp_millis() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+pub(crate) fn unix_timestamp_millis_for_runtime() -> i64 {
+    unix_timestamp_millis()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn register_test_plugin(registry: &HostRegistry, plugin_id: &str, account_uuid: &str) {
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id,
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account(account_uuid, plugin_id, Some("Test"), "authenticated")
+            .unwrap();
+        registry.set_plugin_intent(plugin_id, true, true).unwrap();
+        registry
+            .record_plugin_runtime_ready(plugin_id, "test-session", &["sync-provider.v1".into()])
+            .unwrap();
+    }
 
     fn temp_registry_path() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1009,6 +2318,271 @@ mod tests {
         assert_eq!(snapshot.active_library_uuid, None);
         assert_eq!(snapshot.context_revision, 0);
         assert!(snapshot.libraries.is_empty());
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sync_enable_requires_ready_authenticated_compatible_provider_account() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).expect("open host registry");
+        register_test_plugin(&registry, "com.megle.ready", "account-ready");
+        registry
+            .set_plugin_intent("com.megle.ready", true, true)
+            .unwrap();
+        registry
+            .record_plugin_runtime_ready(
+                "com.megle.ready",
+                "session-ready",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+
+        registry
+            .require_ready_sync_provider("com.megle.ready", "account-ready")
+            .unwrap();
+        assert_eq!(
+            registry
+                .require_ready_sync_provider("com.megle.ready", "wrong-account")
+                .unwrap_err()
+                .to_string(),
+            "provider-account-not-found"
+        );
+
+        registry
+            .update_plugin_account_auth("com.megle.ready", "expired", None)
+            .unwrap();
+        assert_eq!(
+            registry
+                .require_ready_sync_provider("com.megle.ready", "account-ready")
+                .unwrap_err()
+                .to_string(),
+            "provider-account-not-authenticated"
+        );
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_runtime_launch_cannot_restore_ready_after_disable() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).expect("open host registry");
+        register_test_plugin(&registry, "com.megle.stale", "account-stale");
+        let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
+        assert!(registry
+            .plugin_runtime_launch_is_current("com.megle.stale", &fingerprint)
+            .unwrap());
+
+        registry
+            .set_plugin_intent("com.megle.stale", false, true)
+            .unwrap();
+        assert!(!registry
+            .plugin_runtime_launch_is_current("com.megle.stale", &fingerprint)
+            .unwrap());
+        assert!(!registry
+            .record_plugin_runtime_ready_for_launch(
+                "com.megle.stale",
+                &fingerprint,
+                "stale-session",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap());
+        let plugin = registry.host_plugin("com.megle.stale").unwrap().unwrap();
+        assert_eq!(plugin.runtime_state, "disabled");
+        assert!(!plugin.enabled_intent);
+        assert!(!registry
+            .record_plugin_runtime_failure(
+                "com.megle.stale",
+                &fingerprint,
+                "crashed-backoff",
+                "stale-failure",
+                "an old supervisor failed after disable",
+                None,
+            )
+            .unwrap());
+        assert_eq!(
+            registry
+                .host_plugin("com.megle.stale")
+                .unwrap()
+                .unwrap()
+                .runtime_state,
+            "disabled"
+        );
+
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn signed_out_account_gets_a_new_runtime_generation_for_reauthentication() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).expect("open host registry");
+        register_test_plugin(&registry, "com.megle.reauth", "account-reauth");
+        let original = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
+
+        registry
+            .set_plugin_account_secret("com.megle.reauth", None, "signed-out", 2)
+            .unwrap();
+        let launches = registry.plugin_runtime_launches().unwrap();
+        assert_eq!(launches.len(), 1);
+        let reauthentication = launches[0].fingerprint();
+        assert_ne!(original, reauthentication);
+        assert!(!registry
+            .plugin_runtime_launch_is_current("com.megle.reauth", &original)
+            .unwrap());
+        assert!(registry
+            .plugin_runtime_launch_is_current("com.megle.reauth", &reauthentication)
+            .unwrap());
+
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pausing_provider_bindings_returns_rpc_fences_after_generation_advance() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).expect("open host registry");
+        register_test_plugin(&registry, "com.megle.fenced", "account-fenced");
+        let now = unix_timestamp_millis();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library-fenced','root-fenced','Library','local','root','ready','local-only','available',1,'marker',?1,?1)",
+            [now],
+        ).unwrap();
+        let (binding_epoch, _) = registry
+            .begin_sync_binding("library-fenced", "com.megle.fenced", "account-fenced")
+            .unwrap();
+
+        let fences = registry.pause_plugin_bindings("com.megle.fenced").unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].account_uuid, "account-fenced");
+        assert_eq!(fences[0].binding_epoch, binding_epoch);
+        assert_eq!(fences[0].next_transport_generation, 2);
+        let binding = registry
+            .binding_transport("library-fenced", "library")
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.state, "paused");
+        assert_eq!(binding.transport_generation, 2);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn plugin_intent_and_grants_remain_independent() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let permissions = r#"[{"kind":"secret","namespace":"fake-sync","operations":["read"]}]"#;
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.permissions",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: permissions,
+            })
+            .unwrap();
+        registry
+            .set_plugin_intent("com.megle.permissions", true, true)
+            .unwrap();
+        assert_eq!(
+            registry
+                .host_plugin("com.megle.permissions")
+                .unwrap()
+                .unwrap()
+                .runtime_state,
+            "permission-required"
+        );
+        registry
+            .set_plugin_grants("com.megle.permissions", permissions, false)
+            .unwrap();
+        let plugin = registry
+            .host_plugin("com.megle.permissions")
+            .unwrap()
+            .unwrap();
+        assert!(plugin.enabled_intent);
+        assert_eq!(plugin.runtime_state, "configuration-required");
+        registry
+            .reset_plugin_runtime_states_for_startup(true)
+            .unwrap();
+        assert_eq!(
+            registry
+                .host_plugin("com.megle.permissions")
+                .unwrap()
+                .unwrap()
+                .runtime_state,
+            "starting"
+        );
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rediscovery_does_not_activate_a_candidate_version() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "com.megle.versioned-discovery", "account");
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.versioned-discovery",
+                version: "2.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider-v2",
+                entry_sha256: &[8; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        let plugin = registry
+            .host_plugin("com.megle.versioned-discovery")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plugin.selected_version, "1.0.0");
+        let state: String = registry
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM plugin_versions WHERE plugin_id='com.megle.versioned-discovery' AND version='2.0.0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "candidate");
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rediscovery_of_selected_version_requires_new_permissions() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "com.megle.permission-update", "account");
+        registry
+            .set_plugin_intent("com.megle.permission-update", true, true)
+            .unwrap();
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.permission-update",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json:
+                    r#"[{"kind":"secret","namespace":"fake-sync","operations":["read"]}]"#,
+            })
+            .unwrap();
+        let plugin = registry
+            .host_plugin("com.megle.permission-update")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plugin.runtime_state, "permission-required");
+        assert!(plugin.enabled_intent);
         drop(registry);
         let _ = std::fs::remove_file(path);
     }
@@ -1075,6 +2649,7 @@ mod tests {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
         let now = unix_timestamp_millis();
+        register_test_plugin(&registry, "fake", "account");
         registry.connection.lock().unwrap().execute(
             "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','root','Library','local','root','ready','local-only','available',1,'marker',?1,?1)",
             [now],
@@ -1222,6 +2797,7 @@ mod tests {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
         let library = uuid::Uuid::now_v7().to_string();
+        register_test_plugin(&registry, "fake", "account");
         registry.connection.lock().unwrap().execute("INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES (?1,?2,'Old','local','root','ready','local-only','available',1,'marker',1,1)",params![library,uuid::Uuid::now_v7().to_string()]).unwrap();
         registry
             .begin_sync_binding(&library, "fake", "account")
@@ -1249,6 +2825,83 @@ mod tests {
                 .as_deref(),
             Some("#123456")
         );
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_cursor_and_receipt_reject_old_transport_generation() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "fake", "account");
+        registry.connection.lock().unwrap().execute("INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','root','Library','local','root','ready','local-only','available',1,'marker',1,1)", []).unwrap();
+        let (binding, _) = registry
+            .begin_sync_binding("library", "fake", "account")
+            .unwrap();
+        registry
+            .commit_binding_page(
+                "library",
+                binding,
+                1,
+                "remote",
+                "delta",
+                Some("cursor-1"),
+                "page-2",
+            )
+            .unwrap();
+        let paged = registry
+            .binding_transport("library", "delta")
+            .unwrap()
+            .unwrap();
+        assert_eq!(paged.cursor.as_deref(), Some("cursor-1"));
+        assert_eq!(paged.page_token.as_deref(), Some("page-2"));
+        registry
+            .commit_binding_cursor("library", binding, 1, "remote", "delta", Some("cursor-2"))
+            .unwrap();
+        registry
+            .record_provider_receipt(
+                "library",
+                binding,
+                1,
+                "library-descriptor",
+                Some("etag"),
+                &[3; 32],
+                "created",
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .binding_transport("library", "delta")
+                .unwrap()
+                .unwrap()
+                .cursor
+                .as_deref(),
+            Some("cursor-2")
+        );
+        assert!(registry
+            .binding_transport("library", "delta")
+            .unwrap()
+            .unwrap()
+            .page_token
+            .is_none());
+        assert_eq!(registry.begin_unbind("library", binding).unwrap(), 2);
+        assert!(registry
+            .commit_binding_cursor("library", binding, 1, "remote", "delta", Some("late"))
+            .is_err());
+        assert!(registry
+            .commit_binding_page(
+                "library",
+                binding,
+                1,
+                "remote",
+                "delta",
+                Some("cursor-2"),
+                "late-page",
+            )
+            .is_err());
+        assert!(registry
+            .record_provider_receipt("library", binding, 1, "late", None, &[4; 32], "created")
+            .is_err());
         drop(registry);
         let _ = std::fs::remove_file(path);
     }
@@ -1301,6 +2954,131 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(state, "gap");
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn candidate_probation_commits_or_rolls_back_and_recovers_after_restart() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "com.megle.versioned", "account-versioned");
+        let now = unix_timestamp_millis();
+        let manifest_json = format!(
+            r#"{{"manifestVersion":2,"id":"com.megle.versioned","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
+            "0".repeat(64)
+        );
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.megle.versioned','2.0.0',?1,'provider-v2',?2,'candidate',?3)",
+            params![manifest_json,[2u8;32].as_slice(),now],
+        ).unwrap();
+        let manifest_v3_json = manifest_json.replace("2.0.0", "3.0.0");
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.megle.versioned','3.0.0',?1,'provider-v3',?2,'candidate',?3)",
+            params![manifest_v3_json,[3u8;32].as_slice(),now],
+        ).unwrap();
+        registry
+            .select_plugin_version("com.megle.versioned", "2.0.0", true)
+            .unwrap();
+        assert_eq!(
+            registry
+                .select_plugin_version("com.megle.versioned", "3.0.0", true)
+                .unwrap_err()
+                .to_string(),
+            "plugin-version-switch-in-progress"
+        );
+        assert_eq!(
+            registry
+                .host_plugin("com.megle.versioned")
+                .unwrap()
+                .unwrap()
+                .selected_version,
+            "2.0.0"
+        );
+        registry
+            .rollback_plugin_probation("com.megle.versioned", "health-failed")
+            .unwrap();
+        assert_eq!(
+            registry
+                .host_plugin("com.megle.versioned")
+                .unwrap()
+                .unwrap()
+                .selected_version,
+            "1.0.0"
+        );
+
+        registry
+            .select_plugin_version("com.megle.versioned", "2.0.0", true)
+            .unwrap();
+        drop(registry);
+        let registry = HostRegistry::open(&path).unwrap();
+        assert_eq!(registry.recover_plugin_version_journal().unwrap(), 1);
+        assert_eq!(
+            registry
+                .host_plugin("com.megle.versioned")
+                .unwrap()
+                .unwrap()
+                .selected_version,
+            "1.0.0"
+        );
+
+        registry
+            .select_plugin_version("com.megle.versioned", "2.0.0", true)
+            .unwrap();
+        registry
+            .commit_plugin_probation("com.megle.versioned")
+            .unwrap();
+        let projection = registry
+            .host_plugin("com.megle.versioned")
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.selected_version, "2.0.0");
+        assert_eq!(projection.known_good_version.as_deref(), Some("2.0.0"));
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_runtime_launch_cannot_finish_candidate_probation_after_disable() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "com.megle.stale-probation", "account-stale");
+        let now = unix_timestamp_millis();
+        let manifest_json = format!(
+            r#"{{"manifestVersion":2,"id":"com.megle.stale-probation","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
+            "0".repeat(64)
+        );
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.megle.stale-probation','2.0.0',?1,'provider-v2',?2,'candidate',?3)",
+            params![manifest_json,[2u8;32].as_slice(),now],
+        ).unwrap();
+        registry
+            .select_plugin_version("com.megle.stale-probation", "2.0.0", true)
+            .unwrap();
+        let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
+        registry
+            .set_plugin_intent("com.megle.stale-probation", false, true)
+            .unwrap();
+
+        assert!(!registry
+            .commit_plugin_probation_for_launch("com.megle.stale-probation", &fingerprint)
+            .unwrap());
+        assert!(registry
+            .rollback_plugin_probation_for_launch(
+                "com.megle.stale-probation",
+                &fingerprint,
+                "stale-health-failure",
+            )
+            .unwrap()
+            .is_none());
+        let plugin = registry
+            .host_plugin("com.megle.stale-probation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plugin.selected_version, "2.0.0");
+        assert_eq!(plugin.known_good_version.as_deref(), Some("1.0.0"));
+        assert_eq!(plugin.runtime_state, "disabled");
+
         drop(registry);
         let _ = std::fs::remove_file(path);
     }

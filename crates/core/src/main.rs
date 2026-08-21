@@ -22,6 +22,94 @@ use axum::http::HeaderValue;
 
 use crate::api::BasicAuthCredentials;
 
+fn run_plugin_runtime_test_helper() -> anyhow::Result<bool> {
+    let Ok(mode) = std::env::var("MEGLE_PLUGIN_RUNTIME_TEST_HELPER") else {
+        return Ok(false);
+    };
+    match mode.as_str() {
+        "exit" => {}
+        "stdout-noise" => {
+            use std::io::Write;
+            std::io::stdout().write_all(b"not-a-framed-provider")?;
+            std::io::stdout().flush()?;
+        }
+        "hang" => loop {
+            std::thread::park_timeout(std::time::Duration::from_secs(60));
+        },
+        "tree" => {
+            let child = std::process::Command::new(std::env::current_exe()?)
+                .env("MEGLE_PLUGIN_RUNTIME_TEST_HELPER", "hang")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            println!("{}", child.id());
+            loop {
+                std::thread::park_timeout(std::time::Duration::from_secs(60));
+            }
+        }
+        "framed" => {
+            use std::io::{Read, Write};
+            let mut input = std::io::stdin().lock();
+            let mut output = std::io::stdout().lock();
+            loop {
+                let mut header = [0_u8; 17];
+                match input.read_exact(&mut header) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => return Err(error.into()),
+                }
+                let length = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+                if length > 1024 * 1024 || header[4] != 1 {
+                    anyhow::bail!("invalid framed helper request")
+                }
+                let mut payload = vec![0_u8; length];
+                input.read_exact(&mut payload)?;
+                let mut envelope: serde_json::Value = serde_json::from_slice(&payload)?;
+                let method = envelope["method"].as_str().unwrap_or_default().to_string();
+                envelope["messageType"] = serde_json::json!("response");
+                envelope["payload"] = match method.as_str() {
+                    "runtime.hello" => {
+                        let hello = envelope["payload"].clone();
+                        serde_json::json!({
+                            "nonce": hello["nonce"],
+                            "wireVersion": 1,
+                            "pluginId": hello["pluginId"],
+                            "version": hello["version"],
+                            "accountUuid": hello["accountUuid"],
+                            "capabilities":["sync-provider.v1"],
+                            "methodVersions": hello["methodVersions"],
+                            "limits": hello["limits"]
+                        })
+                    }
+                    "describe" => serde_json::json!({
+                        "pluginId":"com.megle.fake",
+                        "accountUuid":"fake-account",
+                        "capabilities":["sync-provider.v1"],
+                        "maxObjectBytes":67108864u64
+                    }),
+                    "health" => serde_json::json!({"ready":true,"detail":null}),
+                    "diagnostics" => serde_json::json!({"helper":true}),
+                    "shutdown" => serde_json::Value::Null,
+                    _ => serde_json::json!({"ok":true}),
+                };
+                let response = serde_json::to_vec(&envelope)?;
+                output.write_all(&(response.len() as u32).to_le_bytes())?;
+                output.write_all(&[1])?;
+                output.write_all(&0_u64.to_le_bytes())?;
+                output.write_all(&0_u32.to_le_bytes())?;
+                output.write_all(&response)?;
+                output.flush()?;
+                if method == "shutdown" {
+                    break;
+                }
+            }
+        }
+        _ => anyhow::bail!("unknown plugin runtime test helper mode"),
+    }
+    Ok(true)
+}
+
 fn initialize_tracing() {
     use tracing_subscriber::EnvFilter;
 
@@ -35,6 +123,9 @@ fn initialize_tracing() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if run_plugin_runtime_test_helper()? {
+        return Ok(());
+    }
     initialize_tracing();
     let host_path = std::env::var("MEGLE_HOST_DB_PATH")
         .ok()

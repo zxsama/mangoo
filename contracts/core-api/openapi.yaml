@@ -1155,17 +1155,17 @@ paths:
       operationId: listPlugins
       responses:
         "200":
-          description: Installed plugin states.
+          description: Host-owned installed plugin intent, runtime, auth and permission projections.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PluginListResponse"
+                $ref: "#/components/schemas/HostPluginListResponse"
   /plugins/discover:
     post:
       operationId: discoverPlugins
       responses:
         "202":
-          description: Plugin folder rescan completed; returns counts and per-manifest errors.
+          description: Bundled manifest and embedded-trust verification completed.
           content:
             application/json:
               schema:
@@ -1177,11 +1177,11 @@ paths:
         - $ref: "#/components/parameters/pluginId"
       responses:
         "200":
-          description: Plugin record.
+          description: Host plugin projection.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PluginRecord"
+                $ref: "#/components/schemas/HostPluginProjection"
         "404":
           description: Plugin not found.
           content:
@@ -1189,18 +1189,24 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
     delete:
-      operationId: deletePlugin
+      operationId: unregisterPlugin
       parameters:
         - $ref: "#/components/parameters/pluginId"
       responses:
         "200":
-          description: Plugin row removed; on-disk folder is left untouched.
+          description: Unreferenced plugin installation was unregistered.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DeletePluginResponse"
+                $ref: "#/components/schemas/PluginCommandResponse"
         "404":
           description: Plugin not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Plugin still has an account or Library binding.
           content:
             application/json:
               schema:
@@ -1212,11 +1218,11 @@ paths:
         - $ref: "#/components/parameters/pluginId"
       responses:
         "200":
-          description: Plugin enabled.
+          description: Enabled intent accepted; runtime readiness is reported separately.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PluginRecord"
+                $ref: "#/components/schemas/HostPluginProjection"
         "404":
           description: Plugin not found.
           content:
@@ -1224,7 +1230,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "409":
-          description: Plugin manifest is invalid and cannot be enabled.
+          description: Permissions, authentication, configuration or compatibility prevent enable.
           content:
             application/json:
               schema:
@@ -1236,17 +1242,206 @@ paths:
         - $ref: "#/components/parameters/pluginId"
       responses:
         "200":
-          description: Plugin disabled.
+          description: Disabled intent accepted.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PluginRecord"
+                $ref: "#/components/schemas/HostPluginProjection"
         "404":
           description: Plugin not found.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /plugins/{pluginId}/grants:
+    put:
+      operationId: updatePluginGrants
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PluginGrantRequest"
+      responses:
+        "200":
+          description: Grant set replaced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HostPluginProjection"
+        "400":
+          description: A grant is duplicated or was not requested by the plugin.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Plugin not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugins/{pluginId}/retry:
+    post:
+      operationId: retryPlugin
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      responses:
+        "202":
+          description: Runtime retry accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginCommandResponse"
+        "404":
+          description: Plugin not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: The plugin is disabled, lacks required grants, or requires unavailable configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugins/{pluginId}/versions/select:
+    post:
+      operationId: selectPluginVersion
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PluginVersionRequest"
+      responses:
+        "202":
+          description: Candidate verification and probation accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginCommandResponse"
+        "404":
+          description: Plugin or requested plugin version not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Another candidate version is already being verified or is in probation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugins/{pluginId}/versions/rollback:
+    post:
+      operationId: rollbackPluginVersion
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      responses:
+        "202":
+          description: Known-good rollback accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginCommandResponse"
+        "404":
+          description: Plugin not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: No candidate probation or known-good version is available to roll back.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugins/{pluginId}/auth/begin:
+    post:
+      operationId: beginPluginAuth
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      responses:
+        "201":
+          description: Authorization flow started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginAuthBeginResponse"
+  /plugins/{pluginId}/auth/complete:
+    post:
+      operationId: completePluginAuth
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PluginAuthCompleteRequest"
+      responses:
+        "202":
+          description: Authorization result accepted for Provider validation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginCommandResponse"
+  /plugins/{pluginId}/auth/sign-out:
+    post:
+      operationId: signOutPlugin
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      responses:
+        "202":
+          description: Binding pause and secret deletion accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginCommandResponse"
+  /plugins/{pluginId}/health:
+    get:
+      operationId: getPluginHealth
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      responses:
+        "200":
+          description: Current Host runtime health projection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginHealthResponse"
+  /plugins/{pluginId}/diagnostics:
+    get:
+      operationId: getPluginDiagnostics
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      responses:
+        "200":
+          description: Bounded redacted Provider diagnostics.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginDiagnosticsResponse"
+  /plugin-auth/callback/{flowId}:
+    get:
+      operationId: completePluginAuthCallback
+      security: []
+      parameters:
+        - name: flowId
+          in: path
+          required: true
+          schema: { type: string, minLength: 43, maxLength: 43 }
+      responses:
+        "200":
+          description: Minimal fixed authorization completion page.
+          content:
+            text/html:
+              schema: { type: string }
 components:
   securitySchemes:
     sessionToken:
@@ -1497,6 +1692,7 @@ components:
     EnableLibrarySyncRequest:
       type: object
       required: [providerId, accountIdentity]
+      additionalProperties: false
       properties:
         providerId:
           type: string
@@ -2412,66 +2608,96 @@ components:
           type: boolean
     PluginCapability:
       type: string
-      enum: [decoder, metadata, action, import-provider]
-    PluginStatus:
+      enum: [sync-provider.v1]
+    PluginRuntimeState:
       type: string
-      enum: [registered, invalid, enabled, disabled]
-    PluginRecord:
+      enum: [disabled, permission-required, starting, ready, degraded, crashed-backoff, incompatible, configuration-required]
+    PluginAuthState:
+      type: string
+      enum: [signed-out, authorization-required, authorizing, authenticated, expired, error]
+    PluginPermission:
+      oneOf:
+        - type: object
+          required: [kind, schemes, hosts]
+          additionalProperties: false
+          properties:
+            kind: { const: network }
+            schemes:
+              type: array
+              minItems: 1
+              uniqueItems: true
+              items: { const: https }
+            hosts:
+              type: array
+              minItems: 1
+              uniqueItems: true
+              items:
+                type: string
+                maxLength: 253
+                pattern: "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))+$"
+        - type: object
+          required: [kind, mode]
+          additionalProperties: false
+          properties:
+            kind: { const: oauth-loopback }
+            mode: { const: ephemeral-only }
+        - type: object
+          required: [kind, namespace, operations]
+          additionalProperties: false
+          properties:
+            kind: { const: secret }
+            namespace:
+              type: string
+              maxLength: 64
+              pattern: "^[a-z0-9][a-z0-9-]{0,63}$"
+            operations:
+              type: array
+              minItems: 1
+              uniqueItems: true
+              items: { enum: [read, write, delete] }
+        - type: object
+          required: [kind, maxBytes]
+          additionalProperties: false
+          properties:
+            kind: { const: temp-storage }
+            maxBytes: { type: integer, minimum: 1, maximum: 1073741824 }
+    HostPluginProjection:
       type: object
-      required:
-        [
-          id,
-          name,
-          version,
-          description,
-          enabled,
-          status,
-          capabilities,
-          permissions,
-          manifestPath,
-          installedAt,
-          updatedAt,
-          lastError
-        ]
+      required: [pluginId, selectedVersion, knownGoodVersion, enabledIntent, runtimeState, authState, capabilities, requestedPermissions, grantedPermissions, permissionRequired, accountUuid, accountDisplayName, compatibilityReason, backoffUntil, lastHealthyAt, lastErrorCode, lastErrorDetail]
       properties:
-        id:
+        pluginId: { type: string }
+        selectedVersion: { type: string }
+        knownGoodVersion: { type: string, nullable: true }
+        enabledIntent: { type: boolean }
+        runtimeState: { $ref: "#/components/schemas/PluginRuntimeState" }
+        authState:
           type: string
-        name:
-          type: string
-        version:
-          type: string
-        description:
-          type: string
+          enum: [signed-out, authorization-required, authorizing, authenticated, expired, error]
           nullable: true
-        enabled:
-          type: boolean
-        status:
-          $ref: "#/components/schemas/PluginStatus"
         capabilities:
           type: array
-          items:
-            $ref: "#/components/schemas/PluginCapability"
-        permissions:
+          items: { $ref: "#/components/schemas/PluginCapability" }
+        requestedPermissions:
           type: array
-          items:
-            type: string
-        manifestPath:
-          type: string
-        installedAt:
-          type: integer
-        updatedAt:
-          type: integer
-        lastError:
-          type: string
-          nullable: true
-    PluginListResponse:
+          items: { $ref: "#/components/schemas/PluginPermission" }
+        grantedPermissions:
+          type: array
+          items: { $ref: "#/components/schemas/PluginPermission" }
+        permissionRequired: { type: boolean }
+        accountUuid: { type: string, nullable: true }
+        accountDisplayName: { type: string, nullable: true }
+        compatibilityReason: { type: string, nullable: true }
+        backoffUntil: { type: integer, nullable: true }
+        lastHealthyAt: { type: integer, nullable: true }
+        lastErrorCode: { type: string, nullable: true }
+        lastErrorDetail: { type: string, nullable: true }
+    HostPluginListResponse:
       type: object
       required: [items]
       properties:
         items:
           type: array
-          items:
-            $ref: "#/components/schemas/PluginRecord"
+          items: { $ref: "#/components/schemas/HostPluginProjection" }
     PluginDiscoveryError:
       type: object
       required: [manifestPath, message]
@@ -2491,12 +2717,61 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PluginDiscoveryError"
-    DeletePluginResponse:
+    PluginCommandResponse:
       type: object
-      required: [deleted]
+      required: [accepted]
       properties:
-        deleted:
-          type: boolean
+        accepted: { type: boolean }
+    PluginGrantRequest:
+      type: object
+      required: [permissions]
+      additionalProperties: false
+      properties:
+        permissions:
+          type: array
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/PluginPermission" }
+    PluginVersionRequest:
+      type: object
+      required: [version]
+      additionalProperties: false
+      properties:
+        version:
+          type: string
+          minLength: 1
+          maxLength: 64
+    PluginAuthBeginResponse:
+      type: object
+      required: [authorizationUrl, flowId, expiresAt]
+      properties:
+        authorizationUrl: { type: string }
+        flowId: { type: string }
+        expiresAt: { type: integer }
+    PluginAuthCompleteRequest:
+      type: object
+      required: [flowId, result]
+      additionalProperties: false
+      properties:
+        flowId: { type: string, minLength: 1, maxLength: 160 }
+        result:
+          type: object
+          maxProperties: 8
+          additionalProperties: { type: string }
+    PluginHealthResponse:
+      type: object
+      required: [state, lastHealthyAt, lastErrorCode]
+      properties:
+        state: { $ref: "#/components/schemas/PluginRuntimeState" }
+        lastHealthyAt: { type: integer, nullable: true }
+        lastErrorCode: { type: string, nullable: true }
+    PluginDiagnosticsResponse:
+      type: object
+      required: [generatedAt, entries]
+      properties:
+        generatedAt: { type: integer }
+        entries:
+          type: array
+          items: { type: object, additionalProperties: true }
     MediaPositionResponse:
       type: object
       required: [index]

@@ -1,14 +1,18 @@
-import type { PluginStatus } from "@megle/core-client";
+import type { PluginRuntimeState } from "@megle/core-client";
 
-const STATUS_LABEL: Record<PluginStatus, string> = {
-  registered: "Registered",
-  enabled: "Enabled",
+const STATUS_LABEL: Record<PluginRuntimeState, string> = {
   disabled: "Disabled",
-  invalid: "Invalid"
+  "permission-required": "Permission required",
+  starting: "Starting",
+  ready: "Ready",
+  degraded: "Degraded",
+  "crashed-backoff": "Backoff",
+  incompatible: "Incompatible",
+  "configuration-required": "Configuration required"
 };
 
 interface StatusPillProps {
-  status: PluginStatus;
+  status: PluginRuntimeState;
   title?: string;
 }
 

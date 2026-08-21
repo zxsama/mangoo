@@ -21,8 +21,8 @@ export function PluginsView() {
 
   const selected = plugins.selectedPlugin;
   const totalCount = plugins.plugins.length;
-  const enabledCount = plugins.plugins.filter((plugin) => plugin.enabled).length;
-  const invalidCount = plugins.plugins.filter((plugin) => plugin.status === "invalid").length;
+  const enabledCount = plugins.plugins.filter((plugin) => plugin.enabledIntent).length;
+  const invalidCount = plugins.plugins.filter((plugin) => plugin.runtimeState === "incompatible").length;
 
   return (
     <section className="workspace simple-workspace" aria-label="Plugins workbench">
@@ -87,25 +87,24 @@ export function PluginsView() {
                 <div className="plugins-empty">
                   <p className="plugins-empty-title">No plugins discovered yet.</p>
                   <p className="plugins-empty-hint">
-                    Drop a plugin folder under{" "}
-                    <code className="dialog-code">MEGLE_PLUGINS_DIR</code> and click Re-scan.
+                    Install a trusted bundled provider, then click Re-scan.
                   </p>
                 </div>
               ) : (
                 plugins.plugins.map((plugin) => (
                   <PluginCard
-                    busy={plugins.busyPluginIds.has(plugin.id)}
-                    key={plugin.id}
-                    onSelect={() => plugins.selectPlugin(plugin.id)}
+                    busy={plugins.busyPluginIds.has(plugin.pluginId)}
+                    key={plugin.pluginId}
+                    onSelect={() => plugins.selectPlugin(plugin.pluginId)}
                     onToggleEnabled={() => {
-                      if (plugin.enabled) {
-                        void plugins.disable(plugin.id);
+                      if (plugin.enabledIntent) {
+                        void plugins.disable(plugin.pluginId);
                       } else {
-                        void plugins.enable(plugin.id);
+                        void plugins.enable(plugin.pluginId);
                       }
                     }}
                     plugin={plugin}
-                    selected={plugins.selectedPluginId === plugin.id}
+                    selected={plugins.selectedPluginId === plugin.pluginId}
                   />
                 ))
               )}
@@ -120,8 +119,10 @@ export function PluginsView() {
           >
             {selected ? (
               <PluginDetail
-                busy={plugins.busyPluginIds.has(selected.id)}
-                onRemove={() => void plugins.remove(selected.id)}
+                busy={plugins.busyPluginIds.has(selected.pluginId)}
+                onApprovePermissions={() => void plugins.approvePermissions(selected.pluginId)}
+                onRetry={() => void plugins.retry(selected.pluginId)}
+                onRemove={() => void plugins.remove(selected.pluginId)}
                 plugin={selected}
               />
             ) : (

@@ -193,7 +193,8 @@ export function startCoreProcess(
           }
         : {}),
       MEGLE_SESSION_TOKEN: session.sessionToken,
-      MEGLE_ALLOWED_ORIGIN: session.allowedOrigin
+      MEGLE_ALLOWED_ORIGIN: session.allowedOrigin,
+      MEGLE_PLUGINS_DIR: process.env.MEGLE_PLUGINS_DIR ?? bundledPluginsDir()
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true
@@ -519,6 +520,11 @@ function coreBinaryPath(): string {
   // "debug" (the `npm run dev` flow). The production launcher sets "release".
   const profile = process.env.MEGLE_CORE_PROFILE === "release" ? "release" : "debug";
   return path.join(repoRoot(), "target", profile, binaryName);
+}
+
+function bundledPluginsDir(): string {
+  const profile = process.env.MEGLE_CORE_PROFILE === "release" ? "release" : "debug";
+  return path.join(repoRoot(), "target", profile, "bundled-plugins");
 }
 
 function ensureTrailingSlash(value: string): string {

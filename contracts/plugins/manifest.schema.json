@@ -1,55 +1,30 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://megle.local/contracts/plugins/manifest.schema.json",
-  "title": "Megle Plugin Manifest",
+  "title": "Megle Plugin Manifest v2",
   "type": "object",
-  "required": ["id", "name", "version", "engine", "entry", "capabilities", "permissions"],
+  "required": ["manifestVersion", "id", "name", "version", "engine", "entry", "rpc", "activationEvents", "requestedPermissions", "integrity"],
   "additionalProperties": false,
   "properties": {
-    "id": {
-      "type": "string",
-      "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$"
-    },
-    "name": {
-      "type": "string",
-      "minLength": 1
-    },
-    "version": {
-      "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[A-Za-z0-9.-]+)?$"
-    },
-    "engine": {
-      "type": "string",
-      "enum": ["process"]
-    },
-    "entry": {
-      "type": "string",
-      "minLength": 1
-    },
-    "capabilities": {
-      "type": "array",
-      "minItems": 1,
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "enum": ["decoder", "metadata", "action", "import-provider"]
-      }
-    },
-    "permissions": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "enum": ["read-media-file", "write-user-selected-folder", "spawn-process", "network"]
-      }
-    },
-    "formats": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "pattern": "^\\.[A-Za-z0-9]+$"
-      }
-    }
+    "manifestVersion": { "const": 2 },
+    "id": { "type": "string", "pattern": "^[a-z0-9]+(\\.[a-z0-9][a-z0-9-]*)+$", "maxLength": 255 },
+    "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "version": { "type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$", "maxLength": 128 },
+    "engine": { "const": "process" },
+    "entry": { "$ref": "#/$defs/processEntry" },
+    "rpc": { "$ref": "#/$defs/rpc" },
+    "activationEvents": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["sync-enabled", "auth-requested", "diagnostics-requested"] } },
+    "requestedPermissions": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/permission" } },
+    "integrity": { "type": "object", "required": ["sha256"], "additionalProperties": false, "properties": { "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } }
+  },
+  "$defs": {
+    "relativeEntry": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$))[^\\u0000]+$" },
+    "processEntry": { "type": "object", "minProperties": 1, "additionalProperties": false, "properties": { "windowsX64": { "$ref": "#/$defs/relativeEntry" }, "linuxX64": { "$ref": "#/$defs/relativeEntry" } } },
+    "rpc": { "type": "object", "required": ["wireVersions", "capabilities", "methodVersions"], "additionalProperties": false, "properties": { "wireVersions": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "integer", "minimum": 1, "maximum": 65535 } }, "capabilities": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["sync-provider.v1"] } }, "methodVersions": { "type": "object", "required": ["describe", "health", "diagnostics", "shutdown", "auth.begin", "auth.complete", "auth.status", "auth.sign_out", "delta.list", "object.head", "object.get", "object.put_immutable", "upload.begin", "upload.write", "upload.commit", "upload.abort"], "additionalProperties": false, "properties": { "describe": { "const": 1 }, "health": { "const": 1 }, "diagnostics": { "const": 1 }, "shutdown": { "const": 1 }, "auth.begin": { "const": 1 }, "auth.complete": { "const": 1 }, "auth.status": { "const": 1 }, "auth.sign_out": { "const": 1 }, "delta.list": { "const": 1 }, "object.head": { "const": 1 }, "object.get": { "const": 1 }, "object.put_immutable": { "const": 1 }, "upload.begin": { "const": 1 }, "upload.write": { "const": 1 }, "upload.commit": { "const": 1 }, "upload.abort": { "const": 1 } } } } },
+    "networkPermission": { "type": "object", "required": ["kind", "schemes", "hosts"], "additionalProperties": false, "properties": { "kind": { "const": "network" }, "schemes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "const": "https" } }, "hosts": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))+$", "maxLength": 253 } } } },
+    "oauthLoopbackPermission": { "type": "object", "required": ["kind", "mode"], "additionalProperties": false, "properties": { "kind": { "const": "oauth-loopback" }, "mode": { "const": "ephemeral-only" } } },
+    "secretPermission": { "type": "object", "required": ["kind", "namespace", "operations"], "additionalProperties": false, "properties": { "kind": { "const": "secret" }, "namespace": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" }, "operations": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["read", "write", "delete"] } } } },
+    "tempStoragePermission": { "type": "object", "required": ["kind", "maxBytes"], "additionalProperties": false, "properties": { "kind": { "const": "temp-storage" }, "maxBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 } } },
+    "permission": { "oneOf": [{ "$ref": "#/$defs/networkPermission" }, { "$ref": "#/$defs/oauthLoopbackPermission" }, { "$ref": "#/$defs/secretPermission" }, { "$ref": "#/$defs/tempStoragePermission" }] }
   }
 }

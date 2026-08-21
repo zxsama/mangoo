@@ -6,7 +6,8 @@ import type {
   EnableLibrarySyncRequest,
   CreateLibraryResponse,
   CreateTagRequest,
-  DeletePluginResponse,
+  HostPluginProjection,
+  HostPluginListResponse,
   ThumbnailCacheCancelBulkResponse,
   ThumbnailCacheClearResponse,
   ThumbnailCacheEnqueueResponse,
@@ -38,8 +39,13 @@ import type {
   NotificationOutboxResponse,
   Page,
   PluginDiscoveryResponse,
-  PluginListResponse,
-  PluginRecord,
+  PluginAuthBeginResponse,
+  PluginAuthCompleteRequest,
+  PluginCommandResponse,
+  PluginDiagnosticsResponse,
+  PluginGrantRequest,
+  PluginHealthResponse,
+  PluginVersionRequest,
   RenameRequest,
   RootRecord,
   ScanTaskRequest,
@@ -611,9 +617,9 @@ export function createCoreClient(config: CoreClientConfig) {
         requestPriority: "metadata",
         body: JSON.stringify(body)
       }),
-    listPlugins: () => request<PluginListResponse>("/plugins", { requestPriority: "metadata" }),
+    listPlugins: () => request<HostPluginListResponse>("/plugins", { requestPriority: "metadata" }),
     getPlugin: (pluginId: string) =>
-      request<PluginRecord>(`/plugins/${encodeURIComponent(pluginId)}`, {
+      request<HostPluginProjection>(`/plugins/${encodeURIComponent(pluginId)}`, {
         requestPriority: "metadata"
       }),
     discoverPlugins: () =>
@@ -622,20 +628,38 @@ export function createCoreClient(config: CoreClientConfig) {
         requestPriority: "interactive"
       }),
     enablePlugin: (pluginId: string) =>
-      request<PluginRecord>(`/plugins/${encodeURIComponent(pluginId)}/enable`, {
+      request<HostPluginProjection>(`/plugins/${encodeURIComponent(pluginId)}/enable`, {
         method: "POST",
         requestPriority: "interactive"
       }),
     disablePlugin: (pluginId: string) =>
-      request<PluginRecord>(`/plugins/${encodeURIComponent(pluginId)}/disable`, {
+      request<HostPluginProjection>(`/plugins/${encodeURIComponent(pluginId)}/disable`, {
         method: "POST",
         requestPriority: "interactive"
       }),
-    deletePlugin: (pluginId: string) =>
-      request<DeletePluginResponse>(`/plugins/${encodeURIComponent(pluginId)}`, {
+    unregisterPlugin: (pluginId: string) =>
+      request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}`, {
         method: "DELETE",
         requestPriority: "interactive"
-      })
+      }),
+    updatePluginGrants: (pluginId: string, input: PluginGrantRequest) =>
+      request<HostPluginProjection>(`/plugins/${encodeURIComponent(pluginId)}/grants`, { method: "PUT", requestPriority: "interactive", body: JSON.stringify(input) }),
+    retryPlugin: (pluginId: string) =>
+      request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/retry`, { method: "POST", requestPriority: "interactive" }),
+    selectPluginVersion: (pluginId: string, input: PluginVersionRequest) =>
+      request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/versions/select`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
+    rollbackPluginVersion: (pluginId: string) =>
+      request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/versions/rollback`, { method: "POST", requestPriority: "interactive" }),
+    beginPluginAuth: (pluginId: string) =>
+      request<PluginAuthBeginResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/begin`, { method: "POST", requestPriority: "interactive" }),
+    completePluginAuth: (pluginId: string, input: PluginAuthCompleteRequest) =>
+      request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/complete`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
+    signOutPlugin: (pluginId: string) =>
+      request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/sign-out`, { method: "POST", requestPriority: "interactive" }),
+    getPluginHealth: (pluginId: string) =>
+      request<PluginHealthResponse>(`/plugins/${encodeURIComponent(pluginId)}/health`, { requestPriority: "metadata" }),
+    getPluginDiagnostics: (pluginId: string) =>
+      request<PluginDiagnosticsResponse>(`/plugins/${encodeURIComponent(pluginId)}/diagnostics`, { requestPriority: "metadata" })
   };
 }
 

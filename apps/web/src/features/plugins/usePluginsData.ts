@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { PluginDiscoveryError, PluginRecord } from "@megle/core-client";
+import type { HostPluginProjection, PluginDiscoveryError } from "@megle/core-client";
 import { CoreApiError } from "@megle/core-client";
 import { createCoreClient } from "../../core/client";
 
@@ -9,9 +9,9 @@ export interface PluginsDiscoverySummary {
 }
 
 export interface PluginsState {
-  plugins: PluginRecord[];
+  plugins: HostPluginProjection[];
   selectedPluginId: string | null;
-  selectedPlugin: PluginRecord | null;
+  selectedPlugin: HostPluginProjection | null;
   loading: boolean;
   busyPluginIds: Set<string>;
   error: string | null;
@@ -21,12 +21,14 @@ export interface PluginsState {
   discover: () => Promise<void>;
   enable: (id: string) => Promise<void>;
   disable: (id: string) => Promise<void>;
+  approvePermissions: (id: string) => Promise<void>;
+  retry: (id: string) => Promise<void>;
   remove: (id: string) => Promise<void>;
 }
 
 export function usePluginsData(): PluginsState {
   const client = useMemo(() => createCoreClient(), []);
-  const [plugins, setPlugins] = useState<PluginRecord[]>([]);
+  const [plugins, setPlugins] = useState<HostPluginProjection[]>([]);
   const [selectedPluginId, setSelectedPluginId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyPluginIds, setBusyPluginIds] = useState<Set<string>>(() => new Set());
@@ -34,7 +36,7 @@ export function usePluginsData(): PluginsState {
   const [lastDiscovery, setLastDiscovery] = useState<PluginsDiscoverySummary | null>(null);
 
   const selectedPlugin = useMemo(
-    () => plugins.find((plugin) => plugin.id === selectedPluginId) ?? null,
+    () => plugins.find((plugin) => plugin.pluginId === selectedPluginId) ?? null,
     [plugins, selectedPluginId]
   );
 
@@ -55,7 +57,7 @@ export function usePluginsData(): PluginsState {
     setPlugins(response.items);
     setSelectedPluginId((current) => {
       if (current === null) return current;
-      return response.items.some((plugin) => plugin.id === current) ? current : null;
+      return response.items.some((plugin) => plugin.pluginId === current) ? current : null;
     });
     return response.items;
   }, [client]);
@@ -87,8 +89,8 @@ export function usePluginsData(): PluginsState {
     }
   }, [client, loadPlugins]);
 
-  const replacePlugin = useCallback((record: PluginRecord) => {
-    setPlugins((current) => current.map((plugin) => (plugin.id === record.id ? record : plugin)));
+  const replacePlugin = useCallback((record: HostPluginProjection) => {
+    setPlugins((current) => current.map((plugin) => (plugin.pluginId === record.pluginId ? record : plugin)));
   }, []);
 
   const enable = useCallback(
@@ -123,13 +125,49 @@ export function usePluginsData(): PluginsState {
     [client, markBusy, replacePlugin]
   );
 
+  const approvePermissions = useCallback(
+    async (id: string) => {
+      const plugin = plugins.find((item) => item.pluginId === id);
+      if (!plugin) return;
+      markBusy(id, true);
+      setError(null);
+      try {
+        const record = await client.updatePluginGrants(id, {
+          permissions: plugin.requestedPermissions
+        });
+        replacePlugin(record);
+      } catch (cause) {
+        setError(errorMessage(cause));
+      } finally {
+        markBusy(id, false);
+      }
+    },
+    [client, markBusy, plugins, replacePlugin]
+  );
+
+  const retry = useCallback(
+    async (id: string) => {
+      markBusy(id, true);
+      setError(null);
+      try {
+        await client.retryPlugin(id);
+        await loadPlugins();
+      } catch (cause) {
+        setError(errorMessage(cause));
+      } finally {
+        markBusy(id, false);
+      }
+    },
+    [client, loadPlugins, markBusy]
+  );
+
   const remove = useCallback(
     async (id: string) => {
       markBusy(id, true);
       setError(null);
       try {
-        await client.deletePlugin(id);
-        setPlugins((current) => current.filter((plugin) => plugin.id !== id));
+        await client.unregisterPlugin(id);
+        setPlugins((current) => current.filter((plugin) => plugin.pluginId !== id));
         setSelectedPluginId((current) => (current === id ? null : current));
       } catch (cause) {
         setError(errorMessage(cause));
@@ -157,6 +195,8 @@ export function usePluginsData(): PluginsState {
     discover,
     enable,
     disable,
+    approvePermissions,
+    retry,
     remove
   };
 }

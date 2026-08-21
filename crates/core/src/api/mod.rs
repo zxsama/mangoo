@@ -144,6 +144,8 @@ pub struct AppState {
     active: Arc<std::sync::RwLock<ActiveSnapshot>>,
     request_gate: Arc<tokio::sync::RwLock<()>>,
     pub library_manager: Option<Arc<LibraryManager>>,
+    pub(crate) plugin_auth_flows: Arc<crate::plugins::auth_flow::AuthFlowRegistry>,
+    pub(crate) secret_store: Option<Arc<dyn crate::plugins::secret_store::SecretStore>>,
     #[cfg(test)]
     pub(crate) notification_outbox_test_probe: Option<Arc<NotificationOutboxTestProbe>>,
 }
@@ -164,6 +166,10 @@ impl AppState {
             })),
             request_gate: Arc::new(tokio::sync::RwLock::new(())),
             library_manager: None,
+            plugin_auth_flows: Arc::new(crate::plugins::auth_flow::AuthFlowRegistry::default()),
+            secret_store: Some(Arc::new(
+                crate::plugins::secret_store::MemorySecretStore::default(),
+            )),
             notification_outbox_test_probe: None,
         }
     }
@@ -181,6 +187,10 @@ impl AppState {
             })),
             request_gate: Arc::new(tokio::sync::RwLock::new(())),
             library_manager: None,
+            plugin_auth_flows: Arc::new(crate::plugins::auth_flow::AuthFlowRegistry::default()),
+            secret_store: Some(Arc::new(
+                crate::plugins::secret_store::MemorySecretStore::default(),
+            )),
             #[cfg(test)]
             notification_outbox_test_probe: None,
         }
@@ -194,6 +204,26 @@ impl AppState {
 
     pub async fn new_host(registry_path: PathBuf, libraries_dir: PathBuf) -> anyhow::Result<Self> {
         let registry = Arc::new(HostRegistry::open(registry_path)?);
+        registry.recover_plugin_version_journal()?;
+        let bundled_plugins_dir = crate::plugins::bundled_root_from_environment()?;
+        let secret_store = match crate::plugins::secret_store::platform_secret_store() {
+            Ok(store) => Some(store),
+            Err(crate::plugins::secret_store::SecretStoreError::ConfigurationRequired(detail)) => {
+                tracing::warn!(%detail, "plugin Secret Store is not configured; local browsing remains available");
+                None
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "plugin Secret Store initialization failed: {error}"
+                ))
+            }
+        };
+        let (_, discovery_errors) =
+            crate::plugins::reconcile_bundled(&registry, &bundled_plugins_dir);
+        for entry in discovery_errors {
+            tracing::warn!(manifest_path = %entry.manifest_path.display(), error = %entry.message, "bundled Provider discovery rejected an entry");
+        }
+        registry.reset_plugin_runtime_states_for_startup(secret_store.is_some())?;
         let active = Arc::new(std::sync::RwLock::new(ActiveSnapshot {
             library_uuid: None,
             context_revision: 0,
@@ -204,6 +234,8 @@ impl AppState {
         let manager = Arc::new(LibraryManager::new(
             registry,
             libraries_dir,
+            bundled_plugins_dir,
+            secret_store.clone(),
             Arc::clone(&active),
             Arc::clone(&request_gate),
         ));
@@ -211,10 +243,13 @@ impl AppState {
             active,
             request_gate,
             library_manager: Some(Arc::clone(&manager)),
+            plugin_auth_flows: Arc::new(crate::plugins::auth_flow::AuthFlowRegistry::default()),
+            secret_store,
             #[cfg(test)]
             notification_outbox_test_probe: None,
         };
         manager.restore_active().await?;
+        manager.start_plugin_runtime_supervisors();
         manager.start_sync_coordinator();
         Ok(state)
     }
@@ -253,6 +288,9 @@ impl AppState {
     }
 
     pub fn plugins_dir(&self) -> anyhow::Result<Option<PathBuf>> {
+        if let Some(manager) = &self.library_manager {
+            return Ok(Some(manager.bundled_plugins_dir().to_path_buf()));
+        }
         Ok(self.resources()?.plugins_dir.clone())
     }
 
@@ -701,7 +739,15 @@ async fn attach_library_context(
     next: Next,
 ) -> Response {
     start_runtime_background_tasks(&state);
-    let is_library_control = request.uri().path().starts_with("/api/libraries");
+    // Host-owned Library and plugin control is independent of the currently
+    // active Catalog. It must remain usable on a new device before any Library
+    // is activated, and must never inherit an active-Library revision fence.
+    let is_library_control = request.uri().path().starts_with("/api/libraries")
+        || request.uri().path().starts_with("/api/plugins")
+        || request
+            .uri()
+            .path()
+            .starts_with("/api/plugin-auth/callback/");
     let is_mutation = !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
@@ -771,6 +817,13 @@ async fn require_session_token(
     if request.method() == Method::OPTIONS {
         return next.run(request).await;
     }
+    if request
+        .uri()
+        .path()
+        .starts_with("/api/plugin-auth/callback/")
+    {
+        return next.run(request).await;
+    }
 
     if let Some(expected) = config.session_token.as_deref() {
         let actual = request
@@ -818,7 +871,12 @@ async fn require_basic_auth(
 ) -> Response {
     // `/api/health` always passes through so Docker/HTTP healthchecks keep
     // working without embedding credentials.
-    if request.uri().path() == "/api/health" {
+    if request.uri().path() == "/api/health"
+        || request
+            .uri()
+            .path()
+            .starts_with("/api/plugin-auth/callback/")
+    {
         return next.run(request).await;
     }
 

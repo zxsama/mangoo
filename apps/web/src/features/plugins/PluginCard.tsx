@@ -1,10 +1,10 @@
-import type { PluginRecord } from "@megle/core-client";
+import type { HostPluginProjection } from "@megle/core-client";
 import { Loader2 } from "lucide-react";
 import { LiquidGlassSurface } from "../../design/liquid-glass";
 import { StatusPill } from "./StatusPill";
 
 interface PluginCardProps {
-  plugin: PluginRecord;
+  plugin: HostPluginProjection;
   selected: boolean;
   busy: boolean;
   onSelect: () => void;
@@ -18,9 +18,9 @@ export function PluginCard({
   onSelect,
   onToggleEnabled
 }: PluginCardProps) {
-  const toggleDisabled = busy || plugin.status === "invalid";
-  const toggleLabel = plugin.enabled ? "Disable" : "Enable";
-  const errorTooltip = plugin.lastError ?? undefined;
+  const toggleDisabled = busy || plugin.runtimeState === "incompatible";
+  const toggleLabel = plugin.enabledIntent ? "Disable" : "Enable";
+  const errorTooltip = plugin.lastErrorDetail ?? undefined;
 
   return (
     <LiquidGlassSurface
@@ -29,7 +29,7 @@ export function PluginCard({
       className={`plugin-card${selected ? " selected" : ""}`}
       interactive
       role="listitem"
-      aria-label={`${plugin.name} plugin`}
+      aria-label={`${plugin.pluginId} plugin`}
       tone="panel"
     >
       <button
@@ -39,35 +39,32 @@ export function PluginCard({
         aria-pressed={selected}
       >
         <div className="plugin-card-heading">
-          <span className="plugin-card-name">{plugin.name}</span>
-          <span className="plugin-card-version">v{plugin.version}</span>
+          <span className="plugin-card-name">{plugin.pluginId}</span>
+          <span className="plugin-card-version">v{plugin.selectedVersion}</span>
         </div>
-        {plugin.description ? (
-          <div className="plugin-card-description">{plugin.description}</div>
-        ) : null}
         <div className="plugin-card-meta">
-          <StatusPill status={plugin.status} title={errorTooltip} />
-          {plugin.lastError ? (
-            <span className="plugin-card-error" title={plugin.lastError}>
-              {plugin.lastError}
+          <StatusPill status={plugin.runtimeState} title={errorTooltip} />
+          {plugin.lastErrorDetail ? (
+            <span className="plugin-card-error" title={plugin.lastErrorDetail}>
+              {plugin.lastErrorDetail}
             </span>
           ) : null}
         </div>
       </button>
       <div className="plugin-card-actions">
         <label
-          className={`plugin-toggle${plugin.enabled ? " on" : ""}${
+          className={`plugin-toggle${plugin.enabledIntent ? " on" : ""}${
             toggleDisabled ? " disabled" : ""
           }`}
           title={
-            plugin.status === "invalid"
-              ? plugin.lastError ?? "Invalid manifest; cannot enable"
+            plugin.runtimeState === "incompatible"
+              ? plugin.compatibilityReason ?? "Incompatible provider"
               : toggleLabel
           }
         >
           <input
             type="checkbox"
-            checked={plugin.enabled}
+            checked={plugin.enabledIntent}
             disabled={toggleDisabled}
             onChange={(event) => {
               event.stopPropagation();

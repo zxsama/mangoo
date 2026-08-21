@@ -185,15 +185,50 @@ pub struct LibraryManager {
     operation: AsyncMutex<()>,
     runtime_generation: AtomicU64,
     libraries_dir: PathBuf,
+    bundled_plugins_dir: PathBuf,
+    secret_store: Option<Arc<dyn crate::plugins::secret_store::SecretStore>>,
     runtime_leases: RuntimeLeases,
     sync_coordinator: crate::sync::coordinator::SyncCoordinator,
     sync_scheduler: Mutex<Option<crate::sync::coordinator::SyncSchedulerHandle>>,
+    plugin_runtime_scheduler: Mutex<Option<PluginRuntimeSchedulerHandle>>,
+}
+
+struct PluginRuntimeSchedulerHandle {
+    cancellation: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl LibraryManager {
+    pub fn host_registry(&self) -> &Arc<HostRegistry> {
+        &self.registry
+    }
+    pub fn provider_manager(&self) -> crate::sync::provider::ProviderManager {
+        self.sync_coordinator.provider_manager()
+    }
+
+    pub async fn fence_plugin_bindings(
+        &self,
+        plugin_id: &str,
+        fences: Vec<crate::host_registry::BindingFence>,
+    ) -> anyhow::Result<()> {
+        let providers = self.provider_manager();
+        for fence in fences {
+            providers
+                .fence_binding(
+                    plugin_id,
+                    &fence.account_uuid,
+                    fence.binding_epoch,
+                    fence.next_transport_generation,
+                )
+                .await?;
+        }
+        Ok(())
+    }
     pub fn new(
         registry: Arc<HostRegistry>,
         libraries_dir: PathBuf,
+        bundled_plugins_dir: PathBuf,
+        secret_store: Option<Arc<dyn crate::plugins::secret_store::SecretStore>>,
         active: Arc<RwLock<ActiveSnapshot>>,
         request_gate: Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
@@ -209,10 +244,216 @@ impl LibraryManager {
             operation: AsyncMutex::new(()),
             runtime_generation: AtomicU64::new(0),
             libraries_dir,
+            bundled_plugins_dir,
+            secret_store,
             runtime_leases,
             sync_coordinator,
             sync_scheduler: Mutex::new(None),
+            plugin_runtime_scheduler: Mutex::new(None),
         }
+    }
+
+    pub fn bundled_plugins_dir(&self) -> &Path {
+        &self.bundled_plugins_dir
+    }
+
+    pub fn start_plugin_runtime_supervisors(self: &Arc<Self>) {
+        let cancellation = CancellationToken::new();
+        let task_cancel = cancellation.clone();
+        let weak = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            use std::collections::HashMap;
+            let mut running: HashMap<
+                String,
+                (String, CancellationToken, tokio::task::JoinHandle<()>),
+            > = HashMap::new();
+            let mut blocked: HashMap<String, String> = HashMap::new();
+            loop {
+                let Some(manager) = weak.upgrade() else {
+                    break;
+                };
+                let launches = match manager.registry.plugin_runtime_launches() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to reconcile plugin runtimes");
+                        Vec::new()
+                    }
+                };
+                let desired = launches
+                    .iter()
+                    .map(|v| (v.plugin_id.clone(), v.fingerprint()))
+                    .collect::<HashMap<_, _>>();
+                blocked.retain(|id, fingerprint| {
+                    desired
+                        .get(id)
+                        .is_some_and(|desired| desired == fingerprint)
+                });
+                let finished = running
+                    .iter()
+                    .filter(|(_, (_, _, handle))| handle.is_finished())
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                for id in finished {
+                    if let Some((_, _, handle)) = running.remove(&id) {
+                        let _ = handle.await;
+                    }
+                }
+                let stale = running
+                    .keys()
+                    .filter(|id| {
+                        desired.get(*id).is_none_or(|fingerprint| {
+                            running.get(*id).is_some_and(|v| &v.0 != fingerprint)
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for id in stale {
+                    if let Some((_, cancel, handle)) = running.remove(&id) {
+                        cancel.cancel();
+                        let _ = handle.await;
+                    }
+                }
+                for launch in launches {
+                    if running.contains_key(&launch.plugin_id) {
+                        continue;
+                    }
+                    let fingerprint = launch.fingerprint();
+                    if blocked.get(&launch.plugin_id) == Some(&fingerprint) {
+                        continue;
+                    }
+                    let Ok(manifest) = serde_json::from_str::<
+                        crate::plugins::manifest::ManifestRecord,
+                    >(&launch.manifest_json) else {
+                        let _ = manager.registry.record_plugin_runtime_failure(
+                            &launch.plugin_id,
+                            &fingerprint,
+                            "incompatible",
+                            "manifest-invalid",
+                            "stored bundled manifest is invalid",
+                            None,
+                        );
+                        blocked.insert(launch.plugin_id.clone(), fingerprint);
+                        continue;
+                    };
+                    let platform = if cfg!(windows) {
+                        crate::plugins::manifest::Platform::WindowsX64
+                    } else {
+                        crate::plugins::manifest::Platform::LinuxX64
+                    };
+                    let trusted = crate::plugins::runtime::trust::embedded_trust_registry()
+                        .iter()
+                        .any(|entry| {
+                            entry.plugin_id == launch.plugin_id
+                                && entry.version == launch.version
+                                && entry.platform == platform
+                                && entry.binary_sha256 == launch.entry_sha256
+                        });
+                    if !trusted {
+                        let _ = manager.registry.record_plugin_runtime_failure(
+                            &launch.plugin_id,
+                            &fingerprint,
+                            "incompatible",
+                            "not-in-embedded-trust-registry",
+                            "selected Provider is not present in the build-time trust registry",
+                            None,
+                        );
+                        blocked.insert(launch.plugin_id.clone(), fingerprint);
+                        continue;
+                    }
+                    let plugin_id = launch.plugin_id.clone();
+                    let account_uuid = launch.account_uuid.clone();
+                    let registry = Arc::clone(&manager.registry);
+                    let providers = manager.provider_manager();
+                    let child_cancel = task_cancel.child_token();
+                    let supervisor_cancel = child_cancel.clone();
+                    let install_root = launch.install_root.clone();
+                    let runtime_root = std::env::var_os("MEGLE_PLUGIN_STATE_DIR")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            manager
+                                .libraries_dir
+                                .parent()
+                                .unwrap_or(&manager.libraries_dir)
+                                .join("plugin-state")
+                        });
+                    let runtime_dir = runtime_root.join(&plugin_id).join(&account_uuid);
+                    let task_manifest = manifest.clone();
+                    let task_plugin_id = plugin_id.clone();
+                    let task_account_uuid = account_uuid.clone();
+                    let task_granted_permissions = launch.granted_permissions.clone();
+                    let task_fingerprint = fingerprint.clone();
+                    let task_providers = providers.clone();
+                    let activation_registry = Arc::clone(&registry);
+                    let secret_store = manager.secret_store.clone();
+                    let handle = tokio::spawn(async move {
+                        let supervisor_fingerprint = task_fingerprint.clone();
+                        let activation_fingerprint = task_fingerprint;
+                        let activation_providers = task_providers.clone();
+                        let activation_manifest = task_manifest.clone();
+                        let activation_account = task_account_uuid.clone();
+                        let activation_root = install_root.clone();
+                        let activation_runtime = runtime_dir.clone();
+                        if let Err(error) =
+                            crate::plugins::runtime::supervisor::supervise_until_cancelled(
+                                Arc::clone(&registry),
+                                task_providers,
+                                task_plugin_id.clone(),
+                                task_account_uuid,
+                                supervisor_fingerprint,
+                                supervisor_cancel,
+                                Default::default(),
+                                Default::default(),
+                                move || {
+                                    let providers = activation_providers.clone();
+                                    let manifest = activation_manifest.clone();
+                                    let account = activation_account.clone();
+                                    let granted_permissions = task_granted_permissions.clone();
+                                    let root = activation_root.clone();
+                                    let runtime = activation_runtime.clone();
+                                    let secret_store = secret_store.clone();
+                                    let registry = Arc::clone(&activation_registry);
+                                    let launch_fingerprint = activation_fingerprint.clone();
+                                    async move {
+                                        let reverse = secret_store.map(|store| Arc::new(crate::plugins::runtime::secret_broker::SecretBroker::new(store, registry, manifest.id.clone(), account.clone(), launch_fingerprint)) as Arc<dyn crate::plugins::runtime::rpc::ReverseRpcHandler>);
+                                        crate::plugins::runtime::supervisor::activate_and_register(
+                                            &providers,
+                                            &manifest,
+                                            &account,
+                                            granted_permissions,
+                                            &root,
+                                            platform,
+                                            crate::plugins::runtime::trust::embedded_trust_registry(
+                                            ),
+                                            runtime,
+                                            reverse,
+                                        )
+                                        .await
+                                    }
+                                },
+                            )
+                            .await
+                        {
+                            tracing::error!(plugin_id = %task_plugin_id, %error, "plugin supervisor stopped with error");
+                        }
+                    });
+                    running.insert(plugin_id, (fingerprint, child_cancel, handle));
+                }
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
+            }
+            for (_, (_, cancel, handle)) in running {
+                cancel.cancel();
+                let _ = handle.await;
+            }
+        });
+        *self
+            .plugin_runtime_scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) =
+            Some(PluginRuntimeSchedulerHandle { cancellation, task });
     }
 
     pub fn start_sync_coordinator(self: &Arc<Self>) {
@@ -237,6 +478,18 @@ impl LibraryManager {
 
     #[allow(dead_code)]
     pub async fn shutdown_sync_coordinator(&self) -> anyhow::Result<()> {
+        let plugin_scheduler = self
+            .plugin_runtime_scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(plugin_scheduler) = plugin_scheduler {
+            plugin_scheduler.cancellation.cancel();
+            plugin_scheduler
+                .task
+                .await
+                .map_err(|error| anyhow::anyhow!("plugin runtime scheduler failed: {error}"))?;
+        }
         let scheduler = self
             .sync_scheduler
             .lock()
@@ -245,6 +498,7 @@ impl LibraryManager {
         if let Some(scheduler) = scheduler {
             scheduler.shutdown().await?;
         }
+        self.sync_coordinator.provider_manager().shutdown().await?;
         Ok(())
     }
 
@@ -1017,6 +1271,16 @@ impl LibraryManager {
         if descriptor.binding_state != "local-only" {
             anyhow::bail!("library-already-synchronized");
         }
+        self.registry
+            .require_ready_sync_provider(provider_id, account_identity)?;
+        if self
+            .sync_coordinator
+            .provider_manager()
+            .resolve(provider_id, account_identity)?
+            .is_none()
+        {
+            anyhow::bail!("provider-not-ready");
+        }
         let (binding_epoch, actor_epoch) =
             self.registry
                 .begin_sync_binding(library_uuid, provider_id, account_identity)?;
@@ -1074,6 +1338,22 @@ impl LibraryManager {
         if descriptor.binding_state == "local-only" {
             return Ok(());
         }
+        let transport = self
+            .registry
+            .binding_transport(library_uuid, "library")?
+            .ok_or_else(|| anyhow::anyhow!("sync-binding-not-found"))?;
+        let next_generation = self
+            .registry
+            .begin_unbind(library_uuid, transport.binding_epoch)?;
+        self.sync_coordinator
+            .provider_manager()
+            .fence_binding(
+                &transport.plugin_id,
+                &transport.account_uuid,
+                transport.binding_epoch,
+                next_generation as u64,
+            )
+            .await?;
         let published = self.registry.sync_published_frontier(library_uuid)?;
         let active = self.active_snapshot();
         if active.library_uuid.as_deref() == Some(library_uuid) {
@@ -1153,6 +1433,10 @@ mod tests {
         LibraryManager::new(
             registry,
             base.join("libraries"),
+            base.join("bundled-plugins"),
+            Some(Arc::new(
+                crate::plugins::secret_store::MemorySecretStore::default(),
+            )),
             Arc::new(RwLock::new(ActiveSnapshot {
                 library_uuid: None,
                 context_revision: 0,
@@ -1521,6 +1805,112 @@ mod tests {
         if let Some(runtime) = manager.active_snapshot().runtime {
             runtime.shutdown().await.unwrap();
         }
+        drop(manager);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn sync_enable_requires_a_live_ready_provider_before_creating_a_binding() {
+        let base = std::env::temp_dir().join(format!("megle-sync-enable-{}", Uuid::now_v7()));
+        fs::create_dir_all(&base).unwrap();
+        let manager = test_manager(&base);
+        manager
+            .registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.megle.fake",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        manager
+            .registry
+            .upsert_plugin_account(
+                "fake-account",
+                "com.megle.fake",
+                Some("Fake"),
+                "authenticated",
+            )
+            .unwrap();
+        manager
+            .registry
+            .set_plugin_intent("com.megle.fake", true, true)
+            .unwrap();
+        manager
+            .registry
+            .record_plugin_runtime_ready(
+                "com.megle.fake",
+                "test-session",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+        let library = manager
+            .create_library(
+                "Sync".into(),
+                None,
+                None,
+                base.join("managed-sync"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(
+            manager
+                .enable_library_sync_with_revision(
+                    &library.library_uuid,
+                    0,
+                    "com.megle.fake",
+                    "fake-account",
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            "provider-not-ready"
+        );
+        assert_eq!(
+            manager
+                .registry
+                .library(&library.library_uuid)
+                .unwrap()
+                .unwrap()
+                .binding_state,
+            "local-only"
+        );
+
+        manager
+            .provider_manager()
+            .register(
+                "com.megle.fake",
+                "fake-account",
+                Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
+            )
+            .unwrap();
+        manager
+            .enable_library_sync_with_revision(
+                &library.library_uuid,
+                0,
+                "com.megle.fake",
+                "fake-account",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .registry
+                .binding_transport(&library.library_uuid, "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "preparing"
+        );
+
         drop(manager);
         let _ = fs::remove_dir_all(base);
     }

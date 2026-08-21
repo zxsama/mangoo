@@ -1,4 +1,5 @@
 use rusqlite::OptionalExtension;
+use sha2::Digest;
 use std::path::{Path, PathBuf};
 
 use super::runtime::{DormantSyncRuntime, RuntimeLeases};
@@ -28,6 +29,7 @@ impl SyncSchedulerHandle {
 pub struct SyncCoordinator {
     registry: std::sync::Arc<HostRegistry>,
     leases: RuntimeLeases,
+    providers: super::provider::ProviderManager,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -41,9 +43,37 @@ pub struct SyncTurnResult {
     pub seed_checkpoint: Option<(uuid::Uuid, i64)>,
 }
 
+#[derive(Debug, Clone)]
+struct PublishedSegment {
+    segment_uuid: [u8; 16],
+    actor_epoch: uuid::Uuid,
+    last_seq: u64,
+    object_key: String,
+}
+
 impl SyncCoordinator {
     pub fn new(registry: std::sync::Arc<HostRegistry>, leases: RuntimeLeases) -> Self {
-        Self { registry, leases }
+        Self {
+            registry,
+            leases,
+            providers: super::provider::ProviderManager::default(),
+        }
+    }
+
+    pub fn with_providers(
+        registry: std::sync::Arc<HostRegistry>,
+        leases: RuntimeLeases,
+        providers: super::provider::ProviderManager,
+    ) -> Self {
+        Self {
+            registry,
+            leases,
+            providers,
+        }
+    }
+
+    pub fn provider_manager(&self) -> super::provider::ProviderManager {
+        self.providers.clone()
     }
 
     /// Start the provider-neutral production scheduler for synced Libraries.
@@ -159,6 +189,9 @@ impl SyncCoordinator {
         library_uuid: &str,
         catalog_path: &Path,
     ) -> anyhow::Result<SyncTurnResult> {
+        let published = self
+            .provider_transport_turn(library_uuid, catalog_path)
+            .await?;
         if !catalog_path.exists() {
             self.bootstrap_missing_catalog(library_uuid, catalog_path)?;
         }
@@ -169,11 +202,14 @@ impl SyncCoordinator {
             .unwrap_or_else(|| Path::new("."))
             .join("sync-spool");
         self.apply_host_spool(&spool_dir)?;
+        let published_for_catalog = published.clone();
         let result = runtime
             .run_turn(move |database| {
                 let connection = database.connection_for_fsops();
+                commit_published_segments(connection, &published_for_catalog)?;
                 super::persistence::recover_interrupted_checkpoints(connection)?;
                 register_unindexed_segments(connection, &spool_dir)?;
+                seal_next_outbox_segment(connection, &spool_dir)?;
                 let apply_started = std::time::Instant::now();
                 let applied_events = super::spool::apply_next_durable_segment(connection)?;
                 let apply_transaction_micros = apply_started.elapsed().as_micros() as u64;
@@ -212,6 +248,7 @@ impl SyncCoordinator {
             })
             .await?;
         self.finish_seed_if_ready(library_uuid, &result)?;
+        self.commit_host_published_frontier(library_uuid, &published)?;
         Ok(result)
     }
 
@@ -269,19 +306,332 @@ impl SyncCoordinator {
             .snapshot()?
             .active_library_uuid
             .ok_or_else(|| anyhow::anyhow!("active sync turn has no active Library"))?;
+        let published = self
+            .provider_transport_turn(&descriptor, catalog_path)
+            .await?;
         let (host_vector, host_metadata) = self.registry.host_checkpoint_snapshot(&descriptor)?;
         let spool_dir = catalog_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("sync-spool");
         self.apply_host_spool(&spool_dir)?;
+        let published_for_catalog = published.clone();
         let result = writer
             .write_authoritative(move |database| {
+                commit_published_segments(database.connection_for_fsops(), &published_for_catalog)?;
                 perform_turn(database, host_vector, host_metadata, spool_dir)
             })
             .await?;
         self.finish_seed_if_ready(&descriptor, &result)?;
+        self.commit_host_published_frontier(&descriptor, &published)?;
         Ok(result)
+    }
+
+    /// Performs provider I/O before any Catalog writer or runtime lease is
+    /// acquired. Durable intake and cursor commits remain Host/Core-owned and
+    /// are fenced by binding epoch plus transport generation.
+    async fn provider_transport_turn(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+    ) -> anyhow::Result<Vec<PublishedSegment>> {
+        let Some(binding) = self.registry.binding_transport(library_uuid, "library")? else {
+            return Ok(Vec::new());
+        };
+        if !matches!(
+            binding.state.as_str(),
+            "preparing" | "capturing" | "seed_ready" | "publishing" | "active"
+        ) {
+            return Ok(Vec::new());
+        }
+        let Some(provider) = self
+            .providers
+            .resolve(&binding.plugin_id, &binding.account_uuid)?
+        else {
+            return Ok(Vec::new());
+        };
+        let namespace = binding
+            .remote_namespace
+            .clone()
+            .unwrap_or_else(|| library_uuid.to_owned());
+        let context = super::provider::TransportContext {
+            binding_epoch: binding.binding_epoch.to_string(),
+            transport_generation: binding.transport_generation as u64,
+        };
+        let mut page_token = binding.page_token.clone();
+        let mut completed_cursor = None;
+        let spool = catalog_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("sync-spool");
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            if pages > 1024 {
+                anyhow::bail!("provider pagination exceeded the per-turn safety limit");
+            }
+            let requested_page = page_token.clone();
+            let page = provider
+                .delta_list(
+                    super::provider::DeltaScope::Library {
+                        namespace: namespace.clone(),
+                        binding_epoch: binding.binding_epoch.to_string(),
+                        transport_generation: binding.transport_generation as u64,
+                    },
+                    binding.cursor.as_deref(),
+                    page_token.as_deref(),
+                    100,
+                )
+                .await
+                .map_err(anyhow::Error::new)?;
+            for metadata in &page.objects {
+                if !metadata.key.starts_with("segments/")
+                    && !metadata.key.starts_with("host/")
+                    && !metadata.key.starts_with("checkpoints/")
+                    && metadata.key != "library-descriptor"
+                {
+                    continue;
+                }
+                let object_limit = if metadata.key.starts_with("checkpoints/") {
+                    64 * 1024 * 1024
+                } else {
+                    super::inbox::MAX_APPLY_DECODED_BYTES as u64
+                };
+                let object = provider
+                    .object_get(&context, &metadata.key, object_limit)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                super::provider::validate_download(&object, object_limit)
+                    .map_err(anyhow::Error::new)?;
+                if object.metadata.key != metadata.key
+                    || object.metadata.size != metadata.size
+                    || object.metadata.sha256 != metadata.sha256
+                {
+                    anyhow::bail!(
+                        "provider object metadata does not match the delta listing for {}",
+                        metadata.key
+                    );
+                }
+                let object_bytes = std::fs::read(&object.path)?;
+                if metadata.key.starts_with("segments/") {
+                    super::spool::intake_segment(&spool, &object_bytes, None, |_| Ok(()))?;
+                } else if metadata.key.starts_with("host/") {
+                    let directory = spool.join("host");
+                    std::fs::create_dir_all(&directory)?;
+                    let destination =
+                        directory.join(format!("{}.json", hex_hash(&metadata.sha256)));
+                    atomic_write(&destination, &object_bytes)?;
+                } else if metadata.key.starts_with("checkpoints/") {
+                    let checkpoint: super::checkpoint::Checkpoint =
+                        serde_json::from_slice(&object_bytes)?;
+                    checkpoint.verify()?;
+                    let directory = spool.join("checkpoints");
+                    std::fs::create_dir_all(&directory)?;
+                    let destination = directory.join(
+                        Path::new(&metadata.key)
+                            .file_name()
+                            .ok_or_else(|| anyhow::anyhow!("invalid checkpoint object key"))?,
+                    );
+                    atomic_write(&destination, &object_bytes)?;
+                }
+                self.registry.record_provider_receipt(
+                    library_uuid,
+                    binding.binding_epoch,
+                    binding.transport_generation,
+                    &metadata.key,
+                    metadata.etag.as_deref(),
+                    &metadata.sha256,
+                    "durable",
+                )?;
+            }
+            page_token = page.page_token.clone();
+            completed_cursor = page.completed_cursor.clone().or(completed_cursor);
+            if let Some(next_page) = page_token.as_deref() {
+                if requested_page.as_deref() == Some(next_page) {
+                    anyhow::bail!("provider returned a non-advancing page token");
+                }
+                self.registry.commit_binding_page(
+                    library_uuid,
+                    binding.binding_epoch,
+                    binding.transport_generation,
+                    &namespace,
+                    "library",
+                    binding.cursor.as_deref(),
+                    next_page,
+                )?;
+            } else {
+                self.registry.commit_binding_cursor(
+                    library_uuid,
+                    binding.binding_epoch,
+                    binding.transport_generation,
+                    &namespace,
+                    "library",
+                    completed_cursor.as_deref(),
+                )?;
+                break;
+            }
+        }
+        self.push_protocol_objects(
+            provider.as_ref(),
+            library_uuid,
+            &binding,
+            catalog_path,
+            &spool,
+        )
+        .await
+    }
+
+    async fn push_protocol_objects(
+        &self,
+        provider: &dyn super::provider::SyncProvider,
+        library_uuid: &str,
+        binding: &crate::host_registry::BindingTransport,
+        catalog_path: &Path,
+        spool: &Path,
+    ) -> anyhow::Result<Vec<PublishedSegment>> {
+        let context = super::provider::TransportContext {
+            binding_epoch: binding.binding_epoch.to_string(),
+            transport_generation: binding.transport_generation as u64,
+        };
+        let outgoing = spool.join("outgoing");
+        let mut published = Vec::new();
+        if outgoing.exists() {
+            for entry in std::fs::read_dir(&outgoing)? {
+                let path = entry?.path();
+                if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                    continue;
+                }
+                let bytes = std::fs::read(&path)?;
+                let segment = match serde_json::from_slice::<super::segment::SealedSegment>(&bytes)
+                {
+                    Ok(segment)
+                        if segment.header.library_uuid.to_string() == library_uuid
+                            && segment.header.actor.actor_epoch.0 == binding.actor_epoch =>
+                    {
+                        segment
+                    }
+                    _ => continue,
+                };
+                super::segment::verify_segment(&segment, segment.header.predecessor_hash)?;
+                let hash: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+                let key = format!("segments/{}.json", hex_hash(&hash));
+                let result = provider
+                    .object_put_immutable(&context, &key, &bytes, hash)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                let (state, etag) = put_receipt(&result)?;
+                self.registry.record_provider_receipt(
+                    library_uuid,
+                    binding.binding_epoch,
+                    binding.transport_generation,
+                    &key,
+                    etag,
+                    &hash,
+                    state,
+                )?;
+                let mut segment_uuid = [0u8; 16];
+                segment_uuid.copy_from_slice(&segment.segment_hash[..16]);
+                published.push(PublishedSegment {
+                    segment_uuid,
+                    actor_epoch: binding.actor_epoch,
+                    last_seq: segment.header.last_seq,
+                    object_key: key,
+                });
+            }
+        }
+        if binding.state == "seed_ready" || binding.state == "publishing" {
+            let checkpoint_uuid = binding
+                .latest_checkpoint_uuid
+                .ok_or_else(|| anyhow::anyhow!("seed binding has no ready checkpoint"))?;
+            let connection = rusqlite::Connection::open_with_flags(
+                catalog_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let (checkpoint_path, expected_hash): (String, Vec<u8>) = connection.query_row(
+                "SELECT spool_path,payload_hash FROM sync_checkpoints WHERE checkpoint_uuid=?1 AND state='ready'",
+                [checkpoint_uuid.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            drop(connection);
+            let checkpoint = std::fs::read(&checkpoint_path)?;
+            let checkpoint_hash: [u8; 32] = sha2::Sha256::digest(&checkpoint).into();
+            if expected_hash.as_slice() != checkpoint_hash {
+                anyhow::bail!("seed checkpoint payload hash mismatch");
+            }
+            let checkpoint_key = format!("checkpoints/{checkpoint_uuid}.checkpoint");
+            let checkpoint_result = provider
+                .object_put_immutable(&context, &checkpoint_key, &checkpoint, checkpoint_hash)
+                .await
+                .map_err(anyhow::Error::new)?;
+            let (checkpoint_state, checkpoint_etag) = put_receipt(&checkpoint_result)?;
+            self.registry.record_provider_receipt(
+                library_uuid,
+                binding.binding_epoch,
+                binding.transport_generation,
+                &checkpoint_key,
+                checkpoint_etag,
+                &checkpoint_hash,
+                checkpoint_state,
+            )?;
+            let descriptor = serde_json::to_vec(&serde_json::json!({
+                "version":1,
+                "libraryUuid":library_uuid,
+                "bindingEpoch":binding.binding_epoch,
+                "namespace":binding.remote_namespace.as_deref().unwrap_or(library_uuid),
+                "seed":{
+                    "checkpointUuid":checkpoint_uuid,
+                    "objectKey":checkpoint_key,
+                    "sha256":hex_hash(&checkpoint_hash)
+                },
+                "dependencies":[checkpoint_key]
+            }))?;
+            let hash: [u8; 32] = sha2::Sha256::digest(&descriptor).into();
+            let result = provider
+                .object_put_immutable(&context, "library-descriptor", &descriptor, hash)
+                .await
+                .map_err(anyhow::Error::new)?;
+            let (state, etag) = put_receipt(&result)?;
+            self.registry.record_provider_receipt(
+                library_uuid,
+                binding.binding_epoch,
+                binding.transport_generation,
+                "library-descriptor",
+                etag,
+                &hash,
+                state,
+            )?;
+            self.registry.confirm_remote_descriptor(
+                library_uuid,
+                binding.binding_epoch,
+                binding.transport_generation,
+                &checkpoint_key,
+            )?;
+        }
+        Ok(published)
+    }
+
+    fn commit_host_published_frontier(
+        &self,
+        library_uuid: &str,
+        published: &[PublishedSegment],
+    ) -> anyhow::Result<()> {
+        let Some(frontier) = published.iter().map(|segment| segment.last_seq).max() else {
+            return Ok(());
+        };
+        let Some(binding) = self.registry.binding_transport(library_uuid, "library")? else {
+            return Ok(());
+        };
+        self.registry.advance_published_frontier(
+            library_uuid,
+            binding.binding_epoch,
+            binding.transport_generation,
+            frontier,
+            &published
+                .iter()
+                .max_by_key(|segment| segment.last_seq)
+                .expect("frontier exists")
+                .object_key,
+        )
     }
 
     fn finish_seed_if_ready(
@@ -301,7 +651,7 @@ impl SyncCoordinator {
                 if generation < capture_generation {
                     return Ok(());
                 }
-                self.registry.mark_sync_seed_ready(
+                self.registry.mark_local_seed_ready(
                     library_uuid,
                     checkpoint,
                     capture_generation,
@@ -343,6 +693,7 @@ fn perform_turn(
     let connection = database.connection_for_fsops();
     super::persistence::recover_interrupted_checkpoints(connection)?;
     register_unindexed_segments(connection, &spool_dir)?;
+    seal_next_outbox_segment(connection, &spool_dir)?;
     let apply_started = std::time::Instant::now();
     let applied_events = super::spool::apply_next_durable_segment(connection)?;
     let apply_transaction_micros = apply_started.elapsed().as_micros() as u64;
@@ -374,6 +725,157 @@ fn perform_turn(
         apply_transaction_micros,
         seed_checkpoint,
     })
+}
+
+fn commit_published_segments(
+    connection: &rusqlite::Connection,
+    published: &[PublishedSegment],
+) -> anyhow::Result<()> {
+    if published.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    let now = unix_timestamp_millis();
+    for segment in published {
+        transaction.execute(
+            "UPDATE sync_segments SET state='published' WHERE segment_uuid=?1 AND actor_epoch=?2 AND state IN ('sealed','published')",
+            rusqlite::params![
+                segment.segment_uuid.as_slice(),
+                segment.actor_epoch.as_bytes().as_slice()
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE sync_outbox SET state='published',published_at=COALESCE(published_at,?1) WHERE segment_uuid=?2 AND state IN ('sealed','published')",
+            rusqlite::params![now, segment.segment_uuid.as_slice()],
+        )?;
+        transaction.execute(
+            "UPDATE sync_actor_epochs SET published_through_seq=MAX(published_through_seq,?1) WHERE actor_epoch=?2",
+            rusqlite::params![
+                segment.last_seq as i64,
+                segment.actor_epoch.as_bytes().as_slice()
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn seal_next_outbox_segment(
+    connection: &rusqlite::Connection,
+    spool_dir: &Path,
+) -> anyhow::Result<bool> {
+    let actor: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT active_actor_epoch FROM sync_local_state WHERE singleton=1 AND capture_enabled=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(actor) = actor else { return Ok(false) };
+    let mut statement = connection.prepare(
+        "SELECT e.payload FROM sync_outbox o JOIN sync_events e ON e.event_uuid=o.event_uuid WHERE o.state='pending' AND e.actor_epoch=?1 ORDER BY e.actor_seq LIMIT 256",
+    )?;
+    let events = statement
+        .query_map([&actor], |row| row.get::<_, Vec<u8>>(0))?
+        .map(|row| Ok(super::codec::decode_event(&row?)?))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    drop(statement);
+    if events.is_empty() {
+        return Ok(false);
+    }
+    let predecessor_path: Option<String> = connection
+        .query_row(
+            "SELECT spool_path FROM sync_segments WHERE actor_epoch=?1 AND state IN ('sealed','published','acked') ORDER BY last_seq DESC LIMIT 1",
+            [&actor],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let predecessor = predecessor_path
+        .map(|path| -> anyhow::Result<[u8; 32]> {
+            Ok(
+                serde_json::from_slice::<super::segment::SealedSegment>(&std::fs::read(path)?)?
+                    .segment_hash,
+            )
+        })
+        .transpose()?;
+    let segment = super::segment::seal_segment(events, predecessor)?;
+    let outgoing = spool_dir.join("outgoing");
+    std::fs::create_dir_all(&outgoing)?;
+    let bytes = serde_json::to_vec(&segment)?;
+    let path = outgoing.join(format!("{}.segment.json", hex_hash(&segment.segment_hash)));
+    atomic_write(&path, &bytes)?;
+    let mut segment_uuid = [0u8; 16];
+    segment_uuid.copy_from_slice(&segment.segment_hash[..16]);
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "INSERT INTO sync_segments(segment_uuid,stream_uuid,stream_kind,device_uuid,actor_epoch,binding_epoch,first_seq,last_seq,event_count,wire_version,reducer_version,compression,decoded_bytes,predecessor_hash,payload_hash,spool_path,state,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'none',?12,?13,?14,?15,'sealed',?16)",
+        rusqlite::params![
+            segment_uuid.as_slice(),
+            segment.header.actor.stream_uuid.0.as_bytes().as_slice(),
+            match segment.header.stream_kind { super::types::StreamKind::Catalog => "catalog", super::types::StreamKind::HostMetadata => "host-metadata" },
+            segment.header.actor.device_uuid.0.as_bytes().as_slice(),
+            segment.header.actor.actor_epoch.0.as_bytes().as_slice(),
+            segment.events[0].binding_epoch.0.as_bytes().as_slice(),
+            segment.header.first_seq as i64,
+            segment.header.last_seq as i64,
+            segment.header.count as i64,
+            segment.header.wire_version,
+            segment.header.reducer_version,
+            segment.header.decoded_bytes as i64,
+            segment.header.predecessor_hash.map(|value| value.to_vec()),
+            segment.header.payload_hash.as_slice(),
+            path.to_string_lossy(),
+            unix_timestamp_millis(),
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE sync_outbox SET state='sealed',segment_uuid=?1 WHERE state='pending' AND event_uuid IN (SELECT event_uuid FROM sync_events WHERE actor_epoch=?2 AND actor_seq BETWEEN ?3 AND ?4)",
+        rusqlite::params![segment_uuid.as_slice(),actor,segment.header.first_seq as i64,segment.header.last_seq as i64],
+    )?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+fn put_receipt(
+    result: &super::provider::PutImmutableResult,
+) -> anyhow::Result<(&'static str, Option<&str>)> {
+    match result {
+        super::provider::PutImmutableResult::Created { etag } => Ok(("created", etag.as_deref())),
+        super::provider::PutImmutableResult::AlreadyExistsMatching { etag } => {
+            Ok(("already-exists-matching", etag.as_deref()))
+        }
+        super::provider::PutImmutableResult::HashConflict { .. } => {
+            anyhow::bail!("provider immutable object hash conflict")
+        }
+    }
+}
+fn hex_hash(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7().simple()));
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(temp, path)?;
+    Ok(())
+}
+
+fn unix_timestamp_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn advance_bulk_turn(connection: &rusqlite::Connection) -> anyhow::Result<()> {
@@ -797,8 +1299,38 @@ mod tests {
             })
             .unwrap();
             host.commit_creation(&creation, &descriptor).unwrap();
+            host.register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: &format!("benchmark-{index}"),
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[9; 32],
+                install_root: &base,
+                trust_policy_id: "benchmark",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+            host.upsert_plugin_account(
+                &format!("local-{index}"),
+                &format!("benchmark-{index}"),
+                Some("Benchmark"),
+                "authenticated",
+            )
+            .unwrap();
+            host.set_plugin_intent(&format!("benchmark-{index}"), true, true)
+                .unwrap();
+            host.record_plugin_runtime_ready(
+                &format!("benchmark-{index}"),
+                &format!("benchmark-session-{index}"),
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
             let (binding, _) = host
-                .begin_sync_binding(&descriptor.library_uuid, "benchmark", "local")
+                .begin_sync_binding(
+                    &descriptor.library_uuid,
+                    &format!("benchmark-{index}"),
+                    &format!("local-{index}"),
+                )
                 .unwrap();
             host.set_sync_capture_generation(&descriptor.library_uuid, binding, 1)
                 .unwrap();

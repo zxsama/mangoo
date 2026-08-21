@@ -1,7 +1,7 @@
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::Query as ExtraQuery;
@@ -17,12 +17,11 @@ use crate::api::AppState;
 use crate::db::notification_outbox::NotificationOutboxEvent;
 use crate::db::{
     Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot,
-    NotificationOrigin, PluginRecord, PreviewBlobRecord, PreviewFailureRecord, RootRecord,
-    SearchQuery, TagError, TagRecord, TaskRecord, ThumbBlobRecord, ThumbnailCacheClearResult,
-    ThumbnailCacheEnqueueResult, ThumbnailCacheRefreshMode, ThumbnailCacheScope,
-    ThumbnailCacheSnapshot, ThumbnailCacheStats, ThumbnailFailureRecord, ThumbnailRecord,
-    ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority, UserMetadataPatch, UserMetadataRecord,
-    THUMBNAIL_BULK_PRIORITY,
+    NotificationOrigin, PreviewBlobRecord, PreviewFailureRecord, RootRecord, SearchQuery, TagError,
+    TagRecord, TaskRecord, ThumbBlobRecord, ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult,
+    ThumbnailCacheRefreshMode, ThumbnailCacheScope, ThumbnailCacheSnapshot, ThumbnailCacheStats,
+    ThumbnailFailureRecord, ThumbnailRecord, ThumbnailScopeLeaverPolicy, ThumbnailTaskPriority,
+    UserMetadataPatch, UserMetadataRecord, THUMBNAIL_BULK_PRIORITY,
 };
 use crate::fsops::{
     self, DeleteRequest, FileOperationRecord, FsOpsError, FsOpsErrorCode, MoveRequest,
@@ -136,6 +135,16 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/plugins/{pluginId}",
     "/api/plugins/{pluginId}/enable",
     "/api/plugins/{pluginId}/disable",
+    "/api/plugins/{pluginId}/grants",
+    "/api/plugins/{pluginId}/retry",
+    "/api/plugins/{pluginId}/versions/select",
+    "/api/plugins/{pluginId}/versions/rollback",
+    "/api/plugins/{pluginId}/auth/begin",
+    "/api/plugins/{pluginId}/auth/complete",
+    "/api/plugins/{pluginId}/auth/sign-out",
+    "/api/plugins/{pluginId}/health",
+    "/api/plugins/{pluginId}/diagnostics",
+    "/api/plugin-auth/callback/{flowId}",
 ];
 
 #[derive(Debug, Serialize)]
@@ -166,7 +175,7 @@ struct AcceptedResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginListResponse {
-    items: Vec<PluginRecord>,
+    items: Vec<crate::host_registry::HostPluginProjection>,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,8 +194,45 @@ struct PluginDiscoveryResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DeletePluginResponse {
-    deleted: bool,
+struct PluginCommandResponse {
+    accepted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginGrantRequest {
+    permissions: Vec<serde_json::Value>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginVersionRequest {
+    version: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginAuthCompleteRequest {
+    flow_id: String,
+    result: std::collections::BTreeMap<String, String>,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginAuthBeginResponse {
+    authorization_url: String,
+    flow_id: String,
+    expires_at: i64,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginHealthResponse {
+    state: String,
+    last_healthy_at: Option<i64>,
+    last_error_code: Option<String>,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginDiagnosticsResponse {
+    generated_at: i64,
+    entries: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -702,6 +748,37 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/plugins/:plugin_id/enable", post(enable_plugin))
         .route("/api/plugins/:plugin_id/disable", post(disable_plugin))
+        .route("/api/plugins/:plugin_id/grants", put(update_plugin_grants))
+        .route("/api/plugins/:plugin_id/retry", post(retry_plugin_runtime))
+        .route(
+            "/api/plugins/:plugin_id/versions/select",
+            post(select_plugin_version),
+        )
+        .route(
+            "/api/plugins/:plugin_id/versions/rollback",
+            post(rollback_plugin_version),
+        )
+        .route(
+            "/api/plugins/:plugin_id/auth/begin",
+            post(begin_plugin_auth),
+        )
+        .route(
+            "/api/plugins/:plugin_id/auth/complete",
+            post(complete_plugin_auth),
+        )
+        .route(
+            "/api/plugins/:plugin_id/auth/sign-out",
+            post(sign_out_plugin),
+        )
+        .route("/api/plugins/:plugin_id/health", get(plugin_health))
+        .route(
+            "/api/plugins/:plugin_id/diagnostics",
+            get(plugin_diagnostics),
+        )
+        .route(
+            "/api/plugin-auth/callback/:flow_id",
+            get(complete_plugin_auth_callback),
+        )
         .with_state(state)
 }
 
@@ -782,7 +859,7 @@ struct UpdateLibraryRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EnableLibrarySyncRequest {
     provider_id: String,
     account_identity: String,
@@ -2393,9 +2470,7 @@ fn invalid_notification_request(message: &'static str) -> CoreError {
 }
 
 async fn list_plugins(State(state): State<AppState>) -> ApiResult<Json<PluginListResponse>> {
-    // Read on the dedicated WAL read connection so it never blocks behind a
-    // scan-time write holding the shared mutex (see get_user_metadata).
-    let items = run_read_database(state, |database| Ok(database.list_plugins()?)).await?;
+    let items = host_registry(&state)?.list_host_plugins()?;
     Ok(Json(PluginListResponse { items }))
 }
 
@@ -2403,13 +2478,12 @@ async fn discover_plugins(
     State(state): State<AppState>,
 ) -> ApiResult<(StatusCode, Json<PluginDiscoveryResponse>)> {
     let plugins_dir = resolve_plugins_dir(&state);
-    // The locked variant performs the disk walk before acquiring the
-    // mutex, then reacquires per upsert. This keeps other API endpoints
-    // responsive while a large `plugins/` directory is enumerated.
-    let database = fsops_database(&state)?;
-    let report = plugins::discover_and_persist_locked(database.as_ref(), &plugins_dir)?;
-    let errors = report
-        .errors
+    let registry = Arc::clone(host_registry(&state)?);
+    let (registered, errors) =
+        tokio::task::spawn_blocking(move || plugins::reconcile_bundled(&registry, &plugins_dir))
+            .await
+            .map_err(|e| CoreError::from(anyhow::anyhow!("plugin discovery task failed: {e}")))?;
+    let errors = errors
         .into_iter()
         .map(|entry| PluginDiscoveryError {
             manifest_path: entry.manifest_path.to_string_lossy().into_owned(),
@@ -2419,7 +2493,7 @@ async fn discover_plugins(
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginDiscoveryResponse {
-            discovered: report.discovered as u64,
+            discovered: registered as u64,
             errors,
         }),
     ))
@@ -2428,65 +2502,549 @@ async fn discover_plugins(
 async fn get_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
-) -> ApiResult<Json<PluginRecord>> {
-    let plugin = run_read_database(state, move |database| {
-        database
-            .get_plugin(&plugin_id)?
-            .ok_or_else(|| not_found_plugin(&plugin_id))
-    })
-    .await?;
+) -> ApiResult<Json<crate::host_registry::HostPluginProjection>> {
+    let plugin = host_registry(&state)?
+        .host_plugin(&plugin_id)?
+        .ok_or_else(|| not_found_plugin(&plugin_id))?;
     Ok(Json(plugin))
 }
 
 async fn enable_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
-) -> ApiResult<Json<PluginRecord>> {
-    let updated = run_shared_database(state, move |database| {
-        let existing = database
-            .get_plugin(&plugin_id)?
-            .ok_or_else(|| not_found_plugin(&plugin_id))?;
-        if existing.status == "invalid" {
-            return Err(CoreError::coded(
-                StatusCode::CONFLICT,
-                "manifest_invalid",
-                format!("plugin manifest is invalid and cannot be enabled: {plugin_id}"),
-            ));
-        }
-        database
-            .set_plugin_enabled(&plugin_id, true)?
-            .ok_or_else(|| not_found_plugin(&plugin_id))
-    })
-    .await?;
+) -> ApiResult<Json<crate::host_registry::HostPluginProjection>> {
+    let registry = host_registry(&state)?;
+    registry
+        .set_plugin_intent(&plugin_id, true, state.secret_store.is_some())
+        .map_err(|_| not_found_plugin(&plugin_id))?;
+    let updated = registry
+        .host_plugin(&plugin_id)?
+        .ok_or_else(|| not_found_plugin(&plugin_id))?;
     Ok(Json(updated))
 }
 
 async fn disable_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
-) -> ApiResult<Json<PluginRecord>> {
-    let updated = run_shared_database(state, move |database| {
-        database
-            .set_plugin_enabled(&plugin_id, false)?
-            .ok_or_else(|| not_found_plugin(&plugin_id))
-    })
-    .await?;
+) -> ApiResult<Json<crate::host_registry::HostPluginProjection>> {
+    let manager = library_manager(&state)?;
+    let registry = manager.host_registry();
+    registry
+        .set_plugin_intent(&plugin_id, false, state.secret_store.is_some())
+        .map_err(|_| not_found_plugin(&plugin_id))?;
+    let fences = registry.pause_plugin_bindings(&plugin_id)?;
+    manager.fence_plugin_bindings(&plugin_id, fences).await?;
+    let updated = registry
+        .host_plugin(&plugin_id)?
+        .ok_or_else(|| not_found_plugin(&plugin_id))?;
     Ok(Json(updated))
 }
 
 async fn delete_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
-) -> ApiResult<Json<DeletePluginResponse>> {
-    run_shared_database(state, move |database| {
-        if database.delete_plugin(&plugin_id)? {
-            Ok(())
-        } else {
-            Err(not_found_plugin(&plugin_id))
+) -> ApiResult<Json<PluginCommandResponse>> {
+    host_registry(&state)?
+        .unregister_plugin(&plugin_id)
+        .map_err(|e| {
+            if e.to_string().contains("in-use") {
+                CoreError::coded(StatusCode::CONFLICT, "plugin_in_use", e.to_string())
+            } else {
+                not_found_plugin(&plugin_id)
+            }
+        })?;
+    Ok(Json(PluginCommandResponse { accepted: true }))
+}
+
+fn host_registry(state: &AppState) -> ApiResult<&Arc<crate::host_registry::HostRegistry>> {
+    state
+        .library_manager
+        .as_ref()
+        .map(|m| m.host_registry())
+        .ok_or_else(|| {
+            CoreError::from(anyhow::anyhow!(
+                "Host plugin control is unavailable outside Host mode"
+            ))
+        })
+}
+
+async fn update_plugin_grants(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PluginGrantRequest>,
+) -> ApiResult<Json<crate::host_registry::HostPluginProjection>> {
+    let manager = library_manager(&state)?;
+    let registry = manager.host_registry();
+    let json = serde_json::to_string(&body.permissions).map_err(anyhow::Error::from)?;
+    let fences = registry
+        .set_plugin_grants(&id, &json, state.secret_store.is_some())
+        .map_err(|error| match error.to_string().as_str() {
+            "permission-not-requested" => CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "permission_not_requested",
+                error.to_string(),
+            ),
+            _ => not_found_plugin(&id),
+        })?;
+    manager.fence_plugin_bindings(&id, fences).await?;
+    Ok(Json(
+        registry
+            .host_plugin(&id)?
+            .ok_or_else(|| not_found_plugin(&id))?,
+    ))
+}
+async fn retry_plugin_runtime(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    host_registry(&state)?
+        .retry_plugin_runtime(&id, state.secret_store.is_some())
+        .map_err(|error| match error.to_string().as_str() {
+            "plugin-disabled" | "plugin-permission-required" | "plugin-configuration-required" => {
+                CoreError::coded(
+                    StatusCode::CONFLICT,
+                    "plugin_not_retryable",
+                    error.to_string(),
+                )
+            }
+            _ => not_found_plugin(&id),
+        })?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PluginCommandResponse { accepted: true }),
+    ))
+}
+async fn select_plugin_version(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PluginVersionRequest>,
+) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let manager = library_manager(&state)?;
+    let fences = manager
+        .host_registry()
+        .select_plugin_version(&id, &body.version, state.secret_store.is_some())
+        .map_err(|error| match error.to_string().as_str() {
+            "plugin-version-switch-in-progress" => CoreError::coded(
+                StatusCode::CONFLICT,
+                "plugin_version_switch_in_progress",
+                error.to_string(),
+            ),
+            _ => CoreError::coded(
+                StatusCode::NOT_FOUND,
+                "plugin_version_not_found",
+                error.to_string(),
+            ),
+        })?;
+    manager.fence_plugin_bindings(&id, fences).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PluginCommandResponse { accepted: true }),
+    ))
+}
+async fn rollback_plugin_version(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let manager = library_manager(&state)?;
+    let fences = manager
+        .host_registry()
+        .rollback_plugin_version(&id)
+        .map_err(|error| match error.to_string().as_str() {
+            "plugin-not-found" => not_found_plugin(&id),
+            _ => CoreError::coded(
+                StatusCode::CONFLICT,
+                "known_good_unavailable",
+                error.to_string(),
+            ),
+        })?;
+    manager.fence_plugin_bindings(&id, fences).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PluginCommandResponse { accepted: true }),
+    ))
+}
+fn plugin_provider(
+    state: &AppState,
+    id: &str,
+) -> ApiResult<std::sync::Arc<dyn crate::sync::provider::SyncProvider>> {
+    let plugin = host_registry(state)?
+        .host_plugin(id)?
+        .ok_or_else(|| not_found_plugin(id))?;
+    let account_uuid = plugin.account_uuid.ok_or_else(|| {
+        CoreError::coded(
+            StatusCode::CONFLICT,
+            "provider_account_required",
+            format!("provider account is not configured: {id}"),
+        )
+    })?;
+    host_registry(state)?
+        .require_runtime_provider(id, &account_uuid)
+        .map_err(|_| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "provider_not_ready",
+                format!("provider runtime is not ready: {id}"),
+            )
+        })?;
+    library_manager(state)?
+        .provider_manager()
+        .resolve(id, &account_uuid)?
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "provider_not_ready",
+                format!("provider runtime is not ready: {id}"),
+            )
+        })
+}
+
+fn map_provider_error(error: crate::sync::provider::ProviderError) -> CoreError {
+    use crate::sync::provider::ProviderErrorCode;
+    let status = match error.code {
+        ProviderErrorCode::InvalidArgument | ProviderErrorCode::ProtocolError => {
+            StatusCode::BAD_REQUEST
         }
-    })
-    .await?;
-    Ok(Json(DeletePluginResponse { deleted: true }))
+        ProviderErrorCode::Unauthenticated => StatusCode::UNAUTHORIZED,
+        ProviderErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
+        ProviderErrorCode::NotFound => StatusCode::NOT_FOUND,
+        ProviderErrorCode::PreconditionFailed | ProviderErrorCode::CursorReset => {
+            StatusCode::CONFLICT
+        }
+        ProviderErrorCode::Throttled => StatusCode::TOO_MANY_REQUESTS,
+        ProviderErrorCode::Unavailable
+        | ProviderErrorCode::DeadlineExceeded
+        | ProviderErrorCode::Cancelled
+        | ProviderErrorCode::Internal => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    CoreError::coded(status, "provider_error", error.to_string())
+}
+
+async fn begin_plugin_auth(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<PluginAuthBeginResponse>)> {
+    let plugin = host_registry(&state)?
+        .host_plugin(&id)?
+        .ok_or_else(|| not_found_plugin(&id))?;
+    let account_uuid = plugin.account_uuid.ok_or_else(|| {
+        CoreError::coded(
+            StatusCode::CONFLICT,
+            "provider_account_required",
+            format!("provider account is not configured: {id}"),
+        )
+    })?;
+    let supervisor_session = host_registry(&state)?
+        .plugin_runtime_session(&id)?
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "provider_not_ready",
+                "Provider runtime session is unavailable".into(),
+            )
+        })?;
+    let public_url = std::env::var("MEGLE_PUBLIC_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let host_flow_id = if public_url.is_some() {
+        Some(
+            state
+                .plugin_auth_flows
+                .create(crate::plugins::auth_flow::AuthFlowBinding {
+                    plugin_id: id.clone(),
+                    account_uuid,
+                    supervisor_session: supervisor_session.clone(),
+                    provider_flow_id: None,
+                })
+                .map_err(|error| {
+                    CoreError::coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "oauth_flow_capacity",
+                        error.to_string(),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let callback_url = match (public_url, host_flow_id.as_deref()) {
+        (Some(value), Some(flow_id)) => Some(
+            crate::plugins::auth_flow::PublicUrl::parse(&value, cfg!(debug_assertions))?
+                .callback_url(flow_id)?
+                .to_string(),
+        ),
+        _ => None,
+    };
+    let auth = plugin_provider(&state, &id)?
+        .auth_begin(callback_url)
+        .await
+        .map_err(map_provider_error)?;
+    if !host_registry(&state)?.update_plugin_account_auth_for_session(
+        &id,
+        &supervisor_session,
+        "authorizing",
+        None,
+    )? {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "oauth_session_changed",
+            "Provider runtime restarted during authorization".into(),
+        ));
+    }
+    let response_flow_id = if let Some(flow_id) = host_flow_id {
+        state
+            .plugin_auth_flows
+            .attach_provider_flow(&flow_id, auth.flow_id)?;
+        flow_id
+    } else {
+        auth.flow_id
+    };
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+        + 10 * 60 * 1000;
+    Ok((
+        StatusCode::CREATED,
+        Json(PluginAuthBeginResponse {
+            authorization_url: auth.authorization_url,
+            flow_id: response_flow_id,
+            expires_at,
+        }),
+    ))
+}
+
+async fn complete_plugin_auth_callback(
+    State(state): State<AppState>,
+    Path(flow_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> ApiResult<Html<&'static str>> {
+    let entries = crate::plugins::auth_flow::parse_callback_fields(raw_query.as_deref()).map_err(
+        |error| {
+            CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid_oauth_callback",
+                error.to_string(),
+            )
+        },
+    )?;
+    let binding = state
+        .plugin_auth_flows
+        .consume_bound(&flow_id, &entries)
+        .map_err(|error| {
+            CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid_oauth_callback",
+                error.to_string(),
+            )
+        })?;
+    let provider_flow_id = binding.provider_flow_id.ok_or_else(|| {
+        CoreError::coded(
+            StatusCode::CONFLICT,
+            "oauth_flow_invalid",
+            "OAuth provider flow is unavailable".into(),
+        )
+    })?;
+    let current_session = host_registry(&state)?
+        .plugin_runtime_session(&binding.plugin_id)?
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "provider_not_ready",
+                "Provider runtime session is unavailable".into(),
+            )
+        })?;
+    if current_session != binding.supervisor_session {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "oauth_session_changed",
+            "Provider runtime restarted during authorization".into(),
+        ));
+    }
+    let auth = plugin_provider(&state, &binding.plugin_id)?
+        .auth_complete(&provider_flow_id, entries.into_iter().collect())
+        .await
+        .map_err(map_provider_error)?;
+    if !host_registry(&state)?.update_plugin_account_auth_for_session(
+        &binding.plugin_id,
+        &binding.supervisor_session,
+        if auth.authenticated {
+            "authenticated"
+        } else {
+            "authorization-required"
+        },
+        auth.account_display_name.as_deref(),
+    )? {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "oauth_session_changed",
+            "Provider runtime restarted during authorization".into(),
+        ));
+    }
+    Ok(Html(
+        "<!doctype html><meta charset=utf-8><title>Megle</title>Authorization completed. You may close this window.",
+    ))
+}
+async fn complete_plugin_auth(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PluginAuthCompleteRequest>,
+) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let auth_fields = body.result.into_iter().collect::<Vec<_>>();
+    crate::plugins::auth_flow::validate_callback_fields(&auth_fields).map_err(|error| {
+        CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid_oauth_result",
+            error.to_string(),
+        )
+    })?;
+    let supervisor_session = host_registry(&state)?
+        .plugin_runtime_session(&id)?
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "provider_not_ready",
+                "Provider runtime session is unavailable".into(),
+            )
+        })?;
+    let auth = plugin_provider(&state, &id)?
+        .auth_complete(&body.flow_id, auth_fields.into_iter().collect())
+        .await
+        .map_err(map_provider_error)?;
+    if !host_registry(&state)?.update_plugin_account_auth_for_session(
+        &id,
+        &supervisor_session,
+        if auth.authenticated {
+            "authenticated"
+        } else {
+            "authorization-required"
+        },
+        auth.account_display_name.as_deref(),
+    )? {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "oauth_session_changed",
+            "Provider runtime restarted during authorization".into(),
+        ));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PluginCommandResponse { accepted: true }),
+    ))
+}
+async fn sign_out_plugin(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let registry = Arc::clone(host_registry(&state)?);
+    let account = registry
+        .plugin_account_secret(&id)?
+        .ok_or_else(|| not_found_plugin(&id))?;
+    let fences = registry.pause_plugin_bindings(&id)?;
+    library_manager(&state)?
+        .fence_plugin_bindings(&id, fences)
+        .await?;
+    plugin_provider(&state, &id)?
+        .auth_sign_out()
+        .await
+        .map_err(map_provider_error)?;
+    if let (Some(store), Some(secret_ref)) = (&state.secret_store, account.secret_ref.as_deref()) {
+        let plugin = registry
+            .host_plugin(&id)?
+            .ok_or_else(|| not_found_plugin(&id))?;
+        let namespace = plugin
+            .granted_permissions
+            .as_array()
+            .and_then(|permissions| {
+                permissions.iter().find_map(|permission| {
+                    (permission.get("kind").and_then(serde_json::Value::as_str) == Some("secret"))
+                        .then(|| {
+                            permission
+                                .get("namespace")
+                                .and_then(serde_json::Value::as_str)
+                        })
+                        .flatten()
+                })
+            })
+            .ok_or_else(|| {
+                CoreError::coded(
+                    StatusCode::CONFLICT,
+                    "secret_permission_missing",
+                    "No granted secret namespace is available for sign-out".into(),
+                )
+            })?;
+        let scope = crate::plugins::secret_store::SecretScope {
+            plugin_id: id.clone(),
+            account_uuid: account.account_uuid,
+            namespace: namespace.to_owned(),
+            purpose: "oauth".into(),
+        };
+        match store.delete(&scope, secret_ref) {
+            Ok(()) | Err(crate::plugins::secret_store::SecretStoreError::NotFound) => {}
+            Err(error) => {
+                return Err(CoreError::from(anyhow::anyhow!(
+                    "secret deletion failed after bindings paused: {error}"
+                )))
+            }
+        }
+    }
+    if !registry.sign_out_plugin_account(&id, account.generation)? {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "plugin_account_changed",
+            "Provider account changed during sign-out".into(),
+        ));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PluginCommandResponse { accepted: true }),
+    ))
+}
+async fn plugin_health(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<PluginHealthResponse>> {
+    if let Ok(provider) = plugin_provider(&state, &id) {
+        let health = provider.health().await.map_err(map_provider_error)?;
+        return Ok(Json(PluginHealthResponse {
+            state: if health.ready { "ready" } else { "degraded" }.to_string(),
+            last_healthy_at: None,
+            last_error_code: health.detail,
+        }));
+    }
+    let p = host_registry(&state)?
+        .host_plugin(&id)?
+        .ok_or_else(|| not_found_plugin(&id))?;
+    Ok(Json(PluginHealthResponse {
+        state: p.runtime_state,
+        last_healthy_at: p.last_healthy_at,
+        last_error_code: p.last_error_code,
+    }))
+}
+async fn plugin_diagnostics(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<PluginDiagnosticsResponse>> {
+    if let Ok(provider) = plugin_provider(&state, &id) {
+        let entry = provider.diagnostics().await.map_err(map_provider_error)?;
+        return Ok(Json(PluginDiagnosticsResponse {
+            generated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            entries: vec![entry],
+        }));
+    }
+    let p = host_registry(&state)?
+        .host_plugin(&id)?
+        .ok_or_else(|| not_found_plugin(&id))?;
+    let entry = serde_json::json!({"runtimeState":p.runtime_state,"lastErrorCode":p.last_error_code,"lastErrorDetail":p.last_error_detail});
+    Ok(Json(PluginDiagnosticsResponse {
+        generated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        entries: vec![entry],
+    }))
 }
 
 fn not_found_plugin(plugin_id: &str) -> CoreError {
@@ -8407,8 +8965,11 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_routes_basic_lifecycle() {
-        let database = test_database();
-        let state = AppState::new(database);
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
+            .await
+            .unwrap();
         let app = router(state);
 
         // GET /api/plugins -> empty list (no rows persisted).
@@ -8442,6 +9003,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = response_json(response).await;
         assert_eq!(body["code"], "plugin_not_found");
+        let _ = std::fs::remove_dir_all(base);
 
         // DELETE /api/plugins/{id} -> 404 with code plugin_not_found.
         let response = app
@@ -8458,6 +9020,121 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = response_json(response).await;
         assert_eq!(body["code"], "plugin_not_found");
+    }
+
+    #[tokio::test]
+    async fn plugin_provider_routes_delegate_to_registered_runtime() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
+            .await
+            .unwrap();
+        let manager = state.library_manager.clone().unwrap();
+        manager
+            .host_registry()
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.megle.fake",
+                version: "1.0.0",
+                manifest_json: "{}",
+                entry_relative_path: "fake-provider",
+                entry_sha256: &[0; 32],
+                install_root: &base,
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        manager
+            .host_registry()
+            .upsert_plugin_account(
+                "fake-account",
+                "com.megle.fake",
+                Some("Fake account"),
+                "authenticated",
+            )
+            .unwrap();
+        manager
+            .host_registry()
+            .set_plugin_intent("com.megle.fake", true, true)
+            .unwrap();
+        manager
+            .host_registry()
+            .record_plugin_runtime_ready(
+                "com.megle.fake",
+                "test-session",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+        manager
+            .provider_manager()
+            .register(
+                "com.megle.fake",
+                "fake-account",
+                std::sync::Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
+            )
+            .unwrap();
+        let app = router(state);
+
+        let begin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/plugins/com.megle.fake/auth/begin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(begin.status(), StatusCode::CREATED);
+        let flow_id = response_json(begin).await["flowId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let complete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/plugins/com.megle.fake/auth/complete")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        "{{\"flowId\":\"{flow_id}\",\"result\":{{\"code\":\"ok\"}}}}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete.status(), StatusCode::ACCEPTED);
+
+        for endpoint in ["health", "diagnostics"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/plugins/com.megle.fake/{endpoint}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let sign_out = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/plugins/com.megle.fake/auth/sign-out")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sign_out.status(), StatusCode::ACCEPTED);
+        manager.provider_manager().shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -8516,12 +9193,10 @@ mod tests {
         // plugins folder does not exist on disk. We exercise the discovery
         // function directly to avoid mutating process-wide environment
         // variables, which would race with tests that share the runtime.
-        let database = test_database();
         let plugins_dir = unique_temp_dir();
-        let report =
-            crate::plugins::discover_and_persist(&database, &plugins_dir).expect("discover");
-        assert_eq!(report.discovered, 0);
-        assert!(report.errors.is_empty());
+        let (records, errors) = crate::plugins::discover(&plugins_dir);
+        assert!(records.is_empty());
+        assert!(errors.is_empty());
     }
 
     #[tokio::test]

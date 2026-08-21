@@ -486,26 +486,51 @@ export interface ListFileOperationsParams {
   cursor?: string;
 }
 
-export type PluginCapability = "decoder" | "metadata" | "action" | "import-provider";
-export type PluginStatus = "registered" | "invalid" | "enabled" | "disabled";
+export type PluginCapability = "sync-provider.v1";
+export type PluginRuntimeState =
+  | "disabled"
+  | "permission-required"
+  | "starting"
+  | "ready"
+  | "degraded"
+  | "crashed-backoff"
+  | "incompatible"
+  | "configuration-required";
+export type PluginAuthState =
+  | "signed-out"
+  | "authorization-required"
+  | "authorizing"
+  | "authenticated"
+  | "expired"
+  | "error";
+export type PluginPermission =
+  | { kind: "network"; schemes: "https"[]; hosts: string[] }
+  | { kind: "oauth-loopback"; mode: "ephemeral-only" }
+  | { kind: "secret"; namespace: string; operations: ("read" | "write" | "delete")[] }
+  | { kind: "temp-storage"; maxBytes: number };
 
-export interface PluginRecord {
-  id: string;
-  name: string;
-  version: string;
-  description: string | null;
-  enabled: boolean;
-  status: PluginStatus;
+export interface HostPluginProjection {
+  pluginId: string;
+  selectedVersion: string;
+  knownGoodVersion: string | null;
+  enabledIntent: boolean;
+  runtimeState: PluginRuntimeState;
+  authState: "signed-out" | "authorization-required" | "authorizing" | "authenticated" | "expired" | "error" | null;
   capabilities: PluginCapability[];
-  permissions: string[];
-  manifestPath: string;
-  installedAt: number;
-  updatedAt: number;
-  lastError: string | null;
+  requestedPermissions: PluginPermission[];
+  grantedPermissions: PluginPermission[];
+  permissionRequired: boolean;
+  accountUuid: string | null;
+  accountDisplayName: string | null;
+  compatibilityReason: string | null;
+  backoffUntil: number | null;
+  lastHealthyAt: number | null;
+  lastErrorCode: string | null;
+  lastErrorDetail: string | null;
 }
 
-export interface PluginListResponse {
-  items: PluginRecord[];
+export interface HostPluginListResponse {
+  items: HostPluginProjection[];
 }
 
 export interface PluginDiscoveryError {
@@ -518,6 +543,30 @@ export interface PluginDiscoveryResponse {
   errors: PluginDiscoveryError[];
 }
 
-export interface DeletePluginResponse {
-  deleted: boolean;
+export interface PluginCommandResponse {
+  accepted: boolean;
+}
+export interface PluginGrantRequest {
+  permissions: PluginPermission[];
+}
+export interface PluginVersionRequest {
+  version: string;
+}
+export interface PluginAuthBeginResponse {
+  authorizationUrl: string;
+  flowId: string;
+  expiresAt: number;
+}
+export interface PluginAuthCompleteRequest {
+  flowId: string;
+  result: Record<string, string>;
+}
+export interface PluginHealthResponse {
+  state: PluginRuntimeState;
+  lastHealthyAt: number | null;
+  lastErrorCode: string | null;
+}
+export interface PluginDiagnosticsResponse {
+  generatedAt: number;
+  entries: Record<string, unknown>[];
 }

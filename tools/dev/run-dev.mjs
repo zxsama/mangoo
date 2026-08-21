@@ -118,6 +118,7 @@ process.on("SIGTERM", () => {
 process.on("exit", shutdown);
 
 if (process.env.MEGLE_CORE_EXTERNAL !== "1") {
+  run("node", ["tools/build/build-bundled-plugins.mjs"]);
   run(findCargoCommand(), ["build", "-p", "megle-core"]);
 }
 

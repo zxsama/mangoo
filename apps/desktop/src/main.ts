@@ -1997,7 +1997,16 @@ function resolvePluginsDir(): string {
   if (fromEnv && fromEnv.length > 0) {
     return fromEnv;
   }
-  return path.join(userDataDir(), "plugins");
+  const profile = process.env.MEGLE_CORE_PROFILE === "release" ? "release" : "debug";
+  return path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "..",
+    "target",
+    profile,
+    "bundled-plugins"
+  );
 }
 
 app
