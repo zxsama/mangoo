@@ -269,7 +269,11 @@ impl SyncProvider for FramedSyncProvider {
     ) -> ProviderFuture<'a, Option<ObjectMetadata>> {
         Box::pin(async move {
             let v = self
-                .transport_rpc(context, "object.head", json!({"key":key}))
+                .transport_rpc(
+                    context,
+                    "object.head",
+                    json!({"namespace":context.namespace,"key":key}),
+                )
                 .await?;
             if v.is_null() {
                 Ok(None)
@@ -289,7 +293,7 @@ impl SyncProvider for FramedSyncProvider {
                 .transport_rpc(
                     context,
                     "object.get",
-                    json!({"key":key,"maxBytes":max_bytes}),
+                    json!({"namespace":context.namespace,"key":key,"maxBytes":max_bytes}),
                 )
                 .await?;
             let meta = metadata(
@@ -334,7 +338,7 @@ impl SyncProvider for FramedSyncProvider {
                 .transport_rpc(
                     context,
                     "object.get_range",
-                    json!({"key":key,"start":start,"end":end,"maxBytes":max_bytes}),
+                    json!({"namespace":context.namespace,"key":key,"start":start,"end":end,"maxBytes":max_bytes}),
                 )
                 .await?;
             let meta = metadata(
@@ -402,7 +406,7 @@ impl SyncProvider for FramedSyncProvider {
                 .session
                 .call_with_bytes(
                     "object.put_immutable",
-                    json!({"key":key,"sha256":hex(&sha256)}),
+                    json!({"namespace":context.namespace,"key":key,"sha256":hex(&sha256)}),
                     bytes,
                     self.timeout,
                     Some(context.binding_epoch.clone()),
@@ -424,7 +428,7 @@ impl SyncProvider for FramedSyncProvider {
                 .transport_rpc(
                     context,
                     "upload.begin",
-                    json!({"key":key,"size":size,"sha256":hex(&sha256)}),
+                    json!({"namespace":context.namespace,"key":key,"size":size,"sha256":hex(&sha256)}),
                 )
                 .await?;
             Ok(UploadSession {
@@ -448,7 +452,7 @@ impl SyncProvider for FramedSyncProvider {
                 .session
                 .call_with_bytes(
                     "upload.write",
-                    json!({"uploadId":id,"offset":offset}),
+                    json!({"namespace":context.namespace,"uploadId":id,"offset":offset}),
                     bytes,
                     self.timeout,
                     Some(context.binding_epoch.clone()),
@@ -468,7 +472,11 @@ impl SyncProvider for FramedSyncProvider {
     ) -> ProviderFuture<'a, PutImmutableResult> {
         Box::pin(async move {
             put(self
-                .transport_rpc(context, "upload.commit", json!({"uploadId":id}))
+                .transport_rpc(
+                    context,
+                    "upload.commit",
+                    json!({"namespace":context.namespace,"uploadId":id}),
+                )
                 .await?)
         })
     }
@@ -478,8 +486,12 @@ impl SyncProvider for FramedSyncProvider {
         id: &'a str,
     ) -> ProviderFuture<'a, ()> {
         Box::pin(async move {
-            self.transport_rpc(context, "upload.abort", json!({"uploadId":id}))
-                .await?;
+            self.transport_rpc(
+                context,
+                "upload.abort",
+                json!({"namespace":context.namespace,"uploadId":id}),
+            )
+            .await?;
             Ok(())
         })
     }
@@ -509,5 +521,51 @@ fn auth_status(v: Value) -> ProviderResult<AuthStatus> {
             .get("accountDisplayName")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        stable_account_identity: v.get("stableAccountIdentity").map(canonical_json),
+        account_kind: v
+            .get("accountKind")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
+}
+
+fn canonical_json(value: &Value) -> String {
+    fn normalize(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), normalize(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(values) => Value::Array(values.iter().map(normalize).collect()),
+            _ => value.clone(),
+        }
+    }
+
+    normalize(value).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_account_identity_is_canonical_across_object_key_order() {
+        let left = auth_status(json!({
+            "authenticated": true,
+            "stableAccountIdentity": {"driveId":"drive","accountKind":"business","objectHint":"object"}
+        }))
+        .unwrap();
+        let right = auth_status(json!({
+            "authenticated": true,
+            "stableAccountIdentity": {"objectHint":"object","accountKind":"business","driveId":"drive"}
+        }))
+        .unwrap();
+        assert_eq!(left.stable_account_identity, right.stable_account_identity);
+    }
 }

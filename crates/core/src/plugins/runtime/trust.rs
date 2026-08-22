@@ -20,24 +20,36 @@ pub struct TrustEntry {
 pub fn embedded_trust_registry() -> &'static [TrustEntry] {
     static REGISTRY: std::sync::OnceLock<Vec<TrustEntry>> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let hash = super::generated_trust::GENERATED_FAKE_PROVIDER_SHA256;
-        if hash == [0; 32] {
-            return Vec::new();
-        }
-        vec![
+        let fake_hash = super::generated_trust::GENERATED_FAKE_PROVIDER_SHA256;
+        let onedrive_hash = super::generated_trust::GENERATED_ONEDRIVE_PROVIDER_SHA256;
+        let mut entries = vec![
             TrustEntry {
                 plugin_id: "com.megle.fake-sync".into(),
                 version: "1.0.0".into(),
                 platform: Platform::WindowsX64,
-                binary_sha256: hash,
+                binary_sha256: fake_hash,
             },
             TrustEntry {
                 plugin_id: "com.megle.fake-sync".into(),
                 version: "1.0.0".into(),
                 platform: Platform::LinuxX64,
-                binary_sha256: hash,
+                binary_sha256: fake_hash,
             },
-        ]
+            TrustEntry {
+                plugin_id: "com.megle.onedrive".into(),
+                version: "1.0.0".into(),
+                platform: Platform::WindowsX64,
+                binary_sha256: onedrive_hash,
+            },
+            TrustEntry {
+                plugin_id: "com.megle.onedrive".into(),
+                version: "1.0.0".into(),
+                platform: Platform::LinuxX64,
+                binary_sha256: onedrive_hash,
+            },
+        ];
+        entries.retain(|entry| entry.binary_sha256 != [0; 32]);
+        entries
     })
 }
 

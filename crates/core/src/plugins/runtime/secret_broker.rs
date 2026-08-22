@@ -83,9 +83,12 @@ impl SecretBroker {
 impl ReverseRpcHandler for SecretBroker {
     fn handle(&self, method: &str, payload: &Value) -> Result<Value, String> {
         let operation = match method {
-            "host.secret.get" => "read",
-            "host.secret.create" | "host.secret.cas" => "write",
-            "host.secret.delete" => "delete",
+            "host.secret.current" | "host.secret.get" => "read",
+            "host.secret.create"
+            | "host.secret.cas"
+            | "host.secret.create_scoped"
+            | "host.secret.cas_scoped" => "write",
+            "host.secret.delete" | "host.secret.delete_scoped" => "delete",
             _ => return Err("reverse RPC method is not allowed".into()),
         };
         let scope = self.scope(payload, operation)?;
@@ -100,6 +103,17 @@ impl ReverseRpcHandler for SecretBroker {
                 .map_err(|_| "invalid base64 value".into())
         };
         match method {
+            "host.secret.current" => {
+                let account = self
+                    .registry
+                    .plugin_account_secret(&self.plugin_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("plugin account is not registered")?;
+                if account.account_uuid != self.account_uuid {
+                    return Err("plugin account does not match runtime".into());
+                }
+                Ok(json!({"secretRef":account.secret_ref,"accountGeneration":account.generation}))
+            }
             "host.secret.create" => {
                 let reference = self
                     .store
@@ -118,6 +132,13 @@ impl ReverseRpcHandler for SecretBroker {
                     let _ = self.store.delete(&scope, &reference);
                     return Err("plugin runtime session is stale".into());
                 }
+                Ok(json!({"secretRef":reference,"generation":1}))
+            }
+            "host.secret.create_scoped" => {
+                let reference = self
+                    .store
+                    .create(&scope, &decode("value")?)
+                    .map_err(|e| e.to_string())?;
                 Ok(json!({"secretRef":reference,"generation":1}))
             }
             "host.secret.get" => {
@@ -165,6 +186,24 @@ impl ReverseRpcHandler for SecretBroker {
                 }
                 Ok(json!({"generation":next}))
             }
+            "host.secret.cas_scoped" => {
+                let next = self
+                    .store
+                    .compare_and_swap(
+                        &scope,
+                        payload
+                            .get("secretRef")
+                            .and_then(Value::as_str)
+                            .ok_or("missing secretRef")?,
+                        payload
+                            .get("expectedGeneration")
+                            .and_then(Value::as_u64)
+                            .ok_or("missing generation")?,
+                        &decode("value")?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"generation":next}))
+            }
             "host.secret.delete" => {
                 let generation = self
                     .registry
@@ -190,6 +229,18 @@ impl ReverseRpcHandler for SecretBroker {
                 {
                     return Err("plugin runtime session is stale".into());
                 }
+                Ok(Value::Null)
+            }
+            "host.secret.delete_scoped" => {
+                self.store
+                    .delete(
+                        &scope,
+                        payload
+                            .get("secretRef")
+                            .and_then(Value::as_str)
+                            .ok_or("missing secretRef")?,
+                    )
+                    .map_err(|e| e.to_string())?;
                 Ok(Value::Null)
             }
             _ => Err("reverse RPC method is not allowed".into()),

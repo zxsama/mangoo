@@ -18,6 +18,8 @@ services:
       MEGLE_SESSION_TOKEN: ${MEGLE_SESSION_TOKEN:-}
       RUST_LOG: ${RUST_LOG:-info}
       MEGLE_PUBLIC_URL: ${MEGLE_PUBLIC_URL:-}
+      MEGLE_ONEDRIVE_CLIENT_ID: ${MEGLE_ONEDRIVE_CLIENT_ID:-}
+      MEGLE_ONEDRIVE_AUTHORITY: ${MEGLE_ONEDRIVE_AUTHORITY:-https://login.microsoftonline.com/common/}
     volumes:
       - megle-data:/data
       - ${MEGLE_LIBRARY_PATH:-./library}:/library:ro

@@ -61,6 +61,8 @@ pub struct AuthBegin {
 pub struct AuthStatus {
     pub authenticated: bool,
     pub account_display_name: Option<String>,
+    pub stable_account_identity: Option<String>,
+    pub account_kind: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeltaScope {
@@ -86,6 +88,7 @@ pub struct DeltaPage {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportContext {
+    pub namespace: String,
     pub binding_epoch: String,
     pub transport_generation: u64,
 }
@@ -532,6 +535,8 @@ impl SyncProvider for InMemorySyncProvider {
             Ok(AuthStatus {
                 authenticated: true,
                 account_display_name: Some("Fake account".into()),
+                stable_account_identity: None,
+                account_kind: None,
             })
         })
     }
@@ -543,6 +548,8 @@ impl SyncProvider for InMemorySyncProvider {
                     .lock()
                     .map_err(|e| error(ProviderErrorCode::Internal, true, e.to_string()))?,
                 account_display_name: Some("Fake account".into()),
+                stable_account_identity: None,
+                account_kind: None,
             })
         })
     }
@@ -781,6 +788,7 @@ mod tests {
         let bytes = b"immutable";
         let hash = Sha256::digest(bytes).into();
         let context = TransportContext {
+            namespace: uuid::Uuid::now_v7().to_string(),
             binding_epoch: uuid::Uuid::now_v7().to_string(),
             transport_generation: 1,
         };
@@ -843,6 +851,7 @@ mod tests {
     async fn expired_partial_upload_restarts_without_committing_truncated_bytes() {
         let provider = InMemorySyncProvider::default();
         let context = TransportContext {
+            namespace: uuid::Uuid::now_v7().to_string(),
             binding_epoch: uuid::Uuid::now_v7().to_string(),
             transport_generation: 1,
         };
@@ -915,6 +924,7 @@ mod tests {
                 let bytes = format!("library-{index}").into_bytes();
                 let hash = Sha256::digest(&bytes).into();
                 let context = TransportContext {
+                    namespace: uuid::Uuid::now_v7().to_string(),
                     binding_epoch: uuid::Uuid::now_v7().to_string(),
                     transport_generation: 1,
                 };

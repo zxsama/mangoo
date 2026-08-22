@@ -121,6 +121,8 @@ you remove the `:ro` flag.
 | `MEGLE_SECRETS_DIR` | Encrypted Provider credential records. | `/data/secrets` |
 | `MEGLE_SECRET_KEY_FILE` | Read-only 32-byte master-key file. | `/run/secrets/megle_secret_key` |
 | `MEGLE_PUBLIC_URL` | Public HTTPS base used for Docker OAuth callbacks; no userinfo/query/fragment. | _(unset)_ |
+| `MEGLE_ONEDRIVE_CLIENT_ID` | Microsoft Entra public-client application ID for the bundled OneDrive Provider. It is configuration, not a secret. | _(unset; Provider reports configuration-required)_ |
+| `MEGLE_ONEDRIVE_AUTHORITY` | Optional Microsoft identity authority override. | `https://login.microsoftonline.com/common/` |
 | `MEGLE_SERVE_WEB` | Serve the bundled UI when `1`. | `1` |
 | `MEGLE_WEB_DIR` | Directory containing `index.html` + `assets/`. | `/opt/megle/web` |
 | `MEGLE_BASIC_AUTH` | Browser/API Basic auth. Compose uses a development credential that must be overridden for production. | `megle:change-me` (Compose) |
@@ -159,11 +161,16 @@ The named `megle-data` volume is preserved across rebuilds.
   cannot currently send `X-Megle-Session` from the browser. Tracking work
   for cookie-based session-token wiring is in the master plan.
 - **No HTTPS in the image.** Terminate TLS in a reverse proxy.
+- **OneDrive OAuth requires an exact public callback.** Set `MEGLE_PUBLIC_URL`
+  to the external HTTPS origin registered for the public client, and set
+  `MEGLE_ONEDRIVE_CLIENT_ID`; tokens remain in the mounted encrypted Secret
+  Store, never in Compose environment values.
 - **Single user.** All requests share one library, one set of tags, and one
   task queue.
 - **Windows-only file ops still apply.** Linux containers can mount Windows
-  shares, but advanced file operations (recycle bin, OneDrive integration)
-  rely on Windows APIs and are no-ops on Linux.
+  shares, but advanced recycle-bin operations remain Windows-specific. The
+  OneDrive sync Provider itself is bundled for Linux and runs as a supervised
+  process from read-only `/opt/megle/plugins`.
 
 ## Running without compose
 

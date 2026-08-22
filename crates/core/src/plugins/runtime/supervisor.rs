@@ -456,7 +456,7 @@ pub async fn activate_and_register(
         &executable,
         &LaunchSpec {
             runtime_dir,
-            safe_env: Default::default(),
+            safe_env: provider_safe_env(&manifest.id),
         },
     )?;
     let (stdin, stdout, stderr) = child.take_stdio()?;
@@ -531,9 +531,23 @@ pub async fn activate_and_register(
         stderr_task: tokio::sync::Mutex::new(Some(stderr_task)),
     })
 }
+
+fn provider_safe_env(plugin_id: &str) -> std::collections::HashMap<String, String> {
+    if plugin_id != "com.megle.onedrive" {
+        return Default::default();
+    }
+    let mut keys = vec!["MEGLE_ONEDRIVE_CLIENT_ID", "MEGLE_ONEDRIVE_AUTHORITY"];
+    if cfg!(debug_assertions) {
+        keys.push("MEGLE_ONEDRIVE_EMULATOR_URL");
+    }
+    keys.into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+        .collect()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[test]
     fn breaker_and_manual_retry_are_deterministic() {

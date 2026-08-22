@@ -11,13 +11,17 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release -p megle-fake-provider \
+RUN cargo test --release -p megle-fake-provider --test process_conformance \
+    && cargo test --release -p megle-onedrive-provider --features graph-emulator \
+    && cargo build --release -p megle-fake-provider -p megle-onedrive-provider \
     && strip target/release/megle-fake-provider \
-    && HASH=$(sha256sum target/release/megle-fake-provider | cut -d' ' -f1) \
-    && BYTES=$(echo "$HASH" | sed 's/../0x&,/g') \
-    && printf '// Generated during Docker build.\npub const GENERATED_FAKE_PROVIDER_SHA256: [u8; 32] = [%s];\n' "$BYTES" > crates/core/src/plugins/runtime/generated_trust.rs \
+    && strip target/release/megle-onedrive-provider \
+    && FAKE_HASH=$(sha256sum target/release/megle-fake-provider | cut -d' ' -f1) \
+    && ONEDRIVE_HASH=$(sha256sum target/release/megle-onedrive-provider | cut -d' ' -f1) \
+    && FAKE_BYTES=$(echo "$FAKE_HASH" | sed 's/../0x&,/g') \
+    && ONEDRIVE_BYTES=$(echo "$ONEDRIVE_HASH" | sed 's/../0x&,/g') \
+    && printf '// Generated during Docker build.\npub const GENERATED_FAKE_PROVIDER_SHA256: [u8; 32] = [%s];\npub const GENERATED_ONEDRIVE_PROVIDER_SHA256: [u8; 32] = [%s];\n' "$FAKE_BYTES" "$ONEDRIVE_BYTES" > crates/core/src/plugins/runtime/generated_trust.rs \
     && cargo build --release -p megle-core \
-    && cargo test --release -p megle-fake-provider --test process_conformance \
     && cargo test --release -p megle-core --test plugin_runtime_process \
     && strip target/release/megle-core
 
@@ -55,12 +59,17 @@ RUN groupadd --system --gid 10001 megle \
 COPY --from=core-builder /src/target/release/megle-core /usr/local/bin/megle-core
 COPY --from=core-builder /src/target/release/megle-fake-provider /opt/megle/plugins/com.megle.fake-sync/bin/megle-fake-provider
 COPY bundled-plugins/com.megle.fake-sync/plugin.template.json /opt/megle/plugins/com.megle.fake-sync/plugin.template.json
+COPY --from=core-builder /src/target/release/megle-onedrive-provider /opt/megle/plugins/com.megle.onedrive/bin/megle-onedrive-provider
+COPY bundled-plugins/com.megle.onedrive/plugin.template.json /opt/megle/plugins/com.megle.onedrive/plugin.template.json
 COPY --from=web-builder  /web/apps/web/dist             /opt/megle/web
 
 RUN sha256sum /opt/megle/plugins/com.megle.fake-sync/bin/megle-fake-provider | cut -d' ' -f1 > /tmp/provider.sha \
     && sed "s/__SHA256__/$(cat /tmp/provider.sha)/g" /opt/megle/plugins/com.megle.fake-sync/plugin.template.json > /opt/megle/plugins/com.megle.fake-sync/plugin.json \
-    && rm /tmp/provider.sha /opt/megle/plugins/com.megle.fake-sync/plugin.template.json \
-    && chown -R root:root /opt/megle/plugins && chmod -R a-w /opt/megle/plugins && chmod 0555 /opt/megle/plugins/com.megle.fake-sync/bin/megle-fake-provider
+    && sha256sum /opt/megle/plugins/com.megle.onedrive/bin/megle-onedrive-provider | cut -d' ' -f1 > /tmp/onedrive.sha \
+    && sed "s/__SHA256__/$(cat /tmp/onedrive.sha)/g" /opt/megle/plugins/com.megle.onedrive/plugin.template.json > /opt/megle/plugins/com.megle.onedrive/plugin.json \
+    && rm /tmp/provider.sha /tmp/onedrive.sha /opt/megle/plugins/com.megle.fake-sync/plugin.template.json /opt/megle/plugins/com.megle.onedrive/plugin.template.json \
+    && chown -R root:root /opt/megle/plugins && chmod -R a-w /opt/megle/plugins \
+    && chmod 0555 /opt/megle/plugins/com.megle.fake-sync/bin/megle-fake-provider /opt/megle/plugins/com.megle.onedrive/bin/megle-onedrive-provider
 
 ENV MEGLE_HOST_DB_PATH=/data/host/host.sqlite \
     MEGLE_LIBRARIES_DIR=/data/host/libraries \

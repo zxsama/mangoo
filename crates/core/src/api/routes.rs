@@ -2926,6 +2926,23 @@ async fn complete_plugin_auth(
             "Provider runtime restarted during authorization".into(),
         ));
     }
+    if auth.authenticated {
+        let Some(fences) = host_registry(&state)?.update_plugin_account_identity_for_session(
+            &id,
+            &supervisor_session,
+            auth.stable_account_identity.as_deref(),
+        )?
+        else {
+            return Err(CoreError::coded(
+                StatusCode::CONFLICT,
+                "oauth_session_changed",
+                "Provider runtime restarted during authorization".into(),
+            ));
+        };
+        library_manager(&state)?
+            .fence_plugin_bindings(&id, fences)
+            .await?;
+    }
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),

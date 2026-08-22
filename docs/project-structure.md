@@ -1,5 +1,11 @@
 # Project Structure
 
+## Bundled OneDrive Provider
+
+- `crates/onedrive-provider/` owns OAuth PKCE, Microsoft Graph AppFolder/Delta/object transport, framed child RPC, and Secret Broker-backed credential/upload-session records.
+- `bundled-plugins/com.megle.onedrive/` is the signed manifest template packaged beside the platform binary.
+- `tools/bench/onedrive-provider-bench.mjs` runs the real-child emulator benchmark; production executables are only loaded from trusted bundled roots.
+
 Megle uses a contract-first monorepo so the desktop shell, reusable Web UI, Rust Core, database schema, plugin protocol, and tests do not drift apart.
 
 ## Top-Level Layout
@@ -62,7 +68,7 @@ tools/
 - Core API: `contracts/core-api/openapi.yaml`
 - Plugin manifest: `contracts/plugins/manifest.schema.json`
 - Per-Library catalog SQLite migrations: `crates/core/migrations/`
-- Host Registry SQLite migrations: `crates/core/host_migrations/`; `host.sqlite` owns Library UUIDs, managed-root bindings, active context revision, and creation/removal journals, while inactive local-only catalogs stay closed.
+- Host Registry SQLite migrations: `crates/core/host_migrations/`; `host.sqlite` owns Library UUIDs, managed-root bindings, active context revision, account-root Provider cursors and validated remote-Library discovery inventory, and creation/removal journals, while inactive local-only catalogs stay closed.
 - Phase-level implementation notes: `docs/implementation-roadmap.md`
 - Performance benchmark results: `docs/performance-results/`
 - Managed-Library lifecycle/load harness boundary: `tools/dev/managed-library-harness.mjs`; the reproducible AC15 baseline driver is `tools/bench/managed-library-lifecycle-bench.mjs`.

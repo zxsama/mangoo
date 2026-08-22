@@ -57,7 +57,10 @@ impl Default for FrameLimits {
             max_binary: 4 * 1024 * 1024,
             max_buffered: 8 * 1024 * 1024,
             stream_window: 8 * 1024 * 1024,
-            max_object: 64 * 1024 * 1024,
+            // Media data packs are bounded at 96 MiB. The RPC stream remains
+            // windowed at 8 MiB, so this raises the permitted object envelope
+            // without increasing the in-memory buffering budget.
+            max_object: 96 * 1024 * 1024,
         }
     }
 }

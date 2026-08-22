@@ -1,5 +1,9 @@
 # Testing Strategy
 
+## OneDrive Provider
+
+`cargo test -p megle-onedrive-provider` runs unit tests plus a real-child Graph emulator flow. `npm run check:onedrive-bundle` additionally hashes the packaged Windows executable and runs the same process conformance suite through that exact bundled path. `npm run bench:onedrive-provider` repeats the real-child flow in release mode. Live Microsoft Personal/Business checks are deliberately ignored unless an operator supplies credentials and invokes `npm run test:onedrive-live`; emulator success is never recorded as live-account evidence.
+
 Tests and code should move together. Phase 1 starts with fast checks that enforce the repository shape, API contract, and database schema before the full Rust/Electron build is available.
 
 ## Test Layers

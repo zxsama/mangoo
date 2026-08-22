@@ -2,7 +2,8 @@
 resolver = "2"
 members = [
   "crates/core",
-  "crates/fake-provider"
+  "crates/fake-provider",
+  "crates/onedrive-provider"
 ]
 
 [workspace.package]

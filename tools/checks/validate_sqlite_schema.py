@@ -9,6 +9,7 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0001_host_registry.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0002_sync_protocol_foundation.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0003_plugin_runtime.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0004_provider_root_discovery.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -470,6 +471,13 @@ def verify_host_plugin_upgrade_from_populated_v2() -> None:
             conn.executescript(HOST_MIGRATIONS[2].read_text(encoding="utf-8"))
         if conn.execute("SELECT COUNT(*) FROM libraries").fetchone()[0] != 1:
             fail("Host 0003 reopen gate was not idempotent")
+        conn.executescript(HOST_MIGRATIONS[3].read_text(encoding="utf-8"))
+        if conn.execute("SELECT schema_version FROM host_meta").fetchone()[0] != 4:
+            fail("Host 0004 did not advance schema version")
+        if not table_has_column(conn, "provider_account_root_cursors", "page_token"):
+            fail("Host 0004 did not add root page_token")
+        if conn.execute("SELECT COUNT(*) FROM libraries").fetchone()[0] != 1:
+            fail("Host 0004 removed a Library registration")
     finally:
         conn.close()
 
@@ -570,6 +578,7 @@ def main() -> None:
             "plugin_runtime_state",
             "plugin_accounts",
             "provider_account_root_cursors",
+            "provider_remote_libraries",
             "provider_binding_cursors",
             "provider_object_receipts",
             "plugin_activation_journal",
@@ -581,7 +590,7 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (3, None, 0):
+        if meta != (4, None, 0):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         binding_cursor_columns = {
             row[1]
@@ -591,6 +600,14 @@ def main() -> None:
         }
         if "page_token" not in binding_cursor_columns:
             fail("provider_binding_cursors.page_token is required for durable pagination")
+        root_cursor_columns = {
+            row[1]
+            for row in host_conn.execute(
+                "PRAGMA table_info(provider_account_root_cursors)"
+            )
+        }
+        if "page_token" not in root_cursor_columns:
+            fail("provider_account_root_cursors.page_token is required for durable root pagination")
         creation_columns = {
             row[1]
             for row in host_conn.execute(

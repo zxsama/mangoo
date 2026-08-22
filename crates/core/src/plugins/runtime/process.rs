@@ -27,6 +27,7 @@ impl ChildProcess {
         let mut cmd = Command::new(executable.path());
         cmd.current_dir(&spec.runtime_dir)
             .env_clear()
+            .envs(platform_runtime_env())
             .envs(&spec.safe_env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -92,6 +93,20 @@ impl ChildProcess {
                 Err(e)
             }
         })
+    }
+}
+
+fn platform_runtime_env() -> std::collections::HashMap<String, String> {
+    #[cfg(windows)]
+    {
+        ["SystemRoot", "WINDIR"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        Default::default()
     }
 }
 

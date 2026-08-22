@@ -649,12 +649,15 @@ const requiredDirs = [
   "contracts/core-api",
   "contracts/plugins",
   "bundled-plugins/com.megle.fake-sync",
+  "bundled-plugins/com.megle.onedrive",
   "crates/core/src",
   "crates/core/tests",
   "crates/core/migrations",
   "crates/core/host_migrations",
   "crates/fake-provider/src",
   "crates/fake-provider/tests",
+  "crates/onedrive-provider/src",
+  "crates/onedrive-provider/tests",
   "docs/performance-results/raw/2026-05-16",
   "packages/core-client",
   "packages/notification-contract",
@@ -702,10 +705,12 @@ const requiredFiles = [
   "contracts/plugins/fixtures/invalid-entry-traversal.json",
   "contracts/plugins/fixtures/invalid-permission-field.json",
   "bundled-plugins/com.megle.fake-sync/plugin.template.json",
+  "bundled-plugins/com.megle.onedrive/plugin.template.json",
   "crates/core/Cargo.toml",
   "crates/core/migrations/0001_initial.sql",
   "crates/core/host_migrations/0001_host_registry.sql",
   "crates/core/host_migrations/0003_plugin_runtime.sql",
+  "crates/core/host_migrations/0004_provider_root_discovery.sql",
   "crates/core/src/plugins/runtime/generated_trust.rs",
   "crates/core/migrations/0021_notification_outbox.sql",
   "crates/core/migrations/0028_remove_catalog_plugins.sql",
@@ -721,6 +726,9 @@ const requiredFiles = [
   "crates/fake-provider/Cargo.toml",
   "crates/fake-provider/src/main.rs",
   "crates/fake-provider/tests/process_conformance.rs",
+  "crates/onedrive-provider/Cargo.toml",
+  "crates/onedrive-provider/src/main.rs",
+  "crates/onedrive-provider/tests/process_conformance.rs",
   "docs/project-structure.md",
   "docs/performance-results/managed-library-lifecycle-2026-08-16.md",
   "docs/performance-results/plugin-runtime-sync-provider-2026-08-21.md",
@@ -780,6 +788,9 @@ if (!rootCargo.includes('"crates/core"')) {
 if (!rootCargo.includes('"crates/fake-provider"')) {
   fail("Cargo workspace must include the portable fake Provider conformance crate");
 }
+if (!rootCargo.includes('"crates/onedrive-provider"')) {
+  fail("Cargo workspace must include the bundled OneDrive Provider crate");
+}
 if (rootCargo.includes('"crates/indexer"') || rootCargo.includes('"crates/thumbnails"')) {
   fail("Phase 1 should not pre-split indexer/thumbnails into workspace crates");
 }
@@ -815,6 +826,7 @@ if (pluginManifest.additionalProperties !== false) {
 const dockerfile = readText("Dockerfile");
 for (const marker of [
   "cargo test --release -p megle-fake-provider --test process_conformance",
+  "cargo test --release -p megle-onedrive-provider",
   "cargo test --release -p megle-core --test plugin_runtime_process",
   "MEGLE_PLUGINS_DIR=/opt/megle/plugins"
 ]) {

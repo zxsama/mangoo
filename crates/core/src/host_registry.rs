@@ -8,6 +8,8 @@ const HOST_MIGRATION_0001: &str = include_str!("../host_migrations/0001_host_reg
 const HOST_MIGRATION_0002: &str =
     include_str!("../host_migrations/0002_sync_protocol_foundation.sql");
 const HOST_MIGRATION_0003: &str = include_str!("../host_migrations/0003_plugin_runtime.sql");
+const HOST_MIGRATION_0004: &str =
+    include_str!("../host_migrations/0004_provider_root_discovery.sql");
 
 #[derive(Debug, Clone)]
 pub struct LibraryDescriptor {
@@ -206,6 +208,15 @@ pub struct BindingFence {
     pub account_uuid: String,
     pub binding_epoch: uuid::Uuid,
     pub next_transport_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRootTransport {
+    pub plugin_id: String,
+    pub account_uuid: String,
+    pub account_generation: i64,
+    pub cursor: Option<String>,
+    pub page_token: Option<String>,
 }
 
 pub struct HostRegistry {
@@ -436,6 +447,18 @@ impl HostRegistry {
             return Ok(false);
         }
         transaction.execute(
+            "DELETE FROM provider_binding_cursors WHERE library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1)",
+            [plugin_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM provider_account_root_cursors WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
+            [plugin_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM provider_remote_libraries WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
+            [plugin_id],
+        )?;
+        transaction.execute(
             "UPDATE plugin_runtime_state SET state='starting',pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",
             params![unix_timestamp_millis(), plugin_id],
         )?;
@@ -461,13 +484,16 @@ impl HostRegistry {
         secret_store_available: bool,
     ) -> anyhow::Result<usize> {
         let now = unix_timestamp_millis();
+        let onedrive_configured = std::env::var("MEGLE_ONEDRIVE_CLIENT_ID")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let rows = {
             let mut statement = transaction.prepare(
                 "SELECT plugin_id,enabled_intent,requested_permissions_json,granted_permissions_json FROM plugin_installations",
             )?;
-            let rows = statement
+            let values = statement
                 .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -477,7 +503,7 @@ impl HostRegistry {
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            rows
+            values
         };
         let mut changed = 0;
         for (plugin_id, enabled, requested_json, granted_json) in rows {
@@ -500,6 +526,12 @@ impl HostRegistry {
                     "configuration-required",
                     Some("secret-store-unavailable"),
                     Some("MEGLE_SECRET_KEY_FILE is missing or invalid"),
+                )
+            } else if plugin_id == "com.megle.onedrive" && !onedrive_configured {
+                (
+                    "configuration-required",
+                    Some("onedrive-client-id-missing"),
+                    Some("MEGLE_ONEDRIVE_CLIENT_ID is required"),
                 )
             } else {
                 ("starting", None, None)
@@ -846,6 +878,54 @@ impl HostRegistry {
             params![auth_state,display_name,unix_timestamp_millis(),plugin_id,expected_session],
         )?;
         Ok(changed == 1)
+    }
+
+    pub fn update_plugin_account_identity_for_session(
+        &self,
+        plugin_id: &str,
+        expected_session: &str,
+        stable_identity: Option<&str>,
+    ) -> anyhow::Result<Option<Vec<BindingFence>>> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let current: Option<String> = transaction.query_row(
+            "SELECT stable_account_identity FROM plugin_accounts WHERE plugin_id=?1 AND EXISTS(SELECT 1 FROM plugin_runtime_state r WHERE r.plugin_id=plugin_accounts.plugin_id AND r.state='ready' AND r.session_id=?2)",
+            params![plugin_id, expected_session],
+            |row| row.get(0),
+        ).optional()?.flatten();
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_accounts WHERE plugin_id=?1 AND EXISTS(SELECT 1 FROM plugin_runtime_state r WHERE r.plugin_id=plugin_accounts.plugin_id AND r.state='ready' AND r.session_id=?2))",
+            params![plugin_id, expected_session],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let fences = if current.as_deref() != stable_identity && current.is_some() {
+            let fences = pause_plugin_bindings_in_transaction(&transaction, plugin_id)?;
+            transaction.execute(
+                "DELETE FROM provider_binding_cursors WHERE library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1)",
+                [plugin_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM provider_account_root_cursors WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
+                [plugin_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM provider_remote_libraries WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
+                [plugin_id],
+            )?;
+            fences
+        } else {
+            Vec::new()
+        };
+        transaction.execute(
+            "UPDATE plugin_accounts SET stable_account_identity=?1,updated_at=?2 WHERE plugin_id=?3",
+            params![stable_identity, now, plugin_id],
+        )?;
+        transaction.commit()?;
+        Ok(Some(fences))
     }
 
     pub fn retry_plugin_runtime(
@@ -1200,6 +1280,101 @@ impl HostRegistry {
         ).optional().map_err(Into::into)
     }
 
+    pub fn provider_root_transports(&self) -> anyhow::Result<Vec<ProviderRootTransport>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT a.plugin_id,a.account_uuid,a.generation,c.cursor,c.page_token FROM plugin_accounts a JOIN plugin_installations i ON i.plugin_id=a.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=a.plugin_id LEFT JOIN provider_account_root_cursors c ON c.account_uuid=a.account_uuid AND c.scope='root' WHERE i.enabled_intent=1 AND r.state='ready' AND a.auth_state='authenticated' AND EXISTS (SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1') ORDER BY a.plugin_id",
+        )?;
+        let transports = statement
+            .query_map([], |row| {
+                Ok(ProviderRootTransport {
+                    plugin_id: row.get(0)?,
+                    account_uuid: row.get(1)?,
+                    account_generation: row.get(2)?,
+                    cursor: row.get(3)?,
+                    page_token: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(transports)
+    }
+
+    pub fn commit_provider_root_page(
+        &self,
+        account_uuid: &str,
+        account_generation: i64,
+        cursor: Option<&str>,
+        page_token: &str,
+        libraries: &[super::sync::provider::ObjectMetadata],
+    ) -> anyhow::Result<()> {
+        self.commit_provider_root_progress(
+            account_uuid,
+            account_generation,
+            cursor,
+            Some(page_token),
+            libraries,
+        )
+    }
+
+    pub fn commit_provider_root_cursor(
+        &self,
+        account_uuid: &str,
+        account_generation: i64,
+        cursor: Option<&str>,
+        libraries: &[super::sync::provider::ObjectMetadata],
+    ) -> anyhow::Result<()> {
+        self.commit_provider_root_progress(
+            account_uuid,
+            account_generation,
+            cursor,
+            None,
+            libraries,
+        )
+    }
+
+    fn commit_provider_root_progress(
+        &self,
+        account_uuid: &str,
+        account_generation: i64,
+        cursor: Option<&str>,
+        page_token: Option<&str>,
+        libraries: &[super::sync::provider::ObjectMetadata],
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let current: Option<i64> = transaction
+            .query_row(
+                "SELECT generation FROM plugin_accounts WHERE account_uuid=?1",
+                [account_uuid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current != Some(account_generation) {
+            anyhow::bail!("stale-provider-account-generation");
+        }
+        for metadata in libraries {
+            let library_uuid = metadata
+                .key
+                .strip_suffix("/library-descriptor")
+                .ok_or_else(|| anyhow::anyhow!("invalid provider root descriptor key"))?;
+            let canonical = uuid::Uuid::parse_str(library_uuid)?;
+            if canonical.to_string() != library_uuid {
+                anyhow::bail!("non-canonical provider root Library UUID");
+            }
+            transaction.execute(
+                "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,descriptor_etag,account_generation,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(account_uuid,library_uuid) DO UPDATE SET descriptor_size=excluded.descriptor_size,descriptor_sha256=excluded.descriptor_sha256,descriptor_etag=excluded.descriptor_etag,account_generation=excluded.account_generation,updated_at=excluded.updated_at",
+                params![account_uuid,library_uuid,metadata.size as i64,metadata.sha256.as_slice(),metadata.etag,account_generation,now],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO provider_account_root_cursors(account_uuid,scope,cursor,page_token,generation,updated_at) VALUES (?1,'root',?2,?3,?4,?5) ON CONFLICT(account_uuid,scope) DO UPDATE SET cursor=excluded.cursor,page_token=excluded.page_token,generation=excluded.generation,updated_at=excluded.updated_at",
+            params![account_uuid,cursor,page_token,account_generation,now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn commit_binding_cursor(
         &self,
         library_uuid: &str,
@@ -1524,6 +1699,14 @@ impl HostRegistry {
         )?;
         if schema_version < 3 {
             connection.execute_batch(HOST_MIGRATION_0003)?;
+        }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 4 {
+            connection.execute_batch(HOST_MIGRATION_0004)?;
         }
         connection.execute(
             "INSERT OR IGNORE INTO host_sync_local_state(singleton,device_uuid,stream_uuid,next_actor_seq,hlc_wall_ms,hlc_logical,capture_enabled,updated_at) VALUES (1,?1,?2,1,0,0,0,?3)",
@@ -2675,6 +2858,202 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
         assert!(registry.library("library").unwrap().is_some());
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_account_identity_change_pauses_bindings_and_clears_cursors() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let now = unix_timestamp_millis();
+        register_test_plugin(&registry, "fake", "account");
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','root','Library','local','root','ready','local-only','available',1,'marker',?1,?1)",
+            [now],
+        ).unwrap();
+        let (binding, _) = registry
+            .begin_sync_binding("library", "fake", "account")
+            .unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO provider_binding_cursors(library_uuid,binding_epoch,remote_namespace,scope,cursor,page_token,transport_generation,updated_at) VALUES ('library',?1,'library','library','old',NULL,1,?2)",
+            params![binding.as_bytes().as_slice(), now],
+        ).unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO provider_account_root_cursors(account_uuid,scope,cursor,generation,updated_at) VALUES ('account','root','old',1,?1)",
+            [now],
+        ).unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at) VALUES ('account','018f0000-0000-7000-8000-000000000001',1,zeroblob(32),1,?1)",
+            [now],
+        ).unwrap();
+        assert!(registry
+            .update_plugin_account_identity_for_session("fake", "test-session", Some("drive-a"))
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        let fences = registry
+            .update_plugin_account_identity_for_session("fake", "test-session", Some("drive-b"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].binding_epoch, binding);
+        assert_eq!(fences[0].next_transport_generation, 2);
+        let connection = registry.connection.lock().unwrap();
+        let state: (String, i64) = connection.query_row(
+            "SELECT state,transport_generation FROM library_sync_bindings WHERE library_uuid='library'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(state, ("paused".into(), 2));
+        let binding_cursors: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_binding_cursors WHERE library_uuid='library'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let root_cursors: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_account_root_cursors WHERE account_uuid='account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remote_libraries: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_remote_libraries WHERE account_uuid='account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((binding_cursors, root_cursors, remote_libraries), (0, 0, 0));
+        drop(connection);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn signing_out_a_provider_account_clears_all_remote_cursors_and_inventory() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let now = unix_timestamp_millis();
+        register_test_plugin(&registry, "fake", "account");
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','root','Library','local','root','ready','local-only','available',1,'marker',?1,?1)",
+            [now],
+        ).unwrap();
+        let (binding, _) = registry
+            .begin_sync_binding("library", "fake", "account")
+            .unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO provider_binding_cursors(library_uuid,binding_epoch,remote_namespace,scope,cursor,page_token,transport_generation,updated_at) VALUES ('library',?1,'library','library','old',NULL,1,?2)",
+            params![binding.as_bytes().as_slice(), now],
+        ).unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO provider_account_root_cursors(account_uuid,scope,cursor,generation,updated_at) VALUES ('account','root','old',1,?1)",
+            [now],
+        ).unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at) VALUES ('account','018f0000-0000-7000-8000-000000000001',1,zeroblob(32),1,?1)",
+            [now],
+        ).unwrap();
+
+        assert!(registry.sign_out_plugin_account("fake", 1).unwrap());
+        let connection = registry.connection.lock().unwrap();
+        let counts = (
+            connection
+                .query_row("SELECT COUNT(*) FROM provider_binding_cursors", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_account_root_cursors",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_remote_libraries",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+        );
+        assert_eq!(counts, (0, 0, 0));
+        let account: (Option<String>, String, i64) = connection.query_row(
+            "SELECT secret_ref,auth_state,generation FROM plugin_accounts WHERE plugin_id='fake'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(account, (None, "signed-out".into(), 2));
+        drop(connection);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_root_inventory_is_generation_fenced_and_cursor_isolated() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "fake", "account");
+        let transport = registry.provider_root_transports().unwrap().remove(0);
+        assert_eq!(transport.account_uuid, "account");
+        let library_uuid = uuid::Uuid::now_v7().to_string();
+        let metadata = crate::sync::provider::ObjectMetadata {
+            key: format!("{library_uuid}/library-descriptor"),
+            size: 42,
+            sha256: [9; 32],
+            etag: Some("etag-one".into()),
+        };
+        registry
+            .commit_provider_root_page(
+                "account",
+                transport.account_generation,
+                Some("cursor-zero"),
+                "page-one",
+                std::slice::from_ref(&metadata),
+            )
+            .unwrap();
+        let transport = registry.provider_root_transports().unwrap().remove(0);
+        assert_eq!(transport.cursor.as_deref(), Some("cursor-zero"));
+        assert_eq!(transport.page_token.as_deref(), Some("page-one"));
+        registry
+            .commit_provider_root_cursor(
+                "account",
+                transport.account_generation,
+                Some("cursor-one"),
+                std::slice::from_ref(&metadata),
+            )
+            .unwrap();
+        let connection = registry.connection.lock().unwrap();
+        let inventory: (i64, Vec<u8>, String) = connection
+            .query_row(
+                "SELECT descriptor_size,descriptor_sha256,descriptor_etag FROM provider_remote_libraries WHERE account_uuid='account' AND library_uuid=?1",
+                [library_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(inventory, (42, vec![9; 32], "etag-one".into()));
+        let root: (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT cursor,page_token FROM provider_account_root_cursors WHERE account_uuid='account' AND scope='root'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(root, (Some("cursor-one".into()), None));
+        drop(connection);
+        assert!(registry
+            .commit_provider_root_cursor(
+                "account",
+                transport.account_generation + 1,
+                Some("stale"),
+                &[],
+            )
+            .is_err());
         drop(registry);
         let _ = std::fs::remove_file(path);
     }

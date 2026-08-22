@@ -212,6 +212,24 @@ impl SyncCoordinator {
                 });
                 let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
                 let mut turns = tokio::task::JoinSet::new();
+                {
+                    let coordinator = coordinator.clone();
+                    let gate = std::sync::Arc::clone(&gate);
+                    let cancellation = child_cancellation.clone();
+                    task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let turn_guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
+                    turns.spawn(async move {
+                        let _turn_guard = turn_guard;
+                        let permit = tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            permit = gate.acquire_owned() => permit.ok(),
+                        };
+                        let Some(_permit) = permit else { return };
+                        if let Err(error) = coordinator.run_root_discovery_turns().await {
+                            tracing::warn!(%error, "provider root discovery turn failed");
+                        }
+                    });
+                }
                 if let Some((library_uuid, path, writer)) = active {
                     let coordinator = coordinator.clone();
                     let gate = std::sync::Arc::clone(&gate);
@@ -229,9 +247,6 @@ impl SyncCoordinator {
                             tracing::warn!(%error,%library_uuid,"active sync turn failed");
                         }
                     });
-                }
-                if libraries.is_empty() && turns.is_empty() {
-                    continue;
                 }
                 libraries.sort_by(|left, right| left.library_uuid.cmp(&right.library_uuid));
                 if !libraries.is_empty() {
@@ -285,6 +300,84 @@ impl SyncCoordinator {
             task,
             in_flight,
         }
+    }
+
+    async fn run_root_discovery_turns(&self) -> anyhow::Result<()> {
+        for transport in self.registry.provider_root_transports()? {
+            let Some(provider) = self
+                .providers
+                .resolve(&transport.plugin_id, &transport.account_uuid)?
+            else {
+                continue;
+            };
+            let mut page_token = transport.page_token.clone();
+            let mut cursor = transport.cursor.clone();
+            let mut completed_cursor = None;
+            let mut pages = 0usize;
+            let mut reset_attempted = false;
+            loop {
+                pages += 1;
+                if pages > 1024 {
+                    anyhow::bail!("provider root pagination exceeded the per-turn safety limit");
+                }
+                let requested_page = page_token.clone();
+                let page = match provider
+                    .delta_list(
+                        super::provider::DeltaScope::Root,
+                        cursor.as_deref(),
+                        page_token.as_deref(),
+                        100,
+                    )
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(error)
+                        if error.code == super::provider::ProviderErrorCode::CursorReset
+                            && !reset_attempted =>
+                    {
+                        reset_attempted = true;
+                        cursor = None;
+                        page_token = None;
+                        self.registry.commit_provider_root_cursor(
+                            &transport.account_uuid,
+                            transport.account_generation,
+                            None,
+                            &[],
+                        )?;
+                        continue;
+                    }
+                    Err(error) => return Err(anyhow::Error::new(error)),
+                };
+                page_token = page.page_token.clone();
+                completed_cursor = page.completed_cursor.clone().or(completed_cursor);
+                if let Some(next_page) = page_token.as_deref() {
+                    if requested_page.as_deref() == Some(next_page) {
+                        anyhow::bail!("provider root returned a non-advancing page token");
+                    }
+                    self.registry.commit_provider_root_page(
+                        &transport.account_uuid,
+                        transport.account_generation,
+                        cursor.as_deref(),
+                        next_page,
+                        &page.objects,
+                    )?;
+                } else {
+                    self.registry.commit_provider_root_cursor(
+                        &transport.account_uuid,
+                        transport.account_generation,
+                        completed_cursor.as_deref(),
+                        &page.objects,
+                    )?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn run_root_discovery_for_test(&self) -> anyhow::Result<()> {
+        self.run_root_discovery_turns().await
     }
 
     /// Production provider-neutral turn. Provider adapters only place verified
@@ -506,6 +599,10 @@ impl SyncCoordinator {
         };
         let limiter = workers.limiter();
         let context = super::provider::TransportContext {
+            namespace: binding
+                .remote_namespace
+                .clone()
+                .unwrap_or_else(|| library_uuid.to_owned()),
             binding_epoch: binding.binding_epoch.to_string(),
             transport_generation: binding.transport_generation as u64,
         };
@@ -560,35 +657,58 @@ impl SyncCoordinator {
             .clone()
             .unwrap_or_else(|| library_uuid.to_owned());
         let context = super::provider::TransportContext {
+            namespace: namespace.clone(),
             binding_epoch: binding.binding_epoch.to_string(),
             transport_generation: binding.transport_generation as u64,
         };
         let mut page_token = binding.page_token.clone();
+        let mut cursor = binding.cursor.clone();
         let mut completed_cursor = None;
         let spool = catalog_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("sync-spool");
         let mut pages = 0usize;
+        let mut reset_attempted = false;
         loop {
             pages += 1;
             if pages > 1024 {
                 anyhow::bail!("provider pagination exceeded the per-turn safety limit");
             }
             let requested_page = page_token.clone();
-            let page = provider
+            let page = match provider
                 .delta_list(
                     super::provider::DeltaScope::Library {
                         namespace: namespace.clone(),
                         binding_epoch: binding.binding_epoch.to_string(),
                         transport_generation: binding.transport_generation as u64,
                     },
-                    binding.cursor.as_deref(),
+                    cursor.as_deref(),
                     page_token.as_deref(),
                     100,
                 )
                 .await
-                .map_err(anyhow::Error::new)?;
+            {
+                Ok(page) => page,
+                Err(error)
+                    if error.code == super::provider::ProviderErrorCode::CursorReset
+                        && !reset_attempted =>
+                {
+                    reset_attempted = true;
+                    cursor = None;
+                    page_token = None;
+                    self.registry.commit_binding_cursor(
+                        library_uuid,
+                        binding.binding_epoch,
+                        binding.transport_generation,
+                        &namespace,
+                        "library",
+                        None,
+                    )?;
+                    continue;
+                }
+                Err(error) => return Err(anyhow::Error::new(error)),
+            };
             for metadata in &page.objects {
                 if !metadata.key.starts_with("segments/")
                     && !metadata.key.starts_with("host/")
@@ -670,7 +790,7 @@ impl SyncCoordinator {
                     binding.transport_generation,
                     &namespace,
                     "library",
-                    binding.cursor.as_deref(),
+                    cursor.as_deref(),
                     next_page,
                 )?;
             } else {
@@ -704,6 +824,10 @@ impl SyncCoordinator {
         spool: &Path,
     ) -> anyhow::Result<Vec<PublishedSegment>> {
         let context = super::provider::TransportContext {
+            namespace: binding
+                .remote_namespace
+                .clone()
+                .unwrap_or_else(|| library_uuid.to_owned()),
             binding_epoch: binding.binding_epoch.to_string(),
             transport_generation: binding.transport_generation as u64,
         };
@@ -2224,6 +2348,7 @@ mod tests {
                     Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
                     path.parent().unwrap().join("media-objects"),
                     crate::sync::provider::TransportContext {
+                        namespace: uuid::Uuid::now_v7().to_string(),
                         binding_epoch: binding.to_string(),
                         transport_generation: 1,
                     },

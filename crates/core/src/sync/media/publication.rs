@@ -19,7 +19,9 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-const UPLOAD_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
+/// Microsoft Graph upload-session fragment chosen from the documented 5-10 MiB
+/// range. Ten MiB is 32 * 320 KiB, satisfying Graph's non-final alignment rule.
+const UPLOAD_FRAGMENT_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct SealedPublication {

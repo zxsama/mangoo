@@ -1273,6 +1273,7 @@ mod tests {
             provider.clone(),
             root.join("media-objects"),
             TransportContext {
+                namespace: uuid::Uuid::now_v7().to_string(),
                 binding_epoch: binding.to_string(),
                 transport_generation: 1,
             },
@@ -1320,6 +1321,7 @@ mod tests {
             provider.clone(),
             root.join("media-restore-cache"),
             TransportContext {
+                namespace: uuid::Uuid::now_v7().to_string(),
                 binding_epoch: binding.to_string(),
                 transport_generation: 1,
             },
@@ -1364,6 +1366,7 @@ mod tests {
             provider,
             root.join("media-restore-cache"),
             TransportContext {
+                namespace: uuid::Uuid::now_v7().to_string(),
                 binding_epoch: binding.to_string(),
                 transport_generation: 1,
             },
@@ -1523,6 +1526,7 @@ mod tests {
             Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
             root.join("media-objects"),
             TransportContext {
+                namespace: uuid::Uuid::now_v7().to_string(),
                 binding_epoch: binding.to_string(),
                 transport_generation: 1,
             },
