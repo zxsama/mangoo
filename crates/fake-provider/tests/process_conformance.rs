@@ -81,10 +81,22 @@ impl ProviderProcess {
     }
 
     fn object_get(&mut self, key: &str) -> Vec<u8> {
+        self.object_get_request("object.get", json!({"key":key,"maxBytes":67108864}))
+            .0
+    }
+
+    fn object_get_range(&mut self, key: &str, start: u64, end: u64) -> (Vec<u8>, Value) {
+        self.object_get_request(
+            "object.get_range",
+            json!({"key":key,"start":start,"end":end,"maxBytes":end-start}),
+        )
+    }
+
+    fn object_get_request(&mut self, method: &str, payload: Value) -> (Vec<u8>, Value) {
         let request_id = uuid::Uuid::now_v7();
         write_control(
             &mut self.stdin,
-            &json!({"wireVersion":1,"messageType":"request","requestId":request_id,"method":"object.get","deadlineMs":5000,"bindingEpoch":uuid::Uuid::nil(),"transportGeneration":1,"payload":{"key":key,"maxBytes":67108864}}),
+            &json!({"wireVersion":1,"messageType":"request","requestId":request_id,"method":method,"deadlineMs":5000,"bindingEpoch":uuid::Uuid::nil(),"transportGeneration":1,"payload":payload}),
         );
         let (_, _, _, open) = read_frame(&mut self.stdout);
         let open: Value = serde_json::from_slice(&open).unwrap();
@@ -105,7 +117,7 @@ impl ProviderProcess {
         let (_, _, _, response) = read_frame(&mut self.stdout);
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["requestId"], request_id.to_string());
-        bytes
+        (bytes, response["payload"].clone())
     }
 }
 
@@ -119,7 +131,7 @@ impl Drop for ProviderProcess {
 #[test]
 fn bundled_process_conforms_to_immutable_delta_upload_and_auth_contract() {
     let mut provider = ProviderProcess::start();
-    let method_versions = json!({"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1});
+    let method_versions = json!({"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1});
     let limits = json!({"maxControlBytes":1048576,"maxBinaryBytes":4194304,"maxBufferedBytes":8388608,"streamWindowBytes":8388608,"maxConcurrentRequests":64,"maxConcurrentStreams":32,"maxObjectBytes":67108864});
     let hello = provider.call("runtime.hello", json!({"nonce":vec![0;32],"wireVersions":[1],"pluginId":"com.megle.fake-sync","version":"1.0.0","accountUuid":"fake-account","grantedPermissions":[],"methodVersions":method_versions,"limits":limits}));
     assert_eq!(hello["wireVersion"], 1);
@@ -135,6 +147,11 @@ fn bundled_process_conforms_to_immutable_delta_upload_and_auth_contract() {
         "created"
     );
     assert_eq!(provider.object_get("segments/a"), bytes);
+    let (range_bytes, ranged) = provider.object_get_range("segments/a", 1, 8);
+    assert_eq!(range_bytes, &bytes[1..8]);
+    assert_eq!(ranged["responseStart"], 1);
+    assert_eq!(ranged["responseEnd"], 8);
+    assert_eq!(ranged["wholeObject"], false);
     assert_eq!(
         provider.call(
             "delta.list",

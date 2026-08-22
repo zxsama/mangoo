@@ -96,6 +96,9 @@ if (page.objects.length !== 1 || page.objects[0].sha256 !== hash) throw new Erro
 const read = await call("object.get", {key:"segments/large",maxBytes:payload.length}, epoch, 1);
 const downloaded = incoming.get(read.streamId);
 if (!downloaded?.complete || Buffer.concat(downloaded.chunks).compare(payload) !== 0) throw new Error("process provider streamed download failed");
+const ranged = await call("object.get_range", {key:"segments/large",start:1024,end:1024+65536,maxBytes:65536}, epoch, 1);
+const rangedBytes = incoming.get(ranged.streamId);
+if (!rangedBytes?.complete || Buffer.concat(rangedBytes.chunks).compare(payload.subarray(1024,1024+65536)) !== 0) throw new Error("process provider ranged download failed");
 const uploadBytes = Buffer.from("resumable-upload");
 const uploadHash = crypto.createHash("sha256").update(uploadBytes).digest("hex");
 const upload = await call("upload.begin", {key:"checkpoints/one",size:uploadBytes.length,sha256:uploadHash}, epoch, 1);
