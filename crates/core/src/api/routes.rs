@@ -2880,6 +2880,23 @@ async fn complete_plugin_auth_callback(
             "Provider runtime restarted during authorization".into(),
         ));
     }
+    if auth.authenticated {
+        let Some(fences) = host_registry(&state)?.update_plugin_account_identity_for_session(
+            &binding.plugin_id,
+            &binding.supervisor_session,
+            auth.stable_account_identity.as_deref(),
+        )?
+        else {
+            return Err(CoreError::coded(
+                StatusCode::CONFLICT,
+                "oauth_session_changed",
+                "Provider runtime restarted during authorization".into(),
+            ));
+        };
+        library_manager(&state)?
+            .fence_plugin_bindings(&binding.plugin_id, fences)
+            .await?;
+    }
     Ok(Html(
         "<!doctype html><meta charset=utf-8><title>Megle</title>Authorization completed. You may close this window.",
     ))
@@ -2964,46 +2981,6 @@ async fn sign_out_plugin(
         .auth_sign_out()
         .await
         .map_err(map_provider_error)?;
-    if let (Some(store), Some(secret_ref)) = (&state.secret_store, account.secret_ref.as_deref()) {
-        let plugin = registry
-            .host_plugin(&id)?
-            .ok_or_else(|| not_found_plugin(&id))?;
-        let namespace = plugin
-            .granted_permissions
-            .as_array()
-            .and_then(|permissions| {
-                permissions.iter().find_map(|permission| {
-                    (permission.get("kind").and_then(serde_json::Value::as_str) == Some("secret"))
-                        .then(|| {
-                            permission
-                                .get("namespace")
-                                .and_then(serde_json::Value::as_str)
-                        })
-                        .flatten()
-                })
-            })
-            .ok_or_else(|| {
-                CoreError::coded(
-                    StatusCode::CONFLICT,
-                    "secret_permission_missing",
-                    "No granted secret namespace is available for sign-out".into(),
-                )
-            })?;
-        let scope = crate::plugins::secret_store::SecretScope {
-            plugin_id: id.clone(),
-            account_uuid: account.account_uuid,
-            namespace: namespace.to_owned(),
-            purpose: "oauth".into(),
-        };
-        match store.delete(&scope, secret_ref) {
-            Ok(()) | Err(crate::plugins::secret_store::SecretStoreError::NotFound) => {}
-            Err(error) => {
-                return Err(CoreError::from(anyhow::anyhow!(
-                    "secret deletion failed after bindings paused: {error}"
-                )))
-            }
-        }
-    }
     if !registry.sign_out_plugin_account(&id, account.generation)? {
         return Err(CoreError::coded(
             StatusCode::CONFLICT,

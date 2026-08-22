@@ -215,6 +215,7 @@ pub struct ProviderRootTransport {
     pub plugin_id: String,
     pub account_uuid: String,
     pub account_generation: i64,
+    pub runtime_session_id: String,
     pub cursor: Option<String>,
     pub page_token: Option<String>,
 }
@@ -460,6 +461,44 @@ impl HostRegistry {
         )?;
         transaction.execute(
             "UPDATE plugin_runtime_state SET state='starting',pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",
+            params![unix_timestamp_millis(), plugin_id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn require_plugin_reauthorization_for_launch(
+        &self,
+        plugin_id: &str,
+        expected_fingerprint: &str,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if !plugin_runtime_launch_matches(&transaction, plugin_id, expected_fingerprint)? {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE plugin_accounts SET secret_ref=NULL,auth_state='authorization-required',generation=generation+1,last_error='authorization-required',updated_at=?1 WHERE plugin_id=?2",
+            params![unix_timestamp_millis(), plugin_id],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        pause_plugin_bindings_in_transaction(&transaction, plugin_id)?;
+        transaction.execute(
+            "DELETE FROM provider_binding_cursors WHERE library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1)",
+            [plugin_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM provider_account_root_cursors WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
+            [plugin_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM provider_remote_libraries WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
+            [plugin_id],
+        )?;
+        transaction.execute(
+            "UPDATE plugin_runtime_state SET state='degraded',pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code='authorization-required',last_error_detail='Microsoft authorization is required',updated_at=?1 WHERE plugin_id=?2",
             params![unix_timestamp_millis(), plugin_id],
         )?;
         transaction.commit()?;
@@ -1283,7 +1322,7 @@ impl HostRegistry {
     pub fn provider_root_transports(&self) -> anyhow::Result<Vec<ProviderRootTransport>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare(
-            "SELECT a.plugin_id,a.account_uuid,a.generation,c.cursor,c.page_token FROM plugin_accounts a JOIN plugin_installations i ON i.plugin_id=a.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=a.plugin_id LEFT JOIN provider_account_root_cursors c ON c.account_uuid=a.account_uuid AND c.scope='root' WHERE i.enabled_intent=1 AND r.state='ready' AND a.auth_state='authenticated' AND EXISTS (SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1') ORDER BY a.plugin_id",
+            "SELECT a.plugin_id,a.account_uuid,a.generation,r.session_id,c.cursor,c.page_token FROM plugin_accounts a JOIN plugin_installations i ON i.plugin_id=a.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=a.plugin_id LEFT JOIN provider_account_root_cursors c ON c.account_uuid=a.account_uuid AND c.scope='root' WHERE i.enabled_intent=1 AND r.state='ready' AND r.session_id IS NOT NULL AND a.auth_state='authenticated' AND EXISTS (SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1') ORDER BY a.plugin_id",
         )?;
         let transports = statement
             .query_map([], |row| {
@@ -1291,8 +1330,9 @@ impl HostRegistry {
                     plugin_id: row.get(0)?,
                     account_uuid: row.get(1)?,
                     account_generation: row.get(2)?,
-                    cursor: row.get(3)?,
-                    page_token: row.get(4)?,
+                    runtime_session_id: row.get(3)?,
+                    cursor: row.get(4)?,
+                    page_token: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1303,6 +1343,7 @@ impl HostRegistry {
         &self,
         account_uuid: &str,
         account_generation: i64,
+        runtime_session_id: &str,
         cursor: Option<&str>,
         page_token: &str,
         libraries: &[super::sync::provider::ObjectMetadata],
@@ -1310,6 +1351,7 @@ impl HostRegistry {
         self.commit_provider_root_progress(
             account_uuid,
             account_generation,
+            runtime_session_id,
             cursor,
             Some(page_token),
             libraries,
@@ -1320,12 +1362,14 @@ impl HostRegistry {
         &self,
         account_uuid: &str,
         account_generation: i64,
+        runtime_session_id: &str,
         cursor: Option<&str>,
         libraries: &[super::sync::provider::ObjectMetadata],
     ) -> anyhow::Result<()> {
         self.commit_provider_root_progress(
             account_uuid,
             account_generation,
+            runtime_session_id,
             cursor,
             None,
             libraries,
@@ -1336,6 +1380,7 @@ impl HostRegistry {
         &self,
         account_uuid: &str,
         account_generation: i64,
+        runtime_session_id: &str,
         cursor: Option<&str>,
         page_token: Option<&str>,
         libraries: &[super::sync::provider::ObjectMetadata],
@@ -1345,8 +1390,8 @@ impl HostRegistry {
         let transaction = connection.transaction()?;
         let current: Option<i64> = transaction
             .query_row(
-                "SELECT generation FROM plugin_accounts WHERE account_uuid=?1",
-                [account_uuid],
+                "SELECT a.generation FROM plugin_accounts a JOIN plugin_runtime_state r ON r.plugin_id=a.plugin_id WHERE a.account_uuid=?1 AND r.state='ready' AND r.session_id=?2",
+                params![account_uuid, runtime_session_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -2995,6 +3040,87 @@ mod tests {
     }
 
     #[test]
+    fn invalid_grant_requires_reauthorization_and_fences_remote_state() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let now = unix_timestamp_millis();
+        register_test_plugin(&registry, "fake", "account");
+        registry
+            .set_plugin_account_secret("fake", Some("credential"), "authenticated", 1)
+            .unwrap();
+        let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','root','Library','local','root','ready','local-only','available',1,'marker',?1,?1)",
+            [now],
+        ).unwrap();
+        let (binding, _) = registry
+            .begin_sync_binding("library", "fake", "account")
+            .unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO provider_binding_cursors(library_uuid,binding_epoch,remote_namespace,scope,cursor,page_token,transport_generation,updated_at) VALUES ('library',?1,'library','library','old',NULL,1,?2)",
+            params![binding.as_bytes().as_slice(), now],
+        ).unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO provider_account_root_cursors(account_uuid,scope,cursor,generation,updated_at) VALUES ('account','root','old',1,?1)",
+            [now],
+        ).unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at) VALUES ('account','018f0000-0000-7000-8000-000000000001',1,zeroblob(32),1,?1)",
+            [now],
+        ).unwrap();
+
+        assert!(registry
+            .require_plugin_reauthorization_for_launch("fake", &fingerprint)
+            .unwrap());
+        assert!(!registry
+            .require_plugin_reauthorization_for_launch("fake", &fingerprint)
+            .unwrap());
+        let connection = registry.connection.lock().unwrap();
+        let account: (Option<String>, String, i64) = connection
+            .query_row(
+                "SELECT secret_ref,auth_state,generation FROM plugin_accounts WHERE plugin_id='fake'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(account, (None, "authorization-required".into(), 2));
+        let binding_state: (String, i64) = connection
+            .query_row(
+                "SELECT state,transport_generation FROM library_sync_bindings WHERE library_uuid='library'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(binding_state, ("paused".into(), 2));
+        let runtime: (String, Option<String>) = connection
+            .query_row(
+                "SELECT state,last_error_code FROM plugin_runtime_state WHERE plugin_id='fake'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime,
+            ("degraded".into(), Some("authorization-required".into()))
+        );
+        for table in [
+            "provider_binding_cursors",
+            "provider_account_root_cursors",
+            "provider_remote_libraries",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        drop(connection);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn provider_root_inventory_is_generation_fenced_and_cursor_isolated() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
@@ -3012,6 +3138,7 @@ mod tests {
             .commit_provider_root_page(
                 "account",
                 transport.account_generation,
+                &transport.runtime_session_id,
                 Some("cursor-zero"),
                 "page-one",
                 std::slice::from_ref(&metadata),
@@ -3024,6 +3151,7 @@ mod tests {
             .commit_provider_root_cursor(
                 "account",
                 transport.account_generation,
+                &transport.runtime_session_id,
                 Some("cursor-one"),
                 std::slice::from_ref(&metadata),
             )
@@ -3050,6 +3178,16 @@ mod tests {
             .commit_provider_root_cursor(
                 "account",
                 transport.account_generation + 1,
+                &transport.runtime_session_id,
+                Some("stale"),
+                &[],
+            )
+            .is_err());
+        assert!(registry
+            .commit_provider_root_cursor(
+                "account",
+                transport.account_generation,
+                "stale-session",
                 Some("stale"),
                 &[],
             )

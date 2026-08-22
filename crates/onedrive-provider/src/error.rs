@@ -68,6 +68,18 @@ pub fn map_http_error(
     graph_code: Option<&str>,
     retry_after_ms: Option<u64>,
 ) -> ProviderError {
+    if graph_code.is_some_and(|code| {
+        matches!(
+            code.to_ascii_lowercase().as_str(),
+            "invalid_grant" | "invalidauthenticationtoken" | "tokenexpired" | "tokenrevoked"
+        )
+    }) {
+        return ProviderError::new(
+            "unauthenticated",
+            false,
+            "Microsoft authorization is required",
+        );
+    }
     let (code, retryable, detail) = match status {
         401 => (
             "unauthenticated",
@@ -137,5 +149,9 @@ mod tests {
             assert_eq!(error.retryable, retryable, "status {status}");
             assert_eq!(error.retry_after_ms, Some(1_000), "status {status}");
         }
+        assert_eq!(
+            map_http_error(400, Some("invalid_grant"), None).code,
+            "unauthenticated"
+        );
     }
 }

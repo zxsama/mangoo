@@ -20,6 +20,7 @@ use crate::{MAX_OBJECT_BYTES, UPLOAD_FRAGMENT_ALIGNMENT, UPLOAD_FRAGMENT_BYTES};
 const MAX_URL_BYTES: usize = 8192;
 const MAX_REDIRECTS: usize = 3;
 const MAX_LIBRARY_DESCRIPTOR_BYTES: u64 = 1024 * 1024;
+const MAX_JSON_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -240,6 +241,9 @@ impl GraphClient {
                 continue;
             };
             if namespace.is_none() && item.get("folder").is_some() {
+                if !is_direct_library_folder(item) {
+                    continue;
+                }
                 let Ok(library_uuid) = uuid::Uuid::parse_str(name) else {
                     continue;
                 };
@@ -259,28 +263,35 @@ impl GraphClient {
                 objects.push(object_value(descriptor));
                 continue;
             }
-            if item.get("folder").is_some() || validate_relative_key(name).is_err() {
+            if item.get("folder").is_some() {
                 continue;
             }
+            let Some(relative_key) = namespace
+                .map(|namespace| delta_relative_key(item, namespace))
+                .transpose()?
+                .flatten()
+            else {
+                continue;
+            };
             let Some(size) = item.get("size").and_then(Value::as_u64) else {
                 continue;
             };
-            let hash = if let Some(namespace) = namespace {
-                match self.head(access_token, namespace, name)? {
-                    Some(metadata) if metadata.size == size => metadata.sha256,
-                    Some(_) => {
-                        return Err(ProviderError::protocol(
+            let hash = expected_hash_from_key(&relative_key)
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    let namespace =
+                        namespace.expect("root Delta objects are handled as Library folders");
+                    match self.head(access_token, namespace, &relative_key)? {
+                        Some(metadata) if metadata.size == size => Ok(metadata.sha256),
+                        Some(_) => Err(ProviderError::protocol(
                             "Graph delta size changed during validation",
-                        ))
+                        )),
+                        None => Err(ProviderError::protocol(
+                            "Graph Delta object disappeared during validation",
+                        )),
                     }
-                    None => continue,
-                }
-            } else if let Some((_, hash)) = expected_hash_from_key(name) {
-                hash
-            } else {
-                continue;
-            };
-            objects.push(json!({"key":name,"size":size,"sha256":hash,"etag":item.get("eTag").and_then(Value::as_str)}));
+                })?;
+            objects.push(json!({"key":relative_key,"size":size,"sha256":hash,"etag":item.get("eTag").and_then(Value::as_str)}));
         }
         let next = value
             .get("@odata.nextLink")
@@ -387,6 +398,22 @@ impl GraphClient {
                 "Graph object exceeds Provider limit",
             ));
         }
+        let hash = self.hash_object_body(access_token, namespace, key, size)?;
+        Ok(Some(RemoteObject {
+            key: key.to_owned(),
+            size,
+            sha256: hash,
+            etag: value.get("eTag").and_then(Value::as_str).map(str::to_owned),
+        }))
+    }
+
+    fn hash_object_body(
+        &self,
+        access_token: &str,
+        namespace: &str,
+        key: &str,
+        size: u64,
+    ) -> Result<String, ProviderError> {
         let content_url = self.item_url(namespace, key, ":/content")?;
         let first = self.send_graph(Method::GET, content_url, access_token, None, None)?;
         let response = if first.status().is_redirection() {
@@ -413,13 +440,7 @@ impl GraphClient {
         if body_size != size {
             return Err(ProviderError::protocol("Graph object body is truncated"));
         }
-        let hash = hex(&body_hash);
-        Ok(Some(RemoteObject {
-            key: key.to_owned(),
-            size,
-            sha256: hash,
-            etag: value.get("eTag").and_then(Value::as_str).map(str::to_owned),
-        }))
+        Ok(hex(&body_hash))
     }
 
     pub fn download(
@@ -430,9 +451,33 @@ impl GraphClient {
         range: Option<(u64, u64)>,
         max_bytes: u64,
     ) -> Result<Download, ProviderError> {
-        let metadata = self.head(access_token, namespace, key)?.ok_or_else(|| {
-            ProviderError::new("not_found", false, "OneDrive object was not found")
-        })?;
+        let metadata = match expected_hash_from_key(key) {
+            Some(sha256) => {
+                let url = self.item_url(namespace, key, "?$select=id,name,size,eTag")?;
+                let response = self.send_graph(Method::GET, url, access_token, None, None)?;
+                if response.status() == StatusCode::NOT_FOUND {
+                    return Err(ProviderError::new(
+                        "not_found",
+                        false,
+                        "OneDrive object was not found",
+                    ));
+                }
+                let value = decode_json_response(response)?;
+                let size = value
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| ProviderError::protocol("Graph object has no size"))?;
+                RemoteObject {
+                    key: key.to_owned(),
+                    size,
+                    sha256,
+                    etag: value.get("eTag").and_then(Value::as_str).map(str::to_owned),
+                }
+            }
+            None => self.head(access_token, namespace, key)?.ok_or_else(|| {
+                ProviderError::new("not_found", false, "OneDrive object was not found")
+            })?,
+        };
         if metadata.size > MAX_OBJECT_BYTES || max_bytes > MAX_OBJECT_BYTES {
             return Err(ProviderError::new(
                 "invalid_argument",
@@ -562,6 +607,13 @@ impl GraphClient {
         size: u64,
         sha256: &str,
     ) -> Result<UploadRecordV1, ProviderError> {
+        if size == 0 || size > MAX_OBJECT_BYTES || !valid_sha256(sha256) {
+            return Err(ProviderError::new(
+                "invalid_argument",
+                false,
+                "invalid immutable upload identity",
+            ));
+        }
         let url = self.item_url(namespace, key, ":/createUploadSession")?;
         let response = self.send_graph(
             Method::POST,
@@ -631,10 +683,16 @@ impl GraphClient {
             .send()
             .map_err(network_error)?;
         if response.status().is_success() {
+            let final_response = response.status() != StatusCode::ACCEPTED;
             let value = decode_json_response(response)?;
             if let Some(next) = next_expected_offset(&value) {
+                if next < offset || next > record.size {
+                    return Err(ProviderError::protocol(
+                        "upload response acknowledged an invalid offset",
+                    ));
+                }
                 record.committed_bytes = next;
-            } else if value.get("id").is_some() {
+            } else if final_response && value.get("id").is_some() {
                 record.committed_bytes = record.size;
             } else {
                 return Err(ProviderError::protocol(
@@ -660,7 +718,13 @@ impl GraphClient {
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(next_expected_offset(&decode_json_response(response)?))
+        let offset = next_expected_offset(&decode_json_response(response)?);
+        if offset.is_some_and(|offset| offset > record.size) {
+            return Err(ProviderError::protocol(
+                "upload status acknowledged an invalid offset",
+            ));
+        }
+        Ok(offset)
     }
 
     pub fn abort_upload(&self, record: &UploadRecordV1) -> Result<(), ProviderError> {
@@ -734,6 +798,7 @@ impl GraphClient {
         }
         if url.scheme() != "https"
             || url.host_str() != Some("graph.microsoft.com")
+            || url.port_or_known_default() != Some(443)
             || !url.path().starts_with("/v1.0/")
         {
             return Err(ProviderError::protocol(
@@ -823,8 +888,15 @@ fn decode_json_response(response: Response) -> Result<Value, ProviderError> {
     if !response.status().is_success() {
         return Err(response_error(response));
     }
+    let mut bytes = Vec::new();
     response
-        .json()
+        .take(MAX_JSON_RESPONSE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(body_io_error)?;
+    if bytes.len() as u64 > MAX_JSON_RESPONSE_BYTES {
+        return Err(ProviderError::protocol("Graph JSON response is too large"));
+    }
+    serde_json::from_slice(&bytes)
         .map_err(|_| ProviderError::protocol("Graph returned malformed JSON"))
 }
 
@@ -836,8 +908,21 @@ fn response_error(response: Response) -> ProviderError {
             .get(RETRY_AFTER)
             .and_then(|v| v.to_str().ok()),
     );
-    let value = response.json::<Value>().unwrap_or(Value::Null);
-    let code = value.pointer("/error/code").and_then(Value::as_str);
+    let mut bytes = Vec::new();
+    let value = if response
+        .take(MAX_JSON_RESPONSE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_ok()
+        && bytes.len() as u64 <= MAX_JSON_RESPONSE_BYTES
+    {
+        serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let code = value
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("error").and_then(Value::as_str));
     map_http_error(status, code, retry_after)
 }
 
@@ -916,7 +1001,73 @@ pub fn validate_capability_url(
     if url.scheme() != "https" && !(allow_http_emulator && url.scheme() == "http") {
         return Err(ProviderError::protocol("capability URL must use HTTPS"));
     }
+    let host = url
+        .host_str()
+        .ok_or_else(|| ProviderError::protocol("capability URL has no host"))?;
+    if url.scheme() == "http" && !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return Err(ProviderError::protocol(
+            "capability emulator URL must be loopback",
+        ));
+    }
+    if url.scheme() == "https" && !trusted_capability_host(host) {
+        return Err(ProviderError::protocol(
+            "capability URL escaped Microsoft storage hosts",
+        ));
+    }
+    if url.port().is_some_and(|port| {
+        (url.scheme() == "https" && port != 443) || (url.scheme() == "http" && !allow_http_emulator)
+    }) {
+        return Err(ProviderError::protocol("capability URL has no host"));
+    }
     Ok(url)
+}
+
+fn trusted_capability_host(host: &str) -> bool {
+    [
+        "1drv.com",
+        "sharepoint.com",
+        "sharepointonline.com",
+        "microsoft.com",
+    ]
+    .iter()
+    .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
+fn is_direct_library_folder(item: &Value) -> bool {
+    item.pointer("/parentReference/path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| path.ends_with("/Megle/libraries"))
+}
+
+fn delta_relative_key(item: &Value, namespace: &str) -> Result<Option<String>, ProviderError> {
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::protocol("Graph Delta item has no name"))?;
+    if validate_relative_key(name).is_err() || name.contains('/') {
+        return Ok(None);
+    }
+    let Some(parent_path) = item
+        .pointer("/parentReference/path")
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let marker = format!("/Megle/libraries/{namespace}");
+    let Some(index) = parent_path.rfind(&marker) else {
+        return Ok(None);
+    };
+    let suffix = &parent_path[index + marker.len()..];
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        return Ok(None);
+    }
+    let key = if suffix.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}/{name}", suffix.trim_start_matches('/'))
+    };
+    validate_relative_key(&key)?;
+    Ok(Some(key))
 }
 
 pub fn parse_retry_after(value: Option<&str>) -> Option<u64> {
@@ -978,13 +1129,12 @@ fn next_expected_offset(value: &Value) -> Option<u64> {
         .min()
 }
 
-fn expected_hash_from_key(key: &str) -> Option<(&str, String)> {
-    let candidate = key
-        .rsplit('/')
+fn expected_hash_from_key(key: &str) -> Option<String> {
+    key.rsplit('/')
         .next()?
-        .split('.')
-        .find(|part| part.len() == 64 && part.bytes().all(|b| b.is_ascii_hexdigit()))?;
-    Some((candidate, candidate.to_ascii_lowercase()))
+        .split(['.', '-'])
+        .find(|part| valid_sha256(part))
+        .map(str::to_ascii_lowercase)
 }
 
 fn string(value: &Value, key: &str) -> Result<String, ProviderError> {
@@ -1029,6 +1179,16 @@ mod tests {
             (10, 20, 100)
         );
         assert!(parse_content_range("items 10-19/100").is_err());
+        let hash = "ab".repeat(32);
+        assert_eq!(
+            expected_hash_from_key(&format!("content/data/ab/{hash}.pack")).as_deref(),
+            Some(hash.as_str())
+        );
+        assert_eq!(
+            expected_hash_from_key(&format!("indexes/chunks/id/0-{hash}.idx")).as_deref(),
+            Some(hash.as_str())
+        );
+        assert_eq!(expected_hash_from_key("checkpoints/id.checkpoint"), None);
     }
 
     #[test]
@@ -1044,9 +1204,38 @@ mod tests {
         assert!(
             validate_capability_url("https://user:pass@example.invalid/upload", false).is_err()
         );
+        assert!(validate_capability_url(
+            "https://public.dm.files.1drv.com/upload?token=opaque",
+            false
+        )
+        .is_ok());
         assert!(
-            validate_capability_url("https://example.invalid/upload?token=opaque", false).is_ok()
+            validate_capability_url("https://example.invalid/upload?token=opaque", false).is_err()
         );
+        assert!(validate_capability_url("http://example.invalid/upload", true).is_err());
+        assert!(validate_capability_url(
+            "https://public.dm.files.1drv.com:444/upload?token=opaque",
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn delta_paths_are_rebuilt_from_validated_parent_paths() {
+        let namespace = "018f0000-0000-7000-8000-000000000001";
+        let nested = json!({
+            "name":"object.json",
+            "parentReference":{"path":format!("/drive/root:/Apps/Megle/Megle/libraries/{namespace}/segments")}
+        });
+        assert_eq!(
+            delta_relative_key(&nested, namespace).unwrap().as_deref(),
+            Some("segments/object.json")
+        );
+        let escaped = json!({
+            "name":"object.json",
+            "parentReference":{"path":"/drive/root:/Apps/Megle/Megle/libraries/other/segments"}
+        });
+        assert_eq!(delta_relative_key(&escaped, namespace).unwrap(), None);
     }
 
     #[test]

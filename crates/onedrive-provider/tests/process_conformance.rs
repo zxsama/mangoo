@@ -23,6 +23,7 @@ struct GraphState {
     download_counts: HashMap<String, usize>,
     capability_bearer_leaks: usize,
     reject_next_graph_request: bool,
+    reject_next_token_refresh: bool,
     next_upload_fault: Option<u16>,
 }
 
@@ -84,6 +85,7 @@ impl Drop for WindowsSockets {
 struct Secrets {
     current: Option<String>,
     records: HashMap<String, (Vec<u8>, u64)>,
+    authorization_required: bool,
 }
 
 struct ProviderProcess {
@@ -309,6 +311,18 @@ impl ProviderProcess {
     fn handle_reverse(&mut self, mut envelope: Value) {
         let method = envelope["method"].as_str().unwrap().to_owned();
         let payload = envelope["payload"].clone();
+        let purpose = payload
+            .get("purpose")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !purpose.is_empty()
+                && purpose.len() <= 160
+                && purpose.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                }),
+            "invalid secret purpose: {purpose}"
+        );
         let mut secrets = self.secrets.lock().unwrap();
         let result = match method.as_str() {
             "host.secret.current" => json!({"secretRef":secrets.current,"accountGeneration":1}),
@@ -348,6 +362,10 @@ impl ProviderProcess {
                 if secrets.current.as_deref() == Some(key) {
                     secrets.current = None;
                 }
+                Value::Null
+            }
+            "host.auth.authorization_required" => {
+                secrets.authorization_required = true;
                 Value::Null
             }
             _ => panic!("unexpected reverse method {method}"),
@@ -701,8 +719,68 @@ fn real_child_runs_oauth_secret_delta_object_range_and_resumable_upload_against_
     );
     assert_eq!(root_delta["objects"].as_array().unwrap().len(), 8);
     assert_eq!(emulator.state.lock().unwrap().capability_bearer_leaks, 0);
+
+    provider.call(
+        "upload.begin",
+        json!({
+            "namespace": namespace,
+            "key": "content/data/pending-sign-out.pack",
+            "size": 20 * 1024 * 1024u64,
+            "sha256": hex(&Sha256::digest(vec![2u8; 20 * 1024 * 1024])),
+        }),
+    );
+    assert_eq!(secrets.lock().unwrap().records.len(), 2);
+    provider.call("auth.sign_out", Value::Null);
+    assert!(secrets.lock().unwrap().records.is_empty());
+    assert_eq!(
+        provider.call("auth.status", Value::Null)["authenticated"],
+        false
+    );
     provider.call("shutdown", Value::Null);
     assert!(provider.child.wait().unwrap().success());
+}
+
+#[test]
+fn invalid_grant_retires_all_secrets_and_requires_authorization() {
+    let emulator = Emulator::start();
+    let secrets = Arc::new(Mutex::new(Secrets::default()));
+    let namespace = "018f0000-0000-7000-8000-000000000001";
+    let mut provider = ProviderProcess::start(&emulator.base, Arc::clone(&secrets));
+    hello(&mut provider);
+    let auth = provider.call(
+        "auth.begin",
+        json!({"callbackUrl":format!("{}callback", emulator.base)}),
+    );
+    let auth_url = Url::parse(auth["authorizationUrl"].as_str().unwrap()).unwrap();
+    let state = auth_url
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    provider.call(
+        "auth.complete",
+        json!({"flowId":auth["flowId"],"fields":{"state":state,"code":"emulator-code"}}),
+    );
+    provider.call(
+        "upload.begin",
+        json!({
+            "namespace": namespace,
+            "key": "content/data/pending-reauth.pack",
+            "size": 20 * 1024 * 1024u64,
+            "sha256": hex(&Sha256::digest(vec![3u8; 20 * 1024 * 1024])),
+        }),
+    );
+    emulator.state.lock().unwrap().reject_next_graph_request = true;
+    emulator.state.lock().unwrap().reject_next_token_refresh = true;
+    let error = provider.call_error(
+        "object.head",
+        json!({"namespace":namespace,"key":"segments/missing.json"}),
+    );
+    assert_eq!(error["code"], "unauthenticated");
+    let secrets = secrets.lock().unwrap();
+    assert!(secrets.records.is_empty());
+    assert!(secrets.authorization_required);
 }
 
 #[test]
@@ -781,7 +859,21 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
                 .into_bytes(),
         )
     } else if path.ends_with("/oauth2/v2.0/token") && method == "POST" {
-        (200, vec![], json!({"access_token":"emulator-access","refresh_token":"emulator-refresh","expires_in":3600,"scope":"Files.ReadWrite.AppFolder offline_access"}).to_string().into_bytes())
+        let reject_refresh = {
+            let mut state = state.lock().unwrap();
+            std::mem::take(&mut state.reject_next_token_refresh)
+        };
+        if reject_refresh {
+            (
+                400,
+                vec![],
+                json!({"error":"invalid_grant","error_description":"expired refresh credential"})
+                    .to_string()
+                    .into_bytes(),
+            )
+        } else {
+            (200, vec![], json!({"access_token":"emulator-access","refresh_token":"emulator-refresh","expires_in":3600,"scope":"Files.ReadWrite.AppFolder offline_access"}).to_string().into_bytes())
+        }
     } else if path == "/v1.0/delta-gone" && method == "GET" {
         (
             410,
@@ -814,7 +906,7 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
             .get("018f0000-0000-7000-8000-000000000001/segments/immutable.json")
             .unwrap()
             .clone();
-        let item = json!({"name":"segments/immutable.json","size":value.len(),"eTag":hex(&Sha256::digest(&value))});
+        let item = json!({"name":"immutable.json","size":value.len(),"eTag":hex(&Sha256::digest(&value)),"parentReference":{"path":"/drive/root:/Apps/Megle/Megle/libraries/018f0000-0000-7000-8000-000000000001/segments"}});
         (
             200,
             vec![],
@@ -847,7 +939,7 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
             state
                 .namespaces
                 .iter()
-                .map(|namespace| json!({"name":namespace,"folder":{},"size":0}))
+                .map(|namespace| json!({"name":namespace,"folder":{},"size":0,"parentReference":{"path":"/drive/root:/Apps/Megle/Megle/libraries"}}))
                 .collect::<Vec<_>>()
         } else {
             state
@@ -858,7 +950,8 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
                         Some(namespace) => key.strip_prefix(&format!("{namespace}/"))?,
                         None => key.as_str(),
                     };
-                    Some(json!({"name":name,"size":value.len(),"eTag":hex(&Sha256::digest(value))}))
+                    let (parent, name) = name.rsplit_once('/').unwrap_or(("", name));
+                    Some(json!({"name":name,"size":value.len(),"eTag":hex(&Sha256::digest(value)),"parentReference":{"path":format!("/drive/root:/Apps/Megle/Megle/libraries/{}/{}",namespace.unwrap_or_default(),parent).trim_end_matches('/')}}))
                 })
                 .collect::<Vec<_>>()
         };

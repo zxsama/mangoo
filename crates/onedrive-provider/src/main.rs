@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use megle_onedrive_provider::config::ProviderConfig;
 use megle_onedrive_provider::error::ProviderError;
 use megle_onedrive_provider::graph::{hex, GraphClient, RemoteObject, UploadRecordV1};
 use megle_onedrive_provider::namespace::parse_library_key;
-use megle_onedrive_provider::oauth::{CredentialRecordV1, OAuthFlows, OAUTH_SCOPES};
+use megle_onedrive_provider::oauth::{
+    CredentialRecordV1, OAuthFlows, UploadSessionSecretV1, FLOW_TTL, MAX_FLOWS, OAUTH_SCOPES,
+};
 use megle_onedrive_provider::rpc::{ControlRequest, RpcTransport};
 use megle_onedrive_provider::{MAX_OBJECT_BYTES, PLUGIN_ID, PLUGIN_VERSION, UPLOAD_FRAGMENT_BYTES};
 use serde_json::{json, Value};
@@ -17,13 +20,15 @@ use sha2::{Digest, Sha256};
 
 const SECRET_NAMESPACE: &str = "microsoft-onedrive";
 const CREDENTIAL_PURPOSE: &str = "oauth-v1";
+type LoopbackResults = HashMap<String, (Instant, HashMap<String, String>)>;
 
 struct ProviderState {
     config: Result<ProviderConfig, ProviderError>,
     graph: Option<GraphClient>,
     account_uuid: String,
     flows: OAuthFlows,
-    loopback_results: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+    loopback_results: Arc<Mutex<LoopbackResults>>,
+    loopback_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     credential_ref: Option<String>,
     credential_generation: Option<u64>,
     credential: Option<CredentialRecordV1>,
@@ -42,6 +47,7 @@ impl ProviderState {
             account_uuid: String::new(),
             flows: OAuthFlows::default(),
             loopback_results: Arc::new(Mutex::new(HashMap::new())),
+            loopback_cancellations: Arc::new(Mutex::new(HashMap::new())),
             credential_ref: None,
             credential_generation: None,
             credential: None,
@@ -185,8 +191,14 @@ impl ProviderState {
                 let record = self.graph_call(rpc, |graph, token| {
                     graph.begin_upload(token, &namespace, &key, size, &sha256)
                 })?;
-                let result = create_secret(rpc, &upload_purpose(&namespace), &record, true)?;
-                Ok(json!({"uploadId":text(&result,"secretRef")?,"committedBytes":0}))
+                let purpose = upload_purpose(&namespace);
+                let result = create_secret(rpc, &purpose, &record, true)?;
+                let upload_id = text(&result, "secretRef")?;
+                if let Err(error) = self.track_upload_secret(rpc, &upload_id, &purpose) {
+                    let _ = delete_secret(rpc, &purpose, &upload_id, true);
+                    return Err(error);
+                }
+                Ok(json!({"uploadId":upload_id,"committedBytes":0}))
             }
             "upload.write" => {
                 let namespace = text(&request.payload, "namespace")?;
@@ -206,6 +218,7 @@ impl ProviderState {
                     &upload_purpose(&namespace),
                     &upload_id,
                 )?;
+                validate_upload_record(&record, &namespace)?;
                 if record.namespace != namespace {
                     return Err(ProviderError::new(
                         "permission_denied",
@@ -244,6 +257,7 @@ impl ProviderState {
                     &upload_purpose(&namespace),
                     &upload_id,
                 )?;
+                validate_upload_record(&record, &namespace)?;
                 let remote = self
                     .graph_call(rpc, |graph, token| {
                         graph.head(token, &namespace, &record.object_key)
@@ -260,7 +274,9 @@ impl ProviderState {
                 } else {
                     json!({"status":"hash_conflict","remoteSha256":remote.sha256})
                 };
-                delete_secret(rpc, &upload_purpose(&namespace), &upload_id, true)?;
+                let purpose = upload_purpose(&namespace);
+                delete_secret(rpc, &purpose, &upload_id, true)?;
+                self.untrack_upload_secret(rpc, &upload_id)?;
                 Ok(result)
             }
             "upload.abort" => {
@@ -270,13 +286,17 @@ impl ProviderState {
                 if let Ok((record, _)) =
                     get_secret::<R, W, UploadRecordV1>(rpc, &upload_purpose(&namespace), &upload_id)
                 {
-                    let _ = self.graph()?.abort_upload(&record);
+                    if validate_upload_record(&record, &namespace).is_ok() {
+                        let _ = self.graph()?.abort_upload(&record);
+                    }
                 }
-                delete_secret(rpc, &upload_purpose(&namespace), &upload_id, true)?;
+                let purpose = upload_purpose(&namespace);
+                delete_secret(rpc, &purpose, &upload_id, true)?;
+                self.untrack_upload_secret(rpc, &upload_id)?;
                 Ok(Value::Null)
             }
             "shutdown" => {
-                self.flows.cancel_all();
+                self.cancel_auth_flows()?;
                 Ok(Value::Null)
             }
             _ => Err(ProviderError::new(
@@ -289,6 +309,19 @@ impl ProviderState {
 
     fn auth_begin(&mut self, payload: &Value) -> Result<Value, ProviderError> {
         let config = self.config()?.clone();
+        {
+            let mut results = self.loopback_results.lock().map_err(|_| {
+                ProviderError::new("internal", false, "OAuth loopback state poisoned")
+            })?;
+            results.retain(|_, (received_at, _)| received_at.elapsed() <= FLOW_TTL);
+            if results.len() >= MAX_FLOWS {
+                return Err(ProviderError::new(
+                    "unavailable",
+                    true,
+                    "too many pending OAuth callbacks",
+                ));
+            }
+        }
         let callback = payload
             .get("callbackUrl")
             .and_then(Value::as_str)
@@ -315,8 +348,21 @@ impl ProviderState {
         let (flow_id, authorization_url) = self.flows.begin(&config, callback.as_deref())?;
         if let Some(listener) = listener {
             let results = Arc::clone(&self.loopback_results);
+            let cancellations = Arc::clone(&self.loopback_cancellations);
             let flow = flow_id.clone();
-            std::thread::spawn(move || receive_loopback(listener, results, flow));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            cancellations
+                .lock()
+                .map_err(|_| {
+                    ProviderError::new("internal", false, "OAuth loopback state poisoned")
+                })?
+                .insert(flow.clone(), Arc::clone(&cancelled));
+            std::thread::spawn(move || {
+                receive_loopback(listener, results, flow.clone(), cancelled);
+                if let Ok(mut guard) = cancellations.lock() {
+                    guard.remove(&flow);
+                }
+            });
         }
         Ok(json!({"authorizationUrl":authorization_url,"flowId":flow_id}))
     }
@@ -327,6 +373,14 @@ impl ProviderState {
         payload: &Value,
     ) -> Result<Value, ProviderError> {
         let flow_id = text(payload, "flowId")?;
+        if let Some(cancelled) = self
+            .loopback_cancellations
+            .lock()
+            .map_err(|_| ProviderError::new("internal", false, "OAuth loopback state poisoned"))?
+            .remove(&flow_id)
+        {
+            cancelled.store(true, Ordering::Release);
+        }
         let mut fields = object_strings(payload.get("fields"));
         if fields.is_empty() {
             fields = self
@@ -336,6 +390,7 @@ impl ProviderState {
                     ProviderError::new("internal", false, "OAuth loopback state poisoned")
                 })?
                 .remove(&flow_id)
+                .map(|(_, fields)| fields)
                 .ok_or_else(|| {
                     ProviderError::new("unavailable", true, "OAuth callback has not arrived")
                 })?;
@@ -373,6 +428,11 @@ impl ProviderState {
                 .split_whitespace()
                 .map(str::to_owned)
                 .collect(),
+            upload_sessions: self
+                .credential
+                .as_ref()
+                .map(|credential| credential.upload_sessions.clone())
+                .unwrap_or_default(),
         };
         if self.credential_ref.is_none() {
             let _ = self.load_credential(rpc);
@@ -424,13 +484,26 @@ impl ProviderState {
         if self.credential_ref.is_none() {
             let _ = self.load_credential(rpc);
         }
-        if let Some(secret_ref) = self.credential_ref.take() {
-            delete_secret(rpc, CREDENTIAL_PURPOSE, &secret_ref, false)?;
-        }
-        self.credential = None;
-        self.credential_generation = None;
-        self.flows.cancel_all();
+        self.retire_credential(rpc)?;
+        self.cancel_auth_flows()?;
         Ok(Value::Null)
+    }
+
+    fn cancel_auth_flows(&mut self) -> Result<(), ProviderError> {
+        self.flows.cancel_all();
+        self.loopback_results
+            .lock()
+            .map_err(|_| ProviderError::new("internal", false, "OAuth loopback state poisoned"))?
+            .clear();
+        let mut cancellations = self
+            .loopback_cancellations
+            .lock()
+            .map_err(|_| ProviderError::new("internal", false, "OAuth loopback state poisoned"))?;
+        for cancelled in cancellations.values() {
+            cancelled.store(true, Ordering::Release);
+        }
+        cancellations.clear();
+        Ok(())
     }
 
     fn load_credential<R: Read, W: Write>(
@@ -447,9 +520,85 @@ impl ProviderState {
         };
         let (record, generation) =
             get_secret::<R, W, CredentialRecordV1>(rpc, CREDENTIAL_PURPOSE, secret_ref)?;
+        if record.format_version != 1 {
+            return Err(ProviderError::protocol(
+                "unsupported credential record version",
+            ));
+        }
         self.credential_ref = Some(secret_ref.to_owned());
         self.credential_generation = Some(generation);
         self.credential = Some(record);
+        Ok(())
+    }
+
+    fn persist_credential<R: Read, W: Write>(
+        &mut self,
+        rpc: &mut RpcTransport<R, W>,
+    ) -> Result<(), ProviderError> {
+        let record = self
+            .credential
+            .as_ref()
+            .ok_or_else(|| ProviderError::protocol("credential record missing"))?;
+        let secret_ref = self
+            .credential_ref
+            .clone()
+            .ok_or_else(|| ProviderError::protocol("credential reference missing"))?;
+        let generation = self
+            .credential_generation
+            .ok_or_else(|| ProviderError::protocol("credential generation missing"))?;
+        let result = cas_secret(
+            rpc,
+            CREDENTIAL_PURPOSE,
+            &secret_ref,
+            generation,
+            record,
+            false,
+        )?;
+        self.credential_generation = result.get("generation").and_then(Value::as_u64);
+        Ok(())
+    }
+
+    fn track_upload_secret<R: Read, W: Write>(
+        &mut self,
+        rpc: &mut RpcTransport<R, W>,
+        secret_ref: &str,
+        purpose: &str,
+    ) -> Result<(), ProviderError> {
+        if self.credential.is_none() {
+            self.load_credential(rpc)?;
+        }
+        let record = self
+            .credential
+            .as_mut()
+            .ok_or_else(|| ProviderError::protocol("credential record missing"))?;
+        if !record
+            .upload_sessions
+            .iter()
+            .any(|entry| entry.secret_ref == secret_ref)
+        {
+            record.upload_sessions.push(UploadSessionSecretV1 {
+                secret_ref: secret_ref.to_owned(),
+                purpose: purpose.to_owned(),
+            });
+        }
+        self.persist_credential(rpc)
+    }
+
+    fn untrack_upload_secret<R: Read, W: Write>(
+        &mut self,
+        rpc: &mut RpcTransport<R, W>,
+        secret_ref: &str,
+    ) -> Result<(), ProviderError> {
+        let Some(record) = self.credential.as_mut() else {
+            return Ok(());
+        };
+        let previous = record.upload_sessions.len();
+        record
+            .upload_sessions
+            .retain(|entry| entry.secret_ref != secret_ref);
+        if record.upload_sessions.len() != previous {
+            self.persist_credential(rpc)?;
+        }
         Ok(())
     }
 
@@ -494,8 +643,36 @@ impl ProviderState {
                 "Microsoft authorization is required",
             )
         })?;
-        let token = graph.refresh_token(&config, &record.refresh_token)?;
-        record.access_token = Some(text(&token, "access_token")?);
+        let token = match graph.refresh_token(&config, &record.refresh_token) {
+            Ok(token) => token,
+            Err(error) if error.code == "unauthenticated" => {
+                self.require_reauthorization(rpc)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let access_token = text(&token, "access_token")?;
+        let identity = match graph.drive_identity(&access_token) {
+            Ok(identity) => identity,
+            Err(error) if error.code == "unauthenticated" => {
+                self.require_reauthorization(rpc)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if identity.drive_id != record.drive_id
+            || identity.account_kind != record.account_kind
+            || identity.tenant_hint != record.tenant_hint
+            || identity.object_hint != record.object_hint
+        {
+            self.require_reauthorization(rpc)?;
+            return Err(ProviderError::new(
+                "unauthenticated",
+                false,
+                "Microsoft account identity changed; authorization is required",
+            ));
+        }
+        record.access_token = Some(access_token);
         if let Some(refresh) = token.get("refresh_token").and_then(Value::as_str) {
             record.refresh_token = refresh.to_owned();
         }
@@ -537,6 +714,35 @@ impl ProviderState {
             })
     }
 
+    fn retire_credential<R: Read, W: Write>(
+        &mut self,
+        rpc: &mut RpcTransport<R, W>,
+    ) -> Result<(), ProviderError> {
+        if let Some(record) = self.credential.as_ref() {
+            for upload in &record.upload_sessions {
+                delete_secret(rpc, &upload.purpose, &upload.secret_ref, true)?;
+            }
+        }
+        if let Some(secret_ref) = self.credential_ref.take() {
+            delete_secret(rpc, CREDENTIAL_PURPOSE, &secret_ref, false)?;
+        }
+        self.credential = None;
+        self.credential_generation = None;
+        Ok(())
+    }
+
+    fn require_reauthorization<R: Read, W: Write>(
+        &mut self,
+        rpc: &mut RpcTransport<R, W>,
+    ) -> Result<(), ProviderError> {
+        self.retire_credential(rpc)?;
+        rpc.reverse_call(
+            "host.auth.authorization_required",
+            secret_scope(CREDENTIAL_PURPOSE),
+        )?;
+        Ok(())
+    }
+
     fn graph_call<R: Read, W: Write, T>(
         &mut self,
         rpc: &mut RpcTransport<R, W>,
@@ -547,7 +753,13 @@ impl ProviderState {
         match operation(&graph, &token) {
             Err(error) if error.code == "unauthenticated" => {
                 let refreshed = self.refresh_access_token(rpc)?;
-                operation(&graph, &refreshed)
+                match operation(&graph, &refreshed) {
+                    Err(error) if error.code == "unauthenticated" => {
+                        self.require_reauthorization(rpc)?;
+                        Err(error)
+                    }
+                    result => result,
+                }
             }
             result => result,
         }
@@ -600,33 +812,78 @@ impl Drop for WindowsSockets {
 
 fn receive_loopback(
     listener: TcpListener,
-    results: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+    results: Arc<Mutex<LoopbackResults>>,
     flow_id: String,
+    cancelled: Arc<AtomicBool>,
 ) {
-    let _ = listener.set_nonblocking(false);
-    if let Ok((mut stream, _)) = listener.accept() {
+    let _ = listener.set_nonblocking(true);
+    let deadline = Instant::now() + FLOW_TTL;
+    while Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
+        let Ok((mut stream, _)) = listener.accept() else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
         let mut buffer = [0u8; 8192];
-        if let Ok(size) = stream.read(&mut buffer) {
-            let line = String::from_utf8_lossy(&buffer[..size]);
-            if let Some(target) = line
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-            {
-                if let Ok(url) = url::Url::parse(&format!("http://127.0.0.1{target}")) {
-                    let fields = url
-                        .query_pairs()
-                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                        .collect();
-                    if let Ok(mut guard) = results.lock() {
-                        guard.insert(flow_id, fields);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let valid = if let Ok(size) = stream.read(&mut buffer) {
+            if size == buffer.len() {
+                false
+            } else {
+                let line = String::from_utf8_lossy(&buffer[..size]);
+                if let Some((method, target)) = line.lines().next().and_then(|line| {
+                    let mut parts = line.split_whitespace();
+                    Some((parts.next()?, parts.next()?))
+                }) {
+                    if let Ok(url) = url::Url::parse(&format!("http://127.0.0.1{target}")) {
+                        if method == "GET" && url.path() == "/plugin-auth/callback" {
+                            let mut fields = HashMap::new();
+                            let mut duplicate = false;
+                            for (key, value) in url.query_pairs() {
+                                if fields
+                                    .insert(key.into_owned(), value.into_owned())
+                                    .is_some()
+                                {
+                                    duplicate = true;
+                                    break;
+                                }
+                            }
+                            if !duplicate
+                                && fields.len() <= 4
+                                && fields.keys().all(|key| {
+                                    matches!(
+                                        key.as_str(),
+                                        "state" | "code" | "error" | "error_description"
+                                    )
+                                })
+                            {
+                                if let Ok(mut guard) = results.lock() {
+                                    guard.insert(flow_id.clone(), (Instant::now(), fields));
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
             }
-        }
-        let body = "Authorization received. You can return to Megle.";
-        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        } else {
+            false
+        };
+        let (status, body) = if valid {
+            ("200 OK", "Authorization received. You can return to Megle.")
+        } else {
+            ("400 Bad Request", "Invalid authorization callback.")
+        };
+        let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
         let _ = stream.write_all(response.as_bytes());
+        break;
     }
 }
 
@@ -634,7 +891,7 @@ fn secret_scope(purpose: &str) -> Value {
     json!({"namespace":SECRET_NAMESPACE,"purpose":purpose})
 }
 fn upload_purpose(namespace: &str) -> String {
-    format!("upload-session-v1/{namespace}")
+    format!("upload-session-v1.{namespace}")
 }
 
 fn create_secret<R: Read, W: Write, T: serde::Serialize>(
@@ -737,6 +994,23 @@ fn namespace_key(payload: &Value) -> Result<(String, String), ProviderError> {
 
 fn validate_namespace(namespace: &str) -> Result<(), ProviderError> {
     parse_library_key(namespace, "probe").map(|_| ())
+}
+fn validate_upload_record(
+    record: &UploadRecordV1,
+    expected_namespace: &str,
+) -> Result<(), ProviderError> {
+    if record.format_version != 1
+        || record.namespace != expected_namespace
+        || record.size == 0
+        || record.size > MAX_OBJECT_BYTES
+        || record.committed_bytes > record.size
+        || record.sha256.len() != 64
+        || !record.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || parse_library_key(&record.namespace, &record.object_key).is_err()
+    {
+        return Err(ProviderError::protocol("invalid upload-session record"));
+    }
+    Ok(())
 }
 fn text(value: &Value, key: &str) -> Result<String, ProviderError> {
     value

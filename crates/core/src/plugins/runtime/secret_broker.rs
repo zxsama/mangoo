@@ -88,7 +88,9 @@ impl ReverseRpcHandler for SecretBroker {
             | "host.secret.cas"
             | "host.secret.create_scoped"
             | "host.secret.cas_scoped" => "write",
-            "host.secret.delete" | "host.secret.delete_scoped" => "delete",
+            "host.secret.delete"
+            | "host.secret.delete_scoped"
+            | "host.auth.authorization_required" => "delete",
             _ => return Err("reverse RPC method is not allowed".into()),
         };
         let scope = self.scope(payload, operation)?;
@@ -205,14 +207,6 @@ impl ReverseRpcHandler for SecretBroker {
                 Ok(json!({"generation":next}))
             }
             "host.secret.delete" => {
-                let generation = self
-                    .registry
-                    .plugin_account_secret(&self.plugin_id)
-                    .map_err(|e| e.to_string())?
-                    .ok_or("plugin account is not registered")?
-                    .generation
-                    .checked_add(1)
-                    .ok_or("secret generation exhausted")?;
                 self.store
                     .delete(
                         &scope,
@@ -222,13 +216,6 @@ impl ReverseRpcHandler for SecretBroker {
                             .ok_or("missing secretRef")?,
                     )
                     .map_err(|e| e.to_string())?;
-                if !self
-                    .registry
-                    .sign_out_plugin_account(&self.plugin_id, generation - 1)
-                    .map_err(|e| e.to_string())?
-                {
-                    return Err("plugin runtime session is stale".into());
-                }
                 Ok(Value::Null)
             }
             "host.secret.delete_scoped" => {
@@ -241,6 +228,19 @@ impl ReverseRpcHandler for SecretBroker {
                             .ok_or("missing secretRef")?,
                     )
                     .map_err(|e| e.to_string())?;
+                Ok(Value::Null)
+            }
+            "host.auth.authorization_required" => {
+                if !self
+                    .registry
+                    .require_plugin_reauthorization_for_launch(
+                        &self.plugin_id,
+                        &self.launch_fingerprint,
+                    )
+                    .map_err(|e| e.to_string())?
+                {
+                    return Err("plugin runtime session is stale".into());
+                }
                 Ok(Value::Null)
             }
             _ => Err("reverse RPC method is not allowed".into()),

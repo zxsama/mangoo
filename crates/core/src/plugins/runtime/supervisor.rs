@@ -269,6 +269,11 @@ where
                     return Ok(());
                 }
                 _ = tokio::time::sleep(health_policy.interval) => {
+                    if !registry.plugin_runtime_launch_is_current(&plugin_id, &launch_fingerprint)? {
+                        activated.shutdown().await?;
+                        manager.unregister(&plugin_id, &account_uuid)?;
+                        return Ok(());
+                    }
                     let healthy = matches!(
                         tokio::time::timeout(health_policy.deadline, activated.provider.health()).await,
                         Ok(Ok(crate::sync::provider::ProviderHealth { ready: true, .. }))
@@ -293,6 +298,11 @@ where
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if !registry.plugin_runtime_launch_is_current(&plugin_id, &launch_fingerprint)? {
+                        activated.shutdown().await?;
+                        manager.unregister(&plugin_id, &account_uuid)?;
+                        return Ok(());
+                    }
                     if activated.child_exited().await? { break "child-exited"; }
                 }
             }
@@ -681,6 +691,94 @@ mod tests {
         .await
         .unwrap();
         cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(manager
+            .resolve("com.megle.fake", "fake-account")
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn supervisor_stops_when_account_generation_invalidates_its_launch() {
+        let root = std::env::temp_dir().join(format!(
+            "megle_supervisor_stale_{}_{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry =
+            Arc::new(crate::host_registry::HostRegistry::open(root.join("host.sqlite")).unwrap());
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.megle.fake",
+                version: "1.0.0",
+                manifest_json: "{}",
+                entry_relative_path: "fake",
+                entry_sha256: &[0; 32],
+                install_root: &root,
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account("fake-account", "com.megle.fake", None, "authenticated")
+            .unwrap();
+        registry
+            .set_plugin_intent("com.megle.fake", true, true)
+            .unwrap();
+        let launch_fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
+        let manager = ProviderManager::default();
+        let activation_manager = manager.clone();
+        let task = tokio::spawn(supervise_until_cancelled(
+            Arc::clone(&registry),
+            manager.clone(),
+            "com.megle.fake".into(),
+            "fake-account".into(),
+            launch_fingerprint.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Default::default(),
+            HealthPolicy {
+                interval: Duration::from_millis(1),
+                deadline: Duration::from_millis(10),
+                degraded_threshold: 3,
+                probation_successes: 1,
+            },
+            move || {
+                let manager = activation_manager.clone();
+                async move {
+                    let provider: Arc<dyn SyncProvider> =
+                        Arc::new(crate::sync::provider::InMemorySyncProvider::default());
+                    manager.register("com.megle.fake", "fake-account", Arc::clone(&provider))?;
+                    Ok(ActivatedProvider {
+                        provider,
+                        child: tokio::sync::Mutex::new(None),
+                        stderr_task: tokio::sync::Mutex::new(None),
+                    })
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager
+                    .resolve("com.megle.fake", "fake-account")
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(registry
+            .require_plugin_reauthorization_for_launch("com.megle.fake", &launch_fingerprint)
+            .unwrap());
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .unwrap()

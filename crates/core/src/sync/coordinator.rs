@@ -341,6 +341,7 @@ impl SyncCoordinator {
                         self.registry.commit_provider_root_cursor(
                             &transport.account_uuid,
                             transport.account_generation,
+                            &transport.runtime_session_id,
                             None,
                             &[],
                         )?;
@@ -357,6 +358,7 @@ impl SyncCoordinator {
                     self.registry.commit_provider_root_page(
                         &transport.account_uuid,
                         transport.account_generation,
+                        &transport.runtime_session_id,
                         cursor.as_deref(),
                         next_page,
                         &page.objects,
@@ -365,6 +367,7 @@ impl SyncCoordinator {
                     self.registry.commit_provider_root_cursor(
                         &transport.account_uuid,
                         transport.account_generation,
+                        &transport.runtime_session_id,
                         completed_cursor.as_deref(),
                         &page.objects,
                     )?;

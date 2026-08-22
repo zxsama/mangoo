@@ -12,7 +12,8 @@ use crate::config::ProviderConfig;
 use crate::error::ProviderError;
 
 pub const OAUTH_SCOPES: &str = "Files.ReadWrite.AppFolder offline_access openid profile";
-const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
+pub const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
+pub const MAX_FLOWS: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct OAuthFlow {
@@ -36,6 +37,15 @@ pub struct CredentialRecordV1 {
     pub object_hint: Option<String>,
     pub display_hint: Option<String>,
     pub scopes: Vec<String>,
+    #[serde(default)]
+    pub upload_sessions: Vec<UploadSessionSecretV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadSessionSecretV1 {
+    pub secret_ref: String,
+    pub purpose: String,
 }
 
 #[derive(Debug, Default)]
@@ -49,6 +59,15 @@ impl OAuthFlows {
         config: &ProviderConfig,
         callback_url: Option<&str>,
     ) -> Result<(String, String), ProviderError> {
+        self.flows
+            .retain(|_, flow| flow.created_at.elapsed() <= FLOW_TTL);
+        if self.flows.len() >= MAX_FLOWS {
+            return Err(ProviderError::new(
+                "unavailable",
+                true,
+                "too many pending OAuth flows",
+            ));
+        }
         let redirect_uri = match callback_url {
             Some(value) => validate_callback(value)?,
             None => "http://127.0.0.1:53682/plugin-auth/callback".to_owned(),
@@ -139,7 +158,13 @@ fn validate_callback(value: &str) -> Result<String, ProviderError> {
             "OAuth callback must be HTTPS or IPv4 loopback",
         ));
     }
-    if url.username() != "" || url.password().is_some() || url.fragment().is_some() {
+    if url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+        || (loopback && url.port().is_none())
+        || (!loopback && url.port().is_some_and(|port| port != 443))
+    {
         return Err(ProviderError::new(
             "invalid_argument",
             false,
@@ -194,5 +219,40 @@ mod tests {
         let fields = HashMap::from([("state".into(), state), ("code".into(), "one-time".into())]);
         assert_eq!(flows.consume(&id, &fields).unwrap().0, "one-time");
         assert!(flows.consume(&id, &fields).is_err());
+    }
+
+    #[test]
+    fn callback_rejects_query_fragment_credentials_and_unsafe_loopback_forms() {
+        for value in [
+            "http://localhost:53682/plugin-auth/callback",
+            "http://127.0.0.1/plugin-auth/callback",
+            "https://user@example.invalid/plugin-auth/callback",
+            "https://example.invalid/plugin-auth/callback?code=secret",
+            "https://example.invalid/plugin-auth/callback#fragment",
+            "https://example.invalid:444/plugin-auth/callback",
+        ] {
+            assert!(validate_callback(value).is_err(), "accepted {value}");
+        }
+        assert!(validate_callback("http://127.0.0.1:53682/plugin-auth/callback").is_ok());
+        assert!(validate_callback("https://example.invalid/plugin-auth/callback").is_ok());
+    }
+
+    #[test]
+    fn pending_oauth_flows_are_bounded() {
+        let mut flows = OAuthFlows::default();
+        for _ in 0..MAX_FLOWS {
+            flows
+                .begin(
+                    &config(),
+                    Some("https://megle.invalid/api/plugin-auth/callback/x"),
+                )
+                .unwrap();
+        }
+        assert!(flows
+            .begin(
+                &config(),
+                Some("https://megle.invalid/api/plugin-auth/callback/x")
+            )
+            .is_err());
     }
 }

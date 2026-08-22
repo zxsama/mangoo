@@ -32,7 +32,11 @@ pub fn validate_relative_key(key: &str) -> Result<(), ProviderError> {
         || key.ends_with('/')
         || key.contains('\\')
         || key.contains('%')
-        || key.chars().any(char::is_control)
+        || key.chars().any(|character| {
+            character.is_control()
+                || !(character.is_ascii_alphanumeric()
+                    || matches!(character, '/' | '-' | '_' | '.'))
+        })
         || key
             .split('/')
             .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
@@ -65,7 +69,9 @@ mod tests {
             graph_path(namespace, "media/data-packs/ab/hash.pack").unwrap(),
             format!("Megle/libraries/{namespace}/media/data-packs/ab/hash.pack")
         );
-        for invalid in ["", "/a", "a/", "a//b", "../a", "a\\b", "a%2fb", "a\nb"] {
+        for invalid in [
+            "", "/a", "a/", "a//b", "../a", "a\\b", "a%2fb", "a?b", "a#b", "a:b", "a\nb",
+        ] {
             assert!(graph_path(namespace, invalid).is_err(), "{invalid}");
         }
         assert!(graph_path("018F0000-0000-7000-8000-000000000001", "segments/a").is_err());

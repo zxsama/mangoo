@@ -383,6 +383,18 @@ impl SyncProvider for FramedSyncProvider {
                 let _ = std::fs::remove_file(&path);
                 return Err(map_error(RpcError::Protocol));
             }
+            if whole_object {
+                if let Err(error) = validate_download(
+                    &DownloadedObject {
+                        metadata: meta.clone(),
+                        path: path.clone(),
+                    },
+                    max_bytes,
+                ) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+            }
             Ok(DownloadedRange {
                 metadata: meta,
                 requested_start: start,
@@ -553,6 +565,7 @@ fn canonical_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn stable_account_identity_is_canonical_across_object_key_order() {
@@ -567,5 +580,31 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(left.stable_account_identity, right.stable_account_identity);
+    }
+
+    #[test]
+    fn whole_object_range_fallback_is_hash_verified() {
+        let path = std::env::temp_dir().join(format!(
+            "megle-provider-range-{}-{}.tmp",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"tampered").unwrap();
+        file.sync_all().unwrap();
+        let downloaded = DownloadedObject {
+            metadata: ObjectMetadata {
+                key: "media/data/object.pack".into(),
+                size: 8,
+                sha256: [0; 32],
+                etag: None,
+            },
+            path: path.clone(),
+        };
+        assert_eq!(
+            validate_download(&downloaded, 1024).unwrap_err().code,
+            ProviderErrorCode::ProtocolError
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

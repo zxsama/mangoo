@@ -13,6 +13,7 @@ const END: u8 = 3;
 const CREDIT: u8 = 4;
 const ABORT: u8 = 5;
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INCOMING_STREAMS: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct ControlRequest {
@@ -82,7 +83,12 @@ impl<R: Read, W: Write> RpcTransport<R, W> {
                 if id == 0 || id % 2 == 0 || size > MAX_OBJECT_BYTES {
                     return Err(ProviderError::protocol("invalid Host stream declaration"));
                 }
-                self.incoming.insert(id, (size, sha));
+                if self.incoming.len() >= MAX_INCOMING_STREAMS {
+                    return Err(ProviderError::protocol("too many open Host streams"));
+                }
+                if self.incoming.insert(id, (size, sha)).is_some() {
+                    return Err(ProviderError::protocol("Host stream id was reused"));
+                }
                 write_frame(
                     &mut self.output,
                     CREDIT,
@@ -219,7 +225,8 @@ impl<R: Read, W: Write> RpcTransport<R, W> {
             }
             let response: Value = serde_json::from_slice(&bytes)
                 .map_err(|_| ProviderError::protocol("malformed reverse RPC response"))?;
-            if response.get("requestId").and_then(Value::as_str) != Some(id.to_string().as_str()) {
+            let expected_id = id.to_string();
+            if response.get("requestId").and_then(Value::as_str) != Some(expected_id.as_str()) {
                 return Err(ProviderError::protocol("reverse RPC response id mismatch"));
             }
             return if response.get("messageType").and_then(Value::as_str) == Some("response") {
@@ -257,10 +264,10 @@ impl<R: Read, W: Write> RpcTransport<R, W> {
     }
 
     fn read_credit(&mut self, id: u64) -> Result<u64, ProviderError> {
-        let (kind, stream_id, _, bytes) = read_frame(&mut self.input)
+        let (kind, stream_id, sequence, bytes) = read_frame(&mut self.input)
             .map_err(io_error)?
             .ok_or_else(|| ProviderError::protocol("missing stream credit"))?;
-        if kind != CREDIT || stream_id != id || bytes.len() != 8 {
+        if kind != CREDIT || stream_id != id || sequence != 0 || bytes.len() != 8 {
             return Err(ProviderError::protocol("invalid stream credit"));
         }
         Ok(u64::from_le_bytes(bytes.as_slice().try_into().map_err(

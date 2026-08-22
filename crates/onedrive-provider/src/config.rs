@@ -32,11 +32,13 @@ impl ProviderConfig {
             &env::var("MEGLE_ONEDRIVE_AUTHORITY").unwrap_or_else(|_| DEFAULT_AUTHORITY.into()),
             allow_http_emulator,
             "authority",
+            "login.microsoftonline.com",
         )?;
         let graph_endpoint = parse_endpoint(
             emulator.as_deref().unwrap_or(DEFAULT_GRAPH_ENDPOINT),
             allow_http_emulator,
             "Graph endpoint",
+            "graph.microsoft.com",
         )?;
         Ok(Self {
             client_id,
@@ -59,7 +61,12 @@ impl ProviderConfig {
     }
 }
 
-fn parse_endpoint(value: &str, allow_http: bool, label: &str) -> Result<Url, ProviderError> {
+fn parse_endpoint(
+    value: &str,
+    allow_http: bool,
+    label: &str,
+    production_host: &str,
+) -> Result<Url, ProviderError> {
     let mut url =
         Url::parse(value).map_err(|_| ProviderError::configuration(format!("invalid {label}")))?;
     if url.scheme() != "https" && !(allow_http && url.scheme() == "http") {
@@ -73,6 +80,26 @@ fn parse_endpoint(value: &str, allow_http: bool, label: &str) -> Result<Url, Pro
         || url.fragment().is_some()
     {
         return Err(ProviderError::configuration(format!("invalid {label}")));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| ProviderError::configuration(format!("invalid {label}")))?;
+    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    if url.scheme() == "http" {
+        if !loopback {
+            return Err(ProviderError::configuration(format!(
+                "{label} emulator must be loopback"
+            )));
+        }
+    } else if host != production_host && !(allow_http && loopback) {
+        return Err(ProviderError::configuration(format!(
+            "{label} host is not allowed"
+        )));
+    }
+    if url.scheme() == "https" && url.port_or_known_default() != Some(443) {
+        return Err(ProviderError::configuration(format!(
+            "{label} HTTPS port is not allowed"
+        )));
     }
     if !url.path().ends_with('/') {
         let path = format!("{}/", url.path());
@@ -97,6 +124,40 @@ mod tests {
             config.authorization_endpoint().unwrap().as_str(),
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
         );
-        assert!(parse_endpoint("http://graph.invalid/v1.0", false, "Graph").is_err());
+        assert!(parse_endpoint(
+            "http://graph.invalid/v1.0",
+            false,
+            "Graph",
+            "graph.microsoft.com"
+        )
+        .is_err());
+        assert!(parse_endpoint(
+            "https://evil.invalid/common/",
+            false,
+            "authority",
+            "login.microsoftonline.com"
+        )
+        .is_err());
+        assert!(parse_endpoint(
+            "http://evil.invalid/v1.0/",
+            true,
+            "Graph",
+            "graph.microsoft.com"
+        )
+        .is_err());
+        assert!(parse_endpoint(
+            "https://evil.invalid/v1.0/",
+            true,
+            "Graph",
+            "graph.microsoft.com"
+        )
+        .is_err());
+        assert!(parse_endpoint(
+            "https://graph.microsoft.com:444/v1.0/",
+            false,
+            "Graph",
+            "graph.microsoft.com"
+        )
+        .is_err());
     }
 }
