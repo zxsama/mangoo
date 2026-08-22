@@ -20,6 +20,7 @@
       "delta.list": 1,
       "object.head": 1,
       "object.get": 1,
+      "object.get_range": 1,
       "object.put_immutable": 1,
       "upload.begin": 1,
       "upload.write": 1,

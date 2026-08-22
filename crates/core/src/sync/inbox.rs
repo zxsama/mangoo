@@ -163,11 +163,49 @@ pub(crate) fn materialize_truth(
             revision_uuid,
             manifest_id,
             supersedes,
+            manifest_pack_id,
+            manifest_offset,
+            manifest_length,
+            byte_length,
+            source_mtime_ms,
         } => {
-            let manifest_hash = super::codec::sha256(manifest_id.as_bytes());
+            let manifest_location = match (
+                manifest_pack_id.as_deref(),
+                *manifest_offset,
+                *manifest_length,
+                *byte_length,
+            ) {
+                (Some(pack), Some(offset), Some(length), Some(bytes)) => Some((
+                    crate::sync::media::parse_hash(manifest_id)?,
+                    crate::sync::media::parse_hash(pack)?,
+                    i64::try_from(offset)?,
+                    i64::try_from(length)?,
+                    i64::try_from(bytes)?,
+                )),
+                (None, None, None, None) => None,
+                _ => anyhow::bail!("content manifest locator is incomplete"),
+            };
+            let manifest_hash = manifest_location
+                .map(|value| value.0)
+                .unwrap_or_else(|| super::codec::sha256(manifest_id.as_bytes()));
             transaction.execute(
-                "INSERT OR IGNORE INTO asset_content_revisions(content_revision_uuid,asset_uuid,event_uuid,manifest_hash,local_mutation_generation,created_at) VALUES (?1,?2,?3,?4,1,?5)",
-                params![revision_uuid.0.as_bytes().as_slice(),entity,event_uuid,manifest_hash.as_slice(),unix_timestamp_millis()],
+                "INSERT OR IGNORE INTO asset_content_revisions(content_revision_uuid,asset_uuid,event_uuid,manifest_hash,byte_size,local_mutation_generation,source_mtime_ms,created_at) VALUES (?1,?2,?3,?4,?5,1,?6,?7)",
+                params![revision_uuid.0.as_bytes().as_slice(),entity,event_uuid,manifest_hash.as_slice(),manifest_location.map(|value|value.4),source_mtime_ms,unix_timestamp_millis()],
+            )?;
+            if let Some((_, pack_hash, offset, length, bytes)) = manifest_location {
+                transaction.execute(
+                    "INSERT INTO media_manifests(manifest_hash,content_hash,byte_length,manifest_pack_hash,pack_offset,record_length,state,created_at,updated_at) VALUES (?1,zeroblob(32),?2,?3,?4,?5,'remote',?6,?6) ON CONFLICT(manifest_hash) DO UPDATE SET byte_length=excluded.byte_length,manifest_pack_hash=excluded.manifest_pack_hash,pack_offset=excluded.pack_offset,record_length=excluded.record_length,state='remote',updated_at=excluded.updated_at",
+                    params![manifest_hash.as_slice(),bytes,pack_hash.as_slice(),offset,length,unix_timestamp_millis()],
+                )?;
+            } else {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO media_manifests(manifest_hash,content_hash,byte_length,state,created_at,updated_at) VALUES (?1,zeroblob(32),0,'remote',?2,?2)",
+                    params![manifest_hash.as_slice(),unix_timestamp_millis()],
+                )?;
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO media_content_manifest_links(content_revision_uuid,manifest_hash,linked_at) VALUES (?1,?2,?3)",
+                params![revision_uuid.0.as_bytes().as_slice(),manifest_hash.as_slice(),unix_timestamp_millis()],
             )?;
             for observed in supersedes {
                 transaction.execute(
@@ -522,5 +560,54 @@ mod tests {
         assert!(inbox.intake(a).unwrap());
         inbox.blocks.remove(&a_actor);
         assert_eq!(inbox.next_batch(&a_actor).unwrap()[0].actor_seq, 1);
+    }
+
+    #[test]
+    fn content_event_carries_immediate_manifest_restore_location() {
+        let database = crate::db::Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        database
+            .add_root(crate::db::NewRoot {
+                path: "D:/Remote".into(),
+                display_name: "Remote".into(),
+            })
+            .unwrap();
+        let revision = crate::sync::types::RevisionUuid(uuid::Uuid::now_v7());
+        let event = event(
+            1,
+            10,
+            Operation::SetContent {
+                revision_uuid: revision,
+                manifest_id: crate::sync::media::hex_hash(&[7; 32]),
+                supersedes: Default::default(),
+                manifest_pack_id: Some(crate::sync::media::hex_hash(&[8; 32])),
+                manifest_offset: Some(12),
+                manifest_length: Some(34),
+                byte_length: Some(56),
+                source_mtime_ms: Some(78),
+            },
+        );
+        database
+            .initialize_sync_identity(
+                event.library_uuid.0,
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        let transaction = database
+            .connection_for_fsops()
+            .unchecked_transaction()
+            .unwrap();
+        apply_remote_batch(&transaction, &[event]).unwrap();
+        transaction.commit().unwrap();
+        let restored: (i64, i64, i64, i64, i64) = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT r.byte_size,r.source_mtime_ms,m.byte_length,m.pack_offset,m.record_length FROM asset_content_revisions r JOIN media_content_manifest_links l ON l.content_revision_uuid=r.content_revision_uuid JOIN media_manifests m ON m.manifest_hash=l.manifest_hash WHERE r.content_revision_uuid=?1",
+                [revision.0.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(restored, (56, 78, 56, 12, 34));
     }
 }

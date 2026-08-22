@@ -38,6 +38,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0026_preview_failures.sql",
     ROOT / "crates" / "core" / "migrations" / "0027_sync_protocol_foundation.sql",
     ROOT / "crates" / "core" / "migrations" / "0028_remove_catalog_plugins.sql",
+    ROOT / "crates" / "core" / "migrations" / "0029_media_object_storage.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -94,6 +95,16 @@ REQUIRED_TABLES = {
     "sync_bulk_items",
     "sync_local_file_identities",
     "sync_identity_conflicts",
+    "media_chunks",
+    "media_packs",
+    "media_manifests",
+    "media_content_manifest_links",
+    "media_publication_jobs",
+    "media_publication_objects",
+    "media_materialization_jobs",
+    "media_verified_ranges",
+    "media_remote_objects",
+    "media_reachability",
 }
 
 REQUIRED_INDEXES = {
@@ -145,6 +156,11 @@ REQUIRED_INDEXES = {
     "idx_sync_publication_retry",
     "idx_sync_checkpoint_watermark_actor",
     "idx_sync_bulk_items_pending",
+    "idx_media_chunks_pack",
+    "idx_media_manifests_content",
+    "idx_media_publication_work",
+    "idx_media_materialization_work",
+    "idx_media_reachability_revision",
 }
 
 EXPECTED_MEDIA_COLUMNS = {
@@ -225,9 +241,10 @@ def index_key_columns(conn: sqlite3.Connection, index_name: str):
 
 def apply_migration(conn: sqlite3.Connection, migration: Path) -> None:
     name = migration.name
-    if name == "0027_sync_protocol_foundation.sql":
+    if name in {"0027_sync_protocol_foundation.sql", "0029_media_object_storage.sql"}:
+        version = 27 if name.startswith("0027") else 29
         already_applied = conn.execute(
-            "SELECT 1 FROM schema_migrations WHERE version = 27"
+            "SELECT 1 FROM schema_migrations WHERE version = ?", (version,)
         ).fetchone()
         if already_applied is None:
             conn.executescript(migration.read_text(encoding="utf-8"))
@@ -331,7 +348,9 @@ def expect_integrity_error(conn: sqlite3.Connection, sql: str, params=()) -> Non
 def verify_sync_upgrade_from_populated_v26() -> None:
     conn = sqlite3.connect(":memory:")
     try:
-        for migration in MIGRATIONS[:-2]:
+        for migration in MIGRATIONS:
+            if migration.name == "0027_sync_protocol_foundation.sql":
+                break
             apply_migration(conn, migration)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(
@@ -348,7 +367,10 @@ def verify_sync_upgrade_from_populated_v26() -> None:
             (root_id, folder_id),
         )
         conn.execute("INSERT INTO tags(name,color) VALUES ('seed-tag','#fff')")
-        apply_migration(conn, MIGRATIONS[-2])
+        apply_migration(
+            conn,
+            ROOT / "crates" / "core" / "migrations" / "0027_sync_protocol_foundation.sql",
+        )
         for table, column in (
             ("roots", "root_uuid"),
             ("folders", "folder_uuid"),
@@ -360,12 +382,65 @@ def verify_sync_upgrade_from_populated_v26() -> None:
                 fail(f"v26 upgrade did not backfill {table}.{column}")
         # A second application must be an idempotent no-op through the same
         # schema_migrations gate used by Database::apply_migrations.
-        apply_migration(conn, MIGRATIONS[-2])
+        apply_migration(
+            conn,
+            ROOT / "crates" / "core" / "migrations" / "0027_sync_protocol_foundation.sql",
+        )
         count = conn.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE version = 27"
         ).fetchone()[0]
         if count != 1:
             fail("migration 27 rerun did not preserve one registration row")
+    finally:
+        conn.close()
+
+
+def verify_media_upgrade_from_populated_v28() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        for migration in MIGRATIONS:
+            if migration.name == "0029_media_object_storage.sql":
+                break
+            apply_migration(conn, migration)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO roots(path,display_name,enabled,created_at) VALUES ('D:/Media','Media',1,1)"
+        )
+        root_id = conn.execute("SELECT id FROM roots").fetchone()[0]
+        conn.execute(
+            "INSERT INTO folders(root_id,parent_id,name,path_hash,mtime,folder_uuid) VALUES (?,NULL,'','root',1,randomblob(16))",
+            (root_id,),
+        )
+        folder_id = conn.execute("SELECT id FROM folders").fetchone()[0]
+        conn.execute(
+            "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,asset_uuid) VALUES (?,?,'seed.jpg','jpg',3,1,randomblob(16))",
+            (root_id, folder_id),
+        )
+        asset_uuid = conn.execute("SELECT asset_uuid FROM files").fetchone()[0]
+        revision_uuid = bytes(range(16))
+        conn.execute(
+            "INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?,?,3,1,1)",
+            (revision_uuid, asset_uuid),
+        )
+        apply_migration(
+            conn,
+            ROOT / "crates" / "core" / "migrations" / "0029_media_object_storage.sql",
+        )
+        if not table_has_column(conn, "asset_content_revisions", "source_mtime_ms"):
+            fail("0029 did not add asset_content_revisions.source_mtime_ms")
+        if conn.execute(
+            "SELECT byte_size FROM asset_content_revisions WHERE content_revision_uuid=?",
+            (revision_uuid,),
+        ).fetchone() != (3,):
+            fail("0029 did not preserve populated content revisions")
+        apply_migration(
+            conn,
+            ROOT / "crates" / "core" / "migrations" / "0029_media_object_storage.sql",
+        )
+        if conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=29"
+        ).fetchone() != (1,):
+            fail("migration 29 rerun did not preserve one registration row")
     finally:
         conn.close()
 
@@ -435,6 +510,24 @@ def verify_sync_query_plans(conn: sqlite3.Connection) -> None:
         (b"0" * 16, b"1" * 16, b"2" * 16),
         "idx_sync_checkpoint_watermark_actor",
     )
+    assert_query_plan_uses(
+        conn,
+        "SELECT intent_uuid FROM media_publication_jobs WHERE phase NOT IN ('canonicalized','event-published','cancelled','archived') AND COALESCE(next_attempt_at,0)<=? ORDER BY priority DESC,next_attempt_at,updated_at,intent_uuid LIMIT 1",
+        (1,),
+        "idx_media_publication_work",
+    )
+    assert_query_plan_uses(
+        conn,
+        "SELECT chunk_hash FROM media_chunks WHERE pack_hash=? ORDER BY pack_offset",
+        (b"0" * 32,),
+        "idx_media_chunks_pack",
+    )
+    assert_query_plan_uses(
+        conn,
+        "SELECT content_revision_uuid FROM media_materialization_jobs WHERE phase NOT IN ('complete','cancelled') AND COALESCE(next_attempt_at,0)<=? ORDER BY priority DESC,next_attempt_at,updated_at,content_revision_uuid LIMIT 1",
+        (1,),
+        "idx_media_materialization_work",
+    )
 
 
 def main() -> None:
@@ -444,6 +537,7 @@ def main() -> None:
 
     verify_scan_reconciliation_repair_path()
     verify_sync_upgrade_from_populated_v26()
+    verify_media_upgrade_from_populated_v28()
     verify_host_plugin_upgrade_from_populated_v2()
 
     for host_migration in HOST_MIGRATIONS:
@@ -685,6 +779,11 @@ def main() -> None:
             ).fetchone()
             if version is None:
                 fail("migration version 27 was not recorded")
+            version = conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 29"
+            ).fetchone()
+            if version is None:
+                fail("migration version 29 was not recorded")
 
             for table, column in (
                 ("roots", "root_uuid"),
@@ -710,6 +809,18 @@ def main() -> None:
             expect_integrity_error(
                 conn,
                 "INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,local_mutation_generation,source_path,state,created_at,updated_at) VALUES (randomblob(16),randomblob(16),randomblob(16),1,'x','uploading',1,1)",
+            )
+            expect_integrity_error(
+                conn,
+                "INSERT INTO media_chunks(chunk_hash,byte_length,state,created_at,updated_at) VALUES (randomblob(31),1,'sealed',1,1)",
+            )
+            expect_integrity_error(
+                conn,
+                "INSERT INTO media_publication_jobs(intent_uuid,phase,created_at,updated_at) VALUES (randomblob(16),'unknown',1,1)",
+            )
+            expect_integrity_error(
+                conn,
+                "INSERT INTO media_verified_ranges(pack_hash,range_start,range_end,range_hash,local_relpath,verified_at) VALUES (randomblob(32),8,4,randomblob(32),'ranges/a',1)",
             )
 
             media_columns = {

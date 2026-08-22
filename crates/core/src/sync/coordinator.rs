@@ -14,14 +14,35 @@ pub const PRODUCTION_SYNC_CONCURRENCY: usize = 4;
 pub struct SyncSchedulerHandle {
     cancellation: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<()>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct SchedulerTurnGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for SchedulerTurnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl SyncSchedulerHandle {
-    pub async fn shutdown(self) -> anyhow::Result<()> {
+    pub fn cancel(&self) {
         self.cancellation.cancel();
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
+    pub async fn join(self) -> anyhow::Result<()> {
         self.task
             .await
             .map_err(|error| anyhow::anyhow!("sync scheduler task failed: {error}"))
+    }
+
+    pub async fn shutdown(self) -> anyhow::Result<()> {
+        self.cancel();
+        self.join().await
     }
 }
 
@@ -30,6 +51,11 @@ pub struct SyncCoordinator {
     registry: std::sync::Arc<HostRegistry>,
     leases: RuntimeLeases,
     providers: super::provider::ProviderManager,
+    media_workers: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<uuid::Uuid, super::media::worker::MediaWorkerSet>,
+        >,
+    >,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -57,6 +83,7 @@ impl SyncCoordinator {
             registry,
             leases,
             providers: super::provider::ProviderManager::default(),
+            media_workers: Default::default(),
         }
     }
 
@@ -69,11 +96,75 @@ impl SyncCoordinator {
             registry,
             leases,
             providers,
+            media_workers: Default::default(),
         }
     }
 
     pub fn provider_manager(&self) -> super::provider::ProviderManager {
         self.providers.clone()
+    }
+
+    pub async fn cancel_media_binding(&self, binding_epoch: uuid::Uuid) -> anyhow::Result<()> {
+        // Keep the cancelled worker set registered as an epoch tombstone. A
+        // scheduler turn may already have read the old binding before unbind;
+        // removing the entry would let that late turn create fresh workers for
+        // the fenced epoch.
+        let workers = self
+            .media_workers
+            .lock()
+            .await
+            .entry(binding_epoch)
+            .or_insert_with(|| {
+                super::media::worker::MediaWorkerSet::new(
+                    super::media::worker::MediaWorkLimiter::new_with_temp_budget(
+                        1,
+                        128,
+                        128 * 1024 * 1024,
+                        16 * 1024 * 1024 * 1024,
+                    )
+                    .expect("production media limits are nonzero"),
+                )
+            })
+            .clone();
+        workers.shutdown().await
+    }
+
+    pub async fn cancel_all_media_workers(&self) {
+        let workers = self
+            .media_workers
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.cancel();
+        }
+    }
+
+    pub async fn shutdown_media_workers(&self) -> anyhow::Result<()> {
+        let workers = {
+            let mut active = self.media_workers.lock().await;
+            active
+                .drain()
+                .map(|(_, workers)| workers)
+                .collect::<Vec<_>>()
+        };
+        for worker in workers {
+            worker.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn media_backpressure_metrics(
+        &self,
+    ) -> Vec<(uuid::Uuid, super::media::worker::MediaBackpressureMetrics)> {
+        self.media_workers
+            .lock()
+            .await
+            .iter()
+            .map(|(epoch, workers)| (*epoch, workers.metrics()))
+            .collect()
     }
 
     /// Start the provider-neutral production scheduler for synced Libraries.
@@ -93,15 +184,20 @@ impl SyncCoordinator {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let child_cancellation = cancellation.clone();
         let active_runtime = std::sync::Arc::new(active_runtime);
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_in_flight = std::sync::Arc::clone(&in_flight);
         let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let concurrency = concurrency.max(1);
             let mut rotation = 0usize;
+            let mut initial_turn = true;
             loop {
-                tokio::select! {
-                    _ = child_cancellation.cancelled() => break,
-                    _ = ticker.tick() => {}
+                if initial_turn {
+                    initial_turn = false;
+                } else {
+                    tokio::select! {
+                        _ = child_cancellation.cancelled() => break,
+                        _ = tokio::time::sleep(interval) => {}
+                    }
                 }
                 let mut libraries = match coordinator.registry.sync_bound_libraries() {
                     Ok(value) => value,
@@ -120,7 +216,10 @@ impl SyncCoordinator {
                     let coordinator = coordinator.clone();
                     let gate = std::sync::Arc::clone(&gate);
                     let cancellation = child_cancellation.clone();
+                    task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let turn_guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
                     turns.spawn(async move {
+                        let _turn_guard = turn_guard;
                         let permit = tokio::select! {
                             _ = cancellation.cancelled() => return,
                             permit = gate.acquire_owned() => permit.ok(),
@@ -144,7 +243,10 @@ impl SyncCoordinator {
                     let coordinator = coordinator.clone();
                     let gate = std::sync::Arc::clone(&gate);
                     let cancellation = child_cancellation.clone();
+                    task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let turn_guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
                     turns.spawn(async move {
+                        let _turn_guard = turn_guard;
                         let permit = tokio::select! {
                             _ = cancellation.cancelled() => return,
                             permit = gate.acquire_owned() => permit.ok(),
@@ -178,7 +280,11 @@ impl SyncCoordinator {
                 }
             }
         });
-        SyncSchedulerHandle { cancellation, task }
+        SyncSchedulerHandle {
+            cancellation,
+            task,
+            in_flight,
+        }
     }
 
     /// Production provider-neutral turn. Provider adapters only place verified
@@ -247,6 +353,8 @@ impl SyncCoordinator {
                 })
             })
             .await?;
+        self.run_dormant_media_turn(library_uuid, catalog_path)
+            .await?;
         self.finish_seed_if_ready(library_uuid, &result)?;
         self.commit_host_published_frontier(library_uuid, &published)?;
         Ok(result)
@@ -290,6 +398,7 @@ impl SyncCoordinator {
             &staging,
             uuid::Uuid::parse_str(&descriptor.root_uuid)?,
             self.registry.device_uuid()?,
+            &descriptor.managed_root,
         )?;
         self.registry
             .restore_host_checkpoint_metadata(&checkpoint.host_metadata)?;
@@ -322,9 +431,105 @@ impl SyncCoordinator {
                 perform_turn(database, host_vector, host_metadata, spool_dir)
             })
             .await?;
+        self.run_active_media_turn(&descriptor, catalog_path, writer)
+            .await?;
         self.finish_seed_if_ready(&descriptor, &result)?;
         self.commit_host_published_frontier(&descriptor, &published)?;
         Ok(result)
+    }
+
+    async fn run_dormant_media_turn(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+    ) -> anyhow::Result<()> {
+        let database = crate::db::Database::open(catalog_path)?;
+        database.apply_migrations()?;
+        let writer = crate::db::DbWriter::spawn(database);
+        let result = self
+            .run_media_turn(library_uuid, catalog_path, &writer)
+            .await;
+        let shutdown = writer.shutdown().await;
+        result?;
+        shutdown
+    }
+
+    async fn run_active_media_turn(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+        writer: &crate::db::DbWriter,
+    ) -> anyhow::Result<()> {
+        self.run_media_turn(library_uuid, catalog_path, writer)
+            .await
+    }
+
+    async fn run_media_turn(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+        writer: &crate::db::DbWriter,
+    ) -> anyhow::Result<()> {
+        let Some(binding) = self.registry.binding_transport(library_uuid, "library")? else {
+            return Ok(());
+        };
+        if !matches!(
+            binding.state.as_str(),
+            "preparing" | "capturing" | "seed_ready" | "publishing" | "active"
+        ) {
+            return Ok(());
+        }
+        let Some(provider) = self
+            .providers
+            .resolve(&binding.plugin_id, &binding.account_uuid)?
+        else {
+            return Ok(());
+        };
+        let library_data_root = catalog_path.parent().unwrap_or_else(|| Path::new("."));
+        let object_root = library_data_root.join("media-objects");
+        let workers = {
+            let mut active = self.media_workers.lock().await;
+            active
+                .entry(binding.binding_epoch)
+                .or_insert_with(|| {
+                    super::media::worker::MediaWorkerSet::new(
+                        super::media::worker::MediaWorkLimiter::new_with_temp_budget(
+                            1,
+                            128,
+                            128 * 1024 * 1024,
+                            16 * 1024 * 1024 * 1024,
+                        )
+                        .expect("production media limits are nonzero"),
+                    )
+                })
+                .clone()
+        };
+        let limiter = workers.limiter();
+        let context = super::provider::TransportContext {
+            binding_epoch: binding.binding_epoch.to_string(),
+            transport_generation: binding.transport_generation as u64,
+        };
+        let worker = super::media::worker::MediaPublicationWorker::new(
+            writer.clone(),
+            provider.clone(),
+            object_root.clone(),
+            context.clone(),
+            limiter.clone(),
+        );
+        let restore = super::media::worker::MediaRestoreWorker::new(
+            writer.clone(),
+            provider,
+            library_data_root.join("media-restore-cache"),
+            context,
+            limiter,
+        );
+        workers
+            .run(async move {
+                worker.run_once().await?;
+                restore.run_once().await?;
+                Ok(())
+            })
+            .await
     }
 
     /// Performs provider I/O before any Catalog writer or runtime lease is
@@ -388,12 +593,15 @@ impl SyncCoordinator {
                 if !metadata.key.starts_with("segments/")
                     && !metadata.key.starts_with("host/")
                     && !metadata.key.starts_with("checkpoints/")
+                    && !metadata.key.starts_with("indexes/")
                     && metadata.key != "library-descriptor"
                 {
                     continue;
                 }
                 let object_limit = if metadata.key.starts_with("checkpoints/") {
                     64 * 1024 * 1024
+                } else if metadata.key.starts_with("indexes/") {
+                    super::media::MAX_INDEX_SHARD_BYTES as u64
                 } else {
                     super::inbox::MAX_APPLY_DECODED_BYTES as u64
                 };
@@ -432,6 +640,12 @@ impl SyncCoordinator {
                             .file_name()
                             .ok_or_else(|| anyhow::anyhow!("invalid checkpoint object key"))?,
                     );
+                    atomic_write(&destination, &object_bytes)?;
+                } else if metadata.key.starts_with("indexes/") {
+                    super::media::format::IndexShardV1::decode(&object_bytes)?;
+                    let directory = spool.join("indexes");
+                    std::fs::create_dir_all(&directory)?;
+                    let destination = directory.join(format!("{}.idx", hex_hash(&metadata.sha256)));
                     atomic_write(&destination, &object_bytes)?;
                 }
                 self.registry.record_provider_receipt(
@@ -573,6 +787,35 @@ impl SyncCoordinator {
                 &checkpoint_hash,
                 checkpoint_state,
             )?;
+            let checkpoint_payload: super::checkpoint::Checkpoint =
+                serde_json::from_slice(&checkpoint)?;
+            checkpoint_payload.verify()?;
+            let mut dependencies = vec![checkpoint_key.clone()];
+            let index_root = spool.join("indexes");
+            for shard in &checkpoint_payload.media_index_shards {
+                let bytes = std::fs::read(index_root.join(format!("{}.idx", shard.sha256)))?;
+                let shard_hash = super::media::parse_hash(&shard.sha256)?;
+                if bytes.len() as u64 != shard.byte_length
+                    || sha2::Sha256::digest(&bytes).as_slice() != shard_hash
+                {
+                    anyhow::bail!("seed media index shard identity mismatch");
+                }
+                let result = provider
+                    .object_put_immutable(&context, &shard.object_key, &bytes, shard_hash)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                let (state, etag) = put_receipt(&result)?;
+                self.registry.record_provider_receipt(
+                    library_uuid,
+                    binding.binding_epoch,
+                    binding.transport_generation,
+                    &shard.object_key,
+                    etag,
+                    &shard_hash,
+                    state,
+                )?;
+                dependencies.push(shard.object_key.clone());
+            }
             let descriptor = serde_json::to_vec(&serde_json::json!({
                 "version":1,
                 "libraryUuid":library_uuid,
@@ -583,7 +826,7 @@ impl SyncCoordinator {
                     "objectKey":checkpoint_key,
                     "sha256":hex_hash(&checkpoint_hash)
                 },
-                "dependencies":[checkpoint_key]
+                "dependencies":dependencies
             }))?;
             let hash: [u8; 32] = sha2::Sha256::digest(&descriptor).into();
             let result = provider
@@ -756,6 +999,10 @@ fn commit_published_segments(
             ],
         )?;
     }
+    transaction.execute(
+            "UPDATE media_publication_jobs SET phase='event-published',owner_token=NULL,lease_expires_at=NULL,updated_at=?1 WHERE phase='canonicalized' AND intent_uuid IN (SELECT i.intent_uuid FROM sync_publication_intents i JOIN sync_outbox o ON o.event_uuid=i.event_uuid WHERE o.state IN ('published','acked'))",
+            [now],
+        )?;
     transaction.commit()?;
     Ok(())
 }
@@ -964,13 +1211,46 @@ mod tests {
         ));
         std::fs::create_dir_all(&base).unwrap();
         let registry = Arc::new(HostRegistry::open(base.join("host.sqlite")).unwrap());
-        let coordinator = SyncCoordinator::new(registry, RuntimeLeases::default());
+        let coordinator = SyncCoordinator::new(Arc::clone(&registry), RuntimeLeases::default());
         let handle = coordinator.spawn_scheduler(std::time::Duration::from_secs(5), 2, || None);
         tokio::time::timeout(std::time::Duration::from_millis(250), handle.shutdown())
             .await
             .expect("scheduler shutdown waited for its five-second tick")
             .unwrap();
         drop(coordinator);
+        drop(registry);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_media_binding_remains_fenced_against_late_turns() {
+        let base = std::env::temp_dir().join(format!(
+            "megle-media-binding-cancel-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let registry = Arc::new(HostRegistry::open(base.join("host.sqlite")).unwrap());
+        let coordinator = SyncCoordinator::new(Arc::clone(&registry), RuntimeLeases::default());
+        let binding = uuid::Uuid::now_v7();
+        assert!(!coordinator
+            .media_workers
+            .lock()
+            .await
+            .contains_key(&binding));
+        coordinator.cancel_media_binding(binding).await.unwrap();
+
+        let stored = coordinator
+            .media_workers
+            .lock()
+            .await
+            .get(&binding)
+            .cloned()
+            .expect("cancelled epoch must remain as a tombstone");
+        assert!(stored.run(async { Ok(()) }).await.is_err());
+        drop(stored);
+        coordinator.shutdown_media_workers().await.unwrap();
+        drop(coordinator);
+        drop(registry);
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -1418,9 +1698,22 @@ mod tests {
         }
         let coordinator_after = process_metrics();
         let coordinator_cpu_ms = (coordinator_after.cpu_ms - coordinator_before.cpu_ms).max(0.0);
+        let idle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !dormant_scheduler.is_idle() {
+            assert!(
+                std::time::Instant::now() < idle_deadline,
+                "production scheduler did not settle before idle measurement"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let idle_before = process_metrics();
         let idle_started = std::time::Instant::now();
-        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        // Windows accounts process CPU in coarse quanta (typically 31.25 ms).
+        // A sub-second sample therefore reports a single accounting tick as
+        // more than 4% even when the scheduler remains dormant. Sample for
+        // four seconds, still below the production five-second poll interval,
+        // so the <1% idle contract is measurable without including a turn.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
         let idle_after = process_metrics();
         let idle_cpu_percent = ((idle_after.cpu_ms - idle_before.cpu_ms).max(0.0)
             / idle_started.elapsed().as_secs_f64()
@@ -1882,6 +2175,114 @@ mod tests {
                     database.bind_fake_sync_manifest(intent, [7; 32]).unwrap();
                 }
             }
+            "media-publication" => {
+                let source = path.parent().unwrap().join("fault-media.jpg");
+                let source_bytes = vec![0x5a; 3 * 1024 * 1024];
+                std::fs::write(&source, &source_bytes).unwrap();
+                let source_mtime = std::fs::metadata(&source)
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                let folder = database
+                    .upsert_folder(crate::db::FolderUpsert {
+                        root_id: root,
+                        parent_id: None,
+                        name: "Fault".into(),
+                        path_hash: "fault-media-folder".into(),
+                        mtime: Some(source_mtime),
+                    })
+                    .unwrap();
+                let file = database
+                    .upsert_file(FileUpsert {
+                        root_id: root,
+                        folder_id: folder,
+                        name: "fault-media.jpg".into(),
+                        ext: ".jpg".into(),
+                        size: source_bytes.len() as i64,
+                        mtime: source_mtime,
+                        ctime: None,
+                        file_key: Some("fault-media".into()),
+                    })
+                    .unwrap();
+                let binding = uuid::Uuid::from_u128(5);
+                database
+                    .begin_sync_capture(binding, uuid::Uuid::from_u128(6))
+                    .unwrap();
+                database
+                    .create_sync_publication_intent(
+                        file,
+                        &source.to_string_lossy(),
+                        source_bytes.len() as i64,
+                    )
+                    .unwrap();
+                let writer = DbWriter::spawn(database);
+                let worker = crate::sync::media::worker::MediaPublicationWorker::new(
+                    writer.clone(),
+                    Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
+                    path.parent().unwrap().join("media-objects"),
+                    crate::sync::provider::TransportContext {
+                        binding_epoch: binding.to_string(),
+                        transport_generation: 1,
+                    },
+                    crate::sync::media::worker::MediaWorkLimiter::new(1, 8, 128 * 1024 * 1024)
+                        .unwrap(),
+                );
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        worker.run_once().await.unwrap();
+                        writer.shutdown().await.unwrap();
+                    });
+            }
+            "media-materialization" => {
+                let managed_root = path.parent().unwrap().join("managed-root");
+                std::fs::create_dir_all(&managed_root).unwrap();
+                let range_path = path.parent().unwrap().join("verified.range");
+                let bytes = b"verified";
+                std::fs::write(&range_path, bytes).unwrap();
+                let chunk_hash = crate::sync::codec::sha256(bytes);
+                let manifest = crate::sync::media::format::ContentManifestV1 {
+                    format_version: crate::sync::media::MEDIA_FORMAT_VERSION,
+                    byte_length: bytes.len() as u64,
+                    content_sha256: crate::sync::media::hex_hash(&chunk_hash),
+                    media_hint: crate::sync::media::format::MediaHint {
+                        sniffed_kind: Some("image".into()),
+                        mime: Some("image/jpeg".into()),
+                    },
+                    chunking: crate::sync::media::format::ChunkingProfile::default(),
+                    chunks: vec![crate::sync::media::format::ManifestChunkV1 {
+                        ordinal: 0,
+                        chunk_sha256: crate::sync::media::hex_hash(&chunk_hash),
+                        byte_length: bytes.len() as u64,
+                        pack_sha256: crate::sync::media::hex_hash(&crate::sync::codec::sha256(
+                            b"pack",
+                        )),
+                        pack_offset: 0,
+                    }],
+                };
+                let chunks = std::collections::BTreeMap::from([(
+                    chunk_hash,
+                    crate::sync::media::recovery::VerifiedChunkSource {
+                        path: range_path,
+                        offset: 0,
+                        length: bytes.len() as u64,
+                    },
+                )]);
+                crate::sync::media::materialize::materialize_from_verified_ranges(
+                    &managed_root,
+                    Path::new("fault-media.jpg"),
+                    uuid::Uuid::from_u128(7),
+                    &manifest,
+                    &chunks,
+                    None,
+                )
+                .unwrap();
+            }
             "remote" => {
                 database
                     .apply_remote_sync_events(&[crate::sync::test_model::event(
@@ -1969,6 +2370,21 @@ mod tests {
         }
     }
 
+    fn count_files_recursively(root: &Path) -> usize {
+        std::fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    count_files_recursively(&entry.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
     #[test]
     fn process_kill_fault_matrix_preserves_atomic_boundaries_and_recovery() {
         let cases = [
@@ -1977,6 +2393,11 @@ mod tests {
             ("publication", "publication.after-intent"),
             ("publication", "publication.after-manifest"),
             ("publication", "publication.after-canonicalization"),
+            ("media-publication", "media.after-data-seal"),
+            ("media-publication", "media.after-manifest-seal"),
+            ("media-publication", "media.after-data-receipt"),
+            ("media-publication", "media.after-manifest-receipt"),
+            ("media-materialization", "media.after-materialization-sync"),
             ("remote", "remote.after-ledger"),
             ("remote", "remote.after-truth-projection"),
             ("remote", "remote.after-frontier"),
@@ -2038,6 +2459,91 @@ mod tests {
                     "publication" => {
                         let canonical: i64 = connection.query_row("SELECT COUNT(*) FROM sync_publication_intents WHERE state='canonicalized'",[],|row|row.get(0)).unwrap();
                         assert_eq!(canonical, 0, "partial publication at {point}");
+                    }
+                    "media-publication" => {
+                        let (durable, canonical_events): (i64, i64) = connection
+                            .query_row(
+                                "SELECT (SELECT COUNT(*) FROM media_publication_objects WHERE state='durable'),(SELECT COUNT(*) FROM sync_events)",
+                                [],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .unwrap();
+                        let expected_durable = match point {
+                            "media.after-data-receipt" => 1,
+                            "media.after-manifest-receipt" => 2,
+                            _ => 0,
+                        };
+                        assert_eq!(durable, expected_durable, "receipt durability at {point}");
+                        assert_eq!(canonical_events, 0, "media event escaped early at {point}");
+                        let expected_files = match point {
+                            "media.after-data-seal" => 1,
+                            "media.after-manifest-seal"
+                            | "media.after-data-receipt"
+                            | "media.after-manifest-receipt" => 2,
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            count_files_recursively(&base.join("media-objects")),
+                            expected_files,
+                            "sealed object publication boundary at {point}"
+                        );
+                    }
+                    "media-materialization" => {
+                        let managed_root = base.join("managed-root");
+                        let staging = managed_root
+                            .join(".megle-staging")
+                            .join(format!("{}.partial", uuid::Uuid::from_u128(7).simple()));
+                        let target = managed_root.join("fault-media.jpg");
+                        assert!(
+                            staging.exists(),
+                            "verified staging was not durable at {point}"
+                        );
+                        assert!(!target.exists(), "partial media target escaped at {point}");
+                        let range_path = base.join("verified.range");
+                        let bytes = b"verified";
+                        let chunk_hash = crate::sync::codec::sha256(bytes);
+                        let manifest = crate::sync::media::format::ContentManifestV1 {
+                            format_version: crate::sync::media::MEDIA_FORMAT_VERSION,
+                            byte_length: bytes.len() as u64,
+                            content_sha256: crate::sync::media::hex_hash(&chunk_hash),
+                            media_hint: crate::sync::media::format::MediaHint {
+                                sniffed_kind: Some("image".into()),
+                                mime: Some("image/jpeg".into()),
+                            },
+                            chunking: crate::sync::media::format::ChunkingProfile::default(),
+                            chunks: vec![crate::sync::media::format::ManifestChunkV1 {
+                                ordinal: 0,
+                                chunk_sha256: crate::sync::media::hex_hash(&chunk_hash),
+                                byte_length: bytes.len() as u64,
+                                pack_sha256: crate::sync::media::hex_hash(
+                                    &crate::sync::codec::sha256(b"pack"),
+                                ),
+                                pack_offset: 0,
+                            }],
+                        };
+                        let chunks = std::collections::BTreeMap::from([(
+                            chunk_hash,
+                            crate::sync::media::recovery::VerifiedChunkSource {
+                                path: range_path,
+                                offset: 0,
+                                length: bytes.len() as u64,
+                            },
+                        )]);
+                        let result =
+                            crate::sync::media::materialize::materialize_from_verified_ranges(
+                                &managed_root,
+                                Path::new("fault-media.jpg"),
+                                uuid::Uuid::from_u128(7),
+                                &manifest,
+                                &chunks,
+                                None,
+                            )
+                            .unwrap();
+                        assert!(matches!(
+                            result,
+                            crate::sync::media::materialize::MaterializationResult::Published(_)
+                        ));
+                        assert_eq!(std::fs::read(target).unwrap(), bytes);
                     }
                     "remote" => {
                         let counts: (i64, i64) = connection.query_row("SELECT (SELECT COUNT(*) FROM sync_events),(SELECT COUNT(*) FROM sync_actor_frontiers)",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();

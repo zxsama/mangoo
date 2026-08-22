@@ -113,6 +113,7 @@ fn repeated_field_history_is_canonical_and_checkpoint_serializable() {
             tables: vec![],
             portable_complete: true,
         },
+        Vec::new(),
     )
     .unwrap();
     checkpoint.verify().unwrap();
@@ -272,6 +273,11 @@ fn concurrent_location_and_content_heads_are_retained() {
             revision_uuid: RevisionUuid(id(30)),
             manifest_id: "one".into(),
             supersedes: BTreeSet::new(),
+            manifest_pack_id: None,
+            manifest_offset: None,
+            manifest_length: None,
+            byte_length: None,
+            source_mtime_ms: None,
         },
     ));
     state.apply(&event(
@@ -281,6 +287,11 @@ fn concurrent_location_and_content_heads_are_retained() {
             revision_uuid: RevisionUuid(id(31)),
             manifest_id: "two".into(),
             supersedes: BTreeSet::new(),
+            manifest_pack_id: None,
+            manifest_offset: None,
+            manifest_length: None,
+            byte_length: None,
+            source_mtime_ms: None,
         },
     ));
     let truth = &state.entities[&EntityUuid(id(10))];
@@ -435,6 +446,7 @@ fn checkpoint_selection_uses_vector_coverage_not_creation_order() {
                 tables: Vec::new(),
                 portable_complete: true,
             },
+            Vec::new(),
         )
         .unwrap()
     };
@@ -508,10 +520,53 @@ fn checkpoint_digest_detects_truth_tampering() {
             tables: Vec::new(),
             portable_complete: true,
         },
+        Vec::new(),
     )
     .unwrap();
     checkpoint.state.applied_events.insert(EventUuid(id(99)));
     assert_eq!(checkpoint.verify(), Err(CodecError::IntegrityMismatch));
+}
+
+#[test]
+fn checkpoint_round_trips_media_index_shards() {
+    let shard_hash = crate::sync::codec::sha256(b"index shard");
+    let shard = super::checkpoint::MediaIndexShardRef {
+        kind: "chunk".into(),
+        object_key: format!(
+            "indexes/chunks/{}/0-{}.idx",
+            uuid::Uuid::nil(),
+            super::media::hex_hash(&shard_hash)
+        ),
+        sha256: super::media::hex_hash(&shard_hash),
+        byte_length: 128,
+    };
+    let checkpoint = Checkpoint::build(
+        CheckpointUuid::new(),
+        LibraryUuid(id(1)),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        HostMetadataSnapshot {
+            library_uuid: id(1).to_string(),
+            name: "Library".into(),
+            icon: None,
+            binding_state: "synchronized".into(),
+            events: Vec::new(),
+        },
+        CatalogProjectionSnapshot::default(),
+        ProtocolState::default(),
+        Vec::new(),
+        CatalogRecoverySnapshot {
+            tables: Vec::new(),
+            portable_complete: true,
+        },
+        vec![shard.clone()],
+    )
+    .unwrap();
+    checkpoint.verify().unwrap();
+    let bytes = canonical_bytes(&checkpoint).unwrap();
+    let decoded: Checkpoint = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded.media_index_shards, vec![shard]);
+    decoded.verify().unwrap();
 }
 
 #[test]

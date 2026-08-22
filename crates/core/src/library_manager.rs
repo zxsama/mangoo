@@ -221,6 +221,9 @@ impl LibraryManager {
                     fence.next_transport_generation,
                 )
                 .await?;
+            self.sync_coordinator
+                .cancel_media_binding(fence.binding_epoch)
+                .await?;
         }
         Ok(())
     }
@@ -495,11 +498,19 @@ impl LibraryManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some(scheduler) = scheduler {
-            scheduler.shutdown().await?;
-        }
-        self.sync_coordinator.provider_manager().shutdown().await?;
-        Ok(())
+        let scheduler_join = if let Some(scheduler) = scheduler {
+            scheduler.cancel();
+            self.sync_coordinator.cancel_all_media_workers().await;
+            scheduler.join().await
+        } else {
+            self.sync_coordinator.cancel_all_media_workers().await;
+            Ok(())
+        };
+        let media_shutdown = self.sync_coordinator.shutdown_media_workers().await;
+        let provider_shutdown = self.sync_coordinator.provider_manager().shutdown().await;
+        scheduler_join?;
+        media_shutdown?;
+        provider_shutdown
     }
 
     pub fn registry(&self) -> &Arc<HostRegistry> {
@@ -1353,6 +1364,9 @@ impl LibraryManager {
                 transport.binding_epoch,
                 next_generation as u64,
             )
+            .await?;
+        self.sync_coordinator
+            .cancel_media_binding(transport.binding_epoch)
             .await?;
         let published = self.registry.sync_published_frontier(library_uuid)?;
         let active = self.active_snapshot();

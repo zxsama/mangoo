@@ -7,9 +7,9 @@ use super::types::*;
 
 pub type StreamVector = BTreeMap<ActorId, u64>;
 
-// v3 changes scalar field history from structured JSON object keys to sorted
-// entry vectors. v2 is deliberately rejected rather than ambiguously decoded.
-pub const CHECKPOINT_SCHEMA_VERSION: u16 = 3;
+// v4 carries verified media index shards so a restored Catalog can resolve
+// content objects without one remote lookup per asset.
+pub const CHECKPOINT_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -35,6 +35,15 @@ pub struct TableSnapshot {
 pub struct CatalogRecoverySnapshot {
     pub tables: Vec<TableSnapshot>,
     pub portable_complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaIndexShardRef {
+    pub kind: String,
+    pub object_key: String,
+    pub sha256: String,
+    pub byte_length: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,6 +115,8 @@ pub struct Checkpoint {
     pub state: ProtocolState,
     pub events: Vec<EventEnvelope>,
     pub recovery: CatalogRecoverySnapshot,
+    #[serde(default)]
+    pub media_index_shards: Vec<MediaIndexShardRef>,
     pub digest: [u8; 32],
 }
 
@@ -143,6 +154,7 @@ impl Checkpoint {
         state: ProtocolState,
         events: Vec<EventEnvelope>,
         recovery: CatalogRecoverySnapshot,
+        media_index_shards: Vec<MediaIndexShardRef>,
     ) -> Result<Self, CodecError> {
         let mut checkpoint = Self {
             checkpoint_schema_version: CHECKPOINT_SCHEMA_VERSION,
@@ -156,6 +168,7 @@ impl Checkpoint {
             state,
             events,
             recovery,
+            media_index_shards,
             digest: [0; 32],
         };
         checkpoint.digest = checkpoint_digest(&checkpoint)?;
@@ -178,6 +191,22 @@ impl Checkpoint {
                 &self.catalog_vector
             };
             if vector.get(&event.actor).copied().unwrap_or(0) < event.actor_seq {
+                return Err(CodecError::IntegrityMismatch);
+            }
+        }
+        let mut shard_keys = std::collections::BTreeSet::new();
+        for shard in &self.media_index_shards {
+            if !matches!(shard.kind.as_str(), "chunk" | "manifest")
+                || shard.byte_length == 0
+                || shard.byte_length > super::media::MAX_INDEX_SHARD_BYTES as u64
+                || super::media::parse_hash(&shard.sha256).is_err()
+                || !shard.object_key.starts_with(if shard.kind == "chunk" {
+                    "indexes/chunks/"
+                } else {
+                    "indexes/manifests/"
+                })
+                || !shard_keys.insert(shard.object_key.as_str())
+            {
                 return Err(CodecError::IntegrityMismatch);
             }
         }

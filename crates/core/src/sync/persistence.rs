@@ -134,6 +134,9 @@ pub fn build_checkpoint(
             .or_insert(event.actor_seq);
     }
     let recovery = capture_recovery_snapshot(&snapshot)?;
+    let index_root = spool_dir.parent().unwrap_or(spool_dir).join("indexes");
+    let media_index_shards =
+        capture_media_index_shards(&snapshot, fence.checkpoint_uuid, &index_root)?;
     let checkpoint = Checkpoint::build(
         fence.checkpoint_uuid,
         fence.library_uuid,
@@ -144,6 +147,7 @@ pub fn build_checkpoint(
         state,
         events,
         recovery,
+        media_index_shards,
     )?;
     let payload_checkpoint = checkpoint;
     payload_checkpoint.verify()?;
@@ -191,13 +195,13 @@ fn capture_recovery_snapshot(connection: &Connection) -> anyhow::Result<CatalogR
     let mut tables = Vec::new();
     for table in RECOVERY_TABLES {
         let mut statement = connection.prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))?;
-        let columns = statement
+        let columns: Vec<String> = statement
             .column_names()
             .iter()
             .map(|v| (*v).to_owned())
             .collect();
         let count = statement.column_count();
-        let rows = statement
+        let mut rows = statement
             .query_map([], |row| {
                 (0..count)
                     .map(|index| match row.get_ref(index)? {
@@ -214,6 +218,19 @@ fn capture_recovery_snapshot(connection: &Connection) -> anyhow::Result<CatalogR
                     .collect::<rusqlite::Result<Vec<_>>>()
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        // Checkpoints are portable protocol objects. Publication source paths
+        // are only useful to the originating device while the intent is live;
+        // retaining them after publication would leak an absolute local path
+        // into every remote recovery snapshot.
+        if *table == "sync_publication_intents" {
+            let source_path_index = columns
+                .iter()
+                .position(|column| column == "source_path")
+                .ok_or_else(|| anyhow::anyhow!("publication snapshot is missing source_path"))?;
+            for row in &mut rows {
+                row[source_path_index] = SqlValueSnapshot::Text("checkpoint-redacted".to_owned());
+            }
+        }
         tables.push(TableSnapshot {
             table: (*table).to_owned(),
             columns,
@@ -221,7 +238,7 @@ fn capture_recovery_snapshot(connection: &Connection) -> anyhow::Result<CatalogR
         });
     }
     let portable_complete: bool = connection.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM sync_publication_intents WHERE state IN ('pending-hash','pending-manifest','ready','failed'))",
+        "SELECT NOT EXISTS(SELECT 1 FROM sync_publication_intents WHERE state IN ('pending-hash','pending-manifest','ready','failed')) AND NOT EXISTS(SELECT 1 FROM media_publication_jobs WHERE phase NOT IN ('event-published','cancelled','archived'))",
         [],
         |row| row.get(0),
     )?;
@@ -229,6 +246,196 @@ fn capture_recovery_snapshot(connection: &Connection) -> anyhow::Result<CatalogR
         tables,
         portable_complete,
     })
+}
+
+fn capture_media_index_shards(
+    connection: &Connection,
+    checkpoint_uuid: CheckpointUuid,
+    index_root: &Path,
+) -> anyhow::Result<Vec<super::checkpoint::MediaIndexShardRef>> {
+    use super::media::format::{IndexShardEntryV1, IndexShardV1};
+    fn persist_shard(
+        index_root: &Path,
+        checkpoint_uuid: CheckpointUuid,
+        kind: &str,
+        ordinal: usize,
+        entries: &mut Vec<IndexShardEntryV1>,
+        shards: &mut Vec<super::checkpoint::MediaIndexShardRef>,
+    ) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let shard = IndexShardV1 {
+            format_version: super::media::MEDIA_FORMAT_VERSION,
+            kind: kind.to_owned(),
+            entries: std::mem::take(entries),
+        };
+        let bytes = shard.encode()?;
+        let hash = sha256(&bytes);
+        let plural_kind = if kind == "chunk" {
+            "chunks"
+        } else {
+            "manifests"
+        };
+        let object_key = format!(
+            "indexes/{plural_kind}/{checkpoint_uuid}/{ordinal}-{}.idx",
+            super::media::hex_hash(&hash)
+        );
+        let relative = PathBuf::from(format!("{}.idx", super::media::hex_hash(&hash)));
+        super::media::packer::durable_publish(index_root, &relative, &bytes, hash)?;
+        shards.push(super::checkpoint::MediaIndexShardRef {
+            kind: kind.to_owned(),
+            object_key,
+            sha256: super::media::hex_hash(&hash),
+            byte_length: bytes.len() as u64,
+        });
+        Ok(())
+    }
+
+    let mut shards = Vec::new();
+    let mut chunks = Vec::with_capacity(super::media::MAX_INDEX_SHARD_ENTRIES);
+    let mut chunk_ordinal = 0usize;
+    let mut statement = connection.prepare(
+        "SELECT c.chunk_hash,p.object_key,p.pack_hash,p.byte_length,c.pack_offset,c.byte_length FROM media_chunks c JOIN media_packs p ON p.pack_hash=c.pack_hash WHERE c.pack_hash IS NOT NULL ORDER BY c.chunk_hash",
+    )?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, u64>(3)?,
+            row.get::<_, u64>(4)?,
+            row.get::<_, u64>(5)?,
+        ))
+    })? {
+        let (hash, object_key, object_hash, object_length, offset, length) = row?;
+        chunks.push(IndexShardEntryV1 {
+            hash: super::media::hex_hash(hash.as_slice().try_into()?),
+            object_key,
+            object_hash: super::media::hex_hash(object_hash.as_slice().try_into()?),
+            object_length,
+            offset,
+            length,
+        });
+        if chunks.len() == super::media::MAX_INDEX_SHARD_ENTRIES {
+            persist_shard(
+                index_root,
+                checkpoint_uuid,
+                "chunk",
+                chunk_ordinal,
+                &mut chunks,
+                &mut shards,
+            )?;
+            chunk_ordinal += 1;
+            chunks = Vec::with_capacity(super::media::MAX_INDEX_SHARD_ENTRIES);
+        }
+    }
+    persist_shard(
+        index_root,
+        checkpoint_uuid,
+        "chunk",
+        chunk_ordinal,
+        &mut chunks,
+        &mut shards,
+    )?;
+
+    let mut manifests = Vec::with_capacity(super::media::MAX_INDEX_SHARD_ENTRIES);
+    let mut manifest_ordinal = 0usize;
+    let mut statement = connection.prepare(
+        "SELECT m.manifest_hash,p.object_key,p.pack_hash,p.byte_length,m.pack_offset,m.record_length FROM media_manifests m JOIN media_packs p ON p.pack_hash=m.manifest_pack_hash WHERE m.manifest_pack_hash IS NOT NULL ORDER BY m.manifest_hash",
+    )?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, u64>(3)?,
+            row.get::<_, u64>(4)?,
+            row.get::<_, u64>(5)?,
+        ))
+    })? {
+        let (hash, object_key, object_hash, object_length, offset, length) = row?;
+        manifests.push(IndexShardEntryV1 {
+            hash: super::media::hex_hash(hash.as_slice().try_into()?),
+            object_key,
+            object_hash: super::media::hex_hash(object_hash.as_slice().try_into()?),
+            object_length,
+            offset,
+            length,
+        });
+        if manifests.len() == super::media::MAX_INDEX_SHARD_ENTRIES {
+            persist_shard(
+                index_root,
+                checkpoint_uuid,
+                "manifest",
+                manifest_ordinal,
+                &mut manifests,
+                &mut shards,
+            )?;
+            manifest_ordinal += 1;
+            manifests = Vec::with_capacity(super::media::MAX_INDEX_SHARD_ENTRIES);
+        }
+    }
+    persist_shard(
+        index_root,
+        checkpoint_uuid,
+        "manifest",
+        manifest_ordinal,
+        &mut manifests,
+        &mut shards,
+    )?;
+    Ok(shards)
+}
+
+fn ingest_media_index_shards(
+    connection: &Connection,
+    shards: &[super::checkpoint::MediaIndexShardRef],
+    index_root: &Path,
+) -> anyhow::Result<()> {
+    let transaction = connection.unchecked_transaction()?;
+    let now = now_ms();
+    for reference in shards {
+        let expected_hash = super::media::parse_hash(&reference.sha256)?;
+        let path = index_root.join(format!("{}.idx", reference.sha256));
+        let bytes = fs::read(&path)?;
+        if bytes.len() as u64 != reference.byte_length || sha256(&bytes) != expected_hash {
+            anyhow::bail!("checkpoint media index shard identity mismatch");
+        }
+        let shard = super::media::format::IndexShardV1::decode(&bytes)?;
+        if shard.kind != reference.kind {
+            anyhow::bail!("checkpoint media index shard kind mismatch");
+        }
+        for entry in shard.entries {
+            let object_hash = super::media::parse_hash(&entry.object_hash)?;
+            let identity_hash = super::media::parse_hash(&entry.hash)?;
+            let object_kind = if shard.kind == "chunk" {
+                "data-pack"
+            } else {
+                "manifest-pack"
+            };
+            transaction.execute(
+                "INSERT INTO media_remote_objects(object_hash,object_kind,object_key,byte_length,receipt_generation,state,updated_at) VALUES (?1,?2,?3,?4,0,'remote',?5) ON CONFLICT(object_hash) DO UPDATE SET object_key=excluded.object_key,byte_length=excluded.byte_length,state='remote',updated_at=excluded.updated_at",
+                params![object_hash.as_slice(), object_kind, entry.object_key, entry.object_length, now],
+            )?;
+            transaction.execute(
+                "INSERT INTO media_packs(pack_hash,object_key,byte_length,state,created_at,updated_at) VALUES (?1,?2,?3,'remote',?4,?4) ON CONFLICT(pack_hash) DO UPDATE SET object_key=excluded.object_key,byte_length=excluded.byte_length,local_relpath=NULL,state='remote',updated_at=excluded.updated_at",
+                params![object_hash.as_slice(), entry.object_key, entry.object_length, now],
+            )?;
+            if shard.kind == "chunk" {
+                transaction.execute(
+                    "INSERT INTO media_chunks(chunk_hash,byte_length,pack_hash,pack_offset,state,created_at,updated_at) VALUES (?1,?2,?3,?4,'remote',?5,?5) ON CONFLICT(chunk_hash) DO UPDATE SET pack_hash=excluded.pack_hash,pack_offset=excluded.pack_offset,state='remote',updated_at=excluded.updated_at WHERE media_chunks.byte_length=excluded.byte_length",
+                    params![identity_hash.as_slice(), entry.length, object_hash.as_slice(), entry.offset, now],
+                )?;
+            } else {
+                transaction.execute(
+                    "UPDATE media_manifests SET manifest_pack_hash=?1,pack_offset=?2,record_length=?3,state='remote',updated_at=?4 WHERE manifest_hash=?5",
+                    params![object_hash.as_slice(), entry.offset, entry.length, now, identity_hash.as_slice()],
+                )?;
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 fn bootstrap_projection_events(
@@ -471,6 +678,7 @@ pub fn materialize_staging_catalog(
     staging_path: &Path,
     root_uuid: uuid::Uuid,
     device_uuid: uuid::Uuid,
+    managed_root: &Path,
 ) -> anyhow::Result<()> {
     checkpoint.verify()?;
     if staging_path.exists() {
@@ -490,7 +698,23 @@ pub fn materialize_staging_catalog(
         database.apply_remote_sync_events(std::slice::from_ref(&event))?;
     }
     restore_recovery_snapshot(database.connection_for_fsops(), &checkpoint.recovery)?;
+    ingest_media_index_shards(
+        database.connection_for_fsops(),
+        &checkpoint.media_index_shards,
+        &staging_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("sync-spool")
+            .join("indexes"),
+    )?;
     restore_catalog_frontiers(database.connection_for_fsops(), &checkpoint.catalog_vector)?;
+    database.connection_for_fsops().execute(
+        "UPDATE roots SET path=?1 WHERE root_uuid=?2",
+        rusqlite::params![
+            managed_root.to_string_lossy(),
+            root_uuid.as_bytes().as_slice()
+        ],
+    )?;
     validate_genesis_replay(database.connection_for_fsops(), checkpoint, i64::MAX)?;
     validate_browse_projection(database.connection_for_fsops(), checkpoint)?;
     database
@@ -797,6 +1021,7 @@ mod tests {
             &staging,
             uuid::Uuid::now_v7(),
             uuid::Uuid::now_v7(),
+            &directory.join("restored-media"),
         )
         .unwrap();
         let promoted = directory.join("promoted.sqlite");
@@ -884,7 +1109,8 @@ mod tests {
             .unwrap_or_else(|| uuid::Uuid::now_v7().as_bytes().to_vec());
         let revision = uuid::Uuid::now_v7();
         connection.execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,local_mutation_generation,created_at) VALUES (?1,?2,1,1)",params![revision.as_bytes().as_slice(),asset]).unwrap();
-        connection.execute("INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,local_mutation_generation,source_path,state,attempt_count,created_at,updated_at) VALUES (?1,?2,?3,1,'local-only','pending-hash',0,1,1)",params![uuid::Uuid::now_v7().as_bytes().as_slice(),asset,revision.as_bytes().as_slice()]).unwrap();
+        let source_path = r"D:\Private\Originals\secret.jpg";
+        connection.execute("INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,local_mutation_generation,source_path,state,attempt_count,created_at,updated_at) VALUES (?1,?2,?3,1,?4,'pending-hash',0,1,1)",params![uuid::Uuid::now_v7().as_bytes().as_slice(),asset,revision.as_bytes().as_slice(),source_path]).unwrap();
         let library: Vec<u8> = connection
             .query_row(
                 "SELECT library_uuid FROM sync_local_state WHERE singleton=1",
@@ -910,7 +1136,127 @@ mod tests {
             .iter()
             .find(|v| v.table == "sync_publication_intents")
             .is_some_and(|v| v.rows.len() == 1));
+        let encoded = super::canonical_bytes(&checkpoint).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&encoded).contains(source_path),
+            "portable checkpoint must redact the originating absolute path"
+        );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn checkpoint_uses_external_bounded_media_indexes_and_restores_chunk_locations() {
+        let database = database();
+        let connection = database.connection_for_fsops();
+        let asset = uuid::Uuid::now_v7();
+        let revision = uuid::Uuid::now_v7();
+        let manifest_hash = [1_u8; 32];
+        let manifest_pack_hash = [2_u8; 32];
+        let chunk_hash = [3_u8; 32];
+        let data_pack_hash = [4_u8; 32];
+        let root_id: i64 = connection
+            .query_row("SELECT id FROM roots LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,mtime,status) VALUES (?1,NULL,'','root-hash',1,'active')",
+                [root_id],
+            )
+            .unwrap();
+        let folder_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO files(root_id,folder_id,asset_uuid,name,ext,size,mtime,status) VALUES (?1,?2,?3,'remote.jpg','jpg',7,1,'ready')",
+                params![root_id, folder_id, asset.as_bytes().as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,manifest_hash,byte_size,local_mutation_generation,created_at) VALUES (?1,?2,?3,7,1,1)",
+                params![revision.as_bytes().as_slice(), asset.as_bytes().as_slice(), manifest_hash.as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO asset_content_heads(asset_uuid,content_revision_uuid,is_display_winner) VALUES (?1,?2,1)",
+                params![asset.as_bytes().as_slice(), revision.as_bytes().as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO media_packs(pack_hash,object_key,byte_length,state,created_at,updated_at) VALUES (?1,'content/data/04.pack',64,'durable',1,1), (?2,'content/manifests/02.mpack',64,'durable',1,1)",
+                params![data_pack_hash.as_slice(), manifest_pack_hash.as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO media_chunks(chunk_hash,byte_length,pack_hash,pack_offset,state,created_at,updated_at) VALUES (?1,7,?2,5,'sealed',1,1)",
+                params![chunk_hash.as_slice(), data_pack_hash.as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO media_manifests(manifest_hash,content_hash,byte_length,manifest_pack_hash,pack_offset,record_length,state,created_at,updated_at) VALUES (?1,?2,7,?3,9,11,'durable',1,1)",
+                params![manifest_hash.as_slice(), [5_u8; 32].as_slice(), manifest_pack_hash.as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO media_content_manifest_links(content_revision_uuid,manifest_hash,linked_at) VALUES (?1,?2,1)",
+                params![revision.as_bytes().as_slice(), manifest_hash.as_slice()],
+            )
+            .unwrap();
+        let library: Vec<u8> = connection
+            .query_row(
+                "SELECT library_uuid FROM sync_local_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fence = capture_checkpoint_fence(
+            connection,
+            StreamVector::new(),
+            test_host(uuid::Uuid::from_slice(&library).unwrap()),
+        )
+        .unwrap();
+        let library_dir =
+            std::env::temp_dir().join(format!("megle-media-index-{}", uuid::Uuid::now_v7()));
+        let checkpoint_dir = library_dir.join("sync-spool").join("checkpoints");
+        build_checkpoint(connection, &fence, &checkpoint_dir).unwrap();
+        let checkpoint = load_and_validate_checkpoint(connection, fence.checkpoint_uuid).unwrap();
+        assert_eq!(checkpoint.media_index_shards.len(), 2);
+        assert!(checkpoint
+            .media_index_shards
+            .iter()
+            .all(|shard| shard.byte_length <= super::super::media::MAX_INDEX_SHARD_BYTES as u64));
+        let encoded = canonical_bytes(&checkpoint).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("content/data/04.pack"));
+
+        let staging = library_dir.join("catalog.sqlite.sync-staging");
+        let restored_database = Database::open(&staging).unwrap();
+        restored_database.apply_migrations().unwrap();
+        ingest_media_index_shards(
+            restored_database.connection_for_fsops(),
+            &checkpoint.media_index_shards,
+            &library_dir.join("sync-spool").join("indexes"),
+        )
+        .unwrap();
+        drop(restored_database);
+        let restored = Connection::open(&staging).unwrap();
+        let chunk_location: (Vec<u8>, i64, String) = restored
+            .query_row(
+                "SELECT pack_hash,pack_offset,state FROM media_chunks WHERE chunk_hash=?1",
+                [chunk_hash.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            chunk_location,
+            (data_pack_hash.to_vec(), 5, "remote".into())
+        );
+        drop(restored);
+        drop(database);
+        std::fs::remove_dir_all(library_dir).unwrap();
     }
 
     fn test_host(library_uuid: uuid::Uuid) -> HostMetadataSnapshot {

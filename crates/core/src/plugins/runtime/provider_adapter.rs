@@ -313,6 +313,83 @@ impl SyncProvider for FramedSyncProvider {
             Ok(object)
         })
     }
+    fn object_get_range<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        key: &'a str,
+        start: u64,
+        end: u64,
+        max_bytes: u64,
+    ) -> ProviderFuture<'a, DownloadedRange> {
+        Box::pin(async move {
+            if end <= start || end - start > max_bytes {
+                return Err(ProviderError {
+                    code: ProviderErrorCode::InvalidArgument,
+                    retryable: false,
+                    retry_after_ms: None,
+                    detail: "invalid object range".into(),
+                });
+            }
+            let v = self
+                .transport_rpc(
+                    context,
+                    "object.get_range",
+                    json!({"key":key,"start":start,"end":end,"maxBytes":max_bytes}),
+                )
+                .await?;
+            let meta = metadata(
+                v.get("metadata")
+                    .ok_or_else(|| map_error(RpcError::Protocol))?,
+            )?;
+            let stream_id = v
+                .get("streamId")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| map_error(RpcError::Protocol))?;
+            let response_start = v
+                .get("responseStart")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| map_error(RpcError::Protocol))?;
+            let response_end = v
+                .get("responseEnd")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| map_error(RpcError::Protocol))?;
+            let whole_object = v
+                .get("wholeObject")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let path = self
+                .session
+                .receive_file(stream_id, self.timeout)
+                .await
+                .map_err(map_error)?;
+            let actual = std::fs::metadata(&path)
+                .map_err(|error| ProviderError {
+                    code: ProviderErrorCode::Internal,
+                    retryable: true,
+                    retry_after_ms: None,
+                    detail: error.to_string(),
+                })?
+                .len();
+            if response_end <= response_start
+                || response_end - response_start != actual
+                || actual > max_bytes
+                || (!whole_object && (response_start != start || response_end != end))
+                || (whole_object && (response_start != 0 || response_end != meta.size))
+            {
+                let _ = std::fs::remove_file(&path);
+                return Err(map_error(RpcError::Protocol));
+            }
+            Ok(DownloadedRange {
+                metadata: meta,
+                requested_start: start,
+                requested_end: end,
+                response_start,
+                response_end,
+                whole_object,
+                path,
+            })
+        })
+    }
     fn object_put_immutable<'a>(
         &'a self,
         context: &'a TransportContext,

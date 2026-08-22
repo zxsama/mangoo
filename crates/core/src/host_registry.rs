@@ -2965,7 +2965,7 @@ mod tests {
         register_test_plugin(&registry, "com.megle.versioned", "account-versioned");
         let now = unix_timestamp_millis();
         let manifest_json = format!(
-            r#"{{"manifestVersion":2,"id":"com.megle.versioned","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
+            r#"{{"manifestVersion":2,"id":"com.megle.versioned","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
             "0".repeat(64)
         );
         registry.connection.lock().unwrap().execute(
@@ -3045,7 +3045,7 @@ mod tests {
         register_test_plugin(&registry, "com.megle.stale-probation", "account-stale");
         let now = unix_timestamp_millis();
         let manifest_json = format!(
-            r#"{{"manifestVersion":2,"id":"com.megle.stale-probation","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
+            r#"{{"manifestVersion":2,"id":"com.megle.stale-probation","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
             "0".repeat(64)
         );
         registry.connection.lock().unwrap().execute(

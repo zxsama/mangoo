@@ -221,6 +221,7 @@ pub fn required_sync_provider_method_versions() -> BTreeMap<String, u16> {
         "delta.list",
         "object.head",
         "object.get",
+        "object.get_range",
         "object.put_immutable",
         "upload.begin",
         "upload.write",
@@ -353,7 +354,7 @@ pub fn sha256_file(path: &Path) -> Result<[u8; 32], std::io::Error> {
 mod tests {
     use super::*;
     fn valid() -> &'static str {
-        r#"{"manifestVersion":2,"id":"com.megle.test","name":"Test","version":"1.2.3","engine":"process","entry":{"windowsX64":"bin/provider.exe","linuxX64":"bin/provider"},"rpc":{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}},"activationEvents":["sync-enabled"],"requestedPermissions":[{"kind":"network","schemes":["https"],"hosts":["graph.microsoft.com"]}],"integrity":{"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}"#
+        r#"{"manifestVersion":2,"id":"com.megle.test","name":"Test","version":"1.2.3","engine":"process","entry":{"windowsX64":"bin/provider.exe","linuxX64":"bin/provider"},"rpc":{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}},"activationEvents":["sync-enabled"],"requestedPermissions":[{"kind":"network","schemes":["https"],"hosts":["graph.microsoft.com"]}],"integrity":{"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}"#
     }
     #[test]
     fn strict_v2_manifest_decodes() {

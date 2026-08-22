@@ -9,6 +9,7 @@ pub mod coordinator;
 pub mod fault;
 pub mod identity;
 pub mod inbox;
+pub mod media;
 pub mod persistence;
 pub mod provider;
 pub mod reducer;

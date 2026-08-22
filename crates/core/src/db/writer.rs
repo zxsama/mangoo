@@ -557,6 +557,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_manifest_binding_requires_matching_durable_receipts() {
+        let database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "C:\\managed-content".into(),
+                display_name: "Managed".into(),
+            })
+            .unwrap();
+        let library = uuid::Uuid::now_v7();
+        let binding = uuid::Uuid::now_v7();
+        database
+            .initialize_sync_identity(library, uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+            .unwrap();
+        database
+            .begin_sync_capture(binding, uuid::Uuid::now_v7())
+            .unwrap();
+        database
+            .execute_batch_for_test(&format!(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status) VALUES ({root_id},NULL,'','root','active');\
+                 INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status) VALUES ({root_id},last_insert_rowid(),'a.jpg','jpg',12,1,'active');"
+            ))
+            .unwrap();
+        let writer = DbWriter::spawn(database);
+        let intent = writer
+            .write_authoritative(|database| {
+                database.create_sync_publication_intent(1, "C:\\managed-content\\a.jpg", 12)
+            })
+            .await
+            .unwrap();
+        let manifest_hash = [7; 32];
+        writer
+            .write_authoritative(move |database| {
+                let connection = database.connection_for_fsops();
+                connection.execute(
+                    "UPDATE media_publication_jobs SET phase='canonicalizing',transport_generation=1 WHERE intent_uuid=?1",
+                    [intent.as_bytes().as_slice()],
+                )?;
+                connection.execute(
+                    "INSERT INTO media_manifests(manifest_hash,content_hash,byte_length,manifest_pack_hash,pack_offset,record_length,state,created_at,updated_at) VALUES (?1,?2,12,?3,0,12,'sealed',1,1)",
+                    rusqlite::params![manifest_hash.as_slice(),[8_u8;32].as_slice(),[9_u8;32].as_slice()],
+                )?;
+                connection.execute(
+                    "INSERT INTO media_content_manifest_links(content_revision_uuid,manifest_hash,linked_at) SELECT content_revision_uuid,?1,1 FROM sync_publication_intents WHERE intent_uuid=?2",
+                    rusqlite::params![manifest_hash.as_slice(),intent.as_bytes().as_slice()],
+                )?;
+                connection.execute(
+                    "INSERT INTO media_publication_objects(intent_uuid,ordinal,object_kind,object_hash,object_key,byte_length,local_relpath,state,updated_at) VALUES (?1,0,'manifest-pack',?2,'content/manifests/test.mpack',1,'manifests/test.mpack','sealed',1)",
+                    rusqlite::params![intent.as_bytes().as_slice(),[9_u8;32].as_slice()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(writer
+            .write_authoritative(move |database| {
+                database.bind_sync_manifest(intent, manifest_hash, 1)
+            })
+            .await
+            .is_err());
+        writer
+            .write_authoritative(move |database| {
+                database.connection_for_fsops().execute(
+                    "UPDATE media_publication_objects SET state='durable',receipt_generation=1 WHERE intent_uuid=?1",
+                    [intent.as_bytes().as_slice()],
+                )?;
+                database.bind_sync_manifest(intent, manifest_hash, 1)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            writer
+                .write(|database| database.sync_capture_counts_for_test())
+                .await
+                .unwrap(),
+            (1, 1, 2)
+        );
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn remote_apply_is_bounded_idempotent_and_never_echoes() {
         use crate::sync::test_model::event;
         use crate::sync::types::{EventUuid, Operation};

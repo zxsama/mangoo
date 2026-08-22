@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "engine": "process",
   "entry": { "windowsX64": "bin/fake-provider.exe", "linuxX64": "bin/fake-provider" },
-  "rpc": { "wireVersions": [1], "capabilities": ["sync-provider.v1"], "methodVersions": { "describe": 1, "health": 1, "diagnostics": 1, "shutdown": 1, "auth.begin": 1, "auth.complete": 1, "auth.status": 1, "auth.sign_out": 1, "delta.list": 1, "object.head": 1, "object.get": 1, "object.put_immutable": 1, "upload.begin": 1, "upload.write": 1, "upload.commit": 1, "upload.abort": 1 } },
+  "rpc": { "wireVersions": [1], "capabilities": ["sync-provider.v1"], "methodVersions": { "describe": 1, "health": 1, "diagnostics": 1, "shutdown": 1, "auth.begin": 1, "auth.complete": 1, "auth.status": 1, "auth.sign_out": 1, "delta.list": 1, "object.head": 1, "object.get": 1, "object.get_range": 1, "object.put_immutable": 1, "upload.begin": 1, "upload.write": 1, "upload.commit": 1, "upload.abort": 1 } },
   "activationEvents": ["sync-enabled", "auth-requested", "diagnostics-requested"],
   "requestedPermissions": [
     { "kind": "network", "schemes": ["https"], "hosts": ["graph.microsoft.com"] },

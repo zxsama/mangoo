@@ -51,3 +51,5 @@ pub const SYNC_PROTOCOL_FOUNDATION_MIGRATION: &str =
     include_str!("../../migrations/0027_sync_protocol_foundation.sql");
 pub const REMOVE_CATALOG_PLUGINS_MIGRATION: &str =
     include_str!("../../migrations/0028_remove_catalog_plugins.sql");
+pub const MEDIA_OBJECT_STORAGE_MIGRATION: &str =
+    include_str!("../../migrations/0029_media_object_storage.sql");

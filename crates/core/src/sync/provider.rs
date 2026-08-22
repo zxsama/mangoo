@@ -94,6 +94,21 @@ pub struct DownloadedObject {
     pub metadata: ObjectMetadata,
     pub path: PathBuf,
 }
+#[derive(Debug)]
+pub struct DownloadedRange {
+    pub metadata: ObjectMetadata,
+    pub requested_start: u64,
+    pub requested_end: u64,
+    pub response_start: u64,
+    pub response_end: u64,
+    pub whole_object: bool,
+    pub path: PathBuf,
+}
+impl Drop for DownloadedRange {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 impl Drop for DownloadedObject {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -141,6 +156,14 @@ pub trait SyncProvider: Send + Sync {
         key: &'a str,
         max_bytes: u64,
     ) -> ProviderFuture<'a, DownloadedObject>;
+    fn object_get_range<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        key: &'a str,
+        start: u64,
+        end: u64,
+        max_bytes: u64,
+    ) -> ProviderFuture<'a, DownloadedRange>;
     fn object_put_immutable<'a>(
         &'a self,
         context: &'a TransportContext,
@@ -417,6 +440,59 @@ impl SyncProvider for InMemorySyncProvider {
                 account_uuid: "fake-account".into(),
                 capabilities: vec!["sync-provider.v1".into()],
                 max_object_bytes: 64 * 1024 * 1024,
+            })
+        })
+    }
+    fn object_get_range<'a>(
+        &'a self,
+        _: &'a TransportContext,
+        key: &'a str,
+        start: u64,
+        end: u64,
+        max_bytes: u64,
+    ) -> ProviderFuture<'a, DownloadedRange> {
+        Box::pin(async move {
+            if end <= start || end - start > max_bytes {
+                return Err(error(
+                    ProviderErrorCode::InvalidArgument,
+                    false,
+                    "invalid object range",
+                ));
+            }
+            let objects = self
+                .objects
+                .lock()
+                .map_err(|e| error(ProviderErrorCode::Internal, true, e.to_string()))?;
+            let bytes = objects
+                .get(key)
+                .ok_or_else(|| error(ProviderErrorCode::NotFound, false, "object not found"))?;
+            if end > bytes.len() as u64 {
+                return Err(error(
+                    ProviderErrorCode::InvalidArgument,
+                    false,
+                    "object range exceeds size",
+                ));
+            }
+            let range = bytes[start as usize..end as usize].to_vec();
+            let path = std::env::temp_dir().join(format!(
+                "megle-memory-provider-{}-{}.range",
+                std::process::id(),
+                uuid::Uuid::now_v7().simple()
+            ));
+            std::fs::write(&path, &range).map_err(storage_error)?;
+            Ok(DownloadedRange {
+                metadata: ObjectMetadata {
+                    key: key.into(),
+                    size: bytes.len() as u64,
+                    sha256: Sha256::digest(bytes).into(),
+                    etag: Some(hex(&Sha256::digest(bytes))),
+                },
+                requested_start: start,
+                requested_end: end,
+                response_start: start,
+                response_end: end,
+                whole_object: false,
+                path,
             })
         })
     }
@@ -761,6 +837,63 @@ mod tests {
     #[tokio::test]
     async fn memory_provider_conforms() {
         conformance(&InMemorySyncProvider::default()).await
+    }
+
+    #[tokio::test]
+    async fn expired_partial_upload_restarts_without_committing_truncated_bytes() {
+        let provider = InMemorySyncProvider::default();
+        let context = TransportContext {
+            binding_epoch: uuid::Uuid::now_v7().to_string(),
+            transport_generation: 1,
+        };
+        let bytes = b"complete immutable object";
+        let hash: [u8; 32] = Sha256::digest(bytes).into();
+        let expired = provider
+            .upload_begin(
+                &context,
+                "content/data/00/session.pack",
+                bytes.len() as u64,
+                hash,
+            )
+            .await
+            .unwrap();
+        provider
+            .upload_write(&context, &expired.upload_id, 0, &bytes[..8])
+            .await
+            .unwrap();
+        provider
+            .upload_abort(&context, &expired.upload_id)
+            .await
+            .unwrap();
+        assert!(provider
+            .upload_write(&context, &expired.upload_id, 8, &bytes[8..])
+            .await
+            .is_err());
+        assert!(provider
+            .object_head(&context, "content/data/00/session.pack")
+            .await
+            .unwrap()
+            .is_none());
+        let resumed = provider
+            .upload_begin(
+                &context,
+                "content/data/00/session.pack",
+                bytes.len() as u64,
+                hash,
+            )
+            .await
+            .unwrap();
+        provider
+            .upload_write(&context, &resumed.upload_id, 0, bytes)
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider
+                .upload_commit(&context, &resumed.upload_id)
+                .await
+                .unwrap(),
+            PutImmutableResult::Created { .. }
+        ));
     }
 
     #[tokio::test]

@@ -1023,6 +1023,13 @@ impl Database {
             "UPDATE sync_local_state SET active_actor_epoch=?1,active_binding_epoch=?2,next_actor_seq=1,capture_enabled=1,updated_at=?3 WHERE singleton=1",
             rusqlite::params![actor_epoch.as_bytes().as_slice(),binding_epoch.as_bytes().as_slice(),now],
         )?;
+        seed_initial_media_publication_intents(&transaction)?;
+        crate::sync::media::inventory::bind_pending_publication_jobs(
+            &transaction,
+            binding_epoch,
+            1,
+            now,
+        )?;
         transaction.commit()?;
         Ok(generation)
     }
@@ -1092,34 +1099,12 @@ impl Database {
         byte_size: i64,
     ) -> anyhow::Result<uuid::Uuid> {
         let transaction = self.connection.unchecked_transaction()?;
-        let asset_uuid: Vec<u8> = transaction.query_row(
-            "SELECT asset_uuid FROM files WHERE id=?1",
-            [file_id],
-            |row| row.get(0),
-        )?;
-        let generation: i64 = transaction.query_row(
-            "SELECT next_local_mutation_generation FROM sync_local_state WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )?;
-        transaction.execute(
-            "UPDATE sync_local_state SET next_local_mutation_generation=?1 WHERE singleton=1",
-            [generation + 1],
-        )?;
-        let revision = uuid::Uuid::now_v7();
-        let intent = uuid::Uuid::now_v7();
-        let now = unix_timestamp_millis();
-        transaction.execute(
-            "INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?1,?2,?3,?4,?5)",
-            rusqlite::params![revision.as_bytes().as_slice(),asset_uuid,byte_size,generation,now],
-        )?;
-        transaction.execute(
-            "INSERT INTO asset_content_heads(asset_uuid,content_revision_uuid,is_display_winner) VALUES (?1,?2,1)",
-            rusqlite::params![asset_uuid,revision.as_bytes().as_slice()],
-        )?;
-        transaction.execute(
-            "INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,binding_epoch,local_mutation_generation,source_path,state,attempt_count,created_at,updated_at) SELECT ?1,?2,?3,active_binding_epoch,?4,?5,'pending-hash',0,?6,?6 FROM sync_local_state WHERE singleton=1",
-            rusqlite::params![intent.as_bytes().as_slice(),asset_uuid,revision.as_bytes().as_slice(),generation,source_path,now],
+        let intent = create_sync_publication_intent_in_transaction(
+            &transaction,
+            file_id,
+            source_path,
+            byte_size,
+            None,
         )?;
         crate::sync::fault::hit("publication.after-intent");
         transaction.commit()?;
@@ -1143,6 +1128,7 @@ impl Database {
             rusqlite::params![manifest_hash.as_slice(), revision_uuid],
         )?;
         crate::sync::fault::hit("publication.after-manifest");
+        let supersedes = content_supersedes_in_transaction(&transaction, &revision_uuid)?;
         let capture = crate::sync::capture::capture_catalog_mutation(
             &transaction,
             crate::sync::capture::MutationOrigin::LocalApi,
@@ -1152,13 +1138,100 @@ impl Database {
                     &revision_uuid,
                 )?),
                 manifest_id: hex_string(&manifest_hash),
-                supersedes: std::collections::BTreeSet::new(),
+                supersedes,
+                manifest_pack_id: None,
+                manifest_offset: None,
+                manifest_length: None,
+                byte_length: None,
+                source_mtime_ms: transaction
+                    .query_row(
+                        "SELECT source_mtime_ms FROM asset_content_revisions WHERE content_revision_uuid=?1",
+                        [&revision_uuid],
+                        |row| row.get(0),
+                    )?,
             },
         )?;
         transaction.execute(
             "UPDATE asset_content_revisions SET event_uuid=?1 WHERE content_revision_uuid=?2",
             rusqlite::params![capture.event_uuid, revision_uuid],
         )?;
+        rebuild_content_heads_in_transaction(&transaction, &asset_uuid)?;
+        transaction.execute(
+            "UPDATE sync_publication_intents SET event_uuid=?1,state='canonicalized',updated_at=?2 WHERE intent_uuid=?3",
+            rusqlite::params![capture.event_uuid,unix_timestamp_millis(),intent_uuid.as_bytes().as_slice()],
+        )?;
+        crate::sync::fault::hit("publication.after-canonicalization");
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn bind_sync_manifest(
+        &self,
+        intent_uuid: uuid::Uuid,
+        manifest_hash: [u8; 32],
+        transport_generation: u64,
+    ) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (asset_uuid, revision_uuid, binding_epoch): (Vec<u8>, Vec<u8>, Option<Vec<u8>>) = transaction.query_row(
+            "SELECT i.asset_uuid,i.content_revision_uuid,i.binding_epoch FROM sync_publication_intents i JOIN media_publication_jobs j ON j.intent_uuid=i.intent_uuid WHERE i.intent_uuid=?1 AND i.state IN ('pending-hash','pending-manifest','ready','failed') AND j.phase='canonicalizing' AND j.transport_generation=?2",
+            rusqlite::params![intent_uuid.as_bytes().as_slice(),transport_generation],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        )?;
+        let active_binding: Option<Vec<u8>> = transaction.query_row(
+            "SELECT active_binding_epoch FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if binding_epoch.is_some() && binding_epoch != active_binding {
+            anyhow::bail!("media publication binding epoch is stale");
+        }
+        let dependencies_ready: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM media_publication_objects WHERE intent_uuid=?1) AND NOT EXISTS(SELECT 1 FROM media_publication_objects WHERE intent_uuid=?1 AND (state<>'durable' OR receipt_generation<>?2))",
+            rusqlite::params![intent_uuid.as_bytes().as_slice(),transport_generation],
+            |row| row.get(0),
+        )?;
+        if !dependencies_ready {
+            anyhow::bail!("media publication dependencies are not durable");
+        }
+        let linked_hash: Vec<u8> = transaction.query_row(
+            "SELECT manifest_hash FROM media_content_manifest_links WHERE content_revision_uuid=?1",
+            [&revision_uuid],
+            |row| row.get(0),
+        )?;
+        if linked_hash.as_slice() != manifest_hash {
+            anyhow::bail!("media manifest link does not match sealed bytes");
+        }
+        let (manifest_pack_hash, manifest_offset, manifest_length, byte_length):
+            (Vec<u8>, i64, i64, i64) = transaction.query_row(
+                "SELECT manifest_pack_hash,pack_offset,record_length,byte_length FROM media_manifests WHERE manifest_hash=?1 AND manifest_pack_hash IS NOT NULL AND pack_offset IS NOT NULL AND record_length IS NOT NULL",
+                [manifest_hash.as_slice()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            )?;
+        let supersedes = content_supersedes_in_transaction(&transaction, &revision_uuid)?;
+        let capture = crate::sync::capture::capture_catalog_mutation(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            crate::sync::capture::entity_uuid(&asset_uuid)?,
+            crate::sync::types::Operation::SetContent {
+                revision_uuid: crate::sync::types::RevisionUuid(uuid::Uuid::from_slice(&revision_uuid)?),
+                manifest_id: hex_string(&manifest_hash),
+                supersedes,
+                manifest_pack_id: Some(hex_string(&manifest_pack_hash)),
+                manifest_offset: Some(u64::try_from(manifest_offset)?),
+                manifest_length: Some(u64::try_from(manifest_length)?),
+                byte_length: Some(u64::try_from(byte_length)?),
+                source_mtime_ms: transaction.query_row(
+                    "SELECT source_mtime_ms FROM asset_content_revisions WHERE content_revision_uuid=?1",
+                    [&revision_uuid],
+                    |row| row.get(0),
+                )?,
+            },
+        )?;
+        transaction.execute(
+            "UPDATE asset_content_revisions SET event_uuid=?1,manifest_hash=?2 WHERE content_revision_uuid=?3",
+            rusqlite::params![capture.event_uuid,manifest_hash.as_slice(),revision_uuid],
+        )?;
+        rebuild_content_heads_in_transaction(&transaction, &asset_uuid)?;
         transaction.execute(
             "UPDATE sync_publication_intents SET event_uuid=?1,state='canonicalized',updated_at=?2 WHERE intent_uuid=?3",
             rusqlite::params![capture.event_uuid,unix_timestamp_millis(),intent_uuid.as_bytes().as_slice()],
@@ -1353,6 +1426,10 @@ impl Database {
         if !self.migration_applied(28)? {
             self.connection
                 .execute_batch(migrations::REMOVE_CATALOG_PLUGINS_MIGRATION)?;
+        }
+        if !self.migration_applied(29)? {
+            self.connection
+                .execute_batch(migrations::MEDIA_OBJECT_STORAGE_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
@@ -5972,6 +6049,37 @@ impl Database {
         };
         let forced_reuse = exact
             .or_else(|| (fingerprint_candidates.len() == 1).then(|| fingerprint_candidates[0]));
+        let previous_asset: Option<Vec<u8>> = if let Some(file_id) = forced_reuse {
+            transaction
+                .query_row(
+                    "SELECT asset_uuid FROM files WHERE id=?1",
+                    [file_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+        } else {
+            transaction
+                .query_row(
+                    "SELECT asset_uuid FROM files WHERE folder_id=?1 AND name=?2",
+                    rusqlite::params![file.folder_id, file.name],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        let previous_fingerprint = if let Some(asset_uuid) = previous_asset {
+            transaction
+                .query_row(
+                    "SELECT content_fingerprint FROM sync_local_file_identities WHERE asset_uuid=?1",
+                    [asset_uuid],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?
+                .flatten()
+        } else {
+            None
+        };
+        let source_size = file.size;
+        let source_mtime_ms = file.mtime.saturating_mul(1000);
         let result =
             upsert_file_in_transaction(transaction, file, scan_generation, origin, forced_reuse)?;
         upsert_media_kind_in_transaction(
@@ -5986,6 +6094,8 @@ impl Database {
             |row| row.get(0),
         )?;
         let asset = uuid::Uuid::from_slice(&asset)?;
+        let content_changed = result.identity_changed
+            || fingerprint.is_some_and(|value| previous_fingerprint.as_deref() != Some(value));
         if fingerprint_candidates.len() > 1 {
             for old_id in fingerprint_candidates {
                 let old: Vec<u8> = transaction.query_row(
@@ -6006,6 +6116,23 @@ impl Database {
             },
             &path.to_string_lossy(),
         )?;
+        let sync_initialized = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_local_state LIMIT 1)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if content_changed
+            && origin == crate::sync::capture::MutationOrigin::ExternalFs
+            && sync_initialized
+        {
+            create_sync_publication_intent_in_transaction(
+                transaction,
+                result.id,
+                &path.to_string_lossy(),
+                source_size,
+                Some(source_mtime_ms),
+            )?;
+        }
         Ok(result.id)
     }
 
@@ -6246,14 +6373,14 @@ impl Database {
                     identity.content_fingerprint.as_deref(),
                     &identity.path,
                     scan_generation,
-                    crate::sync::capture::MutationOrigin::Bootstrap,
+                    crate::sync::capture::MutationOrigin::ExternalFs,
                 )?);
             } else {
                 let result = upsert_file_in_transaction(
                     &transaction,
                     file.file,
                     scan_generation,
-                    crate::sync::capture::MutationOrigin::Bootstrap,
+                    crate::sync::capture::MutationOrigin::ExternalFs,
                     None,
                 )?;
                 upsert_media_kind_in_transaction(
@@ -6318,7 +6445,7 @@ impl Database {
                     identity.content_fingerprint.as_deref(),
                     &identity.path,
                     scan_generation,
-                    crate::sync::capture::MutationOrigin::Bootstrap,
+                    crate::sync::capture::MutationOrigin::ExternalFs,
                 )?);
                 continue;
             }
@@ -6326,7 +6453,7 @@ impl Database {
                 &transaction,
                 file.file,
                 scan_generation,
-                crate::sync::capture::MutationOrigin::Bootstrap,
+                crate::sync::capture::MutationOrigin::ExternalFs,
                 None,
             )?;
             upsert_media_kind_in_transaction(
@@ -7869,6 +7996,153 @@ fn reusable_file_id_for_content_identity_in_transaction(
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn rebuild_content_heads_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    asset_uuid: &[u8],
+) -> anyhow::Result<()> {
+    transaction.execute(
+        "DELETE FROM asset_content_heads WHERE asset_uuid=?1",
+        [asset_uuid],
+    )?;
+    transaction.execute(
+        "INSERT INTO asset_content_heads(asset_uuid,content_revision_uuid,is_display_winner) SELECT r.asset_uuid,r.content_revision_uuid,CASE WHEN r.content_revision_uuid=(SELECT rr.content_revision_uuid FROM asset_content_revisions rr JOIN sync_events e ON e.event_uuid=rr.event_uuid WHERE rr.asset_uuid=?1 AND NOT EXISTS (SELECT 1 FROM asset_content_supersedes s WHERE s.observed_content_revision_uuid=rr.content_revision_uuid) ORDER BY e.hlc_wall_ms DESC,e.hlc_logical DESC,e.device_uuid DESC,e.actor_epoch DESC,e.actor_seq DESC,e.event_uuid DESC LIMIT 1) THEN 1 ELSE 0 END FROM asset_content_revisions r WHERE r.asset_uuid=?1 AND r.event_uuid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM asset_content_supersedes s WHERE s.observed_content_revision_uuid=r.content_revision_uuid)",
+        [asset_uuid],
+    )?;
+    Ok(())
+}
+
+fn content_supersedes_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    revision_uuid: &[u8],
+) -> anyhow::Result<std::collections::BTreeSet<crate::sync::types::RevisionUuid>> {
+    let mut statement = transaction.prepare(
+        "SELECT observed_content_revision_uuid FROM asset_content_supersedes WHERE content_revision_uuid=?1 ORDER BY observed_content_revision_uuid",
+    )?;
+    let supersedes = statement
+        .query_map([revision_uuid], |row| row.get::<_, Vec<u8>>(0))?
+        .map(|value| {
+            Ok(crate::sync::types::RevisionUuid(uuid::Uuid::from_slice(
+                &value?,
+            )?))
+        })
+        .collect();
+    supersedes
+}
+
+fn create_sync_publication_intent_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    file_id: i64,
+    source_path: &str,
+    byte_size: i64,
+    source_mtime_ms: Option<i64>,
+) -> anyhow::Result<uuid::Uuid> {
+    if byte_size < 0 {
+        anyhow::bail!("publication source size cannot be negative");
+    }
+    let asset_uuid: Vec<u8> = transaction.query_row(
+        "SELECT asset_uuid FROM files WHERE id=?1",
+        [file_id],
+        |row| row.get(0),
+    )?;
+    let generation: i64 = transaction.query_row(
+        "SELECT next_local_mutation_generation FROM sync_local_state WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "UPDATE sync_local_state SET next_local_mutation_generation=?1 WHERE singleton=1",
+        [generation + 1],
+    )?;
+    let revision = uuid::Uuid::now_v7();
+    let intent = uuid::Uuid::now_v7();
+    let now = unix_timestamp_millis();
+    let superseded_revisions = {
+        let mut statement = transaction.prepare(
+            "SELECT h.content_revision_uuid FROM asset_content_heads h JOIN asset_content_revisions r ON r.content_revision_uuid=h.content_revision_uuid WHERE h.asset_uuid=?1 AND r.event_uuid IS NOT NULL UNION SELECT s.observed_content_revision_uuid FROM asset_content_heads h JOIN asset_content_revisions r ON r.content_revision_uuid=h.content_revision_uuid JOIN asset_content_supersedes s ON s.content_revision_uuid=h.content_revision_uuid WHERE h.asset_uuid=?1 AND r.event_uuid IS NULL ORDER BY 1",
+        )?;
+        let revisions = statement
+            .query_map([&asset_uuid], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        revisions
+    };
+    let expected_content_hash: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT content_fingerprint FROM sync_local_file_identities WHERE asset_uuid=?1",
+            [&asset_uuid],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if expected_content_hash
+        .as_ref()
+        .is_some_and(|value| value.len() != 32)
+    {
+        anyhow::bail!("captured content fingerprint must be SHA-256");
+    }
+    transaction.execute(
+        "UPDATE sync_publication_intents SET state='cancelled',error_code='superseded_local_revision',updated_at=?1 WHERE asset_uuid=?2 AND event_uuid IS NULL AND state IN ('pending-hash','pending-manifest','ready','failed')",
+        rusqlite::params![now,&asset_uuid],
+    )?;
+    transaction.execute(
+        "UPDATE media_publication_jobs SET phase='cancelled',owner_token=NULL,lease_expires_at=NULL,error_code='superseded_local_revision',updated_at=?1 WHERE intent_uuid IN (SELECT intent_uuid FROM sync_publication_intents WHERE asset_uuid=?2 AND state='cancelled' AND event_uuid IS NULL) AND phase NOT IN ('event-published','archived')",
+        rusqlite::params![now,&asset_uuid],
+    )?;
+    transaction.execute(
+        "INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,source_mtime_ms,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+        rusqlite::params![revision.as_bytes().as_slice(),&asset_uuid,byte_size,generation,source_mtime_ms,now],
+    )?;
+    for observed_revision in superseded_revisions {
+        transaction.execute(
+            "INSERT OR IGNORE INTO asset_content_supersedes(content_revision_uuid,observed_content_revision_uuid) VALUES (?1,?2)",
+            rusqlite::params![revision.as_bytes().as_slice(),observed_revision],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM asset_content_heads WHERE asset_uuid=?1",
+        [&asset_uuid],
+    )?;
+    transaction.execute(
+        "INSERT INTO asset_content_heads(asset_uuid,content_revision_uuid,is_display_winner) VALUES (?1,?2,1)",
+        rusqlite::params![&asset_uuid,revision.as_bytes().as_slice()],
+    )?;
+    transaction.execute(
+        "INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,binding_epoch,local_mutation_generation,source_path,state,attempt_count,created_at,updated_at) SELECT ?1,?2,?3,active_binding_epoch,?4,?5,'pending-hash',0,?6,?6 FROM sync_local_state WHERE singleton=1",
+        rusqlite::params![intent.as_bytes().as_slice(),&asset_uuid,revision.as_bytes().as_slice(),generation,source_path,now],
+    )?;
+    transaction.execute(
+        "INSERT INTO media_publication_jobs(intent_uuid,phase,source_identity_json,binding_epoch,created_at,updated_at) SELECT ?1,'pending-hash',CASE WHEN ?2 IS NULL THEN NULL ELSE json_object('expectedContentSha256',lower(hex(?2))) END,active_binding_epoch,?3,?3 FROM sync_local_state WHERE singleton=1",
+        rusqlite::params![intent.as_bytes().as_slice(),expected_content_hash,now],
+    )?;
+    Ok(intent)
+}
+
+fn seed_initial_media_publication_intents(
+    transaction: &rusqlite::Transaction<'_>,
+) -> anyhow::Result<usize> {
+    type Candidate = (i64, String, i64, i64);
+    let candidates = {
+        let mut statement = transaction.prepare(
+            "WITH RECURSIVE folder_paths(id,root_id,relpath) AS (SELECT id,root_id,'' FROM folders WHERE parent_id IS NULL UNION ALL SELECT f.id,f.root_id,CASE WHEN p.relpath='' THEN f.name ELSE p.relpath||'/'||f.name END FROM folders f JOIN folder_paths p ON f.parent_id=p.id) SELECT f.id,CASE WHEN p.relpath='' THEN root.path||'/'||f.name ELSE root.path||'/'||p.relpath||'/'||f.name END,f.size,f.mtime FROM files f JOIN media ON media.file_id=f.id JOIN roots root ON root.id=f.root_id JOIN folder_paths p ON p.id=f.folder_id WHERE f.status='active' AND root.enabled=1 AND NOT EXISTS (SELECT 1 FROM asset_content_revisions r WHERE r.asset_uuid=f.asset_uuid) ORDER BY f.id",
+        )?;
+        let candidates = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<Vec<Candidate>, _>>()?;
+        candidates
+    };
+    for (file_id, source_path, byte_size, source_mtime_seconds) in &candidates {
+        create_sync_publication_intent_in_transaction(
+            transaction,
+            *file_id,
+            source_path,
+            *byte_size,
+            Some(source_mtime_seconds.saturating_mul(1000)),
+        )?;
+    }
+    Ok(candidates.len())
 }
 
 fn upsert_file_in_transaction(
@@ -10484,6 +10758,202 @@ mod tests {
         let database = Database::open_in_memory().expect("open in-memory database");
         database.apply_migrations().expect("apply migrations");
         database
+    }
+
+    #[test]
+    fn external_scan_captures_initial_and_same_metadata_content_changes() {
+        let mut database = migrated_database();
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/Pictures".to_string(),
+                display_name: "Pictures".to_string(),
+            })
+            .expect("add root");
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .expect("initialize sync identity");
+        let root_folder_id = database
+            .commit_scan_batch(ScanWriteBatch {
+                folders: vec![FolderUpsert {
+                    root_id,
+                    parent_id: None,
+                    name: String::new(),
+                    path_hash: "root-hash".to_string(),
+                    mtime: Some(10),
+                }],
+                files: Vec::new(),
+                scan_generation: None,
+            })
+            .expect("commit root folder")
+            .folder_ids[0];
+        let scan = |fingerprint: &[u8]| ScanWriteBatch {
+            folders: Vec::new(),
+            files: vec![ScanFileUpsert {
+                file: FileUpsert {
+                    root_id,
+                    folder_id: root_folder_id,
+                    name: "same-size.jpg".to_string(),
+                    ext: ".jpg".to_string(),
+                    size: 4,
+                    mtime: 10,
+                    ctime: None,
+                    file_key: Some("stable-file-id".to_string()),
+                },
+                media_kind: "image".to_string(),
+                external_identity: Some(ExternalFileIdentity {
+                    volume_identity: b"stable-volume".to_vec(),
+                    file_identity: b"stable-file-id".to_vec(),
+                    content_fingerprint: Some(fingerprint.to_vec()),
+                    path: PathBuf::from("D:/Pictures/same-size.jpg"),
+                }),
+            }],
+            scan_generation: None,
+        };
+
+        database
+            .commit_scan_batch(scan(&[0xa1; 32]))
+            .expect("first scan");
+        let first_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM sync_publication_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(first_count, 1, "initial scan must publish existing media");
+        let binding: Option<Vec<u8>> = database
+            .connection
+            .query_row(
+                "SELECT binding_epoch FROM sync_publication_intents",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(binding.is_none(), "local-only capture remains unbound");
+
+        database
+            .commit_scan_batch(scan(&[0xa1; 32]))
+            .expect("unchanged rescan");
+        let unchanged_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM sync_publication_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            unchanged_count, 1,
+            "unchanged rescan must not duplicate content"
+        );
+
+        let first_intent: Vec<u8> = database
+            .connection
+            .query_row(
+                "SELECT intent_uuid FROM sync_publication_intents",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let binding = uuid::Uuid::now_v7();
+        database
+            .begin_sync_capture(binding, uuid::Uuid::now_v7())
+            .unwrap();
+        database
+            .bind_fake_sync_manifest(uuid::Uuid::from_slice(&first_intent).unwrap(), [7; 32])
+            .unwrap();
+
+        database
+            .commit_scan_batch(scan(&[0xb2; 32]))
+            .expect("same-metadata overwrite scan");
+        let changed_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM sync_publication_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(changed_count, 2, "content fingerprint change must publish");
+        let head_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM asset_content_heads", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            head_count, 1,
+            "sequential local edits keep one content head"
+        );
+        let supersedes_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM asset_content_supersedes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            supersedes_count, 1,
+            "the new local revision must explicitly supersede the prior head"
+        );
+        database
+            .commit_scan_batch(scan(&[0xc3; 32]))
+            .expect("newer overwrite supersedes pending attempt");
+        let states = {
+            let mut statement = database
+                .connection
+                .prepare(
+                    "SELECT state FROM sync_publication_intents ORDER BY local_mutation_generation",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            states,
+            vec!["canonicalized", "cancelled", "pending-hash"],
+            "a newer local edit must cancel the unpublished revision it replaces"
+        );
+        let intents = {
+            let mut statement = database
+                .connection
+                .prepare(
+                    "SELECT intent_uuid,content_revision_uuid FROM sync_publication_intents ORDER BY local_mutation_generation",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        database
+            .bind_fake_sync_manifest(uuid::Uuid::from_slice(&intents[2].0).unwrap(), [8; 32])
+            .unwrap();
+        let payload: Vec<u8> = database
+            .connection
+            .query_row(
+                "SELECT payload FROM sync_events ORDER BY actor_seq DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event = crate::sync::codec::decode_event(&payload).unwrap();
+        let crate::sync::types::Operation::SetContent { supersedes, .. } = event.operation else {
+            panic!("latest publication must be a content event");
+        };
+        assert_eq!(
+            supersedes,
+            [crate::sync::types::RevisionUuid(
+                uuid::Uuid::from_slice(&intents[0].1).unwrap()
+            )]
+            .into_iter()
+            .collect(),
+            "the canonical content event must carry the local causal supersession"
+        );
     }
 
     #[test]

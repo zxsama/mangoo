@@ -106,6 +106,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| e.to_string())?;
                 Ok(json!({"metadata":metadata,"streamId":id}))
             }
+            "object.get_range" => {
+                let key = request["key"].as_str().ok_or("missing object key")?;
+                let bytes = objects.get(key).ok_or("object not found")?;
+                let start = request["start"].as_u64().ok_or("missing range start")?;
+                let end = request["end"].as_u64().ok_or("missing range end")?;
+                let max_bytes = request["maxBytes"].as_u64().unwrap_or(0);
+                if end <= start || end > bytes.len() as u64 || end - start > max_bytes {
+                    return Err("invalid object range".into());
+                }
+                let range = bytes[start as usize..end as usize].to_vec();
+                let id = next_stream_id;
+                next_stream_id += 2;
+                let metadata = object_metadata(&objects, key).ok_or("object disappeared")?;
+                send_plugin_stream(&mut input, &mut output, id, &range)
+                    .map_err(|e| e.to_string())?;
+                Ok(
+                    json!({"metadata":metadata,"streamId":id,"responseStart":start,"responseEnd":end,"wholeObject":false}),
+                )
+            }
             "object.put_immutable" => {
                 let id = request["streamId"].as_u64().ok_or("missing stream id")?;
                 let declaration = incoming.remove(&id).ok_or("stream not open")?;

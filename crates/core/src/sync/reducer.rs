@@ -171,6 +171,11 @@ impl ProtocolState {
                 revision_uuid,
                 manifest_id,
                 supersedes,
+                manifest_pack_id: _,
+                manifest_offset: _,
+                manifest_length: _,
+                byte_length: _,
+                source_mtime_ms: _,
             } => {
                 entity.content_superseded.extend(supersedes);
                 entity.content_heads = entity

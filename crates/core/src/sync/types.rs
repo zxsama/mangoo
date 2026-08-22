@@ -175,6 +175,16 @@ pub enum Operation {
         revision_uuid: RevisionUuid,
         manifest_id: String,
         supersedes: BTreeSet<RevisionUuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest_pack_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest_offset: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest_length: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        byte_length: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_mtime_ms: Option<i64>,
     },
 }
 
