@@ -90,7 +90,7 @@ const CHANNEL_PERMISSIONS = new Map<string, ReadonlySet<NotificationIpcWindowRol
 ]);
 
 const OPERATION_STATUSES = new Set(["pending", "running", "succeeded", "failed", "cancelled"]);
-const OPERATION_CATEGORIES = new Set(["task", "file_operation", "error", "thumbnail_cache"]);
+const OPERATION_CATEGORIES = new Set(["task", "file_operation", "error", "thumbnail_cache", "sync"]);
 const OPERATION_ORIGINS = new Set(["user", "background", "recovery", "system"]);
 const LOG_SOURCES = new Set<ProcessLogSource>(["main", "core", "renderer"]);
 const LOG_LEVELS = new Set<ProcessLogLevel>(["trace", "debug", "info", "warn", "error"]);

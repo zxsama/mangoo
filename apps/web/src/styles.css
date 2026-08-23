@@ -6320,3 +6320,77 @@ button:disabled {
 .preview-scrubber-pin {
   flex: 0 0 auto;
 }
+
+/* Provider-neutral sync orchestration uses the existing overlay/glass layers. */
+.library-switcher-sync-state,
+.settings-sync-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.library-switcher-sync-state.error,
+.settings-sync-state.error,
+.settings-sync-error { color: var(--danger, #ff9b9b); }
+
+.library-switcher-sync-state.syncing,
+.library-switcher-sync-state.restoring,
+.settings-sync-state.syncing,
+.settings-sync-state.restoring { color: var(--accent, #7cc4ff); }
+
+.settings-sync-panel { display: grid; gap: 12px; margin-top: 16px; }
+.settings-sync-panel > header { display: flex; align-items: flex-start; gap: 9px; }
+.settings-sync-panel h3, .settings-sync-panel p { margin: 0; }
+.settings-sync-panel header p, .settings-sync-card > p { color: var(--text-muted); font-size: 12px; }
+.settings-sync-list { display: grid; gap: 8px; }
+.settings-sync-card { display: grid; gap: 7px; padding: 11px 12px; border-radius: 12px; background: color-mix(in srgb, var(--surface-elevated, #222) 78%, transparent); }
+.settings-sync-card > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.settings-sync-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.settings-sync-actions button { display: inline-flex; align-items: center; gap: 5px; }
+.settings-sync-account,
+.managed-library-restore-confirm,
+.managed-library-restore-progress > div { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 12px; background: color-mix(in srgb, var(--surface-elevated, #222) 78%, transparent); }
+.settings-sync-account > div,
+.managed-library-restore-confirm,
+.managed-library-restore-progress-copy { flex: 1; display: grid; gap: 3px; min-width: 0; }
+.settings-sync-account span,
+.managed-library-restore-confirm span,
+.managed-library-restore-confirm small,
+.managed-library-restore-progress span { color: var(--text-muted); font-size: 12px; }
+.managed-library-restore-progress { display: grid; gap: 8px; }
+.managed-library-restore-progress-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.settings-sync-conflicts { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.settings-sync-conflicts li { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.settings-sync-diagnostics { max-height: min(42vh, 360px); margin: 12px 0 0; padding: 10px; overflow: auto; border-radius: 10px; background: color-mix(in srgb, var(--surface-elevated, #222) 82%, transparent); color: var(--text-muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.managed-library-mode { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.managed-library-mode button[data-selected="true"] { background: var(--selection-fill, rgba(124, 196, 255, 0.18)); }
+.managed-library-enable-sync { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--text-muted); }
+.managed-library-remote-list { display: grid; gap: 8px; max-height: min(46vh, 430px); overflow: auto; }
+.managed-library-remote-card { display: grid; gap: 7px; padding: 10px; border-radius: 12px; background: color-mix(in srgb, var(--surface-elevated, #222) 78%, transparent); }
+.managed-library-remote-card > label { display: flex; align-items: flex-start; gap: 8px; }
+.managed-library-remote-card > label span { display: grid; gap: 2px; }
+.managed-library-remote-card small { color: var(--text-muted); }
+.notification-library-sync-summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.notification-library-sync-summary svg { flex: 0 0 auto; }
+
+@media (max-width: 560px) {
+  .managed-library-mode { grid-template-columns: 1fr; }
+  .settings-sync-card > div:first-child { align-items: flex-start; flex-direction: column; }
+}
+
+@media (forced-colors: active) {
+  .settings-sync-card,
+  .managed-library-remote-card { border: 1px solid CanvasText; }
+}

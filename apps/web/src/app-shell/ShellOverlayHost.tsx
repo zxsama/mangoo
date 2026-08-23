@@ -13,7 +13,7 @@ import { NotificationPopover } from "../features/notifications/NotificationPopov
 import type { CompactNotificationModel } from "../features/notifications/notificationModel";
 import type { NotificationWindowIntent } from "@megle/notification-contract";
 import type { LibraryState } from "../core/useLibraryData";
-import type { RefObject } from "react";
+import type { ComponentProps, RefObject } from "react";
 
 export interface ShellContextMenuState {
   x: number;
@@ -53,7 +53,7 @@ export function ShellNotificationOverlay({
   onOpenNotificationCenter
 }: ShellNotificationOverlayProps) {
   return notificationsOpen && notificationAnchor ? (
-    <NotificationPopover
+    <SyncAwareNotificationPopover
       anchor={notificationAnchor}
       autoFocus={notificationAutoFocus}
       model={notificationModel}
@@ -61,6 +61,10 @@ export function ShellNotificationOverlay({
       onOpenCenter={onOpenNotificationCenter}
     />
   ) : null;
+}
+
+function SyncAwareNotificationPopover(props: ComponentProps<typeof NotificationPopover>) {
+  return <NotificationPopover {...props} />;
 }
 
 export function ShellOverlayHost({

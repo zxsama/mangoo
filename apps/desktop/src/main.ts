@@ -4,6 +4,7 @@ import {
   clipboard,
   dialog,
   ipcMain,
+  powerMonitor,
   screen,
   shell,
   type IpcMainEvent,
@@ -2021,9 +2022,25 @@ app
       publishPhase: pushLibraryPhase
     });
     await createWindow();
+    app.on("browser-window-focus", () => { void wakeCoreSync("foreground"); });
+    powerMonitor.on("resume", () => { void wakeCoreSync("foreground"); });
+    powerMonitor.on("unlock-screen", () => { void wakeCoreSync("foreground"); });
     emitMainStartupReady();
   })
   .catch(handleDesktopStartupFailure);
+
+async function wakeCoreSync(reason: "foreground" | "network"): Promise<void> {
+  const session = coreSession;
+  if (!session) return;
+  try {
+    await fetch(`${session.baseUrl}/sync/wake?reason=${reason}`, {
+      method: "POST",
+      headers: { "x-megle-session": session.sessionToken }
+    });
+  } catch (error) {
+    desktopLogger.warn("main", "[megle] sync wake failed:", error);
+  }
+}
 
 function handleDesktopStartupFailure(error: unknown): void {
   desktopLogger.error("main", "[megle] desktop startup failed:", error);
@@ -2200,17 +2217,25 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
         }
       }
       if (bootstrapRootId !== null) {
-        const retireResponse = await fetch(`${session.baseUrl}/roots/${bootstrapRootId}`, {
-          method: "DELETE",
-          headers: {
-            "x-megle-session": session.sessionToken,
-            "x-megle-context-revision": String(contextRevision)
-          }
-        });
-        if (!retireResponse.ok) {
+        let retireResponse: Response | null = null;
+        const deadline = Date.now() + 5_000;
+        do {
+          retireResponse = await fetch(`${session.baseUrl}/roots/${bootstrapRootId}`, {
+            method: "DELETE",
+            headers: {
+              "x-megle-session": session.sessionToken,
+              "x-megle-context-revision": String(contextRevision)
+            }
+          });
+          if (retireResponse.ok || retireResponse.status !== 500 || Date.now() >= deadline) break;
+          await retireResponse.text();
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        } while (true);
+        if (retireResponse === null || !retireResponse.ok) {
+          const text = await retireResponse.text();
           desktopLogger.warn(
             "main",
-            `[megle] MEGLE_AUTO_ADD_ROOT could not retire bootstrap root (${retireResponse.status})`
+            `[megle] MEGLE_AUTO_ADD_ROOT could not retire bootstrap root (${retireResponse.status}): ${text}`
           );
         } else {
           const deadline = Date.now() + 10_000;

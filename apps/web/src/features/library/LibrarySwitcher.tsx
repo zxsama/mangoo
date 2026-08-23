@@ -32,6 +32,8 @@ import {
   LibraryIconPicker,
 } from "./libraryGlyph";
 import { ManagedLibraryWizard } from "./ManagedLibraryWizard";
+import { useSyncOrchestration } from "../sync/useSyncOrchestration";
+import { syncStatusLabel } from "../sync/syncModel";
 import {
   INITIAL_LIBRARY_SWITCHER_INTERACTION_STATE,
   librarySwitcherInteractionReducer,
@@ -73,9 +75,11 @@ export function LibrarySwitcher({
   open,
   restoreFocusTarget,
 }: LibrarySwitcherProps) {
+  const sync = useSyncOrchestration();
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [query, setQuery] = useState("");
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [wizardMode, setWizardMode] = useState<"create" | "restore">("create");
   const [firstRun, setFirstRun] = useState(false);
   const [interaction, dispatch] = useReducer(
     librarySwitcherInteractionReducer,
@@ -252,6 +256,7 @@ export function LibrarySwitcher({
   );
 
   const libraryRows = filtered.map((item) => {
+    const syncStatus = (sync.snapshot?.libraries ?? []).find((status) => status.libraryUuid === item.libraryUuid);
     const icon = item.icon ?? DEFAULT_LIBRARY_ICON;
     const color = item.color ?? DEFAULT_LIBRARY_COLOR;
     const iconMenuOpen =
@@ -321,6 +326,7 @@ export function LibrarySwitcher({
           type="button"
         >
           <span className="library-switcher-name">{item.name}</span>
+          <span className={`library-switcher-sync-state ${syncStatus?.lifecycle ?? "local-only"}`}>{syncStatusLabel(syncStatus)}</span>
           <span className="library-switcher-path">{item.managedRoot}</span>
         </button>
         {item.active ? (
@@ -401,8 +407,11 @@ export function LibrarySwitcher({
 
   const footerActions = (
     <>
-      <button data-interactive-pointer-target="true" onClick={() => void onCreate()} type="button">
+      <button data-interactive-pointer-target="true" onClick={() => { setWizardMode("create"); void onCreate(); }} type="button">
         创建资源库…
+      </button>
+      <button data-interactive-pointer-target="true" onClick={() => { setWizardMode("restore"); setFirstRun(false); onClose(); window.requestAnimationFrame(() => setWizardOpen(true)); }} type="button">
+        从 OneDrive 恢复…
       </button>
     </>
   );
@@ -473,6 +482,7 @@ export function LibrarySwitcher({
       </ModalSurface>
       <ManagedLibraryWizard
         firstRun={firstRun}
+        initialMode={wizardMode}
         onClose={() => setWizardOpen(false)}
         onCreated={() => {
           setFirstRun(false);

@@ -255,6 +255,7 @@ export function NotificationHistoryView({
           <option value="file_operation">文件操作</option>
           <option value="error">错误</option>
           <option value="thumbnail_cache">缩略图缓存</option>
+          <option value="sync">同步</option>
         </FilterSelect>
         <FilterSelect
           label="来源"
@@ -455,7 +456,7 @@ function statusLabel(value: DesktopNotificationStatus): string {
 }
 
 function categoryLabel(value: DesktopNotificationCategory): string {
-  return ({ task: "后台任务", file_operation: "文件操作", error: "错误", thumbnail_cache: "缩略图缓存" })[value];
+  return ({ task: "后台任务", file_operation: "文件操作", error: "错误", thumbnail_cache: "缩略图缓存", sync: "同步" })[value];
 }
 
 function originLabel(value: DesktopNotificationOperation["origin"]): string {

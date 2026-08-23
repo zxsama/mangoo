@@ -29,6 +29,8 @@ import type { InterfaceStyleController } from "../../design/liquid-glass";
 import { thumbnailFailureLogIntentForLibrary } from "../notifications/notificationModel";
 import { LibraryGlyph, LibraryIconPicker } from "../library/libraryGlyph";
 import { ManagedLibraryWizard } from "../library/ManagedLibraryWizard";
+import { SyncManagementPanel } from "../sync/SyncManagementPanel";
+import { useSyncOrchestration } from "../sync/useSyncOrchestration";
 import {
   LIBRARY_GRID_PREFERENCE_LIMITS,
   type LibraryGridPreferences
@@ -640,6 +642,7 @@ function ShortcutsTab() {
 // ---- Libraries tab: full library management (superset of the switcher) -----
 
 function LibrariesTab({ library }: { library: LibraryState }) {
+  const sync = useSyncOrchestration();
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [iconMenuId, setIconMenuId] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -648,6 +651,7 @@ function LibrariesTab({ library }: { library: LibraryState }) {
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [wizardMode, setWizardMode] = useState<"create" | "restore">("create");
 
   const reload = () => void listLibraries().then(setLibs);
   useEffect(() => {
@@ -818,12 +822,33 @@ function LibrariesTab({ library }: { library: LibraryState }) {
           ))}
         </ul>
         <div className="settings-library-footer">
-          <button type="button" onClick={() => setWizardOpen(true)}>
+          <button type="button" onClick={() => { setWizardMode("create"); setWizardOpen(true); }}>
             创建资源库…
+          </button>
+          <button type="button" onClick={() => { setWizardMode("restore"); setWizardOpen(true); }}>
+            从 OneDrive 恢复…
           </button>
         </div>
       </SettingsGroup>
+      <SyncManagementPanel
+        libraries={libs}
+        statuses={sync.snapshot?.libraries ?? []}
+        providers={(sync.snapshot?.providers ?? []).filter((provider) => provider.runtimeState === "ready" && provider.authState === "authenticated")}
+        busyLibraryId={sync.busyLibraryId}
+        error={sync.error}
+        onAction={(status, action) => void sync.runAction(status, action)}
+        onUnbind={(status, choice) => void sync.unbind(status, choice)}
+        onReconnectPreview={sync.previewReconnect}
+        onReconnectCommit={(status, plan, choice) => void sync.commitReconnect(status, plan, choice)}
+        onAccountChange={(pluginId, switchAccount) => void sync.changeAccount(pluginId, switchAccount)}
+        onEnable={(status, provider) => void sync.enable(status, provider)}
+        onRemoveLocalCopy={(target) => {
+          setConfirmDeleteId(target.libraryUuid);
+          setDeleteConfirmText("");
+        }}
+      />
       <ManagedLibraryWizard
+        initialMode={wizardMode}
         onClose={() => setWizardOpen(false)}
         onCreated={reload}
         onFailure={(cause) => setError(cause instanceof Error ? cause.message : String(cause))}

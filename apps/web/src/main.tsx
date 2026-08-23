@@ -1,8 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { getDesktopBridge, notifyDesktopShellReady } from "./core/desktop";
 import { applyInterfaceStyleVariables, readInterfaceStyle } from "./design/liquid-glass";
 import { OverlayProvider } from "./design/overlays";
+import { installSyncWakeBridge, queryClient } from "./core/queryClient";
 import "./styles.css";
 import "./design/overlays/overlay.css";
 
@@ -10,6 +12,11 @@ import "./design/overlays/overlay.css";
 // first paint. Hooks keep them current after mount; this closes the blank default
 // CSS frame that used to appear before Settings/Plugins initialized.
 applyInterfaceStyleVariables(readInterfaceStyle());
+installSyncWakeBridge();
+
+function ApplicationProviders({ children }: { children: React.ReactNode }) {
+  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
 
 // Secondary OS windows load this same bundle with a role + matching hash route.
 // Hash detection also gives browser builds a safe named-window fallback.
@@ -25,7 +32,7 @@ if (isNotificationsWindow) {
   void import("./features/notifications/NotificationWindow").then(({ NotificationWindow }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>
-        <NotificationWindow />
+        <ApplicationProviders><NotificationWindow /></ApplicationProviders>
       </React.StrictMode>
     );
   });
@@ -33,7 +40,7 @@ if (isNotificationsWindow) {
   void import("./features/plugins/PluginsWindow").then(({ PluginsWindow }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>
-        <PluginsWindow />
+        <ApplicationProviders><PluginsWindow /></ApplicationProviders>
       </React.StrictMode>
     );
   });
@@ -41,7 +48,7 @@ if (isNotificationsWindow) {
   void import("./features/settings/SettingsWindow").then(({ SettingsWindow }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>
-        <SettingsWindow />
+        <ApplicationProviders><SettingsWindow /></ApplicationProviders>
       </React.StrictMode>
     );
   });
@@ -50,9 +57,7 @@ if (isNotificationsWindow) {
   void import("./app/App").then(({ App }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>
-        <OverlayProvider>
-          <App />
-        </OverlayProvider>
+        <ApplicationProviders><OverlayProvider><App /></OverlayProvider></ApplicationProviders>
       </React.StrictMode>
     );
     preloadSecondaryWindowRenderers();
