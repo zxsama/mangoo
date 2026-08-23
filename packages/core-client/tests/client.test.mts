@@ -1107,6 +1107,48 @@ describe("createCoreClient", () => {
     assert.equal(result, null);
   });
 
+  test("sync orchestration endpoints keep paths, idempotency bodies, and revision fences", async () => {
+    mockFetch({ operationUuid: "op-1", state: "complete", phase: "complete", kind: "pause", updatedAt: 1 });
+    const core = client();
+    await core.pauseLibrarySync("library/one", 17, { operationUuid: "op-1" });
+    assert.equal(recorded[0].method, "POST");
+    assert.match(recorded[0].url, /\/libraries\/library%2Fone\/sync\/pause$/);
+    assert.equal(recorded[0].headers["x-megle-context-revision"], "17");
+    assert.deepEqual(JSON.parse(recorded[0].body!), { operationUuid: "op-1" });
+
+    recorded.length = 0;
+    mockFetch({ preflightToken: "00000000-0000-7000-8000-000000000001", expiresAt: 2, totalItems: 1, totalBytes: 42 });
+    await core.preflightSyncRestore({
+      items: [{ accountUuid: "account", libraryUuid: "remote", name: "Remote", managedRoot: "D:/Remote" }]
+    });
+    assert.match(recorded[0].url, /\/sync\/restores\/preflight$/);
+
+    recorded.length = 0;
+    mockFetch({ items: [] });
+    await core.startSyncRestore({
+      operationUuid: "restore-op",
+      preflightToken: "00000000-0000-7000-8000-000000000001",
+      items: [{ accountUuid: "account", libraryUuid: "remote", name: "Remote", managedRoot: "D:/Remote" }]
+    });
+    assert.equal(recorded[0].method, "POST");
+    assert.match(recorded[0].url, /\/sync\/restores$/);
+    assert.equal(JSON.parse(recorded[0].body!).items[0].managedRoot, "D:/Remote");
+  });
+
+  test("sync status uses background scheduling and diagnostics never alter context", async () => {
+    mockFetch({ revision: 1, generatedAt: 1, schedulerState: "running", providers: [], libraries: [] });
+    const core = client();
+    await core.getSyncStatus();
+    assert.match(recorded[0].url, /\/sync\/status$/);
+    assert.equal(recorded[0].method, "GET");
+
+    recorded.length = 0;
+    mockFetch({ redacted: true });
+    await core.exportLibrarySyncDiagnostics("library one");
+    assert.match(recorded[0].url, /\/libraries\/library%20one\/sync\/diagnostics\/export$/);
+    assert.equal(recorded[0].method, "POST");
+  });
+
   test("blob helpers retain plain-text error bodies in CoreApiError", async () => {
     globalThis.fetch = (async () =>
       new Response("Core unavailable", {

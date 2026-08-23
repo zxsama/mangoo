@@ -10,6 +10,8 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0002_sync_protocol_foundation.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0003_plugin_runtime.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0004_provider_root_discovery.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0005_sync_orchestration.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0006_sync_orchestration_recovery.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -583,14 +585,20 @@ def main() -> None:
             "provider_object_receipts",
             "plugin_activation_journal",
             "plugin_version_journal",
+        "sync_orchestration_operations",
+        "sync_preflight_tokens",
+            "sync_unbind_plans",
+            "sync_reconnect_plans",
+            "sync_restore_plans",
+            "sync_restore_preflights",
         }
         missing_host_tables = required_host_tables - host_tables
         if missing_host_tables:
             fail(f"missing Host Registry tables: {sorted(missing_host_tables)}")
         meta = host_conn.execute(
-            "SELECT schema_version, active_library_uuid, context_revision FROM host_meta WHERE singleton = 1"
+            "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (4, None, 0):
+        if meta != (6, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         binding_cursor_columns = {
             row[1]
@@ -608,6 +616,34 @@ def main() -> None:
         }
         if "page_token" not in root_cursor_columns:
             fail("provider_account_root_cursors.page_token is required for durable root pagination")
+        remote_library_columns = {
+            row[1]
+            for row in host_conn.execute("PRAGMA table_info(provider_remote_libraries)")
+        }
+        required_remote_library_columns = {
+            "name",
+            "icon",
+            "media_count",
+            "logical_bytes",
+            "last_synced_at",
+            "compatible",
+            "descriptor_error_code",
+        }
+        if not required_remote_library_columns.issubset(remote_library_columns):
+            fail("provider_remote_libraries is missing descriptor summary columns")
+        binding_columns = {
+            row[1]
+            for row in host_conn.execute("PRAGMA table_info(library_sync_bindings)")
+        }
+        required_binding_status = {
+            "pending_upload_items",
+            "pending_upload_bytes",
+            "pending_download_items",
+            "pending_download_bytes",
+            "conflict_count",
+        }
+        if not required_binding_status.issubset(binding_columns):
+            fail("library_sync_bindings is missing orchestration status counters")
         creation_columns = {
             row[1]
             for row in host_conn.execute(
@@ -635,6 +671,13 @@ def main() -> None:
             "idx_plugin_runtime_schedule",
             "idx_provider_binding_schedule",
             "idx_provider_receipts_state",
+            "idx_sync_operations_library",
+            "idx_sync_operations_active",
+            "idx_sync_unbind_plans_state",
+            "idx_sync_reconnect_plans_state",
+            "idx_sync_restore_plans_state",
+            "idx_sync_restore_plans_operation",
+            "idx_sync_preflight_expiry",
         }
         missing_host_indexes = required_host_indexes - host_indexes
         if missing_host_indexes:

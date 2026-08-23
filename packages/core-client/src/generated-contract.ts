@@ -94,6 +94,35 @@ export interface EnableLibrarySyncRequest {
   accountIdentity: string;
 }
 
+export type LibrarySyncLifecycleState = "local-only" | "enabling" | "syncing" | "paused" | "unbinding" | "restoring" | "error";
+export type LibrarySyncPhase = "preflight" | "capturing" | "uploading" | "publishing" | "active" | "reconcile" | "catalog-restore" | "catalog-ready" | "restoring-media" | "complete" | "retry-wait" | "compatibility-locked" | "cancelled";
+export type CatalogReadiness = "not-created" | "restoring" | "catalog-ready" | "ready";
+export type SyncAllowedAction = "enable" | "pause" | "resume" | "retry" | "sync-now" | "cancel-before-catalog" | "unbind" | "resolve-conflicts" | "reconnect";
+export interface SyncProviderStatus { pluginId: string; accountUuid: string; accountDisplayName?: string | null; runtimeState: string; authState: string; lastHealthyAt?: number | null; lastErrorCode?: string | null; }
+export interface LibrarySyncStatus { libraryUuid: string; name: string; lifecycle: LibrarySyncLifecycleState; phase: LibrarySyncPhase; catalogReadiness: CatalogReadiness; providerId?: string | null; accountUuid?: string | null; remoteLibraryUuid: string | null; allowedActions: SyncAllowedAction[]; lastSuccessAt?: number | null; lastErrorCode?: string | null; retryAfter?: number | null; pollAfter?: number | null; pendingUploadItems: number; pendingDownloadItems: number; pendingUploadBytes: number; pendingDownloadBytes: number; conflictCount: number; localDivergenceCount: number; operationRevision: number; restoreUuid?: string | null; restoreItemsDone?: number | null; restoreItemsTotal?: number | null; restoreBytesDone?: number | null; restoreBytesTotal?: number | null; }
+export interface SyncStatusSnapshot { revision: number; generatedAt: number; schedulerState: "starting" | "running" | "stopped" | "degraded"; providers: SyncProviderStatus[]; libraries: LibrarySyncStatus[]; }
+export interface SyncOperation { operationUuid: string; libraryUuid?: string | null; kind: string; state: "pending" | "running" | "waiting" | "complete" | "failed" | "cancelled"; phase: string; errorCode?: string | null; updatedAt: number; }
+export interface SyncCommandRequest { operationUuid: string; }
+export interface SyncPreflightRequest { providerId: string; accountUuid: string; remoteLibraryUuid: string | null; }
+export interface SyncPreflightResponse { ok: boolean; reason: string; preflightToken: string | null; remoteLibraryUuid: string | null; }
+export interface SyncEnableRequest { operationUuid: string; providerId: string; accountUuid: string; preflightToken: string; }
+export interface SyncUnbindPlan { planUuid: string; libraryUuid: string; pendingCount: number; publishedCount: number; unpublishedCount: number; cutoverActorSeq: number; remoteWatermark: number; originIdentity?: string | null; }
+export interface SyncUnbindCommitRequest { operationUuid: string; planUuid: string; choice: "drain-before-unbind" | "keep-local-fork"; }
+export interface SyncReconnectPreflightRequest { accountUuid: string; remoteLibraryUuid: string; }
+export interface SyncReconnectPlan { planUuid: string; libraryUuid: string; remoteLibraryUuid: string; originIdentity?: string | null; localDivergenceCount: number; remoteDivergenceCount: number; remoteExists: boolean; remoteCompatible: boolean; sameRemoteIdentity: boolean; originRemoteWatermark: number; baseRemoteObjectCount: number; remoteObjectCount: number; remoteDescriptorSha256?: string | null; remoteBindingEpoch?: string | null; remoteAdvanced: boolean; mergeAllowed: boolean; publishNewAllowed: boolean; }
+export interface SyncReconnectCommitRequest { operationUuid: string; planUuid: string; choice: "merge-local-fork" | "publish-new-remote"; }
+export interface RemoteLibrarySummary { accountUuid: string; libraryUuid: string; name: string; icon: string | null; mediaCount: number | null; logicalBytes: number | null; lastSyncedAt: number | null; descriptorSize: number; updatedAt: number; compatible: boolean; boundLocally: boolean; errorCode: string | null; }
+export interface RemoteLibraryListResponse { items: RemoteLibrarySummary[]; nextCursor: string | null; totalCount?: number; }
+export interface SyncRestoreStartItem { accountUuid: string; libraryUuid: string; name: string; managedRoot: string; }
+export interface SyncRestorePreflightRequest { items: SyncRestoreStartItem[]; }
+export interface SyncRestorePreflight { preflightToken: string; expiresAt: number; totalItems: number; totalBytes: number; }
+export interface SyncRestoreStartRequest { operationUuid: string; preflightToken: string; items: SyncRestoreStartItem[]; }
+export interface SyncRestorePlan { restoreUuid: string; operationUuid: string; accountUuid: string; libraryUuid: string; name: string; managedRoot: string; state: string; phase: string; catalogReady: boolean; mediaItemsDone: number; mediaItemsTotal?: number | null; mediaBytesDone: number; mediaBytesTotal?: number | null; errorCode?: string | null; updatedAt: number; }
+export interface SyncRestoreListResponse { items: SyncRestorePlan[]; }
+export interface SyncConflictRecord { conflictUuid: string; entityUuid?: string | null; conflictKind: string; state: string; details?: unknown | null; createdAt: number; resolvedAt?: number | null; }
+export interface SyncConflictListResponse { items: SyncConflictRecord[]; nextCursor: string | null; }
+export interface SyncConflictResolutionRequest { operationUuid: string; resolution: "resolve" | "ignore"; }
+
 export interface LibraryErrorResponse {
   code: string;
   message: string;
@@ -239,7 +268,7 @@ export interface NotificationOperationSnapshot {
   operationId: string;
   revision: number;
   kind: string;
-  category: "task" | "file_operation" | "error" | "thumbnail_cache";
+  category: "task" | "file_operation" | "error" | "thumbnail_cache" | "sync";
   origin: NotificationOrigin;
   presentation: NotificationPresentation;
   status: NotificationOperationStatus;

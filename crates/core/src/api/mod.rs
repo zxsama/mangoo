@@ -743,6 +743,7 @@ async fn attach_library_context(
     // active Catalog. It must remain usable on a new device before any Library
     // is activated, and must never inherit an active-Library revision fence.
     let is_library_control = request.uri().path().starts_with("/api/libraries")
+        || request.uri().path().starts_with("/api/sync")
         || request.uri().path().starts_with("/api/plugins")
         || request
             .uri()

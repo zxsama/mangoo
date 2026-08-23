@@ -85,6 +85,24 @@ impl LibraryRuntimeResources {
         plugins_dir: Option<PathBuf>,
         runtime_lease: Option<RuntimeLease>,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::from_database_with_commit_hook(
+            library_uuid,
+            runtime_generation,
+            database,
+            plugins_dir,
+            runtime_lease,
+            None,
+        )
+    }
+
+    fn from_database_with_commit_hook(
+        library_uuid: Option<String>,
+        runtime_generation: u64,
+        database: Database,
+        plugins_dir: Option<PathBuf>,
+        runtime_lease: Option<RuntimeLease>,
+        authoritative_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> anyhow::Result<Arc<Self>> {
         let notification_outbox_wake = database.notification_outbox_wake();
         let read_database_path = database.path().map(Path::to_path_buf);
         if let Err(error) = database.flush_dirty_notification_heads() {
@@ -93,7 +111,8 @@ impl LibraryRuntimeResources {
         let worker_database = database.reopen()?;
         let watcher_database = database.reopen()?;
         let fsops_database = database.reopen()?.map(|db| Arc::new(Mutex::new(db)));
-        let writer = DbWriter::spawn(database);
+        let writer =
+            DbWriter::spawn_with_authoritative_commit_hook(database, authoritative_commit_hook);
         let worker = worker_database.map(|database| start_managed_worker(database, writer.clone()));
         let task_queue = worker
             .as_ref()
@@ -204,6 +223,285 @@ impl LibraryManager {
     }
     pub fn provider_manager(&self) -> crate::sync::provider::ProviderManager {
         self.sync_coordinator.provider_manager()
+    }
+
+    pub fn wake_sync_after_local_mutation(&self) {
+        if let Some(library_uuid) = self.active_snapshot().library_uuid {
+            let _ = self.registry.wake_binding(&library_uuid);
+        }
+        self.sync_coordinator.wake();
+    }
+
+    pub fn wake_sync_for_foreground_or_network(&self) {
+        let _ = self.registry.wake_all_sync_bindings();
+        self.sync_coordinator.wake();
+    }
+
+    pub async fn publish_sync_operation_notification(
+        &self,
+        operation: &crate::host_registry::SyncOperation,
+    ) -> anyhow::Result<()> {
+        let Some(library_uuid) = operation.library_uuid.as_deref() else {
+            return Ok(());
+        };
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        let terminal = matches!(
+            operation.state.as_str(),
+            "complete" | "failed" | "cancelled"
+        );
+        let status = match operation.state.as_str() {
+            "complete" => "succeeded",
+            "failed" => "failed",
+            "cancelled" => "cancelled",
+            "pending" | "waiting" => "pending",
+            _ => "running",
+        };
+        let mut notification = crate::db::notification_outbox::NotificationOperation {
+            operation_id: format!("sync:{}", operation.operation_uuid),
+            revision: 0,
+            kind: operation.kind.clone(),
+            category: "sync".to_owned(),
+            origin: "user".to_owned(),
+            presentation: "important".to_owned(),
+            status: status.to_owned(),
+            phase: Some(operation.phase.clone()),
+            title: format!("{} · 资源库同步", descriptor.name),
+            summary: operation
+                .error_code
+                .clone()
+                .or_else(|| Some(operation.phase.clone())),
+            task_id: None,
+            root_id: None,
+            folder_id: None,
+            file_id: None,
+            current_value: 0,
+            total_value: None,
+            unit: None,
+            error_code: operation.error_code.clone(),
+            error_detail: None,
+            cancellable: operation.kind == "restore" && !terminal,
+            retryable: operation.state == "failed",
+            attempt: 1,
+            occurrence_count: 1,
+            started_at: operation.updated_at,
+            updated_at: operation.updated_at,
+            completed_at: terminal.then_some(operation.updated_at),
+        };
+        let mode = if terminal {
+            crate::db::notification_outbox::PublishMode::Terminal
+        } else {
+            crate::db::notification_outbox::PublishMode::Phase
+        };
+        let active = self.active_snapshot();
+        if active.library_uuid.as_deref() == Some(library_uuid) {
+            let runtime = active
+                .runtime
+                .ok_or_else(|| anyhow::anyhow!("library-runtime-unavailable"))?;
+            runtime
+                .writer
+                .write_authoritative(move |database| {
+                    database
+                        .publish_notification_operation(&mut notification, mode)
+                        .map(|_| ())
+                })
+                .await
+        } else {
+            let database = Database::open(descriptor.local_data_dir.join("catalog.sqlite"))?;
+            database.apply_migrations()?;
+            let writer = DbWriter::spawn(database);
+            let result = writer
+                .write_authoritative(move |database| {
+                    database
+                        .publish_notification_operation(&mut notification, mode)
+                        .map(|_| ())
+                })
+                .await;
+            let shutdown = writer.shutdown().await;
+            result?;
+            shutdown
+        }
+    }
+
+    pub async fn publish_restore_notification(
+        &self,
+        plan: &crate::host_registry::SyncRestorePlan,
+    ) -> anyhow::Result<()> {
+        let descriptor = self
+            .registry
+            .library(&plan.library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        let catalog_path = descriptor.local_data_dir.join("catalog.sqlite");
+        if !catalog_path.is_file() {
+            return Ok(());
+        }
+        let terminal = matches!(plan.state.as_str(), "complete" | "failed" | "cancelled");
+        let status = match plan.state.as_str() {
+            "complete" => "succeeded",
+            "failed" => "failed",
+            "cancelled" => "cancelled",
+            "paused" => "pending",
+            _ => "running",
+        };
+        let mut notification = crate::db::notification_outbox::NotificationOperation {
+            operation_id: format!("sync:{}:{}", plan.operation_uuid, plan.library_uuid),
+            revision: 0,
+            kind: "restore".to_owned(),
+            category: "sync".to_owned(),
+            origin: "user".to_owned(),
+            presentation: "important".to_owned(),
+            status: status.to_owned(),
+            phase: Some(plan.phase.clone()),
+            title: format!("{} · 资源库恢复", descriptor.name),
+            summary: plan.error_code.clone().or_else(|| Some(plan.phase.clone())),
+            task_id: None,
+            root_id: None,
+            folder_id: None,
+            file_id: None,
+            current_value: i64::try_from(plan.media_items_done).unwrap_or(i64::MAX),
+            total_value: plan
+                .media_items_total
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+            unit: Some("items".to_owned()),
+            error_code: plan.error_code.clone(),
+            error_detail: None,
+            cancellable: !terminal && !plan.catalog_ready,
+            retryable: plan.state == "failed",
+            attempt: 1,
+            occurrence_count: 1,
+            started_at: plan.updated_at,
+            updated_at: plan.updated_at,
+            completed_at: terminal.then_some(plan.updated_at),
+        };
+        let mode = if terminal {
+            crate::db::notification_outbox::PublishMode::Terminal
+        } else {
+            crate::db::notification_outbox::PublishMode::Phase
+        };
+        let database = Database::open(catalog_path)?;
+        database.apply_migrations()?;
+        let writer = DbWriter::spawn(database);
+        let result = writer
+            .write_authoritative(move |database| {
+                database
+                    .publish_notification_operation(&mut notification, mode)
+                    .map(|_| ())
+            })
+            .await;
+        let shutdown = writer.shutdown().await;
+        result?;
+        shutdown
+    }
+
+    pub async fn create_reconnect_plan(
+        &self,
+        library_uuid: &str,
+        account_uuid: &str,
+        remote_library_uuid: &str,
+    ) -> anyhow::Result<crate::host_registry::SyncReconnectPlan> {
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        let database = Database::open(descriptor.local_data_dir.join("catalog.sqlite"))?;
+        database.apply_migrations()?;
+        let connection = database.connection_for_fsops();
+        let next_generation: i64 = connection.query_row(
+            "SELECT next_local_mutation_generation FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let closed_generation: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(e.local_mutation_generation),0) FROM sync_events e JOIN sync_actor_epochs a ON a.actor_epoch=e.actor_epoch WHERE a.state IN ('closed','archived','forked')",
+            [],
+            |row| row.get(0),
+        )?;
+        let local_divergence_count = next_generation
+            .saturating_sub(closed_generation)
+            .saturating_sub(1) as u64;
+        self.registry.ensure_sync_provider_ready(account_uuid)?;
+        let plugin_id = self
+            .registry
+            .plugin_id_for_account(account_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("provider-account-not-found"))?;
+        let provider = self
+            .provider_manager()
+            .resolve(&plugin_id, account_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("provider-not-ready"))?;
+        let (origin_binding_epoch, origin_transport_generation) = self
+            .registry
+            .reconnect_origin_transport(library_uuid, account_uuid, remote_library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("reconnect-origin-not-found"))?;
+        let context = crate::sync::provider::TransportContext {
+            namespace: remote_library_uuid.to_owned(),
+            binding_epoch: origin_binding_epoch.to_string(),
+            transport_generation: origin_transport_generation,
+        };
+        let mut remote_object_count = 0u64;
+        let mut page_token = None;
+        let mut remote_exists = false;
+        loop {
+            let page = provider
+                .delta_list(
+                    crate::sync::provider::DeltaScope::Library {
+                        namespace: remote_library_uuid.to_owned(),
+                        binding_epoch: origin_binding_epoch.to_string(),
+                        transport_generation: origin_transport_generation,
+                    },
+                    None,
+                    page_token.as_deref(),
+                    200,
+                )
+                .await
+                .map_err(anyhow::Error::new)?;
+            remote_object_count = remote_object_count.saturating_add(page.objects.len() as u64);
+            remote_exists |= page
+                .objects
+                .iter()
+                .any(|object| object.key == "library-descriptor");
+            page_token = page.page_token;
+            if page_token.is_none() {
+                break;
+            }
+            if remote_object_count > 1_000_000 {
+                anyhow::bail!("remote-preview-object-limit");
+            }
+        }
+        let mut remote_compatible = false;
+        let mut remote_descriptor_sha256 = None;
+        let mut remote_binding_epoch = None;
+        if remote_exists {
+            let object = provider
+                .object_get(&context, "library-descriptor", 1024 * 1024)
+                .await
+                .map_err(anyhow::Error::new)?;
+            crate::sync::provider::validate_download(&object, 1024 * 1024)
+                .map_err(anyhow::Error::new)?;
+            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&object.path)?)?;
+            remote_compatible = value.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+                && value.get("libraryUuid").and_then(serde_json::Value::as_str)
+                    == Some(remote_library_uuid);
+            remote_binding_epoch = value
+                .get("bindingEpoch")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            remote_descriptor_sha256 = Some(object.metadata.sha256);
+        }
+        self.registry.create_reconnect_plan(
+            library_uuid,
+            account_uuid,
+            remote_library_uuid,
+            local_divergence_count,
+            crate::host_registry::ReconnectPreviewFacts {
+                remote_exists,
+                remote_compatible,
+                remote_object_count,
+                remote_descriptor_sha256,
+                remote_binding_epoch,
+            },
+        )
     }
 
     pub async fn fence_plugin_bindings(
@@ -531,6 +829,7 @@ impl LibraryManager {
     pub async fn restore_active(&self) -> anyhow::Result<()> {
         self.recover_journals()?;
         self.registry.recover_activation_journal()?;
+        self.registry.recover_sync_orchestration_journals()?;
         let snapshot = self.registry.snapshot()?;
         if let Some(library_uuid) = snapshot.active_library_uuid {
             let descriptor = self
@@ -552,6 +851,110 @@ impl LibraryManager {
                 runtime: None,
             };
         }
+        self.recover_sync_runtime_journals().await
+    }
+
+    async fn recover_sync_runtime_journals(&self) -> anyhow::Result<()> {
+        for recovery in self.registry.pending_sync_binding_recovery()? {
+            let revision = self.registry.snapshot()?.context_revision;
+            match recovery.state.as_str() {
+                "unbinding" => {
+                    if self
+                        .registry
+                        .binding_transport(&recovery.library_uuid, "library")?
+                        .is_some()
+                    {
+                        self.unbind_library_sync_with_revision(&recovery.library_uuid, revision)
+                            .await?;
+                    }
+                    if let (Some(plan_uuid), Some(choice)) =
+                        (recovery.plan_uuid.as_deref(), recovery.choice.as_deref())
+                    {
+                        self.registry
+                            .advance_unbind_plan(plan_uuid, choice, "reconciling")?;
+                    }
+                }
+                "preparing" => {
+                    let descriptor = self
+                        .registry
+                        .library(&recovery.library_uuid)?
+                        .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+                    let transport = self
+                        .registry
+                        .binding_transport(&recovery.library_uuid, "library")?
+                        .ok_or_else(|| anyhow::anyhow!("sync-binding-not-found"))?;
+                    let active = self.active_snapshot();
+                    let generation =
+                        if active.library_uuid.as_deref() == Some(recovery.library_uuid.as_str()) {
+                            active
+                                .runtime
+                                .ok_or_else(|| anyhow::anyhow!("library-runtime-unavailable"))?
+                                .writer
+                                .write_authoritative(move |database| {
+                                    database.begin_sync_capture(
+                                        transport.binding_epoch,
+                                        transport.actor_epoch,
+                                    )
+                                })
+                                .await?
+                        } else {
+                            let runtime = crate::sync::runtime::DormantSyncRuntime::new(
+                                &recovery.library_uuid,
+                                descriptor.local_data_dir.join("catalog.sqlite"),
+                                self.runtime_leases.clone(),
+                            );
+                            runtime
+                                .run_turn(move |database| {
+                                    database.begin_sync_capture(
+                                        transport.binding_epoch,
+                                        transport.actor_epoch,
+                                    )
+                                })
+                                .await?
+                        };
+                    self.registry.set_sync_capture_generation(
+                        &recovery.library_uuid,
+                        transport.binding_epoch,
+                        generation,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        let _ = self.sync_coordinator.reconcile_pending_unbinds().await?;
+        for restore in self.registry.pending_restore_recovery()? {
+            let descriptor = self.registry.library(&restore.library_uuid)?;
+            if restore.catalog_ready {
+                if descriptor
+                    .as_ref()
+                    .is_some_and(|value| value.local_data_dir.join("catalog.sqlite").is_file())
+                {
+                    if restore.state != "paused" {
+                        let _ = self.registry.wake_binding(&restore.library_uuid);
+                    }
+                    let _ = self.publish_restore_notification(&restore).await;
+                    continue;
+                }
+                self.registry
+                    .fail_restore_plan(&restore.restore_uuid, "catalog-missing-after-restart")?;
+                continue;
+            }
+            if let Some(descriptor) = descriptor {
+                if descriptor.local_data_dir.join("catalog.sqlite").is_file() {
+                    self.registry
+                        .mark_restore_catalog_ready(&restore.library_uuid)?;
+                } else if restore.state == "failed" {
+                    let _ = self.cancel_restore(&restore.restore_uuid).await;
+                } else {
+                    let _ = self.registry.wake_binding(&restore.library_uuid);
+                }
+            } else if restore.state == "failed" {
+                let _ = self
+                    .registry
+                    .commit_cancelled_restore_cleanup(&restore.restore_uuid, &restore.library_uuid);
+            }
+        }
+        self.sync_coordinator.wake();
         Ok(())
     }
 
@@ -791,6 +1194,56 @@ impl LibraryManager {
         preflight_token: Option<String>,
         activate: bool,
     ) -> anyhow::Result<(LibraryDescriptor, bool, Option<String>)> {
+        self.create_library_internal(
+            name,
+            icon,
+            color,
+            managed_root,
+            preflight_token,
+            activate,
+            None,
+            true,
+        )
+        .await
+    }
+
+    pub async fn create_restore_library(
+        &self,
+        library_uuid: String,
+        name: String,
+        managed_root: PathBuf,
+        account_uuid: &str,
+    ) -> anyhow::Result<LibraryDescriptor> {
+        self.registry.ensure_sync_provider_ready(account_uuid)?;
+        let (descriptor, _, _) = self
+            .create_library_internal(
+                name,
+                None,
+                None,
+                managed_root,
+                None,
+                false,
+                Some(library_uuid),
+                false,
+            )
+            .await?;
+        self.registry
+            .begin_restore_binding(&descriptor.library_uuid, account_uuid)?;
+        self.sync_coordinator.wake();
+        Ok(descriptor)
+    }
+
+    async fn create_library_internal(
+        &self,
+        name: String,
+        icon: Option<String>,
+        color: Option<String>,
+        managed_root: PathBuf,
+        preflight_token: Option<String>,
+        activate: bool,
+        requested_library_uuid: Option<String>,
+        initialize_catalog: bool,
+    ) -> anyhow::Result<(LibraryDescriptor, bool, Option<String>)> {
         let _operation = self.operation.lock().await;
         let validation = self.preflight(&name, &managed_root)?;
         if !validation.ok {
@@ -800,7 +1253,11 @@ impl LibraryManager {
             verify_preflight_token(&validation.normalized_root, token)
                 .map_err(|reason| anyhow::anyhow!(reason.as_str()))?;
         }
-        let library_uuid = Uuid::now_v7().to_string();
+        let library_uuid = requested_library_uuid.unwrap_or_else(|| Uuid::now_v7().to_string());
+        Uuid::parse_str(&library_uuid).map_err(|_| anyhow::anyhow!("invalid-library-uuid"))?;
+        if self.registry.library(&library_uuid)?.is_some() {
+            anyhow::bail!("library-already-present");
+        }
         let root_uuid = Uuid::now_v7().to_string();
         let txn_uuid = Uuid::now_v7().to_string();
         let local_staging_dir = self
@@ -914,8 +1371,8 @@ impl LibraryManager {
             None,
             Some(staging_guard.identity()),
         )?;
-        let catalog_path = local_staging_dir.join("catalog.sqlite");
-        {
+        if initialize_catalog {
+            let catalog_path = local_staging_dir.join("catalog.sqlite");
             let catalog = Database::open(&catalog_path)?;
             catalog.apply_migrations()?;
             catalog.add_root(NewRoot {
@@ -1329,6 +1786,7 @@ impl LibraryManager {
             binding_epoch,
             result.expect("handled error above"),
         )?;
+        self.sync_coordinator.wake();
         Ok(())
     }
 
@@ -1392,7 +1850,335 @@ impl LibraryManager {
         Ok(())
     }
 
-    fn ensure_context_revision(&self, expected_revision: u64) -> anyhow::Result<()> {
+    pub async fn pause_library_sync_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+    ) -> anyhow::Result<()> {
+        let _operation = self.operation.lock().await;
+        self.ensure_context_revision(expected_revision)?;
+        let transport = self
+            .registry
+            .binding_transport(library_uuid, "library")?
+            .ok_or_else(|| anyhow::anyhow!("sync-binding-not-found"))?;
+        let next_generation = self.registry.pause_binding(library_uuid)?;
+        self.sync_coordinator
+            .provider_manager()
+            .fence_binding(
+                &transport.plugin_id,
+                &transport.account_uuid,
+                transport.binding_epoch,
+                next_generation as u64,
+            )
+            .await?;
+        self.sync_coordinator
+            .cancel_media_binding(transport.binding_epoch)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn pause_restore(
+        &self,
+        restore_uuid: &str,
+    ) -> anyhow::Result<crate::host_registry::SyncRestorePlan> {
+        let plan = self
+            .registry
+            .restore_plan(restore_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("restore-not-found"))?;
+        let revision = self.registry.snapshot()?.context_revision;
+        self.pause_library_sync_with_revision(&plan.library_uuid, revision)
+            .await?;
+        self.registry.set_restore_state(restore_uuid, "paused")
+    }
+
+    pub async fn resume_restore(
+        &self,
+        restore_uuid: &str,
+    ) -> anyhow::Result<crate::host_registry::SyncRestorePlan> {
+        let plan = self
+            .registry
+            .restore_plan(restore_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("restore-not-found"))?;
+        let revision = self.registry.snapshot()?.context_revision;
+        self.resume_library_sync_with_revision(&plan.library_uuid, revision)
+            .await?;
+        self.registry.set_restore_state(restore_uuid, "restoring")
+    }
+
+    pub async fn cancel_restore(
+        &self,
+        restore_uuid: &str,
+    ) -> anyhow::Result<crate::host_registry::SyncRestorePlan> {
+        let _operation = self.operation.lock().await;
+        let plan = self
+            .registry
+            .restore_plan(restore_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("restore-not-found"))?;
+        if plan.catalog_ready {
+            anyhow::bail!("restore-action-not-allowed");
+        }
+        let descriptor = self
+            .registry
+            .library(&plan.library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        verify_descriptor_identity(&descriptor)?;
+        if descriptor.local_data_dir.join("catalog.sqlite").exists() {
+            anyhow::bail!("restore-action-not-allowed");
+        }
+        if let Some(transport) = self
+            .registry
+            .binding_transport(&plan.library_uuid, "library")?
+        {
+            let next_generation = self
+                .registry
+                .begin_unbind(&plan.library_uuid, transport.binding_epoch)?;
+            self.sync_coordinator
+                .provider_manager()
+                .fence_binding(
+                    &transport.plugin_id,
+                    &transport.account_uuid,
+                    transport.binding_epoch,
+                    next_generation as u64,
+                )
+                .await?;
+            self.sync_coordinator
+                .cancel_media_binding(transport.binding_epoch)
+                .await?;
+        }
+        let root_identity = SafeDirectory::open(&descriptor.managed_root)?
+            .identity()
+            .to_string();
+        let local_identity = SafeDirectory::open(&descriptor.local_data_dir)?
+            .identity()
+            .to_string();
+        let cleanup_uuid = Uuid::now_v7();
+        let root_quarantine = descriptor
+            .managed_root
+            .with_file_name(format!(".megle-restore-cancel-{cleanup_uuid}"));
+        let local_quarantine = descriptor
+            .local_data_dir
+            .with_file_name(format!(".megle-restore-cancel-{cleanup_uuid}"));
+        safe_rename_directory_expected(
+            &descriptor.local_data_dir,
+            &local_quarantine,
+            &local_identity,
+        )?;
+        if let Err(error) = safe_rename_directory_expected(
+            &descriptor.managed_root,
+            &root_quarantine,
+            &root_identity,
+        ) {
+            safe_rename_directory(&local_quarantine, &descriptor.local_data_dir)?;
+            return Err(error.into());
+        }
+        let cancelled = match self
+            .registry
+            .commit_cancelled_restore_cleanup(restore_uuid, &plan.library_uuid)
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                safe_rename_directory(&root_quarantine, &descriptor.managed_root)?;
+                safe_rename_directory(&local_quarantine, &descriptor.local_data_dir)?;
+                return Err(error);
+            }
+        };
+        safe_delete_tree_expected(&local_quarantine, &local_identity)?;
+        safe_delete_tree_expected(&root_quarantine, &root_identity)?;
+        Ok(cancelled)
+    }
+
+    pub async fn discard_restore_plan(
+        &self,
+        restore_uuid: &str,
+    ) -> anyhow::Result<crate::host_registry::SyncRestorePlan> {
+        let plan = self
+            .registry
+            .restore_plan(restore_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("restore-not-found"))?;
+        if self.registry.library(&plan.library_uuid)?.is_some() {
+            self.cancel_restore(restore_uuid).await
+        } else {
+            self.registry
+                .commit_cancelled_restore_cleanup(restore_uuid, &plan.library_uuid)
+        }
+    }
+
+    pub async fn resume_library_sync_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+    ) -> anyhow::Result<()> {
+        let _operation = self.operation.lock().await;
+        self.ensure_context_revision(expected_revision)?;
+        let transport = self
+            .registry
+            .binding_transport(library_uuid, "library")?
+            .ok_or_else(|| anyhow::anyhow!("sync-binding-not-found"))?;
+        self.registry.set_binding_state(library_uuid, "active")?;
+        self.sync_coordinator
+            .resume_media_binding(transport.binding_epoch)
+            .await;
+        self.sync_coordinator.wake();
+        Ok(())
+    }
+
+    pub async fn wake_library_sync_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+    ) -> anyhow::Result<()> {
+        let _operation = self.operation.lock().await;
+        self.ensure_context_revision(expected_revision)?;
+        self.registry.wake_binding(library_uuid)?;
+        self.sync_coordinator.wake();
+        Ok(())
+    }
+
+    pub async fn resolve_sync_conflict_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+        conflict_uuid: Uuid,
+        resolution: &str,
+    ) -> anyhow::Result<u64> {
+        let _operation = self.operation.lock().await;
+        self.ensure_context_revision(expected_revision)?;
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        let state = match resolution {
+            "resolve" => "resolved",
+            "ignore" => "ignored",
+            _ => anyhow::bail!("invalid-conflict-resolution"),
+        };
+        let conflict_bytes = conflict_uuid.as_bytes().to_vec();
+        let state = state.to_owned();
+        let now = crate::host_registry::unix_timestamp_millis_for_runtime();
+        let update = move |database: &mut Database| -> anyhow::Result<u64> {
+            if database.connection_for_fsops().execute(
+                "UPDATE sync_conflicts SET state=?2,resolved_at=?3 WHERE conflict_uuid=?1 AND state='open'",
+                rusqlite::params![conflict_bytes, state, now],
+            )? == 0
+            {
+                anyhow::bail!("sync-conflict-not-found");
+            }
+            let remaining: i64 = database.connection_for_fsops().query_row(
+                "SELECT COUNT(*) FROM sync_conflicts WHERE state='open'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(remaining.max(0) as u64)
+        };
+        let active = self.active_snapshot();
+        let remaining = if active.library_uuid.as_deref() == Some(library_uuid) {
+            let runtime = active
+                .runtime
+                .ok_or_else(|| anyhow::anyhow!("library-runtime-unavailable"))?;
+            runtime.writer.write_authoritative(update).await?
+        } else {
+            let runtime = crate::sync::runtime::DormantSyncRuntime::new(
+                library_uuid,
+                descriptor.local_data_dir.join("catalog.sqlite"),
+                self.runtime_leases.clone(),
+            );
+            runtime.run_turn(update).await?
+        };
+        self.registry
+            .update_library_conflict_count(library_uuid, remaining)?;
+        Ok(remaining)
+    }
+
+    pub async fn commit_unbind_plan_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+        plan_uuid: &str,
+        choice: &str,
+    ) -> anyhow::Result<bool> {
+        self.registry
+            .validate_unbind_plan(library_uuid, plan_uuid)?;
+        if choice == "drain-before-unbind" {
+            let pending = self.registry.pending_sync_upload_count(library_uuid)?;
+            if pending != 0 {
+                self.sync_coordinator.wake();
+                anyhow::bail!("sync-unbind-drain-pending:{pending}");
+            }
+        }
+        self.registry
+            .advance_unbind_plan(plan_uuid, choice, "cutover")?;
+        self.unbind_library_sync_with_revision(library_uuid, expected_revision)
+            .await?;
+        self.registry
+            .advance_unbind_plan(plan_uuid, choice, "reconciling")?;
+        self.sync_coordinator.reconcile_pending_unbinds().await?;
+        Ok(self.registry.unbind_plan_complete(plan_uuid)?)
+    }
+
+    pub async fn commit_reconnect_plan_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+        plan_uuid: &str,
+        choice: &str,
+    ) -> anyhow::Result<()> {
+        let _operation = self.operation.lock().await;
+        self.ensure_context_revision(expected_revision)?;
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        let committed = self.registry.commit_reconnect_plan(plan_uuid, choice)?;
+        if committed != library_uuid {
+            anyhow::bail!("reconnect-plan-library-mismatch");
+        }
+        let transport = self
+            .registry
+            .binding_transport(library_uuid, "library")?
+            .ok_or_else(|| anyhow::anyhow!("sync-binding-not-found"))?;
+        let active = self.active_snapshot();
+        let capture = if active.library_uuid.as_deref() == Some(library_uuid) {
+            let runtime = active
+                .runtime
+                .ok_or_else(|| anyhow::anyhow!("library-runtime-unavailable"))?;
+            runtime
+                .writer
+                .write_authoritative(move |database| {
+                    database.begin_sync_capture(transport.binding_epoch, transport.actor_epoch)
+                })
+                .await
+        } else {
+            let runtime = crate::sync::runtime::DormantSyncRuntime::new(
+                library_uuid,
+                descriptor.local_data_dir.join("catalog.sqlite"),
+                self.runtime_leases.clone(),
+            );
+            runtime
+                .run_turn(move |database| {
+                    database.begin_sync_capture(transport.binding_epoch, transport.actor_epoch)
+                })
+                .await
+        };
+        match capture {
+            Ok(generation) => self.registry.set_sync_capture_generation(
+                library_uuid,
+                transport.binding_epoch,
+                generation,
+            )?,
+            Err(error) => {
+                self.registry.rollback_reconnect_plan(
+                    plan_uuid,
+                    library_uuid,
+                    transport.binding_epoch,
+                )?;
+                return Err(error);
+            }
+        }
+        self.sync_coordinator.wake();
+        Ok(())
+    }
+
+    pub(crate) fn ensure_context_revision(&self, expected_revision: u64) -> anyhow::Result<()> {
         let actual = self.active_snapshot().context_revision;
         if expected_revision != actual {
             anyhow::bail!("stale-library-context");
@@ -1413,12 +2199,19 @@ impl LibraryManager {
             Uuid::parse_str(&descriptor.root_uuid)?,
             self.registry.device_uuid()?,
         )?;
-        LibraryRuntimeResources::from_database(
+        let registry = Arc::clone(&self.registry);
+        let coordinator = self.sync_coordinator.clone();
+        let wake_library_uuid = descriptor.library_uuid.clone();
+        LibraryRuntimeResources::from_database_with_commit_hook(
             Some(descriptor.library_uuid.clone()),
             generation,
             database,
             Some(descriptor.local_data_dir.join("plugins")),
             Some(self.runtime_leases.try_acquire(&descriptor.library_uuid)?),
+            Some(Arc::new(move || {
+                let _ = registry.wake_binding(&wake_library_uuid);
+                coordinator.wake();
+            })),
         )
     }
 }

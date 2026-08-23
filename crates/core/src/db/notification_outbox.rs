@@ -64,10 +64,8 @@ impl NotificationOperation {
 }
 
 impl Database {
-    /// Test-only convenience for publishing through an owned transaction.
-    /// Production producers must publish inside their existing writer-owned
-    /// transaction and notify only after that transaction commits.
-    #[cfg(test)]
+    /// Publishes through an owned writer transaction. Producers that already
+    /// hold a writer transaction should use the in-transaction variant.
     pub(crate) fn publish_notification_operation(
         &self,
         operation: &mut NotificationOperation,

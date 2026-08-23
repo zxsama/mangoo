@@ -62,11 +62,19 @@ function expectedPropertyLine(name, schema, required) {
 }
 
 function interfaceBody(name) {
-  const pattern = new RegExp(
-    `export\\s+interface\\s+${name}(?:<[^>]+>)?(?:\\s+extends[^\\{]+)?\\s*{([\\s\\S]*?)\\n}`
-  );
-  const match = generated.match(pattern);
-  return match?.[1] ?? "";
+  const declaration = new RegExp(
+    `export\\s+interface\\s+${name}(?:<[^>]+>)?(?:\\s+extends[^\\{]+)?\\s*{`
+  ).exec(generated);
+  if (!declaration) return "";
+
+  const bodyStart = declaration.index + declaration[0].length;
+  let depth = 1;
+  for (let index = bodyStart; index < generated.length; index += 1) {
+    if (generated[index] === "{") depth += 1;
+    if (generated[index] === "}") depth -= 1;
+    if (depth === 0) return generated.slice(bodyStart, index);
+  }
+  return "";
 }
 
 function requireLine(body, line, context) {
@@ -285,7 +293,30 @@ for (const name of [
   "PluginAuthBeginResponse",
   "PluginAuthCompleteRequest",
   "PluginHealthResponse",
-  "PluginDiagnosticsResponse"
+  "PluginDiagnosticsResponse",
+  "SyncProviderStatus",
+  "LibrarySyncStatus",
+  "SyncStatusSnapshot",
+  "SyncOperation",
+  "SyncCommandRequest",
+  "SyncPreflightRequest",
+  "SyncPreflightResponse",
+  "SyncEnableRequest",
+  "SyncUnbindPlan",
+  "SyncUnbindCommitRequest",
+  "SyncReconnectPreflightRequest",
+  "SyncReconnectPlan",
+  "SyncReconnectCommitRequest",
+  "RemoteLibrarySummary",
+  "SyncRestoreStartItem",
+  "SyncRestorePreflightRequest",
+  "SyncRestorePreflight",
+  "SyncRestoreStartRequest",
+  "SyncRestorePlan",
+  "SyncRestoreListResponse",
+  "SyncConflictRecord",
+  "SyncConflictListResponse",
+  "SyncConflictResolutionRequest"
 ]) {
   schema(name);
 }
@@ -334,6 +365,15 @@ assertInterfaceMatchesSchema("HostPluginProjection");
 assertInterfaceMatchesSchema("PluginDiscoveryError");
 assertInterfaceMatchesSchema("PluginDiscoveryResponse");
 assertInterfaceMatchesSchema("PluginCommandResponse");
+for (const name of [
+  "SyncProviderStatus", "LibrarySyncStatus", "SyncStatusSnapshot", "SyncOperation",
+  "SyncCommandRequest", "SyncPreflightRequest", "SyncPreflightResponse", "SyncEnableRequest",
+  "SyncUnbindPlan", "SyncUnbindCommitRequest", "SyncReconnectPreflightRequest",
+  "SyncReconnectPlan", "SyncReconnectCommitRequest", "RemoteLibrarySummary",
+  "SyncRestoreStartItem", "SyncRestorePreflightRequest", "SyncRestorePreflight", "SyncRestoreStartRequest", "SyncRestorePlan",
+  "SyncRestoreListResponse", "SyncConflictRecord", "SyncConflictListResponse",
+  "SyncConflictResolutionRequest"
+]) assertInterfaceMatchesSchema(name);
 
 const fileOperationSchema = schema("FileOperationRecord");
 const operationGroupSchema = fileOperationSchema.properties?.operationGroupId;
@@ -355,7 +395,7 @@ for (const name of ["NotificationOrigin", "NotificationPresentation", "Notificat
 const notificationSnapshotBody = interfaceBody("NotificationOperationSnapshot");
 requireLine(
   notificationSnapshotBody,
-  'category: "task" | "file_operation" | "error" | "thumbnail_cache";',
+  'category: "task" | "file_operation" | "error" | "thumbnail_cache" | "sync";',
   "generated-contract.ts NotificationOperationSnapshot"
 );
 

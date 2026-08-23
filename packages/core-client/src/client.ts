@@ -61,6 +61,7 @@ import type {
   UserMetadataRecord,
   UserMetadataUpdate
 } from "./generated-contract";
+import type { RemoteLibraryListResponse, SyncCommandRequest, SyncConflictListResponse, SyncConflictResolutionRequest, SyncEnableRequest, SyncOperation, SyncPreflightRequest, SyncPreflightResponse, SyncReconnectCommitRequest, SyncReconnectPlan, SyncReconnectPreflightRequest, SyncRestoreListResponse, SyncRestorePlan, SyncRestorePreflight, SyncRestorePreflightRequest, SyncRestoreStartRequest, SyncStatusSnapshot, SyncUnbindCommitRequest, SyncUnbindPlan } from "./generated-contract";
 
 export interface CoreClientConfig {
   baseUrl: string;
@@ -380,6 +381,35 @@ export function createCoreClient(config: CoreClientConfig) {
         requestPriority: options.requestPriority ?? "interactive",
         signal: options.signal
       }),
+    getSyncStatus: (options: CoreRequestOptions = {}) => request<SyncStatusSnapshot>("/sync/status", { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
+    wakeSync: (reason: "foreground" | "network" | "manual" = "manual", options: CoreRequestOptions = {}) => request<void>(`/sync/wake?reason=${encodeURIComponent(reason)}`, { method: "POST", requestPriority: options.requestPriority ?? "interactive", signal: options.signal }),
+    listRemoteLibraries: (options: CoreRequestOptions = {}) => request<RemoteLibraryListResponse>("/sync/remote-libraries", { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
+    preflightLibrarySync: (libraryUuid: string, body: SyncPreflightRequest, options: CoreRequestOptions = {}) => request<SyncPreflightResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/preflight`, { method: "POST", requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    startLibrarySyncEnable: (libraryUuid: string, contextRevision: number, body: SyncEnableRequest, options: CoreRequestOptions = {}) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/enable`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    pauseLibrarySync: (libraryUuid: string, contextRevision: number, body: SyncCommandRequest) => syncCommand(libraryUuid,"pause",contextRevision,body),
+    resumeLibrarySync: (libraryUuid: string, contextRevision: number, body: SyncCommandRequest) => syncCommand(libraryUuid,"resume",contextRevision,body),
+    syncLibraryNow: (libraryUuid: string, contextRevision: number, body: SyncCommandRequest) => syncCommand(libraryUuid,"sync-now",contextRevision,body),
+    retryLibrarySync: (libraryUuid: string, contextRevision: number, body: SyncCommandRequest) => syncCommand(libraryUuid,"retry",contextRevision,body),
+    planLibrarySyncUnbind: (libraryUuid: string) => request<SyncUnbindPlan>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/unbind-plan`, { method: "POST", requestPriority: "interactive" }),
+    commitLibrarySyncUnbind: (libraryUuid: string, contextRevision: number, body: SyncUnbindCommitRequest) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/unbind-commit`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) }),
+    preflightLibrarySyncReconnect: (libraryUuid: string, body: SyncReconnectPreflightRequest) => request<SyncReconnectPlan>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/reconnect-preflight`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(body) }),
+    commitLibrarySyncReconnect: (libraryUuid: string, contextRevision: number, body: SyncReconnectCommitRequest) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/reconnect-commit`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) }),
+    preflightSyncRestore: (body: SyncRestorePreflightRequest) => request<SyncRestorePreflight>("/sync/restores/preflight", { method: "POST", requestPriority: "interactive", body: JSON.stringify(body) }),
+    startSyncRestore: (body: SyncRestoreStartRequest) => request<SyncRestoreListResponse>("/sync/restores", { method: "POST", requestPriority: "interactive", body: JSON.stringify(body) }),
+    getSyncRestore: (restoreUuid: string, options: CoreRequestOptions = {}) => request<SyncRestorePlan>(`/sync/restores/${encodeURIComponent(restoreUuid)}`, { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
+    pauseSyncRestore: (restoreUuid: string) => request<SyncRestorePlan>(`/sync/restores/${encodeURIComponent(restoreUuid)}/pause`, { method: "POST", requestPriority: "interactive" }),
+    resumeSyncRestore: (restoreUuid: string) => request<SyncRestorePlan>(`/sync/restores/${encodeURIComponent(restoreUuid)}/resume`, { method: "POST", requestPriority: "interactive" }),
+    cancelSyncRestore: (restoreUuid: string) => request<SyncRestorePlan>(`/sync/restores/${encodeURIComponent(restoreUuid)}/cancel`, { method: "POST", requestPriority: "interactive" }),
+    listLibrarySyncConflicts: (libraryUuid: string, params: { cursor?: string; limit?: number } = {}, options: CoreRequestOptions = {}) => {
+      const search = new URLSearchParams();
+      if (params.cursor) search.set("cursor", params.cursor);
+      if (params.limit) search.set("limit", String(params.limit));
+      const suffix = search.size ? `?${search.toString()}` : "";
+      return request<SyncConflictListResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/conflicts${suffix}`, { requestPriority: options.requestPriority ?? "background", signal: options.signal });
+    },
+    resolveLibrarySyncConflict: (libraryUuid: string, conflictUuid: string, contextRevision: number, body: SyncConflictResolutionRequest) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/conflicts/${encodeURIComponent(conflictUuid)}/resolve`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) }),
+    getLibrarySyncDiagnostics: (libraryUuid: string) => request<Record<string, unknown>>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/diagnostics`, { requestPriority: "background" }),
+    exportLibrarySyncDiagnostics: (libraryUuid: string) => request<Record<string, unknown>>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/diagnostics/export`, { method: "POST", requestPriority: "interactive" }),
     listRoots: () => request<Page<RootRecord>>("/roots", { requestPriority: "navigation" }),
     listTasks: (options: CoreRequestOptions = {}) =>
       request<Page<TaskRecord>>("/tasks", {
@@ -661,6 +691,10 @@ export function createCoreClient(config: CoreClientConfig) {
     getPluginDiagnostics: (pluginId: string) =>
       request<PluginDiagnosticsResponse>(`/plugins/${encodeURIComponent(pluginId)}/diagnostics`, { requestPriority: "metadata" })
   };
+
+  function syncCommand(libraryUuid: string, action: string, contextRevision: number, body: SyncCommandRequest): Promise<SyncOperation> {
+    return request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/${action}`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) });
+  }
 }
 
 function scheduleCoreRequest<T>(

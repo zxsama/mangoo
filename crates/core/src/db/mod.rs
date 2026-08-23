@@ -1009,11 +1009,27 @@ impl Database {
         actor_epoch: uuid::Uuid,
     ) -> anyhow::Result<i64> {
         let transaction = self.connection.unchecked_transaction()?;
-        let (device, stream, generation): (Vec<u8>, Vec<u8>, i64) = transaction.query_row(
-            "SELECT device_uuid,catalog_stream_uuid,next_local_mutation_generation FROM sync_local_state WHERE singleton=1",
+        let (device, stream, generation, active_actor, active_binding, capture_enabled): (
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            i64,
+        ) = transaction.query_row(
+            "SELECT device_uuid,catalog_stream_uuid,next_local_mutation_generation,active_actor_epoch,active_binding_epoch,capture_enabled FROM sync_local_state WHERE singleton=1",
             [],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
         )?;
+        if capture_enabled != 0 {
+            if active_actor.as_deref() == Some(actor_epoch.as_bytes())
+                && active_binding.as_deref() == Some(binding_epoch.as_bytes())
+            {
+                transaction.commit()?;
+                return Ok(generation);
+            }
+            anyhow::bail!("different sync capture is already active");
+        }
         let now = unix_timestamp_millis();
         transaction.execute(
             "INSERT INTO sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,stream_kind,binding_epoch,state,next_actor_seq,published_through_seq,created_at) VALUES (?1,?2,?3,'catalog',?4,'active',1,0,?5)",
@@ -1037,11 +1053,15 @@ impl Database {
     #[allow(dead_code)]
     pub fn unbind_sync_capture(&self, published_through_seq: i64) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
-        let actor: Vec<u8> = transaction.query_row(
+        let actor: Option<Vec<u8>> = transaction.query_row(
             "SELECT active_actor_epoch FROM sync_local_state WHERE singleton=1",
             [],
             |row| row.get(0),
         )?;
+        let Some(actor) = actor else {
+            transaction.commit()?;
+            return Ok(());
+        };
         let now = unix_timestamp_millis();
         transaction.execute(
             "UPDATE sync_outbox SET state='archived' WHERE state IN ('pending','sealed') AND event_uuid IN (SELECT event_uuid FROM sync_events WHERE actor_epoch=?1 AND actor_seq>?2)",

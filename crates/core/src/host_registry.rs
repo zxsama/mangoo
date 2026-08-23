@@ -10,6 +10,203 @@ const HOST_MIGRATION_0002: &str =
 const HOST_MIGRATION_0003: &str = include_str!("../host_migrations/0003_plugin_runtime.sql");
 const HOST_MIGRATION_0004: &str =
     include_str!("../host_migrations/0004_provider_root_discovery.sql");
+const HOST_MIGRATION_0005: &str = include_str!("../host_migrations/0005_sync_orchestration.sql");
+const HOST_MIGRATION_0006: &str =
+    include_str!("../host_migrations/0006_sync_orchestration_recovery.sql");
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProviderStatus {
+    pub plugin_id: String,
+    pub account_uuid: String,
+    pub account_display_name: Option<String>,
+    pub runtime_state: String,
+    pub auth_state: String,
+    pub last_healthy_at: Option<i64>,
+    pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySyncStatus {
+    pub library_uuid: String,
+    pub name: String,
+    pub lifecycle: String,
+    pub phase: String,
+    pub catalog_readiness: String,
+    pub provider_id: Option<String>,
+    pub account_uuid: Option<String>,
+    pub remote_library_uuid: Option<String>,
+    pub allowed_actions: Vec<String>,
+    pub last_success_at: Option<i64>,
+    pub last_error_code: Option<String>,
+    pub retry_after: Option<i64>,
+    pub poll_after: Option<i64>,
+    pub pending_upload_items: u64,
+    pub pending_download_items: u64,
+    pub pending_upload_bytes: u64,
+    pub pending_download_bytes: u64,
+    pub conflict_count: u64,
+    pub local_divergence_count: u64,
+    pub operation_revision: u64,
+    pub restore_uuid: Option<String>,
+    pub restore_items_done: Option<u64>,
+    pub restore_items_total: Option<u64>,
+    pub restore_bytes_done: Option<u64>,
+    pub restore_bytes_total: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatusSnapshot {
+    pub revision: u64,
+    pub generated_at: i64,
+    pub scheduler_state: String,
+    pub providers: Vec<SyncProviderStatus>,
+    pub libraries: Vec<LibrarySyncStatus>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteLibrarySummary {
+    pub account_uuid: String,
+    pub library_uuid: String,
+    pub name: String,
+    pub icon: Option<String>,
+    pub media_count: Option<u64>,
+    pub logical_bytes: Option<u64>,
+    pub last_synced_at: Option<i64>,
+    pub descriptor_size: u64,
+    pub updated_at: i64,
+    pub compatible: bool,
+    pub bound_locally: bool,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredRemoteLibrary {
+    pub metadata: super::sync::provider::ObjectMetadata,
+    pub name: Option<String>,
+    pub icon: Option<String>,
+    pub media_count: Option<u64>,
+    pub logical_bytes: Option<u64>,
+    pub last_synced_at: Option<i64>,
+    pub compatible: bool,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncOperation {
+    pub operation_uuid: String,
+    pub library_uuid: Option<String>,
+    pub kind: String,
+    pub state: String,
+    pub phase: String,
+    pub error_code: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncUnbindPlan {
+    pub plan_uuid: String,
+    pub library_uuid: String,
+    pub pending_count: u64,
+    pub published_count: u64,
+    pub unpublished_count: u64,
+    pub cutover_actor_seq: u64,
+    pub remote_watermark: u64,
+    pub origin_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncReconnectPlan {
+    pub plan_uuid: String,
+    pub library_uuid: String,
+    pub remote_library_uuid: String,
+    pub origin_identity: Option<String>,
+    pub local_divergence_count: u64,
+    pub remote_divergence_count: u64,
+    pub remote_exists: bool,
+    pub remote_compatible: bool,
+    pub same_remote_identity: bool,
+    pub origin_remote_watermark: u64,
+    pub base_remote_object_count: u64,
+    pub remote_object_count: u64,
+    pub remote_descriptor_sha256: Option<String>,
+    pub remote_binding_epoch: Option<String>,
+    pub remote_advanced: bool,
+    pub merge_allowed: bool,
+    pub publish_new_allowed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconnectPreviewFacts {
+    pub remote_exists: bool,
+    pub remote_compatible: bool,
+    pub remote_object_count: u64,
+    pub remote_descriptor_sha256: Option<[u8; 32]>,
+    pub remote_binding_epoch: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnbindReconciliation {
+    pub plan_uuid: String,
+    pub plugin_id: String,
+    pub account_uuid: String,
+    pub remote_namespace: String,
+    pub binding_epoch: uuid::Uuid,
+    pub transport_generation: u64,
+    pub descriptor_sha256: Option<[u8; 32]>,
+    pub choice: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncRestorePreflight {
+    pub preflight_token: String,
+    pub expires_at: i64,
+    pub total_items: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncRestorePlan {
+    pub restore_uuid: String,
+    pub operation_uuid: String,
+    pub account_uuid: String,
+    pub library_uuid: String,
+    pub name: String,
+    pub managed_root: String,
+    pub state: String,
+    pub phase: String,
+    pub catalog_ready: bool,
+    pub media_items_done: u64,
+    pub media_items_total: Option<u64>,
+    pub media_bytes_done: u64,
+    pub media_bytes_total: Option<u64>,
+    pub error_code: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartRestoreRequest<'a> {
+    pub operation_uuid: &'a str,
+    pub account_uuid: &'a str,
+    pub library_uuid: &'a str,
+    pub managed_root: &'a Path,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncBindingRecovery {
+    pub library_uuid: String,
+    pub state: String,
+    pub plan_uuid: Option<String>,
+    pub choice: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct LibraryDescriptor {
@@ -135,6 +332,83 @@ fn plugin_runtime_launch_fingerprint(
     let grants =
         serde_json::to_string(granted_permissions).unwrap_or_else(|_| "invalid-grants".to_owned());
     format!("{version}:{account_uuid}:{account_generation}:{grants}")
+}
+
+fn sync_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncOperation> {
+    Ok(SyncOperation {
+        operation_uuid: row.get(0)?,
+        library_uuid: row.get(1)?,
+        kind: row.get(2)?,
+        state: row.get(3)?,
+        phase: row.get(4)?,
+        error_code: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn sync_public_state(
+    state: Option<&str>,
+) -> (&'static str, &'static str, &'static str, Vec<&'static str>) {
+    match state {
+        None => ("local-only", "complete", "ready", vec!["enable"]),
+        Some("detached") => (
+            "local-only",
+            "complete",
+            "ready",
+            vec!["enable", "reconnect"],
+        ),
+        Some("preparing") => ("enabling", "preflight", "ready", vec!["retry", "unbind"]),
+        Some("capturing") => (
+            "enabling",
+            "capturing",
+            "ready",
+            vec!["pause", "retry", "unbind"],
+        ),
+        Some("seed_ready") => (
+            "enabling",
+            "uploading",
+            "ready",
+            vec!["pause", "sync-now", "unbind"],
+        ),
+        Some("publishing") => (
+            "enabling",
+            "publishing",
+            "ready",
+            vec!["pause", "sync-now", "unbind"],
+        ),
+        Some("active") => (
+            "syncing",
+            "active",
+            "ready",
+            vec!["pause", "sync-now", "unbind", "resolve-conflicts"],
+        ),
+        Some("paused") => (
+            "paused",
+            "active",
+            "ready",
+            vec!["resume", "unbind", "reconnect"],
+        ),
+        Some("unbinding") => ("unbinding", "reconcile", "ready", vec!["retry"]),
+        Some("restoring") => (
+            "restoring",
+            "catalog-restore",
+            "restoring",
+            vec!["pause", "cancel-before-catalog"],
+        ),
+        Some("compatibility_locked") => (
+            "error",
+            "compatibility-locked",
+            "ready",
+            vec!["retry", "reconnect", "resolve-conflicts"],
+        ),
+        Some("error") => (
+            "error",
+            "retry-wait",
+            "ready",
+            vec!["retry", "pause", "unbind"],
+        ),
+        Some(_) => ("error", "retry-wait", "ready", vec!["retry"]),
+    }
 }
 
 fn plugin_runtime_launch_matches(
@@ -437,7 +711,7 @@ impl HostRegistry {
         &self,
         plugin_id: &str,
         expected_generation: i64,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<Vec<BindingFence>>> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
@@ -445,8 +719,35 @@ impl HostRegistry {
             params![unix_timestamp_millis(),plugin_id,expected_generation],
         )?;
         if changed != 1 {
-            return Ok(false);
+            return Ok(None);
         }
+        transaction.execute(
+            "UPDATE library_sync_bindings SET state='paused',last_error_code='authorization-required',retry_after=NULL,poll_after=NULL,transport_generation=transport_generation+1,updated_at=?1 WHERE plugin_id=?2 AND state <> 'unbinding'",
+            params![unix_timestamp_millis(), plugin_id],
+        )?;
+        let fences = {
+            let mut statement = transaction.prepare(
+                "SELECT account_uuid,binding_epoch,transport_generation FROM library_sync_bindings WHERE plugin_id=?1 AND state='paused' ORDER BY library_uuid",
+            )?;
+            let rows = statement.query_map([plugin_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut fences = Vec::new();
+            for row in rows {
+                let (account_uuid, binding_epoch, next_transport_generation) = row?;
+                fences.push(BindingFence {
+                    account_uuid,
+                    binding_epoch: uuid::Uuid::from_slice(&binding_epoch)?,
+                    next_transport_generation: u64::try_from(next_transport_generation)
+                        .map_err(|_| anyhow::anyhow!("invalid transport generation"))?,
+                });
+            }
+            fences
+        };
         transaction.execute(
             "DELETE FROM provider_binding_cursors WHERE library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1)",
             [plugin_id],
@@ -463,8 +764,9 @@ impl HostRegistry {
             "UPDATE plugin_runtime_state SET state='starting',pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",
             params![unix_timestamp_millis(), plugin_id],
         )?;
+        Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
-        Ok(true)
+        Ok(Some(fences))
     }
 
     pub fn require_plugin_reauthorization_for_launch(
@@ -963,6 +1265,9 @@ impl HostRegistry {
             "UPDATE plugin_accounts SET stable_account_identity=?1,updated_at=?2 WHERE plugin_id=?3",
             params![stable_identity, now, plugin_id],
         )?;
+        if !fences.is_empty() {
+            Self::bump_sync_status_revision(&transaction)?;
+        }
         transaction.commit()?;
         Ok(Some(fences))
     }
@@ -1346,7 +1651,7 @@ impl HostRegistry {
         runtime_session_id: &str,
         cursor: Option<&str>,
         page_token: &str,
-        libraries: &[super::sync::provider::ObjectMetadata],
+        libraries: &[DiscoveredRemoteLibrary],
     ) -> anyhow::Result<()> {
         self.commit_provider_root_progress(
             account_uuid,
@@ -1364,7 +1669,7 @@ impl HostRegistry {
         account_generation: i64,
         runtime_session_id: &str,
         cursor: Option<&str>,
-        libraries: &[super::sync::provider::ObjectMetadata],
+        libraries: &[DiscoveredRemoteLibrary],
     ) -> anyhow::Result<()> {
         self.commit_provider_root_progress(
             account_uuid,
@@ -1383,7 +1688,7 @@ impl HostRegistry {
         runtime_session_id: &str,
         cursor: Option<&str>,
         page_token: Option<&str>,
-        libraries: &[super::sync::provider::ObjectMetadata],
+        libraries: &[DiscoveredRemoteLibrary],
     ) -> anyhow::Result<()> {
         let now = unix_timestamp_millis();
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
@@ -1398,7 +1703,8 @@ impl HostRegistry {
         if current != Some(account_generation) {
             anyhow::bail!("stale-provider-account-generation");
         }
-        for metadata in libraries {
+        for discovered in libraries {
+            let metadata = &discovered.metadata;
             let library_uuid = metadata
                 .key
                 .strip_suffix("/library-descriptor")
@@ -1408,8 +1714,8 @@ impl HostRegistry {
                 anyhow::bail!("non-canonical provider root Library UUID");
             }
             transaction.execute(
-                "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,descriptor_etag,account_generation,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(account_uuid,library_uuid) DO UPDATE SET descriptor_size=excluded.descriptor_size,descriptor_sha256=excluded.descriptor_sha256,descriptor_etag=excluded.descriptor_etag,account_generation=excluded.account_generation,updated_at=excluded.updated_at",
-                params![account_uuid,library_uuid,metadata.size as i64,metadata.sha256.as_slice(),metadata.etag,account_generation,now],
+                "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,descriptor_etag,account_generation,updated_at,name,icon,media_count,logical_bytes,last_synced_at,compatible,descriptor_error_code) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(account_uuid,library_uuid) DO UPDATE SET descriptor_size=excluded.descriptor_size,descriptor_sha256=excluded.descriptor_sha256,descriptor_etag=excluded.descriptor_etag,account_generation=excluded.account_generation,updated_at=excluded.updated_at,name=excluded.name,icon=excluded.icon,media_count=excluded.media_count,logical_bytes=excluded.logical_bytes,last_synced_at=excluded.last_synced_at,compatible=excluded.compatible,descriptor_error_code=excluded.descriptor_error_code",
+                params![account_uuid,library_uuid,metadata.size as i64,metadata.sha256.as_slice(),metadata.etag,account_generation,now,discovered.name,discovered.icon,discovered.media_count.map(|v|v as i64),discovered.logical_bytes.map(|v|v as i64),discovered.last_synced_at,discovered.compatible as i64,discovered.error_code],
             )?;
         }
         transaction.execute(
@@ -1527,11 +1833,15 @@ impl HostRegistry {
     ) -> anyhow::Result<i64> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
-        let generation: i64 = transaction.query_row(
-            "SELECT transport_generation FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2",
+        let (generation, state): (i64, String) = transaction.query_row(
+            "SELECT transport_generation,state FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2",
             params![library_uuid,binding_epoch.as_bytes().as_slice()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if state == "unbinding" {
+            transaction.commit()?;
+            return Ok(generation);
+        }
         let next = generation
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("transport generation exhausted"))?;
@@ -1539,6 +1849,7 @@ impl HostRegistry {
             "UPDATE library_sync_bindings SET state='unbinding',transport_generation=?1,updated_at=?2 WHERE library_uuid=?3 AND binding_epoch=?4",
             params![next,unix_timestamp_millis(),library_uuid,binding_epoch.as_bytes().as_slice()],
         )?;
+        Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(next)
     }
@@ -1714,9 +2025,10 @@ impl HostRegistry {
     }
     pub fn sync_bound_libraries(&self) -> anyhow::Result<Vec<LibraryDescriptor>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let mut statement=connection.prepare("SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' ELSE 'synchronized' END,l.availability,l.marker_identity FROM libraries l JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE b.state IN ('preparing','capturing','seed_ready','publishing','active','paused') ORDER BY l.library_uuid")?;
+        let now = unix_timestamp_millis();
+        let mut statement=connection.prepare("SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing','restoring') THEN 'synchronizing' ELSE 'synchronized' END,l.availability,l.marker_identity FROM libraries l JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE b.state IN ('preparing','capturing','seed_ready','publishing','active','restoring','error') AND COALESCE(b.retry_after,b.poll_after,0)<=?1 ORDER BY l.library_uuid")?;
         let libraries = statement
-            .query_map([], descriptor_from_row)?
+            .query_map([now], descriptor_from_row)?
             .collect::<Result<_, _>>()?;
         Ok(libraries)
     }
@@ -1752,6 +2064,22 @@ impl HostRegistry {
         )?;
         if schema_version < 4 {
             connection.execute_batch(HOST_MIGRATION_0004)?;
+        }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 5 {
+            connection.execute_batch(HOST_MIGRATION_0005)?;
+        }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 6 {
+            connection.execute_batch(HOST_MIGRATION_0006)?;
         }
         connection.execute(
             "INSERT OR IGNORE INTO host_sync_local_state(singleton,device_uuid,stream_uuid,next_actor_seq,hlc_wall_ms,hlc_logical,capture_enabled,updated_at) VALUES (1,?1,?2,1,0,0,0,?3)",
@@ -1832,6 +2160,27 @@ impl HostRegistry {
             "DELETE FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2 AND state='preparing'",
             params![library_uuid, binding_epoch.as_bytes().as_slice()],
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn rollback_reconnect_plan(
+        &self,
+        plan_uuid: &str,
+        library_uuid: &str,
+        binding_epoch: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2 AND state='preparing'",
+            params![library_uuid, binding_epoch.as_bytes().as_slice()],
+        )?;
+        transaction.execute(
+            "UPDATE sync_reconnect_plans SET state='planned',choice=NULL,updated_at=?2 WHERE plan_uuid=?1 AND library_uuid=?3 AND state='committed'",
+            params![plan_uuid, unix_timestamp_millis(), library_uuid],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1921,6 +2270,7 @@ impl HostRegistry {
             "DELETE FROM library_sync_bindings WHERE library_uuid=?1",
             [library_uuid],
         )?;
+        Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(published)
     }
@@ -1934,6 +2284,1092 @@ impl HostRegistry {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    fn bump_sync_status_revision(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<u64> {
+        transaction.execute(
+            "UPDATE host_meta SET sync_status_revision=sync_status_revision+1 WHERE singleton=1",
+            [],
+        )?;
+        Ok(transaction.query_row(
+            "SELECT sync_status_revision FROM host_meta WHERE singleton=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    pub fn create_sync_preflight_token(
+        &self,
+        library_uuid: &str,
+        plugin_id: &str,
+        account_uuid: &str,
+        remote_library_uuid: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let token = uuid::Uuid::now_v7().to_string();
+        let now = unix_timestamp_millis();
+        self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "INSERT INTO sync_preflight_tokens(token,library_uuid,plugin_id,account_uuid,remote_library_uuid,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![token,library_uuid,plugin_id,account_uuid,remote_library_uuid,now+300_000,now],
+        )?;
+        Ok(token)
+    }
+
+    pub fn consume_sync_preflight_token(
+        &self,
+        token: &str,
+        library_uuid: &str,
+        plugin_id: &str,
+        account_uuid: &str,
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "UPDATE sync_preflight_tokens SET consumed_at=?1 WHERE token=?2 AND library_uuid=?3 AND plugin_id=?4 AND account_uuid=?5 AND consumed_at IS NULL AND expires_at>=?1",
+            params![now,token,library_uuid,plugin_id,account_uuid],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("sync-preflight-expired");
+        }
+        Ok(())
+    }
+
+    pub fn sync_status_snapshot(&self) -> anyhow::Result<SyncStatusSnapshot> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let revision = connection.query_row(
+            "SELECT sync_status_revision FROM host_meta WHERE singleton=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        let scheduler_state = connection.query_row(
+            "SELECT sync_scheduler_state FROM host_meta WHERE singleton=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        let providers = {
+            let mut statement = connection.prepare(
+                "SELECT i.plugin_id,a.account_uuid,a.display_name,r.state,a.auth_state,r.last_healthy_at,r.last_error_code FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE EXISTS (SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1') ORDER BY i.plugin_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(SyncProviderStatus {
+                        plugin_id: row.get(0)?,
+                        account_uuid: row.get(1)?,
+                        account_display_name: row.get(2)?,
+                        runtime_state: row.get(3)?,
+                        auth_state: row.get(4)?,
+                        last_healthy_at: row.get(5)?,
+                        last_error_code: row.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut statement = connection.prepare(
+            "SELECT l.library_uuid,l.name,COALESCE(b.plugin_id,u.plugin_id),COALESCE(b.account_uuid,u.account_uuid),COALESCE(b.remote_namespace,u.remote_namespace),CASE WHEN u.state IN ('cutover','reconciling') THEN 'unbinding' WHEN b.state IS NULL AND u.state='complete' THEN 'detached' ELSE b.state END,b.last_success_at,COALESCE(u.last_error_code,b.last_error_code),COALESCE(u.next_retry_at,b.retry_after),b.poll_after,b.published_through_seq,COALESCE(b.pending_upload_items,0),MAX(COALESCE((SELECT MAX(updated_at) FROM sync_orchestration_operations op WHERE op.library_uuid=l.library_uuid),0),COALESCE((SELECT MAX(updated_at) FROM sync_restore_plans rp WHERE rp.library_uuid=l.library_uuid),0),COALESCE(u.updated_at,0)),COALESCE(b.pending_download_items,0),COALESCE(b.pending_download_bytes,0),COALESCE(b.conflict_count,0),COALESCE((SELECT catalog_ready FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),0),COALESCE(b.pending_upload_bytes,0),(SELECT restore_uuid FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_items_done FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_items_total FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_bytes_done FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_bytes_total FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1) FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid LEFT JOIN sync_unbind_plans u ON u.plan_uuid=(SELECT latest_unbind.plan_uuid FROM sync_unbind_plans latest_unbind WHERE latest_unbind.library_uuid=l.library_uuid AND latest_unbind.state IN ('cutover','reconciling','complete') ORDER BY latest_unbind.updated_at DESC LIMIT 1) ORDER BY COALESCE(l.last_opened_at,l.created_at) DESC,l.library_uuid",
+        )?;
+        let libraries = statement
+            .query_map([], |row| {
+                let state: Option<String> = row.get(5)?;
+                let (lifecycle, mut phase, mut readiness, mut actions) =
+                    sync_public_state(state.as_deref());
+                if state.as_deref() == Some("restoring") && row.get::<_, i64>(16)? != 0 {
+                    phase = "restoring-media";
+                    readiness = "catalog-ready";
+                    actions = vec!["pause"];
+                }
+                let published: i64 = row.get::<_, Option<i64>>(10)?.unwrap_or(0);
+                let pending: i64 = row.get(11)?;
+                let pending_download: i64 = row.get(13)?;
+                let pending_download_bytes: i64 = row.get(14)?;
+                let conflicts: i64 = row.get(15)?;
+                Ok(LibrarySyncStatus {
+                    library_uuid: row.get(0)?,
+                    name: row.get(1)?,
+                    lifecycle: lifecycle.to_owned(),
+                    phase: phase.to_owned(),
+                    catalog_readiness: readiness.to_owned(),
+                    provider_id: row.get(2)?,
+                    account_uuid: row.get(3)?,
+                    remote_library_uuid: row.get(4)?,
+                    allowed_actions: actions.into_iter().map(str::to_owned).collect(),
+                    last_success_at: row.get(6)?,
+                    last_error_code: row.get(7)?,
+                    retry_after: row.get(8)?,
+                    poll_after: row.get(9)?,
+                    pending_upload_items: pending.max(0) as u64,
+                    pending_download_items: pending_download.max(0) as u64,
+                    pending_upload_bytes: row.get::<_, i64>(17)?.max(0) as u64,
+                    pending_download_bytes: pending_download_bytes.max(0) as u64,
+                    conflict_count: conflicts.max(0) as u64,
+                    local_divergence_count: (published == 0).then_some(pending).unwrap_or(0).max(0)
+                        as u64,
+                    operation_revision: row.get::<_, i64>(12)?.max(0) as u64,
+                    restore_uuid: row.get(18)?,
+                    restore_items_done: row
+                        .get::<_, Option<i64>>(19)?
+                        .map(|value| value.max(0) as u64),
+                    restore_items_total: row
+                        .get::<_, Option<i64>>(20)?
+                        .map(|value| value.max(0) as u64),
+                    restore_bytes_done: row
+                        .get::<_, Option<i64>>(21)?
+                        .map(|value| value.max(0) as u64),
+                    restore_bytes_total: row
+                        .get::<_, Option<i64>>(22)?
+                        .map(|value| value.max(0) as u64),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SyncStatusSnapshot {
+            revision,
+            generated_at: unix_timestamp_millis(),
+            scheduler_state,
+            providers,
+            libraries,
+        })
+    }
+
+    pub fn set_sync_scheduler_state(&self, state: &str) -> anyhow::Result<()> {
+        if !matches!(state, "starting" | "running" | "degraded" | "stopped") {
+            anyhow::bail!("invalid-sync-scheduler-state");
+        }
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let current: String = transaction.query_row(
+            "SELECT sync_scheduler_state FROM host_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if current != state {
+            transaction.execute(
+                "UPDATE host_meta SET sync_scheduler_state=?1 WHERE singleton=1",
+                [state],
+            )?;
+            Self::bump_sync_status_revision(&transaction)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn update_sync_pending_metrics(
+        &self,
+        library_uuid: &str,
+        upload_items: u64,
+        upload_bytes: u64,
+        download_items: u64,
+        download_bytes: u64,
+        conflict_count: u64,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE library_sync_bindings SET pending_upload_items=?2,pending_upload_bytes=?3,pending_download_items=?4,pending_download_bytes=?5,conflict_count=?6,updated_at=?7 WHERE library_uuid=?1",
+            params![library_uuid,upload_items as i64,upload_bytes as i64,download_items as i64,download_bytes as i64,conflict_count as i64,unix_timestamp_millis()],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_remote_libraries(&self) -> anyhow::Result<Vec<RemoteLibrarySummary>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT r.account_uuid,r.library_uuid,r.name,r.icon,r.media_count,r.logical_bytes,r.last_synced_at,r.descriptor_size,r.updated_at,r.compatible,r.descriptor_error_code,EXISTS(SELECT 1 FROM library_sync_bindings b WHERE b.account_uuid=r.account_uuid AND COALESCE(b.remote_namespace,b.library_uuid)=r.library_uuid) FROM provider_remote_libraries r JOIN plugin_accounts a ON a.account_uuid=r.account_uuid WHERE r.account_generation=a.generation ORDER BY r.updated_at DESC,r.library_uuid",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let library_uuid: String = row.get(1)?;
+                Ok(RemoteLibrarySummary {
+                    account_uuid: row.get(0)?,
+                    name: row.get::<_, Option<String>>(2)?.unwrap_or_else(|| {
+                        format!("Remote {}", &library_uuid[..8.min(library_uuid.len())])
+                    }),
+                    library_uuid,
+                    icon: row.get(3)?,
+                    media_count: row.get::<_, Option<i64>>(4)?.map(|v| v.max(0) as u64),
+                    logical_bytes: row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
+                    last_synced_at: row.get(6)?,
+                    descriptor_size: row.get::<_, i64>(7)?.max(0) as u64,
+                    updated_at: row.get(8)?,
+                    compatible: row.get::<_, i64>(9)? != 0,
+                    error_code: row.get(10)?,
+                    bound_locally: row.get::<_, i64>(11)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn begin_sync_operation_once(
+        &self,
+        operation_uuid: &str,
+        library_uuid: Option<&str>,
+        kind: &str,
+        phase: &str,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<(SyncOperation, bool)> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let request_json = serde_json::to_string(request)?;
+        let inserted = transaction.execute("INSERT INTO sync_orchestration_operations(operation_uuid,library_uuid,kind,state,phase,request_json,created_at,updated_at) VALUES (?1,?2,?3,'running',?4,?5,?6,?6) ON CONFLICT(operation_uuid) DO NOTHING", params![operation_uuid,library_uuid,kind,phase,request_json,now])? != 0;
+        if inserted {
+            Self::bump_sync_status_revision(&transaction)?;
+        } else {
+            let (stored_library_uuid, stored_kind, stored_request): (Option<String>, String, String) = transaction.query_row(
+                "SELECT library_uuid,kind,request_json FROM sync_orchestration_operations WHERE operation_uuid=?1",
+                [operation_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if stored_library_uuid.as_deref() != library_uuid
+                || stored_kind != kind
+                || stored_request != request_json
+            {
+                anyhow::bail!("operation-id-reused");
+            }
+        }
+        let operation = transaction.query_row("SELECT operation_uuid,library_uuid,kind,state,phase,error_code,updated_at FROM sync_orchestration_operations WHERE operation_uuid=?1",[operation_uuid],sync_operation_from_row)?;
+        transaction.commit()?;
+        Ok((operation, inserted))
+    }
+
+    pub fn finish_sync_operation(
+        &self,
+        operation_uuid: &str,
+        state: &str,
+        phase: &str,
+        error_code: Option<&str>,
+    ) -> anyhow::Result<SyncOperation> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if transaction.execute("UPDATE sync_orchestration_operations SET state=?2,phase=?3,error_code=?4,updated_at=?5 WHERE operation_uuid=?1",params![operation_uuid,state,phase,error_code,now])? == 0 { anyhow::bail!("sync-operation-not-found"); }
+        Self::bump_sync_status_revision(&transaction)?;
+        let operation = transaction.query_row("SELECT operation_uuid,library_uuid,kind,state,phase,error_code,updated_at FROM sync_orchestration_operations WHERE operation_uuid=?1",[operation_uuid],sync_operation_from_row)?;
+        transaction.commit()?;
+        Ok(operation)
+    }
+
+    pub fn set_binding_state(&self, library_uuid: &str, state: &str) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let now = unix_timestamp_millis();
+        if transaction.execute("UPDATE library_sync_bindings SET state=?2,last_error_code=NULL,retry_after=NULL,poll_after=?3,updated_at=?3 WHERE library_uuid=?1",params![library_uuid,state,now])? == 0 { anyhow::bail!("sync-binding-not-found"); }
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn pause_binding(&self, library_uuid: &str) -> anyhow::Result<i64> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let generation: i64 = transaction.query_row(
+            "SELECT transport_generation FROM library_sync_bindings WHERE library_uuid=?1",
+            [library_uuid],
+            |row| row.get(0),
+        )?;
+        let next = generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("transport-generation-overflow"))?;
+        transaction.execute("UPDATE library_sync_bindings SET state='paused',transport_generation=?2,retry_after=NULL,poll_after=NULL,updated_at=?3 WHERE library_uuid=?1",params![library_uuid,next,unix_timestamp_millis()])?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    pub fn wake_binding(&self, library_uuid: &str) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if transaction.execute("UPDATE library_sync_bindings SET poll_after=0,retry_after=NULL,last_error_code=NULL,updated_at=?2 WHERE library_uuid=?1 AND state NOT IN ('paused','unbinding')",params![library_uuid,unix_timestamp_millis()])? == 0 { anyhow::bail!("sync-action-not-allowed"); }
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn wake_all_sync_bindings(&self) -> anyhow::Result<usize> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE library_sync_bindings SET poll_after=0,retry_after=NULL,last_error_code=NULL,updated_at=?1 WHERE state NOT IN ('paused','unbinding')",
+            [unix_timestamp_millis()],
+        )?;
+        if changed > 0 {
+            Self::bump_sync_status_revision(&transaction)?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn record_sync_turn_success(&self, library_uuid: &str, active: bool) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let next_poll = now + if active { 30_000 } else { 180_000 };
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE library_sync_bindings SET last_success_at=?2,last_error_code=NULL,retry_after=NULL,poll_after=?3,updated_at=?2 WHERE library_uuid=?1 AND state NOT IN ('paused','unbinding')",
+            params![library_uuid,now,next_poll],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_sync_turn_error(
+        &self,
+        library_uuid: &str,
+        error_code: &str,
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE library_sync_bindings SET state='error',last_error_code=?2,retry_after=?3,poll_after=NULL,updated_at=?4 WHERE library_uuid=?1 AND state NOT IN ('paused','unbinding')",
+            params![library_uuid,error_code,now+15_000,now],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn create_unbind_plan(&self, library_uuid: &str) -> anyhow::Result<SyncUnbindPlan> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let (binding, generation, published, origin, plugin_id, account_uuid, remote_namespace): (Vec<u8>, i64, i64, Option<String>, String, String, String) = transaction.query_row("SELECT b.binding_epoch,b.transport_generation,b.published_through_seq,l.origin_remote_identity,b.plugin_id,b.account_uuid,COALESCE(b.remote_namespace,b.library_uuid) FROM library_sync_bindings b JOIN libraries l ON l.library_uuid=b.library_uuid WHERE b.library_uuid=?1",[library_uuid],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
+        let pending: i64 = transaction.query_row("SELECT COUNT(*) FROM host_sync_outbox WHERE library_uuid=?1 AND state IN ('pending','sealed')",[library_uuid],|row|row.get(0))?;
+        let descriptor_sha256: Option<Vec<u8>> = transaction.query_row("SELECT sha256 FROM provider_object_receipts WHERE library_uuid=?1 AND binding_epoch=?2 AND object_key='library-descriptor' AND state IN ('created','already-exists-matching')",params![library_uuid,&binding],|row|row.get(0)).optional()?;
+        let base_remote_object_count: i64 = transaction.query_row("SELECT COUNT(*) FROM provider_object_receipts WHERE library_uuid=?1 AND binding_epoch=?2 AND state IN ('created','already-exists-matching')",params![library_uuid,&binding],|row|row.get(0))?;
+        let plan_uuid = uuid::Uuid::now_v7().to_string();
+        transaction.execute("INSERT INTO sync_unbind_plans(plan_uuid,library_uuid,binding_epoch,transport_generation,cutover_actor_seq,remote_watermark,pending_count,published_count,unpublished_count,origin_identity,state,created_at,updated_at,plugin_id,account_uuid,remote_namespace,descriptor_sha256,base_remote_object_count) VALUES (?1,?2,?3,?4,?5,?5,?6,?5,?6,?7,'planned',?8,?8,?9,?10,?11,?12,?13)",params![plan_uuid,library_uuid,binding,generation,published,pending,origin,now,plugin_id,account_uuid,remote_namespace,descriptor_sha256,base_remote_object_count])?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(SyncUnbindPlan {
+            plan_uuid,
+            library_uuid: library_uuid.to_owned(),
+            pending_count: pending as u64,
+            published_count: published.max(0) as u64,
+            unpublished_count: pending as u64,
+            cutover_actor_seq: published.max(0) as u64,
+            remote_watermark: published.max(0) as u64,
+            origin_identity: origin,
+        })
+    }
+
+    pub fn validate_unbind_plan(&self, library_uuid: &str, plan_uuid: &str) -> anyhow::Result<()> {
+        let exists: i64 = self.connection.lock().unwrap_or_else(|p| p.into_inner()).query_row("SELECT COUNT(*) FROM sync_unbind_plans WHERE plan_uuid=?1 AND library_uuid=?2 AND state IN ('planned','cutover','reconciling')",params![plan_uuid,library_uuid],|row|row.get(0))?;
+        if exists != 1 {
+            anyhow::bail!("sync-unbind-plan-not-found");
+        }
+        Ok(())
+    }
+
+    pub fn advance_unbind_plan(
+        &self,
+        plan_uuid: &str,
+        choice: &str,
+        state: &str,
+    ) -> anyhow::Result<()> {
+        if !matches!(state, "cutover" | "reconciling") {
+            anyhow::bail!("invalid-unbind-plan-state");
+        }
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE sync_unbind_plans SET state=?2,choice=COALESCE(choice,?3),updated_at=?4 WHERE plan_uuid=?1 AND state IN ('planned','cutover','reconciling')",
+            params![plan_uuid,state,choice,unix_timestamp_millis()],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("sync-unbind-plan-not-found");
+        }
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_sync_upload_count(&self, library_uuid: &str) -> anyhow::Result<u64> {
+        let count: i64 = self.connection.lock().unwrap_or_else(|p| p.into_inner()).query_row(
+            "SELECT COUNT(*) FROM host_sync_outbox WHERE library_uuid=?1 AND state IN ('pending','sealed')",
+            [library_uuid],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    pub fn complete_unbind_plan(&self, plan_uuid: &str, choice: &str) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute("UPDATE sync_unbind_plans SET state='complete',choice=?2,remote_visibility='visible',next_retry_at=NULL,last_error_code=NULL,updated_at=?3 WHERE plan_uuid=?1",params![plan_uuid,choice,unix_timestamp_millis()])?;
+        transaction.execute("UPDATE sync_orchestration_operations SET state='complete',phase='complete',error_code=NULL,updated_at=?2 WHERE operation_uuid=(SELECT operation_uuid FROM sync_unbind_plans WHERE plan_uuid=?1)",params![plan_uuid,unix_timestamp_millis()])?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn attach_unbind_operation(
+        &self,
+        plan_uuid: &str,
+        operation_uuid: &str,
+    ) -> anyhow::Result<()> {
+        let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "UPDATE sync_unbind_plans SET operation_uuid=?2,updated_at=?3 WHERE plan_uuid=?1 AND state IN ('planned','cutover','reconciling')",
+            params![plan_uuid, operation_uuid, unix_timestamp_millis()],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("sync-unbind-plan-not-found");
+        }
+        Ok(())
+    }
+
+    pub fn pending_unbind_reconciliations(&self) -> anyhow::Result<Vec<UnbindReconciliation>> {
+        let now = unix_timestamp_millis();
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare("SELECT plan_uuid,plugin_id,account_uuid,remote_namespace,binding_epoch,transport_generation,descriptor_sha256,choice FROM sync_unbind_plans WHERE state='reconciling' AND (next_retry_at IS NULL OR next_retry_at<=?1) ORDER BY updated_at,plan_uuid")?;
+        let values = statement
+            .query_map([now], |row| {
+                let bytes: Vec<u8> = row.get(4)?;
+                let binding_epoch = uuid::Uuid::from_slice(&bytes).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        bytes.len(),
+                        rusqlite::types::Type::Blob,
+                        Box::new(error),
+                    )
+                })?;
+                let hash = row
+                    .get::<_, Option<Vec<u8>>>(6)?
+                    .and_then(|bytes| bytes.try_into().ok());
+                Ok(UnbindReconciliation {
+                    plan_uuid: row.get(0)?,
+                    plugin_id: row.get(1)?,
+                    account_uuid: row.get(2)?,
+                    remote_namespace: row.get(3)?,
+                    binding_epoch,
+                    transport_generation: row.get::<_, i64>(5)?.saturating_add(1) as u64,
+                    descriptor_sha256: hash,
+                    choice: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(values)
+    }
+
+    pub fn record_unbind_reconcile_failure(
+        &self,
+        plan_uuid: &str,
+        error_code: &str,
+        retry_after_ms: u64,
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute("UPDATE sync_unbind_plans SET state='reconciling',remote_visibility='unknown',reconcile_attempts=reconcile_attempts+1,next_retry_at=?2,last_error_code=?3,updated_at=?1 WHERE plan_uuid=?4",params![now,now.saturating_add(retry_after_ms.min(i64::MAX as u64) as i64),error_code,plan_uuid])?;
+        transaction.execute("UPDATE sync_orchestration_operations SET state='waiting',phase='retry-wait',error_code=?2,updated_at=?3 WHERE operation_uuid=(SELECT operation_uuid FROM sync_unbind_plans WHERE plan_uuid=?1)",params![plan_uuid,error_code,now])?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn unbind_plan_complete(&self, plan_uuid: &str) -> anyhow::Result<bool> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT state='complete' FROM sync_unbind_plans WHERE plan_uuid=?1",
+                [plan_uuid],
+                |row| row.get::<_, i64>(0).map(|value| value != 0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn reconnect_origin_transport(
+        &self,
+        library_uuid: &str,
+        account_uuid: &str,
+        remote_library_uuid: &str,
+    ) -> anyhow::Result<Option<(uuid::Uuid, u64)>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let value: Option<(Vec<u8>, i64)> = connection
+            .query_row(
+                "SELECT binding_epoch,transport_generation FROM sync_unbind_plans WHERE library_uuid=?1 AND account_uuid=?2 AND remote_namespace=?3 AND state='complete' ORDER BY updated_at DESC LIMIT 1",
+                params![library_uuid, account_uuid, remote_library_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        value
+            .map(|(binding, generation)| {
+                Ok((
+                    uuid::Uuid::from_slice(&binding)?,
+                    generation.saturating_add(1) as u64,
+                ))
+            })
+            .transpose()
+    }
+
+    pub fn create_reconnect_plan(
+        &self,
+        library_uuid: &str,
+        account_uuid: &str,
+        remote_library_uuid: &str,
+        local_divergence_count: u64,
+        facts: ReconnectPreviewFacts,
+    ) -> anyhow::Result<SyncReconnectPlan> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let origin: Option<String> = transaction.query_row(
+            "SELECT origin_remote_identity FROM libraries WHERE library_uuid=?1",
+            [library_uuid],
+            |row| row.get(0),
+        )?;
+        let account_ready = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM plugin_accounts a JOIN plugin_runtime_state r ON r.plugin_id=a.plugin_id WHERE a.account_uuid=?1 AND a.auth_state='authenticated' AND r.state='ready' AND EXISTS(SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1'))",
+                [account_uuid],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+        if !account_ready {
+            anyhow::bail!("provider-not-ready");
+        }
+        let same_remote_identity = origin.as_deref() == Some(remote_library_uuid);
+        let (origin_remote_watermark, base_remote_object_count, base_descriptor_sha256):
+            (i64, i64, Option<Vec<u8>>) = transaction
+            .query_row(
+                "SELECT remote_watermark,base_remote_object_count,descriptor_sha256 FROM sync_unbind_plans WHERE library_uuid=?1 AND state='complete' ORDER BY updated_at DESC LIMIT 1",
+                [library_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .unwrap_or((0, 0, None));
+        let base_remote_object_count = base_remote_object_count.max(0) as u64;
+        let count_divergence = facts.remote_object_count.abs_diff(base_remote_object_count);
+        let descriptor_changed = base_descriptor_sha256
+            .as_deref()
+            .zip(
+                facts
+                    .remote_descriptor_sha256
+                    .as_ref()
+                    .map(|hash| hash.as_slice()),
+            )
+            .is_some_and(|(base, current)| base != current);
+        let remote_divergence = count_divergence.max(u64::from(descriptor_changed));
+        let origin_binding_epoch: Option<String> = transaction
+            .query_row(
+                "SELECT lower(hex(binding_epoch)) FROM sync_unbind_plans WHERE library_uuid=?1 AND state='complete' ORDER BY updated_at DESC LIMIT 1",
+                [library_uuid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let same_binding_lineage = origin_binding_epoch
+            .as_deref()
+            .zip(facts.remote_binding_epoch.as_deref())
+            .is_some_and(|(origin, remote)| {
+                let normalized_remote = remote.replace('-', "").to_ascii_lowercase();
+                origin == normalized_remote
+            });
+        let merge_allowed = facts.remote_exists
+            && facts.remote_compatible
+            && same_remote_identity
+            && same_binding_lineage;
+        let plan_uuid = uuid::Uuid::now_v7().to_string();
+        transaction.execute("INSERT INTO sync_reconnect_plans(plan_uuid,library_uuid,account_uuid,remote_library_uuid,origin_identity,local_divergence_count,remote_divergence_count,remote_exists,remote_compatible,same_remote_identity,state,created_at,updated_at,origin_remote_watermark,base_remote_object_count,remote_object_count,remote_descriptor_sha256,remote_binding_epoch,merge_allowed,publish_new_allowed) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'planned',?11,?11,?12,?13,?14,?15,?16,?17,1)",params![plan_uuid,library_uuid,account_uuid,remote_library_uuid,origin,local_divergence_count as i64,remote_divergence as i64,i64::from(facts.remote_exists),i64::from(facts.remote_compatible),i64::from(same_remote_identity),now,origin_remote_watermark,base_remote_object_count,facts.remote_object_count as i64,facts.remote_descriptor_sha256.map(|v|v.to_vec()),facts.remote_binding_epoch,i64::from(merge_allowed)])?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(SyncReconnectPlan {
+            plan_uuid,
+            library_uuid: library_uuid.to_owned(),
+            remote_library_uuid: remote_library_uuid.to_owned(),
+            origin_identity: origin,
+            local_divergence_count,
+            remote_divergence_count: remote_divergence,
+            remote_exists: facts.remote_exists,
+            remote_compatible: facts.remote_compatible,
+            same_remote_identity,
+            origin_remote_watermark: origin_remote_watermark.max(0) as u64,
+            base_remote_object_count,
+            remote_object_count: facts.remote_object_count,
+            remote_descriptor_sha256: facts
+                .remote_descriptor_sha256
+                .map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect()),
+            remote_binding_epoch: facts.remote_binding_epoch,
+            remote_advanced: remote_divergence > 0,
+            merge_allowed,
+            publish_new_allowed: true,
+        })
+    }
+
+    pub fn commit_reconnect_plan(&self, plan_uuid: &str, choice: &str) -> anyhow::Result<String> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if !matches!(choice, "merge-local-fork" | "publish-new-remote") {
+            anyhow::bail!("invalid-reconnect-choice");
+        }
+        let (library_uuid, account_uuid, remote_uuid, merge_allowed, publish_new_allowed): (String, String, String, i64, i64) = transaction.query_row("SELECT library_uuid,account_uuid,remote_library_uuid,merge_allowed,publish_new_allowed FROM sync_reconnect_plans WHERE plan_uuid=?1 AND state='planned'",[plan_uuid],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        if choice == "merge-local-fork" && merge_allowed == 0 {
+            anyhow::bail!("reconnect-merge-preflight-failed");
+        }
+        if choice == "publish-new-remote" && publish_new_allowed == 0 {
+            anyhow::bail!("reconnect-publish-preflight-failed");
+        }
+        let plugin_id: String = transaction.query_row(
+            "SELECT plugin_id FROM plugin_accounts WHERE account_uuid=?1",
+            [&account_uuid],
+            |row| row.get(0),
+        )?;
+        let binding = uuid::Uuid::now_v7();
+        let actor = uuid::Uuid::now_v7();
+        let namespace = if choice == "publish-new-remote" {
+            library_uuid.clone()
+        } else {
+            remote_uuid.clone()
+        };
+        transaction.execute("INSERT INTO library_sync_bindings(library_uuid,plugin_id,account_uuid,remote_namespace,binding_epoch,actor_epoch,state,transport_generation,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,'preparing',1,?7,?7)",params![library_uuid,plugin_id,account_uuid,namespace,binding.as_bytes().as_slice(),actor.as_bytes().as_slice(),now])?;
+        transaction.execute(
+            "UPDATE libraries SET origin_remote_identity=?2,updated_at=?3 WHERE library_uuid=?1",
+            params![library_uuid, namespace, now],
+        )?;
+        transaction.execute("UPDATE sync_reconnect_plans SET state='committed',choice=?2,updated_at=?3 WHERE plan_uuid=?1",params![plan_uuid,choice,now])?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(library_uuid)
+    }
+
+    pub fn start_restore_plan(
+        &self,
+        request: StartRestoreRequest<'_>,
+    ) -> anyhow::Result<SyncRestorePlan> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let remote: Option<(Vec<u8>, String)> = transaction
+            .query_row(
+                "SELECT descriptor_sha256,name FROM provider_remote_libraries WHERE account_uuid=?1 AND library_uuid=?2 AND compatible=1",
+                params![request.account_uuid, request.library_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (hash, remote_name) =
+            remote.ok_or_else(|| anyhow::anyhow!("remote-library-not-restorable"))?;
+        let restore_uuid = uuid::Uuid::now_v7().to_string();
+        transaction.execute("INSERT INTO sync_restore_plans(restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,descriptor_sha256,state,phase,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'restoring','catalog-restore',?8,?8)",params![restore_uuid,request.operation_uuid,request.account_uuid,request.library_uuid,remote_name,request.managed_root.to_string_lossy(),hash,now])?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(SyncRestorePlan {
+            restore_uuid,
+            operation_uuid: request.operation_uuid.to_owned(),
+            account_uuid: request.account_uuid.to_owned(),
+            library_uuid: request.library_uuid.to_owned(),
+            name: remote_name,
+            managed_root: request.managed_root.to_string_lossy().into_owned(),
+            state: "restoring".into(),
+            phase: "catalog-restore".into(),
+            catalog_ready: false,
+            media_items_done: 0,
+            media_items_total: None,
+            media_bytes_done: 0,
+            media_bytes_total: None,
+            error_code: None,
+            updated_at: now,
+        })
+    }
+
+    pub fn begin_restore_binding(
+        &self,
+        library_uuid: &str,
+        account_uuid: &str,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let plugin_id: String = transaction.query_row(
+            "SELECT plugin_id FROM plugin_accounts WHERE account_uuid=?1 AND auth_state='authenticated'",
+            [account_uuid],
+            |row| row.get(0),
+        )?;
+        let ready: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM plugin_runtime_state WHERE plugin_id=?1 AND state='ready' AND EXISTS (SELECT 1 FROM json_each(capabilities_json) WHERE value='sync-provider.v1')",
+            [&plugin_id], |row| row.get(0),
+        )?;
+        if ready != 1 {
+            anyhow::bail!("provider-not-ready");
+        }
+        let binding = uuid::Uuid::now_v7();
+        let actor = uuid::Uuid::now_v7();
+        let now = unix_timestamp_millis();
+        transaction.execute(
+            "INSERT INTO library_sync_bindings(library_uuid,plugin_id,account_uuid,remote_namespace,binding_epoch,actor_epoch,state,transport_generation,created_at,updated_at) VALUES (?1,?2,?3,?1,?4,?5,'restoring',1,?6,?6)",
+            params![library_uuid,plugin_id,account_uuid,binding.as_bytes().as_slice(),actor.as_bytes().as_slice(),now],
+        )?;
+        transaction.execute(
+            "UPDATE libraries SET origin_remote_identity=?1,availability='unavailable',updated_at=?2 WHERE library_uuid=?1",
+            params![library_uuid,now],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn ensure_sync_provider_ready(&self, account_uuid: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let plugin_id: String = connection.query_row(
+            "SELECT plugin_id FROM plugin_accounts WHERE account_uuid=?1 AND auth_state='authenticated'",
+            [account_uuid],
+            |row| row.get(0),
+        )?;
+        let ready: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM plugin_runtime_state WHERE plugin_id=?1 AND state='ready' AND EXISTS (SELECT 1 FROM json_each(capabilities_json) WHERE value='sync-provider.v1')",
+            [&plugin_id],
+            |row| row.get(0),
+        )?;
+        if ready != 1 {
+            anyhow::bail!("provider-not-ready");
+        }
+        Ok(())
+    }
+
+    pub fn plugin_id_for_account(&self, account_uuid: &str) -> anyhow::Result<Option<String>> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT plugin_id FROM plugin_accounts WHERE account_uuid=?1",
+                [account_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn create_restore_preflight(
+        &self,
+        request: &serde_json::Value,
+        total_items: u64,
+        total_bytes: u64,
+    ) -> anyhow::Result<SyncRestorePreflight> {
+        let now = unix_timestamp_millis();
+        let expires_at = now + 10 * 60 * 1000;
+        let token = uuid::Uuid::now_v7().to_string();
+        self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "INSERT INTO sync_restore_preflights(token,request_json,total_items,total_bytes,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![token,serde_json::to_string(request)?,total_items as i64,total_bytes as i64,expires_at,now],
+        )?;
+        Ok(SyncRestorePreflight {
+            preflight_token: token,
+            expires_at,
+            total_items,
+            total_bytes,
+        })
+    }
+
+    pub fn consume_restore_preflight(
+        &self,
+        token: &str,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let request_json = serde_json::to_string(request)?;
+        let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "UPDATE sync_restore_preflights SET consumed_at=?1 WHERE token=?2 AND request_json=?3 AND consumed_at IS NULL AND expires_at>=?1",
+            params![now,token,request_json],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("restore-preflight-expired-or-changed");
+        }
+        Ok(())
+    }
+
+    pub fn mark_restore_catalog_ready(&self, library_uuid: &str) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute("UPDATE library_sync_bindings SET last_success_at=?2,poll_after=?3,updated_at=?2 WHERE library_uuid=?1 AND state='restoring'",params![library_uuid,now,now+30_000])?;
+        transaction.execute("UPDATE sync_restore_plans SET state='catalog-ready',phase='restoring-media',catalog_ready=1,updated_at=?2 WHERE library_uuid=?1 AND state='restoring'",params![library_uuid,now])?;
+        transaction.execute(
+            "UPDATE libraries SET availability='available',updated_at=?2 WHERE library_uuid=?1",
+            params![library_uuid, now],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn update_restore_progress(
+        &self,
+        library_uuid: &str,
+        done: u64,
+        total: u64,
+        bytes_done: u64,
+        bytes_total: u64,
+        conflict_count: u64,
+    ) -> anyhow::Result<()> {
+        let state = if done >= total {
+            "complete"
+        } else {
+            "catalog-ready"
+        };
+        let phase = if done >= total {
+            "complete"
+        } else {
+            "restoring-media"
+        };
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE sync_restore_plans SET state=?2,phase=?3,media_items_done=?4,media_items_total=?5,media_bytes_done=?6,media_bytes_total=?7,updated_at=?8 WHERE library_uuid=?1 AND catalog_ready=1 AND state NOT IN ('paused','cancelled','failed')",
+            params![library_uuid,state,phase,done as i64,total as i64,bytes_done as i64,bytes_total as i64,unix_timestamp_millis()],
+        )?;
+        transaction.execute(
+            "UPDATE library_sync_bindings SET pending_download_items=?2,pending_download_bytes=?3,conflict_count=?4,updated_at=?5 WHERE library_uuid=?1",
+            params![library_uuid, total.saturating_sub(done) as i64, bytes_total.saturating_sub(bytes_done) as i64, conflict_count as i64, unix_timestamp_millis()],
+        )?;
+        if state == "complete" {
+            transaction.execute(
+                "UPDATE library_sync_bindings SET state='active',poll_after=?2,updated_at=?3 WHERE library_uuid=?1 AND state='restoring'",
+                params![library_uuid, unix_timestamp_millis() + 30_000, unix_timestamp_millis()],
+            )?;
+        }
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn update_library_conflict_count(
+        &self,
+        library_uuid: &str,
+        conflict_count: u64,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE library_sync_bindings SET conflict_count=?2,updated_at=?3 WHERE library_uuid=?1",
+            params![library_uuid, conflict_count as i64, unix_timestamp_millis()],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn fail_restore_plan(&self, restore_uuid: &str, error_code: &str) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE sync_restore_plans SET state='failed',phase='retry-wait',error_code=?2,updated_at=?3 WHERE restore_uuid=?1",
+            params![restore_uuid, error_code, now],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn restore_plan(&self, restore_uuid: &str) -> anyhow::Result<Option<SyncRestorePlan>> {
+        self.connection.lock().unwrap_or_else(|p|p.into_inner()).query_row("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at FROM sync_restore_plans WHERE restore_uuid=?1",[restore_uuid],|row|Ok(SyncRestorePlan{restore_uuid:row.get(0)?,operation_uuid:row.get(1)?,account_uuid:row.get(2)?,library_uuid:row.get(3)?,name:row.get(4)?,managed_root:row.get(5)?,state:row.get(6)?,phase:row.get(7)?,catalog_ready:row.get::<_,i64>(8)?!=0,media_items_done:row.get::<_,i64>(9)?.max(0) as u64,media_items_total:row.get::<_,Option<i64>>(10)?.map(|v|v.max(0) as u64),media_bytes_done:row.get::<_,i64>(11)?.max(0) as u64,media_bytes_total:row.get::<_,Option<i64>>(12)?.map(|v|v.max(0) as u64),error_code:row.get(13)?,updated_at:row.get(14)?})).optional().map_err(Into::into)
+    }
+
+    pub fn restore_plan_for_library(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Option<SyncRestorePlan>> {
+        let restore_uuid = self
+            .connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT restore_uuid FROM sync_restore_plans WHERE library_uuid=?1 ORDER BY created_at DESC LIMIT 1",
+                [library_uuid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        restore_uuid
+            .map(|restore_uuid| self.restore_plan(&restore_uuid))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn restore_plans_for_operation(
+        &self,
+        operation_uuid: &str,
+    ) -> anyhow::Result<Vec<SyncRestorePlan>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at FROM sync_restore_plans WHERE operation_uuid=?1 ORDER BY created_at,restore_uuid")?;
+        let plans = statement
+            .query_map([operation_uuid], |row| {
+                Ok(SyncRestorePlan {
+                    restore_uuid: row.get(0)?,
+                    operation_uuid: row.get(1)?,
+                    account_uuid: row.get(2)?,
+                    library_uuid: row.get(3)?,
+                    name: row.get(4)?,
+                    managed_root: row.get(5)?,
+                    state: row.get(6)?,
+                    phase: row.get(7)?,
+                    catalog_ready: row.get::<_, i64>(8)? != 0,
+                    media_items_done: row.get::<_, i64>(9)?.max(0) as u64,
+                    media_items_total: row.get::<_, Option<i64>>(10)?.map(|v| v.max(0) as u64),
+                    media_bytes_done: row.get::<_, i64>(11)?.max(0) as u64,
+                    media_bytes_total: row.get::<_, Option<i64>>(12)?.map(|v| v.max(0) as u64),
+                    error_code: row.get(13)?,
+                    updated_at: row.get(14)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(plans)
+    }
+
+    pub fn pending_restore_recovery(&self) -> anyhow::Result<Vec<SyncRestorePlan>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at FROM sync_restore_plans WHERE state IN ('planned','restoring','catalog-ready','paused','failed') ORDER BY created_at,restore_uuid")?;
+        let values = statement
+            .query_map([], |row| {
+                Ok(SyncRestorePlan {
+                    restore_uuid: row.get(0)?,
+                    operation_uuid: row.get(1)?,
+                    account_uuid: row.get(2)?,
+                    library_uuid: row.get(3)?,
+                    name: row.get(4)?,
+                    managed_root: row.get(5)?,
+                    state: row.get(6)?,
+                    phase: row.get(7)?,
+                    catalog_ready: row.get::<_, i64>(8)? != 0,
+                    media_items_done: row.get::<_, i64>(9)?.max(0) as u64,
+                    media_items_total: row.get::<_, Option<i64>>(10)?.map(|v| v.max(0) as u64),
+                    media_bytes_done: row.get::<_, i64>(11)?.max(0) as u64,
+                    media_bytes_total: row.get::<_, Option<i64>>(12)?.map(|v| v.max(0) as u64),
+                    error_code: row.get(13)?,
+                    updated_at: row.get(14)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(values)
+    }
+
+    pub fn recover_sync_orchestration_journals(&self) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        // A committed reconnect that crashed before Catalog capture stays
+        // committed. The manager resumes the preparing binding idempotently;
+        // reverting the plan would allow a duplicate epoch to be created.
+        // Unbind cutover/reconciliation is resumed through the existing plan;
+        // planned rows are intentionally left untouched for the user.
+        transaction.execute(
+            "UPDATE library_sync_bindings SET poll_after=0,updated_at=?1 WHERE state='unbinding'",
+            [now],
+        )?;
+        // Planned restore rows never exposed a usable Catalog. Mark them failed
+        // so startup cleanup can remove any partially-created local copy.
+        transaction.execute("UPDATE sync_restore_plans SET state='failed',phase='startup-recovery',error_code='interrupted-before-catalog',updated_at=?1 WHERE state='planned' AND catalog_ready=0", [now])?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_sync_binding_recovery(&self) -> anyhow::Result<Vec<SyncBindingRecovery>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT b.library_uuid,CASE WHEN p.plan_uuid IS NULL THEN b.state ELSE 'unbinding' END,p.plan_uuid,p.choice FROM library_sync_bindings b LEFT JOIN sync_unbind_plans p ON p.library_uuid=b.library_uuid AND p.state IN ('cutover','reconciling') WHERE b.state IN ('preparing','unbinding') OR p.plan_uuid IS NOT NULL UNION ALL SELECT p.library_uuid,'unbinding',p.plan_uuid,p.choice FROM sync_unbind_plans p LEFT JOIN library_sync_bindings b ON b.library_uuid=p.library_uuid WHERE p.state IN ('cutover','reconciling') AND b.library_uuid IS NULL ORDER BY 1",
+        )?;
+        let values = statement
+            .query_map([], |row| {
+                Ok(SyncBindingRecovery {
+                    library_uuid: row.get(0)?,
+                    state: row.get(1)?,
+                    plan_uuid: row.get(2)?,
+                    choice: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(values)
+    }
+
+    pub fn set_restore_state(
+        &self,
+        restore_uuid: &str,
+        state: &str,
+    ) -> anyhow::Result<SyncRestorePlan> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let (library_uuid, catalog_ready, current_state): (String, i64, String) = transaction
+            .query_row(
+            "SELECT library_uuid,catalog_ready,state FROM sync_restore_plans WHERE restore_uuid=?1",
+            [restore_uuid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if state == "cancelled" && catalog_ready != 0 {
+            anyhow::bail!("restore-action-not-allowed");
+        }
+        if current_state == "cancelled" || current_state == "complete" {
+            anyhow::bail!("restore-action-not-allowed");
+        }
+        if state == "paused" && current_state == "paused" {
+            transaction.commit()?;
+            drop(connection);
+            return self
+                .restore_plan(restore_uuid)?
+                .ok_or_else(|| anyhow::anyhow!("restore-not-found"));
+        }
+        if state == "restoring" && current_state != "paused" {
+            transaction.commit()?;
+            drop(connection);
+            return self
+                .restore_plan(restore_uuid)?
+                .ok_or_else(|| anyhow::anyhow!("restore-not-found"));
+        }
+        let binding_state = match state {
+            "paused" => "paused",
+            "restoring" => "restoring",
+            "cancelled" => "archived",
+            _ => anyhow::bail!("restore-action-not-allowed"),
+        };
+        transaction.execute(
+            "UPDATE sync_restore_plans SET state=?2,phase=CASE WHEN ?2='cancelled' THEN 'cancelled' ELSE phase END,updated_at=?3 WHERE restore_uuid=?1",
+            params![restore_uuid,state,now],
+        )?;
+        transaction.execute(
+            "UPDATE library_sync_bindings SET state=?2,poll_after=CASE WHEN ?2='restoring' THEN 0 ELSE poll_after END,updated_at=?3 WHERE library_uuid=?1",
+            params![library_uuid,binding_state,now],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        drop(connection);
+        self.restore_plan(restore_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("restore-not-found"))
+    }
+
+    pub fn commit_cancelled_restore_cleanup(
+        &self,
+        restore_uuid: &str,
+        library_uuid: &str,
+    ) -> anyhow::Result<SyncRestorePlan> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE sync_restore_plans SET state='cancelled',phase='cancelled',updated_at=?2 WHERE restore_uuid=?1 AND library_uuid=?3 AND catalog_ready=0",
+            params![restore_uuid, now, library_uuid],
+        )?;
+        transaction.execute(
+            "DELETE FROM libraries WHERE library_uuid=?1",
+            [library_uuid],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        drop(connection);
+        self.restore_plan(restore_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("restore-not-found"))
+    }
+
+    pub fn redacted_sync_diagnostics(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let status = self
+            .sync_status_snapshot()?
+            .libraries
+            .into_iter()
+            .find(|v| v.library_uuid == library_uuid)
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        Ok(
+            serde_json::json!({"generatedAt":unix_timestamp_millis(),"libraryUuid":status.library_uuid,"lifecycle":status.lifecycle,"phase":status.phase,"catalogReadiness":status.catalog_readiness,"lastErrorCode":status.last_error_code,"pendingUploadItems":status.pending_upload_items,"pendingDownloadItems":status.pending_download_items,"conflictCount":status.conflict_count,"redacted":true}),
+        )
     }
 
     pub fn snapshot(&self) -> anyhow::Result<HostSnapshot> {
@@ -2531,11 +3967,127 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn restore_library_becomes_available_only_after_catalog_ready() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "fake", "account");
+        let now = unix_timestamp_millis();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','root','Library','local','root','ready','local-only','available',1,'marker',?1,?1)",
+            [now],
+        ).unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO sync_orchestration_operations(operation_uuid,kind,library_uuid,request_json,state,phase,created_at,updated_at) VALUES ('operation','restore',NULL,'{}','running','preparing',?1,?1)",
+            [now],
+        ).unwrap();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO sync_restore_plans(restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,descriptor_sha256,state,phase,catalog_ready,created_at,updated_at) VALUES ('restore','operation','account','library','Library','root',zeroblob(32),'restoring','restoring-metadata',0,?1,?1)",
+            [now],
+        ).unwrap();
+
+        registry
+            .begin_restore_binding("library", "account")
+            .unwrap();
+        assert_eq!(
+            registry.library("library").unwrap().unwrap().availability,
+            "unavailable"
+        );
+
+        registry.mark_restore_catalog_ready("library").unwrap();
+        assert_eq!(
+            registry.library("library").unwrap().unwrap().availability,
+            "available"
+        );
+
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
     fn temp_registry_path() -> PathBuf {
         std::env::temp_dir().join(format!(
             "megle-host-registry-{}.sqlite",
             uuid::Uuid::now_v7()
         ))
+    }
+
+    fn register_test_library(registry: &HostRegistry, library_uuid: &str) {
+        let descriptor = LibraryDescriptor {
+            library_uuid: library_uuid.into(),
+            root_uuid: uuid::Uuid::now_v7().to_string(),
+            name: "Test Library".into(),
+            icon: None,
+            color: None,
+            local_data_dir: std::env::temp_dir().join(format!("megle-data-{library_uuid}")),
+            managed_root: std::env::temp_dir().join(format!("megle-root-{library_uuid}")),
+            lifecycle_state: "ready".into(),
+            binding_state: "local-only".into(),
+            availability: "available".into(),
+            marker_identity: "marker".into(),
+        };
+        registry
+            .commit_creation("test-creation", &descriptor)
+            .unwrap();
+    }
+
+    #[test]
+    fn orchestration_status_and_preflight_tokens_are_durable_and_idempotent() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "com.megle.sync", "account-sync");
+        register_test_library(&registry, "library-sync");
+
+        let before = registry.sync_status_snapshot().unwrap();
+        assert_eq!(before.libraries[0].lifecycle, "local-only");
+        assert_eq!(before.libraries[0].allowed_actions, vec!["enable"]);
+
+        let token = registry
+            .create_sync_preflight_token("library-sync", "com.megle.sync", "account-sync", None)
+            .unwrap();
+        registry
+            .consume_sync_preflight_token(&token, "library-sync", "com.megle.sync", "account-sync")
+            .unwrap();
+        assert!(registry
+            .consume_sync_preflight_token(&token, "library-sync", "com.megle.sync", "account-sync",)
+            .is_err());
+
+        let operation = registry
+            .begin_sync_operation_once(
+                "operation-sync",
+                Some("library-sync"),
+                "sync-now",
+                "active",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        let repeated = registry
+            .begin_sync_operation_once(
+                "operation-sync",
+                Some("library-sync"),
+                "sync-now",
+                "active",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(operation.1);
+        assert!(!repeated.1);
+        assert_eq!(operation.0.operation_uuid, repeated.0.operation_uuid);
+        assert!(registry
+            .begin_sync_operation_once(
+                "operation-sync",
+                Some("library-sync"),
+                "pause",
+                "active",
+                &serde_json::json!({}),
+            )
+            .is_err());
+        assert!(registry.sync_status_snapshot().unwrap().revision > before.revision);
+
+        drop(registry);
+        let reopened = HostRegistry::open(&path).unwrap();
+        assert!(reopened.sync_status_snapshot().unwrap().revision > before.revision);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2908,6 +4460,185 @@ mod tests {
     }
 
     #[test]
+    fn unbind_reconcile_failure_is_durable_and_restart_retryable() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let now = unix_timestamp_millis();
+        register_test_plugin(&registry, "fake", "account");
+        registry.connection.lock().unwrap().execute("INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','root','Library','local','root','ready','local-only','available',1,'marker',?1,?1)",[now]).unwrap();
+        let (binding, _) = registry
+            .begin_sync_binding("library", "fake", "account")
+            .unwrap();
+        registry
+            .record_provider_receipt(
+                "library",
+                binding,
+                1,
+                "library-descriptor",
+                None,
+                &[9; 32],
+                "created",
+            )
+            .unwrap();
+        let plan = registry.create_unbind_plan("library").unwrap();
+        registry
+            .advance_unbind_plan(&plan.plan_uuid, "keep-local-fork", "cutover")
+            .unwrap();
+        registry.begin_unbind("library", binding).unwrap();
+        registry.commit_local_unbind("library").unwrap();
+        registry
+            .advance_unbind_plan(&plan.plan_uuid, "keep-local-fork", "reconciling")
+            .unwrap();
+        registry
+            .record_unbind_reconcile_failure(&plan.plan_uuid, "provider_unavailable", 0)
+            .unwrap();
+        drop(registry);
+        let reopened = HostRegistry::open(&path).unwrap();
+        let pending = reopened.pending_unbind_reconciliations().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].descriptor_sha256, Some([9; 32]));
+        assert_eq!(
+            reopened.sync_status_snapshot().unwrap().libraries[0].lifecycle,
+            "unbinding"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restore_preflight_token_is_exactly_once_and_payload_bound() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let request = serde_json::json!({"items":[{"libraryUuid":"a","managedRoot":"D:/A"}]});
+        let preflight = registry.create_restore_preflight(&request, 1, 42).unwrap();
+        assert!(registry
+            .consume_restore_preflight(&preflight.preflight_token, &serde_json::json!({"items":[]}))
+            .is_err());
+        registry
+            .consume_restore_preflight(&preflight.preflight_token, &request)
+            .unwrap();
+        assert!(registry
+            .consume_restore_preflight(&preflight.preflight_token, &request)
+            .is_err());
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reconnect_commit_fault_does_not_consume_preview_or_create_binding() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let now = unix_timestamp_millis();
+        register_test_plugin(&registry, "fake", "account");
+        registry.connection.lock().unwrap().execute("INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,origin_remote_identity,created_at,updated_at) VALUES ('library','root','Library','local','root','ready','local-only','available',1,'marker','library',?1,?1)",[now]).unwrap();
+        let origin_binding = uuid::Uuid::now_v7();
+        registry.connection.lock().unwrap().execute("INSERT INTO sync_unbind_plans(plan_uuid,library_uuid,binding_epoch,transport_generation,cutover_actor_seq,remote_watermark,pending_count,published_count,unpublished_count,origin_identity,state,choice,created_at,updated_at,plugin_id,account_uuid,remote_namespace,descriptor_sha256,base_remote_object_count,remote_visibility) VALUES ('origin-unbind','library',?1,2,8,8,0,8,0,'library','complete','keep-local-fork',?2,?2,'fake','account','library',?3,5,'visible')",params![origin_binding.as_bytes().as_slice(),now,&[4_u8;32]]).unwrap();
+        let plan = registry
+            .create_reconnect_plan(
+                "library",
+                "account",
+                "library",
+                3,
+                ReconnectPreviewFacts {
+                    remote_exists: true,
+                    remote_compatible: true,
+                    remote_object_count: 5,
+                    remote_descriptor_sha256: Some([4; 32]),
+                    remote_binding_epoch: Some(origin_binding.to_string()),
+                },
+            )
+            .unwrap();
+        assert!(plan.merge_allowed);
+        registry.connection.lock().unwrap().execute_batch("CREATE TRIGGER fail_reconnect BEFORE INSERT ON library_sync_bindings BEGIN SELECT RAISE(ABORT,'fault-reconnect'); END;").unwrap();
+        assert!(registry
+            .commit_reconnect_plan(&plan.plan_uuid, "merge-local-fork")
+            .is_err());
+        let connection = registry.connection.lock().unwrap();
+        let plan_state: String = connection
+            .query_row(
+                "SELECT state FROM sync_reconnect_plans WHERE plan_uuid=?1",
+                [&plan.plan_uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let bindings: i64 = connection
+            .query_row("SELECT COUNT(*) FROM library_sync_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(plan_state, "planned");
+        assert_eq!(bindings, 0);
+        drop(connection);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restore_plan_fault_leaves_no_partial_journal() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let now = unix_timestamp_millis();
+        register_test_plugin(&registry, "fake", "account");
+        registry.connection.lock().unwrap().execute("INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at,name,compatible) VALUES ('account','remote',1,zeroblob(32),1,?1,'Remote',1)",[now]).unwrap();
+        registry.connection.lock().unwrap().execute("INSERT INTO sync_orchestration_operations(operation_uuid,kind,state,phase,request_json,created_at,updated_at) VALUES ('operation','restore','running','catalog-restore','{}',?1,?1)",[now]).unwrap();
+        registry.connection.lock().unwrap().execute_batch("CREATE TRIGGER fail_restore BEFORE INSERT ON sync_restore_plans BEGIN SELECT RAISE(ABORT,'fault-restore'); END;").unwrap();
+        assert!(registry
+            .start_restore_plan(StartRestoreRequest {
+                operation_uuid: "operation",
+                account_uuid: "account",
+                library_uuid: "remote",
+                managed_root: Path::new("D:/Remote")
+            })
+            .is_err());
+        let count: i64 = registry
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_restore_plans", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn account_switch_fault_rolls_back_all_library_pauses() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let now = unix_timestamp_millis();
+        register_test_plugin(&registry, "fake", "account");
+        for suffix in ["a", "b"] {
+            registry.connection.lock().unwrap().execute("INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES (?1,?2,?1,?1,?1,'ready','local-only','available',1,?1,?3,?3)",params![suffix,format!("root-{suffix}"),now]).unwrap();
+            registry
+                .begin_sync_binding(suffix, "fake", "account")
+                .unwrap();
+        }
+        registry.connection.lock().unwrap().execute_batch("CREATE TRIGGER fail_account_switch BEFORE UPDATE ON library_sync_bindings WHEN NEW.state='paused' BEGIN SELECT RAISE(ABORT,'fault-account-switch'); END;").unwrap();
+        assert!(registry.sign_out_plugin_account("fake", 1).is_err());
+        let connection = registry.connection.lock().unwrap();
+        let signed_out: i64 = connection
+            .query_row(
+                "SELECT auth_state='signed-out' FROM plugin_accounts WHERE plugin_id='fake'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let paused: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM library_sync_bindings WHERE state='paused'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((signed_out, paused), (0, 0));
+        drop(connection);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn remote_account_identity_change_pauses_bindings_and_clears_cursors() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
@@ -3004,7 +4735,13 @@ mod tests {
             [now],
         ).unwrap();
 
-        assert!(registry.sign_out_plugin_account("fake", 1).unwrap());
+        let fences = registry
+            .sign_out_plugin_account("fake", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].binding_epoch, binding);
+        assert_eq!(fences[0].next_transport_generation, 2);
         let connection = registry.connection.lock().unwrap();
         let counts = (
             connection
@@ -3034,6 +4771,17 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
         assert_eq!(account, (None, "signed-out".into(), 2));
+        let binding_state: (String, String, i64) = connection
+            .query_row(
+                "SELECT state,last_error_code,transport_generation FROM library_sync_bindings WHERE library_uuid='library'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            binding_state,
+            ("paused".into(), "authorization-required".into(), 2)
+        );
         drop(connection);
         drop(registry);
         let _ = std::fs::remove_file(path);
@@ -3134,6 +4882,16 @@ mod tests {
             sha256: [9; 32],
             etag: Some("etag-one".into()),
         };
+        let discovered = DiscoveredRemoteLibrary {
+            metadata,
+            name: Some("Remote library".into()),
+            icon: Some("folder".into()),
+            media_count: Some(12),
+            logical_bytes: Some(42_000),
+            last_synced_at: Some(1234),
+            compatible: true,
+            error_code: None,
+        };
         registry
             .commit_provider_root_page(
                 "account",
@@ -3141,7 +4899,7 @@ mod tests {
                 &transport.runtime_session_id,
                 Some("cursor-zero"),
                 "page-one",
-                std::slice::from_ref(&metadata),
+                std::slice::from_ref(&discovered),
             )
             .unwrap();
         let transport = registry.provider_root_transports().unwrap().remove(0);
@@ -3153,7 +4911,7 @@ mod tests {
                 transport.account_generation,
                 &transport.runtime_session_id,
                 Some("cursor-one"),
-                std::slice::from_ref(&metadata),
+                std::slice::from_ref(&discovered),
             )
             .unwrap();
         let connection = registry.connection.lock().unwrap();
@@ -3174,6 +4932,14 @@ mod tests {
             .unwrap();
         assert_eq!(root, (Some("cursor-one".into()), None));
         drop(connection);
+        let remote = registry.list_remote_libraries().unwrap().remove(0);
+        assert_eq!(remote.name, "Remote library");
+        assert_eq!(remote.icon.as_deref(), Some("folder"));
+        assert_eq!(remote.media_count, Some(12));
+        assert_eq!(remote.logical_bytes, Some(42_000));
+        assert_eq!(remote.last_synced_at, Some(1234));
+        assert!(remote.compatible);
+        assert_eq!(remote.error_code, None);
         assert!(registry
             .commit_provider_root_cursor(
                 "account",

@@ -5,6 +5,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::Query as ExtraQuery;
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -97,6 +98,29 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/libraries/{libraryUuid}",
     "/api/libraries/{libraryUuid}/local-copy",
     "/api/libraries/{libraryUuid}/sync-binding",
+    "/api/sync/status",
+    "/api/sync/wake",
+    "/api/sync/remote-libraries",
+    "/api/sync/restores/preflight",
+    "/api/sync/restores",
+    "/api/sync/restores/{restoreUuid}",
+    "/api/sync/restores/{restoreUuid}/pause",
+    "/api/sync/restores/{restoreUuid}/resume",
+    "/api/sync/restores/{restoreUuid}/cancel",
+    "/api/libraries/{libraryUuid}/sync/preflight",
+    "/api/libraries/{libraryUuid}/sync/enable",
+    "/api/libraries/{libraryUuid}/sync/pause",
+    "/api/libraries/{libraryUuid}/sync/resume",
+    "/api/libraries/{libraryUuid}/sync/sync-now",
+    "/api/libraries/{libraryUuid}/sync/retry",
+    "/api/libraries/{libraryUuid}/sync/unbind-plan",
+    "/api/libraries/{libraryUuid}/sync/unbind-commit",
+    "/api/libraries/{libraryUuid}/sync/reconnect-preflight",
+    "/api/libraries/{libraryUuid}/sync/reconnect-commit",
+    "/api/libraries/{libraryUuid}/sync/conflicts",
+    "/api/libraries/{libraryUuid}/sync/conflicts/{conflictUuid}/resolve",
+    "/api/libraries/{libraryUuid}/sync/diagnostics",
+    "/api/libraries/{libraryUuid}/sync/diagnostics/export",
     "/api/roots",
     "/api/roots/{rootId}",
     "/api/folders/{folderId}/children",
@@ -671,6 +695,80 @@ pub fn router(state: AppState) -> Router {
             "/api/libraries/:library_uuid/sync-binding",
             post(enable_library_sync).delete(unbind_library_sync),
         )
+        .route("/api/sync/status", get(get_sync_status))
+        .route("/api/sync/wake", post(wake_sync))
+        .route("/api/sync/remote-libraries", get(list_remote_libraries))
+        .route("/api/sync/restores/preflight", post(preflight_restore))
+        .route("/api/sync/restores", post(start_restore))
+        .route("/api/sync/restores/:restore_uuid", get(get_restore))
+        .route(
+            "/api/sync/restores/:restore_uuid/pause",
+            post(pause_restore),
+        )
+        .route(
+            "/api/sync/restores/:restore_uuid/resume",
+            post(resume_restore),
+        )
+        .route(
+            "/api/sync/restores/:restore_uuid/cancel",
+            post(cancel_restore),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/preflight",
+            post(sync_preflight),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/enable",
+            post(start_sync_enable),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/pause",
+            post(pause_library_sync),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/resume",
+            post(resume_library_sync),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/sync-now",
+            post(sync_library_now),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/retry",
+            post(retry_library_sync),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/unbind-plan",
+            post(create_unbind_plan),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/unbind-commit",
+            post(commit_unbind_plan),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/reconnect-preflight",
+            post(reconnect_preflight),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/reconnect-commit",
+            post(reconnect_commit),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/conflicts",
+            get(list_sync_conflicts),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/conflicts/:conflict_uuid/resolve",
+            post(resolve_sync_conflict),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/diagnostics",
+            get(sync_diagnostics),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync/diagnostics/export",
+            post(export_sync_diagnostics),
+        )
         .route("/api/roots", get(list_roots).post(add_root))
         .route("/api/roots/:root_id", axum::routing::delete(remove_root))
         .route(
@@ -863,6 +961,134 @@ struct UpdateLibraryRequest {
 struct EnableLibrarySyncRequest {
     provider_id: String,
     account_identity: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncCommandRequest {
+    operation_uuid: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncPreflightRequest {
+    provider_id: String,
+    account_uuid: String,
+    remote_library_uuid: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncPreflightResponse {
+    ok: bool,
+    reason: String,
+    preflight_token: Option<String>,
+    remote_library_uuid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncEnableRequest {
+    operation_uuid: String,
+    provider_id: String,
+    account_uuid: String,
+    preflight_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnbindCommitRequest {
+    operation_uuid: String,
+    plan_uuid: String,
+    choice: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReconnectPreflightRequest {
+    account_uuid: String,
+    remote_library_uuid: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReconnectCommitRequest {
+    operation_uuid: String,
+    plan_uuid: String,
+    choice: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreStartRequest {
+    operation_uuid: String,
+    preflight_token: String,
+    items: Vec<RestoreStartItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestorePreflightRequest {
+    items: Vec<RestoreStartItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreStartItem {
+    account_uuid: String,
+    library_uuid: String,
+    name: String,
+    managed_root: String,
+}
+
+fn restore_operation_request(items: &[RestoreStartItem]) -> serde_json::Value {
+    serde_json::json!({
+        "items": items.iter().map(|item| serde_json::json!({
+            "accountUuid": item.account_uuid,
+            "libraryUuid": item.library_uuid,
+            "name": item.name,
+            "managedRoot": item.managed_root,
+        })).collect::<Vec<_>>()
+    })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreListResponse {
+    items: Vec<crate::host_registry::SyncRestorePlan>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConflictQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncConflictRecord {
+    conflict_uuid: String,
+    entity_uuid: Option<String>,
+    conflict_kind: String,
+    state: String,
+    details: Option<serde_json::Value>,
+    created_at: i64,
+    resolved_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncConflictListResponse {
+    items: Vec<SyncConflictRecord>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConflictResolutionRequest {
+    operation_uuid: String,
+    resolution: String,
 }
 
 fn require_context_revision(headers: &HeaderMap) -> ApiResult<u64> {
@@ -1112,6 +1338,762 @@ async fn unbind_library_sync(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn get_sync_status(
+    State(state): State<AppState>,
+) -> ApiResult<Json<crate::host_registry::SyncStatusSnapshot>> {
+    Ok(Json(
+        library_manager(&state)?.registry().sync_status_snapshot()?,
+    ))
+}
+
+async fn wake_sync(State(state): State<AppState>) -> StatusCode {
+    // The renderer can regain focus while Core is still finishing Host bootstrap.
+    // Treat that early wake as an idempotent no-op instead of surfacing a 409 to
+    // the desktop shell; the normal startup tick will pick up the same work.
+    if let Some(manager) = state.library_manager.as_ref() {
+        manager.wake_sync_for_foreground_or_network();
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn list_remote_libraries(
+    State(state): State<AppState>,
+) -> ApiResult<Json<ListResponse<crate::host_registry::RemoteLibrarySummary>>> {
+    Ok(Json(ListResponse {
+        items: library_manager(&state)?
+            .registry()
+            .list_remote_libraries()?,
+        next_cursor: None,
+        total_count: None,
+    }))
+}
+
+async fn sync_preflight(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    Json(request): Json<SyncPreflightRequest>,
+) -> ApiResult<Json<SyncPreflightResponse>> {
+    let manager = library_manager(&state)?;
+    if manager.registry().library(&library_uuid)?.is_none() {
+        return Err(CoreError::not_found("library-not-found".into()));
+    }
+    manager
+        .registry()
+        .require_ready_sync_provider(&request.provider_id, &request.account_uuid)
+        .map_err(map_library_error)?;
+    let token = manager.registry().create_sync_preflight_token(
+        &library_uuid,
+        &request.provider_id,
+        &request.account_uuid,
+        request.remote_library_uuid.as_deref(),
+    )?;
+    Ok(Json(SyncPreflightResponse {
+        ok: true,
+        reason: "ok".into(),
+        preflight_token: Some(token),
+        remote_library_uuid: request.remote_library_uuid,
+    }))
+}
+
+async fn start_sync_enable(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SyncEnableRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
+    let expected = require_context_revision(&headers)?;
+    let manager = library_manager(&state)?;
+    manager
+        .ensure_context_revision(expected)
+        .map_err(map_library_error)?;
+    let (operation, inserted) = manager.registry().begin_sync_operation_once(
+        &request.operation_uuid,
+        Some(&library_uuid),
+        "enable",
+        "capturing",
+        &serde_json::json!({"providerId":request.provider_id,"accountUuid":request.account_uuid,"preflightToken":request.preflight_token}),
+    )?;
+    if !inserted {
+        return Ok(Json(operation));
+    }
+    let _ = manager
+        .publish_sync_operation_notification(&operation)
+        .await;
+    if let Err(error) = manager.registry().consume_sync_preflight_token(
+        &request.preflight_token,
+        &library_uuid,
+        &request.provider_id,
+        &request.account_uuid,
+    ) {
+        let code = error.to_string().replace('-', "_");
+        if let Ok(finished) = manager.registry().finish_sync_operation(
+            &operation.operation_uuid,
+            "failed",
+            "preflight",
+            Some(&code),
+        ) {
+            let _ = manager.publish_sync_operation_notification(&finished).await;
+        }
+        return Err(map_library_error(error));
+    }
+    match manager
+        .enable_library_sync_with_revision(
+            &library_uuid,
+            expected,
+            &request.provider_id,
+            &request.account_uuid,
+        )
+        .await
+    {
+        Ok(()) => {
+            let finished = manager.registry().finish_sync_operation(
+                &operation.operation_uuid,
+                "waiting",
+                "uploading",
+                None,
+            )?;
+            let _ = manager.publish_sync_operation_notification(&finished).await;
+            Ok(Json(finished))
+        }
+        Err(error) => {
+            let code = error.to_string().replace('-', "_");
+            if let Ok(finished) = manager.registry().finish_sync_operation(
+                &operation.operation_uuid,
+                "failed",
+                "retry-wait",
+                Some(&code),
+            ) {
+                let _ = manager.publish_sync_operation_notification(&finished).await;
+            }
+            Err(map_library_error(error))
+        }
+    }
+}
+
+async fn run_sync_command(
+    state: AppState,
+    library_uuid: String,
+    headers: HeaderMap,
+    request: SyncCommandRequest,
+    action: &'static str,
+) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
+    let expected = require_context_revision(&headers)?;
+    let manager = library_manager(&state)?;
+    let (operation, inserted) = manager.registry().begin_sync_operation_once(
+        &request.operation_uuid,
+        Some(&library_uuid),
+        action,
+        "active",
+        &serde_json::json!({}),
+    )?;
+    if !inserted {
+        return Ok(Json(operation));
+    }
+    let _ = manager
+        .publish_sync_operation_notification(&operation)
+        .await;
+    let result = match action {
+        "pause" => {
+            manager
+                .pause_library_sync_with_revision(&library_uuid, expected)
+                .await
+        }
+        "resume" => {
+            manager
+                .resume_library_sync_with_revision(&library_uuid, expected)
+                .await
+        }
+        _ => {
+            manager
+                .wake_library_sync_with_revision(&library_uuid, expected)
+                .await
+        }
+    };
+    match result {
+        Ok(()) => {
+            let finished = manager.registry().finish_sync_operation(
+                &operation.operation_uuid,
+                "complete",
+                "complete",
+                None,
+            )?;
+            let _ = manager.publish_sync_operation_notification(&finished).await;
+            Ok(Json(finished))
+        }
+        Err(error) => {
+            let code = error.to_string().replace('-', "_");
+            if let Ok(finished) = manager.registry().finish_sync_operation(
+                &operation.operation_uuid,
+                "failed",
+                "retry-wait",
+                Some(&code),
+            ) {
+                let _ = manager.publish_sync_operation_notification(&finished).await;
+            }
+            Err(map_library_error(error))
+        }
+    }
+}
+
+async fn pause_library_sync(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SyncCommandRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
+    run_sync_command(state, library_uuid, headers, request, "pause").await
+}
+async fn resume_library_sync(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SyncCommandRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
+    run_sync_command(state, library_uuid, headers, request, "resume").await
+}
+async fn sync_library_now(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SyncCommandRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
+    run_sync_command(state, library_uuid, headers, request, "sync-now").await
+}
+async fn retry_library_sync(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SyncCommandRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
+    run_sync_command(state, library_uuid, headers, request, "retry").await
+}
+
+async fn create_unbind_plan(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+) -> ApiResult<Json<crate::host_registry::SyncUnbindPlan>> {
+    Ok(Json(
+        library_manager(&state)?
+            .registry()
+            .create_unbind_plan(&library_uuid)?,
+    ))
+}
+
+async fn commit_unbind_plan(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UnbindCommitRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
+    if !matches!(
+        request.choice.as_str(),
+        "drain-before-unbind" | "keep-local-fork"
+    ) {
+        return Err(CoreError::bad_request("invalid unbind choice".into()));
+    }
+    let expected = require_context_revision(&headers)?;
+    let manager = library_manager(&state)?;
+    let (operation, inserted) = manager.registry().begin_sync_operation_once(
+        &request.operation_uuid,
+        Some(&library_uuid),
+        "unbind",
+        "reconcile",
+        &serde_json::json!({"planUuid":request.plan_uuid,"choice":request.choice}),
+    )?;
+    if !inserted {
+        return Ok(Json(operation));
+    }
+    let _ = manager
+        .publish_sync_operation_notification(&operation)
+        .await;
+    manager
+        .registry()
+        .attach_unbind_operation(&request.plan_uuid, &operation.operation_uuid)?;
+    let completed = match manager
+        .commit_unbind_plan_with_revision(
+            &library_uuid,
+            expected,
+            &request.plan_uuid,
+            &request.choice,
+        )
+        .await
+    {
+        Ok(completed) => completed,
+        Err(error) => {
+            let code = error.to_string().replace('-', "_");
+            if let Ok(finished) = manager.registry().finish_sync_operation(
+                &operation.operation_uuid,
+                "failed",
+                "retry-wait",
+                Some(&code),
+            ) {
+                let _ = manager.publish_sync_operation_notification(&finished).await;
+            }
+            return Err(map_library_error(error));
+        }
+    };
+    let finished = manager.registry().finish_sync_operation(
+        &operation.operation_uuid,
+        if completed { "complete" } else { "waiting" },
+        if completed { "complete" } else { "retry-wait" },
+        if completed {
+            None
+        } else {
+            Some("remote_visibility_unknown")
+        },
+    )?;
+    let _ = manager.publish_sync_operation_notification(&finished).await;
+    Ok(Json(finished))
+}
+
+async fn reconnect_preflight(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    Json(request): Json<ReconnectPreflightRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncReconnectPlan>> {
+    Ok(Json(
+        library_manager(&state)?
+            .create_reconnect_plan(
+                &library_uuid,
+                &request.account_uuid,
+                &request.remote_library_uuid,
+            )
+            .await?,
+    ))
+}
+
+async fn reconnect_commit(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ReconnectCommitRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
+    if !matches!(
+        request.choice.as_str(),
+        "merge-local-fork" | "publish-new-remote"
+    ) {
+        return Err(CoreError::bad_request("invalid reconnect choice".into()));
+    }
+    let expected = require_context_revision(&headers)?;
+    let manager = library_manager(&state)?;
+    let (operation, inserted) = manager.registry().begin_sync_operation_once(
+        &request.operation_uuid,
+        Some(&library_uuid),
+        "reconnect",
+        "capturing",
+        &serde_json::json!({"planUuid":request.plan_uuid,"choice":request.choice}),
+    )?;
+    if !inserted {
+        return Ok(Json(operation));
+    }
+    let _ = manager
+        .publish_sync_operation_notification(&operation)
+        .await;
+    if let Err(error) = manager
+        .commit_reconnect_plan_with_revision(
+            &library_uuid,
+            expected,
+            &request.plan_uuid,
+            &request.choice,
+        )
+        .await
+    {
+        let code = error.to_string().replace('-', "_");
+        if let Ok(finished) = manager.registry().finish_sync_operation(
+            &operation.operation_uuid,
+            "failed",
+            "retry-wait",
+            Some(&code),
+        ) {
+            let _ = manager.publish_sync_operation_notification(&finished).await;
+        }
+        return Err(map_library_error(error));
+    }
+    let finished = manager.registry().finish_sync_operation(
+        &operation.operation_uuid,
+        "waiting",
+        "uploading",
+        None,
+    )?;
+    let _ = manager.publish_sync_operation_notification(&finished).await;
+    Ok(Json(finished))
+}
+
+fn validate_restore_items(
+    manager: &crate::library_manager::LibraryManager,
+    items: &[RestoreStartItem],
+) -> ApiResult<u64> {
+    if items.is_empty() {
+        return Err(CoreError::bad_request(
+            "restore items cannot be empty".into(),
+        ));
+    }
+    let mut normalized_roots = Vec::with_capacity(items.len());
+    let remote_inventory = manager.registry().list_remote_libraries()?;
+    let mut required_by_volume = std::collections::HashMap::<String, u64>::new();
+    let mut available_by_volume = std::collections::HashMap::<String, u64>::new();
+    for item in items {
+        let check = manager.preflight(&item.name, FilePath::new(&item.managed_root))?;
+        if !check.ok {
+            return Err(CoreError::conflict(check.reason.as_str().into()));
+        }
+        let comparable = check
+            .normalized_root
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase();
+        if normalized_roots.iter().any(|existing: &String| {
+            comparable == *existing
+                || comparable.starts_with(&format!("{existing}\\"))
+                || existing.starts_with(&format!("{comparable}\\"))
+        }) {
+            return Err(CoreError::conflict("managed-root-overlap".into()));
+        }
+        let Some(remote) = remote_inventory.iter().find(|remote| {
+            remote.account_uuid == item.account_uuid
+                && remote.library_uuid == item.library_uuid
+                && remote.compatible
+        }) else {
+            return Err(CoreError::conflict("remote-library-not-restorable".into()));
+        };
+        let volume = check
+            .normalized_root
+            .components()
+            .next()
+            .map(|value| value.as_os_str().to_string_lossy().to_lowercase())
+            .unwrap_or_else(|| check.normalized_root.to_string_lossy().to_lowercase());
+        let required = remote
+            .logical_bytes
+            .unwrap_or(remote.descriptor_size)
+            .saturating_add(256 * 1024 * 1024);
+        *required_by_volume.entry(volume.clone()).or_default() = required_by_volume
+            .get(&volume)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(required);
+        if let Some(available) = check.available_bytes {
+            available_by_volume
+                .entry(volume)
+                .and_modify(|value| *value = (*value).min(available))
+                .or_insert(available);
+        }
+        normalized_roots.push(comparable);
+    }
+    if required_by_volume.iter().any(|(volume, required)| {
+        available_by_volume
+            .get(volume)
+            .is_some_and(|available| required > available)
+    }) {
+        return Err(CoreError::conflict(
+            "aggregate-disk-space-insufficient".into(),
+        ));
+    }
+    Ok(required_by_volume.values().copied().sum())
+}
+
+async fn preflight_restore(
+    State(state): State<AppState>,
+    Json(request): Json<RestorePreflightRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncRestorePreflight>> {
+    let manager = library_manager(&state)?;
+    let total_bytes = validate_restore_items(&manager, &request.items)?;
+    Ok(Json(manager.registry().create_restore_preflight(
+        &restore_operation_request(&request.items),
+        request.items.len() as u64,
+        total_bytes,
+    )?))
+}
+
+async fn start_restore(
+    State(state): State<AppState>,
+    Json(request): Json<RestoreStartRequest>,
+) -> ApiResult<Json<RestoreListResponse>> {
+    let manager = library_manager(&state)?;
+    let request_value = restore_operation_request(&request.items);
+    let existing_plans = manager
+        .registry()
+        .restore_plans_for_operation(&request.operation_uuid)?;
+    if !existing_plans.is_empty() {
+        return Ok(Json(RestoreListResponse {
+            items: existing_plans,
+        }));
+    }
+    manager
+        .registry()
+        .consume_restore_preflight(&request.preflight_token, &request_value)
+        .map_err(map_library_error)?;
+    validate_restore_items(&manager, &request.items)?;
+    let (_operation, inserted) = manager.registry().begin_sync_operation_once(
+        &request.operation_uuid,
+        None,
+        "restore",
+        "catalog-restore",
+        &restore_operation_request(&request.items),
+    )?;
+    if !inserted {
+        return Err(CoreError::conflict(
+            "restore-operation-exists-without-plans".into(),
+        ));
+    }
+    let mut plans: Vec<crate::host_registry::SyncRestorePlan> =
+        Vec::with_capacity(request.items.len());
+    for item in request.items {
+        let plan =
+            match manager
+                .registry()
+                .start_restore_plan(crate::host_registry::StartRestoreRequest {
+                    operation_uuid: &request.operation_uuid,
+                    account_uuid: &item.account_uuid,
+                    library_uuid: &item.library_uuid,
+                    managed_root: FilePath::new(&item.managed_root),
+                }) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    for created in plans.iter().rev() {
+                        let _ = manager.discard_restore_plan(&created.restore_uuid).await;
+                    }
+                    let _ = manager.registry().finish_sync_operation(
+                        &request.operation_uuid,
+                        "failed",
+                        "compensated",
+                        Some("multi-restore-plan-failed"),
+                    );
+                    return Err(map_library_error(error));
+                }
+            };
+        if let Err(error) = manager
+            .create_restore_library(
+                item.library_uuid.clone(),
+                plan.name.clone(),
+                FilePath::new(&item.managed_root).to_path_buf(),
+                &item.account_uuid,
+            )
+            .await
+        {
+            let _ = manager
+                .registry()
+                .fail_restore_plan(&plan.restore_uuid, &error.to_string());
+            for created in plans.iter().rev() {
+                let _ = manager.discard_restore_plan(&created.restore_uuid).await;
+            }
+            let _ = manager.discard_restore_plan(&plan.restore_uuid).await;
+            let _ = manager.registry().finish_sync_operation(
+                &request.operation_uuid,
+                "failed",
+                "compensated",
+                Some("multi-restore-create-failed"),
+            );
+            return Err(error.into());
+        }
+        let _ = manager.publish_restore_notification(&plan).await;
+        plans.push(plan);
+    }
+    manager.registry().finish_sync_operation(
+        &request.operation_uuid,
+        "waiting",
+        "catalog-restore",
+        None,
+    )?;
+    Ok(Json(RestoreListResponse { items: plans }))
+}
+async fn get_restore(
+    State(state): State<AppState>,
+    Path(restore_uuid): Path<String>,
+) -> ApiResult<Json<crate::host_registry::SyncRestorePlan>> {
+    Ok(Json(
+        library_manager(&state)?
+            .registry()
+            .restore_plan(&restore_uuid)?
+            .ok_or_else(|| CoreError::not_found("restore-not-found".into()))?,
+    ))
+}
+async fn pause_restore(
+    State(state): State<AppState>,
+    Path(restore_uuid): Path<String>,
+) -> ApiResult<Json<crate::host_registry::SyncRestorePlan>> {
+    let manager = library_manager(&state)?;
+    let plan = manager.pause_restore(&restore_uuid).await?;
+    let _ = manager.publish_restore_notification(&plan).await;
+    Ok(Json(plan))
+}
+async fn resume_restore(
+    State(state): State<AppState>,
+    Path(restore_uuid): Path<String>,
+) -> ApiResult<Json<crate::host_registry::SyncRestorePlan>> {
+    let manager = library_manager(&state)?;
+    let plan = manager.resume_restore(&restore_uuid).await?;
+    let _ = manager.publish_restore_notification(&plan).await;
+    Ok(Json(plan))
+}
+async fn cancel_restore(
+    State(state): State<AppState>,
+    Path(restore_uuid): Path<String>,
+) -> ApiResult<Json<crate::host_registry::SyncRestorePlan>> {
+    let manager = library_manager(&state)?;
+    let plan = manager.cancel_restore(&restore_uuid).await?;
+    // The local Catalog no longer exists after pre-catalog cancellation, so
+    // publish the terminal notification before cleanup is impossible. The
+    // durable Host operation remains the recovery/audit record.
+    Ok(Json(plan))
+}
+
+async fn list_sync_conflicts(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    Query(query): Query<ConflictQuery>,
+) -> ApiResult<Json<SyncConflictListResponse>> {
+    let descriptor = library_manager(&state)?
+        .registry()
+        .library(&library_uuid)?
+        .ok_or_else(|| CoreError::not_found("library-not-found".into()))?;
+    let database = Database::open(descriptor.local_data_dir.join("catalog.sqlite"))?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let after = query
+        .cursor
+        .as_deref()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok());
+    let mut statement=database.connection_for_fsops().prepare("SELECT conflict_uuid,entity_uuid,conflict_kind,state,details,created_at,resolved_at FROM sync_conflicts WHERE (?1 IS NULL OR conflict_uuid>?1) ORDER BY conflict_uuid LIMIT ?2").map_err(anyhow::Error::new)?;
+    let items = statement
+        .query_map(
+            params![after.map(|v| v.as_bytes().to_vec()), (limit + 1) as i64],
+            |row| {
+                let id: Vec<u8> = row.get(0)?;
+                Ok(SyncConflictRecord {
+                    conflict_uuid: uuid::Uuid::from_slice(&id)
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Blob,
+                                Box::new(e),
+                            )
+                        })?
+                        .to_string(),
+                    entity_uuid: row
+                        .get::<_, Option<Vec<u8>>>(1)?
+                        .and_then(|value| uuid::Uuid::from_slice(&value).ok())
+                        .map(|value| value.to_string()),
+                    conflict_kind: row.get(2)?,
+                    state: row.get(3)?,
+                    details: row
+                        .get::<_, Option<Vec<u8>>>(4)?
+                        .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+                        .map(redact_sync_conflict_details),
+                    created_at: row.get(5)?,
+                    resolved_at: row.get(6)?,
+                })
+            },
+        )
+        .map_err(anyhow::Error::new)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::new)?;
+    let next_cursor = (items.len() > limit).then(|| items[limit - 1].conflict_uuid.clone());
+    Ok(Json(SyncConflictListResponse {
+        items: items.into_iter().take(limit).collect(),
+        next_cursor,
+    }))
+}
+
+fn redact_sync_conflict_details(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let normalized = key.to_ascii_lowercase();
+                    if normalized.contains("path")
+                        || normalized.contains("name")
+                        || normalized.contains("token")
+                        || normalized.contains("secret")
+                    {
+                        None
+                    } else {
+                        Some((key, redact_sync_conflict_details(value)))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(redact_sync_conflict_details)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+async fn resolve_sync_conflict(
+    State(state): State<AppState>,
+    Path((library_uuid, conflict_uuid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<ConflictResolutionRequest>,
+) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
+    let expected = require_context_revision(&headers)?;
+    let manager = library_manager(&state)?;
+    manager
+        .ensure_context_revision(expected)
+        .map_err(map_library_error)?;
+    if !matches!(request.resolution.as_str(), "resolve" | "ignore") {
+        return Err(CoreError::bad_request("invalid conflict resolution".into()));
+    }
+    let (operation, inserted) = manager.registry().begin_sync_operation_once(
+        &request.operation_uuid,
+        Some(&library_uuid),
+        "retry",
+        "complete",
+        &serde_json::json!({"conflictUuid":conflict_uuid,"resolution":request.resolution}),
+    )?;
+    if !inserted {
+        return Ok(Json(operation));
+    }
+    let _ = manager
+        .publish_sync_operation_notification(&operation)
+        .await;
+    let id = uuid::Uuid::parse_str(&conflict_uuid)
+        .map_err(|_| CoreError::bad_request("invalid conflict uuid".into()))?;
+    if let Err(error) = manager
+        .resolve_sync_conflict_with_revision(&library_uuid, expected, id, &request.resolution)
+        .await
+    {
+        let code = error.to_string().replace('-', "_");
+        if let Ok(finished) = manager.registry().finish_sync_operation(
+            &operation.operation_uuid,
+            "failed",
+            "retry-wait",
+            Some(&code),
+        ) {
+            let _ = manager.publish_sync_operation_notification(&finished).await;
+        }
+        return Err(map_library_error(error));
+    }
+    let finished = manager.registry().finish_sync_operation(
+        &operation.operation_uuid,
+        "complete",
+        "complete",
+        None,
+    )?;
+    let _ = manager.publish_sync_operation_notification(&finished).await;
+    Ok(Json(finished))
+}
+
+async fn sync_diagnostics(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(
+        library_manager(&state)?
+            .registry()
+            .redacted_sync_diagnostics(&library_uuid)?,
+    ))
+}
+async fn export_sync_diagnostics(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    sync_diagnostics(State(state), Path(library_uuid)).await
+}
+
 fn map_library_error(error: anyhow::Error) -> CoreError {
     let message = error.to_string();
     let status = if message.contains("not-found") {
@@ -1215,7 +2197,14 @@ where
         .write_authoritative(move |database: &mut Database| Ok(operation(database)))
         .await;
     match inner {
-        Ok(api_result) => api_result,
+        Ok(api_result) => {
+            if api_result.is_ok() {
+                if let Some(manager) = state.library_manager.as_ref() {
+                    manager.wake_sync_after_local_mutation();
+                }
+            }
+            api_result
+        }
         Err(error) => Err(CoreError::from(error)),
     }
 }
@@ -2973,21 +3962,23 @@ async fn sign_out_plugin(
     let account = registry
         .plugin_account_secret(&id)?
         .ok_or_else(|| not_found_plugin(&id))?;
-    let fences = registry.pause_plugin_bindings(&id)?;
+    let provider = plugin_provider(&state, &id)?;
+    let fences = registry
+        .sign_out_plugin_account(&id, account.generation)?
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "plugin_account_changed",
+                "Provider account changed during sign-out".into(),
+            )
+        })?;
     library_manager(&state)?
         .fence_plugin_bindings(&id, fences)
         .await?;
-    plugin_provider(&state, &id)?
-        .auth_sign_out()
-        .await
-        .map_err(map_provider_error)?;
-    if !registry.sign_out_plugin_account(&id, account.generation)? {
-        return Err(CoreError::coded(
-            StatusCode::CONFLICT,
-            "plugin_account_changed",
-            "Provider account changed during sign-out".into(),
-        ));
-    }
+    // Local authorization and all binding fences are already durable. Remote
+    // token revocation is best-effort so a Provider outage cannot report a
+    // failed sign-out while leaving the Host in a half-signed-out state.
+    let _ = provider.auth_sign_out().await;
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
@@ -6913,6 +7904,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn sync_wake_is_host_scoped_before_any_library_is_active() {
+        let app = router(AppState::new(test_database()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sync/wake?reason=foreground")
+                    .body(Body::empty())
+                    .expect("build sync wake request"),
+            )
+            .await
+            .expect("wake sync before Library activation");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
     /// Empty-string env vars (e.g. `${MEGLE_SESSION_TOKEN:-}` from
     /// `compose.yaml`) used to be threaded into `ApiConfig.session_token` as
     /// `Some("")`, which made the auth middleware compare every incoming
@@ -9066,6 +10074,22 @@ mod tests {
                 std::sync::Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
             )
             .unwrap();
+        let created = manager
+            .create_library(
+                "Synced Library".into(),
+                None,
+                None,
+                base.join("managed"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        let (binding_epoch, _) = manager
+            .host_registry()
+            .begin_sync_binding(&created.library_uuid, "com.megle.fake", "fake-account")
+            .unwrap();
         let app = router(state);
 
         let begin = app
@@ -9127,6 +10151,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sign_out.status(), StatusCode::ACCEPTED);
+        let account = manager
+            .host_registry()
+            .plugin_account_secret("com.megle.fake")
+            .unwrap()
+            .unwrap();
+        assert!(account.secret_ref.is_none());
+        assert_eq!(account.generation, 2);
+        let binding = manager
+            .host_registry()
+            .binding_transport(&created.library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.binding_epoch, binding_epoch);
+        assert_eq!(binding.transport_generation, 2);
+        assert_eq!(
+            manager
+                .host_registry()
+                .sync_status_snapshot()
+                .unwrap()
+                .libraries
+                .into_iter()
+                .find(|status| status.library_uuid == created.library_uuid)
+                .unwrap()
+                .lifecycle,
+            "paused"
+        );
         manager.provider_manager().shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(base);
     }

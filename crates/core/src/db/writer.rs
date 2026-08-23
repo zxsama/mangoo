@@ -12,6 +12,7 @@ use crate::db::Database;
 /// jobs of different result types share one channel; `write` downcasts.
 type BoxedResult = anyhow::Result<Box<dyn Any + Send>>;
 type WriteJob = Box<dyn FnOnce(&mut Database) -> BoxedResult + Send>;
+type AuthoritativeCommitHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Durability promised by a writer turn. Regenerable cache/index work remains
 /// on SQLite WAL `NORMAL`; user-authored and synchronization truth must commit
@@ -25,6 +26,7 @@ pub enum WriteDurability {
 struct QueuedJob {
     job: WriteJob,
     durability: WriteDurability,
+    notify_authoritative_commit: bool,
     reply: oneshot::Sender<BoxedResult>,
 }
 
@@ -40,6 +42,7 @@ enum WriterMessage {
 #[derive(Clone)]
 pub struct DbWriter {
     inner: Arc<DbWriterInner>,
+    notify_authoritative_commit: bool,
 }
 
 struct DbWriterInner {
@@ -118,13 +121,24 @@ impl NotificationFlushSignal {
 impl DbWriter {
     /// Start the actor thread over the given write connection and return a handle.
     pub fn spawn(database: Database) -> DbWriter {
+        Self::spawn_with_authoritative_commit_hook(database, None)
+    }
+
+    /// Start the actor with a callback invoked after every successful
+    /// authoritative commit. Active Library runtimes use this to wake the Host
+    /// sync coordinator for API, watcher, task, and filesystem mutations
+    /// without coupling those producers to the scheduler.
+    pub fn spawn_with_authoritative_commit_hook(
+        database: Database,
+        authoritative_commit_hook: Option<AuthoritativeCommitHook>,
+    ) -> DbWriter {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT_INSTANCE_ID: AtomicUsize = AtomicUsize::new(1);
         let notification_flush_signal = database.notification_flush_signal();
         let (sender, receiver) = mpsc::unbounded_channel::<WriterMessage>();
         let join_handle = std::thread::Builder::new()
             .name("megle-db-writer".to_string())
-            .spawn(move || run_writer_actor(database, receiver))
+            .spawn(move || run_writer_actor(database, receiver, authoritative_commit_hook))
             .expect("spawn db writer thread");
         let writer = DbWriter {
             inner: Arc::new(DbWriterInner {
@@ -135,6 +149,7 @@ impl DbWriter {
                 join_handle: Mutex::new(Some(join_handle)),
                 scheduler_join_handle: Mutex::new(None),
             }),
+            notify_authoritative_commit: true,
         };
         let scheduler_writer = Arc::downgrade(&writer.inner);
         let scheduler_join_handle = std::thread::Builder::new()
@@ -155,6 +170,16 @@ impl DbWriter {
     /// Clones share it; distinct actors differ.
     pub fn instance_id(&self) -> usize {
         self.inner.instance_id
+    }
+
+    /// Clone this writer for a coordinator-owned turn. Such work still uses
+    /// authoritative durability, but must not be mistaken for a new local
+    /// mutation and wake the coordinator recursively.
+    pub(crate) fn without_authoritative_commit_wake(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            notify_authoritative_commit: false,
+        }
     }
 
     /// Stop accepting writes, drain all writes queued before this call, flush,
@@ -204,7 +229,7 @@ impl DbWriter {
         F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
     {
         let (reply, reply_rx) = oneshot::channel();
-        self.enqueue(op, WriteDurability::Derived, reply)?;
+        self.enqueue(op, WriteDurability::Derived, false, reply)?;
         let boxed = reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("database writer dropped the job"))??;
@@ -219,7 +244,28 @@ impl DbWriter {
         F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
     {
         let (reply, reply_rx) = oneshot::channel();
-        self.enqueue(op, WriteDurability::Authoritative, reply)?;
+        self.enqueue(
+            op,
+            WriteDurability::Authoritative,
+            self.notify_authoritative_commit,
+            reply,
+        )?;
+        let boxed = reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("database writer dropped the job"))??;
+        downcast(boxed)
+    }
+
+    /// Submit an authoritative synchronization turn without re-triggering the
+    /// local-commit wake hook. Remote apply still gets FULL durability, while
+    /// avoiding a scheduler self-wake loop after every successful pull turn.
+    pub(crate) async fn write_authoritative_without_wake<T, F>(&self, op: F) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
+    {
+        let (reply, reply_rx) = oneshot::channel();
+        self.enqueue(op, WriteDurability::Authoritative, false, reply)?;
         let boxed = reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("database writer dropped the job"))??;
@@ -234,7 +280,7 @@ impl DbWriter {
         F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
     {
         let (reply, reply_rx) = oneshot::channel();
-        self.enqueue(op, WriteDurability::Derived, reply)?;
+        self.enqueue(op, WriteDurability::Derived, false, reply)?;
         let boxed = reply_rx
             .blocking_recv()
             .map_err(|_| anyhow::anyhow!("database writer dropped the job"))??;
@@ -247,7 +293,12 @@ impl DbWriter {
         F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
     {
         let (reply, reply_rx) = oneshot::channel();
-        self.enqueue(op, WriteDurability::Authoritative, reply)?;
+        self.enqueue(
+            op,
+            WriteDurability::Authoritative,
+            self.notify_authoritative_commit,
+            reply,
+        )?;
         let boxed = reply_rx
             .blocking_recv()
             .map_err(|_| anyhow::anyhow!("database writer dropped the job"))??;
@@ -258,6 +309,7 @@ impl DbWriter {
         &self,
         op: F,
         durability: WriteDurability,
+        notify_authoritative_commit: bool,
         reply: oneshot::Sender<BoxedResult>,
     ) -> anyhow::Result<()>
     where
@@ -275,6 +327,7 @@ impl DbWriter {
             .send(WriterMessage::Job(QueuedJob {
                 job,
                 durability,
+                notify_authoritative_commit,
                 reply,
             }))
             .map_err(|_| anyhow::anyhow!("database writer is unavailable"))
@@ -288,7 +341,11 @@ fn downcast<T: 'static>(boxed: Box<dyn Any + Send>) -> anyhow::Result<T> {
         .map_err(|_| anyhow::anyhow!("database writer returned an unexpected type"))
 }
 
-fn run_writer_actor(mut database: Database, mut receiver: mpsc::UnboundedReceiver<WriterMessage>) {
+fn run_writer_actor(
+    mut database: Database,
+    mut receiver: mpsc::UnboundedReceiver<WriterMessage>,
+    authoritative_commit_hook: Option<AuthoritativeCommitHook>,
+) {
     crate::debug_log!("writer actor started");
     while let Some(message) = receiver.blocking_recv() {
         let first = match message {
@@ -299,11 +356,13 @@ fn run_writer_actor(mut database: Database, mut receiver: mpsc::UnboundedReceive
             }
         };
         crate::debug_log!("writer running a job");
-        run_one(&mut database, first);
+        run_one(&mut database, first, authoritative_commit_hook.as_ref());
         let mut shutdown_reply = None;
         while let Ok(next) = receiver.try_recv() {
             match next {
-                WriterMessage::Job(job) => run_one(&mut database, job),
+                WriterMessage::Job(job) => {
+                    run_one(&mut database, job, authoritative_commit_hook.as_ref())
+                }
                 WriterMessage::Shutdown(reply) => {
                     shutdown_reply = Some(reply);
                     break;
@@ -343,7 +402,10 @@ fn run_notification_flush_scheduler(
         if inner.closed.load(Ordering::Acquire) {
             break;
         }
-        let handle = DbWriter { inner };
+        let handle = DbWriter {
+            inner,
+            notify_authoritative_commit: false,
+        };
         let next_due =
             handle.write_blocking(|database| database.next_dirty_notification_flush_at());
         drop(handle);
@@ -374,7 +436,10 @@ fn run_notification_flush_scheduler(
         if inner.closed.load(Ordering::Acquire) {
             break;
         }
-        let handle = DbWriter { inner };
+        let handle = DbWriter {
+            inner,
+            notify_authoritative_commit: false,
+        };
         let flush_at = crate::db::unix_timestamp_millis();
         let flush_result =
             handle.write_blocking(move |database| database.flush_due_notification_heads(flush_at));
@@ -391,7 +456,11 @@ fn run_notification_flush_scheduler(
     }
 }
 
-fn run_one(database: &mut Database, queued: QueuedJob) {
+fn run_one(
+    database: &mut Database,
+    queued: QueuedJob,
+    authoritative_commit_hook: Option<&AuthoritativeCommitHook>,
+) {
     let started = std::time::Instant::now();
     let result = match queued.durability {
         WriteDurability::Derived => database
@@ -416,6 +485,14 @@ fn run_one(database: &mut Database, queued: QueuedJob) {
         started.elapsed().as_millis(),
         result.is_ok()
     );
+    if queued.durability == WriteDurability::Authoritative
+        && queued.notify_authoritative_commit
+        && result.is_ok()
+    {
+        if let Some(hook) = authoritative_commit_hook {
+            hook();
+        }
+    }
     // Ignore send failure: the caller may have been aborted/dropped.
     let _ = queued.reply.send(result);
 }
@@ -425,6 +502,7 @@ mod tests {
     use super::*;
     use crate::db::notification_outbox::{NotificationOperation, PublishMode};
     use crate::db::Database;
+    use std::sync::atomic::AtomicUsize;
 
     #[tokio::test]
     async fn authoritative_turn_runs_full_and_restores_normal() {
@@ -441,6 +519,40 @@ mod tests {
             .await
             .expect("derived turn");
         assert_eq!(restored, 1);
+        writer.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn scheduler_authoritative_turn_does_not_retrigger_local_commit_wake() {
+        let database = Database::open_in_memory().expect("open in-memory db");
+        database.apply_migrations().expect("apply migrations");
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observed_wakes = Arc::clone(&wakes);
+        let writer = DbWriter::spawn_with_authoritative_commit_hook(
+            database,
+            Some(Arc::new(move || {
+                observed_wakes.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        writer
+            .write_authoritative_without_wake(|database| database.write_durability_for_test())
+            .await
+            .expect("scheduler authoritative turn");
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+        writer
+            .without_authoritative_commit_wake()
+            .write_authoritative(|database| database.write_durability_for_test())
+            .await
+            .expect("scheduler-owned helper turn");
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+        writer
+            .write_authoritative(|database| database.write_durability_for_test())
+            .await
+            .expect("local authoritative turn");
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
         writer.shutdown().await.expect("shutdown");
     }
 

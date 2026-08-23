@@ -154,6 +154,185 @@ paths:
       responses:
         "204":
           description: Local capture and transport binding removed; remote data remains.
+  /sync/status:
+    get:
+      operationId: getSyncStatus
+      responses:
+        "200":
+          description: Revisioned Host-wide synchronization snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncStatusSnapshot"
+  /sync/wake:
+    post:
+      operationId: wakeSyncScheduler
+      parameters:
+        - in: query
+          name: reason
+          required: false
+          schema: { type: string, enum: [foreground, network, manual] }
+      responses:
+        "204":
+          description: Eligible bindings were made immediately runnable.
+  /sync/remote-libraries:
+    get:
+      operationId: listRemoteLibraries
+      responses:
+        "200":
+          description: Provider-neutral remote Library inventory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RemoteLibraryListResponse"
+  /sync/restores:
+    post:
+      operationId: startSyncRestore
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SyncRestoreStartRequest"
+      responses:
+        "200":
+          description: Restore plans accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncRestoreListResponse"
+  /sync/restores/preflight:
+    post:
+      operationId: preflightSyncRestore
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SyncRestorePreflightRequest"
+      responses:
+        "200":
+          description: Aggregate multi-Library restore preflight.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncRestorePreflight"
+  /sync/restores/{restoreUuid}:
+    get:
+      operationId: getSyncRestore
+      parameters:
+        - $ref: "#/components/parameters/restoreUuid"
+      responses:
+        "200":
+          description: Restore progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncRestorePlan"
+  /sync/restores/{restoreUuid}/pause:
+    post:
+      operationId: pauseSyncRestore
+      parameters: [{ $ref: "#/components/parameters/restoreUuid" }]
+      responses: { "200": { description: Restore paused., content: { application/json: { schema: { $ref: "#/components/schemas/SyncRestorePlan" } } } } }
+  /sync/restores/{restoreUuid}/resume:
+    post:
+      operationId: resumeSyncRestore
+      parameters: [{ $ref: "#/components/parameters/restoreUuid" }]
+      responses: { "200": { description: Restore resumed., content: { application/json: { schema: { $ref: "#/components/schemas/SyncRestorePlan" } } } } }
+  /sync/restores/{restoreUuid}/cancel:
+    post:
+      operationId: cancelSyncRestore
+      parameters: [{ $ref: "#/components/parameters/restoreUuid" }]
+      responses: { "200": { description: Pre-catalog restore cancelled., content: { application/json: { schema: { $ref: "#/components/schemas/SyncRestorePlan" } } } } }
+  /libraries/{libraryUuid}/sync/preflight:
+    post:
+      operationId: preflightLibrarySync
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncPreflightRequest" } } } }
+      responses: { "200": { description: Sync preflight result., content: { application/json: { schema: { $ref: "#/components/schemas/SyncPreflightResponse" } } } } }
+  /libraries/{libraryUuid}/sync/enable:
+    post:
+      operationId: startLibrarySyncEnable
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/contextRevision" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncEnableRequest" } } } }
+      responses: { "200": { description: Enable operation., content: { application/json: { schema: { $ref: "#/components/schemas/SyncOperation" } } } } }
+  /libraries/{libraryUuid}/sync/pause:
+    post:
+      operationId: pauseLibrarySync
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/contextRevision" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncCommandRequest" } } } }
+      responses: { "200": { description: Pause operation., content: { application/json: { schema: { $ref: "#/components/schemas/SyncOperation" } } } } }
+  /libraries/{libraryUuid}/sync/resume:
+    post:
+      operationId: resumeLibrarySync
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/contextRevision" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncCommandRequest" } } } }
+      responses: { "200": { description: Resume operation., content: { application/json: { schema: { $ref: "#/components/schemas/SyncOperation" } } } } }
+  /libraries/{libraryUuid}/sync/sync-now:
+    post:
+      operationId: syncLibraryNow
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/contextRevision" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncCommandRequest" } } } }
+      responses: { "200": { description: Manual wake operation., content: { application/json: { schema: { $ref: "#/components/schemas/SyncOperation" } } } } }
+  /libraries/{libraryUuid}/sync/retry:
+    post:
+      operationId: retryLibrarySync
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/contextRevision" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncCommandRequest" } } } }
+      responses: { "200": { description: Retry operation., content: { application/json: { schema: { $ref: "#/components/schemas/SyncOperation" } } } } }
+  /libraries/{libraryUuid}/sync/unbind-plan:
+    post:
+      operationId: planLibrarySyncUnbind
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }]
+      responses: { "200": { description: Frozen unbind plan., content: { application/json: { schema: { $ref: "#/components/schemas/SyncUnbindPlan" } } } } }
+  /libraries/{libraryUuid}/sync/unbind-commit:
+    post:
+      operationId: commitLibrarySyncUnbind
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/contextRevision" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncUnbindCommitRequest" } } } }
+      responses: { "200": { description: Unbind operation., content: { application/json: { schema: { $ref: "#/components/schemas/SyncOperation" } } } } }
+  /libraries/{libraryUuid}/sync/reconnect-preflight:
+    post:
+      operationId: preflightLibrarySyncReconnect
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncReconnectPreflightRequest" } } } }
+      responses: { "200": { description: Reconnect plan., content: { application/json: { schema: { $ref: "#/components/schemas/SyncReconnectPlan" } } } } }
+  /libraries/{libraryUuid}/sync/reconnect-commit:
+    post:
+      operationId: commitLibrarySyncReconnect
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/contextRevision" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncReconnectCommitRequest" } } } }
+      responses: { "200": { description: Reconnect operation., content: { application/json: { schema: { $ref: "#/components/schemas/SyncOperation" } } } } }
+  /libraries/{libraryUuid}/sync/conflicts:
+    get:
+      operationId: listLibrarySyncConflicts
+      parameters:
+        - $ref: "#/components/parameters/libraryUuid"
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses: { "200": { description: Library conflicts., content: { application/json: { schema: { $ref: "#/components/schemas/SyncConflictListResponse" } } } } }
+  /libraries/{libraryUuid}/sync/conflicts/{conflictUuid}/resolve:
+    post:
+      operationId: resolveLibrarySyncConflict
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/conflictUuid" }, { $ref: "#/components/parameters/contextRevision" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SyncConflictResolutionRequest" } } } }
+      responses: { "200": { description: Conflict resolution operation., content: { application/json: { schema: { $ref: "#/components/schemas/SyncOperation" } } } } }
+  /libraries/{libraryUuid}/sync/diagnostics:
+    get:
+      operationId: getLibrarySyncDiagnostics
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }]
+      responses: { "200": { description: Redacted diagnostics., content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
+  /libraries/{libraryUuid}/sync/diagnostics/export:
+    post:
+      operationId: exportLibrarySyncDiagnostics
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }]
+      responses: { "200": { description: Redacted diagnostics export., content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
   /libraries/{libraryUuid}:
     patch:
       operationId: updateLibrary
@@ -1499,6 +1678,20 @@ components:
         format: uuid
         minLength: 1
         maxLength: 128
+    restoreUuid:
+      name: restoreUuid
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    conflictUuid:
+      name: conflictUuid
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
     contextRevision:
       name: X-Megle-Context-Revision
       in: header
@@ -1700,6 +1893,258 @@ components:
         accountIdentity:
           type: string
           minLength: 1
+    LibrarySyncLifecycleState:
+      type: string
+      enum: [local-only, enabling, syncing, paused, unbinding, restoring, error]
+    LibrarySyncPhase:
+      type: string
+      enum: [preflight, capturing, uploading, publishing, active, reconcile, catalog-restore, catalog-ready, restoring-media, complete, retry-wait, compatibility-locked, cancelled]
+    CatalogReadiness:
+      type: string
+      enum: [not-created, restoring, catalog-ready, ready]
+    SyncAllowedAction:
+      type: string
+      enum: [enable, pause, resume, retry, sync-now, cancel-before-catalog, unbind, resolve-conflicts, reconnect]
+    SyncProviderStatus:
+      type: object
+      required: [pluginId, accountUuid, runtimeState, authState]
+      properties:
+        pluginId: { type: string }
+        accountUuid: { type: string }
+        accountDisplayName: { anyOf: [{ type: string }, { type: "null" }] }
+        runtimeState: { type: string }
+        authState: { type: string }
+        lastHealthyAt: { anyOf: [{ type: integer }, { type: "null" }] }
+        lastErrorCode: { anyOf: [{ type: string }, { type: "null" }] }
+    LibrarySyncStatus:
+      type: object
+      required: [libraryUuid, name, lifecycle, phase, catalogReadiness, remoteLibraryUuid, allowedActions, pendingUploadItems, pendingDownloadItems, pendingUploadBytes, pendingDownloadBytes, conflictCount, localDivergenceCount, operationRevision]
+      properties:
+        libraryUuid: { type: string, format: uuid }
+        name: { type: string }
+        lifecycle: { $ref: "#/components/schemas/LibrarySyncLifecycleState" }
+        phase: { $ref: "#/components/schemas/LibrarySyncPhase" }
+        catalogReadiness: { $ref: "#/components/schemas/CatalogReadiness" }
+        providerId: { anyOf: [{ type: string }, { type: "null" }] }
+        accountUuid: { anyOf: [{ type: string }, { type: "null" }] }
+        remoteLibraryUuid: { anyOf: [{ type: string }, { type: "null" }] }
+        allowedActions: { type: array, items: { $ref: "#/components/schemas/SyncAllowedAction" } }
+        lastSuccessAt: { anyOf: [{ type: integer }, { type: "null" }] }
+        lastErrorCode: { anyOf: [{ type: string }, { type: "null" }] }
+        retryAfter: { anyOf: [{ type: integer }, { type: "null" }] }
+        pollAfter: { anyOf: [{ type: integer }, { type: "null" }] }
+        pendingUploadItems: { type: integer, minimum: 0 }
+        pendingDownloadItems: { type: integer, minimum: 0 }
+        pendingUploadBytes: { type: integer, minimum: 0 }
+        pendingDownloadBytes: { type: integer, minimum: 0 }
+        conflictCount: { type: integer, minimum: 0 }
+        localDivergenceCount: { type: integer, minimum: 0 }
+        operationRevision: { type: integer, minimum: 0 }
+        restoreUuid: { anyOf: [{ type: string, format: uuid }, { type: "null" }] }
+        restoreItemsDone: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        restoreItemsTotal: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        restoreBytesDone: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        restoreBytesTotal: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+    SyncStatusSnapshot:
+      type: object
+      required: [revision, generatedAt, schedulerState, providers, libraries]
+      properties:
+        revision: { type: integer, minimum: 0 }
+        generatedAt: { type: integer }
+        schedulerState: { type: string, enum: [starting, running, stopped, degraded] }
+        providers: { type: array, items: { $ref: "#/components/schemas/SyncProviderStatus" } }
+        libraries: { type: array, items: { $ref: "#/components/schemas/LibrarySyncStatus" } }
+    SyncOperation:
+      type: object
+      required: [operationUuid, kind, state, phase, updatedAt]
+      properties:
+        operationUuid: { type: string, format: uuid }
+        libraryUuid: { anyOf: [{ type: string }, { type: "null" }] }
+        kind: { type: string }
+        state: { type: string, enum: [pending, running, waiting, complete, failed, cancelled] }
+        phase: { type: string }
+        errorCode: { anyOf: [{ type: string }, { type: "null" }] }
+        updatedAt: { type: integer }
+    SyncCommandRequest:
+      type: object
+      required: [operationUuid]
+      additionalProperties: false
+      properties: { operationUuid: { type: string, format: uuid } }
+    SyncPreflightRequest:
+      type: object
+      required: [providerId, accountUuid, remoteLibraryUuid]
+      additionalProperties: false
+      properties:
+        providerId: { type: string }
+        accountUuid: { type: string }
+        remoteLibraryUuid: { anyOf: [{ type: string }, { type: "null" }] }
+    SyncPreflightResponse:
+      type: object
+      required: [ok, reason, preflightToken, remoteLibraryUuid]
+      properties:
+        ok: { type: boolean }
+        reason: { type: string }
+        preflightToken: { anyOf: [{ type: string }, { type: "null" }] }
+        remoteLibraryUuid: { anyOf: [{ type: string }, { type: "null" }] }
+    SyncEnableRequest:
+      type: object
+      required: [operationUuid, providerId, accountUuid, preflightToken]
+      additionalProperties: false
+      properties:
+        operationUuid: { type: string, format: uuid }
+        providerId: { type: string }
+        accountUuid: { type: string }
+        preflightToken: { type: string }
+    SyncUnbindPlan:
+      type: object
+      required: [planUuid, libraryUuid, pendingCount, publishedCount, unpublishedCount, cutoverActorSeq, remoteWatermark]
+      properties:
+        planUuid: { type: string, format: uuid }
+        libraryUuid: { type: string, format: uuid }
+        pendingCount: { type: integer, minimum: 0 }
+        publishedCount: { type: integer, minimum: 0 }
+        unpublishedCount: { type: integer, minimum: 0 }
+        cutoverActorSeq: { type: integer, minimum: 0 }
+        remoteWatermark: { type: integer, minimum: 0 }
+        originIdentity: { anyOf: [{ type: string }, { type: "null" }] }
+    SyncUnbindCommitRequest:
+      type: object
+      required: [operationUuid, planUuid, choice]
+      properties:
+        operationUuid: { type: string, format: uuid }
+        planUuid: { type: string, format: uuid }
+        choice: { type: string, enum: [drain-before-unbind, keep-local-fork] }
+    SyncReconnectPreflightRequest:
+      type: object
+      required: [accountUuid, remoteLibraryUuid]
+      properties:
+        accountUuid: { type: string }
+        remoteLibraryUuid: { type: string, format: uuid }
+    SyncReconnectPlan:
+      type: object
+      required: [planUuid, libraryUuid, remoteLibraryUuid, localDivergenceCount, remoteDivergenceCount, remoteExists, remoteCompatible, sameRemoteIdentity, originRemoteWatermark, baseRemoteObjectCount, remoteObjectCount, remoteAdvanced, mergeAllowed, publishNewAllowed]
+      properties:
+        planUuid: { type: string, format: uuid }
+        libraryUuid: { type: string, format: uuid }
+        remoteLibraryUuid: { type: string, format: uuid }
+        originIdentity: { anyOf: [{ type: string }, { type: "null" }] }
+        localDivergenceCount: { type: integer, minimum: 0 }
+        remoteDivergenceCount: { type: integer, minimum: 0 }
+        remoteExists: { type: boolean }
+        remoteCompatible: { type: boolean }
+        sameRemoteIdentity: { type: boolean }
+        originRemoteWatermark: { type: integer, minimum: 0 }
+        baseRemoteObjectCount: { type: integer, minimum: 0 }
+        remoteObjectCount: { type: integer, minimum: 0 }
+        remoteDescriptorSha256: { anyOf: [{ type: string }, { type: "null" }] }
+        remoteBindingEpoch: { anyOf: [{ type: string }, { type: "null" }] }
+        remoteAdvanced: { type: boolean }
+        mergeAllowed: { type: boolean }
+        publishNewAllowed: { type: boolean }
+    SyncReconnectCommitRequest:
+      type: object
+      required: [operationUuid, planUuid, choice]
+      properties:
+        operationUuid: { type: string, format: uuid }
+        planUuid: { type: string, format: uuid }
+        choice: { type: string, enum: [merge-local-fork, publish-new-remote] }
+    RemoteLibrarySummary:
+      type: object
+      required: [accountUuid, libraryUuid, name, icon, mediaCount, logicalBytes, lastSyncedAt, descriptorSize, updatedAt, compatible, boundLocally, errorCode]
+      properties:
+        accountUuid: { type: string }
+        libraryUuid: { type: string, format: uuid }
+        name: { type: string }
+        icon: { anyOf: [{ type: string }, { type: "null" }] }
+        mediaCount: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        logicalBytes: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        lastSyncedAt: { anyOf: [{ type: integer }, { type: "null" }] }
+        descriptorSize: { type: integer, minimum: 0 }
+        updatedAt: { type: integer }
+        compatible: { type: boolean }
+        boundLocally: { type: boolean }
+        errorCode: { anyOf: [{ type: string }, { type: "null" }] }
+    RemoteLibraryListResponse:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/RemoteLibrarySummary" } }
+        nextCursor: { anyOf: [{ type: string }, { type: "null" }] }
+        totalCount: { type: integer, minimum: 0 }
+    SyncRestoreStartItem:
+      type: object
+      required: [accountUuid, libraryUuid, name, managedRoot]
+      properties:
+        accountUuid: { type: string }
+        libraryUuid: { type: string, format: uuid }
+        name: { type: string }
+        managedRoot: { type: string }
+    SyncRestoreStartRequest:
+      type: object
+      required: [operationUuid, preflightToken, items]
+      properties:
+        operationUuid: { type: string, format: uuid }
+        preflightToken: { type: string, format: uuid }
+        items: { type: array, minItems: 1, items: { $ref: "#/components/schemas/SyncRestoreStartItem" } }
+    SyncRestorePreflightRequest:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, minItems: 1, items: { $ref: "#/components/schemas/SyncRestoreStartItem" } }
+    SyncRestorePreflight:
+      type: object
+      required: [preflightToken, expiresAt, totalItems, totalBytes]
+      properties:
+        preflightToken: { type: string, format: uuid }
+        expiresAt: { type: integer }
+        totalItems: { type: integer, minimum: 1 }
+        totalBytes: { type: integer, minimum: 0 }
+    SyncRestorePlan:
+      type: object
+      required: [restoreUuid, operationUuid, accountUuid, libraryUuid, name, managedRoot, state, phase, catalogReady, mediaItemsDone, mediaBytesDone, updatedAt]
+      properties:
+        restoreUuid: { type: string, format: uuid }
+        operationUuid: { type: string, format: uuid }
+        accountUuid: { type: string }
+        libraryUuid: { type: string, format: uuid }
+        name: { type: string }
+        managedRoot: { type: string }
+        state: { type: string }
+        phase: { type: string }
+        catalogReady: { type: boolean }
+        mediaItemsDone: { type: integer, minimum: 0 }
+        mediaItemsTotal: { anyOf: [{ type: integer }, { type: "null" }] }
+        mediaBytesDone: { type: integer, minimum: 0 }
+        mediaBytesTotal: { anyOf: [{ type: integer }, { type: "null" }] }
+        errorCode: { anyOf: [{ type: string }, { type: "null" }] }
+        updatedAt: { type: integer }
+    SyncRestoreListResponse:
+      type: object
+      required: [items]
+      properties: { items: { type: array, items: { $ref: "#/components/schemas/SyncRestorePlan" } } }
+    SyncConflictResolutionRequest:
+      type: object
+      required: [operationUuid, resolution]
+      properties:
+        operationUuid: { type: string, format: uuid }
+        resolution: { type: string, enum: [resolve, ignore] }
+    SyncConflictRecord:
+      type: object
+      required: [conflictUuid, conflictKind, state, createdAt]
+      properties:
+        conflictUuid: { type: string, format: uuid }
+        entityUuid: { anyOf: [{ type: string, format: uuid }, { type: "null" }] }
+        conflictKind: { type: string }
+        state: { type: string }
+        details: { anyOf: [{ type: object, additionalProperties: true }, { type: "null" }] }
+        createdAt: { type: integer }
+        resolvedAt: { anyOf: [{ type: integer }, { type: "null" }] }
+    SyncConflictListResponse:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/SyncConflictRecord" } }
+        nextCursor: { anyOf: [{ type: string }, { type: "null" }] }
     CreateLibraryResponse:
       type: object
       required: [library, activated]
@@ -1948,7 +2393,7 @@ components:
           type: string
         category:
           type: string
-          enum: [task, file_operation, error, thumbnail_cache]
+          enum: [task, file_operation, error, thumbnail_cache, sync]
         origin:
           $ref: "#/components/schemas/NotificationOrigin"
         presentation:

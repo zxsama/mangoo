@@ -6,7 +6,10 @@ use super::runtime::{DormantSyncRuntime, RuntimeLeases};
 use crate::host_registry::HostRegistry;
 
 pub const PRODUCTION_SYNC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-pub const PRODUCTION_SYNC_CONCURRENCY: usize = 4;
+pub const PRODUCTION_SYNC_METADATA_CONCURRENCY: usize = 3;
+pub const PRODUCTION_SYNC_APPLY_CONCURRENCY: usize = 1;
+pub const PRODUCTION_SYNC_MEDIA_CONCURRENCY: usize = 2;
+pub const PRODUCTION_SYNC_CONCURRENCY: usize = PRODUCTION_SYNC_METADATA_CONCURRENCY;
 
 /// Joinable ownership for the production dormant-Library polling loop.
 /// Cancellation aborts any turn waiting for a lease; completed turns always
@@ -51,6 +54,10 @@ pub struct SyncCoordinator {
     registry: std::sync::Arc<HostRegistry>,
     leases: RuntimeLeases,
     providers: super::provider::ProviderManager,
+    wake: std::sync::Arc<tokio::sync::Notify>,
+    metadata_budget: std::sync::Arc<tokio::sync::Semaphore>,
+    apply_budget: std::sync::Arc<tokio::sync::Semaphore>,
+    media_budget: std::sync::Arc<tokio::sync::Semaphore>,
     media_workers: std::sync::Arc<
         tokio::sync::Mutex<
             std::collections::HashMap<uuid::Uuid, super::media::worker::MediaWorkerSet>,
@@ -83,6 +90,16 @@ impl SyncCoordinator {
             registry,
             leases,
             providers: super::provider::ProviderManager::default(),
+            wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            metadata_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                PRODUCTION_SYNC_METADATA_CONCURRENCY,
+            )),
+            apply_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                PRODUCTION_SYNC_APPLY_CONCURRENCY,
+            )),
+            media_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                PRODUCTION_SYNC_MEDIA_CONCURRENCY,
+            )),
             media_workers: Default::default(),
         }
     }
@@ -96,12 +113,85 @@ impl SyncCoordinator {
             registry,
             leases,
             providers,
+            wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            metadata_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                PRODUCTION_SYNC_METADATA_CONCURRENCY,
+            )),
+            apply_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                PRODUCTION_SYNC_APPLY_CONCURRENCY,
+            )),
+            media_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                PRODUCTION_SYNC_MEDIA_CONCURRENCY,
+            )),
             media_workers: Default::default(),
         }
     }
 
     pub fn provider_manager(&self) -> super::provider::ProviderManager {
         self.providers.clone()
+    }
+
+    /// Wake the single Host scheduler after a local commit, a manual command,
+    /// or an external connectivity transition. Notifications coalesce, so a
+    /// burst never creates one task per Library.
+    pub fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Reconciles forward-only unbind journals against the remote namespace.
+    /// A missing/failed HEAD is deliberately not treated as success: after the
+    /// local cutover the journal remains retryable until the immutable remote
+    /// descriptor is observably durable again, including after restart.
+    pub async fn reconcile_pending_unbinds(&self) -> anyhow::Result<usize> {
+        let mut completed = 0usize;
+        for plan in self.registry.pending_unbind_reconciliations()? {
+            let Some(provider) = self
+                .providers
+                .resolve(&plan.plugin_id, &plan.account_uuid)?
+            else {
+                self.registry.record_unbind_reconcile_failure(
+                    &plan.plan_uuid,
+                    "provider-not-ready",
+                    15_000,
+                )?;
+                continue;
+            };
+            let context = super::provider::TransportContext {
+                namespace: plan.remote_namespace.clone(),
+                binding_epoch: plan.binding_epoch.to_string(),
+                transport_generation: plan.transport_generation,
+            };
+            let visibility = async {
+                let descriptor = provider
+                    .object_head(&context, "library-descriptor")
+                    .await
+                    .map_err(anyhow::Error::new)?
+                    .ok_or_else(|| anyhow::anyhow!("remote-descriptor-not-visible"))?;
+                let expected = plan
+                    .descriptor_sha256
+                    .ok_or_else(|| anyhow::anyhow!("remote-descriptor-receipt-missing"))?;
+                if descriptor.sha256 != expected {
+                    anyhow::bail!("remote-descriptor-mismatch");
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            match visibility {
+                Ok(()) => {
+                    self.registry
+                        .complete_unbind_plan(&plan.plan_uuid, &plan.choice)?;
+                    completed += 1;
+                }
+                Err(error) => {
+                    self.registry.record_unbind_reconcile_failure(
+                        &plan.plan_uuid,
+                        &normalize_sync_error_code(&error),
+                        15_000,
+                    )?;
+                }
+            }
+        }
+        Ok(completed)
     }
 
     pub async fn cancel_media_binding(&self, binding_epoch: uuid::Uuid) -> anyhow::Result<()> {
@@ -127,6 +217,15 @@ impl SyncCoordinator {
             })
             .clone();
         workers.shutdown().await
+    }
+
+    pub async fn resume_media_binding(&self, binding_epoch: uuid::Uuid) {
+        // Pause leaves a cancelled worker set behind as an epoch tombstone so
+        // an already-started turn cannot recreate work after the fence. Once
+        // the explicit resume transition is serialized by LibraryManager, the
+        // tombstone can be removed and the next scheduled turn creates a fresh
+        // worker set for the incremented transport generation.
+        self.media_workers.lock().await.remove(&binding_epoch);
     }
 
     pub async fn cancel_all_media_workers(&self) {
@@ -167,10 +266,6 @@ impl SyncCoordinator {
             .collect()
     }
 
-    /// Start the provider-neutral production scheduler for synced Libraries.
-    /// Each poll rotates inactive Libraries for fairness while the active
-    /// Catalog uses its existing writer. A global semaphore bounds dormant
-    /// writers and per-Library leases provide the single-writer fence.
     pub fn spawn_scheduler<F>(
         &self,
         interval: std::time::Duration,
@@ -187,39 +282,84 @@ impl SyncCoordinator {
         let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let task_in_flight = std::sync::Arc::clone(&in_flight);
         let task = tokio::spawn(async move {
-            let concurrency = concurrency.max(1);
+            let metadata_concurrency = concurrency.max(1);
             let mut rotation = 0usize;
             let mut initial_turn = true;
+            let _ = coordinator.registry.set_sync_scheduler_state("running");
             loop {
                 if initial_turn {
                     initial_turn = false;
                 } else {
                     tokio::select! {
                         _ = child_cancellation.cancelled() => break,
+                        _ = coordinator.wake.notified() => {},
                         _ = tokio::time::sleep(interval) => {}
                     }
                 }
+
                 let mut libraries = match coordinator.registry.sync_bound_libraries() {
                     Ok(value) => value,
                     Err(error) => {
+                        let _ = coordinator.registry.set_sync_scheduler_state("degraded");
                         tracing::warn!(%error, "sync coordinator registry poll failed");
                         continue;
                     }
                 };
-                let active = active_runtime();
-                libraries.retain(|library| {
-                    active.as_ref().map(|value| value.0.as_str()) != Some(&library.library_uuid)
+                if let Err(error) = coordinator.reconcile_pending_unbinds().await {
+                    tracing::warn!(%error, "unbind remote reconciliation turn failed");
+                }
+                let active = active_runtime().and_then(|runtime| {
+                    libraries
+                        .iter()
+                        .position(|library| library.library_uuid == runtime.0)
+                        .map(|index| {
+                            libraries.remove(index);
+                            runtime
+                        })
                 });
-                let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
-                let mut turns = tokio::task::JoinSet::new();
+                libraries.sort_by(|left, right| left.library_uuid.cmp(&right.library_uuid));
+                if !libraries.is_empty() {
+                    let offset = rotation % libraries.len();
+                    libraries.rotate_left(offset);
+                    rotation = (rotation + 1) % libraries.len();
+                }
+
+                // Reserve the first metadata/apply opportunity for the active
+                // Library. Dormant work cannot consume its slot even when a
+                // provider discovery request is already queued.
+                if let Some((library_uuid, path, writer)) = active.as_ref() {
+                    task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let _guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
+                    match coordinator
+                        .run_active_metadata_turn(library_uuid, path, writer)
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = coordinator
+                                .registry
+                                .record_sync_turn_success(library_uuid, true);
+                        }
+                        Err(error) => {
+                            let code = normalize_sync_error_code(&error);
+                            let _ = coordinator
+                                .registry
+                                .record_sync_turn_error(library_uuid, &code);
+                            tracing::warn!(%error,%library_uuid,"active sync metadata turn failed");
+                        }
+                    }
+                }
+
+                let metadata_gate =
+                    std::sync::Arc::new(tokio::sync::Semaphore::new(metadata_concurrency));
+                let mut metadata_turns = tokio::task::JoinSet::new();
                 {
                     let coordinator = coordinator.clone();
-                    let gate = std::sync::Arc::clone(&gate);
+                    let gate = std::sync::Arc::clone(&metadata_gate);
                     let cancellation = child_cancellation.clone();
                     task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    let turn_guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
-                    turns.spawn(async move {
-                        let _turn_guard = turn_guard;
+                    let guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
+                    metadata_turns.spawn(async move {
+                        let _guard = guard;
                         let permit = tokio::select! {
                             _ = cancellation.cancelled() => return,
                             permit = gate.acquire_owned() => permit.ok(),
@@ -230,70 +370,86 @@ impl SyncCoordinator {
                         }
                     });
                 }
-                if let Some((library_uuid, path, writer)) = active {
+                for library in libraries.iter().cloned() {
                     let coordinator = coordinator.clone();
-                    let gate = std::sync::Arc::clone(&gate);
+                    let gate = std::sync::Arc::clone(&metadata_gate);
                     let cancellation = child_cancellation.clone();
                     task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    let turn_guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
-                    turns.spawn(async move {
-                        let _turn_guard = turn_guard;
-                        let permit = tokio::select! {
-                            _ = cancellation.cancelled() => return,
-                            permit = gate.acquire_owned() => permit.ok(),
-                        };
-                        let Some(_permit) = permit else { return };
-                        if let Err(error) = coordinator.run_active_turn(&path, &writer).await {
-                            tracing::warn!(%error,%library_uuid,"active sync turn failed");
-                        }
-                    });
-                }
-                libraries.sort_by(|left, right| left.library_uuid.cmp(&right.library_uuid));
-                if !libraries.is_empty() {
-                    let offset = rotation % libraries.len();
-                    libraries.rotate_left(offset);
-                    rotation = (rotation + 1) % libraries.len();
-                }
-                for library in libraries {
-                    let coordinator = coordinator.clone();
-                    let gate = std::sync::Arc::clone(&gate);
-                    let cancellation = child_cancellation.clone();
-                    task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    let turn_guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
-                    turns.spawn(async move {
-                        let _turn_guard = turn_guard;
+                    let guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
+                    metadata_turns.spawn(async move {
+                        let _guard = guard;
                         let permit = tokio::select! {
                             _ = cancellation.cancelled() => return,
                             permit = gate.acquire_owned() => permit.ok(),
                         };
                         let Some(_permit) = permit else { return };
                         let path = library.local_data_dir.join("catalog.sqlite");
-                        if let Err(error) = coordinator
-                            .run_library_turn(&library.library_uuid, &path)
+                        match coordinator
+                            .run_library_metadata_turn(&library.library_uuid, &path)
                             .await
                         {
-                            tracing::warn!(%error,library_uuid=%library.library_uuid,"dormant sync turn failed");
+                            Ok(_) => {
+                                let _ = coordinator
+                                    .registry
+                                    .record_sync_turn_success(&library.library_uuid, false);
+                            }
+                            Err(error) => {
+                                let code = normalize_sync_error_code(&error);
+                                let _ = coordinator
+                                    .registry
+                                    .record_sync_turn_error(&library.library_uuid, &code);
+                                tracing::warn!(%error,library_uuid=%library.library_uuid,"dormant sync metadata turn failed");
+                            }
                         }
                     });
                 }
-                loop {
-                    tokio::select! {
-                        _ = child_cancellation.cancelled() => {
-                            // Do not abort a turn after it opened a writer.
-                            // Waiters observe cancellation at the semaphore;
-                            // already-running turns drain and release their
-                            // per-Library lease before shutdown joins us.
-                            while turns.join_next().await.is_some() {}
-                            return;
-                        }
-                        result = turns.join_next() => match result {
-                            Some(Err(error)) => tracing::warn!(%error, "dormant sync task failed"),
-                            Some(Ok(())) => {},
-                            None => break,
-                        }
+                while let Some(result) = metadata_turns.join_next().await {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "sync metadata task failed");
                     }
                 }
+
+                // Media has an independent budget and uses the same active-first
+                // admission plus rotated dormant order. Metadata/apply can
+                // therefore make progress under a saturated transfer queue.
+                if let Some((library_uuid, path, writer)) = active.as_ref() {
+                    task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let _guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
+                    if let Err(error) = coordinator
+                        .run_active_media_turn(library_uuid, path, writer)
+                        .await
+                    {
+                        tracing::warn!(%error,%library_uuid,"active sync media turn failed");
+                    }
+                }
+                let mut media_turns = tokio::task::JoinSet::new();
+                for library in libraries {
+                    let coordinator = coordinator.clone();
+                    let cancellation = child_cancellation.clone();
+                    task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
+                    media_turns.spawn(async move {
+                        let _guard = guard;
+                        if cancellation.is_cancelled() {
+                            return;
+                        }
+                        let path = library.local_data_dir.join("catalog.sqlite");
+                        if let Err(error) = coordinator
+                            .run_dormant_media_turn(&library.library_uuid, &path)
+                            .await
+                        {
+                            tracing::warn!(%error,library_uuid=%library.library_uuid,"dormant sync media turn failed");
+                        }
+                    });
+                }
+                while let Some(result) = media_turns.join_next().await {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "sync media task failed");
+                    }
+                }
+                let _ = coordinator.registry.set_sync_scheduler_state("running");
             }
+            let _ = coordinator.registry.set_sync_scheduler_state("stopped");
         });
         SyncSchedulerHandle {
             cancellation,
@@ -303,6 +459,11 @@ impl SyncCoordinator {
     }
 
     async fn run_root_discovery_turns(&self) -> anyhow::Result<()> {
+        let _metadata_permit = self
+            .metadata_budget
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("sync metadata budget closed"))?;
         for transport in self.registry.provider_root_transports()? {
             let Some(provider) = self
                 .providers
@@ -349,6 +510,84 @@ impl SyncCoordinator {
                     }
                     Err(error) => return Err(anyhow::Error::new(error)),
                 };
+                let mut discovered = Vec::with_capacity(page.objects.len());
+                for metadata in &page.objects {
+                    let Some(library_uuid) = metadata.key.strip_suffix("/library-descriptor")
+                    else {
+                        anyhow::bail!("invalid provider root descriptor key");
+                    };
+                    let context = super::provider::TransportContext {
+                        namespace: library_uuid.to_owned(),
+                        binding_epoch: uuid::Uuid::nil().to_string(),
+                        transport_generation: 1,
+                    };
+                    let parsed = async {
+                        let object = provider
+                            .object_get(&context, "library-descriptor", 1024 * 1024)
+                            .await
+                            .map_err(anyhow::Error::new)?;
+                        super::provider::validate_download(&object, 1024 * 1024)
+                            .map_err(anyhow::Error::new)?;
+                        if object.metadata.size != metadata.size
+                            || object.metadata.sha256 != metadata.sha256
+                        {
+                            anyhow::bail!("remote descriptor metadata mismatch");
+                        }
+                        let bytes = std::fs::read(&object.path)?;
+                        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+                            || value.get("libraryUuid").and_then(serde_json::Value::as_str)
+                                != Some(library_uuid)
+                        {
+                            anyhow::bail!("remote descriptor is incompatible");
+                        }
+                        Ok::<_, anyhow::Error>((
+                            value
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
+                            value
+                                .get("icon")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
+                            value.get("mediaCount").and_then(serde_json::Value::as_u64),
+                            value
+                                .get("logicalBytes")
+                                .and_then(serde_json::Value::as_u64),
+                            value
+                                .get("lastSyncedAt")
+                                .and_then(serde_json::Value::as_i64),
+                        ))
+                    }
+                    .await;
+                    discovered.push(match parsed {
+                        Ok((name, icon, media_count, logical_bytes, last_synced_at)) => {
+                            crate::host_registry::DiscoveredRemoteLibrary {
+                                metadata: metadata.clone(),
+                                name,
+                                icon,
+                                media_count,
+                                logical_bytes,
+                                last_synced_at,
+                                compatible: true,
+                                error_code: None,
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, %library_uuid, "remote Library descriptor is unavailable or incompatible");
+                            crate::host_registry::DiscoveredRemoteLibrary {
+                                metadata: metadata.clone(),
+                                name: None,
+                                icon: None,
+                                media_count: None,
+                                logical_bytes: None,
+                                last_synced_at: None,
+                                compatible: false,
+                                error_code: Some("descriptor-invalid".to_owned()),
+                            }
+                        }
+                    });
+                }
                 page_token = page.page_token.clone();
                 completed_cursor = page.completed_cursor.clone().or(completed_cursor);
                 if let Some(next_page) = page_token.as_deref() {
@@ -361,7 +600,7 @@ impl SyncCoordinator {
                         &transport.runtime_session_id,
                         cursor.as_deref(),
                         next_page,
-                        &page.objects,
+                        &discovered,
                     )?;
                 } else {
                     self.registry.commit_provider_root_cursor(
@@ -369,7 +608,7 @@ impl SyncCoordinator {
                         transport.account_generation,
                         &transport.runtime_session_id,
                         completed_cursor.as_deref(),
-                        &page.objects,
+                        &discovered,
                     )?;
                     break;
                 }
@@ -391,6 +630,23 @@ impl SyncCoordinator {
         library_uuid: &str,
         catalog_path: &Path,
     ) -> anyhow::Result<SyncTurnResult> {
+        let result = self
+            .run_library_metadata_turn(library_uuid, catalog_path)
+            .await?;
+        self.run_dormant_media_turn(library_uuid, catalog_path)
+            .await?;
+        self.record_restore_progress(library_uuid, catalog_path)
+            .await?;
+        Ok(result)
+    }
+
+    async fn run_library_metadata_turn(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+    ) -> anyhow::Result<SyncTurnResult> {
+        let _metadata_permit = self.metadata_budget.acquire().await?;
+        let restoring_catalog = !catalog_path.exists();
         let published = self
             .provider_transport_turn(library_uuid, catalog_path)
             .await?;
@@ -405,6 +661,7 @@ impl SyncCoordinator {
             .join("sync-spool");
         self.apply_host_spool(&spool_dir)?;
         let published_for_catalog = published.clone();
+        let _apply_permit = self.apply_budget.acquire().await?;
         let result = runtime
             .run_turn(move |database| {
                 let connection = database.connection_for_fsops();
@@ -449,10 +706,11 @@ impl SyncCoordinator {
                 })
             })
             .await?;
-        self.run_dormant_media_turn(library_uuid, catalog_path)
-            .await?;
         self.finish_seed_if_ready(library_uuid, &result)?;
         self.commit_host_published_frontier(library_uuid, &published)?;
+        if restoring_catalog {
+            self.registry.mark_restore_catalog_ready(library_uuid)?;
+        }
         Ok(result)
     }
 
@@ -503,34 +761,46 @@ impl SyncCoordinator {
 
     pub async fn run_active_turn(
         &self,
+        library_uuid: &str,
         catalog_path: &Path,
         writer: &crate::db::DbWriter,
     ) -> anyhow::Result<SyncTurnResult> {
-        let descriptor = self
-            .registry
-            .snapshot()?
-            .active_library_uuid
-            .ok_or_else(|| anyhow::anyhow!("active sync turn has no active Library"))?;
-        let published = self
-            .provider_transport_turn(&descriptor, catalog_path)
+        let result = self
+            .run_active_metadata_turn(library_uuid, catalog_path, writer)
             .await?;
-        let (host_vector, host_metadata) = self.registry.host_checkpoint_snapshot(&descriptor)?;
+        self.run_active_media_turn(library_uuid, catalog_path, writer)
+            .await?;
+        self.record_restore_progress(library_uuid, catalog_path)
+            .await?;
+        Ok(result)
+    }
+
+    async fn run_active_metadata_turn(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+        writer: &crate::db::DbWriter,
+    ) -> anyhow::Result<SyncTurnResult> {
+        let _metadata_permit = self.metadata_budget.acquire().await?;
+        let published = self
+            .provider_transport_turn(library_uuid, catalog_path)
+            .await?;
+        let (host_vector, host_metadata) = self.registry.host_checkpoint_snapshot(library_uuid)?;
         let spool_dir = catalog_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("sync-spool");
         self.apply_host_spool(&spool_dir)?;
         let published_for_catalog = published.clone();
+        let _apply_permit = self.apply_budget.acquire().await?;
         let result = writer
-            .write_authoritative(move |database| {
+            .write_authoritative_without_wake(move |database| {
                 commit_published_segments(database.connection_for_fsops(), &published_for_catalog)?;
                 perform_turn(database, host_vector, host_metadata, spool_dir)
             })
             .await?;
-        self.run_active_media_turn(&descriptor, catalog_path, writer)
-            .await?;
-        self.finish_seed_if_ready(&descriptor, &result)?;
-        self.commit_host_published_frontier(&descriptor, &published)?;
+        self.finish_seed_if_ready(library_uuid, &result)?;
+        self.commit_host_published_frontier(library_uuid, &published)?;
         Ok(result)
     }
 
@@ -539,6 +809,7 @@ impl SyncCoordinator {
         library_uuid: &str,
         catalog_path: &Path,
     ) -> anyhow::Result<()> {
+        let _media_permit = self.media_budget.acquire().await?;
         let database = crate::db::Database::open(catalog_path)?;
         database.apply_migrations()?;
         let writer = crate::db::DbWriter::spawn(database);
@@ -550,13 +821,120 @@ impl SyncCoordinator {
         shutdown
     }
 
+    async fn record_restore_progress(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+    ) -> anyhow::Result<()> {
+        let database = crate::db::Database::open(catalog_path)?;
+        let connection = database.connection_for_fsops();
+        let (total, done, bytes_total, bytes_done): (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(CASE WHEN phase='complete' THEN 1 ELSE 0 END),0),COALESCE(SUM(expected_length),0),COALESCE(SUM(downloaded_bytes),0) FROM media_materialization_jobs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let conflicts: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sync_conflicts WHERE state='open'",
+            [],
+            |row| row.get(0),
+        )?;
+        let (metadata_uploads, metadata_upload_bytes): (i64, i64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(length(e.payload)),0) FROM sync_outbox o JOIN sync_events e ON e.event_uuid=o.event_uuid WHERE o.state IN ('pending','sealed')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (media_uploads, media_upload_bytes): (i64, i64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(o.byte_length),0) FROM media_publication_objects o JOIN media_publication_jobs j ON j.intent_uuid=o.intent_uuid WHERE o.state IN ('sealed','uploading','failed') AND j.phase NOT IN ('event-published','cancelled','archived')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        self.registry.update_sync_pending_metrics(
+            library_uuid,
+            metadata_uploads.max(0) as u64 + media_uploads.max(0) as u64,
+            metadata_upload_bytes.max(0) as u64 + media_upload_bytes.max(0) as u64,
+            total.saturating_sub(done).max(0) as u64,
+            bytes_total.saturating_sub(bytes_done).max(0) as u64,
+            conflicts.max(0) as u64,
+        )?;
+        self.registry.update_restore_progress(
+            library_uuid,
+            done.max(0) as u64,
+            total.max(0) as u64,
+            bytes_done.max(0) as u64,
+            bytes_total.max(0) as u64,
+            conflicts.max(0) as u64,
+        )?;
+        if let Some(plan) = self.registry.restore_plan_for_library(library_uuid)? {
+            let terminal = matches!(plan.state.as_str(), "complete" | "failed" | "cancelled");
+            let status = match plan.state.as_str() {
+                "complete" => "succeeded",
+                "failed" => "failed",
+                "cancelled" => "cancelled",
+                "paused" => "pending",
+                _ => "running",
+            };
+            let mut notification = crate::db::notification_outbox::NotificationOperation {
+                operation_id: format!("sync:{}:{}", plan.operation_uuid, library_uuid),
+                revision: 0,
+                kind: "restore".to_owned(),
+                category: "sync".to_owned(),
+                origin: "background".to_owned(),
+                presentation: "important".to_owned(),
+                status: status.to_owned(),
+                phase: Some(plan.phase.clone()),
+                title: format!("{} · 资源库恢复", plan.name),
+                summary: plan.error_code.clone().or_else(|| Some(plan.phase.clone())),
+                task_id: None,
+                root_id: None,
+                folder_id: None,
+                file_id: None,
+                current_value: i64::try_from(plan.media_items_done).unwrap_or(i64::MAX),
+                total_value: plan
+                    .media_items_total
+                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+                unit: Some("items".to_owned()),
+                error_code: plan.error_code,
+                error_detail: None,
+                cancellable: !terminal && !plan.catalog_ready,
+                retryable: plan.state == "failed",
+                attempt: 1,
+                occurrence_count: 1,
+                started_at: plan.updated_at,
+                updated_at: plan.updated_at,
+                completed_at: terminal.then_some(plan.updated_at),
+            };
+            let mode = if terminal {
+                crate::db::notification_outbox::PublishMode::Terminal
+            } else {
+                crate::db::notification_outbox::PublishMode::Phase
+            };
+            let database = crate::db::Database::open(catalog_path)?;
+            database.apply_migrations()?;
+            let writer = crate::db::DbWriter::spawn(database);
+            let publish = writer
+                .write_authoritative(move |database| {
+                    database
+                        .publish_notification_operation(&mut notification, mode)
+                        .map(|_| ())
+                })
+                .await;
+            let shutdown = writer.shutdown().await;
+            publish?;
+            shutdown?;
+        }
+        Ok(())
+    }
+
     async fn run_active_media_turn(
         &self,
         library_uuid: &str,
         catalog_path: &Path,
         writer: &crate::db::DbWriter,
     ) -> anyhow::Result<()> {
-        self.run_media_turn(library_uuid, catalog_path, writer)
+        let _media_permit = self.media_budget.acquire().await?;
+        let scheduler_writer = writer.without_authoritative_commit_wake();
+        self.run_media_turn(library_uuid, catalog_path, &scheduler_writer)
             .await
     }
 
@@ -571,7 +949,7 @@ impl SyncCoordinator {
         };
         if !matches!(
             binding.state.as_str(),
-            "preparing" | "capturing" | "seed_ready" | "publishing" | "active"
+            "preparing" | "capturing" | "seed_ready" | "publishing" | "active" | "restoring"
         ) {
             return Ok(());
         }
@@ -645,7 +1023,7 @@ impl SyncCoordinator {
         };
         if !matches!(
             binding.state.as_str(),
-            "preparing" | "capturing" | "seed_ready" | "publishing" | "active"
+            "preparing" | "capturing" | "seed_ready" | "publishing" | "active" | "restoring"
         ) {
             return Ok(Vec::new());
         }
@@ -808,6 +1186,9 @@ impl SyncCoordinator {
                 break;
             }
         }
+        if binding.state == "restoring" {
+            return Ok(Vec::new());
+        }
         self.push_protocol_objects(
             provider.as_ref(),
             library_uuid,
@@ -943,9 +1324,28 @@ impl SyncCoordinator {
                 )?;
                 dependencies.push(shard.object_key.clone());
             }
+            let library = self
+                .registry
+                .library(library_uuid)?
+                .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+            let connection = rusqlite::Connection::open_with_flags(
+                catalog_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let (media_count, logical_bytes): (i64, i64) = connection.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(size),0) FROM files WHERE status='active'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            drop(connection);
             let descriptor = serde_json::to_vec(&serde_json::json!({
                 "version":1,
                 "libraryUuid":library_uuid,
+                "name":library.name,
+                "icon":library.icon,
+                "mediaCount":media_count.max(0),
+                "logicalBytes":logical_bytes.max(0),
+                "lastSyncedAt":crate::host_registry::unix_timestamp_millis_for_runtime(),
                 "bindingEpoch":binding.binding_epoch,
                 "namespace":binding.remote_namespace.as_deref().unwrap_or(library_uuid),
                 "seed":{
@@ -1052,6 +1452,29 @@ impl SyncCoordinator {
         }
         Ok(applied)
     }
+}
+
+fn normalize_sync_error_code(error: &anyhow::Error) -> String {
+    let normalized = error
+        .to_string()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    for code in [
+        "authorization_required",
+        "quota",
+        "compatibility",
+        "remote_corruption",
+        "disk_full",
+        "path_conflict",
+        "locked",
+        "rate_limited",
+        "unavailable",
+    ] {
+        if normalized.contains(code) {
+            return code.to_owned();
+        }
+    }
+    "provider_unavailable".to_owned()
 }
 
 fn perform_turn(
@@ -1321,7 +1744,8 @@ mod tests {
         Database, DbWriter, FileUpsert, MediaPageQuery, NewRoot, SearchQuery, ThumbBlobRecord,
         ThumbnailStateUpsert, UserMetadataPatch,
     };
-    use crate::host_registry::{CreationIntent, LibraryDescriptor};
+    use crate::host_registry::{CreationIntent, LibraryDescriptor, RegisterBundledPlugin};
+    use crate::sync::provider::SyncProvider;
     use crate::sync::segment::seal_segment;
     use crate::sync::types::Operation;
     use rusqlite::params;
@@ -1329,6 +1753,113 @@ mod tests {
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     };
+
+    fn register_test_provider_account(
+        registry: &HostRegistry,
+        plugin_id: &str,
+        account_uuid: &str,
+    ) {
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id,
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: std::path::Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account(account_uuid, plugin_id, Some("Test"), "authenticated")
+            .unwrap();
+        registry.set_plugin_intent(plugin_id, true, true).unwrap();
+        registry
+            .record_plugin_runtime_ready(plugin_id, "test-session", &["sync-provider.v1".into()])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unbind_reconciliation_requires_observable_remote_descriptor() {
+        let base = std::env::temp_dir().join(format!(
+            "megle-unbind-reconciliation-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let registry = Arc::new(HostRegistry::open(base.join("host.sqlite")).unwrap());
+        register_test_provider_account(&registry, "fake", "account");
+        registry
+            .commit_creation(
+                "test-create",
+                &LibraryDescriptor {
+                    library_uuid: "library".into(),
+                    root_uuid: "root".into(),
+                    name: "Library".into(),
+                    icon: None,
+                    color: None,
+                    local_data_dir: base.join("local"),
+                    managed_root: base.join("root"),
+                    lifecycle_state: "ready".into(),
+                    binding_state: "local-only".into(),
+                    availability: "available".into(),
+                    marker_identity: "marker".into(),
+                },
+            )
+            .unwrap();
+        let (binding, _) = registry
+            .begin_sync_binding("library", "fake", "account")
+            .unwrap();
+        let descriptor = br#"{"version":1,"libraryUuid":"library"}"#;
+        let descriptor_hash: [u8; 32] = sha2::Sha256::digest(descriptor).into();
+        registry
+            .record_provider_receipt(
+                "library",
+                binding,
+                1,
+                "library-descriptor",
+                None,
+                &descriptor_hash,
+                "created",
+            )
+            .unwrap();
+        let plan = registry.create_unbind_plan("library").unwrap();
+        registry
+            .advance_unbind_plan(&plan.plan_uuid, "keep-local-fork", "cutover")
+            .unwrap();
+        registry.begin_unbind("library", binding).unwrap();
+        registry.commit_local_unbind("library").unwrap();
+        registry
+            .advance_unbind_plan(&plan.plan_uuid, "keep-local-fork", "reconciling")
+            .unwrap();
+
+        let coordinator = SyncCoordinator::new(Arc::clone(&registry), RuntimeLeases::default());
+        let provider = Arc::new(crate::sync::provider::InMemorySyncProvider::default());
+        coordinator
+            .provider_manager()
+            .register("fake", "account", provider.clone())
+            .unwrap();
+
+        assert_eq!(coordinator.reconcile_pending_unbinds().await.unwrap(), 0);
+        assert!(!registry.unbind_plan_complete(&plan.plan_uuid).unwrap());
+        registry
+            .record_unbind_reconcile_failure(&plan.plan_uuid, "retry-now", 0)
+            .unwrap();
+        let context = crate::sync::provider::TransportContext {
+            namespace: "library".into(),
+            binding_epoch: binding.to_string(),
+            transport_generation: 2,
+        };
+        provider
+            .object_put_immutable(&context, "library-descriptor", descriptor, descriptor_hash)
+            .await
+            .unwrap();
+        assert_eq!(coordinator.reconcile_pending_unbinds().await.unwrap(), 1);
+        assert!(registry.unbind_plan_complete(&plan.plan_uuid).unwrap());
+        drop(coordinator);
+        drop(registry);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[tokio::test]
     async fn inactive_scheduler_is_cancellable_and_joinable() {
@@ -1375,6 +1906,12 @@ mod tests {
             .expect("cancelled epoch must remain as a tombstone");
         assert!(stored.run(async { Ok(()) }).await.is_err());
         drop(stored);
+        coordinator.resume_media_binding(binding).await;
+        assert!(!coordinator
+            .media_workers
+            .lock()
+            .await
+            .contains_key(&binding));
         coordinator.shutdown_media_workers().await.unwrap();
         drop(coordinator);
         drop(registry);
@@ -1916,7 +2453,7 @@ mod tests {
         let coordinator = SyncCoordinator::new(Arc::clone(&host), leases.clone());
         assert!(
             coordinator
-                .run_active_turn(&path, &seed_writer)
+                .run_active_turn(&library_uuid, &path, &seed_writer)
                 .await
                 .unwrap()
                 .checkpoint_built
@@ -2110,7 +2647,10 @@ mod tests {
             provider.push(serde_json::to_vec(&segment).unwrap());
             crate::sync::provider::intake_provider_segments(&provider, &spool).unwrap();
             let started = std::time::Instant::now();
-            let result = coordinator.run_active_turn(&path, &writer).await.unwrap();
+            let result = coordinator
+                .run_active_turn(&library_uuid, &path, &writer)
+                .await
+                .unwrap();
             let _coordinator_turn_ms = started.elapsed().as_secs_f64() * 1000.0;
             apply_ms.push(result.apply_transaction_micros as f64 / 1000.0);
             max_events = max_events.max(result.applied_events);
@@ -2135,7 +2675,10 @@ mod tests {
         max_decoded = max_decoded.max(budget_segment.header.decoded_bytes);
         provider.push(serde_json::to_vec(&budget_segment).unwrap());
         crate::sync::provider::intake_provider_segments(&provider, &spool).unwrap();
-        let budget_result = coordinator.run_active_turn(&path, &writer).await.unwrap();
+        let budget_result = coordinator
+            .run_active_turn(&library_uuid, &path, &writer)
+            .await
+            .unwrap();
         max_events = max_events.max(budget_result.applied_events);
         assert_eq!(budget_result.applied_events, 100);
         stop.store(true, Ordering::Release);
