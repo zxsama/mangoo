@@ -711,6 +711,8 @@ const requiredFiles = [
   "crates/core/host_migrations/0001_host_registry.sql",
   "crates/core/host_migrations/0003_plugin_runtime.sql",
   "crates/core/host_migrations/0004_provider_root_discovery.sql",
+  "crates/core/host_migrations/0005_sync_orchestration.sql",
+  "crates/core/host_migrations/0006_sync_orchestration_recovery.sql",
   "crates/core/src/plugins/runtime/generated_trust.rs",
   "crates/core/migrations/0021_notification_outbox.sql",
   "crates/core/migrations/0028_remove_catalog_plugins.sql",
@@ -735,6 +737,7 @@ const requiredFiles = [
   "docs/testing-strategy.md",
   "tools/bench/managed-library-lifecycle-bench.mjs",
   "tools/bench/plugin-runtime-bench.mjs",
+  "tools/bench/sync-orchestration-bench.mjs",
   "tools/build/build-bundled-plugins.mjs",
   "tools/dev/managed-library-harness.mjs",
   "tools/dev/run-dev.mjs"

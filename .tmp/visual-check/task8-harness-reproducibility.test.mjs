@@ -114,6 +114,19 @@ test("Cargo diagnostics preserve pre-finish warnings without treating progress a
     { line: "warning: real build warning", phase: "cargo-build" },
     { line: "error[E0308]: mismatched types", phase: "cargo-build" }
   ]);
+
+  const sequentialBuilds = collectStartupDiagnostics([
+    { source: "stderr", text: "Finished `dev` profile [unoptimized + debuginfo] target(s)\n" },
+    {
+      source: "stderr",
+      text: "warning: cached second build warning\nFinished `dev` profile [unoptimized + debuginfo] target(s)\n"
+    }
+  ]);
+  assert.equal(sequentialBuilds.cargoBuildFinished, true);
+  assert.deepEqual(sequentialBuilds.cargoDiagnostics.map(({ line, phase }) => ({ line, phase })), [
+    { line: "warning: cached second build warning", phase: "cargo-build" }
+  ]);
+  assert.deepEqual(sequentialBuilds.runtimeProblems, []);
 });
 
 test("normal OS finalization waits past 300ms for child close and both raw streams", async () => {
@@ -269,6 +282,11 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(regressionSource, /collectRunDiagnostics/);
   assert.match(regressionSource, /cargoDiagnostics/);
   assert.match(regressionSource, /cargoBuildFinished/);
+  assert.match(
+    regressionSource,
+    /unknownStartupProblems = startup\.runtimeProblems\.filter/,
+    "successful Cargo diagnostics must remain evidence without failing the runtime startup gate"
+  );
   for (const field of [
     "startupProblems",
     "startupFailures",

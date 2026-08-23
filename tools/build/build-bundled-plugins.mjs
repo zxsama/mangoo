@@ -33,7 +33,17 @@ for (const provider of providers) {
   generated.push(`pub const ${provider.constant}: [u8; 32] = [\n${rows}\n];`);
   console.log(`[bundled-plugin] ${pluginRoot} ${sha256}`);
 }
-writeFileSync(path.join(root, "crates", "core", "src", "plugins", "runtime", "generated_trust.rs"), `${generated.join("\n")}\n`);
+const generatedTrustPath = path.join(root, "crates", "core", "src", "plugins", "runtime", "generated_trust.rs");
+const generatedTrust = `${generated.join("\n")}\n`;
+let existingGeneratedTrust = null;
+try {
+  existingGeneratedTrust = readFileSync(generatedTrustPath, "utf8");
+} catch (error) {
+  if (error?.code !== "ENOENT") throw error;
+}
+if (existingGeneratedTrust !== generatedTrust) {
+  writeFileSync(generatedTrustPath, generatedTrust);
+}
 
 if (process.argv.includes("--verify-onedrive")) {
   const pluginRoot = path.join(targetRoot, profile, "bundled-plugins", "com.megle.onedrive");

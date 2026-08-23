@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
-  addExistingMediaRoot,
   createAndActivateManagedLibrary,
   managedLibraryHostEnv
 } from "../dev/managed-library-harness.mjs";
@@ -73,7 +72,15 @@ async function main() {
     const createStarted = performance.now();
     const first = await createAndActivateManagedLibrary({ baseUrl, token, name: "Baseline A", managedRoot: path.join(dataDir, "library-a") });
     const firstCreationMs = performance.now() - createStarted;
-    const accepted = await addExistingMediaRoot({ baseUrl, token, contextRevision: first.contextRevision, mediaRoot });
+    const roots = await api("/roots");
+    const rootItems = Array.isArray(roots) ? roots : roots.items;
+    const managedRoot = rootItems.find((item) => item.path === first.library.managedRoot);
+    if (!managedRoot) throw new Error(`managed Library root was not registered: ${JSON.stringify(roots)}`);
+    const accepted = await api("/tasks/scan", {
+      method: "POST",
+      headers: { "x-megle-context-revision": String(first.contextRevision) },
+      body: JSON.stringify({ rootId: managedRoot.id })
+    });
     await waitForScan(accepted.taskId);
     const second = await createAndActivateManagedLibrary({ baseUrl, token, name: "Baseline B", managedRoot: path.join(dataDir, "library-b") });
 

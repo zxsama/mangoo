@@ -18,17 +18,31 @@ function outputLines(startupOutput) {
 
 export function collectStartupDiagnostics(startupOutput, { ignoreRuntimeLine } = {}) {
   let cargoBuildFinished = false;
+  let cargoBuildActive = true;
   const cargoDiagnostics = [];
   const runtimeProblems = [];
 
   for (const problem of outputLines(startupOutput)) {
     const normalizedLine = normalizeLine(problem.line);
     if (!normalizedLine.trim()) continue;
-    if (CARGO_FINISHED_PATTERN.test(normalizedLine)) {
-      cargoBuildFinished = true;
+    if (/^\s*(?:Compiling|Checking)\s+\S+/i.test(normalizedLine)) {
+      cargoBuildActive = true;
+      cargoBuildFinished = false;
       continue;
     }
-    if (!cargoBuildFinished) {
+    if (CARGO_FINISHED_PATTERN.test(normalizedLine)) {
+      cargoBuildFinished = true;
+      cargoBuildActive = false;
+      continue;
+    }
+    if (
+      cargoBuildFinished &&
+      /^\s*(?:Compiling|Checking)\s+\S+|^\s*warning(?:\[[^\]]+\])?:/i.test(normalizedLine)
+    ) {
+      cargoBuildActive = true;
+      cargoBuildFinished = false;
+    }
+    if (!cargoBuildFinished || cargoBuildActive) {
       if (CARGO_DIAGNOSTIC_PATTERN.test(normalizedLine)) {
         cargoDiagnostics.push({ ...problem, line: normalizedLine, phase: "cargo-build" });
       }

@@ -22,6 +22,7 @@
     "check:schema": "python tools/checks/validate_sqlite_schema.py",
     "check:rust": "node tools/checks/verify-rust.mjs",
     "bench:sync-protocol": "node tools/bench/sync-protocol-bench.mjs",
+    "bench:sync-orchestration": "node tools/bench/sync-orchestration-bench.mjs",
     "bench:plugin-runtime": "node tools/bench/plugin-runtime-bench.mjs",
     "bench:onedrive-provider": "node tools/bench/onedrive-provider-bench.mjs",
     "test:onedrive-live": "cargo test -p megle-onedrive-provider --test live_graph -- --ignored --nocapture",

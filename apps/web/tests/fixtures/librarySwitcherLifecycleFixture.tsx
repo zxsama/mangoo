@@ -5,6 +5,7 @@ import {
   type ReactElement,
 } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { QueryClientProvider } from "@tanstack/react-query";
 import type { MegleDesktopBridge } from "../../src/core/desktop";
 import type { LibraryLoadPhase, LibrarySummary } from "../../src/core/libraryTypes";
 import { useLibraryData, type LibraryState } from "../../src/core/useLibraryData";
@@ -17,6 +18,7 @@ import {
 import { LiquidGlassLayer } from "../../src/design/liquid-glass";
 import { LibraryLoadingOverlay } from "../../src/features/library/LibraryLoadingOverlay";
 import { LibrarySwitcher } from "../../src/features/library/LibrarySwitcher";
+import { queryClient } from "../../src/core/queryClient";
 import "../../src/styles.css";
 import "../../src/design/overlays/overlay.css";
 
@@ -311,7 +313,7 @@ async function mountScenario(element: ReactElement): Promise<MountedScenario> {
   document.body.append(container);
   const root = createRoot(container);
   await act(async () => {
-    root.render(element);
+    root.render(<QueryClientProvider client={queryClient}>{element}</QueryClientProvider>);
   });
   await settle(20);
   return { container, root };

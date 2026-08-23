@@ -3821,6 +3821,79 @@ async function notificationWindowFixtureEvidence(client) {
   }
 }
 
+async function syncOrchestrationFixtureEvidence(client) {
+  const states = ["lifecycle", "restore", "conflict", "error", "unbind", "reconnect"];
+  const fixtureUrl = `${webUrl}/tests/fixtures/sync-orchestration.html?state=lifecycle`;
+  const opened = await evaluate(
+    client,
+    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "megle-sync-orchestration-fixture", "popup=yes,width=1120,height=820,resizable=yes"))`
+  );
+  if (!opened) throw new Error("Electron refused to open the sync orchestration visual fixture");
+  const target = await waitForTarget(
+    (page) => page.url.includes("/tests/fixtures/sync-orchestration.html"),
+    10000
+  );
+  const fixtureClient = new CdpClient(target.webSocketDebuggerUrl);
+  await fixtureClient.ready;
+  await Promise.all([
+    fixtureClient.send("Page.enable"),
+    fixtureClient.send("Runtime.enable")
+  ]);
+  const screenshots = {};
+  const evidence = {};
+  try {
+    for (const state of states) {
+      await fixtureClient.send("Page.navigate", {
+        url: `${webUrl}/tests/fixtures/sync-orchestration.html?state=${state}`
+      });
+      await waitFor(
+        fixtureClient,
+        `Boolean(document.querySelector('[data-sync-orchestration-fixture="${state}"] .settings-sync-panel'))`,
+        15000,
+        `sync orchestration ${state} fixture`
+      );
+      if (state === "unbind" || state === "reconnect") {
+        await waitFor(
+          fixtureClient,
+          `Boolean(document.querySelector('[role="alertdialog"]'))`,
+          15000,
+          `sync orchestration ${state} confirmation`
+        );
+      }
+      await fixtureClient.send("Page.bringToFront");
+      screenshots[state] = await rendererScreenshot(
+        fixtureClient,
+        `ui-sync-orchestration-${state}.png`
+      );
+      evidence[state] = await evaluate(
+        fixtureClient,
+        `(() => {
+          const root = document.querySelector('[data-sync-orchestration-fixture="${state}"]');
+          const dialog = document.querySelector('[role="alertdialog"]');
+          return {
+            state: root?.getAttribute('data-sync-orchestration-fixture') ?? null,
+            cardCount: root?.querySelectorAll('.settings-sync-card').length ?? 0,
+            progressCount: root?.querySelectorAll('progress').length ?? 0,
+            conflictVisible: root?.textContent?.includes('冲突 3') ?? false,
+            errorVisible: Boolean(root?.querySelector('.settings-inline-error, .settings-sync-state.error')),
+            dialogVisible: Boolean(dialog),
+            dialogText: dialog?.textContent?.trim()?.slice(0, 500) ?? null
+          };
+        })()`
+      );
+    }
+    return { screenshots, evidence };
+  } finally {
+    await evaluate(fixtureClient, `window.close()`).catch(() => undefined);
+    fixtureClient.close();
+    await waitForTargetCount(
+      (page) => page.url.includes("/tests/fixtures/sync-orchestration.html"),
+      0,
+      10000
+    ).catch(() => undefined);
+  }
+}
+
 async function glassMaterialEvidence(client) {
   await pressKey(client, "Escape", "Escape", 27);
   await waitForCompactPopoverState(client, null).catch(() => undefined);
@@ -6233,7 +6306,7 @@ function collectRunDiagnostics(scenarioFailures = []) {
   const unknownConsoleWarnings = consoleWarnings.filter((warning) => !warning.known);
   const unexpectedConsoleErrors = collectUnexpectedConsoleErrors(consoleErrors);
   const unexpectedNetworkProblems = collectUnexpectedNetworkProblems(networkProblems);
-  const unknownStartupProblems = startupProblems.filter((problem) => !problem.known);
+  const unknownStartupProblems = startup.runtimeProblems.filter((problem) => !problem.known);
   const diagnosticFailures = [...scenarioFailures];
   if (unexpectedConsoleErrors.length) diagnosticFailures.push("console errors");
   if (unexpectedNetworkProblems.length) diagnosticFailures.push("network failures");
@@ -6658,6 +6731,7 @@ try {
   const compactPopovers = await compactPopoverDismissalEvidence(client);
   const notificationFixture = await notificationPopoverFixtureEvidence(client);
   assertCompactNotificationTask5Evidence(compactPopovers, notificationFixture);
+  const syncOrchestrationFixture = await syncOrchestrationFixtureEvidence(client);
 
   await selectMediaByName(client, "portrait-sample");
   await waitFor(
@@ -6821,6 +6895,7 @@ try {
       localEdgeHighlight,
       notificationFixture: notificationFixture.screenshots,
       notificationWindowFixture: notificationWindowFixture.screenshots,
+      syncOrchestrationFixture: syncOrchestrationFixture.screenshots,
       windowBackdrop: windowBackdrop.path ?? null
     },
     verification: {
@@ -6844,6 +6919,7 @@ try {
       compactPopovers,
       notificationFixture,
       notificationWindowFixture,
+      syncOrchestrationFixture,
       inspectorPortrait,
       inspectorPreviewApiResponsesBeforeCentralOpen,
       inspectorThumbnailBlobResponsesBeforeCentralOpen,
@@ -7752,6 +7828,21 @@ try {
     ) ?? [];
   if (unexpectedFixtureConsoleErrors.length || unexpectedFixtureNetworkProblems.length) {
     hardFailures.push("notification test renderer emitted unexpected console or network failures");
+  }
+  const syncFixture = summary.evidence.syncOrchestrationFixture?.evidence;
+  const expectedSyncStates = ["lifecycle", "restore", "conflict", "error", "unbind", "reconnect"];
+  if (
+    !syncFixture ||
+    expectedSyncStates.some((state) => syncFixture[state]?.state !== state || syncFixture[state]?.cardCount < 1) ||
+    syncFixture.restore?.progressCount < 1 ||
+    syncFixture.conflict?.conflictVisible !== true ||
+    syncFixture.error?.errorVisible !== true ||
+    syncFixture.unbind?.dialogVisible !== true ||
+    !syncFixture.unbind?.dialogText?.includes("取消同步") ||
+    syncFixture.reconnect?.dialogVisible !== true ||
+    !syncFixture.reconnect?.dialogText?.includes("三方预览")
+  ) {
+    hardFailures.push("sync orchestration visual fixtures are incomplete");
   }
   const fullWindowFixture = summary.evidence.notificationWindowFixture;
   if (
