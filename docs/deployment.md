@@ -154,6 +154,18 @@ docker compose up -d
 
 The named `megle-data` volume is preserved across rebuilds.
 
+## Synchronization release qualification
+
+Run `node tools/checks/sync-release.mjs --renderer-evidence <clean-renderer-evidence.json>`
+from a clean commit before publishing an image.
+The command builds from a hashed `git archive`, verifies the Windows gate, then
+requires an actual Docker/Linux build/runtime row plus a two-container volume
+restart proof of the Host Registry, active Library Catalog, sync capture state,
+and Provider state. Separate credential-gated Personal and Business OneDrive
+canaries exercise Delta, immutable put, Range download, and upload sessions.
+Missing Docker access or credentials is a blocking result, never an emulator success. See
+`docs/sync-operations.md` for staged rollout and forward-disable rollback.
+
 ## Limitations
 
 - **Browser UI session token is not injected.** When `MEGLE_BASIC_AUTH` is
@@ -165,8 +177,10 @@ The named `megle-data` volume is preserved across rebuilds.
   to the external HTTPS origin registered for the public client, and set
   `MEGLE_ONEDRIVE_CLIENT_ID`; tokens remain in the mounted encrypted Secret
   Store, never in Compose environment values.
-- **Single user.** All requests share one library, one set of tags, and one
-  task queue.
+- **Single-user Host, multiple Libraries.** One deployed Host owns its Library
+  registry and user session. Each managed Library has its own Catalog, roots,
+  tags and sync binding; the active Library is switched through Core without
+  restarting the process.
 - **Windows-only file ops still apply.** Linux containers can mount Windows
   shares, but advanced recycle-bin operations remain Windows-specific. The
   OneDrive sync Provider itself is bundled for Linux and runs as a supervised

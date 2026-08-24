@@ -80,6 +80,15 @@ The current plan is component-based. We are not forking an existing image-manage
 21. [Unified Overlay UI Verification](benchmarks/2026-07-27-unified-overlay-verification.md)
    - Task 8 exact/dirty automated results, reproducible fixtures, native-window, appearance/DPI evidence, and strict residuals.
 
+22. [Sync Integration Verification](benchmarks/2026-08-24-sync-integration-verification.md)
+   - Final correctness, fault, platform, canary and parent AC1–AC20 evidence map.
+
+23. [Sync Integration Performance](performance-results/sync-integration-2026-08-24.md)
+   - Million-scale thresholds and physical 10 GiB kill/resume evidence.
+
+24. [Sync Operations Runbook](sync-operations.md)
+   - Enable, pause, restore, diagnostics, unbind, reconnect and forward-disable rollback.
+
 ## Supporting
 
 - [Product Brief](product-brief.md)

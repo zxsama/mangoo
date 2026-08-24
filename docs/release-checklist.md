@@ -13,7 +13,17 @@ npm test
 npm --workspace @megle/web run build
 npm --workspace @megle/desktop run build
 cargo build --release -p megle-core
+npm run check:sync-integration
+npm run check:desktop-os-backdrop
+node tools/bench/renderer-sync-performance.mjs --output .tmp/sync-release/renderer-evidence.json
+node tools/bench/sync-integration-bench.mjs --renderer-evidence .tmp/sync-release/renderer-evidence.json
+node tools/checks/sync-release.mjs --renderer-evidence .tmp/sync-release/renderer-evidence.json
 ```
+
+`check:sync-release` automatically runs the committed renderer and OS-backdrop
+harnesses inside the extracted exact tree on Windows. An explicitly supplied
+`--renderer-evidence <file>` (or `MEGLE_SYNC_RENDERER_EVIDENCE`) is accepted for
+controlled reruns; missing or invalid evidence is a blocking release row.
 
 Expected:
 
@@ -21,6 +31,13 @@ Expected:
 - Web build emits `apps/web/dist/` without TypeScript or Vite errors.
 - Desktop build emits `apps/desktop/dist/main.js` and `apps/desktop/dist/preload.cjs`.
 - `cargo build --release -p megle-core` produces `target/release/megle-core[.exe]`.
+- The 10 GiB row reports production media workers over framed Provider RPC,
+  equal durable/wire byte counters, matching digests, and bounded memory.
+- The Docker restart rows preserve a real Host Registry, active Library Catalog,
+  sync capture state, and Provider immutable object across two containers.
+- The sync release result is `passed`; Docker/Linux and both OneDrive live
+  canaries are separate required rows. A blocked row or dirty diagnostic run
+  cannot qualify a release.
 
 If any step fails, stop and fix before continuing. Never edit the contract or schema to
 "fix" a check; update the implementation to match the contract.

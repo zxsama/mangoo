@@ -45,6 +45,16 @@ tools/
 - `packages/notification-contract` owns the type-only notification, process-log, and preload bridge DTOs shared by Desktop and Web. It reuses generated Core operation types and has no runtime Node dependency.
 - `tools/bench` is for heavier performance experiments. It may generate large ignored artifacts.
 - `tools/checks` is for quick checks that should run every time the structure changes.
+- `tools/checks/sync-integration.mjs` and `sync-fault-matrix.mjs` aggregate
+  production sync correctness/fault evidence. `sync-release.mjs` owns clean
+  `git archive` platform qualification and fail-closed external rows.
+- `tools/bench/sync-integration-bench.mjs` owns million-scale, media-inventory
+  and physical large-transfer measurements. `renderer-sync-performance.mjs`
+  records paired frame evidence from the real Electron renderer.
+- `tools/checks/desktop-os-backdrop.mjs` is the committed Windows native-capture
+  harness; `sync-legacy-absence.mjs` asserts retired Library selectors and root
+  adoption branches stay absent. All raw output stays under ignored
+  `.tmp/sync-release/` run directories.
 
 ## Unified Notification Center Modules
 
