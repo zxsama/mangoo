@@ -23,8 +23,10 @@ node tools/bench/sync-integration-bench.mjs --quick --renderer-evidence .tmp/syn
 ```
 
 The release profile uses 1,000,000 assets, eight Libraries, 100,000 media jobs,
-1,000,000 chunks and a physical 10 GiB transfer. Raw databases, byte corpora and
-logs are ignored under `.tmp/sync-release/<run-id>/`.
+1,000,000 chunks and a physical 10 GiB transfer. Raw databases and logs are
+ignored under `.tmp/sync-release/<run-id>/`; the release runner places the large
+byte corpus in a capacity-qualified system temporary directory and removes it
+after preserving the parsed counters in the benchmark result.
 
 ## Required thresholds
 
@@ -51,37 +53,38 @@ ingest.
 
 ## Physical transfer result
 
-The Windows development run physically generated, uploaded, range-downloaded,
-materialized and SHA-256-read 10,737,418,240 bytes. Both transfer children were
-hard-killed after a durable halfway marker and restarted from their recorded
-offset/range inventory. Final counters were exactly one object length per
-direction; 640 ranges of 16 MiB were verified; the working buffer was 1 MiB.
-Source, provider and restored digests were all
+The clean immutable Windows run for commit
+`89a67e807a79eb6d7edc6f5367d4c9fe2cb2759e` physically generated, uploaded,
+range-downloaded, materialized and SHA-256-read 10,737,418,240 bytes through
+`MediaPublicationWorker` and `MediaRestoreWorker` over framed Provider RPC.
+Both transfer children were hard-killed after durable halfway markers and
+restarted from their recorded offset/range inventory. Upload resumed at byte
+5,375,172,642 and download at byte 5,373,152,353. The run transferred
+10,737,786,159 upload bytes (including the immutable manifest) and exactly
+10,737,418,240 data-range bytes, used 870 verified ranges, limited the Provider
+buffer to 16 MiB, and peaked at 185,757,696 bytes of worker RSS. Source and
+restored SHA-256 were both
 `c7c26272defe8457bcdb66d25f9d20b090b5b5bc10713784e9234a2c90a68c47`.
-The current implementation now routes this probe through the production
-`MediaPublicationWorker` and `MediaRestoreWorker` over framed Provider RPC. A
-fresh 2026-08-25 Windows run transferred 10,737,786,159 upload bytes (including
-the immutable manifest) and exactly 10,737,418,240 data-range bytes, restored
-all 10 GiB with the same digest, resumed upload from byte 5,375,172,642, used
-870 verified ranges, limited the Provider buffer to 16 MiB, and peaked at
-185,757,696 bytes of worker RSS.
 
 ## Release state
 
-The latest full 1,000,000-asset Windows sample passed all measured Core gates.
-Capture p95/p99 was 2.649/2.897 ms, apply p95/p99 was 3.398/3.523 ms, stress
-CPU was 11.026%, stress private memory was 41.543 MiB, idle CPU was 0%, and the
-eight dormant Library descriptors added 0.652 MiB. Browse/search/thumbnail
-remained local with zero Provider calls; their absolute p95/p99 values were
-0.134/0.156 ms, 36.163/39.402 ms and 0.014/0.017 ms respectively. Relative
+The full immutable 1,000,000-asset Windows sample for commit `89a67e8` passed
+all measured Core gates. Capture p95/p99 was 2.689/2.935 ms, apply p95/p99 was
+3.419/3.566 ms, stress CPU was 9.324%, stress private memory was 44.867 MiB,
+idle CPU was 0%, and the eight dormant Library descriptors added 1.352 MiB.
+Browse/search/thumbnail remained local with zero Provider calls; their absolute
+p95/p99 values were 0.134/0.152 ms, 37.047/37.986 ms and 0.013/0.016 ms
+respectively. Relative
 regression calculations use a 1 ms floor for sub-millisecond measurements,
 while the unchanged 50/100 ms absolute browse ceilings continue to fail closed.
-The committed renderer collector's current quick diagnostic passed with zero
-synchronous renderer IPC, 0.321 percentage-point long-frame increase and 1.577
-percentage-point dropped-frame increase. Exact-tree release evidence remains a
-separate required row.
+The exact-tree renderer collector passed with 80 production sync requests, zero
+request failures, zero synchronous renderer IPC, a 0.097 percentage-point
+long-frame increase and a 0.388 percentage-point dropped-frame increase. The
+exact-tree full gate, sync integration, sync benchmark and native OS-backdrop
+rows also passed.
 
-This document records development evidence, not a release waiver. The exact-tree
-Docker/Linux and live Personal/Business Graph rows are blocked on this machine;
-therefore the release gate must remain nonzero until those rows run elsewhere on
-the same commit.
+The release run remains fail-closed only because this machine has no usable
+Docker daemon and no OneDrive Personal or Business live canary credentials.
+Those three required external rows are recorded as blocked and keep the release
+result nonzero; all immutable Windows exact-tree rows for commit `89a67e8`
+passed.
