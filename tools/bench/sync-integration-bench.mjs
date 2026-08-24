@@ -1,16 +1,26 @@
 import path from "node:path";
 import process from "node:process";
+import os from "node:os";
 import { spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { createRunDirectory, environmentFacts, requiredFailures, root, runCommand, writeJson } from "../checks/sync-release-lib.mjs";
 
 function parseArgs(argv) {
-  const options = { output: null, quick: false, largeBytes: null, rendererEvidence: process.env.MEGLE_SYNC_RENDERER_EVIDENCE ?? null };
+  const options = {
+    output: null,
+    quick: false,
+    largeBytes: null,
+    largeTransferRoot: process.env.MEGLE_SYNC_LARGE_TRANSFER_ROOT ?? null,
+    cleanupLargeTransfer: false,
+    rendererEvidence: process.env.MEGLE_SYNC_RENDERER_EVIDENCE ?? null,
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--output" && argv[index + 1]) options.output = argv[++index];
     else if (value === "--quick") options.quick = true;
     else if (value === "--large-bytes" && argv[index + 1]) options.largeBytes = argv[++index];
+    else if (value === "--large-transfer-root" && argv[index + 1]) options.largeTransferRoot = path.resolve(argv[++index]);
+    else if (value === "--cleanup-large-transfer") options.cleanupLargeTransfer = true;
     else if (value === "--renderer-evidence" && argv[index + 1]) options.rendererEvidence = argv[++index];
     else throw new Error(`unknown or incomplete argument: ${value}`);
   }
@@ -21,6 +31,17 @@ const options = parseArgs(process.argv.slice(2));
 const runDirectory = await createRunDirectory("benchmark", options.output);
 const assets = options.quick ? "1000" : "1000000";
 const largeBytes = options.largeBytes ?? (options.quick ? String(128 * 1024 * 1024) : String(10 * 1024 * 1024 * 1024));
+const largeTransferRoot = options.largeTransferRoot ?? path.join(runDirectory, "large-transfer");
+if (options.cleanupLargeTransfer) {
+  const temporaryRoot = `${path.resolve(os.tmpdir())}${path.sep}`.toLowerCase();
+  const cleanupRoot = path.resolve(largeTransferRoot);
+  if (
+    !cleanupRoot.toLowerCase().startsWith(temporaryRoot)
+    || !path.basename(cleanupRoot).startsWith("megle-sync-large-")
+  ) {
+    throw new Error("--cleanup-large-transfer requires a megle-sync-large-* directory under the system temporary root");
+  }
+}
 const rows = [];
 const expectedCommit = process.env.MEGLE_EVIDENCE_COMMIT
   ?? spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8", windowsHide: true }).stdout.trim();
@@ -166,12 +187,41 @@ rows.push(await runCommand({
   args: ["test", "-p", "megle-core", "--release", "sync::media::worker::tests::physical_large_transfer_resume_probe", "--", "--ignored", "--nocapture"],
   env: {
     MEGLE_SYNC_LARGE_TRANSFER_BYTES: largeBytes,
-    MEGLE_SYNC_LARGE_TRANSFER_ROOT: path.join(runDirectory, "large-transfer"),
+    MEGLE_SYNC_LARGE_TRANSFER_ROOT: largeTransferRoot,
     MEGLE_SYNC_BUNDLED_PLUGINS_DIR: path.join(targetRoot, "release", "bundled-plugins"),
   },
   runDirectory,
   timeoutMs: 3 * 60 * 60 * 1000,
 }));
+let physicalLargeTransfer = null;
+const physicalRow = rows.find((candidate) => candidate.name === "physical-large-transfer-resume");
+try {
+  if (physicalRow?.status === "passed") {
+    physicalLargeTransfer = parseMetric(
+      await readFile(physicalRow.stdoutPath, "utf8"),
+      "SYNC_LARGE_TRANSFER_JSON",
+    );
+  }
+} finally {
+  if (options.cleanupLargeTransfer) {
+    try {
+    await rm(largeTransferRoot, { recursive: true, force: true });
+    } catch (error) {
+      rows.push({
+        name: "physical-large-transfer-cleanup",
+        command: `remove ${largeTransferRoot}`,
+        cwd: process.cwd(),
+        startedAt: new Date().toISOString(),
+        durationMs: 0,
+        exitCode: 1,
+        signal: null,
+        status: "failed",
+        required: true,
+        reason: error.message,
+      });
+    }
+  }
+}
 rows.push(await rendererEvidenceRow(options.rendererEvidence));
 
 const result = {
@@ -181,6 +231,8 @@ const result = {
   quick: options.quick,
   configuredAssets: Number(assets),
   configuredLargeTransferBytes: Number(largeBytes),
+  largeTransferRoot,
+  physicalLargeTransfer,
   rendererEvidence: options.rendererEvidence ? path.resolve(options.rendererEvidence) : null,
   pairedPerformance,
   environment: await environmentFacts(),

@@ -97,7 +97,8 @@ if (!dirty) {
           timeoutMs: 45 * 60 * 1000,
         }));
       }
-      rows.push(await runCommand({ name: "exact-tree-sync-benchmark", command: "node", args: ["tools/bench/sync-integration-bench.mjs", "--output", path.join(runDirectory, "exact-benchmark"), ...(options.quick ? ["--quick"] : []), ...(rendererEvidence ? ["--renderer-evidence", rendererEvidence] : [])], cwd: extracted, env: { MEGLE_EVIDENCE_COMMIT: commit, MEGLE_EVIDENCE_EXACT_TREE: "1" }, runDirectory, timeoutMs: 5 * 60 * 60 * 1000 }));
+      const largeTransferRoot = await mkdtemp(path.join(os.tmpdir(), "megle-sync-large-"));
+      rows.push(await runCommand({ name: "exact-tree-sync-benchmark", command: "node", args: ["tools/bench/sync-integration-bench.mjs", "--output", path.join(runDirectory, "exact-benchmark"), "--large-transfer-root", largeTransferRoot, "--cleanup-large-transfer", ...(options.quick ? ["--quick"] : []), ...(rendererEvidence ? ["--renderer-evidence", rendererEvidence] : [])], cwd: extracted, env: { MEGLE_EVIDENCE_COMMIT: commit, MEGLE_EVIDENCE_EXACT_TREE: "1" }, runDirectory, timeoutMs: 5 * 60 * 60 * 1000 }));
     }
     await writeJson(path.join(runDirectory, "archive.json"), { commit, archive: await fileEvidence(archive) });
   }

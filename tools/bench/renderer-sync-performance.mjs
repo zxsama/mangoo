@@ -142,7 +142,7 @@ try {
         }).then((response) => { if (!response.ok) state.syncRequestFailures += 1; })
           .catch(() => { state.syncRequestFailures += 1; });
       }
-    }, 100);
+    }, 250);
   })()`);
   await delay(durationMs);
   await desktop.cdp.run(`clearInterval(window.__megleRendererPerf.stressTimer)`);
