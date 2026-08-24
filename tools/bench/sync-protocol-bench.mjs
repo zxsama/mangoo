@@ -32,8 +32,9 @@ const metrics = JSON.parse(match[1]);
 const required = [
   "applyP95Ms", "applyP99Ms", "maxAppliedEvents", "maxDecodedBytes",
   "assets", "localCaptureP95Ms", "localCaptureP99Ms", "coordinatorCpuMs",
-  "idleCpuPercent", "dormantPrivateMiB", "browseP95Ms", "searchP95Ms",
-  "thumbP95Ms", "providerCalls", "reopenEvents", "reopenFrontier",
+  "idleCpuPercent", "dormantPrivateMiB", "stressCpuPercent", "stressPrivateMiB", "browseP95Ms", "searchP95Ms",
+  "thumbP95Ms", "browseP99Ms", "searchP99Ms", "thumbP99Ms", "browseP95RegressionPercent", "browseP99RegressionPercent",
+  "searchP95RegressionPercent", "searchP99RegressionPercent", "thumbP95RegressionPercent", "providerCalls", "captureWarmupSamples", "captureSamples", "reopenEvents", "reopenFrontier",
 ];
 for (const name of required) {
   if (!Number.isFinite(metrics[name])) throw new Error(`missing measured metric: ${name}`);
@@ -50,20 +51,30 @@ const thresholds = {
   maxDecodedBytes: 1024 * 1024,
   idleCpuPercent: 1,
   dormantPrivateMiB: 100,
+  stressCpuPercent: 15,
+  stressPrivateMiB: 256,
   browseP95Ms: 50,
+  browseP99Ms: 100,
   searchP95Ms: 150,
+  searchP99Ms: 300,
   thumbP95Ms: 50,
 };
 const violations = [];
 if (metrics.libraries !== thresholds.libraries) violations.push(`libraries=${metrics.libraries}`);
 if (metrics.assets !== thresholds.assets) violations.push(`assets=${metrics.assets}`);
 for (const name of ["applyP95Ms", "applyP99Ms", "maxAppliedEvents", "maxDecodedBytes",
-  "localCaptureP95Ms", "localCaptureP99Ms", "idleCpuPercent", "dormantPrivateMiB", "browseP95Ms", "searchP95Ms", "thumbP95Ms"]) {
+  "localCaptureP95Ms", "localCaptureP99Ms", "idleCpuPercent", "dormantPrivateMiB", "stressCpuPercent", "stressPrivateMiB", "browseP95Ms", "browseP99Ms", "searchP95Ms", "searchP99Ms", "thumbP95Ms"]) {
   if (metrics[name] > thresholds[name]) violations.push(`${name}=${metrics[name]} > ${thresholds[name]}`);
 }
 if (metrics.providerCalls !== 0) violations.push(`providerCalls=${metrics.providerCalls}`);
-if (metrics.reopenEvents !== 800 || metrics.reopenFrontier !== 600) {
-  violations.push(`reopen=${metrics.reopenEvents}/${metrics.reopenFrontier}`);
+if (metrics.browseP95RegressionPercent > 10) violations.push(`browseP95RegressionPercent=${metrics.browseP95RegressionPercent} > 10`);
+if (metrics.browseP99RegressionPercent > 15) violations.push(`browseP99RegressionPercent=${metrics.browseP99RegressionPercent} > 15`);
+if (metrics.searchP95RegressionPercent > 10) violations.push(`searchP95RegressionPercent=${metrics.searchP95RegressionPercent} > 10`);
+if (metrics.searchP99RegressionPercent > 15) violations.push(`searchP99RegressionPercent=${metrics.searchP99RegressionPercent} > 15`);
+if (metrics.thumbP95RegressionPercent > 10) violations.push(`thumbP95RegressionPercent=${metrics.thumbP95RegressionPercent} > 10`);
+const expectedCapturedEvents = metrics.captureWarmupSamples + metrics.captureSamples;
+if (metrics.reopenEvents !== expectedCapturedEvents + 600 || metrics.reopenFrontier !== expectedCapturedEvents) {
+  violations.push(`reopen=${metrics.reopenEvents}/${metrics.reopenFrontier}, expectedCaptured=${expectedCapturedEvents}`);
 }
 if (violations.length) throw new Error(`sync benchmark threshold failure: ${violations.join(", ")}`);
 

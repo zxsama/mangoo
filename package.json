@@ -29,6 +29,12 @@
     "bench:media-objects": "node tools/bench/media-object-storage-bench.mjs",
     "build:bundled-plugins": "node tools/build/build-bundled-plugins.mjs",
     "check:onedrive-bundle": "node tools/build/build-bundled-plugins.mjs --verify-onedrive",
+    "check:sync-integration": "node tools/checks/sync-integration.mjs",
+    "check:sync-legacy-absence": "node tools/checks/sync-legacy-absence.mjs",
+    "check:desktop-os-backdrop": "node tools/checks/desktop-os-backdrop.mjs",
+    "bench:sync-integration": "node tools/bench/sync-integration-bench.mjs",
+    "bench:renderer-sync": "node tools/bench/renderer-sync-performance.mjs",
+    "check:sync-release": "node tools/checks/sync-release.mjs",
     "test": "npm run check:structure && npm run check:core-api && npm run check:core-client && npm run check:notification-contract && npm run check:desktop && npm run check:web && npm run check:ui-design && npm run check:schema && npm run check:rust"
   },
   "engines": {

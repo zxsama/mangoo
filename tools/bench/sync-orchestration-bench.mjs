@@ -16,7 +16,7 @@ if (result.status !== 0) process.exit(result.status ?? 1);
 const match = result.stdout.match(/SYNC_BENCH_JSON=(\{[^\n]+\})/);
 if (!match) throw new Error("production sync coordinator did not emit benchmark metrics");
 const metrics = JSON.parse(match[1]);
-for (const field of ["libraries", "applyP95Ms", "applyP99Ms", "idleCpuPercent", "dormantPrivateMiB", "browseP95Ms", "searchP95Ms", "thumbP95Ms"]) {
+for (const field of ["libraries", "applyP95Ms", "applyP99Ms", "idleCpuPercent", "dormantPrivateMiB", "stressCpuPercent", "stressPrivateMiB", "baselineBrowseP95Ms", "baselineSearchP95Ms", "baselineThumbP95Ms", "browseP95Ms", "browseP99Ms", "browseP95RegressionPercent", "browseP99RegressionPercent", "searchP95Ms", "searchP99Ms", "searchP95RegressionPercent", "searchP99RegressionPercent", "thumbP95Ms", "thumbP99Ms", "thumbP95RegressionPercent"]) {
   if (!Number.isFinite(metrics[field])) throw new Error(`missing production metric: ${field}`);
 }
 if (metrics.libraries < 2) throw new Error("production scheduler benchmark needs multiple Libraries");

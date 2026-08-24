@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "groups": {
+    "core-atomicity": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-core", "sync::coordinator::tests::process_kill_fault_matrix_preserves_atomic_boundaries_and_recovery", "--", "--nocapture"],
+      "timeoutMs": 1800000
+    },
+    "provider-process": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-core", "--test", "plugin_runtime_process", "--", "--nocapture"],
+      "timeoutMs": 900000
+    },
+    "fake-provider": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-fake-provider", "--test", "process_conformance", "--", "--nocapture"],
+      "timeoutMs": 900000
+    },
+    "onedrive-emulator": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-onedrive-provider", "--features", "graph-emulator", "--test", "process_conformance", "--", "--nocapture"],
+      "timeoutMs": 1800000
+    },
+    "lifecycle": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-core", "sync::coordinator::tests::cancelled_media_binding_remains_fenced_against_late_turns", "--", "--nocapture"],
+      "timeoutMs": 900000
+    },
+    "host-lifecycle": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-core", "host_registry::tests::", "--", "--nocapture"],
+      "timeoutMs": 900000
+    },
+    "expired-upload": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-core", "sync::provider::tests::expired_partial_upload_restarts_without_committing_truncated_bytes", "--", "--nocapture"],
+      "timeoutMs": 900000
+    },
+    "reordered-delta": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-core", "sync::spool::tests::reordered_segments_wait_for_their_predecessor_and_then_converge", "--", "--nocapture"],
+      "timeoutMs": 900000
+    },
+    "media-disk-full": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-core", "sync::media::worker::tests::materialization_disk_full_is_durable_and_never_publishes_target", "--", "--nocapture"],
+      "timeoutMs": 900000
+    },
+    "short-range": {
+      "command": "cargo",
+      "args": ["test", "-p", "megle-core", "sync::media::recovery::tests::short_range_response_is_rejected_before_verification", "--", "--nocapture"],
+      "timeoutMs": 900000
+    }
+  },
+  "cases": [
+    { "id": "core-capture-crash", "group": "core-atomicity", "injection": "capture transaction kill points", "expectedDurableState": "no partial truth, event, or outbox commit", "retryOrAction": "reopen and recapture", "convergence": "required" },
+    { "id": "core-publication-crash", "group": "core-atomicity", "injection": "publication intent/canonicalization kill points", "expectedDurableState": "no invisible ready event", "retryOrAction": "resume publication", "convergence": "required" },
+    { "id": "media-publication-crash", "group": "core-atomicity", "injection": "data/manifest seal and receipt kill points", "expectedDurableState": "receipts reflect only durable immutable objects", "retryOrAction": "resume missing object", "convergence": "required" },
+    { "id": "media-materialization-crash", "group": "core-atomicity", "injection": "kill after verified staging sync", "expectedDurableState": "target remains hidden until atomic publish", "retryOrAction": "publish verified staging", "convergence": "required" },
+    { "id": "remote-apply-crash", "group": "core-atomicity", "injection": "ledger/projection/frontier kill points", "expectedDurableState": "no partial remote transaction", "retryOrAction": "replay immutable segment", "convergence": "required" },
+    { "id": "spool-registration-crash", "group": "core-atomicity", "injection": "durable spool and registration kill points", "expectedDurableState": "one durable segment registration", "retryOrAction": "idempotent rescan", "convergence": "required" },
+    { "id": "checkpoint-promotion-crash", "group": "core-atomicity", "injection": "payload, watermark, and promotion kill points", "expectedDurableState": "no partial ready descriptor or promoted catalog", "retryOrAction": "invalidate/rebuild/promote", "convergence": "required" },
+    { "id": "provider-crash-hang-tree", "group": "provider-process", "injection": "exit, hang, malformed stdout, descendant process", "expectedDurableState": "supervisor terminates the process tree without Catalog corruption", "retryOrAction": "restart provider", "convergence": "required" },
+    { "id": "provider-handshake-stream", "group": "fake-provider", "injection": "split framed RPC, range and immutable replay", "expectedDurableState": "correlated response and immutable hash fence", "retryOrAction": "restart/replay", "convergence": "required" },
+    { "id": "network-auth-throttle", "group": "onedrive-emulator", "injection": "network rejection, token refresh, invalid grant, 429/503", "expectedDurableState": "bounded retry or authorization-required; no cursor advance on failure", "retryOrAction": "backoff or reauthorize", "convergence": "required" },
+    { "id": "cursor-page-reset", "group": "onedrive-emulator", "injection": "Delta cursor reset and empty continuation page", "expectedDurableState": "full rescan without remote deletion inference", "retryOrAction": "restart root/library enumeration", "convergence": "required" },
+    { "id": "malformed-truncated-corrupt", "group": "onedrive-emulator", "injection": "malformed range, truncated object, corrupt fallback and oversized metadata", "expectedDurableState": "object remains unavailable and no ready state is published", "retryOrAction": "diagnose/retry clean object", "convergence": "required" },
+    { "id": "quota-upload-ambiguity", "group": "onedrive-emulator", "injection": "quota failure, 416 committed-offset ambiguity, 503 and abort", "expectedDurableState": "durable offset is reconciled and unpublished bytes stay invisible", "retryOrAction": "resume from provider receipt or surface quota", "convergence": "required" },
+    { "id": "unbind-generation-fence", "group": "lifecycle", "injection": "cancel during a late media turn", "expectedDurableState": "stale generation cannot commit", "retryOrAction": "explicit reconnect creates a new epoch", "convergence": "required" },
+    { "id": "account-switch-sign-out-reconnect", "group": "host-lifecycle", "injection": "account identity change, sign-out, reconnect fault and restore-plan fault", "expectedDurableState": "affected bindings pause or roll back atomically while unrelated Libraries remain usable", "retryOrAction": "reauthorize or explicitly reconnect", "convergence": "required" },
+    { "id": "expired-upload-session", "group": "expired-upload", "injection": "expired resumable upload followed by stale writes", "expectedDurableState": "truncated bytes never commit and a new session restarts safely", "retryOrAction": "restart upload", "convergence": "required" },
+    { "id": "permission-loss", "group": "fake-provider", "injection": "framed Provider child rejects active synchronization with authorization_required", "expectedDurableState": "no remote object or cursor state changes", "retryOrAction": "restore permission and reauthorize", "convergence": "required" },
+    { "id": "duplicate-reordered-delta-pages", "group": "reordered-delta", "injection": "duplicate and reordered Provider Delta objects and segments", "expectedDurableState": "objects remain idempotent and only the contiguous predecessor applies", "retryOrAction": "repeat enumeration", "convergence": "required" },
+    { "id": "media-disk-full", "group": "media-disk-full", "injection": "temporary disk reservation is smaller than the production recovery requirement", "expectedDurableState": "no target is published and the limiter records the disk rejection", "retryOrAction": "free space and retry", "convergence": "required" },
+    { "id": "short-range-response", "group": "short-range", "injection": "framed Provider returns fewer bytes than its declared Range response", "expectedDurableState": "the length mismatch is observable and the Core range validator refuses verification", "retryOrAction": "retry clean range", "convergence": "required" }
+  ]
+}

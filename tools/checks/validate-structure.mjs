@@ -738,7 +738,17 @@ const requiredFiles = [
   "tools/bench/managed-library-lifecycle-bench.mjs",
   "tools/bench/plugin-runtime-bench.mjs",
   "tools/bench/sync-orchestration-bench.mjs",
+  "tools/bench/sync-integration-bench.mjs",
+  "tools/bench/renderer-sync-performance.mjs",
+  "tools/checks/desktop-harness-lib.mjs",
+  "tools/checks/desktop-os-backdrop.mjs",
   "tools/build/build-bundled-plugins.mjs",
+  "tools/checks/sync-integration.mjs",
+  "tools/checks/sync-fault-matrix.json",
+  "tools/checks/sync-fault-matrix.mjs",
+  "tools/checks/sync-release.mjs",
+  "tools/checks/sync-release-lib.mjs",
+  "tools/checks/sync-legacy-absence.mjs",
   "tools/dev/managed-library-harness.mjs",
   "tools/dev/run-dev.mjs"
 ];
@@ -777,6 +787,12 @@ for (const scriptName of [
   "check:notification-contract",
   "check:schema",
   "check:rust",
+  "check:sync-integration",
+  "check:sync-legacy-absence",
+  "check:desktop-os-backdrop",
+  "bench:sync-integration",
+  "bench:renderer-sync",
+  "check:sync-release",
   "test"
 ]) {
   if (!packageJson.scripts?.[scriptName]) {
