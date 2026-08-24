@@ -10,6 +10,7 @@ RUN apt-get update \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY bundled-plugins ./bundled-plugins
 
 RUN cargo test --release -p megle-fake-provider --test process_conformance \
     && cargo test --release -p megle-onedrive-provider --features graph-emulator \
@@ -21,9 +22,21 @@ RUN cargo test --release -p megle-fake-provider --test process_conformance \
     && FAKE_BYTES=$(echo "$FAKE_HASH" | sed 's/../0x&,/g') \
     && ONEDRIVE_BYTES=$(echo "$ONEDRIVE_HASH" | sed 's/../0x&,/g') \
     && printf '// Generated during Docker build.\npub const GENERATED_FAKE_PROVIDER_SHA256: [u8; 32] = [%s];\npub const GENERATED_ONEDRIVE_PROVIDER_SHA256: [u8; 32] = [%s];\n' "$FAKE_BYTES" "$ONEDRIVE_BYTES" > crates/core/src/plugins/runtime/generated_trust.rs \
+    && mkdir -p target/release/bundled-plugins/com.megle.fake-sync/bin target/release/bundled-plugins/com.megle.onedrive/bin \
+    && cp target/release/megle-fake-provider target/release/bundled-plugins/com.megle.fake-sync/bin/megle-fake-provider \
+    && cp target/release/megle-onedrive-provider target/release/bundled-plugins/com.megle.onedrive/bin/megle-onedrive-provider \
+    && sed "s/__SHA256__/$FAKE_HASH/g" bundled-plugins/com.megle.fake-sync/plugin.template.json > target/release/bundled-plugins/com.megle.fake-sync/plugin.json \
+    && sed "s/__SHA256__/$ONEDRIVE_HASH/g" bundled-plugins/com.megle.onedrive/plugin.template.json > target/release/bundled-plugins/com.megle.onedrive/plugin.json \
     && cargo build --release -p megle-core \
     && cargo test --release -p megle-core --test plugin_runtime_process \
     && strip target/release/megle-core
+
+# Release-only Linux verifier. The final runtime image remains minimal; this
+# target retains Cargo/test artifacts so the exact archived tree can execute
+# production sync bootstrap, convergence, restore, fault and physical-transfer
+# probes inside Linux.
+FROM core-builder AS sync-verifier
+CMD ["cargo", "test", "--release", "-p", "megle-core"]
 
 # ---- Stage 2: Web UI builder -------------------------------------------------
 FROM node:22-slim AS web-builder

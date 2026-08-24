@@ -347,6 +347,7 @@ fn run_writer_actor(
     authoritative_commit_hook: Option<AuthoritativeCommitHook>,
 ) {
     crate::debug_log!("writer actor started");
+    let mut current_durability = WriteDurability::Derived;
     while let Some(message) = receiver.blocking_recv() {
         let first = match message {
             WriterMessage::Job(job) => job,
@@ -356,13 +357,21 @@ fn run_writer_actor(
             }
         };
         crate::debug_log!("writer running a job");
-        run_one(&mut database, first, authoritative_commit_hook.as_ref());
+        run_one(
+            &mut database,
+            first,
+            &mut current_durability,
+            authoritative_commit_hook.as_ref(),
+        );
         let mut shutdown_reply = None;
         while let Ok(next) = receiver.try_recv() {
             match next {
-                WriterMessage::Job(job) => {
-                    run_one(&mut database, job, authoritative_commit_hook.as_ref())
-                }
+                WriterMessage::Job(job) => run_one(
+                    &mut database,
+                    job,
+                    &mut current_durability,
+                    authoritative_commit_hook.as_ref(),
+                ),
                 WriterMessage::Shutdown(reply) => {
                     shutdown_reply = Some(reply);
                     break;
@@ -459,26 +468,19 @@ fn run_notification_flush_scheduler(
 fn run_one(
     database: &mut Database,
     queued: QueuedJob,
+    current_durability: &mut WriteDurability,
     authoritative_commit_hook: Option<&AuthoritativeCommitHook>,
 ) {
     let started = std::time::Instant::now();
-    let result = match queued.durability {
-        WriteDurability::Derived => database
-            .set_write_durability(WriteDurability::Derived)
-            .and_then(|_| (queued.job)(database)),
-        WriteDurability::Authoritative => {
-            let result = database
-                .set_write_durability(WriteDurability::Authoritative)
-                .and_then(|_| (queued.job)(database));
-            let restore = database.set_write_durability(WriteDurability::Derived);
-            match (result, restore) {
-                (Ok(value), Ok(())) => Ok(value),
-                (Err(error), _) => Err(error),
-                (Ok(_), Err(error)) => Err(error.context(
-                    "authoritative write committed but failed to restore derived durability",
-                )),
-            }
-        }
+    let result = if *current_durability == queued.durability {
+        (queued.job)(database)
+    } else {
+        database
+            .set_write_durability(queued.durability)
+            .and_then(|_| {
+                *current_durability = queued.durability;
+                (queued.job)(database)
+            })
     };
     crate::debug_log!(
         "writer job closure returned in {}ms (ok={})",

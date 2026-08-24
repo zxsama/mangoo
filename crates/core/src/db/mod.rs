@@ -1008,6 +1008,27 @@ impl Database {
         binding_epoch: uuid::Uuid,
         actor_epoch: uuid::Uuid,
     ) -> anyhow::Result<i64> {
+        self.begin_sync_capture_inner(binding_epoch, actor_epoch, true)
+    }
+
+    /// Starts the local actor after a checkpoint bootstrap. The restored
+    /// Catalog already contains remote content revisions, so seeding initial
+    /// publication intents here would incorrectly try to upload media that is
+    /// not present on this device yet.
+    pub(crate) fn begin_restored_sync_capture(
+        &self,
+        binding_epoch: uuid::Uuid,
+        actor_epoch: uuid::Uuid,
+    ) -> anyhow::Result<i64> {
+        self.begin_sync_capture_inner(binding_epoch, actor_epoch, false)
+    }
+
+    fn begin_sync_capture_inner(
+        &self,
+        binding_epoch: uuid::Uuid,
+        actor_epoch: uuid::Uuid,
+        seed_publication_intents: bool,
+    ) -> anyhow::Result<i64> {
         let transaction = self.connection.unchecked_transaction()?;
         let (device, stream, generation, active_actor, active_binding, capture_enabled): (
             Vec<u8>,
@@ -1039,7 +1060,9 @@ impl Database {
             "UPDATE sync_local_state SET active_actor_epoch=?1,active_binding_epoch=?2,next_actor_seq=1,capture_enabled=1,updated_at=?3 WHERE singleton=1",
             rusqlite::params![actor_epoch.as_bytes().as_slice(),binding_epoch.as_bytes().as_slice(),now],
         )?;
-        seed_initial_media_publication_intents(&transaction)?;
+        if seed_publication_intents {
+            seed_initial_media_publication_intents(&transaction)?;
+        }
         crate::sync::media::inventory::bind_pending_publication_jobs(
             &transaction,
             binding_epoch,

@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -9,17 +12,242 @@ const BINARY: u8 = 2;
 const END: u8 = 3;
 const CREDIT: u8 = 4;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Upload {
     key: String,
     size: u64,
     sha256: [u8; 32],
-    bytes: Vec<u8>,
+    committed_bytes: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredObject {
+    file_name: String,
+    size: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferCounters {
+    upload_wire_bytes: u64,
+    download_wire_bytes: u64,
+    data_range_wire_bytes: u64,
+    manifest_range_wire_bytes: u64,
+    range_requests: u64,
+    peak_buffered_bytes: u64,
+}
+
+struct Store {
+    root: PathBuf,
+    persistent: bool,
+    objects: BTreeMap<String, StoredObject>,
+    uploads: HashMap<String, Upload>,
+    counters: TransferCounters,
+}
+
+impl Store {
+    fn open() -> Result<Self, Box<dyn std::error::Error>> {
+        let configured = std::env::var_os("MEGLE_FAKE_PROVIDER_STATE_DIR").map(PathBuf::from);
+        let persistent = configured.is_some();
+        let root = configured.unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("megle-fake-provider")
+                .join(format!("{}-{}", std::process::id(), uuid::Uuid::now_v7()))
+        });
+        std::fs::create_dir_all(root.join("objects"))?;
+        std::fs::create_dir_all(root.join("uploads"))?;
+        let objects = read_json_or_default(&root.join("objects.json"))?;
+        let uploads = read_json_or_default(&root.join("uploads.json"))?;
+        let counters = read_json_or_default(&root.join("counters.json"))?;
+        Ok(Self {
+            root,
+            persistent,
+            objects,
+            uploads,
+            counters,
+        })
+    }
+
+    fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+
+    fn object_path(&self, object: &StoredObject) -> PathBuf {
+        self.root.join("objects").join(&object.file_name)
+    }
+
+    fn upload_path(&self, upload_id: &str) -> PathBuf {
+        self.root.join("uploads").join(format!("{upload_id}.part"))
+    }
+
+    fn save_objects(&self) -> Result<(), String> {
+        write_json_durable(&self.root.join("objects.json"), &self.objects)
+    }
+
+    fn save_uploads(&self) -> Result<(), String> {
+        write_json_durable(&self.root.join("uploads.json"), &self.uploads)
+    }
+
+    fn save_counters(&self) -> Result<(), String> {
+        write_json_durable(&self.root.join("counters.json"), &self.counters)
+    }
+
+    fn create_upload(&self, upload_id: &str) -> Result<(), String> {
+        File::create(self.upload_path(upload_id))
+            .and_then(|file| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        self.save_uploads()
+    }
+
+    fn append_upload(&mut self, upload_id: &str, bytes: &[u8]) -> Result<(), String> {
+        let path = self.upload_path(upload_id);
+        let committed = self
+            .uploads
+            .get(upload_id)
+            .ok_or_else(|| "upload not found".to_owned())?
+            .committed_bytes;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        if file.metadata().map_err(|error| error.to_string())?.len() != committed {
+            return Err("durable upload cursor mismatch".into());
+        }
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        file.sync_data().map_err(|error| error.to_string())?;
+        self.uploads
+            .get_mut(upload_id)
+            .expect("upload checked above")
+            .committed_bytes += bytes.len() as u64;
+        self.counters.upload_wire_bytes += bytes.len() as u64;
+        self.save_uploads()?;
+        self.save_counters()
+    }
+
+    fn commit_upload(&mut self, upload_id: &str) -> Result<Value, String> {
+        let upload = self
+            .uploads
+            .get(upload_id)
+            .cloned()
+            .ok_or_else(|| "upload not found".to_owned())?;
+        if upload.committed_bytes != upload.size {
+            return Err("upload incomplete".into());
+        }
+        let upload_path = self.upload_path(upload_id);
+        let actual = hash_file(&upload_path)?;
+        if actual != upload.sha256 {
+            return Err("upload digest mismatch".into());
+        }
+        if let Some(existing) = self.objects.get(&upload.key) {
+            let result = if existing.sha256 == actual {
+                json!({"status":"already_exists_matching","etag":hex(&actual)})
+            } else {
+                json!({"status":"hash_conflict","remoteSha256":hex(&existing.sha256)})
+            };
+            self.uploads.remove(upload_id);
+            let _ = std::fs::remove_file(upload_path);
+            self.save_uploads()?;
+            return Ok(result);
+        }
+        let file_name = format!("{}.bin", hex(&Sha256::digest(upload.key.as_bytes())));
+        std::fs::rename(&upload_path, self.root.join("objects").join(&file_name))
+            .map_err(|error| error.to_string())?;
+        self.objects.insert(
+            upload.key,
+            StoredObject {
+                file_name,
+                size: upload.size,
+                sha256: actual,
+            },
+        );
+        self.uploads.remove(upload_id);
+        self.save_objects()?;
+        self.save_uploads()?;
+        Ok(json!({"status":"created","etag":hex(&actual)}))
+    }
+
+    fn abort_upload(&mut self, upload_id: &str) -> Result<(), String> {
+        self.uploads.remove(upload_id);
+        match std::fs::remove_file(self.upload_path(upload_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        self.save_uploads()
+    }
+
+    fn put_immutable(&mut self, key: &str, bytes: &[u8], expected: &str) -> Result<Value, String> {
+        let actual: [u8; 32] = Sha256::digest(bytes).into();
+        if hex(&actual) != expected {
+            return Err("caller hash mismatch".into());
+        }
+        if let Some(existing) = self.objects.get(key) {
+            return Ok(if existing.sha256 == actual {
+                json!({"status":"already_exists_matching","etag":hex(&actual)})
+            } else {
+                json!({"status":"hash_conflict","remoteSha256":hex(&existing.sha256)})
+            });
+        }
+        let file_name = format!("{}.bin", hex(&Sha256::digest(key.as_bytes())));
+        let path = self.root.join("objects").join(&file_name);
+        let mut file = File::create(&path).map_err(|error| error.to_string())?;
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        self.objects.insert(
+            key.to_owned(),
+            StoredObject {
+                file_name,
+                size: bytes.len() as u64,
+                sha256: actual,
+            },
+        );
+        self.save_objects()?;
+        Ok(json!({"status":"created","etag":hex(&actual)}))
+    }
+}
+
+fn read_json_or_default<T>(path: &Path) -> Result<T, Box<dyn std::error::Error>>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_json_durable(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
+}
+
+fn hash_file(path: &Path) -> Result<[u8; 32], String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut objects = BTreeMap::<String, Vec<u8>>::new();
-    let mut uploads = HashMap::<String, Upload>::new();
+    let mut store = Store::open()?;
+    let fault_mode = std::env::var("MEGLE_FAKE_PROVIDER_FAULT").unwrap_or_default();
     let mut incoming = HashMap::<u64, (u64, [u8; 32])>::new();
     let mut next_stream_id = 2u64;
     let mut authenticated = false;
@@ -51,6 +279,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         envelope["messageType"] = json!("response");
+        if fault_mode == "permission-loss"
+            && !matches!(
+                method.as_str(),
+                "runtime.hello" | "diagnostics" | "shutdown"
+            )
+        {
+            envelope["messageType"] = json!("error");
+            envelope["payload"] = json!({
+                "code":"authorization_required",
+                "retryable":false,
+                "detail":"injected permission loss"
+            });
+            write_response(&mut output, &envelope)?;
+            continue;
+        }
         if method == "shutdown" {
             envelope["payload"] = Value::Null;
             write_response(&mut output, &envelope)?;
@@ -70,9 +313,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 json!({"pluginId":"com.megle.fake-sync","accountUuid":account_uuid,"capabilities":["sync-provider.v1"],"maxObjectBytes":67108864u64}),
             ),
             "health" => Ok(json!({"ready":true,"detail":null})),
-            "diagnostics" => {
-                Ok(json!({"implementation":"bundled-framed-child","objects":objects.len()}))
-            }
+            "diagnostics" => Ok(
+                json!({"implementation":"bundled-framed-child","objects":store.objects.len(),"persistent":store.is_persistent(),"transferCounters":store.counters}),
+            ),
             "auth.begin" => Ok(
                 json!({"authorizationUrl":"http://127.0.0.1/fake-authorize","flowId":uuid::Uuid::now_v7().to_string()}),
             ),
@@ -87,40 +330,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 authenticated = false;
                 Ok(Value::Null)
             }
-            "delta.list" => Ok(delta_page(&objects, &request)),
+            "delta.list" => Ok(delta_page(&store.objects, &request, &fault_mode)),
             "object.head" => Ok(object_metadata(
-                &objects,
+                &store.objects,
                 request["key"].as_str().unwrap_or_default(),
             )
             .unwrap_or(Value::Null)),
             "object.get" => {
                 let key = request["key"].as_str().ok_or("missing object key")?;
-                let bytes = objects.get(key).ok_or("object not found")?.clone();
-                if bytes.len() as u64 > request["maxBytes"].as_u64().unwrap_or(0) {
+                let object = store.objects.get(key).ok_or("object not found")?.clone();
+                if object.size > request["maxBytes"].as_u64().unwrap_or(0) {
                     return Err("object exceeds caller limit".into());
                 }
+                let bytes =
+                    std::fs::read(store.object_path(&object)).map_err(|error| error.to_string())?;
+                store.counters.peak_buffered_bytes =
+                    store.counters.peak_buffered_bytes.max(bytes.len() as u64);
                 let id = next_stream_id;
                 next_stream_id += 2;
-                let metadata = object_metadata(&objects, key).ok_or("object disappeared")?;
+                let metadata = object_metadata(&store.objects, key).ok_or("object disappeared")?;
                 send_plugin_stream(&mut input, &mut output, id, &bytes)
                     .map_err(|e| e.to_string())?;
+                store.counters.download_wire_bytes += bytes.len() as u64;
+                store.save_counters()?;
                 Ok(json!({"metadata":metadata,"streamId":id}))
             }
             "object.get_range" => {
                 let key = request["key"].as_str().ok_or("missing object key")?;
-                let bytes = objects.get(key).ok_or("object not found")?;
+                let object = store.objects.get(key).ok_or("object not found")?.clone();
                 let start = request["start"].as_u64().ok_or("missing range start")?;
                 let end = request["end"].as_u64().ok_or("missing range end")?;
                 let max_bytes = request["maxBytes"].as_u64().unwrap_or(0);
-                if end <= start || end > bytes.len() as u64 || end - start > max_bytes {
+                if end <= start || end > object.size || end - start > max_bytes {
                     return Err("invalid object range".into());
                 }
-                let range = bytes[start as usize..end as usize].to_vec();
+                let mut file = File::open(store.object_path(&object)).map_err(|e| e.to_string())?;
+                file.seek(SeekFrom::Start(start))
+                    .map_err(|e| e.to_string())?;
+                let mut range =
+                    vec![0_u8; usize::try_from(end - start).map_err(|e| e.to_string())?];
+                file.read_exact(&mut range).map_err(|e| e.to_string())?;
+                if fault_mode == "short-range" && range.len() > 1 {
+                    range.pop();
+                }
+                store.counters.peak_buffered_bytes =
+                    store.counters.peak_buffered_bytes.max(range.len() as u64);
                 let id = next_stream_id;
                 next_stream_id += 2;
-                let metadata = object_metadata(&objects, key).ok_or("object disappeared")?;
+                let metadata = object_metadata(&store.objects, key).ok_or("object disappeared")?;
                 send_plugin_stream(&mut input, &mut output, id, &range)
                     .map_err(|e| e.to_string())?;
+                store.counters.download_wire_bytes += range.len() as u64;
+                store.counters.range_requests += 1;
+                if key.starts_with("content/data/") {
+                    store.counters.data_range_wire_bytes += range.len() as u64;
+                } else if key.starts_with("content/manifests/") {
+                    store.counters.manifest_range_wire_bytes += range.len() as u64;
+                }
+                store.save_counters()?;
                 Ok(
                     json!({"metadata":metadata,"streamId":id,"responseStart":start,"responseEnd":end,"wholeObject":false}),
                 )
@@ -130,8 +397,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let declaration = incoming.remove(&id).ok_or("stream not open")?;
                 let bytes =
                     receive_host_stream(&mut input, id, declaration).map_err(|e| e.to_string())?;
-                put_immutable(
-                    &mut objects,
+                store.counters.peak_buffered_bytes =
+                    store.counters.peak_buffered_bytes.max(bytes.len() as u64);
+                store.counters.upload_wire_bytes += bytes.len() as u64;
+                store.save_counters()?;
+                store.put_immutable(
                     request["key"].as_str().ok_or("missing key")?,
                     &bytes,
                     request["sha256"].as_str().ok_or("missing hash")?,
@@ -139,16 +409,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "upload.begin" => {
                 let upload_id = uuid::Uuid::now_v7().to_string();
-                uploads.insert(
-                    upload_id.clone(),
-                    Upload {
-                        key: request["key"].as_str().ok_or("missing key")?.to_owned(),
-                        size: request["size"].as_u64().ok_or("missing size")?,
-                        sha256: parse_hash(request["sha256"].as_str().ok_or("missing hash")?)
-                            .map_err(|e| e.to_string())?,
-                        bytes: Vec::new(),
-                    },
-                );
+                let upload = Upload {
+                    key: request["key"].as_str().ok_or("missing key")?.to_owned(),
+                    size: request["size"].as_u64().ok_or("missing size")?,
+                    sha256: parse_hash(request["sha256"].as_str().ok_or("missing hash")?)
+                        .map_err(|e| e.to_string())?,
+                    committed_bytes: 0,
+                };
+                store.uploads.insert(upload_id.clone(), upload);
+                store.create_upload(&upload_id)?;
                 Ok(json!({"uploadId":upload_id,"committedBytes":0}))
             }
             "upload.write" => {
@@ -156,37 +425,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let declaration = incoming.remove(&id).ok_or("stream not open")?;
                 let bytes =
                     receive_host_stream(&mut input, id, declaration).map_err(|e| e.to_string())?;
-                let upload = uploads
-                    .get_mut(request["uploadId"].as_str().ok_or("missing upload id")?)
-                    .ok_or("upload not found")?;
-                if request["offset"].as_u64() != Some(upload.bytes.len() as u64)
-                    || upload.bytes.len() + bytes.len() > upload.size as usize
+                store.counters.peak_buffered_bytes =
+                    store.counters.peak_buffered_bytes.max(bytes.len() as u64);
+                let upload_id = request["uploadId"].as_str().ok_or("missing upload id")?;
+                let upload = store.uploads.get(upload_id).ok_or("upload not found")?;
+                if request["offset"].as_u64() != Some(upload.committed_bytes)
+                    || upload.committed_bytes + bytes.len() as u64 > upload.size
                 {
                     Err("upload offset or size mismatch".into())
                 } else {
-                    upload.bytes.extend(bytes);
-                    Ok(json!({"committedBytes":upload.bytes.len()}))
+                    store.append_upload(upload_id, &bytes)?;
+                    Ok(json!({"committedBytes":store.uploads[upload_id].committed_bytes}))
                 }
             }
             "upload.commit" => {
-                let upload = uploads
-                    .remove(request["uploadId"].as_str().ok_or("missing upload id")?)
-                    .ok_or("upload not found")?;
-                if upload.bytes.len() as u64 != upload.size
-                    || Sha256::digest(&upload.bytes).as_slice() != upload.sha256
-                {
-                    Err("upload incomplete or corrupt".into())
-                } else {
-                    put_immutable(
-                        &mut objects,
-                        &upload.key,
-                        &upload.bytes,
-                        &hex(&upload.sha256),
-                    )
-                }
+                store.commit_upload(request["uploadId"].as_str().ok_or("missing upload id")?)
             }
             "upload.abort" => {
-                uploads.remove(request["uploadId"].as_str().unwrap_or_default());
+                store.abort_upload(request["uploadId"].as_str().unwrap_or_default())?;
                 Ok(Value::Null)
             }
             _ => Err(format!("unknown method: {method}")),
@@ -204,49 +460,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn delta_page(objects: &BTreeMap<String, Vec<u8>>, request: &Value) -> Value {
+fn delta_page(
+    objects: &BTreeMap<String, StoredObject>,
+    request: &Value,
+    fault_mode: &str,
+) -> Value {
     let start = request["pageToken"]
         .as_str()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let limit = request["limit"].as_u64().unwrap_or(100).clamp(1, 100) as usize;
-    let items = objects
+    let mut items = objects
         .iter()
         .skip(start)
         .take(limit)
         .map(|(key, _)| object_metadata(objects, key).unwrap())
         .collect::<Vec<_>>();
+    if fault_mode == "reordered-delta" {
+        items.reverse();
+        if let Some(first) = items.first().cloned() {
+            items.push(first);
+        }
+    }
     let next = start + items.len();
     json!({"objects":items,"pageToken":(next < objects.len()).then(|| next.to_string()),"completedCursor":(next >= objects.len()).then(|| format!("v{}", objects.len()))})
 }
 
-fn object_metadata(objects: &BTreeMap<String, Vec<u8>>, key: &str) -> Option<Value> {
-    objects.get(key).map(|bytes| {
-        let digest = Sha256::digest(bytes);
-        json!({"key":key,"size":bytes.len(),"sha256":hex(&digest),"etag":hex(&digest)})
+fn object_metadata(objects: &BTreeMap<String, StoredObject>, key: &str) -> Option<Value> {
+    objects.get(key).map(|object| {
+        json!({"key":key,"size":object.size,"sha256":hex(&object.sha256),"etag":hex(&object.sha256)})
     })
-}
-
-fn put_immutable(
-    objects: &mut BTreeMap<String, Vec<u8>>,
-    key: &str,
-    bytes: &[u8],
-    expected: &str,
-) -> Result<Value, String> {
-    let actual = Sha256::digest(bytes);
-    if hex(&actual) != expected {
-        return Err("caller hash mismatch".into());
-    }
-    if let Some(existing) = objects.get(key) {
-        let remote = Sha256::digest(existing);
-        return Ok(if remote.as_slice() == actual.as_slice() {
-            json!({"status":"already_exists_matching","etag":hex(&remote)})
-        } else {
-            json!({"status":"hash_conflict","remoteSha256":hex(&remote)})
-        });
-    }
-    objects.insert(key.to_owned(), bytes.to_vec());
-    Ok(json!({"status":"created","etag":hex(&actual)}))
 }
 
 fn receive_host_stream(

@@ -377,6 +377,10 @@ pub async fn upload_sealed_objects(
                         now,
                     )
                     .await?;
+                    crate::sync::fault::add_and_hit_after_bytes(
+                        "media.after-upload-cursor",
+                        requested as u64,
+                    );
                     offset = end;
                     session.committed_bytes = committed;
                 }

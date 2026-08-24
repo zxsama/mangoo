@@ -2235,12 +2235,15 @@ fn verify_descriptor_identity(descriptor: &LibraryDescriptor) -> anyhow::Result<
 mod tests {
     use super::*;
 
-    fn test_manager(base: &Path) -> LibraryManager {
+    const FAKE_PLUGIN_ID: &str = "com.megle.fake-sync";
+    const FAKE_ACCOUNT_ID: &str = "fake-account";
+
+    fn isolated_manager(base: &Path, bundled_plugins_dir: PathBuf) -> LibraryManager {
         let registry = Arc::new(HostRegistry::open(&base.join("host.sqlite")).unwrap());
         LibraryManager::new(
             registry,
             base.join("libraries"),
-            base.join("bundled-plugins"),
+            bundled_plugins_dir,
             Some(Arc::new(
                 crate::plugins::secret_store::MemorySecretStore::default(),
             )),
@@ -2252,6 +2255,84 @@ mod tests {
             })),
             Arc::new(tokio::sync::RwLock::new(())),
         )
+    }
+
+    fn test_manager(base: &Path) -> LibraryManager {
+        isolated_manager(base, base.join("bundled-plugins"))
+    }
+
+    fn platform() -> crate::plugins::manifest::Platform {
+        if cfg!(windows) {
+            crate::plugins::manifest::Platform::WindowsX64
+        } else {
+            crate::plugins::manifest::Platform::LinuxX64
+        }
+    }
+
+    fn configure_fake_provider(
+        manager: &LibraryManager,
+        bundled_root: &Path,
+    ) -> crate::plugins::manifest::ManifestRecord {
+        let manifest =
+            crate::plugins::parse_manifest(&bundled_root.join(FAKE_PLUGIN_ID).join("plugin.json"))
+                .unwrap();
+        let entry = manifest.entry_for(platform()).unwrap();
+        let executable = bundled_root.join(FAKE_PLUGIN_ID).join(entry);
+        assert!(executable.is_file(), "bundled fake Provider was not built");
+        let hash = crate::plugins::manifest::sha256_file(&executable).unwrap();
+        let permissions = serde_json::to_string(&manifest.requested_permissions).unwrap();
+        manager
+            .registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: &manifest.id,
+                version: &manifest.version,
+                manifest_json: &serde_json::to_string(&manifest).unwrap(),
+                entry_relative_path: entry,
+                entry_sha256: &hash,
+                install_root: &bundled_root.join(FAKE_PLUGIN_ID),
+                trust_policy_id: "embedded-v1",
+                requested_permissions_json: &permissions,
+            })
+            .unwrap();
+        manager
+            .registry
+            .set_plugin_grants(FAKE_PLUGIN_ID, &permissions, true)
+            .unwrap();
+        manager
+            .registry
+            .upsert_plugin_account(
+                FAKE_ACCOUNT_ID,
+                FAKE_PLUGIN_ID,
+                Some("Bundled Fake Account"),
+                "authenticated",
+            )
+            .unwrap();
+        manager
+            .registry
+            .set_plugin_intent(FAKE_PLUGIN_ID, true, true)
+            .unwrap();
+        manifest
+    }
+
+    async fn activate_fake_provider(
+        manager: &LibraryManager,
+        manifest: &crate::plugins::manifest::ManifestRecord,
+        bundled_root: &Path,
+        runtime: &Path,
+    ) -> crate::plugins::runtime::supervisor::ActivatedProvider {
+        crate::plugins::runtime::supervisor::activate_and_register(
+            &manager.provider_manager(),
+            manifest,
+            FAKE_ACCOUNT_ID,
+            manifest.requested_permissions.clone(),
+            &bundled_root.join(FAKE_PLUGIN_ID),
+            platform(),
+            crate::plugins::runtime::trust::embedded_trust_registry(),
+            runtime.to_path_buf(),
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     fn creation_intent(base: &Path, suffix: &str) -> CreationIntent {
@@ -2519,6 +2600,799 @@ mod tests {
         assert_eq!(snapshot.libraries.len(), 1);
         assert_eq!(snapshot.libraries[0].library_uuid, first.0.library_uuid);
         drop(manager);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Release integration entry point: exercises the production managed-Library
+    /// creation and reopen path from an empty Host without any legacy Catalog
+    /// selector or root-adoption compatibility branch.
+    #[tokio::test]
+    async fn clean_managed_bootstrap_reopens_current_schema() {
+        let base = std::env::temp_dir().join(format!("megle-clean-bootstrap-{}", Uuid::now_v7()));
+        let managed_root = base.join("managed-root");
+        fs::create_dir_all(&base).unwrap();
+
+        let manager = test_manager(&base);
+        let (created, activated, activation_error) = manager
+            .create_library(
+                "Clean bootstrap".into(),
+                None,
+                None,
+                managed_root.clone(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(activated, "new managed Library must become active");
+        assert!(activation_error.is_none());
+        let initial = manager.active_snapshot();
+        assert_eq!(
+            initial.library_uuid.as_deref(),
+            Some(created.library_uuid.as_str())
+        );
+        assert_eq!(manager.registry.snapshot().unwrap().libraries.len(), 1);
+        let marker = read_marker(&managed_root).unwrap();
+        assert_eq!(marker.state, MarkerState::Committed);
+        assert_eq!(marker.library_uuid, created.library_uuid);
+        assert_eq!(marker.root_uuid, created.root_uuid);
+        verify_descriptor_identity(&created).unwrap();
+        let catalog_path = created.local_data_dir.join("catalog.sqlite");
+        let database = Database::open(&catalog_path).unwrap();
+        let migration: i64 = database
+            .connection_for_fsops()
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let identity: (Vec<u8>, Vec<u8>) = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT library_uuid,device_uuid FROM sync_local_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(migration, 29);
+        assert_eq!(
+            Uuid::from_slice(&identity.0).unwrap().to_string(),
+            created.library_uuid
+        );
+        assert_eq!(
+            Uuid::from_slice(&identity.1).unwrap(),
+            manager.registry.device_uuid().unwrap()
+        );
+        drop(database);
+        if let Some(runtime) = initial.runtime {
+            runtime.shutdown().await.unwrap();
+        }
+        drop(manager);
+
+        let reopened = test_manager(&base);
+        reopened.restore_active().await.unwrap();
+        let snapshot = reopened.active_snapshot();
+        assert_eq!(
+            snapshot.library_uuid.as_deref(),
+            Some(created.library_uuid.as_str())
+        );
+        assert!(snapshot.runtime.is_some());
+        let reopened_descriptor = reopened
+            .registry
+            .library(&created.library_uuid)
+            .unwrap()
+            .unwrap();
+        verify_descriptor_identity(&reopened_descriptor).unwrap();
+        assert_eq!(reopened.registry.snapshot().unwrap().libraries.len(), 1);
+        if let Some(runtime) = snapshot.runtime {
+            runtime.shutdown().await.unwrap();
+        }
+        drop(reopened);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Docker release verifier invoked in two independent containers sharing
+    /// only `/evidence`. The first phase persists a real managed Library and a
+    /// framed fake-Provider immutable object; the second reopens the Host and
+    /// proves that registry, Catalog, binding and Provider state survived the
+    /// volume restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "invoked twice by the exact-tree Docker release harness"]
+    async fn docker_volume_restart_persists_library_catalog_and_sync_state() {
+        let phase = std::env::var("MEGLE_DOCKER_PERSISTENCE_PHASE")
+            .expect("MEGLE_DOCKER_PERSISTENCE_PHASE must be create or verify");
+        let base = PathBuf::from(
+            std::env::var("MEGLE_DOCKER_PERSISTENCE_ROOT")
+                .expect("MEGLE_DOCKER_PERSISTENCE_ROOT must be mounted from a Docker volume"),
+        );
+        let bundled_root = PathBuf::from(
+            std::env::var("MEGLE_SYNC_BUNDLED_PLUGINS_DIR")
+                .expect("MEGLE_SYNC_BUNDLED_PLUGINS_DIR must identify packaged Providers"),
+        );
+        fs::create_dir_all(&base).unwrap();
+        let state_file = base.join("expected.json");
+        if phase == "create" {
+            assert!(
+                !state_file.exists(),
+                "create phase must start from an empty verifier state"
+            );
+            let manager = isolated_manager(&base, bundled_root.clone());
+            let manifest = configure_fake_provider(&manager, &bundled_root);
+            let provider = activate_fake_provider(
+                &manager,
+                &manifest,
+                &bundled_root,
+                &base.join("provider-runtime"),
+            )
+            .await;
+            manager
+                .registry
+                .record_plugin_runtime_ready(
+                    FAKE_PLUGIN_ID,
+                    "docker-persistence-create",
+                    &["sync-provider.v1".into()],
+                )
+                .unwrap();
+            let (library, _, _) = manager
+                .create_library(
+                    "Docker Persistent Library".into(),
+                    None,
+                    None,
+                    base.join("managed"),
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+            manager
+                .enable_library_sync_with_revision(
+                    &library.library_uuid,
+                    manager.active_snapshot().context_revision,
+                    FAKE_PLUGIN_ID,
+                    FAKE_ACCOUNT_ID,
+                )
+                .await
+                .unwrap();
+            let binding = manager
+                .registry
+                .binding_transport(&library.library_uuid, "library")
+                .unwrap()
+                .unwrap();
+            let namespace = binding
+                .remote_namespace
+                .clone()
+                .unwrap_or_else(|| library.library_uuid.clone());
+            let context = crate::sync::provider::TransportContext {
+                namespace: namespace.clone(),
+                binding_epoch: binding.binding_epoch.to_string(),
+                transport_generation: u64::try_from(binding.transport_generation).unwrap(),
+            };
+            let marker = b"megle-docker-volume-sync-state".to_vec();
+            let hash = crate::sync::codec::sha256(&marker);
+            provider
+                .provider
+                .object_put_immutable(&context, "objects/release/persistence", &marker, hash)
+                .await
+                .unwrap();
+            fs::write(
+                &state_file,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "libraryUuid": library.library_uuid,
+                    "remoteNamespace": namespace,
+                    "bindingEpoch": binding.binding_epoch,
+                    "transportGeneration": binding.transport_generation,
+                    "objectSha256": crate::sync::media::hex_hash(&hash),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            if let Some(runtime) = manager.active_snapshot().runtime {
+                runtime.shutdown().await.unwrap();
+            }
+            provider.shutdown().await.unwrap();
+        } else if phase == "verify" {
+            let expected: serde_json::Value =
+                serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+            let library_uuid = expected["libraryUuid"].as_str().unwrap();
+            let manager = isolated_manager(&base, bundled_root.clone());
+            let manifest = configure_fake_provider(&manager, &bundled_root);
+            let provider = activate_fake_provider(
+                &manager,
+                &manifest,
+                &bundled_root,
+                &base.join("provider-runtime"),
+            )
+            .await;
+            manager
+                .registry
+                .record_plugin_runtime_ready(
+                    FAKE_PLUGIN_ID,
+                    "docker-persistence-verify",
+                    &["sync-provider.v1".into()],
+                )
+                .unwrap();
+            manager.restore_active().await.unwrap();
+            let snapshot = manager.active_snapshot();
+            assert_eq!(snapshot.library_uuid.as_deref(), Some(library_uuid));
+            let library = manager.registry.library(library_uuid).unwrap().unwrap();
+            verify_descriptor_identity(&library).unwrap();
+            let catalog = Database::open(&library.local_data_dir.join("catalog.sqlite")).unwrap();
+            let schema: i64 = catalog
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                schema, 29,
+                "all production Catalog migrations must be present"
+            );
+            let capture: bool = catalog
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT capture_enabled FROM sync_local_state WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(capture);
+            drop(catalog);
+            let context = crate::sync::provider::TransportContext {
+                namespace: expected["remoteNamespace"].as_str().unwrap().to_owned(),
+                binding_epoch: expected["bindingEpoch"].as_str().unwrap().to_owned(),
+                transport_generation: expected["transportGeneration"].as_u64().unwrap(),
+            };
+            let object = provider
+                .provider
+                .object_head(&context, "objects/release/persistence")
+                .await
+                .unwrap()
+                .expect("Provider object must survive the Docker volume restart");
+            assert_eq!(
+                crate::sync::media::hex_hash(&object.sha256),
+                expected["objectSha256"].as_str().unwrap()
+            );
+            provider.shutdown().await.unwrap();
+            if let Some(runtime) = snapshot.runtime {
+                runtime.shutdown().await.unwrap();
+            }
+        } else {
+            panic!("unsupported persistence phase {phase}");
+        }
+    }
+
+    /// Release integration entry point: two isolated Hosts share only one
+    /// verified bundled Provider child. Device B starts without a Catalog,
+    /// restores the seed checkpoint through framed RPC, then both devices
+    /// capture independent offline edits and converge through production
+    /// coordinator turns. A third Host repeats the no-Catalog restore after
+    /// the concurrent event tail is published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "invoked by tools/checks/sync-integration.mjs"]
+    async fn real_provider_two_device_and_third_device_restore() {
+        let bundled_root = std::env::var_os("MEGLE_SYNC_BUNDLED_PLUGINS_DIR")
+            .map(PathBuf::from)
+            .expect("MEGLE_SYNC_BUNDLED_PLUGINS_DIR must identify the packaged Provider root");
+        let base = std::env::temp_dir().join(format!("megle-real-two-device-{}", Uuid::now_v7()));
+        let device_a_root = base.join("device-a");
+        let device_b_root = base.join("device-b");
+        let device_c_root = base.join("device-c");
+        fs::create_dir_all(&device_a_root).unwrap();
+        fs::create_dir_all(&device_b_root).unwrap();
+        fs::create_dir_all(&device_c_root).unwrap();
+
+        let manager_a = isolated_manager(&device_a_root, bundled_root.clone());
+        let manifest = configure_fake_provider(&manager_a, &bundled_root);
+        let provider_a = activate_fake_provider(
+            &manager_a,
+            &manifest,
+            &bundled_root,
+            &base.join("provider-runtime"),
+        )
+        .await;
+        manager_a
+            .registry
+            .record_plugin_runtime_ready(
+                FAKE_PLUGIN_ID,
+                "two-device-integration",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+
+        let (library_a, _, _) = manager_a
+            .create_library(
+                "Shared Library".into(),
+                None,
+                None,
+                device_a_root.join("managed"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let catalog_a = library_a.local_data_dir.join("catalog.sqlite");
+        let database_a = Database::open(&catalog_a).unwrap();
+        let root_id = database_a
+            .connection_for_fsops()
+            .query_row("SELECT id FROM roots LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let folder_id = database_a
+            .upsert_folder(crate::db::FolderUpsert {
+                root_id,
+                parent_id: None,
+                name: "Shared".into(),
+                path_hash: "shared".into(),
+                mtime: Some(1),
+            })
+            .unwrap();
+        let file_id_a = database_a
+            .upsert_file(crate::db::FileUpsert {
+                root_id,
+                folder_id,
+                name: "seed.png".into(),
+                ext: "png".into(),
+                size: 16,
+                mtime: 1,
+                ctime: None,
+                file_key: Some("seed-file".into()),
+            })
+            .unwrap();
+        let source_path = PathBuf::from(
+            database_a
+                .connection_for_fsops()
+                .query_row("SELECT path FROM roots WHERE id=?1", [root_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+        )
+        .join("Shared")
+        .join("seed.png");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let pixels = image::RgbaImage::from_fn(1024, 1024, |x, y| {
+            image::Rgba([
+                x.wrapping_mul(37).wrapping_add(y) as u8,
+                y.wrapping_mul(61).wrapping_add(x) as u8,
+                x.wrapping_mul(y).wrapping_add(17) as u8,
+                255,
+            ])
+        });
+        let mut source_cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut source_cursor, image::ImageFormat::Png)
+            .unwrap();
+        let source_bytes = source_cursor.into_inner();
+        fs::write(&source_path, &source_bytes).unwrap();
+        database_a
+            .connection_for_fsops()
+            .execute(
+                "UPDATE files SET size=?1 WHERE id=?2",
+                rusqlite::params![source_bytes.len() as i64, file_id_a],
+            )
+            .unwrap();
+        database_a
+            .create_sync_publication_intent(
+                file_id_a,
+                &source_path.to_string_lossy(),
+                source_bytes.len() as i64,
+            )
+            .unwrap();
+        drop(database_a);
+        manager_a
+            .enable_library_sync_with_revision(
+                &library_a.library_uuid,
+                0,
+                FAKE_PLUGIN_ID,
+                FAKE_ACCOUNT_ID,
+            )
+            .await
+            .unwrap();
+        // Media dependencies are published before the event/checkpoint that
+        // references them. Drive bounded turns until the seed is remotely
+        // restorable through the real framed child.
+        for _ in 0..8 {
+            manager_a
+                .sync_coordinator
+                .run_library_turn(&library_a.library_uuid, &catalog_a)
+                .await
+                .unwrap();
+        }
+
+        let manager_b = isolated_manager(&device_b_root, bundled_root.clone());
+        configure_fake_provider(&manager_b, &bundled_root);
+        manager_b
+            .registry
+            .record_plugin_runtime_ready(
+                FAKE_PLUGIN_ID,
+                "two-device-integration",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+        manager_b
+            .provider_manager()
+            .register(FAKE_PLUGIN_ID, FAKE_ACCOUNT_ID, provider_a.provider.clone())
+            .unwrap();
+        let library_b = manager_b
+            .create_restore_library(
+                library_a.library_uuid.clone(),
+                "Shared Library".into(),
+                device_b_root.join("managed"),
+                FAKE_ACCOUNT_ID,
+            )
+            .await
+            .unwrap();
+        let catalog_b = library_b.local_data_dir.join("catalog.sqlite");
+        assert!(!catalog_b.exists(), "restore must begin without a Catalog");
+        manager_b
+            .sync_coordinator
+            .run_library_turn(&library_b.library_uuid, &catalog_b)
+            .await
+            .unwrap();
+        assert!(
+            catalog_b.is_file(),
+            "device B did not materialize the seed Catalog"
+        );
+        let transport_b = manager_b
+            .registry
+            .binding_transport(&library_b.library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        let database_b = Database::open(&catalog_b).unwrap();
+        let generation_b = database_b
+            .begin_sync_capture(transport_b.binding_epoch, transport_b.actor_epoch)
+            .unwrap();
+        assert!(generation_b >= 1);
+        drop(database_b);
+
+        // Both devices edit while disconnected (no coordinator turns). The
+        // separate actor identities and binding epochs are retained in their
+        // local event ledgers until reconnection.
+        let database_a = Database::open(&catalog_a).unwrap();
+        database_a
+            .upsert_user_metadata_partial(
+                file_id_a,
+                crate::db::UserMetadataPatch {
+                    rating: Some(Some(5)),
+                    favorite: None,
+                    note: Some(Some("device-a".into())),
+                },
+            )
+            .unwrap();
+        let tag = database_a
+            .create_tag("shared-tag", Some("#4477aa"))
+            .unwrap();
+        database_a.add_file_tag(file_id_a, tag.id).unwrap();
+        let asset_uuid = database_a
+            .connection_for_fsops()
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE id=?1",
+                [file_id_a],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        let asset = crate::sync::capture::entity_uuid(&asset_uuid).unwrap();
+        let parent_uuid = database_a
+            .connection_for_fsops()
+            .query_row(
+                "SELECT fo.folder_uuid FROM files f JOIN folders fo ON fo.id=f.folder_id WHERE f.id=?1",
+                [file_id_a],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map(|bytes| crate::sync::types::EntityUuid(Uuid::from_slice(&bytes).unwrap()))
+            .unwrap();
+        let location_supersedes = database_a
+            .connection_for_fsops()
+            .prepare("SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1")
+            .unwrap()
+            .query_map([asset_uuid.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|row| crate::sync::types::RevisionUuid(Uuid::from_slice(&row.unwrap()).unwrap()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let delete_token = crate::sync::types::EventUuid::new();
+        for operation in [
+            crate::sync::types::Operation::SetLocation {
+                revision_uuid: crate::sync::types::RevisionUuid::new(),
+                parent_uuid: Some(parent_uuid),
+                name: "renamed-seed.png".into(),
+                supersedes: location_supersedes,
+            },
+            crate::sync::types::Operation::Delete {
+                token: delete_token,
+            },
+            crate::sync::types::Operation::Restore {
+                observed_tokens: std::collections::BTreeSet::from([delete_token]),
+            },
+        ] {
+            let transaction = database_a
+                .connection_for_fsops()
+                .unchecked_transaction()
+                .unwrap();
+            crate::sync::capture::capture_catalog_mutation_if_initialized(
+                &transaction,
+                crate::sync::capture::MutationOrigin::LocalApi,
+                asset,
+                operation,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        let database_b = Database::open(&catalog_b).unwrap();
+        let file_id_b: i64 = database_b
+            .connection_for_fsops()
+            .query_row("SELECT id FROM files LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        database_b
+            .upsert_user_metadata_partial(
+                file_id_b,
+                crate::db::UserMetadataPatch {
+                    rating: Some(Some(2)),
+                    favorite: Some(true),
+                    note: None,
+                },
+            )
+            .unwrap();
+        drop(database_a);
+        drop(database_b);
+
+        // Publish each device, then pull/apply the other's immutable segment.
+        for _ in 0..4 {
+            manager_a
+                .sync_coordinator
+                .run_library_turn(&library_a.library_uuid, &catalog_a)
+                .await
+                .unwrap();
+            manager_b
+                .sync_coordinator
+                .run_library_turn(&library_b.library_uuid, &catalog_b)
+                .await
+                .unwrap();
+        }
+
+        let logical_digest = |path: &Path| -> (
+            Vec<(String, String, String)>,
+            Vec<(String, i64, i64, String)>,
+            Vec<(String, i64)>,
+            Vec<(String, String)>,
+        ) {
+            let database = Database::open(path).unwrap();
+            let connection = database.connection_for_fsops();
+            let files = connection
+                .prepare("SELECT lower(hex(asset_uuid)),name,status FROM files ORDER BY asset_uuid")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let metadata = connection
+                .prepare("SELECT lower(hex(f.asset_uuid)),COALESCE(u.rating,-1),u.favorite,COALESCE(u.note,'') FROM files f LEFT JOIN user_metadata u ON u.file_id=f.id ORDER BY f.asset_uuid")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let frontier = connection
+                .prepare("SELECT lower(hex(f.actor_epoch)),f.applied_through_seq FROM sync_actor_frontiers f WHERE EXISTS (SELECT 1 FROM sync_events e WHERE e.actor_epoch=f.actor_epoch AND e.hlc_wall_ms>0) ORDER BY f.actor_epoch")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let tags = connection
+                .prepare("SELECT t.name,lower(hex(f.asset_uuid)) FROM tags t JOIN file_tags ft ON ft.tag_id=t.id JOIN files f ON f.id=ft.file_id ORDER BY t.name,f.asset_uuid")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (files, metadata, frontier, tags)
+        };
+        let digest_a = logical_digest(&catalog_a);
+        let digest_b = logical_digest(&catalog_b);
+        assert_eq!(
+            digest_a, digest_b,
+            "two production devices did not converge"
+        );
+        assert_eq!(digest_a.1[0].2, 1);
+        assert_eq!(digest_a.1[0].3, "device-a");
+        assert_eq!(digest_a.0[0].1, "renamed-seed.png");
+        assert_eq!(digest_a.0[0].2, "active");
+        assert_eq!(digest_a.3[0].0, "shared-tag");
+
+        // Repeat delivery through both live coordinators and prove idempotence.
+        for _ in 0..2 {
+            manager_a
+                .sync_coordinator
+                .run_library_turn(&library_a.library_uuid, &catalog_a)
+                .await
+                .unwrap();
+            manager_b
+                .sync_coordinator
+                .run_library_turn(&library_b.library_uuid, &catalog_b)
+                .await
+                .unwrap();
+        }
+        assert_eq!(logical_digest(&catalog_a), digest_a);
+        assert_eq!(logical_digest(&catalog_b), digest_b);
+
+        let manager_c = isolated_manager(&device_c_root, bundled_root.clone());
+        configure_fake_provider(&manager_c, &bundled_root);
+        manager_c
+            .registry
+            .record_plugin_runtime_ready(
+                FAKE_PLUGIN_ID,
+                "third-device-integration",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+        manager_c
+            .provider_manager()
+            .register(FAKE_PLUGIN_ID, FAKE_ACCOUNT_ID, provider_a.provider.clone())
+            .unwrap();
+        let library_c = manager_c
+            .create_restore_library(
+                library_a.library_uuid.clone(),
+                "Shared Library".into(),
+                device_c_root.join("managed"),
+                FAKE_ACCOUNT_ID,
+            )
+            .await
+            .unwrap();
+        let catalog_c = library_c.local_data_dir.join("catalog.sqlite");
+        manager_c
+            .sync_coordinator
+            .run_library_turn(&library_c.library_uuid, &catalog_c)
+            .await
+            .unwrap();
+        for _ in 0..12 {
+            manager_c
+                .sync_coordinator
+                .run_library_turn(&library_c.library_uuid, &catalog_c)
+                .await
+                .unwrap();
+        }
+        assert_eq!(logical_digest(&catalog_c), digest_a);
+        let database_c = Database::open(&catalog_c).unwrap();
+        let restored_path = database_c
+            .connection_for_fsops()
+            .query_row(
+                "SELECT r.path,j.destination_relpath FROM media_materialization_jobs j JOIN files f ON f.asset_uuid=j.asset_uuid JOIN roots r ON r.id=f.root_id WHERE f.asset_uuid=?1 AND j.phase='complete'",
+                [asset_uuid.as_slice()],
+                |row| {
+                    let root = PathBuf::from(row.get::<_, String>(0)?);
+                    let relpath = row.get::<_, String>(1)?;
+                    Ok(root.join(relpath))
+                },
+            )
+            .unwrap();
+        assert_eq!(fs::read(&restored_path).unwrap(), source_bytes);
+        assert_eq!(
+            restored_path.file_name().and_then(|value| value.to_str()),
+            Some("renamed-seed.png")
+        );
+        let local_derived_counts: (i64, i64, i64) = database_c
+            .connection_for_fsops()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM thumbs),(SELECT COUNT(*) FROM tasks WHERE kind='thumbnail'),(SELECT COUNT(*) FROM media_fts WHERE media_fts MATCH 'renamed')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            local_derived_counts.0, 0,
+            "thumbnail blobs must not be transported"
+        );
+        assert_eq!(local_derived_counts.1, 0, "thumbnail tasks are local-only");
+        assert_eq!(
+            local_derived_counts.2, 1,
+            "FTS must be regenerated from restored projection"
+        );
+        let generated_thumb =
+            crate::thumbnails::generate_image_thumbnail_bytes(&restored_path).unwrap();
+        let generated_preview =
+            crate::thumbnails::generate_preview_webp(&restored_path, 2048).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let restored_file_id: i64 = database_c
+            .connection_for_fsops()
+            .query_row(
+                "SELECT id FROM files WHERE asset_uuid=?1",
+                [asset_uuid.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        database_c
+            .upsert_thumb_blob(crate::db::ThumbBlobRecord {
+                file_id: restored_file_id,
+                profile: crate::thumbnails::GRID_320_PROFILE.into(),
+                data: generated_thumb.data,
+                width: generated_thumb.width,
+                height: generated_thumb.height,
+                byte_size: generated_thumb.byte_size,
+                output_format: crate::thumbnails::GENERATED_FORMAT.into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        database_c
+            .upsert_preview_blob(crate::db::PreviewBlobRecord {
+                file_id: restored_file_id,
+                profile: crate::thumbnails::PREVIEW_2048_PROFILE.into(),
+                data: generated_preview.data,
+                width: generated_preview.width,
+                height: generated_preview.height,
+                byte_size: generated_preview.byte_size,
+                output_format: generated_preview.output_format.into(),
+                source_size: source_bytes.len() as i64,
+                source_mtime: 1,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let regenerated: (i64, i64) = database_c
+            .connection_for_fsops()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM thumb_blobs WHERE file_id=?1),(SELECT COUNT(*) FROM preview_blobs WHERE file_id=?1)",
+                [restored_file_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(regenerated, (1, 1), "derived media must regenerate locally");
+        let provider_diagnostics = provider_a.provider.diagnostics().await.unwrap();
+        let provider_state_root = base.join("provider-runtime").join("provider-state");
+        let object_metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(provider_state_root.join("objects.json")).unwrap())
+                .unwrap();
+        assert!(object_metadata.as_object().unwrap().keys().all(|key| {
+            !key.contains("thumb") && !key.contains("preview") && !key.contains("fts")
+        }));
+        assert_eq!(
+            manager_c
+                .registry
+                .library(&library_c.library_uuid)
+                .unwrap()
+                .unwrap()
+                .availability,
+            "available"
+        );
+        println!(
+            "SYNC_TWO_DEVICE_JSON={}",
+            serde_json::json!({
+                "providerTransport": "framed-child-rpc",
+                "isolatedHosts": 3,
+                "freshCatalogRestores": 2,
+                "convergedFiles": digest_a.0.len(),
+                "convergedFrontiers": digest_a.2.len(),
+                "convergedTags": digest_a.3.len(),
+                "favorite": digest_a.1[0].2,
+                "note": digest_a.1[0].3,
+                "renamed": digest_a.0[0].1,
+                "deleteRestoreActive": digest_a.0[0].2 == "active",
+                "mediaBytesRestored": source_bytes.len(),
+                "localDerived": {"transportedThumbs":local_derived_counts.0,"transportedThumbnailTasks":local_derived_counts.1,"ftsMatches":local_derived_counts.2,"regeneratedThumbs":regenerated.0,"regeneratedPreviews":regenerated.1},
+                "providerDiagnostics": provider_diagnostics,
+                "repeatedDeliveryIdempotent": true,
+            })
+        );
+
+        manager_a
+            .provider_manager()
+            .unregister(FAKE_PLUGIN_ID, FAKE_ACCOUNT_ID)
+            .unwrap();
+        manager_b
+            .provider_manager()
+            .unregister(FAKE_PLUGIN_ID, FAKE_ACCOUNT_ID)
+            .unwrap();
+        manager_c
+            .provider_manager()
+            .unregister(FAKE_PLUGIN_ID, FAKE_ACCOUNT_ID)
+            .unwrap();
+        provider_a.shutdown().await.unwrap();
+        drop(database_c);
+        drop(manager_a);
+        drop(manager_b);
+        drop(manager_c);
         let _ = fs::remove_dir_all(base);
     }
 

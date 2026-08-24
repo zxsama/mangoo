@@ -908,7 +908,11 @@ fn validate_browse_projection(
 ) -> anyhow::Result<()> {
     let actual = capture_projection(connection)?;
     if actual != checkpoint.projection {
-        anyhow::bail!("staging browse projection differs from checkpoint projection");
+        anyhow::bail!(
+            "staging browse projection differs from checkpoint projection: expected={:?} actual={:?}",
+            checkpoint.projection,
+            actual
+        );
     }
     Ok(())
 }

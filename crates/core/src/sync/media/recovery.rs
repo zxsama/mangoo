@@ -382,4 +382,36 @@ mod tests {
         assert_eq!(selected, b"requested");
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn short_range_response_is_rejected_before_verification() {
+        let root = std::env::temp_dir().join(format!(
+            "megle-media-short-range-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("short-range.part");
+        let complete = b"0123456789abcdef";
+        std::fs::write(&path, &complete[2..11]).unwrap();
+        let object_hash: [u8; 32] = Sha256::digest(complete).into();
+        let download = DownloadedRange {
+            metadata: crate::sync::provider::ObjectMetadata {
+                key: "objects/data/short".into(),
+                size: complete.len() as u64,
+                sha256: object_hash,
+                etag: None,
+            },
+            requested_start: 2,
+            requested_end: 12,
+            response_start: 2,
+            response_end: 12,
+            whole_object: false,
+            path,
+        };
+        let error =
+            read_validated_response(&download, "objects/data/short", object_hash, 2, 12, 1024)
+                .unwrap_err();
+        assert!(error.to_string().contains("wrong range"));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -18,12 +18,19 @@ struct ProviderProcess {
 
 impl ProviderProcess {
     fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_megle-fake-provider"))
+        Self::start_with_fault(None)
+    }
+
+    fn start_with_fault(fault: Option<&str>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_megle-fake-provider"));
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        if let Some(fault) = fault {
+            command.env("MEGLE_FAKE_PROVIDER_FAULT", fault);
+        }
+        let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         Self {
@@ -35,6 +42,12 @@ impl ProviderProcess {
     }
 
     fn call(&mut self, method: &str, payload: Value) -> Value {
+        let response = self.call_envelope(method, payload);
+        assert_eq!(response["messageType"], "response", "{response}");
+        response["payload"].clone()
+    }
+
+    fn call_envelope(&mut self, method: &str, payload: Value) -> Value {
         let request_id = uuid::Uuid::now_v7();
         write_control(
             &mut self.stdin,
@@ -46,8 +59,7 @@ impl ProviderProcess {
             assert_eq!((stream, sequence), (0, 0));
             let response: Value = serde_json::from_slice(&payload).unwrap();
             if response["requestId"] == request_id.to_string() {
-                assert_eq!(response["messageType"], "response", "{response}");
-                return response["payload"].clone();
+                return response;
             }
         }
     }
@@ -119,6 +131,74 @@ impl ProviderProcess {
         assert_eq!(response["requestId"], request_id.to_string());
         (bytes, response["payload"].clone())
     }
+}
+
+#[test]
+fn permission_loss_fails_closed_before_provider_state_changes() {
+    let mut provider = ProviderProcess::start_with_fault(Some("permission-loss"));
+    let denied = provider.call_envelope(
+        "delta.list",
+        json!({"scope":{"kind":"library"},"cursor":null,"pageToken":null,"limit":10}),
+    );
+    assert_eq!(denied["messageType"], "error");
+    assert_eq!(denied["payload"]["code"], "authorization_required");
+    let diagnostics = provider.call("diagnostics", Value::Null);
+    assert_eq!(diagnostics["objects"], 0);
+}
+
+#[test]
+fn duplicate_reordered_delta_pages_remain_idempotent() {
+    let mut provider = ProviderProcess::start_with_fault(Some("reordered-delta"));
+    let bytes_a = b"first";
+    let bytes_b = b"second";
+    for (key, bytes) in [
+        ("segments/a", bytes_a.as_slice()),
+        ("segments/b", bytes_b.as_slice()),
+    ] {
+        let hash: [u8; 32] = Sha256::digest(bytes).into();
+        assert_eq!(
+            provider.call_with_bytes(
+                "object.put_immutable",
+                json!({"key":key,"sha256":hex(&hash)}),
+                bytes
+            )["status"],
+            "created"
+        );
+    }
+    let page = provider.call(
+        "delta.list",
+        json!({"scope":{"kind":"library"},"cursor":null,"pageToken":null,"limit":10}),
+    );
+    let keys = page["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["key"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["segments/b", "segments/a", "segments/b"]);
+    assert_eq!(provider.object_get("segments/a"), bytes_a);
+    assert_eq!(provider.object_get("segments/b"), bytes_b);
+}
+
+#[test]
+fn short_range_response_is_detectably_short_and_not_claimed_as_complete() {
+    let mut provider = ProviderProcess::start_with_fault(Some("short-range"));
+    let bytes = b"0123456789abcdef";
+    let hash: [u8; 32] = Sha256::digest(bytes).into();
+    provider.call_with_bytes(
+        "object.put_immutable",
+        json!({"key":"content/data/a","sha256":hex(&hash)}),
+        bytes,
+    );
+    let (range, metadata) = provider.object_get_range("content/data/a", 2, 12);
+    assert_eq!(metadata["responseStart"], 2);
+    assert_eq!(metadata["responseEnd"], 12);
+    assert_eq!(
+        range.len(),
+        9,
+        "fault must return fewer bytes than declared"
+    );
+    assert_ne!(range.len() as u64, 12 - 2);
 }
 
 impl Drop for ProviderProcess {

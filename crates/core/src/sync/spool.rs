@@ -131,7 +131,10 @@ pub fn register_durable_segment(
 /// after a crash is safe because ledger insertion/frontier update is atomic and
 /// exact duplicate events are idempotent.
 pub fn apply_next_durable_segment(connection: &Connection) -> anyhow::Result<usize> {
-    let row: Option<(Vec<u8>,String)> = connection.query_row("SELECT segment_uuid,spool_path FROM sync_inbox_segments WHERE state IN ('durable','ready','applying') ORDER BY received_at,segment_uuid LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    // Providers may return Delta pages in arbitrary object-key order. Pick a
+    // segment that is contiguous with (or entirely behind) the actor's durable
+    // frontier instead of letting an early successor block its predecessor.
+    let row: Option<(Vec<u8>,String)> = connection.query_row("SELECT s.segment_uuid,s.spool_path FROM sync_inbox_segments s WHERE s.state IN ('durable','ready','applying') AND s.first_seq<=COALESCE((SELECT f.applied_through_seq FROM sync_actor_frontiers f WHERE f.device_uuid=s.device_uuid AND f.stream_uuid=s.stream_uuid AND f.actor_epoch=s.actor_epoch),0)+1 ORDER BY s.received_at,s.first_seq,s.segment_uuid LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((segment_uuid, path)) = row else {
         return Ok(0);
     };
@@ -310,6 +313,62 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].extension().and_then(|v| v.to_str()), Some("json"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn reordered_segments_wait_for_their_predecessor_and_then_converge() {
+        let directory =
+            std::env::temp_dir().join(format!("megle-spool-reordered-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&directory).unwrap();
+        let first = seal_segment(
+            vec![event(
+                1,
+                10,
+                Operation::SetField {
+                    field: "rating".into(),
+                    value: 1.into(),
+                },
+            )],
+            None,
+        )
+        .unwrap();
+        let second = seal_segment(
+            vec![event(
+                2,
+                10,
+                Operation::SetField {
+                    field: "rating".into(),
+                    value: 2.into(),
+                },
+            )],
+            Some(first.segment_hash),
+        )
+        .unwrap();
+        let database = crate::db::Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let connection = database.connection_for_fsops();
+        for segment in [&second, &first, &second] {
+            let bytes = serde_json::to_vec(segment).unwrap();
+            intake_segment(
+                &directory,
+                &bytes,
+                segment.header.predecessor_hash,
+                |record| register_durable_segment(connection, record).map(|_| ()),
+            )
+            .unwrap();
+        }
+        assert_eq!(apply_next_durable_segment(connection).unwrap(), 1);
+        assert_eq!(apply_next_durable_segment(connection).unwrap(), 1);
+        assert_eq!(apply_next_durable_segment(connection).unwrap(), 0);
+        let (frontier, rating, applied): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT MAX(applied_through_seq) FROM sync_actor_frontiers),(SELECT CAST(json_extract(value,'$') AS INTEGER) FROM sync_field_versions WHERE is_winner=1),(SELECT COUNT(*) FROM sync_inbox_segments WHERE state='applied')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((frontier, rating, applied), (2, 2, 2));
         let _ = fs::remove_dir_all(directory);
     }
 }

@@ -462,11 +462,12 @@ pub async fn activate_and_register(
     }
     let executable = verify_bundled_entry(manifest, bundled_root, platform, allowlist)
         .map_err(|e| anyhow::anyhow!("plugin trust verification failed: {e:?}"))?;
+    let safe_env = provider_safe_env(&manifest.id, &runtime_dir);
     let mut child = ChildProcess::spawn_verified(
         &executable,
         &LaunchSpec {
             runtime_dir,
-            safe_env: provider_safe_env(&manifest.id),
+            safe_env,
         },
     )?;
     let (stdin, stdout, stderr) = child.take_stdio()?;
@@ -542,7 +543,23 @@ pub async fn activate_and_register(
     })
 }
 
-fn provider_safe_env(plugin_id: &str) -> std::collections::HashMap<String, String> {
+fn provider_safe_env(
+    plugin_id: &str,
+    runtime_dir: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
+    if plugin_id == "com.megle.fake-sync" {
+        let mut values = std::collections::HashMap::from([(
+            "MEGLE_FAKE_PROVIDER_STATE_DIR".to_owned(),
+            runtime_dir
+                .join("provider-state")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        if let Ok(fault) = std::env::var("MEGLE_FAKE_PROVIDER_FAULT") {
+            values.insert("MEGLE_FAKE_PROVIDER_FAULT".to_owned(), fault);
+        }
+        return values;
+    }
     if plugin_id != "com.megle.onedrive" {
         return Default::default();
     }

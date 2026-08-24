@@ -194,6 +194,10 @@ pub fn materialize_from_verified_ranges(
     chunks: &BTreeMap<[u8; 32], super::recovery::VerifiedChunkSource>,
     source_mtime_ms: Option<i64>,
 ) -> anyhow::Result<MaterializationResult> {
+    #[cfg(test)]
+    if managed_root.join(".megle-test-disk-full").exists() {
+        return Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into());
+    }
     inventory_path(destination_relative)?;
     manifest.validate()?;
     let staging_directory = managed_root.join(".megle-staging");

@@ -144,11 +144,48 @@ pub(crate) fn materialize_truth(
                 )?;
             }
             rebuild_location_heads(transaction, entity)?;
+            let winning_location: Option<(Option<Vec<u8>>, String)> = transaction
+                .query_row(
+                    "SELECT r.parent_uuid,r.name FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=?1 AND h.is_display_winner=1",
+                    [entity],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((parent_uuid, winning_name)) = winning_location {
+                let parent_id = match parent_uuid {
+                    Some(parent) => transaction
+                        .query_row(
+                            "SELECT id FROM folders WHERE folder_uuid=?1",
+                            [parent],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?,
+                    None => None,
+                };
+                transaction.execute(
+                    "UPDATE files SET folder_id=?1,name=?2 WHERE asset_uuid=?3",
+                    params![parent_id, winning_name, entity],
+                )?;
+                if let Some(file_id) = transaction
+                    .query_row(
+                        "SELECT id FROM files WHERE asset_uuid=?1",
+                        [entity],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                {
+                    crate::db::sync_media_fts_for_file_in_transaction_pub(transaction, file_id)?;
+                }
+            }
         }
         Operation::Delete { token } => {
             transaction.execute(
                 "INSERT OR IGNORE INTO sync_tombstone_tokens(token_uuid,entity_uuid,event_uuid,local_mutation_generation,created_at) VALUES (?1,?2,?3,1,?4)",
                 params![token.0.as_bytes().as_slice(),entity,event_uuid,unix_timestamp_millis()],
+            )?;
+            transaction.execute(
+                "UPDATE files SET status='trashed' WHERE asset_uuid=?1",
+                [entity],
             )?;
         }
         Operation::Restore { observed_tokens } => {
@@ -158,6 +195,15 @@ pub(crate) fn materialize_truth(
                     params![event_uuid,observed.0.as_bytes().as_slice()],
                 )?;
             }
+            let live_tokens: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sync_tombstone_tokens t WHERE t.entity_uuid=?1 AND NOT EXISTS (SELECT 1 FROM sync_tombstone_removals r WHERE r.observed_token_uuid=t.token_uuid)",
+                [entity],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "UPDATE files SET status=CASE WHEN ?1=0 THEN 'active' ELSE 'trashed' END WHERE asset_uuid=?2",
+                params![live_tokens, entity],
+            )?;
         }
         Operation::SetContent {
             revision_uuid,
@@ -188,10 +234,13 @@ pub(crate) fn materialize_truth(
             let manifest_hash = manifest_location
                 .map(|value| value.0)
                 .unwrap_or_else(|| super::codec::sha256(manifest_id.as_bytes()));
-            transaction.execute(
-                "INSERT OR IGNORE INTO asset_content_revisions(content_revision_uuid,asset_uuid,event_uuid,manifest_hash,byte_size,local_mutation_generation,source_mtime_ms,created_at) VALUES (?1,?2,?3,?4,?5,1,?6,?7)",
+            let changed = transaction.execute(
+                "INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,event_uuid,manifest_hash,byte_size,local_mutation_generation,source_mtime_ms,created_at) VALUES (?1,?2,?3,?4,?5,1,?6,?7) ON CONFLICT(content_revision_uuid) DO UPDATE SET event_uuid=excluded.event_uuid,manifest_hash=excluded.manifest_hash,byte_size=excluded.byte_size,source_mtime_ms=excluded.source_mtime_ms",
                 params![revision_uuid.0.as_bytes().as_slice(),entity,event_uuid,manifest_hash.as_slice(),manifest_location.map(|value|value.4),source_mtime_ms,unix_timestamp_millis()],
             )?;
+            if changed != 1 {
+                anyhow::bail!("content revision did not materialize");
+            }
             if let Some((_, pack_hash, offset, length, bytes)) = manifest_location {
                 transaction.execute(
                     "INSERT INTO media_manifests(manifest_hash,content_hash,byte_length,manifest_pack_hash,pack_offset,record_length,state,created_at,updated_at) VALUES (?1,zeroblob(32),?2,?3,?4,?5,'remote',?6,?6) ON CONFLICT(manifest_hash) DO UPDATE SET byte_length=excluded.byte_length,manifest_pack_hash=excluded.manifest_pack_hash,pack_offset=excluded.pack_offset,record_length=excluded.record_length,state='remote',updated_at=excluded.updated_at",
@@ -240,11 +289,24 @@ fn materialize_scalar_projection(
         )
         .optional()?;
     if file_id.is_none() {
-        let tag_id: Option<i64> = transaction
+        let mut tag_id: Option<i64> = transaction
             .query_row("SELECT id FROM tags WHERE tag_uuid=?1", [entity], |row| {
                 row.get(0)
             })
             .optional()?;
+        if tag_id.is_none() && field == "name" {
+            if let Some(name) = value.as_str() {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO tags(name,color,tag_uuid) VALUES (?1,NULL,?2)",
+                    params![name, entity],
+                )?;
+                tag_id = transaction
+                    .query_row("SELECT id FROM tags WHERE tag_uuid=?1", [entity], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+            }
+        }
         if let Some(tag_id) = tag_id {
             match field {
                 "name" => {
@@ -268,12 +330,12 @@ fn materialize_scalar_projection(
     }
     let file_id = file_id.expect("checked above");
     let now = unix_timestamp_millis() / 1000;
-    transaction.execute(
-        "INSERT OR IGNORE INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,NULL,0,NULL,?2)",
-        params![file_id,now],
-    )?;
     match field {
         "rating" => {
+            transaction.execute(
+                "INSERT OR IGNORE INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,NULL,0,NULL,?2)",
+                params![file_id,now],
+            )?;
             transaction.execute(
                 "UPDATE user_metadata SET rating=?1,updated_at=?2 WHERE file_id=?3",
                 params![value.as_i64(), now, file_id],
@@ -281,11 +343,19 @@ fn materialize_scalar_projection(
         }
         "favorite" => {
             transaction.execute(
+                "INSERT OR IGNORE INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,NULL,0,NULL,?2)",
+                params![file_id,now],
+            )?;
+            transaction.execute(
                 "UPDATE user_metadata SET favorite=?1,updated_at=?2 WHERE file_id=?3",
                 params![value.as_bool().unwrap_or(false) as i64, now, file_id],
             )?;
         }
         "note" => {
+            transaction.execute(
+                "INSERT OR IGNORE INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,NULL,0,NULL,?2)",
+                params![file_id,now],
+            )?;
             transaction.execute(
                 "UPDATE user_metadata SET note=?1,updated_at=?2 WHERE file_id=?3",
                 params![value.as_str(), now, file_id],
