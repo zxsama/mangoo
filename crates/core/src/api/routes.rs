@@ -3551,6 +3551,7 @@ async fn disable_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
 ) -> ApiResult<Json<crate::host_registry::HostPluginProjection>> {
+    let _begin_guard = state.plugin_auth_begin_gate.lock().await;
     cancel_owned_auth_worker(&state, &plugin_id, None, true).await?;
     let manager = library_manager(&state)?;
     let registry = manager.host_registry();
@@ -3955,7 +3956,16 @@ async fn spawn_loopback_auth_completion(
             }
             let provider = match plugin_provider(&worker_state, &worker_plugin_id) {
                 Ok(provider) => provider,
-                Err(_) => return,
+                Err(_) => {
+                    if let Ok(registry) = host_registry(&worker_state) {
+                        let _ = registry.cancel_plugin_auth_flow(
+                            &worker_plugin_id,
+                            &worker_flow_id,
+                            &worker_session,
+                        );
+                    }
+                    return;
+                }
             };
             match provider.auth_poll(&worker_flow_id).await {
                 Ok(Some(auth)) => {
@@ -4227,6 +4237,7 @@ async fn cancel_plugin_auth(
     Path(id): Path<String>,
     Json(body): Json<PluginAuthCancelRequest>,
 ) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let _begin_guard = state.plugin_auth_begin_gate.lock().await;
     cancel_owned_auth_worker(&state, &id, Some(&body.flow_id), true).await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -4237,6 +4248,7 @@ async fn sign_out_plugin(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let _begin_guard = state.plugin_auth_begin_gate.lock().await;
     let registry = Arc::clone(host_registry(&state)?);
     let account = registry
         .plugin_account_secret(&id)?
