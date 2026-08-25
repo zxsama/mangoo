@@ -148,6 +148,21 @@ impl ReverseRpcHandler for SecretBroker {
                     .store
                     .create(&scope, &decode("value")?)
                     .map_err(|e| e.to_string())?;
+                if !self
+                    .registry
+                    .register_plugin_secret_handle_for_launch(
+                        &self.plugin_id,
+                        &self.account_uuid,
+                        &self.launch_fingerprint,
+                        &reference,
+                        &scope.namespace,
+                        &scope.purpose,
+                    )
+                    .map_err(|e| e.to_string())?
+                {
+                    let _ = self.store.delete(&scope, &reference);
+                    return Err("plugin runtime session is stale".into());
+                }
                 Ok(json!({"secretRef":reference,"generation":1}))
             }
             "host.secret.get" => {
@@ -233,14 +248,15 @@ impl ReverseRpcHandler for SecretBroker {
                 Ok(Value::Null)
             }
             "host.secret.delete_scoped" => {
+                let secret_ref = payload
+                    .get("secretRef")
+                    .and_then(Value::as_str)
+                    .ok_or("missing secretRef")?;
                 self.store
-                    .delete(
-                        &scope,
-                        payload
-                            .get("secretRef")
-                            .and_then(Value::as_str)
-                            .ok_or("missing secretRef")?,
-                    )
+                    .delete(&scope, secret_ref)
+                    .map_err(|e| e.to_string())?;
+                self.registry
+                    .forget_plugin_secret_handle(&self.plugin_id, &self.account_uuid, secret_ref)
                     .map_err(|e| e.to_string())?;
                 Ok(Value::Null)
             }

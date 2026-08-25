@@ -486,11 +486,9 @@ impl ProviderState {
                 .split_whitespace()
                 .map(str::to_owned)
                 .collect(),
-            upload_sessions: self
-                .credential
-                .as_ref()
-                .map(|credential| credential.upload_sessions.clone())
-                .unwrap_or_default(),
+            // A completed authorization replaces the account. Upload-session
+            // capabilities belong to the prior account and never cross it.
+            upload_sessions: Vec::new(),
         };
         // OAuth completion always creates a fresh record. Host swaps the
         // account reference atomically and retires the prior credential. This

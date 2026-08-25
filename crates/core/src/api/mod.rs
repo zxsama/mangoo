@@ -672,6 +672,89 @@ mod credential_retirement_tests {
     }
 
     #[test]
+    fn retirement_reconciliation_deletes_nested_scoped_secret_without_provider() {
+        let path = std::env::temp_dir().join(format!(
+            "megle-nested-credential-retirement-{}.sqlite",
+            uuid::Uuid::now_v7()
+        ));
+        let registry = Arc::new(HostRegistry::open(&path).unwrap());
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.megle.onedrive",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: std::path::Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account(
+                "onedrive-account",
+                "com.megle.onedrive",
+                Some("OneDrive"),
+                "authenticated",
+            )
+            .unwrap();
+        registry
+            .set_plugin_intent("com.megle.onedrive", true, true)
+            .unwrap();
+        registry
+            .record_plugin_runtime_ready(
+                "com.megle.onedrive",
+                "session",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+        let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
+        let oauth_scope = SecretScope {
+            plugin_id: "com.megle.onedrive".into(),
+            account_uuid: "onedrive-account".into(),
+            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
+            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+        };
+        let upload_scope = SecretScope {
+            purpose: "upload-session-v1".into(),
+            ..oauth_scope.clone()
+        };
+        let oauth_ref = store.create(&oauth_scope, b"credential").unwrap();
+        let upload_ref = store.create(&upload_scope, b"capability").unwrap();
+        registry
+            .set_plugin_account_secret("com.megle.onedrive", Some(&oauth_ref), "authenticated", 1)
+            .unwrap();
+        assert!(registry
+            .register_plugin_secret_handle_for_launch(
+                "com.megle.onedrive",
+                "onedrive-account",
+                &fingerprint,
+                &upload_ref,
+                &upload_scope.namespace,
+                &upload_scope.purpose
+            )
+            .unwrap());
+        registry
+            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .unwrap();
+        assert_eq!(
+            reconcile_credential_retirements(&registry, &store, None, None).unwrap(),
+            2
+        );
+        assert!(matches!(
+            store.read(&oauth_scope, &oauth_ref),
+            Err(SecretStoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.read(&upload_scope, &upload_ref),
+            Err(SecretStoreError::NotFound)
+        ));
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn retirement_waits_until_the_old_provider_is_unregistered() {
         let path = std::env::temp_dir().join(format!(
             "megle-credential-retirement-order-{}.sqlite",

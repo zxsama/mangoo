@@ -19,9 +19,24 @@ const HOST_MIGRATION_0008: &str =
     include_str!("../host_migrations/0008_plugin_credential_retirement.sql");
 const HOST_MIGRATION_0009: &str =
     include_str!("../host_migrations/0009_plugin_auth_cancellation.sql");
+const HOST_MIGRATION_0010: &str = include_str!("../host_migrations/0010_plugin_secret_handles.sql");
 
 pub const ONEDRIVE_SECRET_NAMESPACE: &str = "microsoft-onedrive";
 pub const ONEDRIVE_CREDENTIAL_PURPOSE: &str = "oauth-v1";
+
+fn enqueue_onedrive_secret_retirements(
+    transaction: &rusqlite::Transaction<'_>,
+    plugin_id: &str,
+    account_uuid: &str,
+    primary_secret_ref: Option<&str>,
+    now: i64,
+) -> anyhow::Result<()> {
+    if let Some(secret_ref) = primary_secret_ref {
+        transaction.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?7,?7)", params![uuid::Uuid::now_v7().to_string(),plugin_id,account_uuid,secret_ref,ONEDRIVE_SECRET_NAMESPACE,ONEDRIVE_CREDENTIAL_PURPOSE,now])?;
+    }
+    transaction.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_handles WHERE plugin_id=?2 AND account_uuid=?3", params![now, plugin_id, account_uuid])?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -776,9 +791,12 @@ impl HostRegistry {
             replaced.filter(|_| plugin_id == ONEDRIVE_PLUGIN_ID)
         {
             let now = unix_timestamp_millis();
-            transaction.execute(
-                "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?7,?7)",
-                params![uuid::Uuid::now_v7().to_string(),plugin_id,account_uuid,old_secret_ref,ONEDRIVE_SECRET_NAMESPACE,ONEDRIVE_CREDENTIAL_PURPOSE,now],
+            enqueue_onedrive_secret_retirements(
+                &transaction,
+                plugin_id,
+                &account_uuid,
+                Some(&old_secret_ref),
+                now,
             )?;
         }
         let changed = transaction.execute(
@@ -813,9 +831,12 @@ impl HostRegistry {
         if let Some((account_uuid, secret_ref)) =
             retiring.filter(|_| plugin_id == ONEDRIVE_PLUGIN_ID)
         {
-            transaction.execute(
-                "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?7,?7)",
-                params![uuid::Uuid::now_v7().to_string(),plugin_id,account_uuid,secret_ref,ONEDRIVE_SECRET_NAMESPACE,ONEDRIVE_CREDENTIAL_PURPOSE,unix_timestamp_millis()],
+            enqueue_onedrive_secret_retirements(
+                &transaction,
+                plugin_id,
+                &account_uuid,
+                Some(&secret_ref),
+                unix_timestamp_millis(),
             )?;
         }
         let changed = transaction.execute(
@@ -1098,9 +1119,12 @@ impl HostRegistry {
                 )
                 .optional()?;
             if let Some((account_uuid, secret_ref)) = retiring {
-                transaction.execute(
-                    "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?7,?7)",
-                    params![uuid::Uuid::now_v7().to_string(),ONEDRIVE_PLUGIN_ID,account_uuid,secret_ref,ONEDRIVE_SECRET_NAMESPACE,ONEDRIVE_CREDENTIAL_PURPOSE,now],
+                enqueue_onedrive_secret_retirements(
+                    &transaction,
+                    ONEDRIVE_PLUGIN_ID,
+                    &account_uuid,
+                    Some(&secret_ref),
+                    now,
                 )?;
             }
             transaction.execute("UPDATE onedrive_configuration SET host_override_client_id=?1,revision=revision+1,updated_at=?2 WHERE singleton=1", params![requested,now])?;
@@ -1148,24 +1172,62 @@ impl HostRegistry {
     pub fn complete_credential_retirement(&self, retirement_uuid: &str) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
-        let plugin_id: Option<String> = transaction
+        let retirement: Option<(String, String, String)> = transaction
             .query_row(
-                "SELECT plugin_id FROM plugin_credential_retirements WHERE retirement_uuid=?1",
+                "SELECT plugin_id,account_uuid,secret_ref FROM plugin_credential_retirements WHERE retirement_uuid=?1",
                 [retirement_uuid],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         transaction.execute(
             "DELETE FROM plugin_credential_retirements WHERE retirement_uuid=?1",
             [retirement_uuid],
         )?;
-        if let Some(plugin_id) = plugin_id {
+        if let Some((plugin_id, account_uuid, secret_ref)) = retirement {
+            transaction.execute("DELETE FROM plugin_secret_handles WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3", params![plugin_id, account_uuid, secret_ref])?;
             transaction.execute(
                 "UPDATE plugin_runtime_state SET state='starting',last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2 AND state='degraded' AND last_error_code='credential-retirement-pending' AND NOT EXISTS(SELECT 1 FROM plugin_credential_retirements q WHERE q.plugin_id=?2)",
                 params![unix_timestamp_millis(), plugin_id],
             )?;
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn register_plugin_secret_handle_for_launch(
+        &self,
+        plugin_id: &str,
+        account_uuid: &str,
+        expected_fingerprint: &str,
+        secret_ref: &str,
+        namespace: &str,
+        purpose: &str,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if !plugin_runtime_launch_matches(&transaction, plugin_id, expected_fingerprint)? {
+            return Ok(false);
+        }
+        let account_matches: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_accounts WHERE plugin_id=?1 AND account_uuid=?2)",
+            params![plugin_id, account_uuid],
+            |row| row.get(0),
+        )?;
+        if !account_matches {
+            return Ok(false);
+        }
+        transaction.execute("INSERT OR IGNORE INTO plugin_secret_handles(plugin_id,account_uuid,secret_ref,namespace,purpose,created_at) VALUES (?1,?2,?3,?4,?5,?6)", params![plugin_id,account_uuid,secret_ref,namespace,purpose,unix_timestamp_millis()])?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn forget_plugin_secret_handle(
+        &self,
+        plugin_id: &str,
+        account_uuid: &str,
+        secret_ref: &str,
+    ) -> anyhow::Result<()> {
+        self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute("DELETE FROM plugin_secret_handles WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3", params![plugin_id, account_uuid, secret_ref])?;
         Ok(())
     }
 
@@ -2773,6 +2835,14 @@ impl HostRegistry {
         )?;
         if schema_version < 9 {
             connection.execute_batch(HOST_MIGRATION_0009)?;
+        }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 10 {
+            connection.execute_batch(HOST_MIGRATION_0010)?;
         }
         connection.execute(
             "INSERT OR IGNORE INTO host_sync_local_state(singleton,device_uuid,stream_uuid,next_actor_seq,hlc_wall_ms,hlc_logical,capture_enabled,updated_at) VALUES (1,?1,?2,1,0,0,0,?3)",
@@ -6143,6 +6213,118 @@ mod tests {
             .unwrap();
         assert!(reopened.due_credential_retirements(10).unwrap().is_empty());
         drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sign_out_journals_all_registered_scoped_secrets_across_restart() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "com.megle.onedrive", "onedrive-account");
+        registry
+            .set_plugin_account_secret(
+                "com.megle.onedrive",
+                Some("oauth-secret"),
+                "authenticated",
+                1,
+            )
+            .unwrap();
+        let fingerprint = registry
+            .plugin_runtime_launches()
+            .unwrap()
+            .into_iter()
+            .find(|launch| launch.plugin_id == "com.megle.onedrive")
+            .unwrap()
+            .fingerprint();
+        assert!(registry
+            .register_plugin_secret_handle_for_launch(
+                "com.megle.onedrive",
+                "onedrive-account",
+                &fingerprint,
+                "upload-secret",
+                ONEDRIVE_SECRET_NAMESPACE,
+                "upload-session-v1",
+            )
+            .unwrap());
+        registry
+            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .unwrap();
+        let mut refs = registry
+            .due_credential_retirements(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.secret_ref, entry.purpose))
+            .collect::<Vec<_>>();
+        refs.sort();
+        assert_eq!(
+            refs,
+            vec![
+                ("oauth-secret".into(), ONEDRIVE_CREDENTIAL_PURPOSE.into()),
+                ("upload-secret".into(), "upload-session-v1".into()),
+            ]
+        );
+        drop(registry);
+        let reopened = HostRegistry::open(&path).unwrap();
+        assert_eq!(reopened.due_credential_retirements(10).unwrap().len(), 2);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn configuration_change_and_account_switch_journal_nested_secrets() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "com.megle.onedrive", "onedrive-account");
+        registry
+            .set_plugin_account_secret("com.megle.onedrive", Some("old-oauth"), "authenticated", 1)
+            .unwrap();
+        let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
+        assert!(registry
+            .register_plugin_secret_handle_for_launch(
+                "com.megle.onedrive",
+                "onedrive-account",
+                &fingerprint,
+                "old-upload",
+                ONEDRIVE_SECRET_NAMESPACE,
+                "upload-session-v1",
+            )
+            .unwrap());
+        assert!(registry
+            .set_plugin_account_secret_for_launch(
+                "com.megle.onedrive",
+                &fingerprint,
+                Some("new-oauth"),
+                "authenticated",
+            )
+            .unwrap());
+        let mut switched = registry
+            .due_credential_retirements(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.secret_ref)
+            .collect::<Vec<_>>();
+        switched.sort();
+        assert_eq!(switched, vec!["old-oauth", "old-upload"]);
+
+        for retirement in registry.due_credential_retirements(10).unwrap() {
+            registry
+                .complete_credential_retirement(&retirement.retirement_uuid)
+                .unwrap();
+        }
+        let initial = registry.onedrive_configuration().unwrap();
+        let plan = registry
+            .plan_onedrive_configuration(
+                Some("01234567-89ab-4cde-8fab-0123456789ab"),
+                initial.revision,
+            )
+            .unwrap();
+        registry
+            .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, true)
+            .unwrap();
+        let configured = registry.due_credential_retirements(10).unwrap();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].secret_ref, "new-oauth");
+        drop(registry);
         let _ = std::fs::remove_file(path);
     }
 
