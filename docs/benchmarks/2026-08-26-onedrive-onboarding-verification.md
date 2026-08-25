@@ -11,7 +11,7 @@ accepted or stored.
 ## Repository evidence
 
 - `npm test`: passed, including Web, Desktop, Core API/client, schema, UI design,
-  and Rust suites. The Rust Core run reported 638 passed and 12 intentionally
+  and Rust suites. The Rust Core run reported 643 passed and 12 intentionally
   ignored release probes.
 - `npm run check:onedrive-bundle`: passed against the generated Windows bundle;
   the bundled manifest hash matched the launched Provider executable.
@@ -22,16 +22,12 @@ accepted or stored.
 - `npm run check:sync-integration`: passed after the fake Provider manifest and
   handshake were brought forward to the required `auth.poll`/`auth.cancel`
   method map.
-- A quick immutable-tree release run on commit `8c6034c` passed the clean
+- A fresh immutable-tree release run on commit `24848ae` passed the clean
   archive, full gate, Desktop loopback emulator, Docker manual emulator,
   Electron authorization URL boundary, sync integration, renderer performance,
-  and sync benchmark rows. Its temporary extracted tree was removed after
-  capture to recover workspace disk capacity.
-
-The OS-backdrop row could not complete on this workstation because the MSVC
-linker reported a PDB filesystem/limit error while rebuilding the Desktop
-harness. This is an environment/toolchain failure rather than a failed visual
-assertion and must be rerun before release.
+  sync benchmark, and Windows OS-backdrop rows. The earlier PDB linker failure
+  is superseded by this successful committed-tree run. Evidence is retained at
+  `.tmp/sync-release/2026-08-25T18-16-17-009Z-release-1d2b6f30`.
 
 ## Required external evidence
 
