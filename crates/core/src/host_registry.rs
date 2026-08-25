@@ -6159,6 +6159,18 @@ mod tests {
         assert!(!registry
             .plugin_auth_secret_write_is_allowed("com.megle.onedrive")
             .unwrap());
+        assert!(registry
+            .apply_plugin_auth_result_for_flow(
+                "com.megle.onedrive",
+                "flow-a",
+                "session-a",
+                "authenticated",
+                Some("late account"),
+                Some("business"),
+                Some("late-drive"),
+            )
+            .unwrap()
+            .is_none());
         assert_eq!(
             registry
                 .host_plugin("com.megle.onedrive")
