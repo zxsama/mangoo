@@ -4962,6 +4962,89 @@ button:disabled {
   border-top: 1px solid var(--line);
 }
 
+.onedrive-account-setup {
+  display: grid;
+  gap: 10px;
+}
+
+.onedrive-account-setup.compact {
+  padding: 12px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface-elevated, #222) 78%, transparent);
+}
+
+.onedrive-account-summary,
+.onedrive-config-summary,
+.onedrive-auth-flow > div:first-child,
+.onedrive-auth-actions,
+.onedrive-config-impact > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.onedrive-account-summary,
+.onedrive-config-summary,
+.onedrive-auth-flow > div:first-child {
+  justify-content: space-between;
+}
+
+.onedrive-account-summary > div,
+.onedrive-auth-flow,
+.onedrive-config-editor,
+.onedrive-config-impact,
+.onedrive-manual-completion,
+.onedrive-manual-completion label {
+  display: grid;
+  gap: 7px;
+}
+
+.onedrive-account-summary span,
+.onedrive-config-summary,
+.onedrive-config-editor small,
+.onedrive-auth-flow small,
+.onedrive-config-impact span,
+.managed-library-auth-required > p {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.onedrive-auth-state {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-elevated, #222) 84%, transparent);
+}
+
+.onedrive-auth-state.authenticated {
+  color: var(--success-text, #a7efc0);
+  background: color-mix(in srgb, var(--success-fill, #1f7a45) 34%, transparent);
+}
+
+.onedrive-config-editor input,
+.onedrive-manual-completion textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.onedrive-manual-completion textarea {
+  resize: vertical;
+  min-height: 68px;
+}
+
+.onedrive-config-impact,
+.onedrive-auth-flow,
+.managed-library-auth-required {
+  padding: 10px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface-elevated, #222) 78%, transparent);
+}
+
+.managed-library-auth-required {
+  display: grid;
+  gap: 8px;
+}
+
 .plugin-delete-button {
   display: inline-flex;
   align-items: center;

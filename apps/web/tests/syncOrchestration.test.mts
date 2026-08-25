@@ -72,7 +72,9 @@ describe("sync orchestration presentation", () => {
     assert.match(panel, /exportLibrarySyncDiagnostics/);
     assert.match(panel, /onReconnectPreview/);
     assert.match(panel, /三方预览/);
-    assert.match(panel, /account-switch/);
+    assert.match(panel, /OneDriveAccountSetup/);
+    assert.match(wizard, /authResumeRef/);
+    assert.match(wizard, /contextRevision/);
     assert.match(wizard, /preflightSyncRestore/);
     assert.match(wizard, /确认并恢复/);
     assert.match(wizard, /getSyncRestore/);

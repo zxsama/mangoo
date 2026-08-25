@@ -1,6 +1,8 @@
 import { Database, Trash2 } from "lucide-react";
 import type { HostPluginProjection, PluginCapability } from "@megle/core-client";
 import { StatusPill } from "./StatusPill";
+import { OneDriveAccountSetup } from "./OneDriveAccountSetup";
+import { ONEDRIVE_PLUGIN_ID } from "./pluginAuthModel";
 
 interface PluginDetailProps {
   plugin: HostPluginProjection;
@@ -8,6 +10,7 @@ interface PluginDetailProps {
   onApprovePermissions: () => void;
   onRetry: () => void;
   onRemove: () => void;
+  onRefresh: () => void | Promise<void>;
 }
 
 const CAPABILITY_LABEL: Record<PluginCapability, string> = {
@@ -19,7 +22,8 @@ export function PluginDetail({
   busy,
   onApprovePermissions,
   onRetry,
-  onRemove
+  onRemove,
+  onRefresh
 }: PluginDetailProps) {
   return (
     <section className="plugin-detail" aria-label={`${plugin.pluginId} details`}>
@@ -55,6 +59,13 @@ export function PluginDetail({
           </div>
         )}
       </div>
+
+      {plugin.pluginId === ONEDRIVE_PLUGIN_ID ? (
+        <div className="plugin-detail-section">
+          <div className="plugin-detail-section-title">OneDrive account</div>
+          <OneDriveAccountSetup onChanged={onRefresh} />
+        </div>
+      ) : null}
 
       <div className="plugin-detail-section">
         <div className="plugin-detail-section-title">Permissions</div>

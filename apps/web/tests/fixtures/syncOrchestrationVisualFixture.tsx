@@ -37,7 +37,7 @@ function Fixture() {
     <SyncManagementPanel libraries={[library]} statuses={[variants[state]]} busyLibraryId={null} error={null} providers={[{ pluginId:"com.megle.onedrive",accountUuid:"account-fixture",accountDisplayName:"OneDrive · Design",runtimeState:"ready",authState:"authenticated",lastHealthyAt:Date.now(),lastErrorCode:null }]}
       onAction={() => undefined} onEnable={() => undefined} onUnbind={() => undefined}
       onReconnectPreview={async () => reconnectPlan} onReconnectCommit={() => undefined}
-      onAccountChange={() => undefined} onRemoveLocalCopy={() => undefined} />
+      onRemoveLocalCopy={() => undefined} showAccountSetup={false} />
   </main>;
 }
 

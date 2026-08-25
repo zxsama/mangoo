@@ -104,20 +104,6 @@ export function useSyncOrchestration() {
     finally { setBusyLibraryId(null); }
   }, [invalidate]);
 
-  const changeAccount = useCallback(async (pluginId: string, switchAccount: boolean) => {
-    setBusyLibraryId(`account:${pluginId}`); setActionError(null);
-    try {
-      const client = createCoreClient();
-      await client.signOutPlugin(pluginId);
-      if (switchAccount) {
-        const auth = await client.beginPluginAuth(pluginId);
-        window.open(auth.authorizationUrl, "_blank", "noopener,noreferrer");
-      }
-      await invalidate();
-    } catch (cause) { setActionError(cause instanceof Error ? cause.message : String(cause)); }
-    finally { setBusyLibraryId(null); }
-  }, [invalidate]);
-
   const snapshot = statusQuery.data ?? null;
-  return { snapshot, summary: useMemo(() => syncSummaryModel(snapshot), [snapshot]), error: actionError ?? (statusQuery.error instanceof Error ? statusQuery.error.message : null), busyLibraryId, refresh, runAction, enable, unbind, previewReconnect, commitReconnect, changeAccount };
+  return { snapshot, summary: useMemo(() => syncSummaryModel(snapshot), [snapshot]), error: actionError ?? (statusQuery.error instanceof Error ? statusQuery.error.message : null), busyLibraryId, refresh, runAction, enable, unbind, previewReconnect, commitReconnect };
 }

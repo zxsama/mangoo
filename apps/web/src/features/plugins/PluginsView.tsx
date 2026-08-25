@@ -123,6 +123,7 @@ export function PluginsView() {
                 onApprovePermissions={() => void plugins.approvePermissions(selected.pluginId)}
                 onRetry={() => void plugins.retry(selected.pluginId)}
                 onRemove={() => void plugins.remove(selected.pluginId)}
+                onRefresh={plugins.refresh}
                 plugin={selected}
               />
             ) : (

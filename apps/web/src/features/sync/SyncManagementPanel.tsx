@@ -26,6 +26,7 @@ import {
   OverlayDialogHeader,
 } from "../../design/overlays";
 import { actionLabel, syncStatusLabel } from "./syncModel";
+import { OneDriveAccountSetup } from "../plugins/OneDriveAccountSetup";
 
 interface Props {
   libraries: LibrarySummary[];
@@ -40,9 +41,9 @@ interface Props {
   ): void;
   onReconnectPreview(status: LibrarySyncStatus): Promise<SyncReconnectPlan | null>;
   onReconnectCommit(status: LibrarySyncStatus, plan: SyncReconnectPlan, choice: "merge-local-fork" | "publish-new-remote"): void;
-  onAccountChange(pluginId: string, switchAccount: boolean): void;
   onEnable(status: LibrarySyncStatus, provider: SyncProviderStatus): void;
   onRemoveLocalCopy(library: LibrarySummary): void;
+  showAccountSetup?: boolean;
 }
 
 export function SyncManagementPanel({
@@ -55,15 +56,14 @@ export function SyncManagementPanel({
   onUnbind,
   onReconnectPreview,
   onReconnectCommit,
-  onAccountChange,
   onEnable,
   onRemoveLocalCopy,
+  showAccountSetup = true,
 }: Props) {
   const [confirm, setConfirm] = useState<{
-    kind: "unbind" | "reconnect" | "account-sign-out" | "account-switch";
+    kind: "unbind" | "reconnect";
     status: LibrarySyncStatus;
     plan?: SyncReconnectPlan;
-    pluginId?: string;
   } | null>(null);
   const [details, setDetails] = useState<{
     status: LibrarySyncStatus;
@@ -166,6 +166,10 @@ export function SyncManagementPanel({
           {error ?? detailsError}
         </div>
       ) : null}
+      {showAccountSetup ? <OneDriveAccountSetup
+        affectedLibraries={statuses.filter((item) => item.providerId === "com.megle.onedrive" && item.lifecycle !== "local-only").length}
+        compact
+      /> : null}
       <div aria-live="polite" className="settings-sync-list">
         {libraries.map((library) => {
           const status = byId.get(library.libraryUuid);
@@ -284,16 +288,6 @@ export function SyncManagementPanel({
           );
         })}
       </div>
-      {[...new Map(providers.map((provider) => [provider.pluginId, provider])).values()].map((provider) => {
-        const affected = statuses.filter((status) => status.providerId === provider.pluginId && status.lifecycle !== "local-only");
-        if (!affected.length) return null;
-        return <div className="settings-sync-account" key={provider.pluginId}>
-          <div><strong>{provider.accountDisplayName ?? provider.accountUuid}</strong><span>{affected.length} 个资源库将暂停并需要逐库重新连接</span></div>
-          <button data-interactive-pointer-target="true" onClick={() => setConfirm({ kind: "account-sign-out", status: affected[0], pluginId: provider.pluginId })} type="button">退出账号…</button>
-          <button data-interactive-pointer-target="true" onClick={() => setConfirm({ kind: "account-switch", status: affected[0], pluginId: provider.pluginId })} type="button">切换账号…</button>
-        </div>;
-      })}
-
       <ModalSurface
         ariaDescribedBy="sync-confirm-description"
         ariaLabelledBy="sync-confirm-title"
@@ -310,13 +304,13 @@ export function SyncManagementPanel({
               ? "只移除此设备的同步绑定，保留本机资源库和远端对象。选择排空会先发布待处理变更；保留分叉会立即将后续编辑留在本机。"
               : confirm?.kind === "reconnect"
                 ? `三方预览：本机分叉 ${confirm.plan?.localDivergenceCount ?? 0} 项；远端相对解绑基线新增 ${confirm.plan?.remoteDivergenceCount ?? 0} 个对象；原远端身份${confirm.plan?.sameRemoteIdentity ? "匹配" : "不匹配"}，协议${confirm.plan?.remoteCompatible ? "兼容" : "不兼容"}。预览后必须显式选择。`
-                : `此操作会原子暂停受影响的 ${statuses.filter((item) => item.providerId === confirm?.pluginId && item.lifecycle !== "local-only").length} 个资源库，清除账户会话；之后需要逐库重新连接。`
+                : "预览后必须显式选择重新连接方式。"
           }
           descriptionId="sync-confirm-description"
           title={
             confirm?.kind === "unbind"
               ? `取消“${confirm.status.name}”同步`
-              : confirm?.kind === "reconnect" ? `重新连接“${confirm?.status.name ?? ""}”` : confirm?.kind === "account-switch" ? "切换同步账号" : "退出同步账号"
+              : `重新连接“${confirm?.status.name ?? ""}”`
           }
           titleId="sync-confirm-title"
         />
@@ -333,9 +327,6 @@ export function SyncManagementPanel({
               <button disabled={!confirm.plan?.publishNewAllowed} data-interactive-pointer-target="true" onClick={() => { if (confirm.plan) onReconnectCommit(confirm.status, confirm.plan, "publish-new-remote"); setConfirm(null); }} type="button">发布为新远端</button>
               <LiquidGlassButton disabled={!confirm.plan?.mergeAllowed} onClick={() => { if (confirm.plan) onReconnectCommit(confirm.status, confirm.plan, "merge-local-fork"); setConfirm(null); }} type="button">合并本机分叉</LiquidGlassButton>
             </>
-          ) : null}
-          {confirm?.kind === "account-sign-out" || confirm?.kind === "account-switch" ? (
-            <LiquidGlassButton onClick={() => { if (confirm.pluginId) onAccountChange(confirm.pluginId, confirm.kind === "account-switch"); setConfirm(null); }} type="button">{confirm.kind === "account-switch" ? "暂停并切换" : "暂停并退出"}</LiquidGlassButton>
           ) : null}
         </OverlayDialogActions>
       </ModalSurface>

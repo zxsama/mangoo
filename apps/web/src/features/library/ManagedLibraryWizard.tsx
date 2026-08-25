@@ -18,6 +18,8 @@ import {
   LibraryIconPicker,
 } from "./libraryGlyph";
 import { createCoreClient } from "../../core/client";
+import { OneDriveAccountSetupContent } from "../plugins/OneDriveAccountSetup";
+import { usePluginAuth } from "../plugins/usePluginAuth";
 
 export interface ManagedLibraryWizardProps {
   firstRun?: boolean;
@@ -60,6 +62,14 @@ export function ManagedLibraryWizard({
   const [restorePreflight, setRestorePreflight] = useState<SyncRestorePreflight | null>(null);
   const [restorePlans, setRestorePlans] = useState<SyncRestorePlan[]>([]);
   const nameRef = useRef<HTMLInputElement>(null);
+  const restoreModeRef = useRef<HTMLButtonElement>(null);
+  const auth = usePluginAuth();
+  const authResumeRef = useRef<{
+    contextRevision: number;
+    mode: "create" | "restore";
+    selectedRemoteIds: string[];
+  } | null>(null);
+  const previousAuthStateRef = useRef(auth.plugin?.authState);
   const queryClient = useQueryClient();
 
   useEffect(() => {
@@ -69,10 +79,51 @@ export function ManagedLibraryWizard({
     setRestorePreflight(null);
     setRestoreItems(null);
     setRestorePlans([]);
+    authResumeRef.current = null;
   }, [initialMode, open]);
 
+  async function prepareAuthResume() {
+    const active = await createCoreClient().getActiveLibrary();
+    authResumeRef.current = {
+      contextRevision: active.contextRevision,
+      mode,
+      selectedRemoteIds: [...selectedRemoteIds],
+    };
+  }
+
+  async function resumeAfterAuthentication() {
+    const intent = authResumeRef.current;
+    authResumeRef.current = null;
+    if (!intent || !open || intent.mode !== mode) return;
+    const active = await createCoreClient().getActiveLibrary();
+    if (active.contextRevision !== intent.contextRevision) {
+      setError("资源库上下文已变化，请重新选择同步或恢复目标。");
+      return;
+    }
+    setSelectedRemoteIds(new Set(intent.selectedRemoteIds));
+    if (mode === "restore") {
+      setRemoteLoading(true);
+      try {
+        const response = await createCoreClient().listRemoteLibraries();
+        setRemoteLibraries(response.items);
+      } finally {
+        setRemoteLoading(false);
+      }
+    }
+    (mode === "create" ? nameRef.current : restoreModeRef.current)?.focus();
+  }
+
   useEffect(() => {
-    if (!open || mode !== "restore") return;
+    const previous = previousAuthStateRef.current;
+    const current = auth.plugin?.authState;
+    previousAuthStateRef.current = current;
+    if (previous !== "authenticated" && current === "authenticated" && authResumeRef.current) {
+      void resumeAfterAuthentication();
+    }
+  }, [auth.plugin?.authState]);
+
+  useEffect(() => {
+    if (!open || mode !== "restore" || auth.plugin?.authState !== "authenticated") return;
     const controller = new AbortController();
     setRemoteLoading(true);
     void createCoreClient().listRemoteLibraries({ signal: controller.signal })
@@ -84,7 +135,7 @@ export function ManagedLibraryWizard({
         if (!controller.signal.aborted) setRemoteLoading(false);
       });
     return () => controller.abort();
-  }, [mode, open]);
+  }, [auth.plugin?.authState, mode, open]);
 
   const selectedRemote = useMemo(
     () => remoteLibraries.filter((remote) => selectedRemoteIds.has(remote.libraryUuid)),
@@ -262,9 +313,20 @@ export function ManagedLibraryWizard({
         titleId="managed-library-wizard-title"
       />
       <div aria-label="资源库来源" className="managed-library-mode" role="tablist">
-        <button aria-selected={mode === "create"} data-selected={mode === "create"} onClick={() => { setMode("create"); setRestorePreflight(null); setRestoreItems(null); }} role="tab" type="button">新建本机资源库</button>
-        <button aria-selected={mode === "restore"} data-selected={mode === "restore"} onClick={() => { setMode("restore"); setRestorePreflight(null); setRestoreItems(null); }} role="tab" type="button">从 OneDrive 恢复</button>
+        <button aria-selected={mode === "create"} data-selected={mode === "create"} onClick={() => { authResumeRef.current = null; setMode("create"); setRestorePreflight(null); setRestoreItems(null); }} role="tab" type="button">新建本机资源库</button>
+        <button aria-selected={mode === "restore"} data-selected={mode === "restore"} onClick={() => { authResumeRef.current = null; setMode("restore"); setRestorePreflight(null); setRestoreItems(null); }} ref={restoreModeRef} role="tab" type="button">从 OneDrive 恢复</button>
       </div>
+      {auth.plugin?.authState !== "authenticated" && (mode === "restore" || enableSync) ? (
+        <div className="managed-library-auth-required">
+          <p>连接 OneDrive 后会回到此流程；登录期间只在内存中保留当前模式和目标。</p>
+          <OneDriveAccountSetupContent
+            compact
+            controller={auth}
+            onBeforeBegin={prepareAuthResume}
+            onCancelled={() => { authResumeRef.current = null; }}
+          />
+        </div>
+      ) : null}
       {mode === "create" ? <><label className="overlay-field">
         <span>名称</span>
         <input ref={nameRef} value={name} onChange={(event) => setName(event.target.value)} />
@@ -289,7 +351,7 @@ export function ManagedLibraryWizard({
         <span>创建后启用 OneDrive 同步（登录或网络失败不会删除本机资源库）</span>
       </label></> : <div aria-busy={remoteLoading} className="managed-library-remote-list" role="group">
         {remoteLoading ? <p role="status">正在发现远端资源库…</p> : null}
-        {!remoteLoading && remoteLibraries.length === 0 ? <p role="status">当前账户没有可恢复的远端资源库。</p> : null}
+        {!remoteLoading && remoteLibraries.length === 0 ? <p role="status">{auth.plugin?.authState === "authenticated" ? "当前账户没有可恢复的远端资源库。" : "请先连接 OneDrive 以发现可恢复的资源库。"}</p> : null}
         {remoteLibraries.map((remote) => {
           const selected = selectedRemoteIds.has(remote.libraryUuid);
           const remoteDetails = [

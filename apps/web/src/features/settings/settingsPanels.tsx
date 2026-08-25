@@ -840,7 +840,6 @@ function LibrariesTab({ library }: { library: LibraryState }) {
         onUnbind={(status, choice) => void sync.unbind(status, choice)}
         onReconnectPreview={sync.previewReconnect}
         onReconnectCommit={(status, plan, choice) => void sync.commitReconnect(status, plan, choice)}
-        onAccountChange={(pluginId, switchAccount) => void sync.changeAccount(pluginId, switchAccount)}
         onEnable={(status, provider) => void sync.enable(status, provider)}
         onRemoveLocalCopy={(target) => {
           setConfirmDeleteId(target.libraryUuid);
