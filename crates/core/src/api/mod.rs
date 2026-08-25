@@ -3,6 +3,8 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 
 use axum::extract::Request;
 use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
@@ -145,12 +147,34 @@ pub struct AppState {
     request_gate: Arc<tokio::sync::RwLock<()>>,
     pub library_manager: Option<Arc<LibraryManager>>,
     pub(crate) plugin_auth_flows: Arc<crate::plugins::auth_flow::AuthFlowRegistry>,
+    pub(crate) plugin_auth_workers: Arc<AsyncMutex<HashMap<String, PluginAuthWorker>>>,
+    pub(crate) plugin_auth_begin_gate: Arc<AsyncMutex<()>>,
     pub(crate) secret_store: Option<Arc<dyn crate::plugins::secret_store::SecretStore>>,
     #[cfg(test)]
     pub(crate) notification_outbox_test_probe: Option<Arc<NotificationOutboxTestProbe>>,
 }
 
+pub(crate) struct PluginAuthWorker {
+    pub flow_id: String,
+    pub cancellation: CancellationToken,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
 impl AppState {
+    pub async fn shutdown_plugin_auth_workers(&self) {
+        let workers = {
+            let mut workers = self.plugin_auth_workers.lock().await;
+            workers
+                .drain()
+                .map(|(_, worker)| worker)
+                .collect::<Vec<_>>()
+        };
+        for worker in workers {
+            worker.cancellation.cancel();
+            let _ = worker.task.await;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_task_queue(
         database: Database,
@@ -167,6 +191,8 @@ impl AppState {
             request_gate: Arc::new(tokio::sync::RwLock::new(())),
             library_manager: None,
             plugin_auth_flows: Arc::new(crate::plugins::auth_flow::AuthFlowRegistry::default()),
+            plugin_auth_workers: Arc::new(AsyncMutex::new(HashMap::new())),
+            plugin_auth_begin_gate: Arc::new(AsyncMutex::new(())),
             secret_store: Some(Arc::new(
                 crate::plugins::secret_store::MemorySecretStore::default(),
             )),
@@ -188,6 +214,8 @@ impl AppState {
             request_gate: Arc::new(tokio::sync::RwLock::new(())),
             library_manager: None,
             plugin_auth_flows: Arc::new(crate::plugins::auth_flow::AuthFlowRegistry::default()),
+            plugin_auth_workers: Arc::new(AsyncMutex::new(HashMap::new())),
+            plugin_auth_begin_gate: Arc::new(AsyncMutex::new(())),
             secret_store: Some(Arc::new(
                 crate::plugins::secret_store::MemorySecretStore::default(),
             )),
@@ -224,6 +252,7 @@ impl AppState {
             tracing::warn!(manifest_path = %entry.manifest_path.display(), error = %entry.message, "bundled Provider discovery rejected an entry");
         }
         registry.reset_plugin_runtime_states_for_startup(secret_store.is_some())?;
+        registry.recover_plugin_auth_flows_for_startup()?;
         let active = Arc::new(std::sync::RwLock::new(ActiveSnapshot {
             library_uuid: None,
             context_revision: 0,
@@ -244,6 +273,8 @@ impl AppState {
             request_gate,
             library_manager: Some(Arc::clone(&manager)),
             plugin_auth_flows: Arc::new(crate::plugins::auth_flow::AuthFlowRegistry::default()),
+            plugin_auth_workers: Arc::new(AsyncMutex::new(HashMap::new())),
+            plugin_auth_begin_gate: Arc::new(AsyncMutex::new(())),
             secret_store,
             #[cfg(test)]
             notification_outbox_test_probe: None,
@@ -477,6 +508,130 @@ fn start_runtime_background_tasks(state: &AppState) {
     let token = runtime.cancellation_token();
     let sweep_state = state.clone();
     runtime.own_background_task(tokio::spawn(run_transient_retry_loop(sweep_state, token)));
+    let token = runtime.cancellation_token();
+    let retirement_state = state.clone();
+    runtime.own_background_task(tokio::spawn(run_credential_retirement_loop(
+        retirement_state,
+        token,
+    )));
+}
+
+pub(crate) fn reconcile_credential_retirements_once(state: &AppState) -> anyhow::Result<usize> {
+    let Some(store) = state.secret_store.as_ref() else {
+        return Ok(0);
+    };
+    let Some(manager) = state.library_manager.as_ref() else {
+        return Ok(0);
+    };
+    reconcile_credential_retirements(manager.host_registry(), store)
+}
+
+fn reconcile_credential_retirements(
+    registry: &Arc<HostRegistry>,
+    store: &Arc<dyn crate::plugins::secret_store::SecretStore>,
+) -> anyhow::Result<usize> {
+    use crate::plugins::secret_store::{SecretScope, SecretStoreError};
+    let retirements = registry.due_credential_retirements(32)?;
+    let mut completed = 0;
+    for retirement in retirements {
+        let scope = SecretScope {
+            plugin_id: retirement.plugin_id.clone(),
+            account_uuid: retirement.account_uuid,
+            namespace: retirement.namespace,
+            purpose: retirement.purpose,
+        };
+        match store.delete(&scope, &retirement.secret_ref) {
+            Ok(()) | Err(SecretStoreError::NotFound) => {
+                registry.complete_credential_retirement(&retirement.retirement_uuid)?;
+                completed += 1;
+            }
+            Err(error) => {
+                tracing::warn!(plugin_id = %retirement.plugin_id, %error, "credential retirement will be retried");
+                registry
+                    .fail_credential_retirement(&retirement.retirement_uuid, retirement.attempts)?;
+            }
+        }
+    }
+    Ok(completed)
+}
+
+async fn run_credential_retirement_loop(state: AppState, cancellation: CancellationToken) {
+    loop {
+        if let Err(error) = reconcile_credential_retirements_once(&state) {
+            tracing::warn!(%error, "credential retirement reconciliation failed");
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_retirement_tests {
+    use super::*;
+    use crate::plugins::secret_store::{MemorySecretStore, SecretScope, SecretStore};
+
+    #[test]
+    fn retirement_reconciliation_deletes_the_old_secret_and_journal() {
+        let path = std::env::temp_dir().join(format!(
+            "megle-credential-retirement-{}.sqlite",
+            uuid::Uuid::now_v7()
+        ));
+        let registry = Arc::new(HostRegistry::open(&path).unwrap());
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.megle.onedrive",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: std::path::Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account(
+                "onedrive-account",
+                "com.megle.onedrive",
+                Some("OneDrive"),
+                "authenticated",
+            )
+            .unwrap();
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
+        let scope = SecretScope {
+            plugin_id: "com.megle.onedrive".into(),
+            account_uuid: "onedrive-account".into(),
+            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
+            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+        };
+        let secret_ref = store.create(&scope, b"token").unwrap();
+        registry
+            .set_plugin_account_secret("com.megle.onedrive", Some(&secret_ref), "authenticated", 1)
+            .unwrap();
+        let initial = registry.onedrive_configuration().unwrap();
+        let plan = registry
+            .plan_onedrive_configuration(
+                Some("01234567-89ab-4cde-8fab-0123456789ab"),
+                initial.revision,
+            )
+            .unwrap();
+        registry
+            .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, true)
+            .unwrap();
+        assert_eq!(
+            reconcile_credential_retirements(&registry, &store).unwrap(),
+            1
+        );
+        assert!(registry.due_credential_retirements(10).unwrap().is_empty());
+        assert!(matches!(
+            store.read(&scope, &secret_ref),
+            Err(crate::plugins::secret_store::SecretStoreError::NotFound)
+        ));
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Starts the background reachability probe: refreshes `state.root_reachability`

@@ -13,6 +13,7 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0005_sync_orchestration.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0006_sync_orchestration_recovery.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0007_onedrive_auth_configuration.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0008_plugin_credential_retirement.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -588,6 +589,8 @@ def main() -> None:
             "plugin_version_journal",
             "onedrive_configuration",
             "onedrive_configuration_plans",
+            "plugin_credential_retirements",
+            "plugin_auth_flow_ownership",
         "sync_orchestration_operations",
         "sync_preflight_tokens",
             "sync_unbind_plans",
@@ -601,7 +604,7 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (7, None, 0, "stopped"):
+        if meta != (8, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         binding_cursor_columns = {
             row[1]

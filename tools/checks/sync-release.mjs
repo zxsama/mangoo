@@ -84,6 +84,12 @@ if (!dirty) {
       rows.push(await runCommand({ name: "exact-tree-npm-ci", command: "npm", args: ["ci", "--no-audit", "--no-fund"], cwd: extracted, runDirectory, timeoutMs: 30 * 60 * 1000 }));
       rows.push(await runCommand({ name: "exact-tree-legacy-selector-adoption-absence", command: "node", args: ["tools/checks/sync-legacy-absence.mjs"], cwd: extracted, runDirectory }));
       rows.push(await runCommand({ name: "exact-tree-full-gate", command: "npm", args: ["test"], cwd: extracted, runDirectory, timeoutMs: 2 * 60 * 60 * 1000 }));
+      const bundledClientId = process.env.MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID;
+      if (!bundledClientId) {
+        rows.push({ name: "exact-tree-onedrive-client-id-artifact", status: "blocked", required: true, reason: "MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID release build input is absent" });
+      } else {
+        rows.push(await runCommand({ name: "exact-tree-onedrive-client-id-artifact", command: "node", args: ["tools/build/build-bundled-plugins.mjs", "--release", "--verify-onedrive"], cwd: extracted, env: { MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID: bundledClientId }, runDirectory, timeoutMs: 2 * 60 * 60 * 1000 }));
+      }
       rows.push(await runCommand({ name: "exact-tree-sync-integration", command: "node", args: ["tools/checks/sync-integration.mjs", "--output", path.join(runDirectory, "exact-integration"), ...(options.quick ? ["--quick"] : [])], cwd: extracted, runDirectory, timeoutMs: 2 * 60 * 60 * 1000 }));
       if (!rendererEvidence && process.platform === "win32") {
         rendererEvidence = path.join(runDirectory, "exact-renderer-evidence.json");
@@ -128,7 +134,11 @@ if (process.platform === "win32") {
 if (await commandExists("docker", ["info"]) && extracted) {
   const image = `megle:sync-release-${commit.slice(0, 12)}`;
   const verifierImage = `${image}-verifier`;
-  rows.push(await runCommand({ name: "docker-linux-build", command: "docker", args: ["build", "--progress=plain", "-t", image, "."], cwd: extracted, runDirectory, timeoutMs: 3 * 60 * 60 * 1000 }));
+  const bundledClientId = process.env.MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID;
+  if (!bundledClientId) {
+    rows.push({ name: "docker-bundled-onedrive-client-id", status: "blocked", required: true, reason: "MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID release build input is absent" });
+  }
+  rows.push(await runCommand({ name: "docker-linux-build", command: "docker", args: ["build", "--progress=plain", ...(bundledClientId ? ["--build-arg", `MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID=${bundledClientId}`] : []), "-t", image, "."], cwd: extracted, runDirectory, timeoutMs: 3 * 60 * 60 * 1000 }));
   if (rows.at(-1).status === "passed") {
     rows.push(await runCommand({ name: "docker-linux-verifier-build", command: "docker", args: ["build", "--progress=plain", "--target", "sync-verifier", "-t", verifierImage, "."], cwd: extracted, runDirectory, timeoutMs: 3 * 60 * 60 * 1000 }));
     const dockerData = await mkdtemp(path.join(os.tmpdir(), "megle-release-docker-"));

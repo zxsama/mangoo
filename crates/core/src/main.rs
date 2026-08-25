@@ -201,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
         }
     })
     .await;
+    state.shutdown_plugin_auth_workers().await;
     if let Some(manager) = &state.library_manager {
         manager.shutdown_sync_coordinator().await?;
     }

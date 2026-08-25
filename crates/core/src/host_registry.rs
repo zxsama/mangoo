@@ -15,6 +15,11 @@ const HOST_MIGRATION_0006: &str =
     include_str!("../host_migrations/0006_sync_orchestration_recovery.sql");
 const HOST_MIGRATION_0007: &str =
     include_str!("../host_migrations/0007_onedrive_auth_configuration.sql");
+const HOST_MIGRATION_0008: &str =
+    include_str!("../host_migrations/0008_plugin_credential_retirement.sql");
+
+pub const ONEDRIVE_SECRET_NAMESPACE: &str = "microsoft-onedrive";
+pub const ONEDRIVE_CREDENTIAL_PURPOSE: &str = "oauth-v1";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -312,6 +317,23 @@ pub struct OneDriveConfigurationPlan {
     pub affected_libraries: u64,
     pub requires_confirmation: bool,
     pub expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CredentialRetirement {
+    pub retirement_uuid: String,
+    pub plugin_id: String,
+    pub account_uuid: String,
+    pub secret_ref: String,
+    pub namespace: String,
+    pub purpose: String,
+    pub attempts: u32,
+}
+
+#[derive(Debug)]
+pub struct OneDriveConfigurationCommit {
+    pub fences: Vec<BindingFence>,
+    pub effective_changed: bool,
 }
 
 const ONEDRIVE_PLUGIN_ID: &str = "com.megle.onedrive";
@@ -754,6 +776,21 @@ impl HostRegistry {
     ) -> anyhow::Result<Option<Vec<BindingFence>>> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
+        let retiring: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT account_uuid,secret_ref FROM plugin_accounts WHERE plugin_id=?1 AND generation=?2 AND secret_ref IS NOT NULL",
+                params![plugin_id,expected_generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((account_uuid, secret_ref)) =
+            retiring.filter(|_| plugin_id == ONEDRIVE_PLUGIN_ID)
+        {
+            transaction.execute(
+                "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?7,?7)",
+                params![uuid::Uuid::now_v7().to_string(),plugin_id,account_uuid,secret_ref,ONEDRIVE_SECRET_NAMESPACE,ONEDRIVE_CREDENTIAL_PURPOSE,unix_timestamp_millis()],
+            )?;
+        }
         let changed = transaction.execute(
             "UPDATE plugin_accounts SET secret_ref=NULL,auth_state='signed-out',generation=generation+1,updated_at=?1 WHERE plugin_id=?2 AND generation=?3",
             params![unix_timestamp_millis(),plugin_id,expected_generation],
@@ -995,7 +1032,7 @@ impl HostRegistry {
         plan_uuid: &str,
         expected_revision: u64,
         confirmed: bool,
-    ) -> anyhow::Result<Vec<BindingFence>> {
+    ) -> anyhow::Result<OneDriveConfigurationCommit> {
         let now = unix_timestamp_millis();
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
@@ -1022,6 +1059,19 @@ impl HostRegistry {
         }
         let fences = if changed {
             let fences = pause_plugin_bindings_in_transaction(&transaction, ONEDRIVE_PLUGIN_ID)?;
+            let retiring: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT account_uuid,secret_ref FROM plugin_accounts WHERE plugin_id=?1 AND secret_ref IS NOT NULL",
+                    [ONEDRIVE_PLUGIN_ID],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((account_uuid, secret_ref)) = retiring {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?7,?7)",
+                    params![uuid::Uuid::now_v7().to_string(),ONEDRIVE_PLUGIN_ID,account_uuid,secret_ref,ONEDRIVE_SECRET_NAMESPACE,ONEDRIVE_CREDENTIAL_PURPOSE,now],
+                )?;
+            }
             transaction.execute("UPDATE onedrive_configuration SET host_override_client_id=?1,revision=revision+1,updated_at=?2 WHERE singleton=1", params![requested,now])?;
             transaction.execute("UPDATE plugin_accounts SET secret_ref=NULL,stable_account_identity=NULL,account_kind=NULL,auth_state='authorization-required',generation=generation+1,updated_at=?1 WHERE plugin_id=?2", params![now,ONEDRIVE_PLUGIN_ID])?;
             transaction.execute("UPDATE plugin_runtime_state SET state='starting',pid=NULL,session_id=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2", params![now,ONEDRIVE_PLUGIN_ID])?;
@@ -1034,7 +1084,193 @@ impl HostRegistry {
             [plan_uuid],
         )?;
         transaction.commit()?;
-        Ok(fences)
+        Ok(OneDriveConfigurationCommit {
+            fences,
+            effective_changed: changed,
+        })
+    }
+
+    pub fn due_credential_retirements(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<CredentialRetirement>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts FROM plugin_credential_retirements WHERE next_retry_at<=?1 ORDER BY created_at LIMIT ?2",
+        )?;
+        let retirements = statement
+            .query_map(params![unix_timestamp_millis(), limit as i64], |row| {
+                Ok(CredentialRetirement {
+                    retirement_uuid: row.get(0)?,
+                    plugin_id: row.get(1)?,
+                    account_uuid: row.get(2)?,
+                    secret_ref: row.get(3)?,
+                    namespace: row.get(4)?,
+                    purpose: row.get(5)?,
+                    attempts: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(retirements)
+    }
+
+    pub fn complete_credential_retirement(&self, retirement_uuid: &str) -> anyhow::Result<()> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute(
+                "DELETE FROM plugin_credential_retirements WHERE retirement_uuid=?1",
+                [retirement_uuid],
+            )?;
+        Ok(())
+    }
+
+    pub fn fail_credential_retirement(
+        &self,
+        retirement_uuid: &str,
+        attempts: u32,
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let exponent = attempts.min(8);
+        let retry_ms = (1_i64 << exponent) * 1_000;
+        let retry_at = now + retry_ms.min(5 * 60 * 1_000);
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE plugin_credential_retirements SET attempts=attempts+1,next_retry_at=?1,last_error_code='credential-retirement-pending',updated_at=?2 WHERE retirement_uuid=?3",
+            params![retry_at,now,retirement_uuid],
+        )?;
+        transaction.execute(
+            "UPDATE plugin_runtime_state SET state='degraded',pid=NULL,session_id=NULL,last_error_code='credential-retirement-pending',last_error_detail='Old Provider credentials are awaiting secure deletion',updated_at=?1 WHERE plugin_id=(SELECT plugin_id FROM plugin_credential_retirements WHERE retirement_uuid=?2)",
+            params![now,retirement_uuid],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn begin_plugin_auth_flow(
+        &self,
+        plugin_id: &str,
+        flow_id: &str,
+        supervisor_session: &str,
+    ) -> anyhow::Result<bool> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_credential_retirements WHERE plugin_id=?1)",
+            [plugin_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            anyhow::bail!("credential-retirement-pending");
+        }
+        let current: Option<(String, Option<String>, Option<String>)> = transaction
+            .query_row(
+                "SELECT auth_state,display_name,account_kind FROM plugin_accounts WHERE plugin_id=?1 AND EXISTS(SELECT 1 FROM plugin_runtime_state r WHERE r.plugin_id=plugin_accounts.plugin_id AND r.state='ready' AND r.session_id=?2)",
+                params![plugin_id,supervisor_session],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )
+            .optional()?;
+        let Some((prior_auth_state, prior_display_name, prior_account_kind)) = current else {
+            return Ok(false);
+        };
+        transaction.execute(
+            "DELETE FROM plugin_auth_flow_ownership WHERE plugin_id=?1",
+            [plugin_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO plugin_auth_flow_ownership(plugin_id,flow_id,supervisor_session,prior_auth_state,prior_display_name,prior_account_kind,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![plugin_id,flow_id,supervisor_session,prior_auth_state,prior_display_name,prior_account_kind,now],
+        )?;
+        transaction.execute(
+            "UPDATE plugin_accounts SET auth_state='authorizing',last_error=NULL,updated_at=?1 WHERE plugin_id=?2",
+            params![now,plugin_id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn plugin_auth_flow_is_current(
+        &self,
+        plugin_id: &str,
+        flow_id: &str,
+        supervisor_session: &str,
+    ) -> anyhow::Result<bool> {
+        self.connection.lock().unwrap_or_else(|p| p.into_inner()).query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_auth_flow_ownership WHERE plugin_id=?1 AND flow_id=?2 AND supervisor_session=?3)",
+            params![plugin_id,flow_id,supervisor_session],
+            |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
+    pub fn plugin_auth_flow_ownership(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT flow_id,supervisor_session FROM plugin_auth_flow_ownership WHERE plugin_id=?1",
+                [plugin_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn finish_plugin_auth_flow(
+        &self,
+        plugin_id: &str,
+        flow_id: &str,
+        supervisor_session: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "DELETE FROM plugin_auth_flow_ownership WHERE plugin_id=?1 AND flow_id=?2 AND supervisor_session=?3",
+            params![plugin_id,flow_id,supervisor_session],
+        )? == 1)
+    }
+
+    pub fn cancel_plugin_auth_flow(
+        &self,
+        plugin_id: &str,
+        flow_id: &str,
+        supervisor_session: &str,
+    ) -> anyhow::Result<bool> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let prior: Option<(String, Option<String>, Option<String>)> = transaction.query_row(
+            "SELECT prior_auth_state,prior_display_name,prior_account_kind FROM plugin_auth_flow_ownership WHERE plugin_id=?1 AND flow_id=?2 AND supervisor_session=?3",
+            params![plugin_id,flow_id,supervisor_session],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional()?;
+        let Some((auth_state, display_name, account_kind)) = prior else {
+            return Ok(false);
+        };
+        transaction.execute(
+            "UPDATE plugin_accounts SET auth_state=?1,display_name=?2,account_kind=?3,last_error=NULL,updated_at=?4 WHERE plugin_id=?5",
+            params![auth_state,display_name,account_kind,now,plugin_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM plugin_auth_flow_ownership WHERE plugin_id=?1",
+            [plugin_id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn recover_plugin_auth_flows_for_startup(&self) -> anyhow::Result<usize> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE plugin_accounts SET auth_state=COALESCE((SELECT prior_auth_state FROM plugin_auth_flow_ownership f WHERE f.plugin_id=plugin_accounts.plugin_id),auth_state),display_name=COALESCE((SELECT prior_display_name FROM plugin_auth_flow_ownership f WHERE f.plugin_id=plugin_accounts.plugin_id),display_name),account_kind=COALESCE((SELECT prior_account_kind FROM plugin_auth_flow_ownership f WHERE f.plugin_id=plugin_accounts.plugin_id),account_kind),updated_at=?1 WHERE plugin_id IN (SELECT plugin_id FROM plugin_auth_flow_ownership)",
+            [now],
+        )?;
+        transaction.execute("DELETE FROM plugin_auth_flow_ownership", [])?;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn reset_plugin_runtime_states_for_startup(
@@ -1112,7 +1348,7 @@ impl HostRegistry {
     pub fn plugin_runtime_launches(&self) -> anyhow::Result<Vec<PluginRuntimeLaunch>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare(
-            "SELECT i.plugin_id,i.selected_version,v.manifest_json,i.install_root,v.entry_sha256,a.account_uuid,a.generation,i.requested_permissions_json,i.granted_permissions_json FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.enabled_intent=1 AND r.state <> 'configuration-required' ORDER BY i.plugin_id",
+            "SELECT i.plugin_id,i.selected_version,v.manifest_json,i.install_root,v.entry_sha256,a.account_uuid,a.generation,i.requested_permissions_json,i.granted_permissions_json FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.enabled_intent=1 AND r.state <> 'configuration-required' AND NOT EXISTS(SELECT 1 FROM plugin_credential_retirements q WHERE q.plugin_id=i.plugin_id) ORDER BY i.plugin_id",
         )?;
         let rows = statement.query_map([], |row| {
             let hash: Vec<u8> = row.get(4)?;
@@ -2306,6 +2542,14 @@ impl HostRegistry {
         )?;
         if schema_version < 7 {
             connection.execute_batch(HOST_MIGRATION_0007)?;
+        }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 8 {
+            connection.execute_batch(HOST_MIGRATION_0008)?;
         }
         connection.execute(
             "INSERT OR IGNORE INTO host_sync_local_state(singleton,device_uuid,stream_uuid,next_actor_seq,hlc_wall_ms,hlc_logical,capture_enabled,updated_at) VALUES (1,?1,?2,1,0,0,0,?3)",
@@ -5609,6 +5853,7 @@ mod tests {
         assert!(registry
             .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, false)
             .unwrap()
+            .fences
             .is_empty());
         let configured = registry.onedrive_configuration().unwrap();
         assert_eq!(configured.source, "host-override");
@@ -5631,6 +5876,94 @@ mod tests {
         assert!(registry
             .plan_onedrive_configuration(Some("not-a-uuid"), configured.revision)
             .is_err());
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn onedrive_configuration_change_journals_old_credential_until_deleted() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "com.megle.onedrive", "onedrive-account");
+        registry
+            .set_plugin_account_secret("com.megle.onedrive", Some("old-secret"), "authenticated", 1)
+            .unwrap();
+        let initial = registry.onedrive_configuration().unwrap();
+        let plan = registry
+            .plan_onedrive_configuration(
+                Some("01234567-89ab-4cde-8fab-0123456789ab"),
+                initial.revision,
+            )
+            .unwrap();
+        let commit = registry
+            .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, true)
+            .unwrap();
+        assert!(commit.effective_changed);
+        assert_eq!(
+            registry
+                .plugin_account_secret("com.megle.onedrive")
+                .unwrap()
+                .unwrap()
+                .secret_ref,
+            None
+        );
+        let due = registry.due_credential_retirements(10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].secret_ref, "old-secret");
+
+        drop(registry);
+        let reopened = HostRegistry::open(&path).unwrap();
+        let due = reopened.due_credential_retirements(10).unwrap();
+        assert_eq!(due.len(), 1, "retirement must survive restart");
+        reopened
+            .complete_credential_retirement(&due[0].retirement_uuid)
+            .unwrap();
+        assert!(reopened.due_credential_retirements(10).unwrap().is_empty());
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancelling_switch_auth_restores_authenticated_projection() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "com.megle.onedrive", "onedrive-account");
+        registry
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE plugin_runtime_state SET session_id='session-a' WHERE plugin_id='com.megle.onedrive'",
+                [],
+            )
+            .unwrap();
+        assert!(registry
+            .begin_plugin_auth_flow("com.megle.onedrive", "flow-a", "session-a")
+            .unwrap());
+        assert_eq!(
+            registry
+                .host_plugin("com.megle.onedrive")
+                .unwrap()
+                .unwrap()
+                .auth_state
+                .as_deref(),
+            Some("authorizing")
+        );
+        assert!(registry
+            .cancel_plugin_auth_flow("com.megle.onedrive", "flow-a", "session-a")
+            .unwrap());
+        assert_eq!(
+            registry
+                .host_plugin("com.megle.onedrive")
+                .unwrap()
+                .unwrap()
+                .auth_state
+                .as_deref(),
+            Some("authenticated")
+        );
+        assert!(!registry
+            .cancel_plugin_auth_flow("com.megle.onedrive", "flow-a", "session-a")
+            .unwrap());
         drop(registry);
         let _ = std::fs::remove_file(path);
     }

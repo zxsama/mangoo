@@ -4,6 +4,9 @@
 FROM rust:1.88-slim AS core-builder
 WORKDIR /src
 
+ARG MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID
+ENV MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID=${MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID}
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -27,6 +30,8 @@ RUN cargo test --release -p megle-fake-provider --test process_conformance \
     && cp target/release/megle-onedrive-provider target/release/bundled-plugins/com.megle.onedrive/bin/megle-onedrive-provider \
     && sed "s/__SHA256__/$FAKE_HASH/g" bundled-plugins/com.megle.fake-sync/plugin.template.json > target/release/bundled-plugins/com.megle.fake-sync/plugin.json \
     && sed "s/__SHA256__/$ONEDRIVE_HASH/g" bundled-plugins/com.megle.onedrive/plugin.template.json > target/release/bundled-plugins/com.megle.onedrive/plugin.json \
+    && echo "$MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$' \
+    && ! echo "$MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID" | grep -Eiq '^(00000000-|11111111-)' \
     && cargo build --release -p megle-core \
     && cargo test --release -p megle-core --test plugin_runtime_process \
     && strip target/release/megle-core

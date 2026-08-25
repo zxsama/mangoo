@@ -3551,6 +3551,7 @@ async fn disable_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
 ) -> ApiResult<Json<crate::host_registry::HostPluginProjection>> {
+    cancel_owned_auth_worker(&state, &plugin_id, None, true).await?;
     let manager = library_manager(&state)?;
     let registry = manager.host_registry();
     registry
@@ -3747,6 +3748,8 @@ async fn begin_plugin_auth(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<PluginAuthBeginResponse>)> {
+    let _begin_guard = state.plugin_auth_begin_gate.lock().await;
+    cancel_owned_auth_worker(&state, &id, None, true).await?;
     let plugin = host_registry(&state)?
         .host_plugin(&id)?
         .ok_or_else(|| not_found_plugin(&id))?;
@@ -3806,19 +3809,6 @@ async fn begin_plugin_auth(
         .auth_begin(callback_url)
         .await
         .map_err(map_provider_error)?;
-    if !host_registry(&state)?.update_plugin_account_auth_for_session(
-        &id,
-        &supervisor_session,
-        "authorizing",
-        None,
-        None,
-    )? {
-        return Err(CoreError::coded(
-            StatusCode::CONFLICT,
-            "oauth_session_changed",
-            "Provider runtime restarted during authorization".into(),
-        ));
-    }
     let provider_flow_id = auth.flow_id.clone();
     let response_flow_id = if let Some(flow_id) = host_flow_id {
         state
@@ -3828,6 +3818,20 @@ async fn begin_plugin_auth(
     } else {
         provider_flow_id.clone()
     };
+    if !host_registry(&state)?.begin_plugin_auth_flow(
+        &id,
+        &response_flow_id,
+        &supervisor_session,
+    )? {
+        let _ = plugin_provider(&state, &id)?
+            .auth_cancel(&provider_flow_id)
+            .await;
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "oauth_session_changed",
+            "Provider runtime restarted during authorization".into(),
+        ));
+    }
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3839,7 +3843,8 @@ async fn begin_plugin_auth(
             id.clone(),
             provider_flow_id,
             supervisor_session,
-        );
+        )
+        .await;
     }
     Ok((
         StatusCode::CREATED,
@@ -3896,61 +3901,168 @@ async fn apply_plugin_auth_result(
     Ok(())
 }
 
-fn spawn_loopback_auth_completion(
+async fn spawn_loopback_auth_completion(
     state: AppState,
     plugin_id: String,
     flow_id: String,
     supervisor_session: String,
 ) {
-    tokio::spawn(async move {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let worker_cancel = cancellation.clone();
+    let worker_state = state.clone();
+    let worker_plugin_id = plugin_id.clone();
+    let worker_flow_id = flow_id.clone();
+    let worker_session = supervisor_session.clone();
+    let task = tokio::spawn(async move {
         let started = tokio::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(10 * 60);
         let mut delay = std::time::Duration::from_millis(500);
         loop {
+            if worker_cancel.is_cancelled()
+                || !host_registry(&worker_state)
+                    .and_then(|registry| {
+                        registry
+                            .plugin_auth_flow_is_current(
+                                &worker_plugin_id,
+                                &worker_flow_id,
+                                &worker_session,
+                            )
+                            .map_err(CoreError::from)
+                    })
+                    .unwrap_or(false)
+            {
+                return;
+            }
             if tokio::time::Instant::now() >= deadline {
-                if let Ok(provider) = plugin_provider(&state, &plugin_id) {
-                    let _ = provider.auth_cancel(&flow_id).await;
+                if let Ok(provider) = plugin_provider(&worker_state, &worker_plugin_id) {
+                    let _ = provider.auth_cancel(&worker_flow_id).await;
                 }
-                if let Ok(registry) = host_registry(&state) {
+                if let Ok(registry) = host_registry(&worker_state) {
                     let _ = registry.update_plugin_account_auth_for_session(
-                        &plugin_id,
-                        &supervisor_session,
+                        &worker_plugin_id,
+                        &worker_session,
                         "expired",
                         None,
                         None,
                     );
+                    let _ = registry.finish_plugin_auth_flow(
+                        &worker_plugin_id,
+                        &worker_flow_id,
+                        &worker_session,
+                    );
                 }
                 return;
             }
-            let provider = match plugin_provider(&state, &plugin_id) {
+            let provider = match plugin_provider(&worker_state, &worker_plugin_id) {
                 Ok(provider) => provider,
                 Err(_) => return,
             };
-            match provider.auth_poll(&flow_id).await {
+            match provider.auth_poll(&worker_flow_id).await {
                 Ok(Some(auth)) => {
-                    let _ = apply_plugin_auth_result(&state, &plugin_id, &supervisor_session, auth)
-                        .await;
+                    if !host_registry(&worker_state)
+                        .and_then(|registry| {
+                            registry
+                                .plugin_auth_flow_is_current(
+                                    &worker_plugin_id,
+                                    &worker_flow_id,
+                                    &worker_session,
+                                )
+                                .map_err(CoreError::from)
+                        })
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+                    let _ = apply_plugin_auth_result(
+                        &worker_state,
+                        &worker_plugin_id,
+                        &worker_session,
+                        auth,
+                    )
+                    .await;
+                    if let Ok(registry) = host_registry(&worker_state) {
+                        let _ = registry.finish_plugin_auth_flow(
+                            &worker_plugin_id,
+                            &worker_flow_id,
+                            &worker_session,
+                        );
+                    }
                     return;
                 }
                 Ok(None) => {}
                 Err(error) if error.retryable => {}
                 Err(_) => {
-                    if let Ok(registry) = host_registry(&state) {
+                    if let Ok(registry) = host_registry(&worker_state) {
                         let _ = registry.update_plugin_account_auth_for_session(
-                            &plugin_id,
-                            &supervisor_session,
+                            &worker_plugin_id,
+                            &worker_session,
                             "error",
                             None,
                             None,
+                        );
+                        let _ = registry.finish_plugin_auth_flow(
+                            &worker_plugin_id,
+                            &worker_flow_id,
+                            &worker_session,
                         );
                     }
                     return;
                 }
             }
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                _ = worker_cancel.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
             delay = (delay * 2).min(std::time::Duration::from_secs(2));
         }
     });
+    state.plugin_auth_workers.lock().await.insert(
+        plugin_id,
+        crate::api::PluginAuthWorker {
+            flow_id,
+            cancellation,
+            task,
+        },
+    );
+}
+
+async fn cancel_owned_auth_worker(
+    state: &AppState,
+    plugin_id: &str,
+    requested_flow_id: Option<&str>,
+    restore_prior_state: bool,
+) -> ApiResult<bool> {
+    let worker = {
+        let mut workers = state.plugin_auth_workers.lock().await;
+        if workers
+            .get(plugin_id)
+            .is_some_and(|worker| requested_flow_id.is_none_or(|flow_id| worker.flow_id == flow_id))
+        {
+            workers.remove(plugin_id)
+        } else {
+            None
+        }
+    };
+    let ownership = host_registry(state)?.plugin_auth_flow_ownership(plugin_id)?;
+    let matches_requested = ownership
+        .as_ref()
+        .is_some_and(|(flow_id, _)| requested_flow_id.is_none_or(|requested| requested == flow_id));
+    if let Some(worker) = worker {
+        worker.cancellation.cancel();
+        let _ = worker.task.await;
+    }
+    let Some((flow_id, supervisor_session)) = ownership.filter(|_| matches_requested) else {
+        return Ok(false);
+    };
+    if let Ok(provider) = plugin_provider(state, plugin_id) {
+        let _ = provider.auth_cancel(&flow_id).await;
+    }
+    if restore_prior_state {
+        host_registry(state)?.cancel_plugin_auth_flow(plugin_id, &flow_id, &supervisor_session)?;
+    } else {
+        host_registry(state)?.finish_plugin_auth_flow(plugin_id, &flow_id, &supervisor_session)?;
+    }
+    Ok(true)
 }
 
 async fn complete_plugin_auth_callback(
@@ -4047,6 +4159,16 @@ async fn complete_plugin_auth(
     Path(id): Path<String>,
     Json(body): Json<PluginAuthCompleteRequest>,
 ) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let ownership = host_registry(&state)?
+        .plugin_auth_flow_ownership(&id)?
+        .filter(|(flow_id, _)| flow_id == &body.flow_id)
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "oauth_flow_invalid",
+                "OAuth flow is unavailable or no longer current".into(),
+            )
+        })?;
     let auth_fields = crate::plugins::auth_flow::parse_manual_response_uri(&body.response_uri)
         .map_err(|_| {
             CoreError::coded(
@@ -4055,15 +4177,7 @@ async fn complete_plugin_auth(
                 "The authorization response URI is invalid".into(),
             )
         })?;
-    let supervisor_session = host_registry(&state)?
-        .plugin_runtime_session(&id)?
-        .ok_or_else(|| {
-            CoreError::coded(
-                StatusCode::CONFLICT,
-                "provider_not_ready",
-                "Provider runtime session is unavailable".into(),
-            )
-        })?;
+    let supervisor_session = ownership.1;
     let auth = plugin_provider(&state, &id)?
         .auth_complete(&body.flow_id, auth_fields.into_iter().collect())
         .await
@@ -4102,6 +4216,7 @@ async fn complete_plugin_auth(
             .fence_plugin_bindings(&id, fences)
             .await?;
     }
+    host_registry(&state)?.finish_plugin_auth_flow(&id, &body.flow_id, &supervisor_session)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
@@ -4112,26 +4227,7 @@ async fn cancel_plugin_auth(
     Path(id): Path<String>,
     Json(body): Json<PluginAuthCancelRequest>,
 ) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
-    let supervisor_session = host_registry(&state)?
-        .plugin_runtime_session(&id)?
-        .ok_or_else(|| {
-            CoreError::coded(
-                StatusCode::CONFLICT,
-                "provider_not_ready",
-                "Provider runtime session is unavailable".into(),
-            )
-        })?;
-    plugin_provider(&state, &id)?
-        .auth_cancel(&body.flow_id)
-        .await
-        .map_err(map_provider_error)?;
-    host_registry(&state)?.update_plugin_account_auth_for_session(
-        &id,
-        &supervisor_session,
-        "authorization-required",
-        None,
-        None,
-    )?;
+    cancel_owned_auth_worker(&state, &id, Some(&body.flow_id), true).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
@@ -4146,6 +4242,7 @@ async fn sign_out_plugin(
         .plugin_account_secret(&id)?
         .ok_or_else(|| not_found_plugin(&id))?;
     let provider = plugin_provider(&state, &id)?;
+    cancel_owned_auth_worker(&state, &id, None, false).await?;
     let fences = registry
         .sign_out_plugin_account(&id, account.generation)?
         .ok_or_else(|| {
@@ -4162,6 +4259,7 @@ async fn sign_out_plugin(
     // token revocation is best-effort so a Provider outage cannot report a
     // failed sign-out while leaving the Host in a half-signed-out state.
     let _ = provider.auth_sign_out().await;
+    crate::api::reconcile_credential_retirements_once(&state)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
@@ -4191,8 +4289,8 @@ async fn commit_onedrive_configuration(
     State(state): State<AppState>,
     Json(body): Json<OneDriveConfigurationCommitRequest>,
 ) -> ApiResult<Json<crate::host_registry::OneDriveConfiguration>> {
-    let active_provider = plugin_provider(&state, "com.megle.onedrive").ok();
-    let fences = host_registry(&state)?
+    let _begin_guard = state.plugin_auth_begin_gate.lock().await;
+    let commit = host_registry(&state)?
         .commit_onedrive_configuration(&body.plan_uuid, body.expected_revision, body.confirmed)
         .map_err(|error| {
             CoreError::coded(
@@ -4202,10 +4300,11 @@ async fn commit_onedrive_configuration(
             )
         })?;
     library_manager(&state)?
-        .fence_plugin_bindings("com.megle.onedrive", fences)
+        .fence_plugin_bindings("com.megle.onedrive", commit.fences)
         .await?;
-    if let Some(provider) = active_provider {
-        let _ = provider.auth_sign_out().await;
+    if commit.effective_changed {
+        cancel_owned_auth_worker(&state, "com.megle.onedrive", None, false).await?;
+        crate::api::reconcile_credential_retirements_once(&state)?;
     }
     Ok(Json(host_registry(&state)?.onedrive_configuration()?))
 }
