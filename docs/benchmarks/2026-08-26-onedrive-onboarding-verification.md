@@ -22,12 +22,12 @@ accepted or stored.
 - `npm run check:sync-integration`: passed after the fake Provider manifest and
   handshake were brought forward to the required `auth.poll`/`auth.cancel`
   method map.
-- A fresh immutable-tree release run on commit `24848ae` passed the clean
+- A fresh immutable-tree release run on implementation snapshot `e618806` passed the clean
   archive, full gate, Desktop loopback emulator, Docker manual emulator,
   Electron authorization URL boundary, sync integration, renderer performance,
   sync benchmark, and Windows OS-backdrop rows. The earlier PDB linker failure
   is superseded by this successful committed-tree run. Evidence is retained at
-  `.tmp/sync-release/2026-08-25T18-16-17-009Z-release-1d2b6f30`.
+  `.tmp/sync-release/2026-08-25T18-34-09-752Z-release-662c1329`.
 
 ## Required external evidence
 
