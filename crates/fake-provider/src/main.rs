@@ -317,8 +317,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 json!({"implementation":"bundled-framed-child","objects":store.objects.len(),"persistent":store.is_persistent(),"transferCounters":store.counters}),
             ),
             "auth.begin" => Ok(
-                json!({"authorizationUrl":"http://127.0.0.1/fake-authorize","flowId":uuid::Uuid::now_v7().to_string()}),
+                json!({"authorizationUrl":"http://127.0.0.1/fake-authorize","flowId":uuid::Uuid::now_v7().to_string(),"expiresAt":4102444800000u64,"completionMode":"loopback","redirectUri":"http://127.0.0.1/fake-callback"}),
             ),
+            "auth.poll" => Ok(json!({"pending":true})),
+            "auth.cancel" => Ok(Value::Null),
             "auth.complete" => {
                 authenticated = true;
                 Ok(json!({"authenticated":true,"accountDisplayName":"Bundled Fake Account"}))

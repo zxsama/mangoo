@@ -211,7 +211,7 @@ impl Drop for ProviderProcess {
 #[test]
 fn bundled_process_conforms_to_immutable_delta_upload_and_auth_contract() {
     let mut provider = ProviderProcess::start();
-    let method_versions = json!({"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1});
+    let method_versions = json!({"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1});
     let limits = json!({"maxControlBytes":1048576,"maxBinaryBytes":4194304,"maxBufferedBytes":8388608,"streamWindowBytes":8388608,"maxConcurrentRequests":64,"maxConcurrentStreams":32,"maxObjectBytes":67108864});
     let hello = provider.call("runtime.hello", json!({"nonce":vec![0;32],"wireVersions":[1],"pluginId":"com.megle.fake-sync","version":"1.0.0","accountUuid":"fake-account","grantedPermissions":[],"methodVersions":method_versions,"limits":limits}));
     assert_eq!(hello["wireVersion"], 1);
