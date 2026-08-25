@@ -28,6 +28,30 @@ persistence. Live Graph qualification covers Delta, immutable object, Range,
 and upload-session behavior. An unavailable daemon or missing token keeps the
 release result nonzero.
 
+OneDrive onboarding adds four independent product-OAuth evidence inputs. They
+must be captured from the same clean commit without storing any authorization
+code, state, response URI, token, account ID, or drive ID:
+
+```powershell
+$env:MEGLE_ONEDRIVE_PERSONAL_OAUTH_EVIDENCE='C:\evidence\personal.json'
+$env:MEGLE_ONEDRIVE_BUSINESS_OAUTH_EVIDENCE='C:\evidence\business.json'
+$env:MEGLE_ONEDRIVE_DESKTOP_LOOPBACK_EVIDENCE='C:\evidence\desktop-loopback.json'
+$env:MEGLE_ONEDRIVE_DOCKER_MANUAL_EVIDENCE='C:\evidence\docker-manual.json'
+```
+
+Each JSON record has `schemaVersion: 1`, `kind: "onedrive-product-oauth"`, the
+exact `commit`, `capturedAt`, `passed: true`, `sensitiveMaterialPresent: false`,
+`pkceS256: true`, `clientSecretUsed: false`, `secretStorePersisted: true`, and the applicable
+`accountKind`, `platform`, `completionMode`, `redirectUri`, refresh/restart, and
+observed-response-field facts. The release gate validates these facts and the
+strict response-field allowlist. A pre-acquired Graph access token proves only
+transport behavior; it cannot satisfy any Product OAuth row.
+
+Repository-owned emulator rows separately exercise the real Provider child in
+Desktop loopback and Docker manual modes. The Docker release path also runs the
+manual-mode child inside Linux and keeps credential/container persistence as a
+separate row. Missing evidence stays `blocked`.
+
 ## Enable and rollout
 
 Promote one stage at a time:

@@ -20,6 +20,7 @@ mode.
 
 ```bash
 # from the repo root
+export MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID=<your-public-client-application-id>
 docker compose up --build
 ```
 
@@ -120,8 +121,8 @@ you remove the `:ro` flag.
 | `MEGLE_PLUGIN_STATE_DIR` | Writable non-secret Provider runtime state. | `/data/plugin-state` |
 | `MEGLE_SECRETS_DIR` | Encrypted Provider credential records. | `/data/secrets` |
 | `MEGLE_SECRET_KEY_FILE` | Read-only 32-byte master-key file. | `/run/secrets/megle_secret_key` |
-| `MEGLE_PUBLIC_URL` | Public HTTPS base used for Docker OAuth callbacks; no userinfo/query/fragment. | _(unset)_ |
-| `MEGLE_ONEDRIVE_CLIENT_ID` | Microsoft Entra public-client application ID for the bundled OneDrive Provider. It is configuration, not a secret. | _(unset; Provider reports configuration-required)_ |
+| `MEGLE_ONEDRIVE_CLIENT_ID` | Optional public-client application ID override for self-hosted Docker. It is configuration, not a secret. | packaged Megle ID when the publisher supplied one; otherwise configuration-required |
+| `MEGLE_ONEDRIVE_AUTH_MODE` | OneDrive authorization completion mode. Docker must use the image default. | `manual-response-uri` |
 | `MEGLE_ONEDRIVE_AUTHORITY` | Optional Microsoft identity authority override. | `https://login.microsoftonline.com/common/` |
 | `MEGLE_SERVE_WEB` | Serve the bundled UI when `1`. | `1` |
 | `MEGLE_WEB_DIR` | Directory containing `index.html` + `assets/`. | `/opt/megle/web` |
@@ -163,8 +164,49 @@ requires an actual Docker/Linux build/runtime row plus a two-container volume
 restart proof of the Host Registry, active Library Catalog, sync capture state,
 and Provider state. Separate credential-gated Personal and Business OneDrive
 canaries exercise Delta, immutable put, Range download, and upload sessions.
-Missing Docker access or credentials is a blocking result, never an emulator success. See
+The gate also keeps Product OAuth evidence separate from Graph transport tokens:
+Personal, Business, Windows Desktop loopback, and Docker manual response-URI
+authorization each have their own required evidence row. Missing Docker access,
+the publisher Client ID, real accounts, or those evidence files is a blocking
+result, never an emulator success. See
 `docs/sync-operations.md` for staged rollout and forward-disable rollback.
+
+## OneDrive application registration and authorization
+
+The release publisher must create a Microsoft Entra **public client** application.
+Choose the audience that supports accounts in any organizational directory and
+personal Microsoft accounts, add delegated Microsoft Graph permission
+`Files.ReadWrite.AppFolder`, and enable public-client flows. Register both native
+redirect forms used by Megle:
+
+- Windows Desktop: add `http://127.0.0.1/plugin-auth/callback` through the
+  application manifest; the Provider sends the same IPv4 host/path with an
+  ephemeral runtime port.
+- Docker/Web: `https://login.microsoftonline.com/common/oauth2/nativeclient`.
+
+The publisher (or a self-hosted operator building the image) injects the
+application ID at build time with
+`MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID`. Official release builds reject a missing,
+placeholder, or invalid UUID. Developers and self-hosted operators may set
+`MEGLE_ONEDRIVE_CLIENT_ID`; that environment value has priority and is read-only
+in the UI. When no deployment override exists, Desktop may use the packaged ID
+or an advanced Host override configured in the plugin panel. Megle never needs
+or accepts a OneDrive client secret.
+
+Docker follows the same manual handoff used by `abraunegg/onedrive`:
+
+1. Open OneDrive in the Plugins panel and choose **Connect Microsoft account**.
+2. Open or copy the displayed Microsoft authorization URL and finish sign-in in
+   any browser.
+3. When the browser reaches the native-client page, copy the complete address
+   from the address bar and paste it into Megle's **response URI** field.
+4. Submit once. Megle validates the exact scheme, host, path, fields, flow,
+   state, expiry, and PKCE exchange, then immediately clears the transient URI.
+
+There is no inbound OAuth callback, `MEGLE_PUBLIC_URL`, confidential-client
+registration, or client secret in this flow. The response URI contains a
+short-lived authorization code and state: do not put it in Compose, logs,
+screenshots, shell history, tickets, or diagnostics.
 
 ## Limitations
 
@@ -173,10 +215,10 @@ Missing Docker access or credentials is a blocking result, never an emulator suc
   cannot currently send `X-Megle-Session` from the browser. Tracking work
   for cookie-based session-token wiring is in the master plan.
 - **No HTTPS in the image.** Terminate TLS in a reverse proxy.
-- **OneDrive OAuth requires an exact public callback.** Set `MEGLE_PUBLIC_URL`
-  to the external HTTPS origin registered for the public client, and set
-  `MEGLE_ONEDRIVE_CLIENT_ID`; tokens remain in the mounted encrypted Secret
-  Store, never in Compose environment values.
+- **OneDrive authorization is manual in Docker.** Keep
+  `MEGLE_ONEDRIVE_AUTH_MODE=manual-response-uri`; no public callback is exposed.
+  Tokens remain in the mounted encrypted Secret Store and never belong in
+  Compose environment values.
 - **Single-user Host, multiple Libraries.** One deployed Host owns its Library
   registry and user session. Each managed Library has its own Catalog, roots,
   tags and sync binding; the active Library is switched through Core without

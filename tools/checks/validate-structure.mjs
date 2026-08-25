@@ -847,11 +847,22 @@ for (const marker of [
   "cargo test --release -p megle-fake-provider --test process_conformance",
   "cargo test --release -p megle-onedrive-provider",
   "cargo test --release -p megle-core --test plugin_runtime_process",
-  "MEGLE_PLUGINS_DIR=/opt/megle/plugins"
+  "MEGLE_PLUGINS_DIR=/opt/megle/plugins",
+  "MEGLE_ONEDRIVE_AUTH_MODE=manual-response-uri"
 ]) {
   if (!dockerfile.includes(marker)) {
     fail(`Docker plugin runtime contract missing ${marker}`);
   }
+}
+const compose = readText("compose.yaml");
+if (!compose.includes("MEGLE_ONEDRIVE_AUTH_MODE: manual-response-uri")) {
+  fail("Docker Compose must select OneDrive manual response-URI authorization");
+}
+if (!compose.includes("MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID:")) {
+  fail("Docker Compose must forward the publisher OneDrive Client ID build input");
+}
+if (compose.includes("MEGLE_PUBLIC_URL:")) {
+  fail("Docker Compose must not configure the retired OneDrive inbound OAuth callback");
 }
 const dockerIgnore = readText(".dockerignore");
 if (!dockerIgnore.split(/\r?\n/).some((line) => line.trim() === "secrets/")) {

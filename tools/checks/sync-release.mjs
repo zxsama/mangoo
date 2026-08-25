@@ -32,6 +32,58 @@ async function capture(command, args, cwd = root) {
   });
 }
 
+const PRODUCT_OAUTH_FIELDS = new Set(["code", "state", "error", "error_description", "error_uri", "session_state"]);
+
+async function productOAuthEvidenceRow({ name, file, commit, expected }) {
+  if (!file) {
+    return { name, status: "blocked", required: true, reason: `${expected.label} evidence path is absent` };
+  }
+  const resolved = path.resolve(file);
+  if (!existsSync(resolved)) {
+    return { name, status: "blocked", required: true, reason: `${expected.label} evidence file is absent` };
+  }
+  try {
+    const evidence = JSON.parse(await readFile(resolved, "utf8"));
+    const mismatches = [];
+    if (evidence.schemaVersion !== 1) mismatches.push("unsupported schemaVersion");
+    if (evidence.kind !== "onedrive-product-oauth") mismatches.push("unexpected evidence kind");
+    if (evidence.commit !== commit) mismatches.push("commit does not match release tree");
+    if (!Number.isFinite(Date.parse(evidence.capturedAt))) mismatches.push("invalid capturedAt");
+    if (evidence.passed !== true) mismatches.push("canary did not pass");
+    if (evidence.sensitiveMaterialPresent !== false) mismatches.push("evidence is not marked secret-free");
+    if (evidence.clientSecretUsed !== false) mismatches.push("public-client flow did not prove client-secret absence");
+    if (evidence.pkceS256 !== true) mismatches.push("PKCE S256 was not proven");
+    if (evidence.secretStorePersisted !== true) mismatches.push("SecretStore persistence was not proven");
+    if (evidence.refreshedAfterExpiry !== true) mismatches.push("refresh after access-token expiry was not proven");
+    if (expected.accountKind && evidence.accountKind !== expected.accountKind) mismatches.push(`accountKind is not ${expected.accountKind}`);
+    if (expected.platform && evidence.platform !== expected.platform) mismatches.push(`platform is not ${expected.platform}`);
+    if (expected.completionMode && evidence.completionMode !== expected.completionMode) mismatches.push(`completionMode is not ${expected.completionMode}`);
+    if (expected.redirectUri) {
+      if (evidence.redirectUri !== expected.redirectUri) mismatches.push("redirectUri does not match the native-client redirect");
+    } else if (expected.completionMode === "loopback" && !/^http:\/\/127\.0\.0\.1:\d+\/plugin-auth\/callback$/.test(evidence.redirectUri ?? "")) {
+      mismatches.push("redirectUri is not the ephemeral IPv4 loopback callback");
+    }
+    if (expected.browserOpened && evidence.browserOpened !== true) mismatches.push("system-browser launch was not proven");
+    if (expected.containerRestart && evidence.containerRestartPersisted !== true) mismatches.push("container restart persistence was not proven");
+    const fields = evidence.observedResponseFields;
+    if (!Array.isArray(fields) || fields.length === 0 || fields.some((field) => typeof field !== "string" || !PRODUCT_OAUTH_FIELDS.has(field))) {
+      mismatches.push("observedResponseFields is absent or outside the allowlist");
+    }
+    if (Array.isArray(fields) && fields.includes("code") === fields.includes("error")) {
+      mismatches.push("observed response must contain exactly one of code or error");
+    }
+    return {
+      name,
+      status: mismatches.length ? "failed" : "passed",
+      required: true,
+      reason: mismatches.length ? mismatches.join("; ") : null,
+      evidence: await fileEvidence(resolved),
+    };
+  } catch (error) {
+    return { name, status: "failed", required: true, reason: `evidence is invalid JSON: ${error.message}` };
+  }
+}
+
 const options = parseArgs(process.argv.slice(2));
 const runDirectory = await createRunDirectory("release", options.output);
 const rows = [];
@@ -90,6 +142,9 @@ if (!dirty) {
       } else {
         rows.push(await runCommand({ name: "exact-tree-onedrive-client-id-artifact", command: "node", args: ["tools/build/build-bundled-plugins.mjs", "--release", "--verify-onedrive"], cwd: extracted, env: { MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID: bundledClientId }, runDirectory, timeoutMs: 2 * 60 * 60 * 1000 }));
       }
+      rows.push(await runCommand({ name: "exact-tree-onedrive-desktop-loopback-emulator", command: "cargo", args: ["test", "-p", "megle-onedrive-provider", "--features", "graph-emulator", "--test", "process_conformance", "oauth_poll_is_non_destructive_and_cancel_is_idempotent", "--", "--exact"], cwd: extracted, runDirectory, timeoutMs: 15 * 60 * 1000 }));
+      rows.push(await runCommand({ name: "exact-tree-onedrive-docker-manual-emulator", command: "cargo", args: ["test", "-p", "megle-onedrive-provider", "--features", "graph-emulator", "--test", "process_conformance", "manual_auth_uses_native_client_redirect", "--", "--exact"], cwd: extracted, runDirectory, timeoutMs: 15 * 60 * 1000 }));
+      rows.push(await runCommand({ name: "exact-tree-desktop-oauth-url-boundary", command: "node", args: ["--no-warnings", "--import", "./tests/filter-sqlite-experimental-warning.mjs", "--import", "./tests/register-source-imports.mjs", "--experimental-strip-types", "--test", "tests/oauth-authorization-url.test.mts"], cwd: path.join(extracted, "apps", "desktop"), runDirectory, timeoutMs: 15 * 60 * 1000 }));
       rows.push(await runCommand({ name: "exact-tree-sync-integration", command: "node", args: ["tools/checks/sync-integration.mjs", "--output", path.join(runDirectory, "exact-integration"), ...(options.quick ? ["--quick"] : [])], cwd: extracted, runDirectory, timeoutMs: 2 * 60 * 60 * 1000 }));
       if (!rendererEvidence && process.platform === "win32") {
         rendererEvidence = path.join(runDirectory, "exact-renderer-evidence.json");
@@ -160,11 +215,15 @@ if (await commandExists("docker", ["info"]) && extracted) {
       if (rows.at(-1).status === "passed") {
         rows.push(await runCommand({ name: "docker-linux-persistence-verify-after-restart", command: "docker", args: ["run", "--rm", "--mount", `type=volume,source=${volume},target=/evidence`, "-e", "MEGLE_DOCKER_PERSISTENCE_PHASE=verify", "-e", "MEGLE_DOCKER_PERSISTENCE_ROOT=/evidence/persistence", "-e", "MEGLE_SYNC_BUNDLED_PLUGINS_DIR=/src/target/release/bundled-plugins", "--entrypoint", "/bin/sh", verifierImage, "-lc", persistenceCommand], runDirectory, timeoutMs: 30 * 60 * 1000 }));
       }
+      rows.push(await runCommand({ name: "docker-onedrive-manual-oauth-emulator", command: "docker", args: ["run", "--rm", "--entrypoint", "/bin/sh", verifierImage, "-lc", "cargo test --release -p megle-onedrive-provider --features graph-emulator --test process_conformance manual_auth_uses_native_client_redirect -- --exact"], runDirectory, timeoutMs: 30 * 60 * 1000 }));
       rows.push(await runCommand({ name: "docker-linux-sync-integration", command: "docker", args: ["run", "--rm", "--mount", `type=volume,source=${volume},target=/evidence`, "-e", "MEGLE_SYNC_BUNDLED_PLUGINS_DIR=/src/target/release/bundled-plugins", "-e", `MEGLE_SYNC_LARGE_TRANSFER_BYTES=${linuxLargeBytes}`, "-e", "MEGLE_SYNC_LARGE_TRANSFER_ROOT=/evidence/large-transfer", "--entrypoint", "/bin/sh", verifierImage, "-lc", "cargo test --release -p megle-core library_manager::tests::clean_managed_bootstrap_reopens_current_schema -- --nocapture && cargo test --release -p megle-core library_manager::tests::real_provider_two_device_and_third_device_restore -- --ignored --nocapture && cargo test --release -p megle-core sync::test_model::hundred_thousand_shuffled_and_duplicated_events_converge -- --nocapture && cargo test --release -p megle-core sync::persistence::tests::checkpoint_uses_external_bounded_media_indexes_and_restores_chunk_locations -- --nocapture && cargo test --release -p megle-core sync::coordinator::tests::process_kill_fault_matrix_preserves_atomic_boundaries_and_recovery -- --nocapture && cargo test --release -p megle-core sync::media::worker::tests::physical_large_transfer_resume_probe -- --ignored --nocapture"], runDirectory, timeoutMs: 5 * 60 * 60 * 1000 }));
     }
   }
 } else {
   rows.push({ name: "docker-linux", status: "blocked", required: true, reason: extracted ? "Docker CLI/daemon is unavailable" : "exact committed tree is unavailable" });
+}
+if (!rows.some((row) => row.name === "docker-onedrive-manual-oauth-emulator")) {
+  rows.push({ name: "docker-onedrive-manual-oauth-emulator", status: "blocked", required: true, reason: extracted ? "Docker build/runtime did not reach the manual OAuth verifier" : "exact committed tree is unavailable" });
 }
 
 const personal = process.env.MEGLE_ONEDRIVE_PERSONAL_ACCESS_TOKEN;
@@ -181,6 +240,31 @@ for (const [name, kind, token] of [["onedrive-personal-canary", "personal", pers
     timeoutMs: 30 * 60 * 1000,
   }));
 }
+
+rows.push(await productOAuthEvidenceRow({
+  name: "onedrive-personal-product-oauth",
+  file: process.env.MEGLE_ONEDRIVE_PERSONAL_OAUTH_EVIDENCE,
+  commit,
+  expected: { label: "Personal Product OAuth", accountKind: "personal" },
+}));
+rows.push(await productOAuthEvidenceRow({
+  name: "onedrive-business-product-oauth",
+  file: process.env.MEGLE_ONEDRIVE_BUSINESS_OAUTH_EVIDENCE,
+  commit,
+  expected: { label: "Business Product OAuth", accountKind: "business" },
+}));
+rows.push(await productOAuthEvidenceRow({
+  name: "onedrive-desktop-loopback-product-oauth",
+  file: process.env.MEGLE_ONEDRIVE_DESKTOP_LOOPBACK_EVIDENCE,
+  commit,
+  expected: { label: "Desktop loopback Product OAuth", platform: "windows", completionMode: "loopback", browserOpened: true },
+}));
+rows.push(await productOAuthEvidenceRow({
+  name: "onedrive-docker-manual-product-oauth",
+  file: process.env.MEGLE_ONEDRIVE_DOCKER_MANUAL_EVIDENCE,
+  commit,
+  expected: { label: "Docker manual response-URI Product OAuth", platform: "docker-linux", completionMode: "manual-response-uri", redirectUri: "https://login.microsoftonline.com/common/oauth2/nativeclient", containerRestart: true },
+}));
 
 const result = {
   schemaVersion: 1,

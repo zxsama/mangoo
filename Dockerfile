@@ -95,6 +95,7 @@ ENV MEGLE_HOST_DB_PATH=/data/host/host.sqlite \
     MEGLE_PLUGIN_STATE_DIR=/data/plugin-state \
     MEGLE_SECRETS_DIR=/data/secrets \
     MEGLE_SECRET_KEY_FILE=/run/secrets/megle_secret_key \
+    MEGLE_ONEDRIVE_AUTH_MODE=manual-response-uri \
     MEGLE_WEB_DIR=/opt/megle/web \
     MEGLE_SERVE_WEB=1 \
     MEGLE_CORE_ADDR=0.0.0.0:47321 \

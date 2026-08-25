@@ -8,6 +8,13 @@ end-to-end, in order. Anyone who is not the original author should be able to fo
 
 Run from the repo root.
 
+Before an official build, provide the publisher-owned multi-tenant public
+client application ID. Do not use a sample, third-party, or placeholder ID:
+
+```bash
+export MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID=<publisher-entra-application-id>
+```
+
 ```bash
 npm test
 npm --workspace @megle/web run build
@@ -36,8 +43,11 @@ Expected:
 - The Docker restart rows preserve a real Host Registry, active Library Catalog,
   sync capture state, and Provider immutable object across two containers.
 - The sync release result is `passed`; Docker/Linux and both OneDrive live
-  canaries are separate required rows. A blocked row or dirty diagnostic run
-  cannot qualify a release.
+  Graph canaries are separate required rows. Personal OAuth, Business OAuth,
+  Windows Desktop loopback OAuth, and Docker manual response-URI OAuth evidence
+  are also separate required rows. Docker authorization does not use an inbound
+  callback or client secret. A blocked row or dirty diagnostic run cannot
+  qualify a release.
 
 If any step fails, stop and fix before continuing. Never edit the contract or schema to
 "fix" a check; update the implementation to match the contract.
@@ -56,6 +66,13 @@ as a follow-up issue rather than patching during release prep.
 - [ ] Tag / rate / favorite a file; search composes filters; chips clear filters.
 - [ ] Cancel a running scan from Task Center; retry it; final state is succeeded.
 - [ ] Disable / re-enable a registered plugin; the badge reflects state.
+- [ ] From the OneDrive plugin panel, verify Configure/Connect/Waiting/Cancel,
+      account kind, Switch account, and Sign out. Desktop must open the system
+      browser and complete through the ephemeral `127.0.0.1` loopback without a
+      pasted URI.
+- [ ] In the Docker/Web build, verify the authorization link plus complete
+      response-URI paste flow, then restart the container and confirm the
+      encrypted SecretStore-backed account remains connected.
 - [ ] Settings page shows ffmpeg badge, database path, and plugins folder path.
 - [ ] Onboarding hero appears on a fresh profile (no roots) and "Choose folder" opens
       the native picker (or focuses the sidebar input in browser-only mode).

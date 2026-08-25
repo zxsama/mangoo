@@ -64,5 +64,37 @@ Missing or unsafe key configuration degrades only the Provider.
 
 Docker executes bundled Providers only from read-only `/opt/megle/plugins`.
 Writable state is `/data/plugin-state`; `/data` is never executable discovery.
-OAuth uses a configured `MEGLE_PUBLIC_URL`, a 256-bit one-time flow ID and a
-ten-minute TTL. HTTP is accepted only for loopback development.
+
+## OneDrive public-client authorization
+
+One multi-tenant Microsoft Entra public-client registration serves Personal and
+Business accounts with delegated `Files.ReadWrite.AppFolder` and
+`offline_access`. A publisher-supplied `MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID` is
+compiled into official artifacts; `MEGLE_ONEDRIVE_CLIENT_ID` is a non-secret
+deployment override, followed by a revisioned Host override. The public
+projection reports only source/configured/read-only/revision state, never the
+effective ID. Release packaging rejects missing, placeholder, or invalid
+bundled IDs. No mode uses a client secret.
+
+Desktop uses Authorization Code + PKCE S256 with a Provider-owned ephemeral
+`127.0.0.1` listener and fixed `/plugin-auth/callback` path. `auth.poll` observes
+the pending flow without consuming it; only a callback terminal result,
+expiry, explicit `auth.cancel`, or runtime-session fencing ends the flow.
+Electron opens only a narrowly validated Microsoft authorize URL through the
+typed preload bridge.
+
+Docker sets `MEGLE_ONEDRIVE_AUTH_MODE=manual-response-uri`. `auth.begin` uses
+`https://login.microsoftonline.com/common/oauth2/nativeclient`, and the browser
+UI displays the authorization URL plus a transient field for the complete final
+response URI, matching the `abraunegg/onedrive` workflow. Core bounds and
+strictly parses the URI, removes inert `session_state`, and sends only an
+allowlisted field map to the Provider. The URI is cleared after submit/cancel
+and never enters RPC, SQLite, logs, errors, diagnostics, or query cache. Docker
+does not require `MEGLE_PUBLIC_URL`, an inbound callback, or a confidential
+registration.
+
+OAuth tokens and refresh tokens remain behind the Secret Broker: Credential
+Manager on Windows, or authenticated encrypted files under `/data/secrets`
+using the independently mounted `MEGLE_SECRET_KEY_FILE` in Docker. Client IDs
+are configuration; authorization codes, state, response URIs, tokens, and
+preauthenticated Graph URLs are sensitive material.
