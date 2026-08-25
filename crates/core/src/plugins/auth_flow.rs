@@ -12,6 +12,8 @@ pub const MAX_CALLBACK_FIELD_BYTES: usize = 4096;
 pub const MAX_CALLBACK_FIELDS: usize = 8;
 pub const MAX_CALLBACK_QUERY_BYTES: usize = 128 * 1024;
 pub const MAX_ACTIVE_AUTH_FLOWS: usize = 1024;
+pub const MAX_MANUAL_RESPONSE_URI_BYTES: usize = 16 * 1024;
+const MANUAL_REDIRECT_URI: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicUrl(url::Url);
@@ -204,6 +206,77 @@ pub fn validate_callback_fields(fields: &[(String, String)]) -> anyhow::Result<(
     Ok(())
 }
 
+pub fn parse_manual_response_uri(input: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let input = input.trim_matches(|character: char| character.is_ascii_whitespace());
+    if input.is_empty()
+        || input.len() > MAX_MANUAL_RESPONSE_URI_BYTES
+        || input.chars().any(char::is_control)
+        || has_malformed_percent_encoding(input)
+    {
+        anyhow::bail!("invalid OAuth response URI")
+    }
+    let url = url::Url::parse(input).map_err(|_| anyhow::anyhow!("invalid OAuth response URI"))?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("login.microsoftonline.com")
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/common/oauth2/nativeclient"
+    {
+        anyhow::bail!("invalid OAuth response URI")
+    }
+    let allowed = [
+        "code",
+        "state",
+        "error",
+        "error_description",
+        "error_uri",
+        "session_state",
+    ];
+    let mut fields = url.query_pairs().into_owned().collect::<Vec<_>>();
+    validate_callback_fields(&fields)?;
+    if fields
+        .iter()
+        .any(|(key, _)| !allowed.contains(&key.as_str()))
+    {
+        anyhow::bail!("invalid OAuth response URI")
+    }
+    let has_code = fields
+        .iter()
+        .any(|(key, value)| key == "code" && !value.is_empty());
+    let has_error = fields
+        .iter()
+        .any(|(key, value)| key == "error" && !value.is_empty());
+    let has_state = fields
+        .iter()
+        .any(|(key, value)| key == "state" && !value.is_empty());
+    if !has_state || has_code == has_error {
+        anyhow::bail!("invalid OAuth response URI")
+    }
+    fields.retain(|(key, _)| key != "session_state");
+    Ok(fields)
+}
+
+fn has_malformed_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return true;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
 fn validate_component(value: &str) -> anyhow::Result<()> {
     if value.is_empty() || value.len() > 160 || value.bytes().any(|b| b.is_ascii_control()) {
         anyhow::bail!("invalid OAuth flow binding")
@@ -278,5 +351,28 @@ mod tests {
                 ("state".to_owned(), "bound".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn manual_response_uri_is_exact_bounded_and_sanitized() {
+        assert_eq!(
+            parse_manual_response_uri(&format!(
+                "{MANUAL_REDIRECT_URI}?code=opaque&state=bound&session_state=ignored"
+            ))
+            .unwrap(),
+            vec![
+                ("code".into(), "opaque".into()),
+                ("state".into(), "bound".into())
+            ]
+        );
+        for invalid in [
+            "http://login.microsoftonline.com/common/oauth2/nativeclient?code=x&state=s",
+            "https://login.microsoftonline.com.evil/common/oauth2/nativeclient?code=x&state=s",
+            "https://login.microsoftonline.com/common/oauth2/nativeclient?code=x&code=y&state=s",
+            "https://login.microsoftonline.com/common/oauth2/nativeclient?code=x&state=s&token=secret",
+            "https://login.microsoftonline.com/common/oauth2/nativeclient?code=%GG&state=s",
+        ] {
+            assert!(parse_manual_response_uri(invalid).is_err(), "{invalid}");
+        }
     }
 }

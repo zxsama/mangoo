@@ -98,6 +98,10 @@ struct ProviderProcess {
 
 impl ProviderProcess {
     fn start(base: &str, secrets: Arc<Mutex<Secrets>>) -> Self {
+        Self::start_with_mode(base, secrets, "loopback")
+    }
+
+    fn start_with_mode(base: &str, secrets: Arc<Mutex<Secrets>>, mode: &str) -> Self {
         let executable = std::env::var_os("MEGLE_ONEDRIVE_TEST_EXECUTABLE")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_megle-onedrive-provider").into());
         let mut child = Command::new(executable)
@@ -106,6 +110,7 @@ impl ProviderProcess {
             .env("MEGLE_ONEDRIVE_CLIENT_ID", "emulator-public-client")
             .env("MEGLE_ONEDRIVE_AUTHORITY", base)
             .env("MEGLE_ONEDRIVE_EMULATOR_URL", format!("{base}v1.0/"))
+            .env("MEGLE_ONEDRIVE_AUTH_MODE", mode)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -375,6 +380,53 @@ impl ProviderProcess {
         drop(secrets);
         write_control(&mut self.stdin, &envelope);
     }
+}
+
+#[test]
+fn oauth_poll_is_non_destructive_and_cancel_is_idempotent() {
+    let emulator = Emulator::start();
+    let mut provider =
+        ProviderProcess::start(&emulator.base, Arc::new(Mutex::new(Secrets::default())));
+    hello(&mut provider);
+    let auth = provider.call("auth.begin", Value::Null);
+    assert_eq!(auth["completionMode"], "loopback");
+    assert_eq!(
+        provider.call("auth.poll", json!({"flowId":auth["flowId"]}))["pending"],
+        true
+    );
+    provider.call("auth.cancel", json!({"flowId":auth["flowId"]}));
+    provider.call("auth.cancel", json!({"flowId":auth["flowId"]}));
+    let error = provider.call_error(
+        "auth.complete",
+        json!({"flowId":auth["flowId"],"fields":{"state":"wrong","code":"unused"}}),
+    );
+    assert_eq!(error["code"], "invalid_argument");
+}
+
+#[test]
+fn manual_auth_uses_native_client_redirect() {
+    let emulator = Emulator::start();
+    let mut provider = ProviderProcess::start_with_mode(
+        &emulator.base,
+        Arc::new(Mutex::new(Secrets::default())),
+        "manual-response-uri",
+    );
+    hello(&mut provider);
+    let auth = provider.call("auth.begin", Value::Null);
+    assert_eq!(auth["completionMode"], "manual-response-uri");
+    assert_eq!(
+        auth["redirectUri"],
+        "https://login.microsoftonline.com/common/oauth2/nativeclient"
+    );
+    let authorization = Url::parse(auth["authorizationUrl"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        authorization
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .unwrap()
+            .1,
+        "https://login.microsoftonline.com/common/oauth2/nativeclient"
+    );
 }
 
 impl Drop for ProviderProcess {
@@ -799,7 +851,7 @@ fn missing_public_client_configuration_is_a_degraded_health_state() {
 }
 
 fn hello(provider: &mut ProviderProcess) {
-    let methods = json!({"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1});
+    let methods = json!({"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1});
     let limits = json!({"maxControlBytes":1048576,"maxBinaryBytes":4194304,"maxBufferedBytes":8388608,"streamWindowBytes":8388608,"maxConcurrentRequests":64,"maxConcurrentStreams":32,"maxObjectBytes":96*1024*1024u64});
     let ack = provider.call("runtime.hello", json!({"nonce":vec![7;32],"wireVersions":[1],"pluginId":"com.megle.onedrive","version":"1.0.0","accountUuid":"account-one","grantedPermissions":[],"methodVersions":methods,"limits":limits}));
     assert_eq!(ack["pluginId"], "com.megle.onedrive");

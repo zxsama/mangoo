@@ -13,6 +13,13 @@ pub struct ProviderConfig {
     pub authority: Url,
     pub graph_endpoint: Url,
     pub allow_http_emulator: bool,
+    pub auth_mode: AuthMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    Loopback,
+    ManualResponseUri,
 }
 
 impl ProviderConfig {
@@ -40,11 +47,17 @@ impl ProviderConfig {
             "Graph endpoint",
             "graph.microsoft.com",
         )?;
+        let auth_mode = match env::var("MEGLE_ONEDRIVE_AUTH_MODE").as_deref() {
+            Ok("manual-response-uri") => AuthMode::ManualResponseUri,
+            Ok("loopback") | Err(_) => AuthMode::Loopback,
+            Ok(_) => return Err(ProviderError::configuration("invalid OneDrive auth mode")),
+        };
         Ok(Self {
             client_id,
             authority,
             graph_endpoint,
             allow_http_emulator,
+            auth_mode,
         })
     }
 
@@ -119,6 +132,7 @@ mod tests {
             authority: Url::parse(DEFAULT_AUTHORITY).unwrap(),
             graph_endpoint: Url::parse(DEFAULT_GRAPH_ENDPOINT).unwrap(),
             allow_http_emulator: false,
+            auth_mode: AuthMode::Loopback,
         };
         assert_eq!(
             config.authorization_endpoint().unwrap().as_str(),

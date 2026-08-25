@@ -6,6 +6,14 @@ import process from "node:process";
 
 const root = process.cwd();
 const release = process.argv.includes("--release");
+if (release) {
+  const bundledClientId = process.env.MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID?.trim();
+  const validUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(bundledClientId ?? "");
+  const placeholder = !bundledClientId || /^(00000000-|11111111-|example|placeholder|test)/i.test(bundledClientId);
+  if (!validUuid || placeholder) {
+    throw new Error("release bundle requires a publisher-supplied MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID UUID");
+  }
+}
 const profile = release ? "release" : "debug";
 const providers = [
   { package: "megle-fake-provider", pluginId: "com.megle.fake-sync", constant: "GENERATED_FAKE_PROVIDER_SHA256" },

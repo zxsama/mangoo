@@ -145,6 +145,10 @@ impl OAuthFlows {
     pub fn cancel_all(&mut self) {
         self.flows.clear();
     }
+
+    pub fn cancel(&mut self, id: &str) -> bool {
+        self.flows.remove(id).is_some()
+    }
 }
 
 fn validate_callback(value: &str) -> Result<String, ProviderError> {
@@ -190,6 +194,7 @@ mod tests {
             authority: Url::parse("https://login.microsoftonline.com/common/").unwrap(),
             graph_endpoint: Url::parse("https://graph.microsoft.com/v1.0/").unwrap(),
             allow_http_emulator: false,
+            auth_mode: crate::config::AuthMode::Loopback,
         }
     }
 

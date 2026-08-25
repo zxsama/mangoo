@@ -15,6 +15,8 @@
       "shutdown": 1,
       "auth.begin": 1,
       "auth.complete": 1,
+      "auth.poll": 1,
+      "auth.cancel": 1,
       "auth.status": 1,
       "auth.sign_out": 1,
       "delta.list": 1,

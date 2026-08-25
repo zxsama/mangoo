@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use megle_onedrive_provider::config::ProviderConfig;
+use megle_onedrive_provider::config::{AuthMode, ProviderConfig};
 use megle_onedrive_provider::error::ProviderError;
 use megle_onedrive_provider::graph::{hex, GraphClient, RemoteObject, UploadRecordV1};
 use megle_onedrive_provider::namespace::parse_library_key;
@@ -97,6 +97,8 @@ impl ProviderState {
             })),
             "auth.begin" => self.auth_begin(&request.payload),
             "auth.complete" => self.auth_complete(rpc, &request.payload),
+            "auth.poll" => self.auth_poll(rpc, &request.payload),
+            "auth.cancel" => self.auth_cancel(&request.payload),
             "auth.status" => self.auth_status(rpc),
             "auth.sign_out" => self.auth_sign_out(rpc),
             "delta.list" => {
@@ -326,7 +328,13 @@ impl ProviderState {
             .get("callbackUrl")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let (listener, callback) = if callback.is_none() {
+        let manual = config.auth_mode == AuthMode::ManualResponseUri;
+        let (listener, callback) = if manual {
+            (
+                None,
+                Some("https://login.microsoftonline.com/common/oauth2/nativeclient".to_owned()),
+            )
+        } else if callback.is_none() {
             let listener = TcpListener::bind("127.0.0.1:0").map_err(|_| {
                 ProviderError::new("unavailable", true, "failed to bind OAuth loopback")
             })?;
@@ -364,7 +372,48 @@ impl ProviderState {
                 }
             });
         }
-        Ok(json!({"authorizationUrl":authorization_url,"flowId":flow_id}))
+        Ok(json!({
+            "authorizationUrl": authorization_url,
+            "flowId": flow_id,
+            "completionMode": if manual { "manual-response-uri" } else { "loopback" },
+            "redirectUri": callback
+        }))
+    }
+
+    fn auth_poll<R: Read, W: Write>(
+        &mut self,
+        rpc: &mut RpcTransport<R, W>,
+        payload: &Value,
+    ) -> Result<Value, ProviderError> {
+        let flow_id = text(payload, "flowId")?;
+        let fields = self
+            .loopback_results
+            .lock()
+            .map_err(|_| ProviderError::new("internal", false, "OAuth loopback state poisoned"))?
+            .remove(&flow_id)
+            .map(|(_, fields)| fields);
+        let Some(fields) = fields else {
+            return Ok(json!({"pending":true}));
+        };
+        self.finish_auth(rpc, &flow_id, fields)
+    }
+
+    fn auth_cancel(&mut self, payload: &Value) -> Result<Value, ProviderError> {
+        let flow_id = text(payload, "flowId")?;
+        self.flows.cancel(&flow_id);
+        self.loopback_results
+            .lock()
+            .map_err(|_| ProviderError::new("internal", false, "OAuth loopback state poisoned"))?
+            .remove(&flow_id);
+        if let Some(cancelled) = self
+            .loopback_cancellations
+            .lock()
+            .map_err(|_| ProviderError::new("internal", false, "OAuth loopback state poisoned"))?
+            .remove(&flow_id)
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+        Ok(Value::Null)
     }
 
     fn auth_complete<R: Read, W: Write>(
@@ -395,7 +444,16 @@ impl ProviderState {
                     ProviderError::new("unavailable", true, "OAuth callback has not arrived")
                 })?;
         }
-        let (code, verifier, redirect_uri) = self.flows.consume(&flow_id, &fields)?;
+        self.finish_auth(rpc, &flow_id, fields)
+    }
+
+    fn finish_auth<R: Read, W: Write>(
+        &mut self,
+        rpc: &mut RpcTransport<R, W>,
+        flow_id: &str,
+        fields: HashMap<String, String>,
+    ) -> Result<Value, ProviderError> {
+        let (code, verifier, redirect_uri) = self.flows.consume(flow_id, &fields)?;
         let config = self.config()?.clone();
         let graph = self.graph()?.clone();
         let token = graph.exchange_code(&config, &code, &verifier, &redirect_uri)?;

@@ -1570,6 +1570,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PluginCommandResponse"
+  /plugins/{pluginId}/auth/cancel:
+    post:
+      operationId: cancelPluginAuth
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PluginAuthCancelRequest"
+      responses:
+        "202":
+          description: Pending authorization flow cancellation accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginCommandResponse"
   /plugins/{pluginId}/auth/sign-out:
     post:
       operationId: signOutPlugin
@@ -1582,6 +1600,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PluginCommandResponse"
+  /plugins/com.megle.onedrive/configuration:
+    get:
+      operationId: getOneDriveConfiguration
+      responses:
+        "200": { description: OneDrive public-client configuration projection., content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfiguration" } } } }
+    put:
+      operationId: commitOneDriveConfiguration
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfigurationCommitRequest" } } } }
+      responses:
+        "200": { description: Configuration committed., content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfiguration" } } } }
+  /plugins/com.megle.onedrive/configuration/plan:
+    post:
+      operationId: planOneDriveConfiguration
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfigurationPlanRequest" } } } }
+      responses:
+        "200": { description: Configuration impact plan., content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfigurationPlan" } } } }
   /plugins/{pluginId}/health:
     get:
       operationId: getPluginHealth
@@ -1912,6 +1946,7 @@ components:
         pluginId: { type: string }
         accountUuid: { type: string }
         accountDisplayName: { anyOf: [{ type: string }, { type: "null" }] }
+        accountKind: { anyOf: [{ type: string, enum: [personal, business] }, { type: "null" }] }
         runtimeState: { type: string }
         authState: { type: string }
         lastHealthyAt: { anyOf: [{ type: integer }, { type: "null" }] }
@@ -3108,7 +3143,7 @@ components:
             maxBytes: { type: integer, minimum: 1, maximum: 1073741824 }
     HostPluginProjection:
       type: object
-      required: [pluginId, selectedVersion, knownGoodVersion, enabledIntent, runtimeState, authState, capabilities, requestedPermissions, grantedPermissions, permissionRequired, accountUuid, accountDisplayName, compatibilityReason, backoffUntil, lastHealthyAt, lastErrorCode, lastErrorDetail]
+      required: [pluginId, selectedVersion, knownGoodVersion, enabledIntent, runtimeState, authState, capabilities, requestedPermissions, grantedPermissions, permissionRequired, accountUuid, accountDisplayName, accountKind, compatibilityReason, backoffUntil, lastHealthyAt, lastErrorCode, lastErrorDetail]
       properties:
         pluginId: { type: string }
         selectedVersion: { type: string }
@@ -3131,6 +3166,7 @@ components:
         permissionRequired: { type: boolean }
         accountUuid: { type: string, nullable: true }
         accountDisplayName: { type: string, nullable: true }
+        accountKind: { type: string, enum: [personal, business], nullable: true }
         compatibilityReason: { type: string, nullable: true }
         backoffUntil: { type: integer, nullable: true }
         lastHealthyAt: { type: integer, nullable: true }
@@ -3187,21 +3223,60 @@ components:
           maxLength: 64
     PluginAuthBeginResponse:
       type: object
-      required: [authorizationUrl, flowId, expiresAt]
+      required: [authorizationUrl, flowId, expiresAt, completionMode, redirectUri]
       properties:
         authorizationUrl: { type: string }
         flowId: { type: string }
         expiresAt: { type: integer }
+        completionMode: { type: string, enum: [loopback, manual-response-uri] }
+        redirectUri: { type: string, nullable: true }
     PluginAuthCompleteRequest:
       type: object
-      required: [flowId, result]
+      required: [flowId, responseUri]
       additionalProperties: false
       properties:
         flowId: { type: string, minLength: 1, maxLength: 160 }
-        result:
-          type: object
-          maxProperties: 8
-          additionalProperties: { type: string }
+        responseUri: { type: string, minLength: 1, maxLength: 16384 }
+    PluginAuthCancelRequest:
+      type: object
+      required: [flowId]
+      additionalProperties: false
+      properties:
+        flowId: { type: string, minLength: 1, maxLength: 160 }
+    OneDriveConfiguration:
+      type: object
+      required: [source, configured, readOnly, revision, errorCode]
+      properties:
+        source: { type: string, enum: [environment, host-override, bundled, missing] }
+        configured: { type: boolean }
+        readOnly: { type: boolean }
+        revision: { type: integer, minimum: 1 }
+        errorCode: { type: string, nullable: true }
+    OneDriveConfigurationPlanRequest:
+      type: object
+      required: [clientId, expectedRevision]
+      additionalProperties: false
+      properties:
+        clientId: { type: string, nullable: true, maxLength: 64 }
+        expectedRevision: { type: integer, minimum: 1 }
+    OneDriveConfigurationPlan:
+      type: object
+      required: [planUuid, expectedRevision, effectiveChanged, affectedLibraries, requiresConfirmation, expiresAt]
+      properties:
+        planUuid: { type: string }
+        expectedRevision: { type: integer, minimum: 1 }
+        effectiveChanged: { type: boolean }
+        affectedLibraries: { type: integer, minimum: 0 }
+        requiresConfirmation: { type: boolean }
+        expiresAt: { type: integer }
+    OneDriveConfigurationCommitRequest:
+      type: object
+      required: [planUuid, expectedRevision, confirmed]
+      additionalProperties: false
+      properties:
+        planUuid: { type: string }
+        expectedRevision: { type: integer, minimum: 1 }
+        confirmed: { type: boolean }
     PluginHealthResponse:
       type: object
       required: [state, lastHealthyAt, lastErrorCode]

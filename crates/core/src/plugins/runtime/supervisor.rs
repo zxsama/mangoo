@@ -456,13 +456,14 @@ pub async fn activate_and_register(
     allowlist: &[TrustEntry],
     runtime_dir: std::path::PathBuf,
     reverse: Option<Arc<dyn super::rpc::ReverseRpcHandler>>,
+    onedrive_client_id: Option<String>,
 ) -> anyhow::Result<ActivatedProvider> {
     if !manifest.rpc.wire_versions.contains(&1) {
         anyhow::bail!("Provider manifest does not support Host wire version 1");
     }
     let executable = verify_bundled_entry(manifest, bundled_root, platform, allowlist)
         .map_err(|e| anyhow::anyhow!("plugin trust verification failed: {e:?}"))?;
-    let safe_env = provider_safe_env(&manifest.id, &runtime_dir);
+    let safe_env = provider_safe_env(&manifest.id, &runtime_dir, onedrive_client_id);
     let mut child = ChildProcess::spawn_verified(
         &executable,
         &LaunchSpec {
@@ -546,6 +547,7 @@ pub async fn activate_and_register(
 fn provider_safe_env(
     plugin_id: &str,
     runtime_dir: &std::path::Path,
+    onedrive_client_id: Option<String>,
 ) -> std::collections::HashMap<String, String> {
     if plugin_id == "com.megle.fake-sync" {
         let mut values = std::collections::HashMap::from([(
@@ -563,13 +565,19 @@ fn provider_safe_env(
     if plugin_id != "com.megle.onedrive" {
         return Default::default();
     }
-    let mut keys = vec!["MEGLE_ONEDRIVE_CLIENT_ID", "MEGLE_ONEDRIVE_AUTHORITY"];
+    let mut values = std::collections::HashMap::new();
+    if let Some(client_id) = onedrive_client_id {
+        values.insert("MEGLE_ONEDRIVE_CLIENT_ID".to_owned(), client_id);
+    }
+    let mut keys = vec!["MEGLE_ONEDRIVE_AUTHORITY", "MEGLE_ONEDRIVE_AUTH_MODE"];
     if cfg!(debug_assertions) {
         keys.push("MEGLE_ONEDRIVE_EMULATOR_URL");
     }
-    keys.into_iter()
-        .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
-        .collect()
+    values.extend(
+        keys.into_iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value))),
+    );
+    values
 }
 #[cfg(test)]
 mod tests {

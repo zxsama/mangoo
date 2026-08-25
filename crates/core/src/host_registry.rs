@@ -13,6 +13,8 @@ const HOST_MIGRATION_0004: &str =
 const HOST_MIGRATION_0005: &str = include_str!("../host_migrations/0005_sync_orchestration.sql");
 const HOST_MIGRATION_0006: &str =
     include_str!("../host_migrations/0006_sync_orchestration_recovery.sql");
+const HOST_MIGRATION_0007: &str =
+    include_str!("../host_migrations/0007_onedrive_auth_configuration.sql");
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +22,7 @@ pub struct SyncProviderStatus {
     pub plugin_id: String,
     pub account_uuid: String,
     pub account_display_name: Option<String>,
+    pub account_kind: Option<String>,
     pub runtime_state: String,
     pub auth_state: String,
     pub last_healthy_at: Option<i64>,
@@ -282,11 +285,48 @@ pub struct HostPluginProjection {
     pub auth_state: Option<String>,
     pub account_uuid: Option<String>,
     pub account_display_name: Option<String>,
+    pub account_kind: Option<String>,
     pub backoff_until: Option<i64>,
     pub last_healthy_at: Option<i64>,
     pub last_error_code: Option<String>,
     pub last_error_detail: Option<String>,
     pub compatibility_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OneDriveConfiguration {
+    pub source: String,
+    pub configured: bool,
+    pub read_only: bool,
+    pub revision: u64,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OneDriveConfigurationPlan {
+    pub plan_uuid: String,
+    pub expected_revision: u64,
+    pub effective_changed: bool,
+    pub affected_libraries: u64,
+    pub requires_confirmation: bool,
+    pub expires_at: i64,
+}
+
+const ONEDRIVE_PLUGIN_ID: &str = "com.megle.onedrive";
+const BUNDLED_ONEDRIVE_CLIENT_ID: Option<&str> = option_env!("MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID");
+
+fn normalized_client_id(value: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed =
+        uuid::Uuid::parse_str(value).map_err(|_| anyhow::anyhow!("invalid-onedrive-client-id"))?;
+    if parsed.is_nil() {
+        anyhow::bail!("invalid-onedrive-client-id");
+    }
+    Ok(Some(parsed.hyphenated().to_string()))
 }
 
 pub struct RegisterBundledPlugin<'a> {
@@ -820,14 +860,190 @@ impl HostRegistry {
             .map_err(Into::into)
     }
 
+    pub fn onedrive_configuration(&self) -> anyhow::Result<OneDriveConfiguration> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let (host_override, revision): (Option<String>, i64) = connection.query_row(
+            "SELECT host_override_client_id,revision FROM onedrive_configuration WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let environment =
+            normalized_client_id(std::env::var("MEGLE_ONEDRIVE_CLIENT_ID").ok().as_deref());
+        let bundled = normalized_client_id(BUNDLED_ONEDRIVE_CLIENT_ID);
+        let (source, configured, error_code) = match environment {
+            Ok(Some(_)) => ("environment", true, None),
+            Err(_) => (
+                "environment",
+                false,
+                Some("invalid-onedrive-client-id".to_owned()),
+            ),
+            Ok(None) => match normalized_client_id(host_override.as_deref()) {
+                Ok(Some(_)) => ("host-override", true, None),
+                Err(_) => (
+                    "host-override",
+                    false,
+                    Some("invalid-onedrive-client-id".to_owned()),
+                ),
+                Ok(None) => match bundled {
+                    Ok(Some(_)) => ("bundled", true, None),
+                    Err(_) => (
+                        "bundled",
+                        false,
+                        Some("invalid-onedrive-client-id".to_owned()),
+                    ),
+                    Ok(None) => (
+                        "missing",
+                        false,
+                        Some("onedrive-client-id-missing".to_owned()),
+                    ),
+                },
+            },
+        };
+        Ok(OneDriveConfiguration {
+            source: source.into(),
+            configured,
+            read_only: source == "environment",
+            revision: revision as u64,
+            error_code,
+        })
+    }
+
+    fn effective_onedrive_client_id_for_override(
+        &self,
+        host_override: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        if let Some(value) =
+            normalized_client_id(std::env::var("MEGLE_ONEDRIVE_CLIENT_ID").ok().as_deref())?
+        {
+            return Ok(Some(value));
+        }
+        if let Some(value) = normalized_client_id(host_override)? {
+            return Ok(Some(value));
+        }
+        normalized_client_id(BUNDLED_ONEDRIVE_CLIENT_ID)
+    }
+
+    pub fn effective_onedrive_client_id(&self) -> anyhow::Result<Option<String>> {
+        let host_override: Option<String> = self
+            .connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT host_override_client_id FROM onedrive_configuration WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+        self.effective_onedrive_client_id_for_override(host_override.as_deref())
+    }
+
+    pub fn plan_onedrive_configuration(
+        &self,
+        requested_override: Option<&str>,
+        expected_revision: u64,
+    ) -> anyhow::Result<OneDriveConfigurationPlan> {
+        if std::env::var("MEGLE_ONEDRIVE_CLIENT_ID")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            anyhow::bail!("onedrive-configuration-environment-locked");
+        }
+        let requested = normalized_client_id(requested_override)?;
+        let now = unix_timestamp_millis();
+        let expires_at = now + 5 * 60 * 1000;
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let (current, revision): (Option<String>, i64) = transaction.query_row(
+            "SELECT host_override_client_id,revision FROM onedrive_configuration WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if revision as u64 != expected_revision {
+            anyhow::bail!("onedrive-configuration-revision-conflict");
+        }
+        let current_effective =
+            self.effective_onedrive_client_id_for_override(current.as_deref())?;
+        let requested_effective =
+            self.effective_onedrive_client_id_for_override(requested.as_deref())?;
+        let effective_changed = current_effective != requested_effective;
+        let affected_libraries: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM library_sync_bindings WHERE plugin_id=?1",
+            [ONEDRIVE_PLUGIN_ID],
+            |row| row.get(0),
+        )?;
+        let authenticated: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_accounts WHERE plugin_id=?1 AND auth_state='authenticated')", [ONEDRIVE_PLUGIN_ID], |row| row.get(0)
+        )?;
+        let plan_uuid = uuid::Uuid::now_v7().to_string();
+        let requires_confirmation = effective_changed && (authenticated || affected_libraries > 0);
+        transaction.execute(
+            "INSERT INTO onedrive_configuration_plans(plan_uuid,expected_revision,requested_override,effective_changed,affected_libraries,requires_confirmation,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![plan_uuid,revision,requested,effective_changed,affected_libraries,requires_confirmation,expires_at,now],
+        )?;
+        transaction.commit()?;
+        Ok(OneDriveConfigurationPlan {
+            plan_uuid,
+            expected_revision,
+            effective_changed,
+            affected_libraries: affected_libraries as u64,
+            requires_confirmation,
+            expires_at,
+        })
+    }
+
+    pub fn commit_onedrive_configuration(
+        &self,
+        plan_uuid: &str,
+        expected_revision: u64,
+        confirmed: bool,
+    ) -> anyhow::Result<Vec<BindingFence>> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let (plan_revision, requested, changed, requires_confirmation, expires_at): (i64,Option<String>,bool,bool,i64) = transaction.query_row(
+            "SELECT expected_revision,requested_override,effective_changed,requires_confirmation,expires_at FROM onedrive_configuration_plans WHERE plan_uuid=?1", [plan_uuid],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional()?.ok_or_else(|| anyhow::anyhow!("onedrive-configuration-plan-invalid"))?;
+        if expires_at < now {
+            anyhow::bail!("onedrive-configuration-plan-expired");
+        }
+        if plan_revision as u64 != expected_revision {
+            anyhow::bail!("onedrive-configuration-revision-conflict");
+        }
+        if requires_confirmation && !confirmed {
+            anyhow::bail!("onedrive-configuration-confirmation-required");
+        }
+        let current_revision: i64 = transaction.query_row(
+            "SELECT revision FROM onedrive_configuration WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if current_revision as u64 != expected_revision {
+            anyhow::bail!("onedrive-configuration-revision-conflict");
+        }
+        let fences = if changed {
+            let fences = pause_plugin_bindings_in_transaction(&transaction, ONEDRIVE_PLUGIN_ID)?;
+            transaction.execute("UPDATE onedrive_configuration SET host_override_client_id=?1,revision=revision+1,updated_at=?2 WHERE singleton=1", params![requested,now])?;
+            transaction.execute("UPDATE plugin_accounts SET secret_ref=NULL,stable_account_identity=NULL,account_kind=NULL,auth_state='authorization-required',generation=generation+1,updated_at=?1 WHERE plugin_id=?2", params![now,ONEDRIVE_PLUGIN_ID])?;
+            transaction.execute("UPDATE plugin_runtime_state SET state='starting',pid=NULL,session_id=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2", params![now,ONEDRIVE_PLUGIN_ID])?;
+            fences
+        } else {
+            Vec::new()
+        };
+        transaction.execute(
+            "DELETE FROM onedrive_configuration_plans WHERE plan_uuid=?1",
+            [plan_uuid],
+        )?;
+        transaction.commit()?;
+        Ok(fences)
+    }
+
     pub fn reset_plugin_runtime_states_for_startup(
         &self,
         secret_store_available: bool,
     ) -> anyhow::Result<usize> {
         let now = unix_timestamp_millis();
-        let onedrive_configured = std::env::var("MEGLE_ONEDRIVE_CLIENT_ID")
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty());
+        let onedrive_configuration = self.onedrive_configuration()?;
+        let onedrive_configured = onedrive_configuration.configured;
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let rows = {
@@ -872,7 +1088,7 @@ impl HostRegistry {
                 (
                     "configuration-required",
                     Some("onedrive-client-id-missing"),
-                    Some("MEGLE_ONEDRIVE_CLIENT_ID is required"),
+                    Some("Microsoft public client ID is not configured"),
                 )
             } else {
                 ("starting", None, None)
@@ -1092,7 +1308,7 @@ impl HostRegistry {
     pub fn list_host_plugins(&self) -> anyhow::Result<Vec<HostPluginProjection>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare(
-            "SELECT i.plugin_id,i.selected_version,i.known_good_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,r.state,a.auth_state,a.account_uuid,a.display_name,r.backoff_until,r.last_healthy_at,r.last_error_code,r.last_error_detail,r.capabilities_json FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id LEFT JOIN plugin_accounts a ON a.plugin_id=i.plugin_id ORDER BY i.plugin_id",
+            "SELECT i.plugin_id,i.selected_version,i.known_good_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,r.state,a.auth_state,a.account_uuid,a.display_name,r.backoff_until,r.last_healthy_at,r.last_error_code,r.last_error_detail,r.capabilities_json,a.account_kind FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id LEFT JOIN plugin_accounts a ON a.plugin_id=i.plugin_id ORDER BY i.plugin_id",
         )?;
         let rows = statement.query_map([], |row| {
             let requested: String = row.get(4)?;
@@ -1113,6 +1329,7 @@ impl HostRegistry {
                 auth_state: row.get(7)?,
                 account_uuid: row.get(8)?,
                 account_display_name: row.get(9)?,
+                account_kind: row.get(15)?,
                 backoff_until: row.get(10)?,
                 last_healthy_at: row.get(11)?,
                 last_error_code: row.get(12)?,
@@ -1213,10 +1430,11 @@ impl HostRegistry {
         expected_session: &str,
         auth_state: &str,
         display_name: Option<&str>,
+        account_kind: Option<&str>,
     ) -> anyhow::Result<bool> {
         let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
-            "UPDATE plugin_accounts SET auth_state=?1,display_name=COALESCE(?2,display_name),last_error=NULL,updated_at=?3 WHERE plugin_id=?4 AND EXISTS(SELECT 1 FROM plugin_runtime_state r WHERE r.plugin_id=plugin_accounts.plugin_id AND r.state='ready' AND r.session_id=?5)",
-            params![auth_state,display_name,unix_timestamp_millis(),plugin_id,expected_session],
+            "UPDATE plugin_accounts SET auth_state=?1,display_name=COALESCE(?2,display_name),account_kind=COALESCE(?3,account_kind),last_error=NULL,updated_at=?4 WHERE plugin_id=?5 AND EXISTS(SELECT 1 FROM plugin_runtime_state r WHERE r.plugin_id=plugin_accounts.plugin_id AND r.state='ready' AND r.session_id=?6)",
+            params![auth_state,display_name,account_kind,unix_timestamp_millis(),plugin_id,expected_session],
         )?;
         Ok(changed == 1)
     }
@@ -2081,6 +2299,14 @@ impl HostRegistry {
         if schema_version < 6 {
             connection.execute_batch(HOST_MIGRATION_0006)?;
         }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 7 {
+            connection.execute_batch(HOST_MIGRATION_0007)?;
+        }
         connection.execute(
             "INSERT OR IGNORE INTO host_sync_local_state(singleton,device_uuid,stream_uuid,next_actor_seq,hlc_wall_ms,hlc_logical,capture_enabled,updated_at) VALUES (1,?1,?2,1,0,0,0,?3)",
             params![uuid::Uuid::now_v7().as_bytes().as_slice(), uuid::Uuid::now_v7().as_bytes().as_slice(), unix_timestamp_millis()],
@@ -2346,7 +2572,7 @@ impl HostRegistry {
         )?;
         let providers = {
             let mut statement = connection.prepare(
-                "SELECT i.plugin_id,a.account_uuid,a.display_name,r.state,a.auth_state,r.last_healthy_at,r.last_error_code FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE EXISTS (SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1') ORDER BY i.plugin_id",
+                "SELECT i.plugin_id,a.account_uuid,a.display_name,a.account_kind,r.state,a.auth_state,r.last_healthy_at,r.last_error_code FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE EXISTS (SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1') ORDER BY i.plugin_id",
             )?;
             let rows = statement
                 .query_map([], |row| {
@@ -2354,10 +2580,11 @@ impl HostRegistry {
                         plugin_id: row.get(0)?,
                         account_uuid: row.get(1)?,
                         account_display_name: row.get(2)?,
-                        runtime_state: row.get(3)?,
-                        auth_state: row.get(4)?,
-                        last_healthy_at: row.get(5)?,
-                        last_error_code: row.get(6)?,
+                        account_kind: row.get(3)?,
+                        runtime_state: row.get(4)?,
+                        auth_state: row.get(5)?,
+                        last_healthy_at: row.get(6)?,
+                        last_error_code: row.get(7)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -5248,7 +5475,7 @@ mod tests {
         register_test_plugin(&registry, "com.megle.versioned", "account-versioned");
         let now = unix_timestamp_millis();
         let manifest_json = format!(
-            r#"{{"manifestVersion":2,"id":"com.megle.versioned","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
+            r#"{{"manifestVersion":2,"id":"com.megle.versioned","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
             "0".repeat(64)
         );
         registry.connection.lock().unwrap().execute(
@@ -5328,7 +5555,7 @@ mod tests {
         register_test_plugin(&registry, "com.megle.stale-probation", "account-stale");
         let now = unix_timestamp_millis();
         let manifest_json = format!(
-            r#"{{"manifestVersion":2,"id":"com.megle.stale-probation","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
+            r#"{{"manifestVersion":2,"id":"com.megle.stale-probation","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
             "0".repeat(64)
         );
         registry.connection.lock().unwrap().execute(
@@ -5362,6 +5589,48 @@ mod tests {
         assert_eq!(plugin.known_good_version.as_deref(), Some("1.0.0"));
         assert_eq!(plugin.runtime_state, "disabled");
 
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn onedrive_configuration_plan_commit_is_revisioned_and_noop_safe() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let initial = registry.onedrive_configuration().unwrap();
+        let plan = registry
+            .plan_onedrive_configuration(
+                Some("01234567-89ab-4cde-8fab-0123456789ab"),
+                initial.revision,
+            )
+            .unwrap();
+        assert!(plan.effective_changed);
+        assert!(!plan.requires_confirmation);
+        assert!(registry
+            .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, false)
+            .unwrap()
+            .is_empty());
+        let configured = registry.onedrive_configuration().unwrap();
+        assert_eq!(configured.source, "host-override");
+        assert!(configured.configured);
+        assert_eq!(configured.revision, initial.revision + 1);
+        let no_op = registry
+            .plan_onedrive_configuration(
+                Some("01234567-89AB-4CDE-8FAB-0123456789AB"),
+                configured.revision,
+            )
+            .unwrap();
+        assert!(!no_op.effective_changed);
+        registry
+            .commit_onedrive_configuration(&no_op.plan_uuid, no_op.expected_revision, false)
+            .unwrap();
+        assert_eq!(
+            registry.onedrive_configuration().unwrap().revision,
+            configured.revision
+        );
+        assert!(registry
+            .plan_onedrive_configuration(Some("not-a-uuid"), configured.revision)
+            .is_err());
         drop(registry);
         let _ = std::fs::remove_file(path);
     }

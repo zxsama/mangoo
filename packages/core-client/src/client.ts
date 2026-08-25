@@ -40,6 +40,11 @@ import type {
   Page,
   PluginDiscoveryResponse,
   PluginAuthBeginResponse,
+  PluginAuthCancelRequest,
+  OneDriveConfiguration,
+  OneDriveConfigurationPlanRequest,
+  OneDriveConfigurationPlan,
+  OneDriveConfigurationCommitRequest,
   PluginAuthCompleteRequest,
   PluginCommandResponse,
   PluginDiagnosticsResponse,
@@ -684,6 +689,11 @@ export function createCoreClient(config: CoreClientConfig) {
       request<PluginAuthBeginResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/begin`, { method: "POST", requestPriority: "interactive" }),
     completePluginAuth: (pluginId: string, input: PluginAuthCompleteRequest) =>
       request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/complete`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
+    cancelPluginAuth: (pluginId: string, input: PluginAuthCancelRequest) =>
+      request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/cancel`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
+    getOneDriveConfiguration: () => request<OneDriveConfiguration>("/plugins/com.megle.onedrive/configuration", { requestPriority: "metadata" }),
+    planOneDriveConfiguration: (input: OneDriveConfigurationPlanRequest) => request<OneDriveConfigurationPlan>("/plugins/com.megle.onedrive/configuration/plan", { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
+    commitOneDriveConfiguration: (input: OneDriveConfigurationCommitRequest) => request<OneDriveConfiguration>("/plugins/com.megle.onedrive/configuration", { method: "PUT", requestPriority: "interactive", body: JSON.stringify(input) }),
     signOutPlugin: (pluginId: string) =>
       request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/sign-out`, { method: "POST", requestPriority: "interactive" }),
     getPluginHealth: (pluginId: string) =>

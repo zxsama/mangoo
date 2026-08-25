@@ -56,6 +56,8 @@ pub struct ProviderHealth {
 pub struct AuthBegin {
     pub authorization_url: String,
     pub flow_id: String,
+    pub completion_mode: String,
+    pub redirect_uri: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthStatus {
@@ -139,6 +141,8 @@ pub trait SyncProvider: Send + Sync {
         flow_id: &'a str,
         fields: BTreeMap<String, String>,
     ) -> ProviderFuture<'a, AuthStatus>;
+    fn auth_poll<'a>(&'a self, flow_id: &'a str) -> ProviderFuture<'a, Option<AuthStatus>>;
+    fn auth_cancel<'a>(&'a self, flow_id: &'a str) -> ProviderFuture<'a, ()>;
     fn auth_status(&self) -> ProviderFuture<'_, AuthStatus>;
     fn auth_sign_out(&self) -> ProviderFuture<'_, ()>;
     fn delta_list<'a>(
@@ -519,6 +523,8 @@ impl SyncProvider for InMemorySyncProvider {
             Ok(AuthBegin {
                 authorization_url: "https://example.invalid/authorize".into(),
                 flow_id: uuid::Uuid::now_v7().to_string(),
+                completion_mode: "loopback".into(),
+                redirect_uri: None,
             })
         })
     }
@@ -552,6 +558,12 @@ impl SyncProvider for InMemorySyncProvider {
                 account_kind: None,
             })
         })
+    }
+    fn auth_poll<'a>(&'a self, _: &'a str) -> ProviderFuture<'a, Option<AuthStatus>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn auth_cancel<'a>(&'a self, _: &'a str) -> ProviderFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
     fn auth_sign_out(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {

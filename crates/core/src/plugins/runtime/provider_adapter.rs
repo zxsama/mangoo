@@ -187,7 +187,28 @@ impl SyncProvider for FramedSyncProvider {
             Ok(AuthBegin {
                 authorization_url: text(&v, "authorizationUrl")?,
                 flow_id: text(&v, "flowId")?,
+                completion_mode: text(&v, "completionMode")?,
+                redirect_uri: v
+                    .get("redirectUri")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             })
+        })
+    }
+    fn auth_poll<'a>(&'a self, flow_id: &'a str) -> ProviderFuture<'a, Option<AuthStatus>> {
+        Box::pin(async move {
+            let value = self.rpc("auth.poll", json!({"flowId":flow_id})).await?;
+            if value.get("pending").and_then(Value::as_bool) == Some(true) {
+                Ok(None)
+            } else {
+                auth_status(value).map(Some)
+            }
+        })
+    }
+    fn auth_cancel<'a>(&'a self, flow_id: &'a str) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            self.rpc("auth.cancel", json!({"flowId":flow_id})).await?;
+            Ok(())
         })
     }
     fn auth_complete<'a>(

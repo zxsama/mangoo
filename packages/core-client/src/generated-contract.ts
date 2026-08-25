@@ -98,7 +98,7 @@ export type LibrarySyncLifecycleState = "local-only" | "enabling" | "syncing" | 
 export type LibrarySyncPhase = "preflight" | "capturing" | "uploading" | "publishing" | "active" | "reconcile" | "catalog-restore" | "catalog-ready" | "restoring-media" | "complete" | "retry-wait" | "compatibility-locked" | "cancelled";
 export type CatalogReadiness = "not-created" | "restoring" | "catalog-ready" | "ready";
 export type SyncAllowedAction = "enable" | "pause" | "resume" | "retry" | "sync-now" | "cancel-before-catalog" | "unbind" | "resolve-conflicts" | "reconnect";
-export interface SyncProviderStatus { pluginId: string; accountUuid: string; accountDisplayName?: string | null; runtimeState: string; authState: string; lastHealthyAt?: number | null; lastErrorCode?: string | null; }
+export interface SyncProviderStatus { pluginId: string; accountUuid: string; accountDisplayName?: string | null; accountKind?: "personal" | "business" | null; runtimeState: string; authState: string; lastHealthyAt?: number | null; lastErrorCode?: string | null; }
 export interface LibrarySyncStatus { libraryUuid: string; name: string; lifecycle: LibrarySyncLifecycleState; phase: LibrarySyncPhase; catalogReadiness: CatalogReadiness; providerId?: string | null; accountUuid?: string | null; remoteLibraryUuid: string | null; allowedActions: SyncAllowedAction[]; lastSuccessAt?: number | null; lastErrorCode?: string | null; retryAfter?: number | null; pollAfter?: number | null; pendingUploadItems: number; pendingDownloadItems: number; pendingUploadBytes: number; pendingDownloadBytes: number; conflictCount: number; localDivergenceCount: number; operationRevision: number; restoreUuid?: string | null; restoreItemsDone?: number | null; restoreItemsTotal?: number | null; restoreBytesDone?: number | null; restoreBytesTotal?: number | null; }
 export interface SyncStatusSnapshot { revision: number; generatedAt: number; schedulerState: "starting" | "running" | "stopped" | "degraded"; providers: SyncProviderStatus[]; libraries: LibrarySyncStatus[]; }
 export interface SyncOperation { operationUuid: string; libraryUuid?: string | null; kind: string; state: "pending" | "running" | "waiting" | "complete" | "failed" | "cancelled"; phase: string; errorCode?: string | null; updatedAt: number; }
@@ -551,6 +551,7 @@ export interface HostPluginProjection {
   permissionRequired: boolean;
   accountUuid: string | null;
   accountDisplayName: string | null;
+  accountKind: "personal" | "business" | null;
   compatibilityReason: string | null;
   backoffUntil: number | null;
   lastHealthyAt: number | null;
@@ -585,11 +586,26 @@ export interface PluginAuthBeginResponse {
   authorizationUrl: string;
   flowId: string;
   expiresAt: number;
+  completionMode: "loopback" | "manual-response-uri";
+  redirectUri: string | null;
 }
 export interface PluginAuthCompleteRequest {
   flowId: string;
-  result: Record<string, string>;
+  responseUri: string;
 }
+export interface PluginAuthCancelRequest {
+  flowId: string;
+}
+export interface OneDriveConfiguration {
+  source: "environment" | "host-override" | "bundled" | "missing";
+  configured: boolean;
+  readOnly: boolean;
+  revision: number;
+  errorCode: string | null;
+}
+export interface OneDriveConfigurationPlanRequest { clientId: string | null; expectedRevision: number; }
+export interface OneDriveConfigurationPlan { planUuid: string; expectedRevision: number; effectiveChanged: boolean; affectedLibraries: number; requiresConfirmation: boolean; expiresAt: number; }
+export interface OneDriveConfigurationCommitRequest { planUuid: string; expectedRevision: number; confirmed: boolean; }
 export interface PluginHealthResponse {
   state: PluginRuntimeState;
   lastHealthyAt: number | null;

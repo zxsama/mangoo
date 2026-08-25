@@ -165,7 +165,10 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/plugins/{pluginId}/versions/rollback",
     "/api/plugins/{pluginId}/auth/begin",
     "/api/plugins/{pluginId}/auth/complete",
+    "/api/plugins/{pluginId}/auth/cancel",
     "/api/plugins/{pluginId}/auth/sign-out",
+    "/api/plugins/com.megle.onedrive/configuration",
+    "/api/plugins/com.megle.onedrive/configuration/plan",
     "/api/plugins/{pluginId}/health",
     "/api/plugins/{pluginId}/diagnostics",
     "/api/plugin-auth/callback/{flowId}",
@@ -236,7 +239,25 @@ struct PluginVersionRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PluginAuthCompleteRequest {
     flow_id: String,
-    result: std::collections::BTreeMap<String, String>,
+    response_uri: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginAuthCancelRequest {
+    flow_id: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OneDriveConfigurationPlanRequest {
+    client_id: Option<String>,
+    expected_revision: u64,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OneDriveConfigurationCommitRequest {
+    plan_uuid: String,
+    expected_revision: u64,
+    confirmed: bool,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -244,6 +265,8 @@ struct PluginAuthBeginResponse {
     authorization_url: String,
     flow_id: String,
     expires_at: i64,
+    completion_mode: String,
+    redirect_uri: Option<String>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -865,8 +888,20 @@ pub fn router(state: AppState) -> Router {
             post(complete_plugin_auth),
         )
         .route(
+            "/api/plugins/:plugin_id/auth/cancel",
+            post(cancel_plugin_auth),
+        )
+        .route(
             "/api/plugins/:plugin_id/auth/sign-out",
             post(sign_out_plugin),
+        )
+        .route(
+            "/api/plugins/com.megle.onedrive/configuration",
+            get(get_onedrive_configuration).put(commit_onedrive_configuration),
+        )
+        .route(
+            "/api/plugins/com.megle.onedrive/configuration/plan",
+            post(plan_onedrive_configuration),
         )
         .route("/api/plugins/:plugin_id/health", get(plugin_health))
         .route(
@@ -3731,9 +3766,13 @@ async fn begin_plugin_auth(
                 "Provider runtime session is unavailable".into(),
             )
         })?;
-    let public_url = std::env::var("MEGLE_PUBLIC_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let public_url = (id != "com.megle.onedrive")
+        .then(|| {
+            std::env::var("MEGLE_PUBLIC_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .flatten();
     let host_flow_id = if public_url.is_some() {
         Some(
             state
@@ -3772,6 +3811,7 @@ async fn begin_plugin_auth(
         &supervisor_session,
         "authorizing",
         None,
+        None,
     )? {
         return Err(CoreError::coded(
             StatusCode::CONFLICT,
@@ -3779,27 +3819,138 @@ async fn begin_plugin_auth(
             "Provider runtime restarted during authorization".into(),
         ));
     }
+    let provider_flow_id = auth.flow_id.clone();
     let response_flow_id = if let Some(flow_id) = host_flow_id {
         state
             .plugin_auth_flows
-            .attach_provider_flow(&flow_id, auth.flow_id)?;
+            .attach_provider_flow(&flow_id, auth.flow_id.clone())?;
         flow_id
     } else {
-        auth.flow_id
+        provider_flow_id.clone()
     };
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
         + 10 * 60 * 1000;
+    if auth.completion_mode == "loopback" {
+        spawn_loopback_auth_completion(
+            state.clone(),
+            id.clone(),
+            provider_flow_id,
+            supervisor_session,
+        );
+    }
     Ok((
         StatusCode::CREATED,
         Json(PluginAuthBeginResponse {
             authorization_url: auth.authorization_url,
             flow_id: response_flow_id,
             expires_at,
+            completion_mode: auth.completion_mode.clone(),
+            redirect_uri: auth.redirect_uri,
         }),
     ))
+}
+
+async fn apply_plugin_auth_result(
+    state: &AppState,
+    plugin_id: &str,
+    supervisor_session: &str,
+    auth: crate::sync::provider::AuthStatus,
+) -> ApiResult<()> {
+    if !host_registry(state)?.update_plugin_account_auth_for_session(
+        plugin_id,
+        supervisor_session,
+        if auth.authenticated {
+            "authenticated"
+        } else {
+            "authorization-required"
+        },
+        auth.account_display_name.as_deref(),
+        auth.account_kind.as_deref(),
+    )? {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "oauth_session_changed",
+            "Provider runtime restarted during authorization".into(),
+        ));
+    }
+    if auth.authenticated {
+        let Some(fences) = host_registry(state)?.update_plugin_account_identity_for_session(
+            plugin_id,
+            supervisor_session,
+            auth.stable_account_identity.as_deref(),
+        )?
+        else {
+            return Err(CoreError::coded(
+                StatusCode::CONFLICT,
+                "oauth_session_changed",
+                "Provider runtime restarted during authorization".into(),
+            ));
+        };
+        library_manager(state)?
+            .fence_plugin_bindings(plugin_id, fences)
+            .await?;
+    }
+    Ok(())
+}
+
+fn spawn_loopback_auth_completion(
+    state: AppState,
+    plugin_id: String,
+    flow_id: String,
+    supervisor_session: String,
+) {
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(10 * 60);
+        let mut delay = std::time::Duration::from_millis(500);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                if let Ok(provider) = plugin_provider(&state, &plugin_id) {
+                    let _ = provider.auth_cancel(&flow_id).await;
+                }
+                if let Ok(registry) = host_registry(&state) {
+                    let _ = registry.update_plugin_account_auth_for_session(
+                        &plugin_id,
+                        &supervisor_session,
+                        "expired",
+                        None,
+                        None,
+                    );
+                }
+                return;
+            }
+            let provider = match plugin_provider(&state, &plugin_id) {
+                Ok(provider) => provider,
+                Err(_) => return,
+            };
+            match provider.auth_poll(&flow_id).await {
+                Ok(Some(auth)) => {
+                    let _ = apply_plugin_auth_result(&state, &plugin_id, &supervisor_session, auth)
+                        .await;
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) if error.retryable => {}
+                Err(_) => {
+                    if let Ok(registry) = host_registry(&state) {
+                        let _ = registry.update_plugin_account_auth_for_session(
+                            &plugin_id,
+                            &supervisor_session,
+                            "error",
+                            None,
+                            None,
+                        );
+                    }
+                    return;
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(2));
+        }
+    });
 }
 
 async fn complete_plugin_auth_callback(
@@ -3862,6 +4013,7 @@ async fn complete_plugin_auth_callback(
             "authorization-required"
         },
         auth.account_display_name.as_deref(),
+        auth.account_kind.as_deref(),
     )? {
         return Err(CoreError::coded(
             StatusCode::CONFLICT,
@@ -3895,14 +4047,14 @@ async fn complete_plugin_auth(
     Path(id): Path<String>,
     Json(body): Json<PluginAuthCompleteRequest>,
 ) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
-    let auth_fields = body.result.into_iter().collect::<Vec<_>>();
-    crate::plugins::auth_flow::validate_callback_fields(&auth_fields).map_err(|error| {
-        CoreError::coded(
-            StatusCode::BAD_REQUEST,
-            "invalid_oauth_result",
-            error.to_string(),
-        )
-    })?;
+    let auth_fields = crate::plugins::auth_flow::parse_manual_response_uri(&body.response_uri)
+        .map_err(|_| {
+            CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid_oauth_response_uri",
+                "The authorization response URI is invalid".into(),
+            )
+        })?;
     let supervisor_session = host_registry(&state)?
         .plugin_runtime_session(&id)?
         .ok_or_else(|| {
@@ -3925,6 +4077,7 @@ async fn complete_plugin_auth(
             "authorization-required"
         },
         auth.account_display_name.as_deref(),
+        auth.account_kind.as_deref(),
     )? {
         return Err(CoreError::coded(
             StatusCode::CONFLICT,
@@ -3949,6 +4102,36 @@ async fn complete_plugin_auth(
             .fence_plugin_bindings(&id, fences)
             .await?;
     }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PluginCommandResponse { accepted: true }),
+    ))
+}
+async fn cancel_plugin_auth(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PluginAuthCancelRequest>,
+) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let supervisor_session = host_registry(&state)?
+        .plugin_runtime_session(&id)?
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "provider_not_ready",
+                "Provider runtime session is unavailable".into(),
+            )
+        })?;
+    plugin_provider(&state, &id)?
+        .auth_cancel(&body.flow_id)
+        .await
+        .map_err(map_provider_error)?;
+    host_registry(&state)?.update_plugin_account_auth_for_session(
+        &id,
+        &supervisor_session,
+        "authorization-required",
+        None,
+        None,
+    )?;
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
@@ -3983,6 +4166,48 @@ async fn sign_out_plugin(
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
     ))
+}
+async fn get_onedrive_configuration(
+    State(state): State<AppState>,
+) -> ApiResult<Json<crate::host_registry::OneDriveConfiguration>> {
+    Ok(Json(host_registry(&state)?.onedrive_configuration()?))
+}
+async fn plan_onedrive_configuration(
+    State(state): State<AppState>,
+    Json(body): Json<OneDriveConfigurationPlanRequest>,
+) -> ApiResult<Json<crate::host_registry::OneDriveConfigurationPlan>> {
+    host_registry(&state)?
+        .plan_onedrive_configuration(body.client_id.as_deref(), body.expected_revision)
+        .map(Json)
+        .map_err(|error| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "invalid_onedrive_configuration",
+                error.to_string(),
+            )
+        })
+}
+async fn commit_onedrive_configuration(
+    State(state): State<AppState>,
+    Json(body): Json<OneDriveConfigurationCommitRequest>,
+) -> ApiResult<Json<crate::host_registry::OneDriveConfiguration>> {
+    let active_provider = plugin_provider(&state, "com.megle.onedrive").ok();
+    let fences = host_registry(&state)?
+        .commit_onedrive_configuration(&body.plan_uuid, body.expected_revision, body.confirmed)
+        .map_err(|error| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "invalid_onedrive_configuration",
+                error.to_string(),
+            )
+        })?;
+    library_manager(&state)?
+        .fence_plugin_bindings("com.megle.onedrive", fences)
+        .await?;
+    if let Some(provider) = active_provider {
+        let _ = provider.auth_sign_out().await;
+    }
+    Ok(Json(host_registry(&state)?.onedrive_configuration()?))
 }
 async fn plugin_health(
     State(state): State<AppState>,
@@ -10117,7 +10342,7 @@ mod tests {
                     .uri("/api/plugins/com.megle.fake/auth/complete")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(format!(
-                        "{{\"flowId\":\"{flow_id}\",\"result\":{{\"code\":\"ok\"}}}}"
+                        "{{\"flowId\":\"{flow_id}\",\"responseUri\":\"https://login.microsoftonline.com/common/oauth2/nativeclient?code=ok&state=test\"}}"
                     )))
                     .unwrap(),
             )

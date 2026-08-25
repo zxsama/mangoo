@@ -716,6 +716,7 @@ impl LibraryManager {
                                     let registry = Arc::clone(&activation_registry);
                                     let launch_fingerprint = activation_fingerprint.clone();
                                     async move {
+                                        let onedrive_client_id = registry.effective_onedrive_client_id()?;
                                         let reverse = secret_store.map(|store| Arc::new(crate::plugins::runtime::secret_broker::SecretBroker::new(store, registry, manifest.id.clone(), account.clone(), launch_fingerprint)) as Arc<dyn crate::plugins::runtime::rpc::ReverseRpcHandler>);
                                         crate::plugins::runtime::supervisor::activate_and_register(
                                             &providers,
@@ -728,6 +729,7 @@ impl LibraryManager {
                                             ),
                                             runtime,
                                             reverse,
+                                            onedrive_client_id,
                                         )
                                         .await
                                     }
@@ -2329,6 +2331,7 @@ mod tests {
             platform(),
             crate::plugins::runtime::trust::embedded_trust_registry(),
             runtime.to_path_buf(),
+            None,
             None,
         )
         .await

@@ -1121,6 +1121,7 @@ mod tests {
             crate::plugins::runtime::trust::embedded_trust_registry(),
             root.join("provider-runtime"),
             None,
+            None,
         )
         .await
         .unwrap()
