@@ -361,6 +361,10 @@ test("notifications preload exposes only notification, log, and common window ca
   assert.equal(typeof mainBridge.retryLibraryLoad, "function");
   assert.equal(typeof mainBridge.updateMediaFocusStage, "function");
   assert.equal(typeof mainBridge.shell, "object");
+  assert.equal(
+    typeof (mainBridge.shell as { openExternalAuthorizationUrl?: unknown }).openExternalAuthorizationUrl,
+    "function"
+  );
   assert.equal("switchLibrary" in settingsBridge, false);
   assert.equal(typeof settingsBridge.shell, "object");
 
@@ -374,7 +378,8 @@ test("Main role permissions reject notification senders for library and shell IP
     "megle:retry-library-load",
     "megle:pick-new-library-path",
     "megle:shell-reveal-path",
-    "megle:shell-open-path"
+    "megle:shell-open-path",
+    "megle:open-external-authorization-url"
   ]) {
     assert.equal(permissionsModule.canAccessDesktopIpc("notifications", channel), false);
     assert.equal(permissionsModule.canAccessDesktopIpc("main", channel), true);
@@ -484,7 +489,8 @@ test("hardening source contract uses shared DTOs, sender authorization, and fail
   for (const channel of [
     "megle:pick-new-library-path",
     "megle:shell-reveal-path",
-    "megle:shell-open-path"
+    "megle:shell-open-path",
+    "megle:open-external-authorization-url"
   ]) {
     assert.match(main, new RegExp(`requireDesktopIpcAccess\\(event, "${channel}"\\)`));
   }

@@ -83,6 +83,12 @@ export interface DesktopWindowControls {
 export interface DesktopShellActions {
   revealPath: (path: string) => Promise<boolean>;
   openPath: (path: string) => Promise<boolean>;
+  openExternalAuthorizationUrl: (
+    url: string
+  ) => Promise<
+    | { ok: true }
+    | { ok: false; error: "external_browser_rejected" | "external_browser_open_failed" }
+  >;
   copyText: (text: string) => Promise<boolean>;
 }
 
@@ -226,6 +232,16 @@ export async function revealPath(path: string): Promise<boolean> {
 
 export async function openPath(path: string): Promise<boolean> {
   return (await getDesktopShellActions()?.openPath(path)) ?? false;
+}
+
+export async function openExternalAuthorizationUrl(
+  url: string
+): Promise<
+  | { ok: true }
+  | { ok: false; error: "external_browser_rejected" | "external_browser_open_failed" }
+  | null
+> {
+  return (await getDesktopShellActions()?.openExternalAuthorizationUrl(url)) ?? null;
 }
 
 export async function copyText(text: string): Promise<boolean> {

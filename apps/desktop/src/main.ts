@@ -30,6 +30,7 @@ import {
   type DesktopIpcWindowRole
 } from "./desktop-ipc-permissions.js";
 import { desktopLogger, processLogBuffer } from "./desktop-logger.js";
+import { openExternalAuthorizationUrl } from "./oauth-authorization-url.js";
 import {
   CoreLifecycleQueue,
   LifecycleCancelledError,
@@ -953,6 +954,17 @@ ipcMain.handle("megle:pick-new-library-path", async (event, defaultName?: string
     ? await dialog.showOpenDialog(mainWindow, options)
     : await dialog.showOpenDialog(options);
   return result.canceled ? null : (result.filePaths[0] ?? null);
+});
+
+ipcMain.handle("megle:open-external-authorization-url", async (event, authorizationUrl: unknown) => {
+  requireDesktopIpcAccess(event, "megle:open-external-authorization-url");
+  return openExternalAuthorizationUrl(
+    authorizationUrl,
+    (url) => shell.openExternal(url),
+    {
+      emulatorAuthority: app.isPackaged ? undefined : process.env.MEGLE_ONEDRIVE_AUTHORITY
+    }
+  );
 });
 
 async function createWindow(): Promise<void> {

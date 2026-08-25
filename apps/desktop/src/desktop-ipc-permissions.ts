@@ -30,6 +30,7 @@ const PRIVILEGED_CHANNELS = new Set([
   "megle:diagnostics",
   "megle:shell-reveal-path",
   "megle:shell-open-path",
+  "megle:open-external-authorization-url",
   "megle:clipboard-write-text",
   "megle:open-settings-window",
   "megle:close-settings-window",

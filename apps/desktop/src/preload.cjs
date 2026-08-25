@@ -169,6 +169,8 @@ const fullBridge = {
   shell: {
     revealPath: (path) => ipcRenderer.invoke("megle:shell-reveal-path", path),
     openPath: (path) => ipcRenderer.invoke("megle:shell-open-path", path),
+    openExternalAuthorizationUrl: (url) =>
+      ipcRenderer.invoke("megle:open-external-authorization-url", url),
     copyText: (text) => ipcRenderer.invoke("megle:clipboard-write-text", text)
   },
   getLibraryPhase: () => ipcRenderer.invoke("megle:get-library-load-phase"),

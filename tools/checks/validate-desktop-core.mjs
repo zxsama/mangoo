@@ -420,7 +420,8 @@ for (const value of [
   "canAccessDesktopIpc",
   "PRIVILEGED_WINDOW_ROLES",
   '"megle:pick-new-library-path"',
-  '"megle:shell-open-path"'
+  '"megle:shell-open-path"',
+  '"megle:open-external-authorization-url"'
 ]) {
   if (!desktopIpcPermissions.includes(value)) {
     fail(`desktop sender-role allowlist missing ${value}`);
@@ -430,7 +431,8 @@ for (const channel of [
   "megle:retry-library-load",
   "megle:pick-new-library-path",
   "megle:shell-reveal-path",
-  "megle:shell-open-path"
+  "megle:shell-open-path",
+  "megle:open-external-authorization-url"
 ]) {
   if (!main.includes(`requireDesktopIpcAccess(event, "${channel}")`)) {
     fail(`desktop Main must authorize the real sender before ${channel}`);
