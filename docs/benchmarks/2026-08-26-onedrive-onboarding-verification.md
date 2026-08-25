@@ -22,11 +22,11 @@ accepted or stored.
 - `npm run check:sync-integration`: passed after the fake Provider manifest and
   handshake were brought forward to the required `auth.poll`/`auth.cancel`
   method map.
-- Quick immutable-tree release run:
-  `.tmp/sync-release/onedrive-auth-phase5-final/release-result.json`. The clean
+- A quick immutable-tree release run on commit `8c6034c` passed the clean
   archive, full gate, Desktop loopback emulator, Docker manual emulator,
   Electron authorization URL boundary, sync integration, renderer performance,
-  and sync benchmark rows passed.
+  and sync benchmark rows. Its temporary extracted tree was removed after
+  capture to recover workspace disk capacity.
 
 The OS-backdrop row could not complete on this workstation because the MSVC
 linker reported a PDB filesystem/limit error while rebuilding the Desktop
