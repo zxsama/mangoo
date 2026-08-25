@@ -508,32 +508,37 @@ fn start_runtime_background_tasks(state: &AppState) {
     let token = runtime.cancellation_token();
     let sweep_state = state.clone();
     runtime.own_background_task(tokio::spawn(run_transient_retry_loop(sweep_state, token)));
-    let token = runtime.cancellation_token();
-    let retirement_state = state.clone();
-    runtime.own_background_task(tokio::spawn(run_credential_retirement_loop(
-        retirement_state,
-        token,
-    )));
 }
 
 pub(crate) fn reconcile_credential_retirements_once(state: &AppState) -> anyhow::Result<usize> {
-    let Some(store) = state.secret_store.as_ref() else {
-        return Ok(0);
-    };
     let Some(manager) = state.library_manager.as_ref() else {
         return Ok(0);
     };
-    reconcile_credential_retirements(manager.host_registry(), store)
+    manager.reconcile_credential_retirements_once(None)
 }
 
-fn reconcile_credential_retirements(
+pub(crate) fn reconcile_credential_retirements(
     registry: &Arc<HostRegistry>,
     store: &Arc<dyn crate::plugins::secret_store::SecretStore>,
+    providers: Option<&crate::sync::provider::ProviderManager>,
+    running_plugins: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<usize> {
     use crate::plugins::secret_store::{SecretScope, SecretStoreError};
     let retirements = registry.due_credential_retirements(32)?;
     let mut completed = 0;
     for retirement in retirements {
+        if running_plugins.is_some_and(|running| running.contains(&retirement.plugin_id)) {
+            continue;
+        }
+        if providers.is_some_and(|manager| {
+            manager
+                .resolve(&retirement.plugin_id, &retirement.account_uuid)
+                .ok()
+                .flatten()
+                .is_some()
+        }) {
+            continue;
+        }
         let scope = SecretScope {
             plugin_id: retirement.plugin_id.clone(),
             account_uuid: retirement.account_uuid,
@@ -555,22 +560,55 @@ fn reconcile_credential_retirements(
     Ok(completed)
 }
 
-async fn run_credential_retirement_loop(state: AppState, cancellation: CancellationToken) {
-    loop {
-        if let Err(error) = reconcile_credential_retirements_once(&state) {
-            tracing::warn!(%error, "credential retirement reconciliation failed");
-        }
-        tokio::select! {
-            _ = cancellation.cancelled() => break,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod credential_retirement_tests {
     use super::*;
-    use crate::plugins::secret_store::{MemorySecretStore, SecretScope, SecretStore};
+    use crate::plugins::secret_store::{
+        MemorySecretStore, SecretScope, SecretStore, SecretStoreError, SecretValue,
+    };
+
+    struct FailOnceDeleteStore {
+        inner: MemorySecretStore,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl Default for FailOnceDeleteStore {
+        fn default() -> Self {
+            Self {
+                inner: MemorySecretStore::default(),
+                failed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl SecretStore for FailOnceDeleteStore {
+        fn create(&self, scope: &SecretScope, value: &[u8]) -> Result<String, SecretStoreError> {
+            self.inner.create(scope, value)
+        }
+        fn read(
+            &self,
+            scope: &SecretScope,
+            opaque_ref: &str,
+        ) -> Result<SecretValue, SecretStoreError> {
+            self.inner.read(scope, opaque_ref)
+        }
+        fn compare_and_swap(
+            &self,
+            scope: &SecretScope,
+            opaque_ref: &str,
+            expected_generation: u64,
+            value: &[u8],
+        ) -> Result<u64, SecretStoreError> {
+            self.inner
+                .compare_and_swap(scope, opaque_ref, expected_generation, value)
+        }
+        fn delete(&self, scope: &SecretScope, opaque_ref: &str) -> Result<(), SecretStoreError> {
+            if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(SecretStoreError::Storage("injected failure".into()));
+            }
+            self.inner.delete(scope, opaque_ref)
+        }
+    }
 
     #[test]
     fn retirement_reconciliation_deletes_the_old_secret_and_journal() {
@@ -621,13 +659,143 @@ mod credential_retirement_tests {
             .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, true)
             .unwrap();
         assert_eq!(
-            reconcile_credential_retirements(&registry, &store).unwrap(),
+            reconcile_credential_retirements(&registry, &store, None, None).unwrap(),
             1
         );
         assert!(registry.due_credential_retirements(10).unwrap().is_empty());
         assert!(matches!(
             store.read(&scope, &secret_ref),
             Err(crate::plugins::secret_store::SecretStoreError::NotFound)
+        ));
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn retirement_waits_until_the_old_provider_is_unregistered() {
+        let path = std::env::temp_dir().join(format!(
+            "megle-credential-retirement-order-{}.sqlite",
+            uuid::Uuid::now_v7()
+        ));
+        let registry = Arc::new(HostRegistry::open(&path).unwrap());
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.megle.onedrive",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: std::path::Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account(
+                "onedrive-account",
+                "com.megle.onedrive",
+                Some("OneDrive"),
+                "authenticated",
+            )
+            .unwrap();
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
+        let scope = SecretScope {
+            plugin_id: "com.megle.onedrive".into(),
+            account_uuid: "onedrive-account".into(),
+            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
+            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+        };
+        let secret_ref = store.create(&scope, b"token").unwrap();
+        registry
+            .set_plugin_account_secret("com.megle.onedrive", Some(&secret_ref), "authenticated", 1)
+            .unwrap();
+        registry
+            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .unwrap();
+        let providers = crate::sync::provider::ProviderManager::default();
+        providers
+            .register(
+                "com.megle.onedrive",
+                "onedrive-account",
+                Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
+            )
+            .unwrap();
+        assert_eq!(
+            reconcile_credential_retirements(&registry, &store, Some(&providers), None).unwrap(),
+            0
+        );
+        assert!(store.read(&scope, &secret_ref).is_ok());
+        providers
+            .unregister("com.megle.onedrive", "onedrive-account")
+            .unwrap();
+        assert_eq!(
+            reconcile_credential_retirements(&registry, &store, Some(&providers), None).unwrap(),
+            1
+        );
+        assert!(matches!(
+            store.read(&scope, &secret_ref),
+            Err(crate::plugins::secret_store::SecretStoreError::NotFound)
+        ));
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_retirement_is_retried_without_an_active_library_runtime() {
+        let path = std::env::temp_dir().join(format!(
+            "megle-credential-retirement-retry-{}.sqlite",
+            uuid::Uuid::now_v7()
+        ));
+        let registry = Arc::new(HostRegistry::open(&path).unwrap());
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.megle.onedrive",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: std::path::Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account(
+                "onedrive-account",
+                "com.megle.onedrive",
+                Some("OneDrive"),
+                "authenticated",
+            )
+            .unwrap();
+        let concrete = Arc::new(FailOnceDeleteStore::default());
+        let store: Arc<dyn SecretStore> = concrete.clone();
+        let scope = SecretScope {
+            plugin_id: "com.megle.onedrive".into(),
+            account_uuid: "onedrive-account".into(),
+            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
+            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+        };
+        let secret_ref = store.create(&scope, b"token").unwrap();
+        registry
+            .set_plugin_account_secret("com.megle.onedrive", Some(&secret_ref), "authenticated", 1)
+            .unwrap();
+        registry
+            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .unwrap();
+        assert_eq!(
+            reconcile_credential_retirements(&registry, &store, None, None).unwrap(),
+            0
+        );
+        assert_eq!(registry.due_credential_retirements(10).unwrap().len(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        assert_eq!(
+            reconcile_credential_retirements(&registry, &store, None, None).unwrap(),
+            1
+        );
+        assert!(registry.due_credential_retirements(10).unwrap().is_empty());
+        assert!(matches!(
+            store.read(&scope, &secret_ref),
+            Err(SecretStoreError::NotFound)
         ));
         drop(registry);
         let _ = std::fs::remove_file(path);

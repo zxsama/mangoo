@@ -214,7 +214,15 @@ pub struct LibraryManager {
 
 struct PluginRuntimeSchedulerHandle {
     cancellation: CancellationToken,
+    commands: tokio::sync::mpsc::Sender<PluginRuntimeCommand>,
     task: tokio::task::JoinHandle<()>,
+}
+
+enum PluginRuntimeCommand {
+    Stop {
+        plugin_id: String,
+        completed: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
 impl LibraryManager {
@@ -223,6 +231,44 @@ impl LibraryManager {
     }
     pub fn provider_manager(&self) -> crate::sync::provider::ProviderManager {
         self.sync_coordinator.provider_manager()
+    }
+
+    pub fn reconcile_credential_retirements_once(
+        &self,
+        running_plugins: Option<&std::collections::HashSet<String>>,
+    ) -> anyhow::Result<usize> {
+        let Some(store) = self.secret_store.as_ref() else {
+            return Ok(0);
+        };
+        crate::api::reconcile_credential_retirements(
+            self.host_registry(),
+            store,
+            Some(&self.provider_manager()),
+            running_plugins,
+        )
+    }
+
+    pub async fn stop_plugin_runtime(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let commands = self
+            .plugin_runtime_scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|scheduler| scheduler.commands.clone());
+        let Some(commands) = commands else {
+            return Ok(());
+        };
+        let (completed, joined) = tokio::sync::oneshot::channel();
+        commands
+            .send(PluginRuntimeCommand::Stop {
+                plugin_id: plugin_id.to_owned(),
+                completed,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("plugin runtime scheduler is unavailable"))?;
+        joined
+            .await
+            .map_err(|_| anyhow::anyhow!("plugin runtime stop acknowledgement was dropped"))
     }
 
     pub fn wake_sync_after_local_mutation(&self) {
@@ -561,6 +607,7 @@ impl LibraryManager {
     pub fn start_plugin_runtime_supervisors(self: &Arc<Self>) {
         let cancellation = CancellationToken::new();
         let task_cancel = cancellation.clone();
+        let (commands, mut command_rx) = tokio::sync::mpsc::channel(8);
         let weak = Arc::downgrade(self);
         let task = tokio::spawn(async move {
             use std::collections::HashMap;
@@ -573,6 +620,12 @@ impl LibraryManager {
                 let Some(manager) = weak.upgrade() else {
                     break;
                 };
+                let running_plugins = running.keys().cloned().collect();
+                if let Err(error) =
+                    manager.reconcile_credential_retirements_once(Some(&running_plugins))
+                {
+                    tracing::warn!(%error, "credential retirement reconciliation failed");
+                }
                 let launches = match manager.registry.plugin_runtime_launches() {
                     Ok(value) => value,
                     Err(error) => {
@@ -744,6 +797,18 @@ impl LibraryManager {
                 }
                 tokio::select! {
                     _ = task_cancel.cancelled() => break,
+                    command = command_rx.recv() => {
+                        let Some(PluginRuntimeCommand::Stop { plugin_id, completed }) = command else {
+                            break;
+                        };
+                        if let Some((_, cancel, handle)) = running.remove(&plugin_id) {
+                            cancel.cancel();
+                            let _ = handle.await;
+                        } else if let Ok(Some(account)) = manager.registry.plugin_account_secret(&plugin_id) {
+                            let _ = manager.provider_manager().unregister(&plugin_id, &account.account_uuid);
+                        }
+                        let _ = completed.send(());
+                    }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                 }
             }
@@ -755,8 +820,11 @@ impl LibraryManager {
         *self
             .plugin_runtime_scheduler
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) =
-            Some(PluginRuntimeSchedulerHandle { cancellation, task });
+            .unwrap_or_else(|p| p.into_inner()) = Some(PluginRuntimeSchedulerHandle {
+            cancellation,
+            commands,
+            task,
+        });
     }
 
     pub fn start_sync_coordinator(self: &Arc<Self>) {

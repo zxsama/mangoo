@@ -14,6 +14,7 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0006_sync_orchestration_recovery.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0007_onedrive_auth_configuration.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0008_plugin_credential_retirement.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0009_plugin_auth_cancellation.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -604,8 +605,14 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (8, None, 0, "stopped"):
+        if meta != (9, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
+        auth_flow_columns = {
+            row[1]
+            for row in host_conn.execute("PRAGMA table_info(plugin_auth_flow_ownership)")
+        }
+        if not {"state", "prior_secret_ref", "prior_stable_account_identity"}.issubset(auth_flow_columns):
+            fail("plugin_auth_flow_ownership is missing cancellation-fence columns")
         binding_cursor_columns = {
             row[1]
             for row in host_conn.execute(

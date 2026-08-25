@@ -492,26 +492,13 @@ impl ProviderState {
                 .map(|credential| credential.upload_sessions.clone())
                 .unwrap_or_default(),
         };
-        if self.credential_ref.is_none() {
-            let _ = self.load_credential(rpc);
-        }
-        if let (Some(secret_ref), Some(generation)) =
-            (self.credential_ref.clone(), self.credential_generation)
-        {
-            let updated = cas_secret(
-                rpc,
-                CREDENTIAL_PURPOSE,
-                &secret_ref,
-                generation,
-                &record,
-                false,
-            )?;
-            self.credential_generation = updated.get("generation").and_then(Value::as_u64);
-        } else {
-            let created = create_secret(rpc, CREDENTIAL_PURPOSE, &record, false)?;
-            self.credential_ref = Some(text(&created, "secretRef")?);
-            self.credential_generation = created.get("generation").and_then(Value::as_u64);
-        }
+        // OAuth completion always creates a fresh record. Host swaps the
+        // account reference atomically and retires the prior credential. This
+        // makes cancellation reversible even when replacing an existing
+        // account; an in-place CAS would destroy the prior credential bytes.
+        let created = create_secret(rpc, CREDENTIAL_PURPOSE, &record, false)?;
+        self.credential_ref = Some(text(&created, "secretRef")?);
+        self.credential_generation = created.get("generation").and_then(Value::as_u64);
         self.credential = Some(record);
         self.auth_status_value()
     }

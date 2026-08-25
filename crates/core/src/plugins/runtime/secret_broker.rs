@@ -117,6 +117,13 @@ impl ReverseRpcHandler for SecretBroker {
                 Ok(json!({"secretRef":account.secret_ref,"accountGeneration":account.generation}))
             }
             "host.secret.create" => {
+                if !self
+                    .registry
+                    .plugin_auth_secret_write_is_allowed(&self.plugin_id)
+                    .map_err(|e| e.to_string())?
+                {
+                    return Err("OAuth flow is cancelling".into());
+                }
                 let reference = self
                     .store
                     .create(&scope, &decode("value")?)
@@ -159,6 +166,13 @@ impl ReverseRpcHandler for SecretBroker {
                 )
             }
             "host.secret.cas" => {
+                if !self
+                    .registry
+                    .plugin_auth_secret_write_is_allowed(&self.plugin_id)
+                    .map_err(|e| e.to_string())?
+                {
+                    return Err("OAuth flow is cancelling".into());
+                }
                 let next = self
                     .store
                     .compare_and_swap(
