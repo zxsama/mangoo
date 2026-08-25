@@ -20,6 +20,8 @@ const HOST_MIGRATION_0008: &str =
 const HOST_MIGRATION_0009: &str =
     include_str!("../host_migrations/0009_plugin_auth_cancellation.sql");
 const HOST_MIGRATION_0010: &str = include_str!("../host_migrations/0010_plugin_secret_handles.sql");
+const HOST_MIGRATION_0011: &str =
+    include_str!("../host_migrations/0011_plugin_secret_creations.sql");
 
 pub const ONEDRIVE_SECRET_NAMESPACE: &str = "microsoft-onedrive";
 pub const ONEDRIVE_CREDENTIAL_PURPOSE: &str = "oauth-v1";
@@ -1194,7 +1196,7 @@ impl HostRegistry {
         Ok(())
     }
 
-    pub fn register_plugin_secret_handle_for_launch(
+    pub fn reserve_plugin_secret_handle_for_launch(
         &self,
         plugin_id: &str,
         account_uuid: &str,
@@ -1216,9 +1218,81 @@ impl HostRegistry {
         if !account_matches {
             return Ok(false);
         }
+        let inserted = transaction.execute("INSERT OR IGNORE INTO plugin_secret_creations(plugin_id,account_uuid,secret_ref,namespace,purpose,launch_fingerprint,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![plugin_id,account_uuid,secret_ref,namespace,purpose,expected_fingerprint,unix_timestamp_millis()])?;
+        transaction.commit()?;
+        Ok(inserted == 1)
+    }
+
+    #[cfg(test)]
+    pub fn register_plugin_secret_handle_for_launch(
+        &self,
+        plugin_id: &str,
+        account_uuid: &str,
+        expected_fingerprint: &str,
+        secret_ref: &str,
+        namespace: &str,
+        purpose: &str,
+    ) -> anyhow::Result<bool> {
+        if !self.reserve_plugin_secret_handle_for_launch(
+            plugin_id,
+            account_uuid,
+            expected_fingerprint,
+            secret_ref,
+            namespace,
+            purpose,
+        )? {
+            return Ok(false);
+        }
+        self.finalize_plugin_secret_handle_for_launch(
+            plugin_id,
+            account_uuid,
+            expected_fingerprint,
+            secret_ref,
+        )
+    }
+
+    pub fn finalize_plugin_secret_handle_for_launch(
+        &self,
+        plugin_id: &str,
+        account_uuid: &str,
+        expected_fingerprint: &str,
+        secret_ref: &str,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if !plugin_runtime_launch_matches(&transaction, plugin_id, expected_fingerprint)? {
+            return Ok(false);
+        }
+        let pending: Option<(String, String)> = transaction.query_row(
+            "SELECT namespace,purpose FROM plugin_secret_creations WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3 AND launch_fingerprint=?4",
+            params![plugin_id, account_uuid, secret_ref, expected_fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((namespace, purpose)) = pending else {
+            return Ok(false);
+        };
         transaction.execute("INSERT OR IGNORE INTO plugin_secret_handles(plugin_id,account_uuid,secret_ref,namespace,purpose,created_at) VALUES (?1,?2,?3,?4,?5,?6)", params![plugin_id,account_uuid,secret_ref,namespace,purpose,unix_timestamp_millis()])?;
+        transaction.execute("DELETE FROM plugin_secret_creations WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3", params![plugin_id,account_uuid,secret_ref])?;
         transaction.commit()?;
         Ok(true)
+    }
+
+    pub fn abandon_plugin_secret_creation(
+        &self,
+        plugin_id: &str,
+        account_uuid: &str,
+        secret_ref: &str,
+        needs_retirement: bool,
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if needs_retirement {
+            transaction.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_creations WHERE plugin_id=?2 AND account_uuid=?3 AND secret_ref=?4", params![now,plugin_id,account_uuid,secret_ref])?;
+        }
+        transaction.execute("DELETE FROM plugin_secret_creations WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3", params![plugin_id,account_uuid,secret_ref])?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn forget_plugin_secret_handle(
@@ -2844,6 +2918,17 @@ impl HostRegistry {
         if schema_version < 10 {
             connection.execute_batch(HOST_MIGRATION_0010)?;
         }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 11 {
+            connection.execute_batch(HOST_MIGRATION_0011)?;
+        }
+        let now = unix_timestamp_millis();
+        connection.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_creations", [now])?;
+        connection.execute("DELETE FROM plugin_secret_creations", [])?;
         connection.execute(
             "INSERT OR IGNORE INTO host_sync_local_state(singleton,device_uuid,stream_uuid,next_actor_seq,hlc_wall_ms,hlc_logical,capture_enabled,updated_at) VALUES (1,?1,?2,1,0,0,0,?3)",
             params![uuid::Uuid::now_v7().as_bytes().as_slice(), uuid::Uuid::now_v7().as_bytes().as_slice(), unix_timestamp_millis()],

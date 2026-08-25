@@ -144,13 +144,12 @@ impl ReverseRpcHandler for SecretBroker {
                 Ok(json!({"secretRef":reference,"generation":1}))
             }
             "host.secret.create_scoped" => {
-                let reference = self
-                    .store
-                    .create(&scope, &decode("value")?)
+                let value = decode("value")?;
+                let reference = crate::plugins::secret_store::allocate_secret_ref(&scope)
                     .map_err(|e| e.to_string())?;
                 if !self
                     .registry
-                    .register_plugin_secret_handle_for_launch(
+                    .reserve_plugin_secret_handle_for_launch(
                         &self.plugin_id,
                         &self.account_uuid,
                         &self.launch_fingerprint,
@@ -160,7 +159,45 @@ impl ReverseRpcHandler for SecretBroker {
                     )
                     .map_err(|e| e.to_string())?
                 {
-                    let _ = self.store.delete(&scope, &reference);
+                    return Err("plugin runtime session is stale".into());
+                }
+                if let Err(error) = self.store.create_with_ref(&scope, &reference, &value) {
+                    let cleaned = matches!(
+                        self.store.delete(&scope, &reference),
+                        Ok(()) | Err(crate::plugins::secret_store::SecretStoreError::NotFound)
+                    );
+                    self.registry
+                        .abandon_plugin_secret_creation(
+                            &self.plugin_id,
+                            &self.account_uuid,
+                            &reference,
+                            !cleaned,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    return Err(error.to_string());
+                }
+                if !self
+                    .registry
+                    .finalize_plugin_secret_handle_for_launch(
+                        &self.plugin_id,
+                        &self.account_uuid,
+                        &self.launch_fingerprint,
+                        &reference,
+                    )
+                    .map_err(|e| e.to_string())?
+                {
+                    let cleaned = matches!(
+                        self.store.delete(&scope, &reference),
+                        Ok(()) | Err(crate::plugins::secret_store::SecretStoreError::NotFound)
+                    );
+                    self.registry
+                        .abandon_plugin_secret_creation(
+                            &self.plugin_id,
+                            &self.account_uuid,
+                            &reference,
+                            !cleaned,
+                        )
+                        .map_err(|e| e.to_string())?;
                     return Err("plugin runtime session is stale".into());
                 }
                 Ok(json!({"secretRef":reference,"generation":1}))
@@ -252,9 +289,10 @@ impl ReverseRpcHandler for SecretBroker {
                     .get("secretRef")
                     .and_then(Value::as_str)
                     .ok_or("missing secretRef")?;
-                self.store
-                    .delete(&scope, secret_ref)
-                    .map_err(|e| e.to_string())?;
+                match self.store.delete(&scope, secret_ref) {
+                    Ok(()) | Err(crate::plugins::secret_store::SecretStoreError::NotFound) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
                 self.registry
                     .forget_plugin_secret_handle(&self.plugin_id, &self.account_uuid, secret_ref)
                     .map_err(|e| e.to_string())?;

@@ -582,8 +582,13 @@ mod credential_retirement_tests {
     }
 
     impl SecretStore for FailOnceDeleteStore {
-        fn create(&self, scope: &SecretScope, value: &[u8]) -> Result<String, SecretStoreError> {
-            self.inner.create(scope, value)
+        fn create_with_ref(
+            &self,
+            scope: &SecretScope,
+            opaque_ref: &str,
+            value: &[u8],
+        ) -> Result<(), SecretStoreError> {
+            self.inner.create_with_ref(scope, opaque_ref, value)
         }
         fn read(
             &self,
@@ -882,6 +887,138 @@ mod credential_retirement_tests {
         ));
         drop(registry);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pending_secret_creations_and_deleted_items_reconcile_across_restart() {
+        fn ready_registry(path: &std::path::Path) -> (Arc<HostRegistry>, String) {
+            let registry = Arc::new(HostRegistry::open(path).unwrap());
+            registry
+                .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                    plugin_id: "com.megle.onedrive",
+                    version: "1.0.0",
+                    manifest_json: r#"{"manifestVersion":2}"#,
+                    entry_relative_path: "bin/provider",
+                    entry_sha256: &[7; 32],
+                    install_root: std::path::Path::new("bundled"),
+                    trust_policy_id: "test",
+                    requested_permissions_json: "[]",
+                })
+                .unwrap();
+            registry
+                .upsert_plugin_account(
+                    "onedrive-account",
+                    "com.megle.onedrive",
+                    Some("OneDrive"),
+                    "authenticated",
+                )
+                .unwrap();
+            registry
+                .set_plugin_intent("com.megle.onedrive", true, true)
+                .unwrap();
+            registry
+                .record_plugin_runtime_ready(
+                    "com.megle.onedrive",
+                    "session",
+                    &["sync-provider.v1".into()],
+                )
+                .unwrap();
+            let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
+            (registry, fingerprint)
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "megle-pending-secret-creations-{}.sqlite",
+            uuid::Uuid::now_v7()
+        ));
+        let (registry, fingerprint) = ready_registry(&path);
+        let scope = SecretScope {
+            plugin_id: "com.megle.onedrive".into(),
+            account_uuid: "onedrive-account".into(),
+            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
+            purpose: "upload-session-v1".into(),
+        };
+        let before_create_ref = crate::plugins::secret_store::allocate_secret_ref(&scope).unwrap();
+        assert!(registry
+            .reserve_plugin_secret_handle_for_launch(
+                &scope.plugin_id,
+                &scope.account_uuid,
+                &fingerprint,
+                &before_create_ref,
+                &scope.namespace,
+                &scope.purpose,
+            )
+            .unwrap());
+
+        let after_create_ref = crate::plugins::secret_store::allocate_secret_ref(&scope).unwrap();
+        assert!(registry
+            .reserve_plugin_secret_handle_for_launch(
+                &scope.plugin_id,
+                &scope.account_uuid,
+                &fingerprint,
+                &after_create_ref,
+                &scope.namespace,
+                &scope.purpose,
+            )
+            .unwrap());
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
+        store
+            .create_with_ref(&scope, &after_create_ref, b"upload capability")
+            .unwrap();
+        drop(registry);
+
+        let registry = Arc::new(HostRegistry::open(&path).unwrap());
+        assert_eq!(registry.due_credential_retirements(10).unwrap().len(), 2);
+        assert_eq!(
+            reconcile_credential_retirements(&registry, &store, None, None).unwrap(),
+            2
+        );
+        assert_eq!(
+            store.read(&scope, &after_create_ref),
+            Err(SecretStoreError::NotFound)
+        );
+        assert!(registry.due_credential_retirements(10).unwrap().is_empty());
+
+        drop(registry);
+        let deleted_path = std::env::temp_dir().join(format!(
+            "megle-retirement-after-delete-{}.sqlite",
+            uuid::Uuid::now_v7()
+        ));
+        let (registry, fingerprint) = ready_registry(&deleted_path);
+        let deleted_ref = store.create(&scope, b"already deleted").unwrap();
+        assert!(registry
+            .register_plugin_secret_handle_for_launch(
+                &scope.plugin_id,
+                &scope.account_uuid,
+                &fingerprint,
+                &deleted_ref,
+                &scope.namespace,
+                &scope.purpose,
+            )
+            .unwrap());
+        let oauth_scope = SecretScope {
+            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+            ..scope.clone()
+        };
+        let oauth_ref = store.create(&oauth_scope, b"oauth credential").unwrap();
+        registry
+            .set_plugin_account_secret("com.megle.onedrive", Some(&oauth_ref), "authenticated", 1)
+            .unwrap();
+        registry
+            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .unwrap();
+        assert_eq!(registry.due_credential_retirements(10).unwrap().len(), 2);
+        store.delete(&scope, &deleted_ref).unwrap();
+        assert_eq!(
+            reconcile_credential_retirements(&registry, &store, None, None).unwrap(),
+            2
+        );
+        drop(registry);
+        let reopened = HostRegistry::open(&deleted_path).unwrap();
+        assert!(reopened.due_credential_retirements(10).unwrap().is_empty());
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(deleted_path);
     }
 }
 

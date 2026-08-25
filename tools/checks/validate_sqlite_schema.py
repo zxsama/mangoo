@@ -16,6 +16,7 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0008_plugin_credential_retirement.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0009_plugin_auth_cancellation.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0010_plugin_secret_handles.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0011_plugin_secret_creations.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -594,6 +595,7 @@ def main() -> None:
             "plugin_credential_retirements",
             "plugin_auth_flow_ownership",
             "plugin_secret_handles",
+            "plugin_secret_creations",
         "sync_orchestration_operations",
         "sync_preflight_tokens",
             "sync_unbind_plans",
@@ -607,7 +609,7 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (10, None, 0, "stopped"):
+        if meta != (11, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         auth_flow_columns = {
             row[1]
@@ -615,6 +617,19 @@ def main() -> None:
         }
         if not {"state", "prior_secret_ref", "prior_stable_account_identity"}.issubset(auth_flow_columns):
             fail("plugin_auth_flow_ownership is missing cancellation-fence columns")
+        secret_creation_columns = {
+            row[1]
+            for row in host_conn.execute("PRAGMA table_info(plugin_secret_creations)")
+        }
+        if not {
+            "plugin_id",
+            "account_uuid",
+            "secret_ref",
+            "namespace",
+            "purpose",
+            "launch_fingerprint",
+        }.issubset(secret_creation_columns):
+            fail("plugin_secret_creations is missing durable creation metadata")
         binding_cursor_columns = {
             row[1]
             for row in host_conn.execute(

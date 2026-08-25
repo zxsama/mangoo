@@ -76,7 +76,17 @@ impl std::fmt::Display for SecretStoreError {
 impl std::error::Error for SecretStoreError {}
 
 pub trait SecretStore: Send + Sync {
-    fn create(&self, scope: &SecretScope, value: &[u8]) -> Result<String, SecretStoreError>;
+    fn create(&self, scope: &SecretScope, value: &[u8]) -> Result<String, SecretStoreError> {
+        let opaque_ref = allocate_secret_ref(scope)?;
+        self.create_with_ref(scope, &opaque_ref, value)?;
+        Ok(opaque_ref)
+    }
+    fn create_with_ref(
+        &self,
+        scope: &SecretScope,
+        opaque_ref: &str,
+        value: &[u8],
+    ) -> Result<(), SecretStoreError>;
     fn read(&self, scope: &SecretScope, opaque_ref: &str) -> Result<SecretValue, SecretStoreError>;
     fn compare_and_swap(
         &self,
@@ -86,6 +96,26 @@ pub trait SecretStore: Send + Sync {
         value: &[u8],
     ) -> Result<u64, SecretStoreError>;
     fn delete(&self, scope: &SecretScope, opaque_ref: &str) -> Result<(), SecretStoreError>;
+}
+
+pub fn allocate_secret_ref(scope: &SecretScope) -> Result<String, SecretStoreError> {
+    scope
+        .validate()
+        .map_err(|_| SecretStoreError::ScopeDenied)?;
+    let mut random = [0u8; 16];
+    OsRng.fill_bytes(&mut random);
+    Ok(format!("sec_{}", hex(&random)))
+}
+
+fn validate_secret_ref(opaque_ref: &str) -> Result<(), SecretStoreError> {
+    if opaque_ref.starts_with("sec_")
+        && opaque_ref.len() == 36
+        && opaque_ref[4..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        Ok(())
+    } else {
+        Err(SecretStoreError::NotFound)
+    }
 }
 
 pub fn platform_secret_store() -> Result<std::sync::Arc<dyn SecretStore>, SecretStoreError> {
@@ -112,25 +142,36 @@ pub struct MemorySecretStore {
 }
 
 impl SecretStore for MemorySecretStore {
-    fn create(&self, scope: &SecretScope, value: &[u8]) -> Result<String, SecretStoreError> {
+    fn create_with_ref(
+        &self,
+        scope: &SecretScope,
+        opaque_ref: &str,
+        value: &[u8],
+    ) -> Result<(), SecretStoreError> {
         scope
             .validate()
             .map_err(|_| SecretStoreError::ScopeDenied)?;
-        let opaque_ref = format!("mem_{}", uuid::Uuid::now_v7().simple());
-        self.records
+        validate_secret_ref(opaque_ref)?;
+        let mut records = self
+            .records
             .lock()
-            .map_err(|e| SecretStoreError::Storage(e.to_string()))?
-            .insert(
-                opaque_ref.clone(),
-                (
-                    scope.clone(),
-                    SecretValue {
-                        bytes: value.to_vec(),
-                        generation: 1,
-                    },
-                ),
-            );
-        Ok(opaque_ref)
+            .map_err(|e| SecretStoreError::Storage(e.to_string()))?;
+        if records.contains_key(opaque_ref) {
+            return Err(SecretStoreError::Storage(
+                "secret reference collision".into(),
+            ));
+        }
+        records.insert(
+            opaque_ref.to_string(),
+            (
+                scope.clone(),
+                SecretValue {
+                    bytes: value.to_vec(),
+                    generation: 1,
+                },
+            ),
+        );
+        Ok(())
     }
 
     fn read(&self, scope: &SecretScope, opaque_ref: &str) -> Result<SecretValue, SecretStoreError> {
@@ -262,12 +303,7 @@ impl EncryptedFileSecretStore {
     }
 
     fn path(&self, opaque_ref: &str) -> Result<PathBuf, SecretStoreError> {
-        if !opaque_ref.starts_with("sec_")
-            || opaque_ref.len() != 36
-            || !opaque_ref[4..].bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(SecretStoreError::NotFound);
-        }
+        validate_secret_ref(opaque_ref)?;
         Ok(self.directory.join(format!("{opaque_ref}.json")))
     }
 
@@ -376,7 +412,12 @@ impl EncryptedFileSecretStore {
 }
 
 impl SecretStore for EncryptedFileSecretStore {
-    fn create(&self, scope: &SecretScope, value: &[u8]) -> Result<String, SecretStoreError> {
+    fn create_with_ref(
+        &self,
+        scope: &SecretScope,
+        opaque_ref: &str,
+        value: &[u8],
+    ) -> Result<(), SecretStoreError> {
         let _guard = self
             .operation_lock
             .lock()
@@ -384,11 +425,17 @@ impl SecretStore for EncryptedFileSecretStore {
         scope
             .validate()
             .map_err(|_| SecretStoreError::ScopeDenied)?;
-        let mut random = [0u8; 16];
-        OsRng.fill_bytes(&mut random);
-        let opaque_ref = format!("sec_{}", hex(&random));
-        self.save(scope, &opaque_ref, 1, value)?;
-        Ok(opaque_ref)
+        validate_secret_ref(opaque_ref)?;
+        match self.load(scope, opaque_ref) {
+            Err(SecretStoreError::NotFound) => {}
+            Ok(_) => {
+                return Err(SecretStoreError::Storage(
+                    "secret reference collision".into(),
+                ))
+            }
+            Err(error) => return Err(error),
+        }
+        self.save(scope, opaque_ref, 1, value)
     }
     fn read(&self, scope: &SecretScope, opaque_ref: &str) -> Result<SecretValue, SecretStoreError> {
         let _guard = self
@@ -562,7 +609,12 @@ impl WindowsCredentialSecretStore {
 
 #[cfg(windows)]
 impl SecretStore for WindowsCredentialSecretStore {
-    fn create(&self, scope: &SecretScope, value: &[u8]) -> Result<String, SecretStoreError> {
+    fn create_with_ref(
+        &self,
+        scope: &SecretScope,
+        opaque_ref: &str,
+        value: &[u8],
+    ) -> Result<(), SecretStoreError> {
         let _guard = self
             .operation_lock
             .lock()
@@ -570,16 +622,25 @@ impl SecretStore for WindowsCredentialSecretStore {
         scope
             .validate()
             .map_err(|_| SecretStoreError::ScopeDenied)?;
-        let opaque_ref = format!("sec_{}", uuid::Uuid::now_v7().simple());
+        validate_secret_ref(opaque_ref)?;
+        match self.read_record(scope, opaque_ref) {
+            Err(SecretStoreError::NotFound) => {}
+            Ok(_) => {
+                return Err(SecretStoreError::Storage(
+                    "secret reference collision".into(),
+                ))
+            }
+            Err(error) => return Err(error),
+        }
         self.write_record(
             scope,
-            &opaque_ref,
+            opaque_ref,
             &SecretValue {
                 bytes: value.to_vec(),
                 generation: 1,
             },
         )?;
-        Ok(opaque_ref)
+        Ok(())
     }
     fn read(&self, scope: &SecretScope, opaque_ref: &str) -> Result<SecretValue, SecretStoreError> {
         let _guard = self
@@ -619,16 +680,22 @@ impl SecretStore for WindowsCredentialSecretStore {
         Ok(next)
     }
     fn delete(&self, scope: &SecretScope, opaque_ref: &str) -> Result<(), SecretStoreError> {
-        use windows_sys::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC};
+        use windows_sys::Win32::{
+            Foundation::ERROR_NOT_FOUND,
+            Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC},
+        };
         let _guard = self
             .operation_lock
             .lock()
             .map_err(|e| SecretStoreError::Storage(e.to_string()))?;
         let target = Self::target(scope, opaque_ref)?;
         if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0 {
-            return Err(SecretStoreError::Storage(
-                std::io::Error::last_os_error().to_string(),
-            ));
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+                Err(SecretStoreError::NotFound)
+            } else {
+                Err(SecretStoreError::Storage(error.to_string()))
+            };
         }
         Ok(())
     }
@@ -673,6 +740,10 @@ mod tests {
         assert_eq!(store.read(&a, &reference).unwrap().bytes, b"second");
         store.delete(&a, &reference).unwrap();
         assert_eq!(store.read(&a, &reference), Err(SecretStoreError::NotFound));
+        assert_eq!(
+            store.delete(&a, &reference),
+            Err(SecretStoreError::NotFound)
+        );
     }
     #[test]
     fn memory_backend_conforms() {
@@ -697,5 +768,18 @@ mod tests {
         let stored = std::fs::read(store.path(&reference).unwrap()).unwrap();
         assert!(!stored.windows(19).any(|w| w == b"token-not-plaintext"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backend_reports_not_found_after_delete() {
+        let store = WindowsCredentialSecretStore::default();
+        let scope = scope(&format!("account-{}", uuid::Uuid::now_v7().simple()));
+        let reference = store.create(&scope, b"credential").unwrap();
+        store.delete(&scope, &reference).unwrap();
+        assert_eq!(
+            store.delete(&scope, &reference),
+            Err(SecretStoreError::NotFound)
+        );
     }
 }
