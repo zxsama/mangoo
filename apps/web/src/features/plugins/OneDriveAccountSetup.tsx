@@ -67,6 +67,8 @@ export function OneDriveAccountSetupContent({ affectedLibraries = 0, compact = f
         <div className="onedrive-config-summary">
           <span>应用配置：{configurationSourceLabel(auth.configuration.source)}</span>
           {auth.configuration.errorCode ? <small role="alert">{auth.configuration.errorCode}</small> : null}
+          {!auth.configuration.configured && auth.configuration.readOnly ? <small>请为部署设置有效的 MEGLE_ONEDRIVE_CLIENT_ID，然后重启 Megle；环境配置不能在界面中覆盖。</small> : null}
+          {!auth.configuration.configured && !auth.configuration.readOnly ? <small>打开高级配置，填写 Microsoft Entra 应用的 Client ID；不需要 client secret。</small> : null}
           {!auth.configuration.readOnly ? (
             <button data-interactive-pointer-target="true" disabled={auth.busy} onClick={() => setEditingConfiguration((value) => !value)} type="button">
               {editingConfiguration ? "收起高级配置" : "高级配置"}

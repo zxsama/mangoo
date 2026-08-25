@@ -71,6 +71,8 @@ describe("OneDrive plugin auth presentation", () => {
     assert.doesNotMatch(controller, /localStorage|sessionStorage/);
     assert.match(setup, /manual-response-uri/);
     assert.match(setup, /完整 response URI/);
+    assert.match(setup, /MEGLE_ONEDRIVE_CLIENT_ID/);
+    assert.match(setup, /不需要 client secret/);
     assert.match(setup, /openAuthorizationUrl/);
     assert.match(setup, /确认切换 OneDrive 账号/);
     assert.match(wizard, /authResumeRef/);
