@@ -6,6 +6,7 @@ import {
   accountKindLabel,
   configurationSourceLabel,
   formatAuthRemaining,
+  pluginAuthStateLabel,
   pluginAuthPrimaryAction,
 } from "../src/features/plugins/pluginAuthModel.ts";
 
@@ -59,6 +60,10 @@ describe("OneDrive plugin auth presentation", () => {
     assert.equal(configurationSourceLabel("environment"), "部署环境（只读）");
     assert.equal(configurationSourceLabel("bundled"), "Megle 内置应用配置");
     assert.equal(formatAuthRemaining(61_000, 0), "1:01");
+    assert.equal(pluginAuthStateLabel("signed-out"), "已退出");
+    assert.equal(pluginAuthStateLabel("authorization-required"), "需要授权");
+    assert.equal(pluginAuthStateLabel("expired"), "授权已过期");
+    assert.equal(pluginAuthStateLabel("error"), "授权失败");
   });
 
   it("keeps response URI transient and routes actions through the shared controller", () => {

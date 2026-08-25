@@ -32,6 +32,18 @@ export function accountKindLabel(kind: HostPluginProjection["accountKind"]): str
   return "OneDrive";
 }
 
+export function pluginAuthStateLabel(state: HostPluginProjection["authState"]): string {
+  switch (state) {
+    case "authenticated": return "已连接";
+    case "authorizing": return "正在授权";
+    case "authorization-required": return "需要授权";
+    case "expired": return "授权已过期";
+    case "error": return "授权失败";
+    case "signed-out": return "已退出";
+    default: return "未连接";
+  }
+}
+
 export function configurationSourceLabel(source: OneDriveConfiguration["source"]): string {
   switch (source) {
     case "environment": return "部署环境（只读）";

@@ -5,6 +5,7 @@ import {
   accountKindLabel,
   configurationSourceLabel,
   formatAuthRemaining,
+  pluginAuthStateLabel,
 } from "./pluginAuthModel";
 import { usePluginAuth } from "./usePluginAuth";
 import type { PluginAuthController } from "./usePluginAuth";
@@ -45,6 +46,7 @@ export function OneDriveAccountSetupContent({ affectedLibraries = 0, compact = f
 
   const accountLabel = auth.plugin?.accountDisplayName ?? "尚未连接账号";
   const accountKind = accountKindLabel(auth.plugin?.accountKind ?? null);
+  const authStateLabel = pluginAuthStateLabel(auth.plugin?.authState ?? null);
 
   async function submitConfiguration() {
     const normalized = clientId.trim();
@@ -56,10 +58,10 @@ export function OneDriveAccountSetupContent({ affectedLibraries = 0, compact = f
       <div className="onedrive-account-summary">
         <div>
           <strong>{accountLabel}</strong>
-          <span>{auth.plugin?.authState === "authenticated" ? accountKind : "OneDrive 尚未连接"}</span>
+          <span>{auth.plugin?.authState === "authenticated" ? accountKind : authStateLabel}</span>
         </div>
         <span className={`onedrive-auth-state ${auth.plugin?.authState ?? "signed-out"}`} role="status">
-          {auth.plugin?.authState === "authenticated" ? "已连接" : auth.plugin?.authState === "authorizing" ? "正在授权" : "未连接"}
+          {authStateLabel}
         </span>
       </div>
 
@@ -94,7 +96,7 @@ export function OneDriveAccountSetupContent({ affectedLibraries = 0, compact = f
           <span>{auth.configurationPlan.effectiveChanged ? `${auth.configurationPlan.affectedLibraries} 个资源库会被暂停并隔离旧账号会话。` : "提交不会退出账号或改变资源库状态。"}</span>
           <div>
             <button data-interactive-pointer-target="true" onClick={auth.clearConfigurationPlan} type="button">取消</button>
-            <LiquidGlassButton disabled={auth.busy} onClick={() => void auth.commitConfiguration(auth.configurationPlan?.requiresConfirmation ?? false).catch(() => undefined)} type="button">确认应用</LiquidGlassButton>
+            <LiquidGlassButton disabled={auth.busy} onClick={() => void auth.commitConfiguration(Boolean(auth.configurationPlan?.effectiveChanged && auth.configurationPlan.requiresConfirmation)).catch(() => undefined)} type="button">确认应用</LiquidGlassButton>
           </div>
         </div>
       ) : null}
@@ -108,7 +110,7 @@ export function OneDriveAccountSetupContent({ affectedLibraries = 0, compact = f
           <div className="onedrive-auth-actions">
             <button data-interactive-pointer-target="true" onClick={() => void auth.copyAuthorizationUrl()} type="button"><Clipboard aria-hidden="true" size={14} />复制授权链接</button>
             <button data-interactive-pointer-target="true" onClick={() => void auth.openAuthorizationUrl()} type="button"><ExternalLink aria-hidden="true" size={14} />重新打开</button>
-            <button data-interactive-pointer-target="true" disabled={auth.busy} onClick={() => { onCancelled?.(); void auth.cancel().catch(() => undefined); }} type="button"><X aria-hidden="true" size={14} />取消授权</button>
+            <button data-interactive-pointer-target="true" disabled={auth.busy} onClick={() => { void auth.cancel().then(() => onCancelled?.()).catch(() => undefined); }} type="button"><X aria-hidden="true" size={14} />取消授权</button>
           </div>
           {auth.flow.completionMode === "manual-response-uri" ? (
             <form className="onedrive-manual-completion" onSubmit={(event) => { event.preventDefault(); void auth.complete().catch(() => undefined); }}>
@@ -145,7 +147,7 @@ export function OneDriveAccountSetupContent({ affectedLibraries = 0, compact = f
           <span>此操作会退出当前账号。{affectedLibraries > 0 ? `${affectedLibraries} 个同步资源库将被暂停并隔离旧会话。` : "当前没有已绑定资源库。"}{confirmation === "switch" ? "随后会立即开始新的授权。" : ""}</span>
           <div>
             <button data-interactive-pointer-target="true" onClick={() => setConfirmation(null)} type="button">取消</button>
-            <LiquidGlassButton onClick={() => { const action = confirmation; setConfirmation(null); if (action === "switch") void Promise.resolve(onBeforeBegin?.()).then(() => auth.begin(true)).catch(() => undefined); else void auth.signOut().catch(() => undefined); }} type="button">
+            <LiquidGlassButton onClick={() => { const action = confirmation; setConfirmation(null); if (action === "switch") void Promise.resolve(onBeforeBegin?.()).then(() => auth.begin(true)).catch(() => onCancelled?.()); else void auth.signOut().catch(() => undefined); }} type="button">
               {confirmation === "switch" ? "暂停并切换" : "暂停并退出"}
             </LiquidGlassButton>
           </div>

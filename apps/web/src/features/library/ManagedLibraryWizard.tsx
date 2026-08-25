@@ -69,6 +69,7 @@ export function ManagedLibraryWizard({
     mode: "create" | "restore";
     selectedRemoteIds: string[];
   } | null>(null);
+  const [authResumePending, setAuthResumePending] = useState(false);
   const previousAuthStateRef = useRef(auth.plugin?.authState);
   const queryClient = useQueryClient();
 
@@ -80,6 +81,7 @@ export function ManagedLibraryWizard({
     setRestoreItems(null);
     setRestorePlans([]);
     authResumeRef.current = null;
+    setAuthResumePending(false);
   }, [initialMode, open]);
 
   async function prepareAuthResume() {
@@ -89,11 +91,13 @@ export function ManagedLibraryWizard({
       mode,
       selectedRemoteIds: [...selectedRemoteIds],
     };
+    setAuthResumePending(true);
   }
 
   async function resumeAfterAuthentication() {
     const intent = authResumeRef.current;
     authResumeRef.current = null;
+    setAuthResumePending(false);
     if (!intent || !open || intent.mode !== mode) return;
     const active = await createCoreClient().getActiveLibrary();
     if (active.contextRevision !== intent.contextRevision) {
@@ -121,6 +125,37 @@ export function ManagedLibraryWizard({
       void resumeAfterAuthentication();
     }
   }, [auth.plugin?.authState]);
+
+  useEffect(() => {
+    if (!authResumePending) return;
+    const state = auth.plugin?.authState;
+    if (!auth.plugin || state === "error" || state === "expired") {
+      authResumeRef.current = null;
+      setAuthResumePending(false);
+    }
+  }, [auth.plugin, auth.plugin?.authState, authResumePending]);
+
+  useEffect(() => {
+    if (!authResumePending || !open) return;
+    let disposed = false;
+    const verifyContext = async () => {
+      const intent = authResumeRef.current;
+      if (!intent) return;
+      try {
+        const active = await createCoreClient().getActiveLibrary({ requestPriority: "background" });
+        if (!disposed && active.contextRevision !== intent.contextRevision) {
+          authResumeRef.current = null;
+          setAuthResumePending(false);
+          setError("资源库上下文已变化，请重新选择同步或恢复目标。");
+        }
+      } catch {
+        // A transient context read must not destroy an otherwise recoverable intent.
+      }
+    };
+    const timer = window.setInterval(() => void verifyContext(), 1_000);
+    void verifyContext();
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [authResumePending, open]);
 
   useEffect(() => {
     if (!open || mode !== "restore" || auth.plugin?.authState !== "authenticated") return;
@@ -313,8 +348,8 @@ export function ManagedLibraryWizard({
         titleId="managed-library-wizard-title"
       />
       <div aria-label="资源库来源" className="managed-library-mode" role="tablist">
-        <button aria-selected={mode === "create"} data-selected={mode === "create"} onClick={() => { authResumeRef.current = null; setMode("create"); setRestorePreflight(null); setRestoreItems(null); }} role="tab" type="button">新建本机资源库</button>
-        <button aria-selected={mode === "restore"} data-selected={mode === "restore"} onClick={() => { authResumeRef.current = null; setMode("restore"); setRestorePreflight(null); setRestoreItems(null); }} ref={restoreModeRef} role="tab" type="button">从 OneDrive 恢复</button>
+        <button aria-selected={mode === "create"} data-selected={mode === "create"} onClick={() => { authResumeRef.current = null; setAuthResumePending(false); setMode("create"); setRestorePreflight(null); setRestoreItems(null); }} role="tab" type="button">新建本机资源库</button>
+        <button aria-selected={mode === "restore"} data-selected={mode === "restore"} onClick={() => { authResumeRef.current = null; setAuthResumePending(false); setMode("restore"); setRestorePreflight(null); setRestoreItems(null); }} ref={restoreModeRef} role="tab" type="button">从 OneDrive 恢复</button>
       </div>
       {auth.plugin?.authState !== "authenticated" && (mode === "restore" || enableSync) ? (
         <div className="managed-library-auth-required">
@@ -323,7 +358,7 @@ export function ManagedLibraryWizard({
             compact
             controller={auth}
             onBeforeBegin={prepareAuthResume}
-            onCancelled={() => { authResumeRef.current = null; }}
+            onCancelled={() => { authResumeRef.current = null; setAuthResumePending(false); }}
           />
         </div>
       ) : null}

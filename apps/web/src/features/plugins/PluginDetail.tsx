@@ -117,12 +117,12 @@ export function PluginDetail({
       ) : null}
 
       <div className="plugin-detail-actions">
-        {plugin.permissionRequired ? (
+        {plugin.pluginId !== ONEDRIVE_PLUGIN_ID && plugin.permissionRequired ? (
           <button className="plugins-rescan" onClick={onApprovePermissions} type="button" disabled={busy}>
             Approve requested permissions
           </button>
         ) : null}
-        {plugin.runtimeState === "crashed-backoff" || plugin.runtimeState === "degraded" ? (
+        {plugin.pluginId !== ONEDRIVE_PLUGIN_ID && (plugin.runtimeState === "crashed-backoff" || plugin.runtimeState === "degraded") ? (
           <button className="plugins-rescan" onClick={onRetry} type="button" disabled={busy}>
             Retry provider
           </button>

@@ -52,11 +52,13 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
 
   useEffect(() => {
     if (!flow) return;
-    if (plugin?.authState === "authenticated" || plugin?.authState === "error" || plugin?.authState === "expired") {
+    if (!plugin || plugin.authState === "authenticated" || plugin.authState === "error" || plugin.authState === "expired") {
       setFlow(null);
       setResponseUri("");
     }
   }, [flow, plugin?.authState]);
+
+  useEffect(() => () => setResponseUri(""), []);
 
   const invalidate = useCallback(async () => {
     await Promise.all([
@@ -94,13 +96,17 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
     setActionError(null);
     setResponseUri("");
     try {
-      if (switchAccount) await client.signOutPlugin(pluginId);
+      if (switchAccount) {
+        await client.signOutPlugin(pluginId);
+        await invalidate();
+      }
       const nextFlow = await client.beginPluginAuth(pluginId);
       setFlow(nextFlow);
       const desktopResult = await openExternalAuthorizationUrl(nextFlow.authorizationUrl);
       if (desktopResult && !desktopResult.ok) {
         await client.cancelPluginAuth(pluginId, { flowId: nextFlow.flowId }).catch(() => undefined);
         setFlow(null);
+        await invalidate();
         throw new Error(desktopResult.error === "external_browser_rejected" ? "授权地址未通过安全校验。" : "无法打开系统浏览器。");
       }
       if (!desktopResult && !window.open(nextFlow.authorizationUrl, "_blank", "noopener,noreferrer")) {
@@ -109,6 +115,7 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
       await invalidate();
     } catch (cause) {
       setActionError(errorMessage(cause));
+      await invalidate().catch(() => undefined);
       throw cause;
     } finally {
       setDirectBusy(false);
@@ -142,9 +149,11 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
 
   const cancel = useCallback(async () => {
     const active = flow;
-    setFlow(null);
     setResponseUri("");
-    if (active) await run.mutateAsync(() => client.cancelPluginAuth(pluginId, { flowId: active.flowId }));
+    if (active) {
+      await run.mutateAsync(() => client.cancelPluginAuth(pluginId, { flowId: active.flowId }));
+      setFlow((current) => current?.flowId === active.flowId ? null : current);
+    }
     await invalidate();
   }, [client, flow, invalidate, pluginId, run]);
 
