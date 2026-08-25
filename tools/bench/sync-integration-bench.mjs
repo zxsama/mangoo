@@ -176,7 +176,9 @@ if (performanceSample) {
 rows.push(await runCommand({
   name: "build-bundled-providers-release",
   command: "node",
-  args: ["tools/build/build-bundled-plugins.mjs", "--release"],
+  // This benchmark needs optimized Provider binaries, not a publishable Core
+  // artifact. Publisher Client ID validation remains an independent release row.
+  args: ["tools/build/build-bundled-plugins.mjs", "--release-profile"],
   runDirectory,
   timeoutMs: 30 * 60 * 1000,
 }));
