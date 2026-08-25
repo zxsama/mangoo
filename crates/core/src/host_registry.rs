@@ -1146,13 +1146,26 @@ impl HostRegistry {
     }
 
     pub fn complete_credential_retirement(&self, retirement_uuid: &str) -> anyhow::Result<()> {
-        self.connection
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .execute(
-                "DELETE FROM plugin_credential_retirements WHERE retirement_uuid=?1",
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let plugin_id: Option<String> = transaction
+            .query_row(
+                "SELECT plugin_id FROM plugin_credential_retirements WHERE retirement_uuid=?1",
                 [retirement_uuid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        transaction.execute(
+            "DELETE FROM plugin_credential_retirements WHERE retirement_uuid=?1",
+            [retirement_uuid],
+        )?;
+        if let Some(plugin_id) = plugin_id {
+            transaction.execute(
+                "UPDATE plugin_runtime_state SET state='starting',last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2 AND state='degraded' AND last_error_code='credential-retirement-pending' AND NOT EXISTS(SELECT 1 FROM plugin_credential_retirements q WHERE q.plugin_id=?2)",
+                params![unix_timestamp_millis(), plugin_id],
             )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
