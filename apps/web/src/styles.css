@@ -397,6 +397,8 @@ body {
 [data-interactive-pointer-target="true"]::after {
   z-index: 0;
   padding: 1px;
+  border: 0;
+  box-shadow: none;
   background:
     radial-gradient(
       circle var(--glass-pointer-glow-radius) at var(--interactive-pointer-x, 50%) var(--interactive-pointer-y, 50%),

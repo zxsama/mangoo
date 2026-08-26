@@ -240,10 +240,13 @@ try {
   await act(async () => window.dispatchEvent(new MouseEvent("mousemove", { clientX: proximityX, clientY: proximityY })));
   await delay(30);
   await waitFor(() => card.getAttribute("data-interactive-pointer-target") === "true");
+  const proximityEdgeStyle = getComputedStyle(card, "::after");
   const proximity = {
     activeOutsideBounds: !cardBody.matches(":hover"),
     opacityActive: card.style.getPropertyValue("--interactive-pointer-opacity").trim() === "1",
-    radialOutlinePresent: getComputedStyle(card, "::after").backgroundImage.includes("radial-gradient")
+    radialOutlinePresent: proximityEdgeStyle.backgroundImage.includes("radial-gradient"),
+    fullBorderAbsent: proximityEdgeStyle.borderTopWidth === "0px",
+    insetShadowAbsent: proximityEdgeStyle.boxShadow === "none"
   };
   await act(async () => cardBody.click());
   await waitFor(() => presentationHost.querySelector(".plugin-card-body")?.getAttribute("aria-pressed") === "true");

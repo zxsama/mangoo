@@ -2854,14 +2854,19 @@ const interactivePointerEdgeBlocks = cssBlocksForExactSelector(
   stylesForChecks,
   '[data-interactive-pointer-target="true"]::after'
 );
-if (
-  !interactivePointerEdgeBlocks.some(
-    (block) =>
-      block.includes("--interactive-pointer-x") &&
-      block.includes("--interactive-pointer-y")
-  )
-) {
+const interactivePointerRadialEdgeBlock = interactivePointerEdgeBlocks.find(
+  (block) =>
+    block.includes("--interactive-pointer-x") &&
+    block.includes("--interactive-pointer-y") &&
+    block.includes("--glass-pointer-border-stops")
+);
+if (!interactivePointerRadialEdgeBlock) {
   fail("interactive pointer edge highlights must use the same real cursor coordinates as the background glow");
+} else if (
+  latestDeclarationValue(interactivePointerRadialEdgeBlock, "border") !== "0" ||
+  latestDeclarationValue(interactivePointerRadialEdgeBlock, "box-shadow") !== "none"
+) {
+  fail("interactive pointer radial edge highlights must not reveal a uniform full-control border or inset shadow");
 }
 
 for (const [token, minValue] of [
