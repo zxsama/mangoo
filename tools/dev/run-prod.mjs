@@ -92,16 +92,26 @@ const HASH_INPUTS = [
   "apps/desktop/src",
   "crates/core/src",
   "crates/core/migrations",
+  "crates/core/host_migrations",
+  "crates/fake-provider/src",
+  "crates/onedrive-provider/src",
+  "bundled-plugins",
   "packages/core-client/src"
 ];
 const HASH_FILES = [
   "Cargo.toml",
+  "Cargo.lock",
   "crates/core/Cargo.toml",
+  "crates/fake-provider/Cargo.toml",
+  "crates/onedrive-provider/Cargo.toml",
   "apps/web/vite.config.ts",
   "apps/web/package.json",
   "apps/desktop/package.json",
   "package.json"
 ];
+const HASH_EXCLUDED_FILES = new Set([
+  path.normalize("crates/core/src/plugins/runtime/generated_trust.rs")
+]);
 
 function hashInputs() {
   const hash = crypto.createHash("sha256");
@@ -111,6 +121,8 @@ function hashInputs() {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
       else {
+        const relative = path.normalize(path.relative(root, full));
+        if (HASH_EXCLUDED_FILES.has(relative)) continue;
         hash.update(full);
         hash.update(fs.readFileSync(full));
       }
@@ -129,10 +141,15 @@ function hashInputs() {
 
 function outputsExist() {
   const coreExe = process.platform === "win32" ? "megle-core.exe" : "megle-core";
+  const providerExe = (packageName) => process.platform === "win32" ? `${packageName}.exe` : packageName;
   return (
     fs.existsSync(path.join(root, "apps", "web", "dist", "index.html")) &&
     fs.existsSync(path.join(root, "apps", "desktop", "dist", "main.js")) &&
-    fs.existsSync(path.join(root, "target", "release", coreExe))
+    fs.existsSync(path.join(root, "target", "release", coreExe)) &&
+    fs.existsSync(path.join(root, "target", "release", "bundled-plugins", "com.megle.fake-sync", "plugin.json")) &&
+    fs.existsSync(path.join(root, "target", "release", "bundled-plugins", "com.megle.fake-sync", "bin", providerExe("megle-fake-provider"))) &&
+    fs.existsSync(path.join(root, "target", "release", "bundled-plugins", "com.megle.onedrive", "plugin.json")) &&
+    fs.existsSync(path.join(root, "target", "release", "bundled-plugins", "com.megle.onedrive", "bin", providerExe("megle-onedrive-provider")))
   );
 }
 
@@ -178,7 +195,10 @@ if (upToDate) {
   // Build order: Core (slowest, release) can run while we build the JS, but keep
   // it simple and sequential for clear output. Each tool skips its own unchanged
   // work internally, so a partial change is still fast.
-  run("node", ["tools/build/build-bundled-plugins.mjs", "--release"], "build bundled Providers");
+  // A local product-mode launch needs optimized artifacts, but it is not an
+  // official release packaging operation. The latter intentionally requires a
+  // publisher-owned OneDrive client ID and remains available through --release.
+  run("node", ["tools/build/build-bundled-plugins.mjs", "--release-profile"], "build bundled Providers");
   run(findCargoCommand(), ["build", "--release", "-p", "megle-core"], "build core (release)");
   run("npm", ["--workspace", "@megle/web", "run", "build"], "build web");
   run("npm", ["--workspace", "@megle/desktop", "run", "build"], "build desktop");

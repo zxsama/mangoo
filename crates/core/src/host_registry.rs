@@ -1756,7 +1756,10 @@ impl HostRegistry {
             .as_ref()
             .is_none_or(|(selected_version, _)| selected_version == plugin.version);
         if let Some((selected_version, install_root)) = &existing {
-            if Path::new(install_root) != plugin.install_root {
+            let install_root_changed = Path::new(install_root) != plugin.install_root;
+            if install_root_changed
+                && (plugin.trust_policy_id != "embedded-v1" || selected_version != plugin.version)
+            {
                 anyhow::bail!("plugin-install-root-changed");
             }
             if selected_version != plugin.version {
@@ -1777,8 +1780,8 @@ impl HostRegistry {
             )?;
         } else if is_selected {
             transaction.execute(
-                "UPDATE plugin_installations SET manifest_version=2,trust_policy_id=?1,requested_permissions_json=?2,updated_at=?3 WHERE plugin_id=?4",
-                params![plugin.trust_policy_id,plugin.requested_permissions_json,now,plugin.plugin_id],
+                "UPDATE plugin_installations SET manifest_version=2,install_root=?1,trust_policy_id=?2,requested_permissions_json=?3,updated_at=?4 WHERE plugin_id=?5",
+                params![plugin.install_root.to_string_lossy(),plugin.trust_policy_id,plugin.requested_permissions_json,now,plugin.plugin_id],
             )?;
         }
         transaction.execute(
@@ -5181,6 +5184,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "candidate");
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rediscovery_of_selected_embedded_plugin_updates_install_root() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let release_root = Path::new(r"D:\Megle\target\release\bundled-plugins\com.megle.onedrive");
+        let debug_root = Path::new(r"D:\Megle\target\debug\bundled-plugins\com.megle.onedrive");
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.onedrive",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: release_root,
+                trust_policy_id: "embedded-v1",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.onedrive",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[8; 32],
+                install_root: debug_root,
+                trust_policy_id: "embedded-v1",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+
+        let stored_root: String = registry
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT install_root FROM plugin_installations WHERE plugin_id='com.megle.onedrive'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(Path::new(&stored_root), debug_root);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn non_embedded_plugin_cannot_change_install_root_on_rediscovery() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.test",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: Path::new("bundled-a"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+
+        let error = registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.test",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[8; 32],
+                install_root: Path::new("bundled-b"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "plugin-install-root-changed");
         drop(registry);
         let _ = std::fs::remove_file(path);
     }

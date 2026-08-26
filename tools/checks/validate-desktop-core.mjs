@@ -624,6 +624,21 @@ for (const value of ["MEGLE_CORE_EXTERNAL", "findCargoCommand", "cargo", "build"
 if (!/run\(\s*findCargoCommand\(\)\s*,\s*\[\s*"build"\s*,\s*"-p"\s*,\s*"megle-core"\s*\]\s*\)/.test(devRunner)) {
   fail("dev runner must use cargo build -p megle-core instead of leaving Core build to Electron startup");
 }
+if (!/build-bundled-plugins\.mjs"\s*,\s*"--release-profile"/.test(prodRunner)) {
+  fail("local production runner must build optimized Providers without invoking formal release credential validation");
+}
+for (const value of [
+  "crates/fake-provider/src",
+  "crates/onedrive-provider/src",
+  "bundled-plugins",
+  "generated_trust.rs",
+  "com.megle.fake-sync",
+  "com.megle.onedrive"
+]) {
+  if (!prodRunner.includes(value)) {
+    fail(`production runner cache/output validation missing ${value}`);
+  }
+}
 
 // Core is started from exactly two call sites: the initial cold-start/retry
 // loop and the shared healthy-replacement helper used by target and recovery
