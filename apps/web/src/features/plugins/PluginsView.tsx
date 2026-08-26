@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import { AlertTriangle, Loader2, RefreshCw } from "lucide-react";
 import { MediaLoadingRing } from "../loading/MediaLoadingRing";
-import { LiquidGlassSurface } from "../../design/liquid-glass";
+import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import { PluginCard } from "./PluginCard";
 import { PluginDetail } from "./PluginDetail";
 import { usePluginsData } from "./usePluginsData";
@@ -37,9 +37,10 @@ export function PluginsView() {
                       invalidCount > 0 ? ` · ${invalidCount} invalid` : ""
                     }`}
               </div>
-              <button
-                className="plugins-rescan"
+              <LiquidGlassButton
+                className="plugins-rescan plugin-action"
                 onClick={() => void runDiscover()}
+                tone="control"
                 type="button"
                 disabled={discovering}
                 aria-label="Re-scan plugin folder"
@@ -50,7 +51,7 @@ export function PluginsView() {
                   <RefreshCw size={14} />
                 )}
                 <span>{discovering ? "Scanning…" : "Re-scan"}</span>
-              </button>
+              </LiquidGlassButton>
             </div>
 
             {plugins.error ? (

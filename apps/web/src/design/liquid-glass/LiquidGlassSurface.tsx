@@ -79,6 +79,7 @@ const INTERACTIVE_AFFORDANCE_OWNER_SELECTOR = [
   // move rows opt out via :not(.move-row-disabled).
   ".move-row:not(.move-row-disabled)",
   ".plugin-card",
+  ".plugin-disclosure-summary",
   ".settings-dialog-nav-item",
   ".settings-radio",
   // Glass BUTTONS (LiquidGlassButton renders data-liquid-glass="button"). They
@@ -313,6 +314,7 @@ export const LiquidGlassButton = forwardRef<HTMLButtonElement, LiquidGlassButton
         data-no-drag="true"
         data-glass-tone={tone}
         data-glass-variant={variant}
+        data-direct-contact-feedback="foreground"
         data-liquid-glass="button"
         ref={ref}
         style={withInitialPressure(style)}

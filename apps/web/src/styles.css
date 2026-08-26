@@ -505,8 +505,21 @@ body {
 }
 
 .liquid-glass-button {
+  min-height: 30px;
+  padding: 0 12px;
+  border: 0;
   overflow: hidden;
   border-radius: var(--radius-control);
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+
+.liquid-glass-button[data-glass-tone="primary"] {
+  color: #e1fbff;
+}
+
+.liquid-glass-button[data-glass-tone="danger"] {
+  color: #ffd9d5;
 }
 
 :where(button, [role="button"], input, select, textarea) {
@@ -531,6 +544,14 @@ body {
   /* Shape and edge illumination come from the unified cursor-centred pointer target. */
   color: #f8fdff;
   transform: translateY(-1px);
+}
+
+[data-direct-contact-feedback="foreground"]:hover:not(:active):not(:focus-visible):not(:disabled):not([aria-disabled="true"]) {
+  color: #f8fdff;
+}
+
+[data-direct-contact-feedback="foreground"]:hover:not(:active):not(:focus-visible):not(:disabled):not([aria-disabled="true"]) [data-direct-contact-content] {
+  color: #f8fdff;
 }
 
 :where(button, [role="button"]):active:not(:disabled) {
@@ -4420,15 +4441,11 @@ button:disabled {
   height: 30px;
   padding: 0 12px;
   color: var(--text-soft);
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: 7px;
   cursor: pointer;
 }
 
 .plugins-rescan:hover:not(:disabled) {
   color: #f4f7f9;
-  border-color: var(--line-strong);
 }
 
 .plugins-body {
@@ -4575,7 +4592,7 @@ button:disabled {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--surface-1);
-  transition: border-color 0.15s ease;
+  transition: color 0.15s ease;
 }
 
 .plugin-card.selected {
@@ -4635,16 +4652,6 @@ button:disabled {
   min-width: 0;
 }
 
-.plugin-card-error {
-  flex: 1;
-  min-width: 0;
-  color: #ffd2ce;
-  font-size: 11.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .plugin-card-actions {
   display: flex;
   align-items: center;
@@ -4692,7 +4699,7 @@ button:disabled {
 .plugin-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   cursor: pointer;
   user-select: none;
   font-size: 11.5px;
@@ -4723,7 +4730,7 @@ button:disabled {
   background: var(--surface-3);
   border: 1px solid var(--line);
   border-radius: 999px;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: opacity 0.15s ease;
 }
 
 .plugin-toggle-thumb {
@@ -4734,7 +4741,7 @@ button:disabled {
   height: 12px;
   background: var(--text-soft);
   border-radius: 50%;
-  transition: transform 0.15s ease, background 0.15s ease;
+  transition: transform 0.15s ease, background 0.15s ease, filter 0.15s ease;
 }
 
 .plugin-toggle.on .plugin-toggle-track {
@@ -4747,11 +4754,10 @@ button:disabled {
   background: #d6f0f3;
 }
 
-.plugin-toggle-label {
+.plugin-toggle-busy {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  min-width: 48px;
+  color: var(--text-muted);
 }
 
 .plugins-detail-pane {
@@ -4776,7 +4782,8 @@ button:disabled {
 
 .plugin-detail {
   display: grid;
-  gap: 16px;
+  align-content: start;
+  gap: 14px;
   min-width: 0;
 }
 
@@ -4815,14 +4822,6 @@ button:disabled {
   font-size: 12px;
 }
 
-.plugin-detail-id {
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-
 .plugin-detail-description {
   margin: 0;
   color: var(--text-soft);
@@ -4833,6 +4832,10 @@ button:disabled {
 .plugin-detail-section {
   display: grid;
   gap: 8px;
+}
+
+.plugin-detail-primary-section {
+  padding-top: 4px;
 }
 
 .plugin-detail-section-title {
@@ -4957,14 +4960,86 @@ button:disabled {
 
 .plugin-detail-actions {
   display: grid;
-  gap: 4px;
-  padding-top: 4px;
+  justify-items: start;
+  gap: 7px;
+  padding-top: 10px;
   border-top: 1px solid var(--line);
+}
+
+.plugin-primary-actions,
+.plugin-action-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.plugin-action {
+  width: auto;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 12px;
+  align-self: flex-start;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.plugin-action-danger {
+  color: #ffd9d5;
+}
+
+.plugin-disclosure {
+  min-width: 0;
+  border-top: 1px solid var(--line);
+}
+
+.plugin-disclosure-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 2px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+  list-style: none;
+  transition: color 140ms ease;
+}
+
+.plugin-disclosure-summary::-webkit-details-marker {
+  display: none;
+}
+
+.plugin-disclosure-summary:hover {
+  color: #f8fdff;
+}
+
+.plugin-disclosure-summary:focus-visible {
+  outline: 2px solid rgba(151, 219, 226, 0.72);
+  outline-offset: -4px;
+}
+
+.plugin-disclosure-chevron {
+  margin-left: auto;
+  color: currentColor;
+  transition: transform 140ms ease;
+}
+
+.plugin-disclosure[open] > .plugin-disclosure-summary .plugin-disclosure-chevron {
+  transform: rotate(90deg);
+}
+
+.plugin-disclosure-body {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 4px 2px 2px;
 }
 
 .onedrive-account-setup {
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 .onedrive-account-setup.compact {
@@ -4974,7 +5049,6 @@ button:disabled {
 }
 
 .onedrive-account-summary,
-.onedrive-config-summary,
 .onedrive-auth-flow > div:first-child,
 .onedrive-auth-actions,
 .onedrive-config-impact > div {
@@ -4985,12 +5059,11 @@ button:disabled {
 }
 
 .onedrive-account-summary,
-.onedrive-config-summary,
 .onedrive-auth-flow > div:first-child {
   justify-content: space-between;
 }
 
-.onedrive-account-summary > div,
+.onedrive-account-summary,
 .onedrive-auth-flow,
 .onedrive-config-editor,
 .onedrive-config-impact,
@@ -5001,7 +5074,6 @@ button:disabled {
 }
 
 .onedrive-account-summary span,
-.onedrive-config-summary,
 .onedrive-config-editor small,
 .onedrive-auth-flow small,
 .onedrive-config-impact span,
@@ -5010,15 +5082,13 @@ button:disabled {
   font-size: 12px;
 }
 
-.onedrive-auth-state {
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--surface-elevated, #222) 84%, transparent);
+.onedrive-account-summary strong {
+  color: var(--text-primary);
+  font-size: 15px;
 }
 
-.onedrive-auth-state.authenticated {
-  color: var(--success-text, #a7efc0);
-  background: color-mix(in srgb, var(--success-fill, #1f7a45) 34%, transparent);
+.onedrive-primary-actions {
+  min-height: 30px;
 }
 
 .onedrive-config-editor input,
@@ -5040,28 +5110,44 @@ button:disabled {
   background: color-mix(in srgb, var(--surface-elevated, #222) 78%, transparent);
 }
 
+.onedrive-advanced-configuration {
+  margin-top: 2px;
+}
+
+.onedrive-config-editor label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-soft);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.onedrive-config-editor input,
+.onedrive-manual-completion textarea {
+  min-height: 32px;
+  padding: 6px 9px;
+  color: var(--text-primary);
+  background: rgba(5, 9, 13, 0.48);
+  border: 1px solid var(--line);
+}
+
+.onedrive-advanced-copy,
+.onedrive-config-diagnostic,
+.onedrive-auth-pending-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.onedrive-config-diagnostic code {
+  color: #ffd2ce;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
 .managed-library-auth-required {
   display: grid;
   gap: 8px;
-}
-
-.plugin-delete-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  align-self: flex-start;
-  height: 30px;
-  padding: 0 12px;
-  color: #ffd2ce;
-  background: rgba(228, 124, 115, 0.16);
-  border: 1px solid rgba(228, 124, 115, 0.4);
-  border-radius: 7px;
-  cursor: pointer;
-  font-size: 12.5px;
-}
-
-.plugin-delete-button:hover:not(:disabled) {
-  background: rgba(228, 124, 115, 0.26);
 }
 
 .plugin-delete-hint {
@@ -5159,16 +5245,12 @@ button:disabled {
   padding: 0 18px;
   margin-top: 6px;
   color: #d6f0f3;
-  background: rgba(142, 199, 208, 0.18);
-  border: 1px solid rgba(142, 199, 208, 0.42);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: 8px;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-}
-
-.onboarding-hero-cta:hover {
-  background: rgba(142, 199, 208, 0.28);
 }
 
 .settings-body {
@@ -5693,7 +5775,6 @@ button:disabled {
 .root-form button[type="submit"],
 .load-more-button button,
 .plugins-rescan,
-.plugin-delete-button,
 .plugin-manifest-copy,
 .settings-action,
 .grid-empty-action,
@@ -5724,11 +5805,6 @@ button:disabled {
   border-color: rgba(151, 219, 226, 0.5);
 }
 
-.plugin-delete-button {
-  color: #ffd9d5;
-  border-color: rgba(239, 141, 127, 0.48);
-}
-
 .plugins-detail-pane,
 .settings-section,
 .plugin-card,
@@ -5743,10 +5819,8 @@ button:disabled {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 12px 34px rgba(0, 0, 0, 0.24);
 }
 
-.plugin-toggle:hover:not(.disabled) .plugin-toggle-track {
-  border-color: var(--line-strong);
-  background: rgba(151, 219, 226, 0.18);
-  transform: translateY(-1px);
+.plugin-toggle:hover:not(.disabled) .plugin-toggle-thumb {
+  filter: brightness(1.18);
 }
 
 .plugin-toggle input:focus-visible + .plugin-toggle-track {
@@ -5874,7 +5948,6 @@ button:disabled {
 .central-preview-control,
 .plugins-rescan,
 .plugin-manifest-copy,
-.plugin-delete-button,
 .window-chrome-button,
 .onboarding-hero-cta,
 .settings-action,

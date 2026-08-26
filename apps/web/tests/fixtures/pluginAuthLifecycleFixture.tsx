@@ -2,10 +2,28 @@ import { act, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { HostPluginProjection, OneDriveConfiguration } from "@megle/core-client";
+import { LiquidGlassLayer } from "../../src/design/liquid-glass";
 import { OneDriveAccountSetup, OneDriveAccountSetupContent } from "../../src/features/plugins/OneDriveAccountSetup";
+import { PluginCard } from "../../src/features/plugins/PluginCard";
+import { PluginDetail } from "../../src/features/plugins/PluginDetail";
 import type { PluginAuthController } from "../../src/features/plugins/usePluginAuth";
 import { ManagedLibraryWizard } from "../../src/features/library/ManagedLibraryWizard";
 import { OverlayProvider } from "../../src/design/overlays";
+import "../../src/styles.css";
+
+type NativeInputPayload =
+  | { type: "key"; keyCode: string; modifiers?: string[] }
+  | { type: "mouse-click" | "mouse-move"; x: number; y: number };
+type NativeInputRequest = NativeInputPayload & { id: number };
+
+declare global {
+  interface Window {
+    __overlayLifecycleInputRequest?: NativeInputRequest;
+    __overlayLifecycleInputResponseId?: number;
+  }
+}
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const pluginBase: HostPluginProjection = {
   pluginId: "com.megle.onedrive", selectedVersion: "2.0.0", knownGoodVersion: "2.0.0",
@@ -51,7 +69,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json({ accepted: true });
   }
   if (path.endsWith("/configuration/plan")) { planRequestCount += 1; const changed = planChanged; return json({ planUuid: "plan-1", expectedRevision: 1, effectiveChanged: changed, affectedLibraries: changed ? 2 : 0, requiresConfirmation: changed, expiresAt: Date.now() + 60_000 }); }
-  if (path.endsWith("/configuration") && init?.method === "PUT") { commitBody = JSON.parse(String(init.body)); configuration = { ...configuration, revision: 2, source: "host-override" }; return json(configuration); }
+  if (path.endsWith("/configuration") && init?.method === "PUT") { commitBody = JSON.parse(String(init.body)); configuration = { ...configuration, configured: true, errorCode: null, revision: 2, source: "host-override" }; return json(configuration); }
   if (path.endsWith("/libraries/active")) return json({ contextRevision: activeContextRevision, library: null });
   if (path.endsWith("/sync/remote-libraries")) { remoteLibraryCalls += 1; return json({ items: [], nextCursor: null }); }
   return json({ accepted: true });
@@ -62,7 +80,7 @@ window.open = () => ({ focus() {} }) as Window;
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } } });
 function Fixture() {
   const [mounted, setMounted] = useState(true);
-  return <QueryClientProvider client={queryClient}><button id="toggle" onClick={() => setMounted((value) => !value)}>toggle</button>{mounted ? <OneDriveAccountSetup /> : null}</QueryClientProvider>;
+  return <LiquidGlassLayer><QueryClientProvider client={queryClient}><button id="toggle" onClick={() => setMounted((value) => !value)}>toggle</button>{mounted ? <OneDriveAccountSetup /> : null}</QueryClientProvider></LiquidGlassLayer>;
 }
 
 function TransientInputFixture() {
@@ -80,17 +98,43 @@ function WizardFixture() {
   return <QueryClientProvider client={queryClient}><OverlayProvider><ManagedLibraryWizard initialMode="restore" onClose={() => {}} onCreated={() => {}} onFailure={() => {}} open /></OverlayProvider></QueryClientProvider>;
 }
 
+function PluginPresentationFixture({ initialPlugin }: { initialPlugin: HostPluginProjection }) {
+  const [selected, setSelected] = useState(false);
+  const [enabled, setEnabled] = useState(initialPlugin.enabledIntent);
+  const renderedPlugin = { ...initialPlugin, enabledIntent: enabled };
+  return (
+    <LiquidGlassLayer>
+      <PluginCard busy={false} onSelect={() => setSelected(true)} onToggleEnabled={() => setEnabled((value) => !value)} plugin={renderedPlugin} selected={selected} />
+      <PluginDetail busy={false} onApprovePermissions={() => {}} onRefresh={() => {}} onRemove={() => {}} onRetry={() => {}} plugin={renderedPlugin} />
+    </LiquidGlassLayer>
+  );
+}
+
 const root = createRoot(document.getElementById("root")!);
 await act(async () => root.render(<Fixture />));
 
 let stage = "initial render";
 const waitFor = async (predicate: () => boolean) => {
   const deadline = Date.now() + 4_000;
-  while (!predicate()) { if (Date.now() > deadline) throw new Error(`fixture wait timed out: ${stage}; ${document.body.textContent}`); await new Promise((resolve) => setTimeout(resolve, 20)); }
+  while (!predicate()) { if (Date.now() > deadline) throw new Error(`fixture wait timed out: ${stage}; active=${document.activeElement?.outerHTML}; ${document.body.textContent}`); await new Promise((resolve) => setTimeout(resolve, 20)); }
 };
 const button = (text: string) => [...document.querySelectorAll("button")].find((item) => item.textContent?.includes(text)) as HTMLButtonElement | undefined;
+const control = (text: string) => [...document.querySelectorAll("button, summary")].find((item) => item.textContent?.includes(text)) as HTMLElement | undefined;
 const click = async (text: string) => { const target = button(text); if (!target) throw new Error(`button not found: ${text}`); await act(async () => target.click()); };
+const clickControl = async (text: string) => { const target = control(text); if (!target) throw new Error(`control not found: ${text}`); await act(async () => target.click()); };
 const input = async (selector: string, value: string) => { const target = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement; const setter = Object.getOwnPropertyDescriptor(target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, "value")!.set!; await act(async () => { setter.call(target, value); target.dispatchEvent(new Event("input", { bubbles: true })); }); };
+const delay = (milliseconds = 0) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+let nativeInputRequestId = 0;
+const requestNativeInput = async (request: NativeInputPayload) => {
+  const id = ++nativeInputRequestId;
+  window.__overlayLifecycleInputRequest = { ...request, id } as NativeInputRequest;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    if (window.__overlayLifecycleInputResponseId === id) return;
+    await delay(10);
+  }
+  throw new Error(`Timed out waiting for native input response ${id}`);
+};
+const requestNativeKey = (keyCode: string) => requestNativeInput({ type: "key", keyCode });
 
 try {
   stage = "initial authenticated";
@@ -98,8 +142,8 @@ try {
   beginFails = true;
   stage = "switch failure";
   await click("切换账号"); await click("暂停并切换");
-  await waitFor(() => document.body.textContent?.includes("已退出") === true);
-  const switchFailure = { staleAccountHidden: !document.body.textContent?.includes("Old account"), signedOutVisible: document.body.textContent?.includes("已退出") === true };
+  await waitFor(() => document.body.textContent?.includes("尚未连接 OneDrive") === true);
+  const switchFailure = { staleAccountHidden: !document.body.textContent?.includes("Old account"), signedOutVisible: document.body.textContent?.includes("尚未连接 OneDrive") === true };
 
   beginFails = false; cancelFails = true;
   stage = "begin manual";
@@ -114,11 +158,28 @@ try {
   const manualCompletion = { dispatched: (completeBody as { flowId?: string })?.flowId === "flow-1", terminalCleared: !document.querySelector("textarea") };
 
   plugin = { ...plugin, authState: "authorization-required", accountUuid: null, accountDisplayName: null, accountKind: null };
+  configuration = { ...configuration, configured: false, source: "missing", errorCode: "onedrive-client-id-missing" };
   stage = "configuration editor";
   await queryClient.invalidateQueries({ queryKey: ["plugins"] });
-  await waitFor(() => Boolean(button("高级配置")));
-  await click("高级配置"); await input("input[placeholder]", "11111111-1111-1111-1111-111111111111");
-  await click("预览更改"); await waitFor(() => document.body.textContent?.includes("配置将发生变化") === true);
+  await queryClient.invalidateQueries({ queryKey: ["plugins", "com.megle.onedrive", "configuration"] });
+  await waitFor(() => Boolean(button("配置 Client ID")));
+  await click("配置 Client ID");
+  await waitFor(() => Boolean(document.querySelector("details.onedrive-advanced-configuration[open]")));
+  const configurationInput = document.querySelector("details.onedrive-advanced-configuration input") as HTMLInputElement;
+  await waitFor(() => document.activeElement === configurationInput);
+  const advancedFocusedByAction = true;
+  const advancedUsesNativeDisclosure = Boolean(document.querySelector("details.onedrive-advanced-configuration > summary.plugin-disclosure-summary"));
+  const advancedSummary = control("高级配置")!;
+  await act(async () => advancedSummary.focus());
+  await waitFor(() => document.activeElement === advancedSummary);
+  await requestNativeKey("Space");
+  await waitFor(() => !document.querySelector("details.onedrive-advanced-configuration[open]"));
+  const advancedClosedWithKeyboard = true;
+  await requestNativeKey("Space");
+  await waitFor(() => Boolean(document.querySelector("details.onedrive-advanced-configuration[open]")));
+  const advancedOpenedWithKeyboard = true;
+  await input("input[placeholder]", "11111111-1111-1111-1111-111111111111");
+  await click("检查更改"); await waitFor(() => document.body.textContent?.includes("配置将发生变化") === true);
   stage = "configuration commit";
   await click("确认应用"); await waitFor(() => configuration.revision === 2);
   await waitFor(() => !document.body.textContent?.includes("配置将发生变化"));
@@ -128,7 +189,7 @@ try {
   stage = "configuration noop";
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
-    button("预览更改")!.click();
+    button("检查更改")!.click();
   });
   await waitFor(() => planRequestCount > priorPlanRequests && document.body.textContent?.includes("有效配置没有变化") === true);
   await act(async () => { button("确认应用")!.click(); }); await waitFor(() => commitBody !== null);
@@ -138,7 +199,7 @@ try {
   stage = "configuration readonly";
   await queryClient.invalidateQueries({ queryKey: ["plugins", "com.megle.onedrive", "configuration"] });
   await waitFor(() => document.body.textContent?.includes("部署环境（只读）") === true);
-  const readOnly = { editorHidden: !button("高级配置") };
+  const readOnly = { editorHidden: !document.querySelector(".onedrive-config-editor"), disclosureVisible: Boolean(control("高级配置")) };
 
   stage = "unmount setup";
   const transientHost = document.createElement("div"); document.body.append(transientHost);
@@ -152,6 +213,69 @@ try {
   await act(async () => remountedRoot.unmount()); transientHost.remove();
 
   await act(async () => root.unmount()); queryClient.clear();
+
+  stage = "plugin presentation";
+  const presentationPlugin: HostPluginProjection = {
+    ...pluginBase,
+    pluginId: "com.megle.presentation-check",
+    runtimeState: "degraded",
+    lastErrorCode: "provider-degraded",
+    lastErrorDetail: "raw provider failure"
+  };
+  const presentationHost = document.createElement("div");
+  presentationHost.style.cssText = "width:320px;margin:80px";
+  document.body.append(presentationHost);
+  const presentationRoot = createRoot(presentationHost);
+  await act(async () => presentationRoot.render(<PluginPresentationFixture initialPlugin={presentationPlugin} />));
+  await delay(40);
+  const card = presentationHost.querySelector(".plugin-card") as HTMLElement;
+  const cardBody = presentationHost.querySelector(".plugin-card-body") as HTMLElement;
+  const cardName = presentationHost.querySelector(".plugin-card-name") as HTMLElement;
+  document.body.style.margin = "0";
+  presentationHost.style.cssText = "width:320px;margin:80px";
+  const cardBounds = card.getBoundingClientRect();
+  document.documentElement.style.setProperty("--glass-pointer-sensing-distance", "80px");
+  const proximityX = Math.round(cardBounds.right + 20);
+  const proximityY = Math.round(cardBounds.top + cardBounds.height / 2);
+  await act(async () => window.dispatchEvent(new MouseEvent("mousemove", { clientX: proximityX, clientY: proximityY })));
+  await delay(30);
+  await waitFor(() => card.getAttribute("data-interactive-pointer-target") === "true");
+  const proximity = {
+    activeOutsideBounds: !cardBody.matches(":hover"),
+    opacityActive: card.style.getPropertyValue("--interactive-pointer-opacity").trim() === "1",
+    radialOutlinePresent: getComputedStyle(card, "::after").backgroundImage.includes("radial-gradient")
+  };
+  await act(async () => cardBody.click());
+  await waitFor(() => presentationHost.querySelector(".plugin-card-body")?.getAttribute("aria-pressed") === "true");
+  const toggleInput = presentationHost.querySelector('.plugin-toggle input[type="checkbox"]') as HTMLInputElement;
+  await act(async () => toggleInput.click());
+  await waitFor(() => !(presentationHost.querySelector('.plugin-toggle input[type="checkbox"]') as HTMLInputElement).checked);
+  const currentCard = presentationHost.querySelector(".plugin-card") as HTMLElement;
+  const currentCardBody = presentationHost.querySelector(".plugin-card-body") as HTMLElement;
+  const currentToggleInput = presentationHost.querySelector('.plugin-toggle input[type="checkbox"]') as HTMLInputElement;
+  const cardInteraction = { selected: currentCardBody.getAttribute("aria-pressed") === "true", toggled: !currentToggleInput.checked };
+  const cardText = currentCard.textContent ?? "";
+  const technicalDetails = presentationHost.querySelector("details.plugin-technical-details") as HTMLDetailsElement;
+  const technicalSummary = technicalDetails.querySelector("summary") as HTMLElement;
+  const removeButton = [...technicalDetails.querySelectorAll("button")].find((item) => item.textContent?.includes("从注册表移除"));
+  const conciseCard = {
+    rawErrorHidden: !cardText.includes("raw provider failure"),
+    toggleTextHidden: !cardText.includes("Disable"),
+    toggleAccessible: currentToggleInput.getAttribute("aria-label") === "Enable"
+  };
+  const technicalDisclosure = {
+    collapsedInitially: !technicalDetails.open,
+    diagnosticsNested: technicalDetails.textContent?.includes("raw provider failure") === true,
+    removalNested: Boolean(removeButton)
+  };
+  await act(async () => technicalSummary.focus());
+  await waitFor(() => document.activeElement === technicalSummary);
+  await requestNativeKey("Space");
+  await waitFor(() => technicalDetails.open);
+  const technicalOpenedWithKeyboard = true;
+  await act(async () => presentationRoot.unmount());
+  presentationHost.remove();
+
   plugin = { ...pluginBase, authState: "authorization-required", accountUuid: null, accountDisplayName: null, accountKind: null };
   configuration = { ...configBase }; activeContextRevision = 7; remoteLibraryCalls = 0;
   const wizardHost = document.createElement("div"); document.body.append(wizardHost); const wizardRoot = createRoot(wizardHost);
@@ -171,7 +295,7 @@ try {
   const wizardRevision = { staleIntentCleared: document.body.textContent?.includes("资源库上下文已变化") === true };
   await act(async () => staleWizardRoot.unmount()); wizardHost.remove();
 
-  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, configConfirm, configNoop, readOnly, unmountCleanup, wizardResume, wizardRevision };
+  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, configConfirm, configNoop, advancedUsesNativeDisclosure, advancedFocusedByAction, advancedClosedWithKeyboard, advancedOpenedWithKeyboard, readOnly, unmountCleanup, proximity, cardInteraction, conciseCard, technicalDisclosure, technicalOpenedWithKeyboard, wizardResume, wizardRevision };
 } catch (error) {
   (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: false, error: error instanceof Error ? error.stack ?? error.message : String(error) };
 }

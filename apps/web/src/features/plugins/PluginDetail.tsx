@@ -1,5 +1,6 @@
-import { Database, Trash2 } from "lucide-react";
+import { ChevronRight, Database, Trash2 } from "lucide-react";
 import type { HostPluginProjection, PluginCapability } from "@megle/core-client";
+import { LiquidGlassButton } from "../../design/liquid-glass";
 import { StatusPill } from "./StatusPill";
 import { OneDriveAccountSetup } from "./OneDriveAccountSetup";
 import { ONEDRIVE_PLUGIN_ID } from "./pluginAuthModel";
@@ -25,6 +26,8 @@ export function PluginDetail({
   onRemove,
   onRefresh
 }: PluginDetailProps) {
+  const isOneDrive = plugin.pluginId === ONEDRIVE_PLUGIN_ID;
+
   return (
     <section className="plugin-detail" aria-label={`${plugin.pluginId} details`}>
       <header className="plugin-detail-header">
@@ -33,113 +36,115 @@ export function PluginDetail({
             <div className="plugin-detail-title">{plugin.pluginId}</div>
             <div className="plugin-detail-subtitle">
               <span>v{plugin.selectedVersion}</span>
-              <span className="plugin-detail-id" title={plugin.pluginId}>
-                {plugin.pluginId}
-              </span>
             </div>
           </div>
-          <StatusPill status={plugin.runtimeState} title={plugin.lastErrorDetail ?? undefined} />
+          {!isOneDrive ? (
+            <StatusPill status={plugin.runtimeState} title={plugin.lastErrorDetail ?? undefined} />
+          ) : null}
         </div>
       </header>
 
-      <div className="plugin-detail-section">
-        <div className="plugin-detail-section-title">Capabilities</div>
-        {plugin.capabilities.length === 0 ? (
-          <div className="plugin-detail-empty">None declared.</div>
-        ) : (
-          <div className="plugin-capability-chips">
-            {plugin.capabilities.map((capability) => {
-              return (
-                <span className="plugin-capability-chip" key={capability}>
-                  <Database size={12} aria-hidden="true" />
-                  <span>{CAPABILITY_LABEL[capability]}</span>
-                </span>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {plugin.pluginId === ONEDRIVE_PLUGIN_ID ? (
-        <div className="plugin-detail-section">
-          <div className="plugin-detail-section-title">OneDrive account</div>
+      {isOneDrive ? (
+        <div className="plugin-detail-section plugin-detail-primary-section">
           <OneDriveAccountSetup onChanged={onRefresh} />
         </div>
       ) : null}
 
-      <div className="plugin-detail-section">
-        <div className="plugin-detail-section-title">Permissions</div>
-        {plugin.requestedPermissions.length === 0 ? (
-          <div className="plugin-detail-empty">No permissions requested.</div>
-        ) : (
-          <ul className="plugin-permission-list">
-            {plugin.requestedPermissions.map((permission, index) => (
-              <li key={`${permission.kind}-${index}`}>{permission.kind}</li>
-            ))}
-          </ul>
-        )}
-      </div>
-
-      <div className="plugin-detail-section">
-        <div className="plugin-detail-section-title">Runtime</div>
-        <dl className="plugin-detail-meta">
-          <div>
-            <dt>Intent</dt>
-            <dd>{plugin.enabledIntent ? "Enabled" : "Disabled"}</dd>
-          </div>
-          <div>
-            <dt>Authentication</dt>
-            <dd>{plugin.accountDisplayName ?? plugin.authState ?? "No account"}</dd>
-          </div>
-          <div>
-            <dt>Last healthy</dt>
-            <dd>{plugin.lastHealthyAt ? new Date(plugin.lastHealthyAt).toLocaleString() : "Never"}</dd>
-          </div>
-          <div>
-            <dt>Retry after</dt>
-            <dd>{plugin.backoffUntil ? new Date(plugin.backoffUntil).toLocaleString() : "None"}</dd>
-          </div>
-        </dl>
-      </div>
-
-      {plugin.compatibilityReason ? (
-        <div className="plugin-detail-section">
-          <div className="plugin-detail-section-title">Compatibility</div>
-          <p className="plugin-delete-hint">{plugin.compatibilityReason}</p>
+      {!isOneDrive && (plugin.permissionRequired || plugin.runtimeState === "crashed-backoff" || plugin.runtimeState === "degraded") ? (
+        <div className="plugin-primary-actions">
+          {plugin.permissionRequired ? (
+            <LiquidGlassButton className="plugin-action" disabled={busy} onClick={onApprovePermissions} tone="primary" type="button">
+              Approve permissions
+            </LiquidGlassButton>
+          ) : null}
+          {plugin.runtimeState === "crashed-backoff" || plugin.runtimeState === "degraded" ? (
+            <LiquidGlassButton className="plugin-action" disabled={busy} onClick={onRetry} tone="primary" type="button">
+              Retry provider
+            </LiquidGlassButton>
+          ) : null}
         </div>
       ) : null}
 
-      {plugin.lastErrorDetail ? (
-        <div className="plugin-detail-section">
-          <div className="plugin-detail-section-title">Last error</div>
-          <pre className="plugin-detail-error">{plugin.lastErrorDetail}</pre>
-        </div>
-      ) : null}
+      <details className="plugin-disclosure plugin-technical-details">
+        <summary className="plugin-disclosure-summary" data-direct-contact-feedback="foreground">
+          <span>技术信息</span>
+          <ChevronRight aria-hidden="true" className="plugin-disclosure-chevron" size={15} />
+        </summary>
+        <div className="plugin-disclosure-body">
+          <div className="plugin-detail-section">
+            <div className="plugin-detail-section-title">Capabilities</div>
+            {plugin.capabilities.length === 0 ? (
+              <div className="plugin-detail-empty">None declared.</div>
+            ) : (
+              <div className="plugin-capability-chips">
+                {plugin.capabilities.map((capability) => (
+                  <span className="plugin-capability-chip" key={capability}>
+                    <Database size={12} aria-hidden="true" />
+                    <span>{CAPABILITY_LABEL[capability]}</span>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
 
-      <div className="plugin-detail-actions">
-        {plugin.pluginId !== ONEDRIVE_PLUGIN_ID && plugin.permissionRequired ? (
-          <button className="plugins-rescan" onClick={onApprovePermissions} type="button" disabled={busy}>
-            Approve requested permissions
-          </button>
-        ) : null}
-        {plugin.pluginId !== ONEDRIVE_PLUGIN_ID && (plugin.runtimeState === "crashed-backoff" || plugin.runtimeState === "degraded") ? (
-          <button className="plugins-rescan" onClick={onRetry} type="button" disabled={busy}>
-            Retry provider
-          </button>
-        ) : null}
-        <button
-          className="plugin-delete-button"
-          onClick={onRemove}
-          type="button"
-          disabled={busy}
-        >
-          <Trash2 size={14} />
-          <span>Remove from registry</span>
-        </button>
-        <p className="plugin-delete-hint">
-          Removal is blocked while an account or Library binding references this provider.
-        </p>
-      </div>
+          <div className="plugin-detail-section">
+            <div className="plugin-detail-section-title">Permissions</div>
+            {plugin.requestedPermissions.length === 0 ? (
+              <div className="plugin-detail-empty">No permissions requested.</div>
+            ) : (
+              <ul className="plugin-permission-list">
+                {plugin.requestedPermissions.map((permission, index) => (
+                  <li key={`${permission.kind}-${index}`}>{permission.kind}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="plugin-detail-section">
+            <div className="plugin-detail-section-title">Runtime</div>
+            <dl className="plugin-detail-meta">
+              <div>
+                <dt>Last healthy</dt>
+                <dd>{plugin.lastHealthyAt ? new Date(plugin.lastHealthyAt).toLocaleString() : "Never"}</dd>
+              </div>
+              <div>
+                <dt>Retry after</dt>
+                <dd>{plugin.backoffUntil ? new Date(plugin.backoffUntil).toLocaleString() : "None"}</dd>
+              </div>
+            </dl>
+          </div>
+
+          {plugin.compatibilityReason ? (
+            <div className="plugin-detail-section">
+              <div className="plugin-detail-section-title">Compatibility</div>
+              <p className="plugin-delete-hint">{plugin.compatibilityReason}</p>
+            </div>
+          ) : null}
+
+          {plugin.lastErrorDetail ? (
+            <div className="plugin-detail-section">
+              <div className="plugin-detail-section-title">Last error</div>
+              <pre className="plugin-detail-error">{plugin.lastErrorDetail}</pre>
+            </div>
+          ) : null}
+
+          <div className="plugin-detail-actions">
+            <LiquidGlassButton
+              className="plugin-action plugin-action-danger"
+              disabled={busy}
+              onClick={onRemove}
+              tone="danger"
+              type="button"
+            >
+              <Trash2 aria-hidden="true" size={14} />
+              <span>从注册表移除</span>
+            </LiquidGlassButton>
+            <p className="plugin-delete-hint">
+              账号或资源库仍引用此 Provider 时无法移除。
+            </p>
+          </div>
+        </div>
+      </details>
     </section>
   );
 }

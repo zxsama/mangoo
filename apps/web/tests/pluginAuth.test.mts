@@ -83,4 +83,21 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(wizard, /authResumeRef/);
     assert.match(wizard, /active\.contextRevision !== intent\.contextRevision/);
   });
+
+  it("keeps plugin maintenance details out of the primary workflow", () => {
+    const setup = readFileSync(new URL("../src/features/plugins/OneDriveAccountSetup.tsx", import.meta.url), "utf8");
+    const card = readFileSync(new URL("../src/features/plugins/PluginCard.tsx", import.meta.url), "utf8");
+    const detail = readFileSync(new URL("../src/features/plugins/PluginDetail.tsx", import.meta.url), "utf8");
+
+    assert.match(setup, /<details[\s\S]*onedrive-advanced-configuration/);
+    assert.match(setup, /<summary[\s\S]*高级配置/);
+    assert.match(setup, /检查更改/);
+    assert.doesNotMatch(setup, /预览更改|收起高级配置/);
+    assert.match(card, /aria-label=\{toggleLabel\}/);
+    assert.doesNotMatch(card, /plugin-card-error|plugin-toggle-label/);
+    assert.match(detail, /<details className="plugin-disclosure plugin-technical-details">/);
+    assert.match(detail, /技术信息/);
+    assert.match(detail, /tone="danger"/);
+    assert.doesNotMatch(detail, /<dt>Intent<\/dt>|<dt>Authentication<\/dt>|plugin-detail-id/);
+  });
 });

@@ -149,6 +149,9 @@ const libraryCenterPane = readOptional("apps/web/src/features/library/LibraryCen
 const libraryInspectorPane = readOptional("apps/web/src/features/library/LibraryInspectorPane.tsx") ?? "";
 const pluginsView = read("apps/web/src/features/plugins/PluginsView.tsx");
 const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
+const pluginCard = read("apps/web/src/features/plugins/PluginCard.tsx");
+const pluginDetail = read("apps/web/src/features/plugins/PluginDetail.tsx");
+const oneDriveAccountSetup = read("apps/web/src/features/plugins/OneDriveAccountSetup.tsx");
 const notificationWindow = read("apps/web/src/features/notifications/NotificationWindow.tsx");
 const notificationStatusView = read("apps/web/src/features/notifications/NotificationStatusView.tsx");
 const notificationHistoryView = read("apps/web/src/features/notifications/NotificationHistoryView.tsx");
@@ -1435,6 +1438,59 @@ if (libraryView.includes("library-content-toolbar")) {
 
 if (!pluginsView.includes("plugins-body-actions")) {
   fail("PluginsView actions must live in the page body instead of a header toolbar");
+}
+
+if (!pluginsView.includes("LiquidGlassButton") || !pluginsView.includes('className="plugins-rescan plugin-action"')) {
+  fail("PluginsView rescan action must use the shared liquid-glass button hierarchy");
+}
+
+for (const value of [
+  'data-direct-contact-feedback="foreground"',
+  "aria-label={toggleLabel}",
+  "<StatusPill"
+]) {
+  if (!pluginCard.includes(value)) {
+    fail(`PluginCard concise row contract missing ${value}`);
+  }
+}
+for (const retiredValue of ["plugin-card-error", "plugin-toggle-label"]) {
+  if (pluginCard.includes(retiredValue)) {
+    fail(`PluginCard must not render duplicate row detail ${retiredValue}`);
+  }
+}
+
+for (const value of [
+  '<details className="plugin-disclosure plugin-technical-details">',
+  'data-direct-contact-feedback="foreground"',
+  "技术信息",
+  'tone="danger"',
+  "plugin-detail-actions"
+]) {
+  if (!pluginDetail.includes(value)) {
+    fail(`PluginDetail technical disclosure contract missing ${value}`);
+  }
+}
+for (const retiredValue of ["plugin-detail-id", "<dt>Intent</dt>", "<dt>Authentication</dt>"]) {
+  if (pluginDetail.includes(retiredValue)) {
+    fail(`PluginDetail primary view must not duplicate ${retiredValue}`);
+  }
+}
+
+for (const value of [
+  "onedrive-advanced-configuration",
+  "<summary",
+  "高级配置",
+  "检查更改",
+  "configurationInputRef"
+]) {
+  if (!oneDriveAccountSetup.includes(value)) {
+    fail(`OneDrive advanced disclosure contract missing ${value}`);
+  }
+}
+for (const retiredValue of ["预览更改", "收起高级配置", "onedrive-config-summary", "onedrive-auth-state"]) {
+  if (oneDriveAccountSetup.includes(retiredValue)) {
+    fail(`OneDrive primary view must not render duplicate or obsolete presentation ${retiredValue}`);
+  }
 }
 
 for (const value of ["toolbar-titles", "toolbar-title"]) {
@@ -2876,6 +2932,55 @@ if (
 }
 if (!legacyButtonHoverBlocks.some((block) => latestDeclarationValue(block, "transform") === "translateY(-1px)")) {
   fail("generic button hover must preserve the existing one-pixel lift feedback");
+}
+
+if (!liquidGlassSurface.includes('data-direct-contact-feedback="foreground"')) {
+  fail("LiquidGlassButton must opt into the shared foreground-only direct-contact feedback contract");
+}
+
+const directContactHoverBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  '[data-direct-contact-feedback="foreground"]:hover:not(:active):not(:focus-visible):not(:disabled):not([aria-disabled="true"])'
+);
+if (
+  !directContactHoverBlocks.some(
+    (block) =>
+      latestBackgroundValue(block) === null &&
+      latestDeclarationValue(block, "border-color") === null &&
+      latestDeclarationValue(block, "box-shadow") === null &&
+      latestDeclarationValue(block, "color") === "#f8fdff"
+  )
+) {
+  fail("direct-contact feedback must match titlebar tools by changing foreground only, without overriding background, border, or shadow");
+}
+
+for (const [stylesheet, source] of [
+  ["styles.css", stylesForChecks],
+  ["overlay.css", overlayStylesForChecks]
+]) {
+  const competingHover = cssRuleBlocksForMatchingSelectors(
+    source,
+    (selector) =>
+      selector.includes(":hover") &&
+      [
+        ".onboarding-hero-cta",
+        ".notification-open-center",
+        ".plugin-card-body",
+        ".plugin-toggle",
+        ".plugin-action",
+        ".plugin-disclosure-summary"
+      ].some((family) => cssSelectorContainsClass(selector, family))
+  ).find(
+    ({ block }) =>
+      hasNonTransparentBackground(block) ||
+      hasNonzeroBorderDeclaration(block, "border") ||
+      hasVisibleBorderDeclaration(block, "border-color") ||
+      hasNonNoneDeclaration(block, "background-image") ||
+      hasNonNoneDeclaration(block, "box-shadow")
+  );
+  if (competingHover) {
+    fail(`${stylesheet} must not add a competing full-surface hover to direct-contact controls: ${competingHover.selectorList}`);
+  }
 }
 
 const sidebarPointerScopeClasses = [
