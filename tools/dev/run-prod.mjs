@@ -18,6 +18,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { ensureMeglePreview } from "./prod-preview.mjs";
 
 const root = process.cwd();
 const dataDir = path.join(root, ".data");
@@ -153,36 +154,6 @@ function outputsExist() {
   );
 }
 
-async function waitForUrl(url, timeoutMs = 30_000) {
-  const deadline = Date.now() + timeoutMs;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(url, { cache: "no-store" });
-      if (response.ok) return;
-      lastError = new Error(`${url} returned ${response.status}`);
-    } catch (error) {
-      lastError = error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  throw new Error(`Timed out waiting for ${url}: ${String(lastError)}`);
-}
-
-// Whether a preview server already serving OUR built bundle is on `url` (from a
-// previous launch). If so we reuse it instead of starting a second preview that
-// would fail with "port in use".
-async function isPreviewServingOurBundle(url) {
-  try {
-    const response = await fetch(url, { cache: "no-store" });
-    if (!response.ok) return false;
-    const html = await response.text();
-    return html.includes("<title>Megle</title>");
-  } catch {
-    return false;
-  }
-}
-
 // ── Main ─────────────────────────────────────────────────────────────────────
 const currentHash = hashInputs();
 const storedHash = fs.existsSync(hashFile) ? fs.readFileSync(hashFile, "utf8").trim() : null;
@@ -206,15 +177,12 @@ if (upToDate) {
   console.log("[prod] build complete.");
 }
 
-// Serve the built bundle (static, no HMR) and wait until it responds. Reuse an
-// existing preview server if one from a prior launch is still up on the port.
-if (await isPreviewServingOurBundle(previewUrl)) {
-  console.log(`[prod] reusing preview server already serving the built UI at ${previewUrl}.`);
-} else {
-  console.log(`[prod] serving built UI at ${previewUrl} (vite preview)…`);
-  spawnChild("npm", ["--workspace", "@megle/web", "run", "preview"]);
-  await waitForUrl(previewUrl);
-}
+// Serve the built bundle (static, no HMR). Reuse an existing Megle preview, but
+// fail closed if a newly spawned preview exits before our page is confirmed.
+await ensureMeglePreview({
+  url: previewUrl,
+  spawnPreview: () => spawnChild("npm", ["--workspace", "@megle/web", "run", "preview"])
+});
 
 // Launch Electron against the preview server with the RELEASE Core sidecar.
 console.log("[prod] launching desktop…");

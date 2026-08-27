@@ -67,6 +67,7 @@ const desktopPackage = read("apps/desktop/package.json");
 const rootPackage = read("package.json");
 const devRunner = read("tools/dev/run-dev.mjs");
 const prodRunner = read("tools/dev/run-prod.mjs");
+const prodPreview = read("tools/dev/prod-preview.mjs");
 const managedLibraryHarness = read("tools/dev/managed-library-harness.mjs");
 const managedLibraryBench = read("tools/bench/managed-library-lifecycle-bench.mjs");
 const migratedHostHarnesses = [
@@ -626,6 +627,17 @@ if (!/run\(\s*findCargoCommand\(\)\s*,\s*\[\s*"build"\s*,\s*"-p"\s*,\s*"megle-co
 }
 if (!/build-bundled-plugins\.mjs"\s*,\s*"--release-profile"/.test(prodRunner)) {
   fail("local production runner must build optimized Providers without invoking formal release credential validation");
+}
+if (!prodRunner.includes('import { ensureMeglePreview } from "./prod-preview.mjs"')) {
+  fail("production runner must use the preview lifecycle guard before launching Electron");
+}
+for (const value of ["child.once(\"exit\"", "child.once(\"error\"", "<title>Megle</title>", "fixed preview port may already be in use"]) {
+  if (!prodPreview.includes(value)) {
+    fail(`production preview lifecycle guard missing ${value}`);
+  }
+}
+if (!rootPackage.includes("node --test tools/dev/prod-preview.test.mjs")) {
+  fail("check:desktop must run the production preview lifecycle regression tests");
 }
 for (const value of [
   "crates/fake-provider/src",
