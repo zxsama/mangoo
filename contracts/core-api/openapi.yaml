@@ -3143,9 +3143,10 @@ components:
             maxBytes: { type: integer, minimum: 1, maximum: 1073741824 }
     HostPluginProjection:
       type: object
-      required: [pluginId, selectedVersion, knownGoodVersion, enabledIntent, runtimeState, authState, capabilities, requestedPermissions, grantedPermissions, permissionRequired, accountUuid, accountDisplayName, accountKind, compatibilityReason, backoffUntil, lastHealthyAt, lastErrorCode, lastErrorDetail]
+      required: [pluginId, name, selectedVersion, knownGoodVersion, enabledIntent, runtimeState, authState, capabilities, requestedPermissions, grantedPermissions, permissionRequired, accountUuid, accountDisplayName, accountKind, compatibilityReason, backoffUntil, lastHealthyAt, lastErrorCode, lastErrorDetail]
       properties:
         pluginId: { type: string }
+        name: { type: string, minLength: 1, maxLength: 128 }
         selectedVersion: { type: string }
         knownGoodVersion: { type: string, nullable: true }
         enabledIntent: { type: boolean }

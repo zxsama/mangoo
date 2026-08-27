@@ -166,7 +166,7 @@ export function OneDriveAccountSetupContent({
       {auth.error ? <div className="settings-inline-error" role="alert">{auth.error}</div> : null}
       {auth.primaryAction === "unavailable" && !auth.loading ? (
         <p className="onedrive-auth-pending-note" role="status">
-          尚未发现受信的 OneDrive Provider，请先在插件面板重新扫描。
+          尚未发现受信的 OneDrive Provider。
         </p>
       ) : null}
 
@@ -270,9 +270,9 @@ export function OneDriveAccountSetupContent({
           onToggle={(event) => setEditingConfiguration(event.currentTarget.open)}
           open={editingConfiguration}
         >
-          <summary className="plugin-disclosure-summary" data-direct-contact-feedback="foreground">
-            <span>高级配置</span>
+          <summary className="plugin-disclosure-summary" data-pointer-glow="off">
             <ChevronRight aria-hidden="true" className="plugin-disclosure-chevron" size={15} />
+            <span className="plugin-disclosure-label">高级配置</span>
           </summary>
           <div className="plugin-disclosure-body">
             <p className="onedrive-advanced-copy">
@@ -382,6 +382,6 @@ function primaryStateDescription(auth: PluginAuthController): string {
     case "manage":
       return accountKindLabel(auth.plugin?.accountKind ?? null);
     default:
-      return "重新扫描插件后再试。";
+      return "正在自动检测已安装的插件。";
   }
 }

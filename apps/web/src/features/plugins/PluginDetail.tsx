@@ -4,6 +4,7 @@ import { LiquidGlassButton } from "../../design/liquid-glass";
 import { StatusPill } from "./StatusPill";
 import { OneDriveAccountSetup } from "./OneDriveAccountSetup";
 import { ONEDRIVE_PLUGIN_ID } from "./pluginAuthModel";
+import { pluginPanelId, pluginTabId } from "./PluginCard";
 
 interface PluginDetailProps {
   plugin: HostPluginProjection;
@@ -29,11 +30,16 @@ export function PluginDetail({
   const isOneDrive = plugin.pluginId === ONEDRIVE_PLUGIN_ID;
 
   return (
-    <section className="plugin-detail" aria-label={`${plugin.pluginId} details`}>
+    <section
+      aria-labelledby={pluginTabId(plugin.pluginId)}
+      className="plugin-detail"
+      id={pluginPanelId(plugin.pluginId)}
+      role="tabpanel"
+    >
       <header className="plugin-detail-header">
         <div className="plugin-detail-heading">
           <div className="plugin-detail-titles">
-            <div className="plugin-detail-title">{plugin.pluginId}</div>
+            <div className="plugin-detail-title">{plugin.name}</div>
             <div className="plugin-detail-subtitle">
               <span>v{plugin.selectedVersion}</span>
             </div>
@@ -66,9 +72,9 @@ export function PluginDetail({
       ) : null}
 
       <details className="plugin-disclosure plugin-technical-details">
-        <summary className="plugin-disclosure-summary" data-direct-contact-feedback="foreground">
-          <span>技术信息</span>
+        <summary className="plugin-disclosure-summary" data-pointer-glow="off">
           <ChevronRight aria-hidden="true" className="plugin-disclosure-chevron" size={15} />
+          <span className="plugin-disclosure-label">技术信息</span>
         </summary>
         <div className="plugin-disclosure-body">
           <div className="plugin-detail-section">

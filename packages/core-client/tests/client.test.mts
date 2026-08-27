@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { afterEach, beforeEach, describe, test } from "node:test";
 
 import { createCoreClient } from "../src/client.ts";
-import type { FileOperationRecord } from "../src/generated-contract.ts";
+import type { FileOperationRecord, HostPluginProjection } from "../src/generated-contract.ts";
 
 interface RecordedRequest {
   url: string;
@@ -789,6 +789,35 @@ describe("createCoreClient", () => {
     assert.equal(recorded[0].method, "DELETE");
     // encoded slash so we don't accidentally hit /plugins/org.example/risky as two path segments
     assert.match(recorded[0].url, /\/plugins\/org\.example%2Frisky$/);
+  });
+
+  test("plugin list preserves the manifest display name projection", async () => {
+    const plugin = {
+      pluginId: "com.megle.onedrive",
+      name: "Megle OneDrive Sync Provider",
+      selectedVersion: "1.0.0",
+      knownGoodVersion: null,
+      enabledIntent: false,
+      runtimeState: "disabled",
+      authState: null,
+      capabilities: ["sync-provider.v1"],
+      requestedPermissions: [],
+      grantedPermissions: [],
+      permissionRequired: false,
+      accountUuid: null,
+      accountDisplayName: null,
+      accountKind: null,
+      compatibilityReason: null,
+      backoffUntil: null,
+      lastHealthyAt: null,
+      lastErrorCode: null,
+      lastErrorDetail: null
+    } satisfies HostPluginProjection;
+    mockFetch({ items: [plugin] });
+
+    const response = await client().listPlugins();
+
+    assert.equal(response.items[0]?.name, "Megle OneDrive Sync Provider");
   });
 
   test("getPreviewBlob requests original media bytes", async () => {

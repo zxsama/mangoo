@@ -73,13 +73,11 @@ const INTERACTIVE_AFFORDANCE_OWNER_SELECTOR = [
   ".tree-item",
   ".tile-thumb",
   ".settings-style-slider-control",
-  // Clickable list rows / cards. These were previously highlighted by their own
+  // Clickable list rows. These were previously highlighted by their own
   // rectangular :hover border+background; they now route through the single
   // circular pointer-distance glow like every other interactive element. Disabled
   // move rows opt out via :not(.move-row-disabled).
   ".move-row:not(.move-row-disabled)",
-  ".plugin-card",
-  ".plugin-disclosure-summary",
   ".settings-dialog-nav-item",
   ".settings-radio",
   // Glass BUTTONS (LiquidGlassButton renders data-liquid-glass="button"). They

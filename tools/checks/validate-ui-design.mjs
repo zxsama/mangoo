@@ -369,7 +369,6 @@ if (
 for (const selector of [
   ".plugins-detail-pane",
   ".settings-section",
-  ".plugin-card",
   ".grid-empty-search",
   ".grid-empty-folder",
   ".move-tree"
@@ -1436,24 +1435,35 @@ if (libraryView.includes("library-content-toolbar")) {
   fail("LibraryView must not keep the old content toolbar after controls move into the integrated titlebar");
 }
 
-if (!pluginsView.includes("plugins-body-actions")) {
-  fail("PluginsView actions must live in the page body instead of a header toolbar");
+for (const retiredValue of ["plugins-body-actions", "plugins-rescan", "Re-scan"]) {
+  if (pluginsView.includes(retiredValue)) {
+    fail(`PluginsView must rely on automatic discovery instead of the retired manual scan UI: found ${retiredValue}`);
+  }
 }
-
-if (!pluginsView.includes("LiquidGlassButton") || !pluginsView.includes('className="plugins-rescan plugin-action"')) {
-  fail("PluginsView rescan action must use the shared liquid-glass button hierarchy");
+for (const value of ['role="tablist"', 'aria-orientation="vertical"']) {
+  if (!pluginsView.includes(value)) {
+    fail(`PluginsView navigation semantics missing ${value}`);
+  }
 }
 
 for (const value of [
   'data-direct-contact-feedback="foreground"',
+  'data-pointer-glow="off"',
+  'role="tab"',
+  "aria-selected={selected}",
+  "aria-controls={selected ? pluginPanelId(plugin.pluginId) : undefined}",
+  "id={pluginTabId(plugin.pluginId)}",
+  "onKeyDown={handleTabKeyDown}",
   "aria-label={toggleLabel}",
+  "{plugin.name}",
+  "plugin-card-icon",
   "<StatusPill"
 ]) {
   if (!pluginCard.includes(value)) {
     fail(`PluginCard concise row contract missing ${value}`);
   }
 }
-for (const retiredValue of ["plugin-card-error", "plugin-toggle-label"]) {
+for (const retiredValue of ["LiquidGlassSurface", "aria-pressed", "plugin-card-error", "plugin-toggle-label"]) {
   if (pluginCard.includes(retiredValue)) {
     fail(`PluginCard must not render duplicate row detail ${retiredValue}`);
   }
@@ -1461,7 +1471,8 @@ for (const retiredValue of ["plugin-card-error", "plugin-toggle-label"]) {
 
 for (const value of [
   '<details className="plugin-disclosure plugin-technical-details">',
-  'data-direct-contact-feedback="foreground"',
+  'data-pointer-glow="off"',
+  'className="plugin-disclosure-label"',
   "技术信息",
   'tone="danger"',
   "plugin-detail-actions"
@@ -1470,21 +1481,96 @@ for (const value of [
     fail(`PluginDetail technical disclosure contract missing ${value}`);
   }
 }
+if (!/plugin-disclosure-chevron[\s\S]{0,180}plugin-disclosure-label/.test(pluginDetail)) {
+  fail("PluginDetail disclosure chevron must precede its label");
+}
 for (const retiredValue of ["plugin-detail-id", "<dt>Intent</dt>", "<dt>Authentication</dt>"]) {
   if (pluginDetail.includes(retiredValue)) {
     fail(`PluginDetail primary view must not duplicate ${retiredValue}`);
+  }
+}
+for (const value of [
+  "aria-labelledby={pluginTabId(plugin.pluginId)}",
+  "id={pluginPanelId(plugin.pluginId)}",
+  'role="tabpanel"'
+]) {
+  if (!pluginDetail.includes(value)) {
+    fail(`PluginDetail tabpanel relationship missing ${value}`);
   }
 }
 
 for (const value of [
   "onedrive-advanced-configuration",
   "<summary",
+  'data-pointer-glow="off"',
+  'className="plugin-disclosure-label"',
   "高级配置",
   "检查更改",
   "configurationInputRef"
 ]) {
   if (!oneDriveAccountSetup.includes(value)) {
     fail(`OneDrive advanced disclosure contract missing ${value}`);
+  }
+}
+if (!/plugin-disclosure-chevron[\s\S]{0,180}plugin-disclosure-label/.test(oneDriveAccountSetup)) {
+  fail("OneDrive advanced disclosure chevron must precede its label");
+}
+if (liquidGlassSurface.includes('".plugin-card"') || liquidGlassSurface.includes('".plugin-disclosure-summary"')) {
+  fail("plugin navigation and disclosure summaries must not be registered as global pointer-glow owners");
+}
+
+const pluginCardCss = cssBlocksForExactSelector(stylesForChecks, ".plugin-card").join("\n");
+if (
+  latestDeclarationValue(pluginCardCss, "border") !== "0" ||
+  latestBackgroundValue(pluginCardCss) !== "transparent" ||
+  latestDeclarationValue(pluginCardCss, "box-shadow") !== "none"
+) {
+  fail("plugin navigation rows must rest without a card border, surface fill, or shadow");
+}
+const selectedPluginCardCss = cssBlocksForExactSelector(stylesForChecks, ".plugin-card.selected").join("\n");
+if (
+  !hasNonTransparentBackground(selectedPluginCardCss) ||
+  hasVisibleBorderDeclaration(selectedPluginCardCss, "border-color") ||
+  hasNonNoneDeclaration(selectedPluginCardCss, "box-shadow")
+) {
+  fail("selected plugin navigation must use a stable fill without a border ring or shadow");
+}
+for (const selector of [
+  ".plugin-card-body:hover:not(:disabled)",
+  ".plugin-card-body:focus-visible",
+  ".plugin-card-body:active:not(:disabled)"
+]) {
+  const stateCss = cssBlocksForExactSelector(stylesForChecks, selector).join("\n");
+  if (
+    latestBackgroundValue(stateCss) !== "transparent" ||
+    hasVisibleBorderDeclaration(stateCss, "border-color") ||
+    hasNonNoneDeclaration(stateCss, "box-shadow")
+  ) {
+    fail(`${selector} must keep full-row shape feedback transparent`);
+  }
+}
+const pluginDisclosureSummaryCss = cssBlocksForExactSelector(stylesForChecks, ".plugin-disclosure-summary").join("\n");
+if (
+  latestDeclarationValue(pluginDisclosureSummaryCss, "border") !== "0" ||
+  latestBackgroundValue(pluginDisclosureSummaryCss) !== "transparent" ||
+  latestDeclarationValue(pluginDisclosureSummaryCss, "box-shadow") !== "none" ||
+  latestDeclarationValue(pluginDisclosureSummaryCss, "outline") !== "none"
+) {
+  fail("plugin disclosure summaries must not draw a full-row background, border, shadow, or outline");
+}
+for (const selector of [
+  ".plugin-disclosure-summary:hover",
+  ".plugin-disclosure-summary:focus-visible",
+  ".plugin-disclosure[open] > .plugin-disclosure-summary"
+]) {
+  const stateCss = cssBlocksForExactSelector(stylesForChecks, selector).join("\n");
+  if (
+    latestBackgroundValue(stateCss) !== "transparent" ||
+    latestDeclarationValue(stateCss, "border") !== "0" ||
+    latestDeclarationValue(stateCss, "box-shadow") !== "none" ||
+    latestDeclarationValue(stateCss, "outline") !== "none"
+  ) {
+    fail(`${selector} must limit feedback to disclosure text and chevron`);
   }
 }
 for (const retiredValue of ["预览更改", "收起高级配置", "onedrive-config-summary", "onedrive-auth-state"]) {
@@ -2384,10 +2470,10 @@ if (
     pluginsView,
     "apps/web/src/features/plugins/PluginsView.tsx",
     "plugins-sidebar",
-    ["plugins-body-actions", "plugins-list"]
+    ["plugins-list"]
   )
 ) {
-  fail("PluginsView must group sidebar controls and the plugin list in .plugins-sidebar");
+  fail("PluginsView must keep the plugin navigation list inside .plugins-sidebar");
 }
 if (
   !settingsWindow.includes("useSecondaryWindowInterfaceStyle({ broadcastChanges: true })") ||

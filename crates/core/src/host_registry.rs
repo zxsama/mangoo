@@ -298,6 +298,7 @@ pub struct RemovalRecovery {
 #[serde(rename_all = "camelCase")]
 pub struct HostPluginProjection {
     pub plugin_id: String,
+    pub name: String,
     pub selected_version: String,
     pub known_good_version: Option<String>,
     pub enabled_intent: bool,
@@ -1898,13 +1899,17 @@ impl HostRegistry {
     pub fn list_host_plugins(&self) -> anyhow::Result<Vec<HostPluginProjection>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare(
-            "SELECT i.plugin_id,i.selected_version,i.known_good_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,r.state,a.auth_state,a.account_uuid,a.display_name,r.backoff_until,r.last_healthy_at,r.last_error_code,r.last_error_detail,r.capabilities_json,a.account_kind FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id LEFT JOIN plugin_accounts a ON a.plugin_id=i.plugin_id ORDER BY i.plugin_id",
+            "SELECT i.plugin_id,i.selected_version,i.known_good_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,r.state,a.auth_state,a.account_uuid,a.display_name,r.backoff_until,r.last_healthy_at,r.last_error_code,r.last_error_detail,r.capabilities_json,a.account_kind,v.manifest_json FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id LEFT JOIN plugin_accounts a ON a.plugin_id=i.plugin_id LEFT JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version ORDER BY i.plugin_id",
         )?;
         let rows = statement.query_map([], |row| {
+            let plugin_id: String = row.get(0)?;
             let requested: String = row.get(4)?;
             let granted: String = row.get(5)?;
+            let manifest_json: Option<String> = row.get(16)?;
+            let name = selected_plugin_name(&plugin_id, manifest_json.as_deref());
             Ok(HostPluginProjection {
-                plugin_id: row.get(0)?,
+                plugin_id,
+                name,
                 selected_version: row.get(1)?,
                 known_good_version: row.get(2)?,
                 enabled_intent: row.get::<_, i64>(3)? != 0,
@@ -4781,6 +4786,19 @@ fn descriptor_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryDescr
     })
 }
 
+fn selected_plugin_name(plugin_id: &str, manifest_json: Option<&str>) -> String {
+    manifest_json
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("name")?
+                .as_str()
+                .map(|name| name.trim().to_owned())
+        })
+        .filter(|name| !name.is_empty() && name.len() <= 128)
+        .unwrap_or_else(|| plugin_id.chars().take(128).collect())
+}
+
 fn unix_timestamp_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5147,6 +5165,98 @@ mod tests {
                 .runtime_state,
             "starting"
         );
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn host_plugin_name_comes_from_the_selected_version_manifest() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.named",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2,"name":"Named Provider v1"}"#,
+                entry_relative_path: "bin/provider-v1",
+                entry_sha256: &[7; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.named",
+                version: "2.0.0",
+                manifest_json: r#"{"manifestVersion":2,"name":"Named Provider v2"}"#,
+                entry_relative_path: "bin/provider-v2",
+                entry_sha256: &[8; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE plugin_installations SET selected_version='2.0.0' WHERE plugin_id='com.megle.named'",
+                [],
+            )
+            .unwrap();
+
+        let listed = registry.list_host_plugins().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Named Provider v2");
+        assert_eq!(
+            registry
+                .host_plugin("com.megle.named")
+                .unwrap()
+                .unwrap()
+                .name,
+            "Named Provider v2"
+        );
+
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn host_plugin_name_falls_back_for_a_historical_manifest_without_name() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.megle.historical",
+                version: "1.0.0",
+                manifest_json: r#"{"manifestVersion":2,"name":"   "}"#,
+                entry_relative_path: "bin/provider",
+                entry_sha256: &[7; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+
+        let plugin = registry
+            .host_plugin("com.megle.historical")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plugin.name, "com.megle.historical");
+        assert_eq!(
+            selected_plugin_name(&"p".repeat(255), Some(r#"{"name":""}"#)).len(),
+            128
+        );
+        assert_eq!(
+            selected_plugin_name(
+                "com.megle.historical",
+                Some(&format!(r#"{{"name":"{}"}}"#, "n".repeat(129)))
+            ),
+            "com.megle.historical"
+        );
+
         drop(registry);
         let _ = std::fs::remove_file(path);
     }

@@ -1,59 +1,20 @@
-import { useCallback, useState } from "react";
-import { AlertTriangle, Loader2, RefreshCw } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import { MediaLoadingRing } from "../loading/MediaLoadingRing";
-import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
+import { LiquidGlassSurface } from "../../design/liquid-glass";
 import { PluginCard } from "./PluginCard";
 import { PluginDetail } from "./PluginDetail";
 import { usePluginsData } from "./usePluginsData";
 
 export function PluginsView() {
   const plugins = usePluginsData();
-  const [discovering, setDiscovering] = useState(false);
-
-  const runDiscover = useCallback(async () => {
-    setDiscovering(true);
-    try {
-      await plugins.discover();
-    } finally {
-      setDiscovering(false);
-    }
-  }, [plugins]);
-
   const selected = plugins.selectedPlugin;
   const totalCount = plugins.plugins.length;
-  const enabledCount = plugins.plugins.filter((plugin) => plugin.enabledIntent).length;
-  const invalidCount = plugins.plugins.filter((plugin) => plugin.runtimeState === "incompatible").length;
 
   return (
     <section className="workspace simple-workspace" aria-label="Plugins workbench">
       <div className="plugins-body">
         <div className="plugins-layout">
           <aside className="plugins-sidebar">
-            <div className="plugins-body-actions">
-              <div className="plugins-status-summary">
-                {totalCount === 0
-                  ? "No plugins discovered"
-                  : `${totalCount} registered · ${enabledCount} enabled${
-                      invalidCount > 0 ? ` · ${invalidCount} invalid` : ""
-                    }`}
-              </div>
-              <LiquidGlassButton
-                className="plugins-rescan plugin-action"
-                onClick={() => void runDiscover()}
-                tone="control"
-                type="button"
-                disabled={discovering}
-                aria-label="Re-scan plugin folder"
-              >
-                {discovering ? (
-                  <Loader2 className="spin" size={14} />
-                ) : (
-                  <RefreshCw size={14} />
-                )}
-                <span>{discovering ? "Scanning…" : "Re-scan"}</span>
-              </LiquidGlassButton>
-            </div>
-
             {plugins.error ? (
               <div className="plugins-error" role="alert">
                 <AlertTriangle aria-hidden="true" size={14} />
@@ -62,33 +23,30 @@ export function PluginsView() {
             ) : null}
 
             {plugins.lastDiscovery && plugins.lastDiscovery.errors.length > 0 ? (
-              <div className="plugins-discovery-errors" role="status">
-                <div className="plugins-discovery-summary">
-                  Last scan: {plugins.lastDiscovery.discovered} discovered,{" "}
-                  {plugins.lastDiscovery.errors.length} error
-                  {plugins.lastDiscovery.errors.length === 1 ? "" : "s"}
-                </div>
-                <ul className="plugins-discovery-error-list">
-                  {plugins.lastDiscovery.errors.map((entry, index) => (
-                    <li key={`${entry.manifestPath}-${index}`}>
-                      <code title={entry.manifestPath}>{entry.manifestPath}</code>
-                      <span>{entry.message}</span>
-                    </li>
-                  ))}
-                </ul>
+              <div className="plugins-discovery-errors" role="alert">
+                <AlertTriangle aria-hidden="true" size={14} />
+                <span className="plugins-discovery-summary">
+                  {plugins.lastDiscovery.errors.length} installed plugin
+                  {plugins.lastDiscovery.errors.length === 1 ? "" : "s"} could not be loaded.
+                </span>
               </div>
             ) : null}
 
-            <div className="plugins-list" role="list">
+            <div
+              aria-label="Installed plugins"
+              aria-orientation="vertical"
+              className="plugins-list"
+              role="tablist"
+            >
               {plugins.loading && totalCount === 0 ? (
                 <div aria-label="Refreshing plugins" className="empty-panel empty-panel-busy" role="status">
                   <MediaLoadingRing size={18} />
                 </div>
               ) : totalCount === 0 ? (
                 <div className="plugins-empty">
-                  <p className="plugins-empty-title">No plugins discovered yet.</p>
+                  <p className="plugins-empty-title">No plugins discovered.</p>
                   <p className="plugins-empty-hint">
-                    Install a trusted bundled provider, then click Re-scan.
+                    Trusted bundled plugins are detected automatically.
                   </p>
                 </div>
               ) : (
@@ -130,7 +88,7 @@ export function PluginsView() {
             ) : (
               <div className="plugins-detail-empty">
                 {totalCount === 0
-                  ? "Once a plugin is registered, its details will appear here."
+                  ? "Installed plugins will appear here automatically."
                   : "Select a plugin to inspect capabilities, permissions, and manifest details."}
               </div>
             )}

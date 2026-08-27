@@ -1,7 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { HostPluginProjection, PluginDiscoveryError } from "@megle/core-client";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type {
+  HostPluginListResponse,
+  HostPluginProjection,
+  PluginDiscoveryError,
+  PluginDiscoveryResponse
+} from "@megle/core-client";
 import { CoreApiError } from "@megle/core-client";
 import { createCoreClient } from "../../core/client";
+import { PLUGINS_QUERY_KEY } from "./usePluginAuth";
+
+export const PLUGIN_LIST_REFRESH_MS = 30_000;
+export const PLUGIN_DISCOVERY_COOLDOWN_MS = 5_000;
+const EMPTY_PLUGINS: HostPluginProjection[] = [];
 
 export interface PluginsDiscoverySummary {
   discovered: number;
@@ -18,7 +29,6 @@ export interface PluginsState {
   lastDiscovery: PluginsDiscoverySummary | null;
   selectPlugin: (id: string | null) => void;
   refresh: () => Promise<void>;
-  discover: () => Promise<void>;
   enable: (id: string) => Promise<void>;
   disable: (id: string) => Promise<void>;
   approvePermissions: (id: string) => Promise<void>;
@@ -26,14 +36,134 @@ export interface PluginsState {
   remove: (id: string) => Promise<void>;
 }
 
+interface PluginDiscoveryCoordinatorOptions {
+  cooldownMs: number;
+  discover: () => Promise<PluginDiscoveryResponse>;
+  isActive: () => boolean;
+  now?: () => number;
+  onError: (cause: unknown) => void | Promise<void>;
+  onSuccess: (response: PluginDiscoveryResponse) => void | Promise<void>;
+}
+
+export interface PluginDiscoveryCoordinator {
+  run: () => Promise<void>;
+}
+
+export function createPluginDiscoveryCoordinator(
+  options: PluginDiscoveryCoordinatorOptions
+): PluginDiscoveryCoordinator {
+  let inFlight: Promise<void> | null = null;
+  let lastStartedAt = Number.NEGATIVE_INFINITY;
+
+  return {
+    run: () => {
+      if (inFlight) return inFlight;
+
+      const now = options.now?.() ?? Date.now();
+      if (now - lastStartedAt < options.cooldownMs) return Promise.resolve();
+      lastStartedAt = now;
+
+      let operation: Promise<void>;
+      operation = Promise.resolve()
+        .then(options.discover)
+        .then(async (response) => {
+          if (options.isActive()) await options.onSuccess(response);
+        })
+        .catch(async (cause: unknown) => {
+          if (options.isActive()) await options.onError(cause);
+        })
+        .finally(() => {
+          if (inFlight === operation) inFlight = null;
+        });
+      inFlight = operation;
+      return operation;
+    }
+  };
+}
+
+export function reconcilePluginSelection(
+  current: string | null,
+  plugins: HostPluginProjection[]
+): string | null {
+  if (plugins.length === 0) return null;
+  return current && plugins.some((plugin) => plugin.pluginId === current)
+    ? current
+    : plugins[0].pluginId;
+}
+
+type PluginMutationRequest =
+  | { kind: "enable"; pluginId: string }
+  | { kind: "disable"; pluginId: string }
+  | { kind: "approve-permissions"; plugin: HostPluginProjection }
+  | { kind: "retry"; pluginId: string }
+  | { kind: "remove"; pluginId: string };
+
+type PluginMutationResult =
+  | { kind: "replace"; plugin: HostPluginProjection }
+  | { kind: "refresh" }
+  | { kind: "remove"; pluginId: string };
+
 export function usePluginsData(): PluginsState {
   const client = useMemo(() => createCoreClient(), []);
-  const [plugins, setPlugins] = useState<HostPluginProjection[]>([]);
+  const queryClient = useQueryClient();
+  const mountedRef = useRef(false);
   const [selectedPluginId, setSelectedPluginId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   const [busyPluginIds, setBusyPluginIds] = useState<Set<string>>(() => new Set());
-  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [lastDiscovery, setLastDiscovery] = useState<PluginsDiscoverySummary | null>(null);
+
+  const {
+    data: pluginsResponse,
+    error: pluginsQueryError,
+    isLoading,
+    refetch: refetchPlugins
+  } = useQuery({
+    queryKey: PLUGINS_QUERY_KEY,
+    queryFn: () => client.listPlugins(),
+    refetchInterval: PLUGIN_LIST_REFRESH_MS
+  });
+  const plugins = pluginsResponse?.items ?? EMPTY_PLUGINS;
+
+  const discoveryCoordinator = useMemo(
+    () =>
+      createPluginDiscoveryCoordinator({
+        cooldownMs: PLUGIN_DISCOVERY_COOLDOWN_MS,
+        discover: async () => {
+          const response = await client.discoverPlugins();
+          await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY, exact: true });
+          return response;
+        },
+        isActive: () => mountedRef.current,
+        onError: (cause) => {
+          setLastDiscovery(null);
+          setDiscoveryError(errorMessage(cause));
+        },
+        onSuccess: async (response) => {
+          setDiscoveryError(null);
+          setLastDiscovery({ discovered: response.discovered, errors: response.errors });
+        }
+      }),
+    [client, queryClient]
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const discover = () => void discoveryCoordinator.run();
+
+    discover();
+    window.addEventListener("focus", discover);
+    window.addEventListener("online", discover);
+    return () => {
+      mountedRef.current = false;
+      window.removeEventListener("focus", discover);
+      window.removeEventListener("online", discover);
+    };
+  }, [discoveryCoordinator]);
+
+  useEffect(() => {
+    setSelectedPluginId((current) => reconcilePluginSelection(current, plugins));
+  }, [plugins]);
 
   const selectedPlugin = useMemo(
     () => plugins.find((plugin) => plugin.pluginId === selectedPluginId) ?? null,
@@ -52,153 +182,127 @@ export function usePluginsData(): PluginsState {
     });
   }, []);
 
-  const loadPlugins = useCallback(async () => {
-    const response = await client.listPlugins();
-    setPlugins(response.items);
-    setSelectedPluginId((current) => {
-      if (current === null) return current;
-      return response.items.some((plugin) => plugin.pluginId === current) ? current : null;
-    });
-    return response.items;
-  }, [client]);
+  const { mutateAsync: mutatePlugin } = useMutation<
+    PluginMutationResult,
+    unknown,
+    PluginMutationRequest
+  >({
+    mutationFn: async (request) => {
+      switch (request.kind) {
+        case "enable":
+          return { kind: "replace", plugin: await client.enablePlugin(request.pluginId) };
+        case "disable":
+          return { kind: "replace", plugin: await client.disablePlugin(request.pluginId) };
+        case "approve-permissions":
+          return {
+            kind: "replace",
+            plugin: await client.updatePluginGrants(request.plugin.pluginId, {
+              permissions: request.plugin.requestedPermissions
+            })
+          };
+        case "retry":
+          await client.retryPlugin(request.pluginId);
+          return { kind: "refresh" };
+        case "remove":
+          await client.unregisterPlugin(request.pluginId);
+          return { kind: "remove", pluginId: request.pluginId };
+      }
+    },
+    onMutate: (request) => {
+      setActionError(null);
+      markBusy(pluginMutationId(request), true);
+    },
+    onSuccess: async (result) => {
+      if (result.kind === "replace") {
+        queryClient.setQueryData<HostPluginListResponse>(PLUGINS_QUERY_KEY, (current) => ({
+          items: replacePlugin(current?.items ?? [], result.plugin)
+        }));
+        return;
+      }
+      if (result.kind === "remove") {
+        queryClient.setQueryData<HostPluginListResponse>(PLUGINS_QUERY_KEY, (current) => ({
+          items: (current?.items ?? []).filter((plugin) => plugin.pluginId !== result.pluginId)
+        }));
+        return;
+      }
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY, exact: true });
+    },
+    onError: (cause) => setActionError(errorMessage(cause)),
+    onSettled: (_data, _error, request) => markBusy(pluginMutationId(request), false)
+  });
+
+  const runMutation = useCallback(
+    async (request: PluginMutationRequest) => {
+      try {
+        await mutatePlugin(request);
+      } catch {
+        // The mutation callback exposes the error through this controller.
+      }
+    },
+    [mutatePlugin]
+  );
 
   const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      await loadPlugins();
-    } catch (cause) {
-      setError(errorMessage(cause));
-    } finally {
-      setLoading(false);
-    }
-  }, [loadPlugins]);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  const discover = useCallback(async () => {
-    setError(null);
-    try {
-      const response = await client.discoverPlugins();
-      setLastDiscovery({ discovered: response.discovered, errors: response.errors });
-      await loadPlugins();
-    } catch (cause) {
-      setError(errorMessage(cause));
-    }
-  }, [client, loadPlugins]);
-
-  const replacePlugin = useCallback((record: HostPluginProjection) => {
-    setPlugins((current) => current.map((plugin) => (plugin.pluginId === record.pluginId ? record : plugin)));
-  }, []);
+    await refetchPlugins();
+  }, [refetchPlugins]);
 
   const enable = useCallback(
-    async (id: string) => {
-      markBusy(id, true);
-      setError(null);
-      try {
-        const record = await client.enablePlugin(id);
-        replacePlugin(record);
-      } catch (cause) {
-        setError(errorMessage(cause));
-      } finally {
-        markBusy(id, false);
-      }
-    },
-    [client, markBusy, replacePlugin]
+    (pluginId: string) => runMutation({ kind: "enable", pluginId }),
+    [runMutation]
   );
-
   const disable = useCallback(
-    async (id: string) => {
-      markBusy(id, true);
-      setError(null);
-      try {
-        const record = await client.disablePlugin(id);
-        replacePlugin(record);
-      } catch (cause) {
-        setError(errorMessage(cause));
-      } finally {
-        markBusy(id, false);
-      }
-    },
-    [client, markBusy, replacePlugin]
+    (pluginId: string) => runMutation({ kind: "disable", pluginId }),
+    [runMutation]
   );
-
   const approvePermissions = useCallback(
-    async (id: string) => {
-      const plugin = plugins.find((item) => item.pluginId === id);
-      if (!plugin) return;
-      markBusy(id, true);
-      setError(null);
-      try {
-        const record = await client.updatePluginGrants(id, {
-          permissions: plugin.requestedPermissions
-        });
-        replacePlugin(record);
-      } catch (cause) {
-        setError(errorMessage(cause));
-      } finally {
-        markBusy(id, false);
-      }
+    async (pluginId: string) => {
+      const plugin = plugins.find((item) => item.pluginId === pluginId);
+      if (plugin) await runMutation({ kind: "approve-permissions", plugin });
     },
-    [client, markBusy, plugins, replacePlugin]
+    [plugins, runMutation]
   );
-
   const retry = useCallback(
-    async (id: string) => {
-      markBusy(id, true);
-      setError(null);
-      try {
-        await client.retryPlugin(id);
-        await loadPlugins();
-      } catch (cause) {
-        setError(errorMessage(cause));
-      } finally {
-        markBusy(id, false);
-      }
-    },
-    [client, loadPlugins, markBusy]
+    (pluginId: string) => runMutation({ kind: "retry", pluginId }),
+    [runMutation]
   );
-
   const remove = useCallback(
-    async (id: string) => {
-      markBusy(id, true);
-      setError(null);
-      try {
-        await client.unregisterPlugin(id);
-        setPlugins((current) => current.filter((plugin) => plugin.pluginId !== id));
-        setSelectedPluginId((current) => (current === id ? null : current));
-      } catch (cause) {
-        setError(errorMessage(cause));
-      } finally {
-        markBusy(id, false);
-      }
-    },
-    [client, markBusy]
+    (pluginId: string) => runMutation({ kind: "remove", pluginId }),
+    [runMutation]
   );
-
-  const selectPlugin = useCallback((id: string | null) => {
-    setSelectedPluginId(id);
-  }, []);
+  const selectPlugin = useCallback((id: string | null) => setSelectedPluginId(id), []);
 
   return {
     plugins,
     selectedPluginId,
     selectedPlugin,
-    loading,
+    loading: isLoading,
     busyPluginIds,
-    error,
+    error:
+      actionError ??
+      discoveryError ??
+      (pluginsQueryError ? errorMessage(pluginsQueryError) : null),
     lastDiscovery,
     selectPlugin,
     refresh,
-    discover,
     enable,
     disable,
     approvePermissions,
     retry,
     remove
   };
+}
+
+function pluginMutationId(request: PluginMutationRequest): string {
+  return request.kind === "approve-permissions" ? request.plugin.pluginId : request.pluginId;
+}
+
+function replacePlugin(
+  current: HostPluginProjection[],
+  record: HostPluginProjection
+): HostPluginProjection[] {
+  return current.some((plugin) => plugin.pluginId === record.pluginId)
+    ? current.map((plugin) => (plugin.pluginId === record.pluginId ? record : plugin))
+    : [...current, record];
 }
 
 function errorMessage(cause: unknown): string {

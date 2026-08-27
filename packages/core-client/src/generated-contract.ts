@@ -540,6 +540,7 @@ export type PluginPermission =
 
 export interface HostPluginProjection {
   pluginId: string;
+  name: string;
   selectedVersion: string;
   knownGoodVersion: string | null;
   enabledIntent: boolean;

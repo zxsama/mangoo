@@ -26,7 +26,7 @@ declare global {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const pluginBase: HostPluginProjection = {
-  pluginId: "com.megle.onedrive", selectedVersion: "2.0.0", knownGoodVersion: "2.0.0",
+  pluginId: "com.megle.onedrive", name: "Megle OneDrive Sync Provider", selectedVersion: "2.0.0", knownGoodVersion: "2.0.0",
   enabledIntent: true, runtimeState: "ready", authState: "authenticated",
   capabilities: ["sync-provider.v1"], requestedPermissions: [], grantedPermissions: [], permissionRequired: false,
   accountUuid: "account-old", accountDisplayName: "Old account", accountKind: "personal",
@@ -170,6 +170,10 @@ try {
   const advancedFocusedByAction = true;
   const advancedUsesNativeDisclosure = Boolean(document.querySelector("details.onedrive-advanced-configuration > summary.plugin-disclosure-summary"));
   const advancedSummary = control("高级配置")!;
+  const advancedPresentation = {
+    pointerGlowDisabled: advancedSummary.getAttribute("data-pointer-glow") === "off",
+    chevronBeforeLabel: advancedSummary.firstElementChild?.classList.contains("plugin-disclosure-chevron") === true
+  };
   await act(async () => advancedSummary.focus());
   await waitFor(() => document.activeElement === advancedSummary);
   await requestNativeKey("Space");
@@ -218,6 +222,7 @@ try {
   const presentationPlugin: HostPluginProjection = {
     ...pluginBase,
     pluginId: "com.megle.presentation-check",
+    name: "Presentation Check",
     runtimeState: "degraded",
     lastErrorCode: "provider-degraded",
     lastErrorDetail: "raw provider failure"
@@ -230,7 +235,6 @@ try {
   await delay(40);
   const card = presentationHost.querySelector(".plugin-card") as HTMLElement;
   const cardBody = presentationHost.querySelector(".plugin-card-body") as HTMLElement;
-  const cardName = presentationHost.querySelector(".plugin-card-name") as HTMLElement;
   document.body.style.margin = "0";
   presentationHost.style.cssText = "width:320px;margin:80px";
   const cardBounds = card.getBoundingClientRect();
@@ -239,37 +243,57 @@ try {
   const proximityY = Math.round(cardBounds.top + cardBounds.height / 2);
   await act(async () => window.dispatchEvent(new MouseEvent("mousemove", { clientX: proximityX, clientY: proximityY })));
   await delay(30);
-  await waitFor(() => card.getAttribute("data-interactive-pointer-target") === "true");
-  const proximityEdgeStyle = getComputedStyle(card, "::after");
-  const proximity = {
-    activeOutsideBounds: !cardBody.matches(":hover"),
-    opacityActive: card.style.getPropertyValue("--interactive-pointer-opacity").trim() === "1",
-    radialOutlinePresent: proximityEdgeStyle.backgroundImage.includes("radial-gradient"),
-    fullBorderAbsent: proximityEdgeStyle.borderTopWidth === "0px",
-    insetShadowAbsent: proximityEdgeStyle.boxShadow === "none"
+  const outsideInactive = card.getAttribute("data-interactive-pointer-target") !== "true" &&
+    card.style.getPropertyValue("--interactive-pointer-opacity").trim() !== "1" &&
+    cardBody.getAttribute("data-interactive-pointer-target") !== "true" &&
+    cardBody.style.getPropertyValue("--interactive-pointer-opacity").trim() !== "1";
+  await act(async () => window.dispatchEvent(new MouseEvent("mousemove", {
+    clientX: Math.round(cardBounds.left + cardBounds.width / 2),
+    clientY: Math.round(cardBounds.top + cardBounds.height / 2)
+  })));
+  await delay(30);
+  const pointerOptOut = {
+    declared: card.getAttribute("data-pointer-glow") === "off",
+    outsideInactive,
+    insideInactive: card.getAttribute("data-interactive-pointer-target") !== "true" &&
+      card.style.getPropertyValue("--interactive-pointer-opacity").trim() !== "1" &&
+      cardBody.getAttribute("data-interactive-pointer-target") !== "true" &&
+      cardBody.style.getPropertyValue("--interactive-pointer-opacity").trim() !== "1"
   };
   await act(async () => cardBody.click());
-  await waitFor(() => presentationHost.querySelector(".plugin-card-body")?.getAttribute("aria-pressed") === "true");
+  await waitFor(() => presentationHost.querySelector(".plugin-card-body")?.getAttribute("aria-selected") === "true");
   const toggleInput = presentationHost.querySelector('.plugin-toggle input[type="checkbox"]') as HTMLInputElement;
   await act(async () => toggleInput.click());
   await waitFor(() => !(presentationHost.querySelector('.plugin-toggle input[type="checkbox"]') as HTMLInputElement).checked);
   const currentCard = presentationHost.querySelector(".plugin-card") as HTMLElement;
   const currentCardBody = presentationHost.querySelector(".plugin-card-body") as HTMLElement;
   const currentToggleInput = presentationHost.querySelector('.plugin-toggle input[type="checkbox"]') as HTMLInputElement;
-  const cardInteraction = { selected: currentCardBody.getAttribute("aria-pressed") === "true", toggled: !currentToggleInput.checked };
+  const cardInteraction = { selected: currentCardBody.getAttribute("aria-selected") === "true", toggled: !currentToggleInput.checked };
   const cardText = currentCard.textContent ?? "";
+  const cardParts = [...currentCardBody.children].map((child) => child.className);
   const technicalDetails = presentationHost.querySelector("details.plugin-technical-details") as HTMLDetailsElement;
   const technicalSummary = technicalDetails.querySelector("summary") as HTMLElement;
   const removeButton = [...technicalDetails.querySelectorAll("button")].find((item) => item.textContent?.includes("从注册表移除"));
   const conciseCard = {
+    friendlyNameVisible: cardText.includes("Presentation Check"),
+    rawIdHidden: !cardText.includes("com.megle.presentation-check"),
+    oneLineOrder: cardParts.join("|") === "plugin-card-icon|plugin-card-name|plugin-card-version|plugin-status-pill plugin-status-pill-degraded",
     rawErrorHidden: !cardText.includes("raw provider failure"),
     toggleTextHidden: !cardText.includes("Disable"),
     toggleAccessible: currentToggleInput.getAttribute("aria-label") === "Enable"
   };
   const technicalDisclosure = {
     collapsedInitially: !technicalDetails.open,
+    pointerGlowDisabled: technicalSummary.getAttribute("data-pointer-glow") === "off",
+    chevronBeforeLabel: technicalSummary.firstElementChild?.classList.contains("plugin-disclosure-chevron") === true,
     diagnosticsNested: technicalDetails.textContent?.includes("raw provider failure") === true,
     removalNested: Boolean(removeButton)
+  };
+  const detailPanel = technicalDetails.closest(".plugin-detail");
+  const tabRelationship = {
+    controlsPanel: currentCardBody.getAttribute("aria-controls") === detailPanel?.id,
+    panelLabelledByTab: detailPanel?.getAttribute("aria-labelledby") === currentCardBody.id,
+    panelRole: detailPanel?.getAttribute("role") === "tabpanel"
   };
   await act(async () => technicalSummary.focus());
   await waitFor(() => document.activeElement === technicalSummary);
@@ -298,7 +322,7 @@ try {
   const wizardRevision = { staleIntentCleared: document.body.textContent?.includes("资源库上下文已变化") === true };
   await act(async () => staleWizardRoot.unmount()); wizardHost.remove();
 
-  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, configConfirm, configNoop, advancedUsesNativeDisclosure, advancedFocusedByAction, advancedClosedWithKeyboard, advancedOpenedWithKeyboard, readOnly, unmountCleanup, proximity, cardInteraction, conciseCard, technicalDisclosure, technicalOpenedWithKeyboard, wizardResume, wizardRevision };
+  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, configConfirm, configNoop, advancedUsesNativeDisclosure, advancedPresentation, advancedFocusedByAction, advancedClosedWithKeyboard, advancedOpenedWithKeyboard, readOnly, unmountCleanup, pointerOptOut, cardInteraction, conciseCard, tabRelationship, technicalDisclosure, technicalOpenedWithKeyboard, wizardResume, wizardRevision };
 } catch (error) {
   (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: false, error: error instanceof Error ? error.stack ?? error.message : String(error) };
 }

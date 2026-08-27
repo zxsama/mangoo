@@ -21,6 +21,7 @@ const configuration: OneDriveConfiguration = {
 function plugin(overrides: Partial<HostPluginProjection> = {}): HostPluginProjection {
   return {
     pluginId: "com.megle.onedrive",
+    name: "Megle OneDrive Sync Provider",
     selectedVersion: "2.0.0",
     knownGoodVersion: "2.0.0",
     enabledIntent: true,
@@ -90,13 +91,27 @@ describe("OneDrive plugin auth presentation", () => {
     const detail = readFileSync(new URL("../src/features/plugins/PluginDetail.tsx", import.meta.url), "utf8");
 
     assert.match(setup, /<details[\s\S]*onedrive-advanced-configuration/);
-    assert.match(setup, /<summary[\s\S]*高级配置/);
+    assert.match(setup, /<summary[^>]*data-pointer-glow="off"[\s\S]*plugin-disclosure-chevron[\s\S]*plugin-disclosure-label">高级配置/);
     assert.match(setup, /检查更改/);
     assert.doesNotMatch(setup, /预览更改|收起高级配置/);
+    assert.doesNotMatch(setup, /重新扫描/);
     assert.match(card, /aria-label=\{toggleLabel\}/);
+    assert.match(card, /data-pointer-glow="off"/);
+    assert.match(card, /role="tab"/);
+    assert.match(card, /aria-selected=\{selected\}/);
+    assert.match(card, /aria-controls=\{selected \? pluginPanelId\(plugin\.pluginId\) : undefined\}/);
+    assert.match(card, /id=\{pluginTabId\(plugin\.pluginId\)\}/);
+    assert.match(card, /onKeyDown=\{handleTabKeyDown\}/);
+    assert.match(card, /\{plugin\.name\}/);
+    assert.match(card, /plugin-card-icon/);
+    assert.doesNotMatch(card, /LiquidGlassSurface|aria-pressed/);
     assert.doesNotMatch(card, /plugin-card-error|plugin-toggle-label/);
     assert.match(detail, /<details className="plugin-disclosure plugin-technical-details">/);
-    assert.match(detail, /技术信息/);
+    assert.match(detail, /<summary[^>]*data-pointer-glow="off"[\s\S]*plugin-disclosure-chevron[\s\S]*plugin-disclosure-label">技术信息/);
+    assert.match(detail, /plugin-detail-title">\{plugin\.name\}/);
+    assert.match(detail, /aria-labelledby=\{pluginTabId\(plugin\.pluginId\)\}/);
+    assert.match(detail, /id=\{pluginPanelId\(plugin\.pluginId\)\}/);
+    assert.match(detail, /role="tabpanel"/);
     assert.match(detail, /tone="danger"/);
     assert.doesNotMatch(detail, /<dt>Intent<\/dt>|<dt>Authentication<\/dt>|plugin-detail-id/);
   });
