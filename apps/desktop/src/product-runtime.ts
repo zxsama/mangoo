@@ -47,6 +47,10 @@ export function packagedWindowIconPath(isPackaged: boolean, resourcesPath: strin
   return isPackaged ? path.join(resourcesPath, "icon.png") : undefined;
 }
 
+export function mainWindowSkipsTaskbarDuringBootstrap(isPackaged: boolean): boolean {
+  return !isPackaged;
+}
+
 export function withDefaultHostStorage(
   session: CoreSession,
   userDataDir: string

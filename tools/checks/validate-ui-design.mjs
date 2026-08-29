@@ -251,8 +251,13 @@ if (nativeMaterial.unsafeTopLevelSpreads.length > 0) {
   fail("desktop BrowserWindow options must not use top-level spreads that can override acrylic transparency settings");
 }
 
-if (!/show:\s*true\b/.test(desktopMain) || !/skipTaskbar:\s*true\b/.test(desktopMain)) {
-  fail("desktop window must start as an offscreen skip-taskbar composition bootstrap window so Windows acrylic is active before user-visible reveal");
+if (
+  !/show:\s*true\b/.test(desktopMain) ||
+  !/skipTaskbar:\s*mainWindowSkipsTaskbarDuringBootstrap\(app\.isPackaged\)/.test(desktopMain) ||
+  !/window\.setSkipTaskbar\(mainWindowSkipsTaskbarDuringBootstrap\(app\.isPackaged\)\)/.test(desktopMain) ||
+  !/window\.setSkipTaskbar\(false\)/.test(desktopMain)
+) {
+  fail("desktop main window must remain taskbar-registered throughout packaged composition bootstrap and become taskbar-visible on reveal");
 }
 
 if (!/ready-to-show/.test(desktopMain)) {

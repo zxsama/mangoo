@@ -667,7 +667,7 @@ for (const value of ["favicon.svg", "icon.png", "icon.ico", "sharp"]) {
     fail(`desktop icon generator missing ${value}`);
   }
 }
-for (const value of ["MEGLE_APP_USER_MODEL_ID", "MEGLE_CORE_BINARY", "MEGLE_SERVE_WEB", "MEGLE_WEB_DIR", "MEGLE_PARENT_PID", "packagedApplicationIdentity", "rendererUrlForSession", "withDefaultHostStorage"]) {
+for (const value of ["MEGLE_APP_USER_MODEL_ID", "MEGLE_CORE_BINARY", "MEGLE_SERVE_WEB", "MEGLE_WEB_DIR", "MEGLE_PARENT_PID", "packagedApplicationIdentity", "packagedWindowIconPath", "mainWindowSkipsTaskbarDuringBootstrap", "rendererUrlForSession", "withDefaultHostStorage"]) {
   if (!productRuntime.includes(value)) {
     fail(`packaged desktop runtime missing ${value}`);
   }
@@ -682,7 +682,7 @@ for (const value of ["isPackagedWindowsGuiProcess", "megle.exe", "process.stdout
     fail(`desktop logger missing packaged no-console guard: ${value}`);
   }
 }
-for (const value of ["configurePackagedRuntime", "app.setName", "app.setAppUserModelId", "app.requestSingleInstanceLock", "packagedWindowIconPath", "rendererUrlForSession"]) {
+for (const value of ["configurePackagedRuntime", "app.setName", "app.setAppUserModelId", "app.requestSingleInstanceLock", "packagedWindowIconPath", "mainWindowSkipsTaskbarDuringBootstrap", "rendererUrlForSession"]) {
   if (!main.includes(value)) {
     fail(`desktop main missing packaged application identity/runtime contract: ${value}`);
   }

@@ -83,6 +83,7 @@ import {
 import { SecondaryWindowOpeningCoordinator } from "./secondary-window-opening.js";
 import {
   configurePackagedRuntime,
+  mainWindowSkipsTaskbarDuringBootstrap,
   packagedApplicationIdentity,
   packagedWindowIconPath,
   rendererUrlForSession,
@@ -1060,7 +1061,7 @@ async function createWindow(): Promise<void> {
     icon: windowIcon,
     show: true,
     frame: false,
-    skipTaskbar: true,
+    skipTaskbar: mainWindowSkipsTaskbarDuringBootstrap(app.isPackaged),
     webPreferences: {
       preload: fileURLToPath(new URL("./preload.cjs", import.meta.url)),
       contextIsolation: true,
@@ -1920,7 +1921,7 @@ async function prepareWindowCompositionForReveal(window: BrowserWindow): Promise
   if (window.isDestroyed()) {
     return;
   }
-  window.setSkipTaskbar(true);
+  window.setSkipTaskbar(mainWindowSkipsTaskbarDuringBootstrap(app.isPackaged));
   applyWindowMaterial(window);
   primeWindowComposition(window);
   await new Promise((resolve) => setTimeout(resolve, 80));

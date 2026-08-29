@@ -3,6 +3,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import {
   configurePackagedRuntime,
+  mainWindowSkipsTaskbarDuringBootstrap,
   MEGLE_APP_USER_MODEL_ID,
   packagedApplicationIdentity,
   packagedWindowIconPath,
@@ -76,6 +77,11 @@ describe("packaged desktop runtime", () => {
       path.join("C:\\Megle\\resources", "icon.png")
     );
     assert.equal(packagedWindowIconPath(false, "C:\\Megle\\resources"), undefined);
+  });
+
+  it("keeps the packaged main window registered with the taskbar during bootstrap", () => {
+    assert.equal(mainWindowSkipsTaskbarDuringBootstrap(true), false);
+    assert.equal(mainWindowSkipsTaskbarDuringBootstrap(false), true);
   });
 
   it("preserves launcher-selected Host storage and fills only missing defaults", () => {
