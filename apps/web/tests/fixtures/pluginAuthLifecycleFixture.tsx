@@ -44,6 +44,7 @@ let planRequestCount = 0;
 let activeContextRevision = 1;
 let remoteLibraryCalls = 0;
 let enableCalls = 0;
+let retryCalls = 0;
 const grantBodies: unknown[] = [];
 
 function json(body: unknown, status = 200) {
@@ -56,6 +57,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (path.endsWith("/plugins") && (!init?.method || init.method === "GET")) return json({ items: [plugin] });
   if (path.endsWith("/configuration") && (!init?.method || init.method === "GET")) return json(configuration);
   if (path.endsWith("/enable") && init?.method === "POST") { enableCalls += 1; plugin = { ...plugin, enabledIntent: true }; return json(plugin); }
+  if (path.endsWith("/retry") && init?.method === "POST") { retryCalls += 1; plugin = { ...plugin, runtimeState: "ready", authState: "authorization-required", lastErrorCode: null, lastErrorDetail: null }; return json(plugin); }
   if (path.endsWith("/grants") && init?.method === "PUT") { const body = JSON.parse(String(init.body)); grantBodies.push(body); plugin = { ...plugin, grantedPermissions: body.permissions, permissionRequired: false, runtimeState: plugin.enabledIntent ? "ready" : "disabled" }; return json(plugin); }
   if (path.endsWith("/auth/sign-out")) { plugin = { ...plugin, authState: "signed-out", accountUuid: null, accountDisplayName: null, accountKind: null }; return json({ accepted: true }); }
   if (path.endsWith("/auth/begin")) {
@@ -154,7 +156,6 @@ try {
   cancelFails = true;
   stage = "begin manual";
   await clickWizard("登录 Microsoft 账号");
-  if (!document.querySelector("textarea")) await click("继续登录");
   await waitFor(() => Boolean(document.querySelector("textarea")));
   await clickWizard("取消授权"); await waitFor(() => document.body.textContent?.includes("cancel failed") === true);
   const cancelFailure = { flowRetained: Boolean(document.querySelector("textarea")), retryAvailable: Boolean(wizardButton("取消授权")) };
@@ -172,6 +173,7 @@ try {
   await queryClient.invalidateQueries({ queryKey: ["plugins"] });
   await queryClient.invalidateQueries({ queryKey: ["plugins", "com.megle.onedrive", "configuration"] });
   await waitFor(() => Boolean(button("配置 OneDrive")));
+  const ineffectiveStatusVisible = document.body.textContent?.includes("配置未生效") === true;
   await click("配置 OneDrive");
   await waitFor(() => document.body.textContent?.includes("注册并配置 Microsoft Entra 应用") === true);
   const disabledConfiguration = { wizardOpened: true, enableStayedExplicit: enableCalls === 0 };
@@ -251,13 +253,13 @@ try {
   const transientHost = document.createElement("div"); document.body.append(transientHost);
   const transientRoot = createRoot(transientHost);
   await act(async () => transientRoot.render(<TransientInputFixture />));
-  await click("继续登录");
+  await click("配置 OneDrive");
   await waitFor(() => Boolean(document.querySelector("textarea")));
   await input("textarea", "sensitive-response-uri");
   await act(async () => transientRoot.unmount());
   const remountedRoot = createRoot(transientHost);
   await act(async () => remountedRoot.render(<TransientInputFixture />));
-  await click("继续登录");
+  await click("配置 OneDrive");
   await waitFor(() => Boolean(document.querySelector("textarea")));
   const unmountCleanup = { responseUriGone: !document.body.textContent?.includes("sensitive-response-uri"), flowGone: (document.querySelector("textarea") as HTMLTextAreaElement).value === "" };
   await act(async () => remountedRoot.unmount()); transientHost.remove();
@@ -353,8 +355,17 @@ try {
   configuration = { ...configBase }; activeContextRevision = 7; remoteLibraryCalls = 0;
   const wizardHost = document.createElement("div"); document.body.append(wizardHost); const wizardRoot = createRoot(wizardHost);
   await act(async () => wizardRoot.render(<WizardFixture />));
-  stage = "wizard stable resume"; await waitFor(() => Boolean(button("登录 Microsoft 账号")));
-  await click("登录 Microsoft 账号"); await waitFor(() => Boolean(button("登录 Microsoft 账号")));
+  stage = "wizard stable resume"; await waitFor(() => Boolean(button("配置 OneDrive")));
+  const stableActionStatus = { ineffectiveStatusVisible, effectiveStatusVisible: document.body.textContent?.includes("配置已生效") === true, signedOutVisible: document.body.textContent?.includes("尚未登录") === true };
+  await click("配置 OneDrive"); await waitFor(() => Boolean(button("登录 Microsoft 账号")));
+  await clickWizard("取消");
+  plugin = { ...plugin, runtimeState: "degraded", authState: "error", lastErrorCode: "provider-degraded", lastErrorDetail: "provider temporarily unavailable" };
+  await queryClient.invalidateQueries({ queryKey: ["plugins"] });
+  await waitFor(() => document.body.textContent?.includes("需要重新连接") === true);
+  const retriesBeforeConfiguration = retryCalls;
+  await click("配置 OneDrive");
+  await waitFor(() => retryCalls > retriesBeforeConfiguration && Boolean(button("登录 Microsoft 账号")));
+  const retryState = { stableLabel: Boolean(button("配置 OneDrive")), runtimeRetried: retryCalls === retriesBeforeConfiguration + 1 };
   await click("登录 Microsoft 账号"); await waitFor(() => Boolean(document.querySelector("textarea")));
   await input("textarea", "https://login.microsoftonline.com/common/oauth2/nativeclient?code=wizard&state=s"); await click("验证并连接");
   await waitFor(() => remoteLibraryCalls > 0 && document.activeElement?.textContent?.includes("从 OneDrive 恢复") === true);
@@ -363,13 +374,13 @@ try {
   await act(async () => wizardRoot.unmount()); queryClient.clear();
   plugin = { ...pluginBase, authState: "authorization-required", accountUuid: null, accountDisplayName: null, accountKind: null }; activeContextRevision = 9;
   const staleWizardRoot = createRoot(wizardHost); await act(async () => staleWizardRoot.render(<WizardFixture />));
-  stage = "wizard stale revision"; await waitFor(() => Boolean(button("登录 Microsoft 账号"))); await click("登录 Microsoft 账号"); await waitFor(() => Boolean(button("登录 Microsoft 账号"))); await click("登录 Microsoft 账号"); await waitFor(() => Boolean(document.querySelector("textarea")));
+  stage = "wizard stale revision"; await waitFor(() => Boolean(button("配置 OneDrive"))); await click("配置 OneDrive"); await waitFor(() => Boolean(button("登录 Microsoft 账号"))); await click("登录 Microsoft 账号"); await waitFor(() => Boolean(document.querySelector("textarea")));
   activeContextRevision = 10;
   await waitFor(() => document.body.textContent?.includes("资源库上下文已变化") === true);
   const wizardRevision = { staleIntentCleared: document.body.textContent?.includes("资源库上下文已变化") === true };
   await act(async () => staleWizardRoot.unmount()); wizardHost.remove();
 
-  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, disabledConfiguration, configurationPreparation, configConfirm, configNoop, portalOpenFailureVisible, reopenState, wizardGates, wizardLayout, readOnly, unmountCleanup, pointerOptOut, cardInteraction, conciseCard, tabRelationship, technicalDisclosure, technicalOpenedWithKeyboard, wizardResume, wizardRevision };
+  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, disabledConfiguration, configurationPreparation, stableActionStatus, retryState, configConfirm, configNoop, portalOpenFailureVisible, reopenState, wizardGates, wizardLayout, readOnly, unmountCleanup, pointerOptOut, cardInteraction, conciseCard, tabRelationship, technicalDisclosure, technicalOpenedWithKeyboard, wizardResume, wizardRevision };
 } catch (error) {
   (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: false, error: error instanceof Error ? error.stack ?? error.message : String(error) };
 }

@@ -1521,10 +1521,17 @@ for (const value of [
 for (const value of [
   "OneDriveSetupWizard",
   "配置 OneDrive",
-  "登录 Microsoft 账号"
+  "配置未生效",
+  "配置已生效",
+  "configurationStatusDescription"
 ]) {
   if (!oneDriveAccountSetup.includes(value)) {
     fail(`OneDrive concise setup entry contract missing ${value}`);
+  }
+}
+for (const retiredAction of [">登录 Microsoft 账号<", ">继续登录<", ">重新连接<"]) {
+  if (oneDriveAccountSetup.includes(retiredAction)) {
+    fail(`OneDrive primary setup action must remain stable; found ${retiredAction}`);
   }
 }
 for (const value of [

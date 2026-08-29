@@ -115,6 +115,12 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(setupWizard, /clientIdValid/);
     assert.match(setupWizard, /auth\.plugin\?\.authState === "authenticated"/);
     assert.match(setup, /确认切换 OneDrive 账号/);
+    assert.match(setup, /配置已生效/);
+    assert.match(setup, /配置未生效/);
+    assert.match(setup, /configurationStatusDescription/);
+    assert.doesNotMatch(setup, />登录 Microsoft 账号<|>继续登录<|>重新连接</);
+    assert.match(setup, /oneDriveSetupRecoveryStep\(auth\.error \?\? auth\.plugin\?\.lastErrorDetail \?\? null\) \?\? deriveOneDriveSetupStep\(auth\.configuration, false\)/);
+    assert.match(setup, /auth\.plugin\?\.runtimeState === "degraded" \|\| auth\.plugin\?\.runtimeState === "crashed-backoff"/);
     assert.doesNotMatch(setup, /<button\b/);
     assert.match(wizard, /authResumeRef/);
     assert.match(wizard, /active\.contextRevision !== intent\.contextRevision/);
