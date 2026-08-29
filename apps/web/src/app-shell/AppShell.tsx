@@ -132,6 +132,10 @@ export function AppShell({
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+    // Pointer-down focuses the separator so keyboard resizing remains available
+    // during the drag. Clear that pointer-acquired focus when the gesture ends;
+    // otherwise :focus-visible can keep the divider highlighted after hover ends.
+    event.currentTarget.blur();
     document.body.dataset.shellResizing = "false";
     window.dispatchEvent(new Event("megle:shell-resize-state"));
     setActiveResizeSide(null);
