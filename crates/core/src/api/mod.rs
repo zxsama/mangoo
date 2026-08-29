@@ -444,10 +444,17 @@ pub fn router_with_state(state: AppState, config: ApiConfig) -> Router {
     if let Some(web_dir) = config.web_dir.as_ref() {
         let index_path = web_dir.join("index.html");
         let assets_dir = web_dir.join("assets");
+        let content_security_policy = HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'",
+        );
 
         // Long-lived cache for hashed asset filenames under `assets/`.
         let assets_service = ServeDir::new(&assets_dir);
         let assets_with_cache = tower::ServiceBuilder::new()
+            .layer(SetResponseHeaderLayer::overriding(
+                HeaderName::from_static("content-security-policy"),
+                content_security_policy.clone(),
+            ))
             .layer(SetResponseHeaderLayer::overriding(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -460,6 +467,10 @@ pub fn router_with_state(state: AppState, config: ApiConfig) -> Router {
         // assets keep their immutable cache via the `/assets` mount above.
         let serve_dir = ServeDir::new(web_dir).fallback(ServeFile::new(&index_path));
         let static_with_cache = tower::ServiceBuilder::new()
+            .layer(SetResponseHeaderLayer::overriding(
+                HeaderName::from_static("content-security-policy"),
+                content_security_policy,
+            ))
             .layer(SetResponseHeaderLayer::overriding(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("no-cache"),

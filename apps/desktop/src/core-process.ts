@@ -176,13 +176,14 @@ export function startCoreProcess(
 
   const binaryPath = coreBinaryPath();
   if (!fs.existsSync(binaryPath)) {
-    throw new Error(
-      `Core debug binary is missing at ${binaryPath}. Run "cargo build -p megle-core" before starting internal desktop Core.`
-    );
+    const recovery = process.env.MEGLE_CORE_BINARY
+      ? "Rebuild the packaged desktop application before launching it."
+      : 'Run "cargo build -p megle-core" before starting internal desktop Core.';
+    throw new Error(`Core binary is missing at ${binaryPath}. ${recovery}`);
   }
 
   const child = spawn(binaryPath, [], {
-    cwd: repoRoot(),
+    cwd: process.env.MEGLE_CORE_BINARY ? path.dirname(binaryPath) : repoRoot(),
     env: {
       ...process.env,
       MEGLE_CORE_ADDR: session.bindAddress,
@@ -515,6 +516,8 @@ function repoRoot(): string {
 }
 
 function coreBinaryPath(): string {
+  const configuredBinary = process.env.MEGLE_CORE_BINARY?.trim();
+  if (configuredBinary) return path.resolve(configuredBinary);
   const binaryName = process.platform === "win32" ? "megle-core.exe" : "megle-core";
   // MEGLE_CORE_PROFILE selects the cargo build profile directory. Defaults to
   // "debug" (the `npm run dev` flow). The production launcher sets "release".

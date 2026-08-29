@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
   ProcessLogBuffer,
   type ProcessLogLevel,
@@ -156,4 +157,14 @@ function normalizeLog(source: ProcessLogSource, level: ProcessLogLevel, args: un
 }
 
 export const processLogBuffer = new ProcessLogBuffer();
-export const desktopLogger = new DesktopLogger({ buffer: processLogBuffer });
+// Packaged Windows GUI processes have no stable stdout/stderr owner. Electron
+// can still expose console methods backed by a pipe that disappears as soon as
+// the short-lived build launcher exits, turning an ordinary log line into an
+// uncaught EPIPE. The in-app ProcessLogBuffer remains active in every mode.
+// Repository/dev runs still mirror logs (including piped visual harnesses);
+// only the packaged GUI suppresses a console sink when no terminal exists.
+const isPackagedWindowsGuiProcess =
+  process.platform === "win32" && path.basename(process.execPath).toLowerCase() === "megle.exe";
+const desktopConsole =
+  !isPackagedWindowsGuiProcess || process.stdout?.isTTY || process.stderr?.isTTY ? console : {};
+export const desktopLogger = new DesktopLogger({ buffer: processLogBuffer, console: desktopConsole });

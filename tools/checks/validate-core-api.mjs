@@ -203,7 +203,7 @@ if (!mainRs.includes("MEGLE_WEB_DIR")) {
 if (!mainRs.includes("MEGLE_BASIC_AUTH")) {
   fail("main.rs must read MEGLE_BASIC_AUTH to enable HTTP Basic auth");
 }
-for (const value of ["pub web_dir", "pub basic_auth", "BasicAuthCredentials", "ServeDir", "ServeFile"]) {
+for (const value of ["pub web_dir", "pub basic_auth", "BasicAuthCredentials", "ServeDir", "ServeFile", "content-security-policy"]) {
   if (!apiModRs.includes(value)) {
     fail(`Core API static-serve / basic-auth wiring missing ${value}`);
   }

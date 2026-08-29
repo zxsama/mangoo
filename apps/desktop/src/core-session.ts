@@ -40,6 +40,9 @@ export async function createCoreSession(): Promise<CoreSession> {
   }
 
   const baseUrl = configuredBaseUrl ?? `http://${bindAddress}/api`;
+  const packagedRendererOrigin = process.env.MEGLE_SERVE_WEB === "1"
+    ? `http://${bindAddress}`
+    : undefined;
 
   return {
     baseUrl,
@@ -48,7 +51,10 @@ export async function createCoreSession(): Promise<CoreSession> {
     librariesDir: process.env.MEGLE_LIBRARIES_DIR,
     sessionToken,
     allowedOrigin:
-      process.env.MEGLE_ALLOWED_ORIGIN ?? process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173"
+      process.env.MEGLE_ALLOWED_ORIGIN ??
+      process.env.MEGLE_WEB_URL ??
+      packagedRendererOrigin ??
+      "http://127.0.0.1:5173"
   };
 }
 

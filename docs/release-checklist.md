@@ -165,7 +165,7 @@ Expected:
    ```
 4. Create a GitHub release on the new tag and upload the built artifacts:
    - `target/release/megle-core[.exe]`
-   - `apps/desktop/dist/` packaged via `electron-builder` (or the chosen packager)
+   - `.data/desktop-release/win-unpacked/` produced by `npm run build:desktop-package`
    - `apps/web/dist/` zipped for static hosting
 5. Smoke the released artifacts on a clean Windows machine before announcing.
 

@@ -10720,6 +10720,14 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert_eq!(cache, "no-cache");
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("connect-src 'self'"));
         let bytes = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read fallback body");
@@ -10748,6 +10756,12 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert_eq!(cache, "public, max-age=31536000, immutable");
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(csp.contains("default-src 'self'"));
 
         let _ = fs::remove_dir_all(web_dir);
     }

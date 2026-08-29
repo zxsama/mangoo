@@ -331,12 +331,55 @@ function skipIgnored(source, start) {
     return blockEnd === -1 ? source.length : blockEnd + 2;
   }
 
+  if (source[start] === "/" && isRegexLiteralStart(source, start)) {
+    return findRegexEnd(source, start);
+  }
+
   const quote = source[start];
   if (quote === '"' || quote === "'" || quote === "`") {
     return findStringEnd(source, start, quote);
   }
 
   return start;
+}
+
+function isRegexLiteralStart(source, start) {
+  for (let index = start - 1; index >= 0; index -= 1) {
+    if (/\s/.test(source[index])) continue;
+    return "([{=,:;!?&|+-*%^~<>".includes(source[index]);
+  }
+  return true;
+}
+
+function findRegexEnd(source, start) {
+  let escaped = false;
+  let inCharacterClass = false;
+  for (let index = start + 1; index < source.length; index += 1) {
+    const char = source[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "[") {
+      inCharacterClass = true;
+      continue;
+    }
+    if (char === "]") {
+      inCharacterClass = false;
+      continue;
+    }
+    if (char === "/" && !inCharacterClass) {
+      let end = index + 1;
+      while (/[A-Za-z]/.test(source[end] ?? "")) end += 1;
+      return end;
+    }
+    if (char === "\n" || char === "\r") return start;
+  }
+  return source.length;
 }
 
 function findStringEnd(source, start, quote) {

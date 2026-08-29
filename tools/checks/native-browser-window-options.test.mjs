@@ -38,6 +38,7 @@ assert.deepEqual(rejected.missingRequiredProperties, [
 ]);
 
 const valid = inspectNativeBrowserWindowOptions(`
+  const safeName = input.replace(/[<>:"/\\\\|?*\\u0000-\\u001f]/g, " ");
   const win = new BrowserWindow({
     title: "literal with frame: true",
     frame: false,

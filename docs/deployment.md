@@ -1,4 +1,19 @@
-# Megle Deployment (Docker)
+# Megle Deployment
+
+## Windows packaged local launch
+
+From the repository root, run `start-desktop-prod.bat` (optionally passing a
+folder to add on first launch). The launcher incrementally builds the release
+Core, bundled Providers, Web renderer, and Desktop shell, then creates and
+starts `.data/desktop-release/win-unpacked/Megle.exe`.
+
+After startup, the batch/Node build process exits. `Megle.exe` owns the Core
+sidecar, Core serves the packaged renderer on its allocated loopback origin,
+and no Vite preview or fixed port `4173` is required. Use
+`npm run build:desktop-package` to rebuild the unpacked product without
+launching it. This local directory package is unsigned and is not an installer.
+
+## Docker
 
 This guide covers running Megle as a headless service in Docker. Core serves
 both the HTTP API and the built React UI, so a single container is enough to
@@ -128,6 +143,7 @@ you remove the `:ro` flag.
 | `MEGLE_BASIC_AUTH` | Browser/API Basic auth. Compose uses a development credential that must be overridden for production. | `megle:change-me` (Compose) |
 | `MEGLE_SESSION_TOKEN` | Optional desktop session token. | _(unset)_ |
 | `MEGLE_ALLOWED_ORIGIN` | Optional dev CORS origin (exact match). | _(unset)_ |
+| `MEGLE_PARENT_PID` | Packaged Desktop PID watched by Core so an unexpected Electron exit also shuts down Core and its Provider jobs. Set automatically by `Megle.exe`; do not set manually. | _(unset)_ |
 | `RUST_LOG` | Tracing filter. | `info` |
 
 Override any of them via `compose.yaml` or the `-e` flag on `docker run`.

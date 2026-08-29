@@ -82,6 +82,13 @@ import {
 } from "./secondary-window-reveal.js";
 import { SecondaryWindowOpeningCoordinator } from "./secondary-window-opening.js";
 import {
+  configurePackagedRuntime,
+  packagedApplicationIdentity,
+  packagedWindowIconPath,
+  rendererUrlForSession,
+  withDefaultHostStorage
+} from "./product-runtime.js";
+import {
   createStartupLogEmitter,
   type StartupLogEmitter
 } from "./startup-logging.js";
@@ -1036,6 +1043,7 @@ async function createWindow(): Promise<void> {
   launchWindowPlacement = placement;
   launchWindowMaximized = state.maximized;
   windowStatePersistenceEnabled = false;
+  const windowIcon = packagedWindowIconPath(app.isPackaged, process.resourcesPath);
 
   mainWindow = new BrowserWindow({
     title: runId ? `Megle ${runId}` : "Megle",
@@ -1049,6 +1057,7 @@ async function createWindow(): Promise<void> {
     transparent: false,
     backgroundColor: "#00000000",
     roundedCorners: true,
+    icon: windowIcon,
     show: true,
     frame: false,
     skipTaskbar: true,
@@ -1139,9 +1148,9 @@ async function createWindow(): Promise<void> {
     mainWindow = null;
   });
 
-  const devServer = process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173";
+  const rendererUrl = process.env.MEGLE_WEB_URL ?? rendererUrlForSession(session);
   try {
-    await window.loadURL(devServer);
+    await window.loadURL(rendererUrl);
     armShellReadyFailureFallback(window);
   } catch (error) {
     await revealMainWindowForLaunchFailure(window, "loadURL-rejected");
@@ -1183,6 +1192,7 @@ async function createSecondaryWindow(
   const config = SECONDARY_WINDOW_CONFIGS[role];
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
   const position = resolveSecondaryWindowPosition(role, parent, config);
+  const windowIcon = packagedWindowIconPath(app.isPackaged, process.resourcesPath);
   const window = new BrowserWindow({
     title: config.title,
     width: config.width,
@@ -1198,6 +1208,7 @@ async function createSecondaryWindow(
     transparent: false,
     backgroundColor: "#00000000",
     roundedCorners: true,
+    icon: windowIcon,
     show: false,
     frame: false,
     skipTaskbar: false,
@@ -1274,9 +1285,11 @@ async function createSecondaryWindow(
     );
   });
 
-  const devServer = process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173";
+  const rendererUrl = process.env.MEGLE_WEB_URL
+    ? `${process.env.MEGLE_WEB_URL}${config.route}`
+    : rendererUrlForSession(session, config.route);
   try {
-    await window.loadURL(`${devServer}${config.route}`);
+    await window.loadURL(rendererUrl);
   } catch (error) {
     desktopLogger.warn("main", `[megle] ${role} window loadURL rejected:`, error);
     destroyFailedSecondaryWindow(
@@ -1634,12 +1647,7 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
 // The Desktop owns one long-lived Host process; library activation is a Core API mutation.
 async function createColdStartSession(): Promise<CoreSession> {
   const base = await createCoreSession();
-  const hostRoot = path.join(userDataDir(), "host");
-  return {
-    ...base,
-    hostDbPath: path.join(hostRoot, "host.sqlite"),
-    librariesDir: path.join(hostRoot, "libraries")
-  };
+  return withDefaultHostStorage(base, userDataDir());
 }
 
 // Gracefully restart Core pointed at a new database file, reusing the same
@@ -2081,7 +2089,35 @@ function resolvePluginsDir(): string {
   );
 }
 
-app
+configurePackagedRuntime({
+  isPackaged: app.isPackaged,
+  resourcesPath: process.resourcesPath,
+  parentPid: process.pid
+});
+const packagedIdentity = packagedApplicationIdentity(app.isPackaged);
+if (packagedIdentity) {
+  app.setName(packagedIdentity.name);
+  if (packagedIdentity.appUserModelId) {
+    app.setAppUserModelId(packagedIdentity.appUserModelId);
+  }
+}
+
+const hasSingleInstanceLock = !app.isPackaged || app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+}
+
+if (app.isPackaged) {
+  app.on("second-instance", () => {
+    const window = mainWindow;
+    if (!window || window.isDestroyed()) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+  });
+}
+
+if (hasSingleInstanceLock) app
   .whenReady()
   .then(async () => {
     void ensureNotificationService().catch((error) => {

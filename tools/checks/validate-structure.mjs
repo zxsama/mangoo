@@ -677,6 +677,7 @@ const requiredFiles = [
   "apps/desktop/src/core-process.ts",
   "apps/desktop/src/core-session.ts",
   "apps/desktop/src/main.ts",
+  "apps/desktop/src/product-runtime.ts",
   "apps/desktop/src/notification-ipc.ts",
   "apps/desktop/src/notification-service.ts",
   "apps/desktop/src/notification-store.ts",
@@ -743,6 +744,8 @@ const requiredFiles = [
   "tools/checks/desktop-harness-lib.mjs",
   "tools/checks/desktop-os-backdrop.mjs",
   "tools/build/build-bundled-plugins.mjs",
+  "tools/build/generate-desktop-icon.mjs",
+  "tools/build/package-desktop.mjs",
   "tools/checks/sync-integration.mjs",
   "tools/checks/sync-fault-matrix.json",
   "tools/checks/sync-fault-matrix.mjs",
@@ -766,6 +769,8 @@ const forbiddenGeneratedPaths = [
 ];
 
 const forbiddenLegacyPaths = [
+  "tools/dev/prod-preview.mjs",
+  "tools/dev/prod-preview.test.mjs",
   `apps/web/src/features/tasks/${["Task", "Panel"].join("")}.tsx`,
   `apps/web/src/features/tasks/${["Task", "Center"].join("")}.tsx`,
   `apps/web/src/features/tasks/${["Task", "Overlay"].join("")}.tsx`,

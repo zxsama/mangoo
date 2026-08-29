@@ -16,7 +16,8 @@
     "check:core-api": "node tools/checks/validate-core-api.mjs",
     "check:core-client": "npm --workspace @megle/core-client run check && npm --workspace @megle/core-client run typecheck && npm --workspace @megle/core-client run test",
     "check:notification-contract": "npm --workspace @megle/notification-contract run check && npm --workspace @megle/notification-contract run typecheck && npm --workspace @megle/notification-contract run test",
-    "check:desktop": "node tools/checks/validate-desktop-core.mjs && node --test tools/dev/prod-preview.test.mjs && npm --workspace @megle/desktop run typecheck && npm --workspace @megle/desktop run test",
+    "check:desktop": "node tools/checks/validate-desktop-core.mjs && npm --workspace @megle/desktop run typecheck && npm --workspace @megle/desktop run test",
+    "build:desktop-package": "node tools/build/build-bundled-plugins.mjs --release-profile && cargo build --release -p megle-core && npm --workspace @megle/web run build && npm --workspace @megle/desktop run build && node tools/build/generate-desktop-icon.mjs && node tools/build/package-desktop.mjs",
     "check:web": "node tools/checks/validate-web-client.mjs && npm --workspace @megle/web run typecheck && npm --workspace @megle/web run test",
     "check:ui-design": "node tools/checks/validate-ui-design.mjs",
     "check:schema": "python tools/checks/validate_sqlite_schema.py",
@@ -42,6 +43,9 @@
     "npm": ">=10.0.0"
   },
   "devDependencies": {
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
+    "sharp": "^0.35.4",
     "ws": "^8.20.1"
   }
 }

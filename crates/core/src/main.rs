@@ -195,11 +195,7 @@ async fn main() -> anyhow::Result<()> {
             },
         ),
     )
-    .with_graceful_shutdown(async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(%error, "failed to install Core shutdown signal");
-        }
-    })
+    .with_graceful_shutdown(wait_for_shutdown_signal())
     .await;
     state.shutdown_plugin_auth_workers().await;
     if let Some(manager) = &state.library_manager {
@@ -207,6 +203,88 @@ async fn main() -> anyhow::Result<()> {
     }
     serve_result?;
     Ok(())
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() {
+    let Some(parent_pid) = configured_parent_pid() else {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to install Core shutdown signal");
+        }
+        return;
+    };
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                tracing::warn!(%error, "failed to install Core shutdown signal");
+            }
+        }
+        result = wait_for_windows_parent_exit(parent_pid) => {
+            match result {
+                Ok(()) => tracing::info!(parent_pid, "Desktop parent exited; shutting Core down"),
+                Err(error) => {
+                    tracing::warn!(parent_pid, %error, "failed to watch Desktop parent; waiting for Ctrl+C");
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        tracing::warn!(%error, "failed to install Core shutdown signal");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+async fn wait_for_shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "failed to install Core shutdown signal");
+    }
+}
+
+#[cfg(windows)]
+fn configured_parent_pid() -> Option<u32> {
+    let value = std::env::var("MEGLE_PARENT_PID").ok();
+    parse_parent_pid(value.as_deref())
+}
+
+#[cfg(any(windows, test))]
+fn parse_parent_pid(value: Option<&str>) -> Option<u32> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+}
+
+#[cfg(windows)]
+async fn wait_for_windows_parent_exit(parent_pid: u32) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, INFINITE};
+
+        const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+        let parent = OpenProcess(SYNCHRONIZE_ACCESS, 0, parent_pid);
+        if parent.is_null() {
+            let error = std::io::Error::last_os_error();
+            // ERROR_INVALID_PARAMETER means the PID no longer exists. Treat
+            // that as the parent already having exited instead of leaving an
+            // orphaned Core waiting for a console signal that will never come.
+            return if error.raw_os_error() == Some(87) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        let result = WaitForSingleObject(parent, INFINITE);
+        CloseHandle(parent);
+        if result == WAIT_OBJECT_0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Bind the API listener, retrying briefly on transient "address in use"
@@ -258,12 +336,28 @@ fn resolve_web_dir() -> Option<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("apps/web/dist"));
-    if !configured.is_dir() {
+    if !configured.is_dir() || !configured.join("index.html").is_file() {
         tracing::warn!(
-            "MEGLE_SERVE_WEB=1 but {} is not a directory; static UI disabled",
+            "MEGLE_SERVE_WEB=1 but {} is not a built web root containing index.html; static UI disabled",
             configured.display()
         );
         return None;
     }
     Some(configured)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_parent_pid;
+
+    #[test]
+    fn parent_pid_parser_accepts_only_positive_decimal_process_ids() {
+        assert_eq!(parse_parent_pid(Some("4242")), Some(4242));
+        assert_eq!(parse_parent_pid(Some(" 4242 ")), Some(4242));
+        assert_eq!(parse_parent_pid(None), None);
+        assert_eq!(parse_parent_pid(Some("")), None);
+        assert_eq!(parse_parent_pid(Some("0")), None);
+        assert_eq!(parse_parent_pid(Some("-1")), None);
+        assert_eq!(parse_parent_pid(Some("not-a-pid")), None);
+    }
 }

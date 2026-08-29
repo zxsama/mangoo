@@ -60,14 +60,18 @@ const notificationStore = readOptional("apps/desktop/src/notification-store.ts")
 const desktopIpcPermissions = readOptional("apps/desktop/src/desktop-ipc-permissions.ts");
 const secondaryWindowOpening = readOptional("apps/desktop/src/secondary-window-opening.ts");
 const notificationContract = readOptional("packages/notification-contract/src/index.ts");
+const coreMain = read("crates/core/src/main.rs");
+const desktopLogger = read("apps/desktop/src/desktop-logger.ts");
 const webDesktopBridge = read("apps/web/src/core/desktop.ts");
 const webMain = read("apps/web/src/main.tsx");
 const secondaryReveal = read("apps/desktop/src/secondary-window-reveal.ts");
 const desktopPackage = read("apps/desktop/package.json");
+const productRuntime = read("apps/desktop/src/product-runtime.ts");
+const packageDesktop = read("tools/build/package-desktop.mjs");
+const desktopIconBuilder = read("tools/build/generate-desktop-icon.mjs");
 const rootPackage = read("package.json");
 const devRunner = read("tools/dev/run-dev.mjs");
 const prodRunner = read("tools/dev/run-prod.mjs");
-const prodPreview = read("tools/dev/prod-preview.mjs");
 const managedLibraryHarness = read("tools/dev/managed-library-harness.mjs");
 const managedLibraryBench = read("tools/bench/managed-library-lifecycle-bench.mjs");
 const migratedHostHarnesses = [
@@ -150,6 +154,16 @@ for (const value of ["coreBinaryPath", "target", "debug", "megle-core.exe", "fs.
 for (const value of ["taskkill", "/T", "/F", "stopCoreProcessTree"]) {
   if (!processFile.includes(value)) {
     fail(`core process cleanup missing ${value}`);
+  }
+}
+for (const value of ["MEGLE_CORE_BINARY", "path.resolve(configuredBinary)"]) {
+  if (!processFile.includes(value)) {
+    fail(`core process orchestration missing packaged binary path contract: ${value}`);
+  }
+}
+for (const value of ["MEGLE_SERVE_WEB", "packagedRendererOrigin"]) {
+  if (!session.includes(value)) {
+    fail(`core session missing packaged renderer origin contract: ${value}`);
   }
 }
 
@@ -628,16 +642,58 @@ if (!/run\(\s*findCargoCommand\(\)\s*,\s*\[\s*"build"\s*,\s*"-p"\s*,\s*"megle-co
 if (!/build-bundled-plugins\.mjs"\s*,\s*"--release-profile"/.test(prodRunner)) {
   fail("local production runner must build optimized Providers without invoking formal release credential validation");
 }
-if (!prodRunner.includes('import { ensureMeglePreview } from "./prod-preview.mjs"')) {
-  fail("production runner must use the preview lifecycle guard before launching Electron");
-}
-for (const value of ["child.once(\"exit\"", "child.once(\"error\"", "<title>Megle</title>", "fixed preview port may already be in use"]) {
-  if (!prodPreview.includes(value)) {
-    fail(`production preview lifecycle guard missing ${value}`);
+for (const forbidden of ["ensureMeglePreview", "vite preview", "electron.cmd", "MEGLE_WEB_URL: previewUrl"]) {
+  if (prodRunner.includes(forbidden)) {
+    fail(`production runner must not retain preview/dev runtime dependency: ${forbidden}`);
   }
 }
-if (!rootPackage.includes("node --test tools/dev/prod-preview.test.mjs")) {
-  fail("check:desktop must run the production preview lifecycle regression tests");
+for (const retiredPreviewPath of ["tools/dev/prod-preview.mjs", "tools/dev/prod-preview.test.mjs"]) {
+  if (existsSync(path.join(root, retiredPreviewPath))) {
+    fail(`retired production preview helper must be removed: ${retiredPreviewPath}`);
+  }
+}
+for (const value of ["import.meta.dirname", "desktop-release", "win-unpacked", "Megle.exe", "detached: true", "desktop.unref()", "shell: false", "missingOutputs()", "desktop package is incomplete"]) {
+  if (!prodRunner.includes(value)) {
+    fail(`production runner missing packaged executable launch contract: ${value}`);
+  }
+}
+for (const value of ["electron-builder", "Platform.WINDOWS", 'createTarget(["dir"])', "electronDist", "extraResources", "megle-core.exe", "core/bundled-plugins", "megle-fake-provider.exe", "megle-onedrive-provider.exe", "apps", "web", "dist", "icon.ico"]) {
+  if (!packageDesktop.includes(value)) {
+    fail(`desktop packager missing ${value}`);
+  }
+}
+for (const value of ["favicon.svg", "icon.png", "icon.ico", "sharp"]) {
+  if (!desktopIconBuilder.includes(value)) {
+    fail(`desktop icon generator missing ${value}`);
+  }
+}
+for (const value of ["MEGLE_APP_USER_MODEL_ID", "MEGLE_CORE_BINARY", "MEGLE_SERVE_WEB", "MEGLE_WEB_DIR", "MEGLE_PARENT_PID", "packagedApplicationIdentity", "rendererUrlForSession", "withDefaultHostStorage"]) {
+  if (!productRuntime.includes(value)) {
+    fail(`packaged desktop runtime missing ${value}`);
+  }
+}
+for (const value of ["MEGLE_PARENT_PID", "wait_for_windows_parent_exit", "OpenProcess", "SYNCHRONIZE_ACCESS", "WaitForSingleObject"]) {
+  if (!coreMain.includes(value)) {
+    fail(`Core parent-process watchdog missing ${value}`);
+  }
+}
+for (const value of ["isPackagedWindowsGuiProcess", "megle.exe", "process.stdout?.isTTY", "desktopConsole"]) {
+  if (!desktopLogger.includes(value)) {
+    fail(`desktop logger missing packaged no-console guard: ${value}`);
+  }
+}
+for (const value of ["configurePackagedRuntime", "app.setName", "app.setAppUserModelId", "app.requestSingleInstanceLock", "packagedWindowIconPath", "rendererUrlForSession"]) {
+  if (!main.includes(value)) {
+    fail(`desktop main missing packaged application identity/runtime contract: ${value}`);
+  }
+}
+for (const value of ["electron-builder", "esbuild", "sharp"]) {
+  if (!rootPackage.includes(`\"${value}\"`)) {
+    fail(`root package missing desktop packaging dependency ${value}`);
+  }
+}
+if (!rootPackage.includes('"build:desktop-package"') || !rootPackage.includes("build-bundled-plugins.mjs --release-profile") || !rootPackage.includes("cargo build --release -p megle-core")) {
+  fail("build:desktop-package must build release Core, Providers, Web, and Desktop before packaging");
 }
 for (const value of [
   "crates/fake-provider/src",
@@ -822,13 +878,13 @@ const createWindowBody = functionBody(main, "async function createWindow(): Prom
 if (!createWindowBody) {
   fail("desktop main must keep createWindow as an async function");
 } else {
-  const loadUrlIndex = createWindowBody.indexOf("await window.loadURL(devServer)");
+  const loadUrlIndex = createWindowBody.indexOf("await window.loadURL(rendererUrl)");
   if (loadUrlIndex === -1) {
     fail("desktop createWindow must load the configured renderer URL");
-  } else if (/const\s+devServer[\s\S]*?;\s*armShellReadyFailureFallback\(window\);\s*try\s*\{\s*await\s+window\.loadURL\(devServer\)/.test(createWindowBody)) {
+  } else if (/const\s+rendererUrl[\s\S]*?;\s*armShellReadyFailureFallback\(window\);\s*try\s*\{\s*await\s+window\.loadURL\(rendererUrl\)/.test(createWindowBody)) {
     fail("desktop shell-ready failure fallback must not start before renderer loadURL has had a chance to run");
   }
-  if (!/await\s+window\.loadURL\(devServer\);[\s\S]*?armShellReadyFailureFallback\(window\)/.test(createWindowBody)) {
+  if (!/await\s+window\.loadURL\(rendererUrl\);[\s\S]*?armShellReadyFailureFallback\(window\)/.test(createWindowBody)) {
     fail("desktop shell-ready failure fallback must be armed after renderer loadURL completes");
   }
 }
