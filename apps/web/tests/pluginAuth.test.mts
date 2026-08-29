@@ -9,9 +9,14 @@ import {
   pluginAuthStateLabel,
   pluginAuthPrimaryAction,
 } from "../src/features/plugins/pluginAuthModel.ts";
+import {
+  deriveOneDriveSetupStep,
+  isValidOneDriveClientId,
+  oneDriveSetupRecoveryStep,
+} from "../src/features/plugins/oneDriveSetupModel.ts";
 
 const configuration: OneDriveConfiguration = {
-  source: "bundled",
+  source: "host-override",
   configured: true,
   readOnly: false,
   revision: 1,
@@ -59,12 +64,24 @@ describe("OneDrive plugin auth presentation", () => {
     assert.equal(accountKindLabel("personal"), "OneDrive Personal");
     assert.equal(accountKindLabel("business"), "OneDrive Business");
     assert.equal(configurationSourceLabel("environment"), "部署环境（只读）");
-    assert.equal(configurationSourceLabel("bundled"), "Megle 内置应用配置");
+    assert.equal(configurationSourceLabel("host-override"), "此设备高级覆盖");
     assert.equal(formatAuthRemaining(61_000, 0), "1:01");
     assert.equal(pluginAuthStateLabel("signed-out"), "已退出");
     assert.equal(pluginAuthStateLabel("authorization-required"), "需要授权");
     assert.equal(pluginAuthStateLabel("expired"), "授权已过期");
     assert.equal(pluginAuthStateLabel("error"), "授权失败");
+  });
+
+  it("enforces wizard gates and derives safe recovery steps", () => {
+    assert.equal(isValidOneDriveClientId("11111111-1111-4111-8111-111111111111"), true);
+    assert.equal(isValidOneDriveClientId("00000000-0000-0000-0000-000000000000"), false);
+    assert.equal(isValidOneDriveClientId("directory-id"), false);
+    assert.equal(deriveOneDriveSetupStep({ ...configuration, configured: false }, false), 1);
+    assert.equal(deriveOneDriveSetupStep(configuration, false), 4);
+    assert.equal(deriveOneDriveSetupStep(configuration, true), 5);
+    assert.equal(oneDriveSetupRecoveryStep("AADSTS700016 application not found"), 3);
+    assert.equal(oneDriveSetupRecoveryStep("redirect URI mismatch"), 2);
+    assert.equal(oneDriveSetupRecoveryStep("network unavailable"), null);
   });
 
   it("keeps response URI transient and routes actions through the shared controller", () => {
@@ -73,13 +90,21 @@ describe("OneDrive plugin auth presentation", () => {
     const wizard = readFileSync(new URL("../src/features/library/ManagedLibraryWizard.tsx", import.meta.url), "utf8");
     assert.match(controller, /useQuery\(/);
     assert.match(controller, /cancelPluginAuth/);
+    assert.match(controller, /requestOAuthReturnFocus/);
+    assert.match(controller, /locallyStartedFlowRef/);
     assert.match(controller, /setResponseUri\(""\)/);
     assert.doesNotMatch(controller, /localStorage|sessionStorage/);
-    assert.match(setup, /manual-response-uri/);
-    assert.match(setup, /完整 response URI/);
-    assert.match(setup, /MEGLE_ONEDRIVE_CLIENT_ID/);
-    assert.match(setup, /不需要 client secret/);
-    assert.match(setup, /openAuthorizationUrl/);
+    const setupWizard = readFileSync(new URL("../src/features/plugins/OneDriveSetupWizard.tsx", import.meta.url), "utf8");
+    assert.match(setupWizard, /manual-response-uri/);
+    assert.match(setupWizard, /登录返回地址/);
+    assert.match(setupWizard, /Client Secret/);
+    assert.match(setupWizard, /openAuthorizationUrl/);
+    assert.doesNotMatch(setupWizard, /password|access token|refresh token/i);
+    assert.match(setupWizard, /配置进度/);
+    assert.match(setupWizard, /created/);
+    assert.match(setupWizard, /allConfigurationChecksComplete/);
+    assert.match(setupWizard, /clientIdValid/);
+    assert.match(setupWizard, /auth\.plugin\?\.authState === "authenticated"/);
     assert.match(setup, /确认切换 OneDrive 账号/);
     assert.match(wizard, /authResumeRef/);
     assert.match(wizard, /active\.contextRevision !== intent\.contextRevision/);
@@ -90,10 +115,9 @@ describe("OneDrive plugin auth presentation", () => {
     const card = readFileSync(new URL("../src/features/plugins/PluginCard.tsx", import.meta.url), "utf8");
     const detail = readFileSync(new URL("../src/features/plugins/PluginDetail.tsx", import.meta.url), "utf8");
 
-    assert.match(setup, /<details[\s\S]*onedrive-advanced-configuration/);
-    assert.match(setup, /<summary[^>]*data-pointer-glow="off"[\s\S]*plugin-disclosure-chevron[\s\S]*plugin-disclosure-label">高级配置/);
-    assert.match(setup, /检查更改/);
-    assert.doesNotMatch(setup, /预览更改|收起高级配置/);
+    assert.match(setup, /OneDriveSetupWizard/);
+    assert.match(setup, /配置 OneDrive/);
+    assert.doesNotMatch(setup, /高级配置|检查更改|预览更改|收起高级配置/);
     assert.doesNotMatch(setup, /重新扫描/);
     assert.match(card, /aria-label=\{toggleLabel\}/);
     assert.match(card, /data-pointer-glow="off"/);

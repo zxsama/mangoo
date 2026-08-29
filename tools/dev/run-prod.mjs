@@ -166,9 +166,8 @@ if (upToDate) {
   // Build order: Core (slowest, release) can run while we build the JS, but keep
   // it simple and sequential for clear output. Each tool skips its own unchanged
   // work internally, so a partial change is still fast.
-  // A local product-mode launch needs optimized artifacts, but it is not an
-  // official release packaging operation. The latter intentionally requires a
-  // publisher-owned OneDrive client ID and remains available through --release.
+  // A local product-mode launch needs optimized artifacts. OneDrive application
+  // identity is self-managed at runtime, so release artifacts contain no Client ID.
   run("node", ["tools/build/build-bundled-plugins.mjs", "--release-profile"], "build bundled Providers");
   run(findCargoCommand(), ["build", "--release", "-p", "megle-core"], "build core (release)");
   run("npm", ["--workspace", "@megle/web", "run", "build"], "build web");

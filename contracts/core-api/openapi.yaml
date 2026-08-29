@@ -3248,7 +3248,7 @@ components:
       type: object
       required: [source, configured, readOnly, revision, errorCode]
       properties:
-        source: { type: string, enum: [environment, host-override, bundled, missing] }
+        source: { type: string, enum: [environment, host-override, missing] }
         configured: { type: boolean }
         readOnly: { type: boolean }
         revision: { type: integer, minimum: 1 }

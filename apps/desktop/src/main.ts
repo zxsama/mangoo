@@ -30,7 +30,12 @@ import {
   type DesktopIpcWindowRole
 } from "./desktop-ipc-permissions.js";
 import { desktopLogger, processLogBuffer } from "./desktop-logger.js";
+import { openEntraAppRegistrationPage } from "./entra-app-registration.js";
 import { openExternalAuthorizationUrl } from "./oauth-authorization-url.js";
+import {
+  OAuthReturnFocusEntitlements,
+  restoreOAuthReturnFocus
+} from "./oauth-return-focus.js";
 import {
   CoreLifecycleQueue,
   LifecycleCancelledError,
@@ -82,6 +87,9 @@ import {
 } from "./startup-logging.js";
 
 let mainWindow: BrowserWindow | null = null;
+const oauthReturnFocusEntitlements = new OAuthReturnFocusEntitlements();
+const oauthReturnFocusNavigationEpochs = new Map<number, number>();
+const oauthReturnFocusTrackedSenders = new Set<number>();
 const mediaFocusCoordinator = new MediaFocusCoordinator();
 const emitMainStartupReady = createStartupLogEmitter(
   desktopLogger,
@@ -414,6 +422,30 @@ async function activeHostLibrary(
   return library?.libraryUuid && library.name
     ? { id: library.libraryUuid, name: library.name }
     : null;
+}
+
+function beginOAuthReturnFocusAttempt(sender: WebContents): number {
+  if (!oauthReturnFocusTrackedSenders.has(sender.id)) {
+    oauthReturnFocusTrackedSenders.add(sender.id);
+    oauthReturnFocusNavigationEpochs.set(sender.id, 0);
+    sender.on("did-start-navigation", (_event, _url, _isInPlace, isMainFrame) => {
+      if (!isMainFrame) return;
+      oauthReturnFocusNavigationEpochs.set(
+        sender.id,
+        (oauthReturnFocusNavigationEpochs.get(sender.id) ?? 0) + 1
+      );
+      oauthReturnFocusEntitlements.revoke(sender.id);
+    });
+    sender.once("destroyed", () => {
+      oauthReturnFocusEntitlements.revoke(sender.id);
+      oauthReturnFocusNavigationEpochs.delete(sender.id);
+      oauthReturnFocusTrackedSenders.delete(sender.id);
+    });
+  }
+  const attemptEpoch = (oauthReturnFocusNavigationEpochs.get(sender.id) ?? 0) + 1;
+  oauthReturnFocusNavigationEpochs.set(sender.id, attemptEpoch);
+  oauthReturnFocusEntitlements.revoke(sender.id);
+  return attemptEpoch;
 }
 
 async function registeredNotificationLibrary(libraryId: string): Promise<{ id: string; name: string }> {
@@ -958,13 +990,40 @@ ipcMain.handle("megle:pick-new-library-path", async (event, defaultName?: string
 
 ipcMain.handle("megle:open-external-authorization-url", async (event, authorizationUrl: unknown) => {
   requireDesktopIpcAccess(event, "megle:open-external-authorization-url");
+  const originatingWindow = windowForIpcEvent(event);
+  if (!originatingWindow) {
+    return { ok: false, error: "external_browser_open_failed" } as const;
+  }
+  const attemptEpoch = beginOAuthReturnFocusAttempt(event.sender);
   return openExternalAuthorizationUrl(
     authorizationUrl,
     (url) => shell.openExternal(url),
     {
       emulatorAuthority: app.isPackaged ? undefined : process.env.MEGLE_ONEDRIVE_AUTHORITY
+    },
+    () => {
+      if (
+        !event.sender.isDestroyed()
+        && !originatingWindow.isDestroyed()
+        && oauthReturnFocusNavigationEpochs.get(event.sender.id) === attemptEpoch
+      ) {
+        oauthReturnFocusEntitlements.grant(event.sender.id);
+      }
     }
   );
+});
+
+ipcMain.handle("megle:open-entra-app-registration-page", async (event) => {
+  requireDesktopIpcAccess(event, "megle:open-entra-app-registration-page");
+  return openEntraAppRegistrationPage((url) => shell.openExternal(url));
+});
+
+ipcMain.handle("megle:request-oauth-return-focus", (event) => {
+  requireDesktopIpcAccess(event, "megle:request-oauth-return-focus");
+  if (!oauthReturnFocusEntitlements.consume(event.sender.id)) return false;
+  const originatingWindow = windowForIpcEvent(event);
+  if (!originatingWindow) return false;
+  return restoreOAuthReturnFocus(originatingWindow);
 });
 
 async function createWindow(): Promise<void> {
@@ -2282,6 +2341,7 @@ app.on("activate", () => {
 });
 
 app.on("before-quit", (event) => {
+  oauthReturnFocusEntitlements.clear();
   // Persist window state synchronously before tearing Core down. The
   // `persisted` guard prevents the second `before-quit` (after `app.exit`)
   // from re-entering this branch — Node would otherwise double-stop Core

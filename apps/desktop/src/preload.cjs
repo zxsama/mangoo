@@ -171,6 +171,10 @@ const fullBridge = {
     openPath: (path) => ipcRenderer.invoke("megle:shell-open-path", path),
     openExternalAuthorizationUrl: (url) =>
       ipcRenderer.invoke("megle:open-external-authorization-url", url),
+    openEntraAppRegistrationPage: () =>
+      ipcRenderer.invoke("megle:open-entra-app-registration-page"),
+    requestOAuthReturnFocus: () =>
+      ipcRenderer.invoke("megle:request-oauth-return-focus"),
     copyText: (text) => ipcRenderer.invoke("megle:clipboard-write-text", text)
   },
   getLibraryPhase: () => ipcRenderer.invoke("megle:get-library-load-phase"),

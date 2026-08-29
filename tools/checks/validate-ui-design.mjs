@@ -152,6 +152,7 @@ const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
 const pluginCard = read("apps/web/src/features/plugins/PluginCard.tsx");
 const pluginDetail = read("apps/web/src/features/plugins/PluginDetail.tsx");
 const oneDriveAccountSetup = read("apps/web/src/features/plugins/OneDriveAccountSetup.tsx");
+const oneDriveSetupWizard = read("apps/web/src/features/plugins/OneDriveSetupWizard.tsx");
 const notificationWindow = read("apps/web/src/features/notifications/NotificationWindow.tsx");
 const notificationStatusView = read("apps/web/src/features/notifications/NotificationStatusView.tsx");
 const notificationHistoryView = read("apps/web/src/features/notifications/NotificationHistoryView.tsx");
@@ -1500,20 +1501,33 @@ for (const value of [
 }
 
 for (const value of [
-  "onedrive-advanced-configuration",
-  "<summary",
-  'data-pointer-glow="off"',
-  'className="plugin-disclosure-label"',
-  "高级配置",
-  "检查更改",
-  "configurationInputRef"
+  "OneDriveSetupWizard",
+  "配置 OneDrive",
+  "登录 Microsoft 账号"
 ]) {
   if (!oneDriveAccountSetup.includes(value)) {
-    fail(`OneDrive advanced disclosure contract missing ${value}`);
+    fail(`OneDrive concise setup entry contract missing ${value}`);
   }
 }
-if (!/plugin-disclosure-chevron[\s\S]{0,180}plugin-disclosure-label/.test(oneDriveAccountSetup)) {
-  fail("OneDrive advanced disclosure chevron must precede its label");
+for (const value of [
+  "配置 OneDrive 应用",
+  "配置进度",
+  "创建应用",
+  "配置应用",
+  "保存 Client ID",
+  "登录验证",
+  "Files.ReadWrite.AppFolder",
+  "manual-response-uri",
+  "clientIdValid",
+  "allConfigurationChecksComplete",
+  "ModalSurface"
+]) {
+  if (!oneDriveSetupWizard.includes(value)) {
+    fail(`OneDrive sequential wizard contract missing ${value}`);
+  }
+}
+if (/type=["']password["']|client.?secret[^\n]{0,120}<input/i.test(oneDriveSetupWizard)) {
+  fail("OneDrive self-managed setup must not accept passwords or Client Secrets");
 }
 if (liquidGlassSurface.includes('".plugin-card"') || liquidGlassSurface.includes('".plugin-disclosure-summary"')) {
   fail("plugin navigation and disclosure summaries must not be registered as global pointer-glow owners");
@@ -1573,7 +1587,7 @@ for (const selector of [
     fail(`${selector} must limit feedback to disclosure text and chevron`);
   }
 }
-for (const retiredValue of ["预览更改", "收起高级配置", "onedrive-config-summary", "onedrive-auth-state"]) {
+for (const retiredValue of ["预览更改", "收起高级配置", "onedrive-config-summary", "onedrive-auth-state", "配置 Client ID", "Megle 内置应用配置"]) {
   if (oneDriveAccountSetup.includes(retiredValue)) {
     fail(`OneDrive primary view must not render duplicate or obsolete presentation ${retiredValue}`);
   }

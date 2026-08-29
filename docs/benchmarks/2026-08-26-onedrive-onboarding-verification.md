@@ -1,5 +1,10 @@
 # OneDrive Account Onboarding Verification — 2026-08-26
 
+> Historical evidence note: the publisher-owned application identity described
+> below was superseded on 2026-08-29 by the self-managed Client ID workflow.
+> Retain these results only as evidence for the OAuth/runtime implementation;
+> they do not describe the current release configuration model.
+
 ## Scope
 
 This verification covers the OneDrive Client ID configuration, Desktop
@@ -34,8 +39,8 @@ accepted or stored.
 The release stays blocked until all of the following are supplied for the exact
 release commit:
 
-1. A publisher-owned, valid `MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID` and matching
-   Microsoft Entra public-client registration.
+1. An operator-owned, valid Microsoft Entra public-client registration and
+   Client ID configured through the product setup workflow.
 2. A real Personal account Product OAuth capture plus its Graph transport
    canary.
 3. A real Business account Product OAuth capture plus its Graph transport

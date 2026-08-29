@@ -67,14 +67,15 @@ Writable state is `/data/plugin-state`; `/data` is never executable discovery.
 
 ## OneDrive public-client authorization
 
-One multi-tenant Microsoft Entra public-client registration serves Personal and
-Business accounts with delegated `Files.ReadWrite.AppFolder` and
-`offline_access`. A publisher-supplied `MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID` is
-compiled into official artifacts; `MEGLE_ONEDRIVE_CLIENT_ID` is a non-secret
-deployment override, followed by a revisioned Host override. The public
-projection reports only source/configured/read-only/revision state, never the
-effective ID. Release packaging rejects missing, placeholder, or invalid
-bundled IDs. No mode uses a client secret.
+Each user or deployment operator supplies a self-managed Microsoft Entra
+public-client registration for Personal and/or Business accounts with delegated
+`Files.ReadWrite.AppFolder` and `offline_access`. Release artifacts embed no
+publisher-owned Client ID. `MEGLE_ONEDRIVE_CLIENT_ID` is an optional non-secret,
+read-only deployment value; otherwise the five-step setup wizard stores a
+revisioned Host override. The public projection reports only
+source/configured/read-only/revision state, never the effective ID. Missing
+configuration safely keeps OneDrive `configuration-required`. No mode uses or
+accepts a client secret.
 
 Desktop uses Authorization Code + PKCE S256 with a Provider-owned ephemeral
 `127.0.0.1` listener and fixed `/plugin-auth/callback` path. `auth.poll` observes

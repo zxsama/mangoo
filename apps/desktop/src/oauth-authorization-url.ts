@@ -156,13 +156,15 @@ export function isAllowedExternalAuthorizationUrl(
 export async function openExternalAuthorizationUrl(
   input: unknown,
   opener: (url: string) => Promise<void>,
-  options: AuthorizationUrlValidationOptions = {}
+  options: AuthorizationUrlValidationOptions = {},
+  onOpened?: () => void
 ): Promise<ExternalAuthorizationOpenResult> {
   if (!isAllowedExternalAuthorizationUrl(input, options)) {
     return { ok: false, error: "external_browser_rejected" };
   }
   try {
     await opener(input);
+    onOpened?.();
     return { ok: true };
   } catch {
     return { ok: false, error: "external_browser_open_failed" };

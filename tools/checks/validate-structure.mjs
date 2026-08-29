@@ -858,11 +858,23 @@ const compose = readText("compose.yaml");
 if (!compose.includes("MEGLE_ONEDRIVE_AUTH_MODE: manual-response-uri")) {
   fail("Docker Compose must select OneDrive manual response-URI authorization");
 }
-if (!compose.includes("MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID:")) {
-  fail("Docker Compose must forward the publisher OneDrive Client ID build input");
-}
 if (compose.includes("MEGLE_PUBLIC_URL:")) {
   fail("Docker Compose must not configure the retired OneDrive inbound OAuth callback");
+}
+const retiredBundledClientIdVariable = ["MEGLE", "BUNDLED", "ONEDRIVE", "CLIENT", "ID"].join("_");
+for (const sourcePath of [
+  "Dockerfile",
+  "compose.yaml",
+  "contracts/core-api/openapi.yaml",
+  "crates/core/src/host_registry.rs",
+  "packages/core-client/src/generated-contract.ts",
+  "tools/build/build-bundled-plugins.mjs",
+  "tools/checks/sync-release.mjs",
+  "tools/dev/run-prod.mjs",
+]) {
+  if (readText(sourcePath).includes(retiredBundledClientIdVariable)) {
+    fail(`${sourcePath} must not restore the retired publisher-owned OneDrive Client ID`);
+  }
 }
 const dockerIgnore = readText(".dockerignore");
 if (!dockerIgnore.split(/\r?\n/).some((line) => line.trim() === "secrets/")) {

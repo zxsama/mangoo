@@ -48,7 +48,6 @@ export function configurationSourceLabel(source: OneDriveConfiguration["source"]
   switch (source) {
     case "environment": return "部署环境（只读）";
     case "host-override": return "此设备高级覆盖";
-    case "bundled": return "Megle 内置应用配置";
     case "missing": return "尚未配置";
   }
 }

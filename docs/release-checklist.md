@@ -8,12 +8,10 @@ end-to-end, in order. Anyone who is not the original author should be able to fo
 
 Run from the repo root.
 
-Before an official build, provide the publisher-owned multi-tenant public
-client application ID. Do not use a sample, third-party, or placeholder ID:
-
-```bash
-export MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID=<publisher-entra-application-id>
-```
+Official artifacts contain no publisher-owned OneDrive Client ID. The build
+must succeed without one and leave OneDrive `configuration-required` until the
+operator completes the self-managed application wizard or supplies the optional
+runtime `MEGLE_ONEDRIVE_CLIENT_ID` value.
 
 ```bash
 npm test
@@ -66,8 +64,9 @@ as a follow-up issue rather than patching during release prep.
 - [ ] Tag / rate / favorite a file; search composes filters; chips clear filters.
 - [ ] Cancel a running scan from Task Center; retry it; final state is succeeded.
 - [ ] Disable / re-enable a registered plugin; the badge reflects state.
-- [ ] From the OneDrive plugin panel, verify Configure/Connect/Waiting/Cancel,
-      account kind, Switch account, and Sign out. Desktop must open the system
+- [ ] From the OneDrive plugin panel, complete the five-step self-managed app
+      wizard and verify Login/Waiting/Cancel, account kind, Switch account, and
+      Sign out. Desktop must open the system
       browser and complete through the ephemeral `127.0.0.1` loopback without a
       pasted URI.
 - [ ] In the Docker/Web build, verify the authorization link plus complete

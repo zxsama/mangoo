@@ -357,7 +357,6 @@ pub struct OneDriveConfigurationCommit {
 }
 
 const ONEDRIVE_PLUGIN_ID: &str = "com.megle.onedrive";
-const BUNDLED_ONEDRIVE_CLIENT_ID: Option<&str> = option_env!("MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID");
 
 fn normalized_client_id(value: Option<&str>) -> anyhow::Result<Option<String>> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -957,7 +956,6 @@ impl HostRegistry {
         )?;
         let environment =
             normalized_client_id(std::env::var("MEGLE_ONEDRIVE_CLIENT_ID").ok().as_deref());
-        let bundled = normalized_client_id(BUNDLED_ONEDRIVE_CLIENT_ID);
         let (source, configured, error_code) = match environment {
             Ok(Some(_)) => ("environment", true, None),
             Err(_) => (
@@ -972,19 +970,11 @@ impl HostRegistry {
                     false,
                     Some("invalid-onedrive-client-id".to_owned()),
                 ),
-                Ok(None) => match bundled {
-                    Ok(Some(_)) => ("bundled", true, None),
-                    Err(_) => (
-                        "bundled",
-                        false,
-                        Some("invalid-onedrive-client-id".to_owned()),
-                    ),
-                    Ok(None) => (
-                        "missing",
-                        false,
-                        Some("onedrive-client-id-missing".to_owned()),
-                    ),
-                },
+                Ok(None) => (
+                    "missing",
+                    false,
+                    Some("onedrive-client-id-missing".to_owned()),
+                ),
             },
         };
         Ok(OneDriveConfiguration {
@@ -1008,7 +998,7 @@ impl HostRegistry {
         if let Some(value) = normalized_client_id(host_override)? {
             return Ok(Some(value));
         }
-        normalized_client_id(BUNDLED_ONEDRIVE_CLIENT_ID)
+        Ok(None)
     }
 
     pub fn effective_onedrive_client_id(&self) -> anyhow::Result<Option<String>> {
@@ -6414,6 +6404,14 @@ mod tests {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
         let initial = registry.onedrive_configuration().unwrap();
+        assert_eq!(initial.source, "missing");
+        assert!(!initial.configured);
+        assert!(!initial.read_only);
+        assert_eq!(
+            initial.error_code.as_deref(),
+            Some("onedrive-client-id-missing")
+        );
+        assert_eq!(registry.effective_onedrive_client_id().unwrap(), None);
         let plan = registry
             .plan_onedrive_configuration(
                 Some("01234567-89ab-4cde-8fab-0123456789ab"),
@@ -6449,6 +6447,16 @@ mod tests {
             .plan_onedrive_configuration(Some("not-a-uuid"), configured.revision)
             .is_err());
         drop(registry);
+
+        let reopened = HostRegistry::open(&path).unwrap();
+        let persisted = reopened.onedrive_configuration().unwrap();
+        assert_eq!(persisted.source, "host-override");
+        assert!(persisted.configured);
+        assert_eq!(
+            reopened.effective_onedrive_client_id().unwrap().as_deref(),
+            Some("01234567-89ab-4cde-8fab-0123456789ab")
+        );
+        drop(reopened);
         let _ = std::fs::remove_file(path);
     }
 

@@ -598,7 +598,7 @@ export interface PluginAuthCancelRequest {
   flowId: string;
 }
 export interface OneDriveConfiguration {
-  source: "environment" | "host-override" | "bundled" | "missing";
+  source: "environment" | "host-override" | "missing";
   configured: boolean;
   readOnly: boolean;
   revision: number;

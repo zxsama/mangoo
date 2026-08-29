@@ -104,27 +104,45 @@ describe("OneDrive external authorization URL boundary", () => {
 
   it("reports validation and native opener failures without throwing", async () => {
     let opened: string | null = null;
+    let successfulOpenNotifications = 0;
     assert.deepEqual(
       await openExternalAuthorizationUrl("https://example.com", async (url) => {
         opened = url;
+      }, {}, () => {
+        successfulOpenNotifications += 1;
       }),
       { ok: false, error: "external_browser_rejected" }
     );
     assert.equal(opened, null);
 
     assert.deepEqual(
-      await openExternalAuthorizationUrl(authorizationUrl(), async () => {
-        throw new Error("native failure");
-      }),
+      await openExternalAuthorizationUrl(
+        authorizationUrl(),
+        async () => {
+          throw new Error("native failure");
+        },
+        {},
+        () => {
+          successfulOpenNotifications += 1;
+        }
+      ),
       { ok: false, error: "external_browser_open_failed" }
     );
 
     assert.deepEqual(
-      await openExternalAuthorizationUrl(authorizationUrl(), async (url) => {
-        opened = url;
-      }),
+      await openExternalAuthorizationUrl(
+        authorizationUrl(),
+        async (url) => {
+          opened = url;
+        },
+        {},
+        () => {
+          successfulOpenNotifications += 1;
+        }
+      ),
       { ok: true }
     );
     assert.equal(opened, authorizationUrl());
+    assert.equal(successfulOpenNotifications, 1);
   });
 });

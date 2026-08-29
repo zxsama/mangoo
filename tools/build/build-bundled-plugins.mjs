@@ -7,14 +7,6 @@ import process from "node:process";
 const root = process.cwd();
 const release = process.argv.includes("--release");
 const releaseProfile = release || process.argv.includes("--release-profile");
-if (release) {
-  const bundledClientId = process.env.MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID?.trim();
-  const validUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(bundledClientId ?? "");
-  const placeholder = !bundledClientId || /^(00000000-|11111111-|example|placeholder|test)/i.test(bundledClientId);
-  if (!validUuid || placeholder) {
-    throw new Error("release bundle requires a publisher-supplied MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID UUID");
-  }
-}
 const profile = releaseProfile ? "release" : "debug";
 const coreBuildArgs = ["build", ...(release ? ["--release"] : []), "-p", "megle-core"];
 const targetRoot = process.env.CARGO_TARGET_DIR
@@ -57,12 +49,6 @@ if (existingGeneratedTrust !== generatedTrust) {
 
 if (release) {
   execFileSync("cargo", coreBuildArgs, { cwd: root, stdio: "inherit", shell: process.platform === "win32" });
-  const coreBinary = path.join(targetRoot, profile, process.platform === "win32" ? "megle-core.exe" : "megle-core");
-  const artifact = readFileSync(coreBinary);
-  if (!artifact.includes(Buffer.from(process.env.MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID.trim()))) {
-    throw new Error("release Core artifact does not embed MEGLE_BUNDLED_ONEDRIVE_CLIENT_ID");
-  }
-  console.log(`[bundled-client-id-verified] ${coreBinary}`);
 }
 
 if (process.argv.includes("--verify-onedrive")) {

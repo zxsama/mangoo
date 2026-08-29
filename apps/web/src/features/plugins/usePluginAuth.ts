@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CoreApiError } from "@megle/core-client";
 import type {
@@ -6,7 +6,7 @@ import type {
   PluginAuthBeginResponse,
 } from "@megle/core-client";
 import { createCoreClient } from "../../core/client";
-import { copyText, openExternalAuthorizationUrl } from "../../core/desktop";
+import { copyText, openExternalAuthorizationUrl, requestOAuthReturnFocus } from "../../core/desktop";
 import { ONEDRIVE_PLUGIN_ID, pluginAuthPrimaryAction } from "./pluginAuthModel";
 
 export const PLUGINS_QUERY_KEY = ["plugins"] as const;
@@ -36,6 +36,8 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
   const [actionError, setActionError] = useState<string | null>(null);
   const [directBusy, setDirectBusy] = useState(false);
   const [configurationPlan, setConfigurationPlan] = useState<OneDriveConfigurationPlan | null>(null);
+  const locallyStartedFlowRef = useRef<string | null>(null);
+  const previousAuthStateRef = useRef<string | null | undefined>(undefined);
 
   const pluginsQuery = useQuery({
     queryKey: PLUGINS_QUERY_KEY,
@@ -49,6 +51,18 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
     queryFn: () => client.getOneDriveConfiguration(),
   });
   const configuration = configurationQuery.data ?? null;
+
+  useEffect(() => {
+    const previous = previousAuthStateRef.current;
+    const current = plugin?.authState;
+    previousAuthStateRef.current = current;
+    if (current === "authenticated" && previous !== "authenticated" && locallyStartedFlowRef.current) {
+      locallyStartedFlowRef.current = null;
+      void requestOAuthReturnFocus();
+    } else if (current === "error" || current === "expired" || current === "signed-out") {
+      locallyStartedFlowRef.current = null;
+    }
+  }, [plugin?.authState]);
 
   useEffect(() => {
     if (!flow) return;
@@ -111,6 +125,8 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
       }
       if (!desktopResult && !window.open(nextFlow.authorizationUrl, "_blank", "noopener,noreferrer")) {
         setActionError("浏览器阻止了新标签页，请复制授权链接后手动打开。");
+      } else {
+        locallyStartedFlowRef.current = nextFlow.flowId;
       }
       await invalidate();
     } catch (cause) {
@@ -149,6 +165,7 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
 
   const cancel = useCallback(async () => {
     const active = flow;
+    locallyStartedFlowRef.current = null;
     setResponseUri("");
     if (active) {
       await run.mutateAsync(() => client.cancelPluginAuth(pluginId, { flowId: active.flowId }));
@@ -158,6 +175,7 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
   }, [client, flow, invalidate, pluginId, run]);
 
   const signOut = useCallback(async () => {
+    locallyStartedFlowRef.current = null;
     setFlow(null);
     setResponseUri("");
     await run.mutateAsync(() => client.signOutPlugin(pluginId));
@@ -190,11 +208,17 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
 
   const commitConfiguration = useCallback(async (confirmed: boolean) => {
     if (!configurationPlan) return;
-    await run.mutateAsync(() => client.commitOneDriveConfiguration({
-      planUuid: configurationPlan.planUuid,
-      expectedRevision: configurationPlan.expectedRevision,
-      confirmed,
-    }));
+    await run.mutateAsync(async () => {
+      const committed = await client.commitOneDriveConfiguration({
+        planUuid: configurationPlan.planUuid,
+        expectedRevision: configurationPlan.expectedRevision,
+        confirmed,
+      });
+      if (!committed.configured) {
+        throw new Error("OneDrive Client ID 保存后尚未生效，请重试。");
+      }
+      return committed;
+    });
     setConfigurationPlan(null);
     setFlow(null);
     setResponseUri("");

@@ -365,6 +365,14 @@ test("notifications preload exposes only notification, log, and common window ca
     typeof (mainBridge.shell as { openExternalAuthorizationUrl?: unknown }).openExternalAuthorizationUrl,
     "function"
   );
+  assert.equal(
+    typeof (mainBridge.shell as { requestOAuthReturnFocus?: unknown }).requestOAuthReturnFocus,
+    "function"
+  );
+  assert.equal(
+    typeof (mainBridge.shell as { openEntraAppRegistrationPage?: unknown }).openEntraAppRegistrationPage,
+    "function"
+  );
   assert.equal("switchLibrary" in settingsBridge, false);
   assert.equal(typeof settingsBridge.shell, "object");
 
@@ -379,7 +387,9 @@ test("Main role permissions reject notification senders for library and shell IP
     "megle:pick-new-library-path",
     "megle:shell-reveal-path",
     "megle:shell-open-path",
-    "megle:open-external-authorization-url"
+    "megle:open-external-authorization-url",
+    "megle:open-entra-app-registration-page",
+    "megle:request-oauth-return-focus"
   ]) {
     assert.equal(permissionsModule.canAccessDesktopIpc("notifications", channel), false);
     assert.equal(permissionsModule.canAccessDesktopIpc("main", channel), true);

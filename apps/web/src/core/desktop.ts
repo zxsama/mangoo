@@ -89,6 +89,8 @@ export interface DesktopShellActions {
     | { ok: true }
     | { ok: false; error: "external_browser_rejected" | "external_browser_open_failed" }
   >;
+  openEntraAppRegistrationPage?: () => Promise<boolean>;
+  requestOAuthReturnFocus?: () => Promise<boolean>;
   copyText: (text: string) => Promise<boolean>;
 }
 
@@ -242,6 +244,14 @@ export async function openExternalAuthorizationUrl(
   | null
 > {
   return (await getDesktopShellActions()?.openExternalAuthorizationUrl(url)) ?? null;
+}
+
+export async function requestOAuthReturnFocus(): Promise<boolean> {
+  return (await getDesktopShellActions()?.requestOAuthReturnFocus?.()) ?? false;
+}
+
+export async function openEntraAppRegistrationPage(): Promise<boolean> {
+  return (await getDesktopShellActions()?.openEntraAppRegistrationPage?.()) ?? false;
 }
 
 export async function copyText(text: string): Promise<boolean> {
