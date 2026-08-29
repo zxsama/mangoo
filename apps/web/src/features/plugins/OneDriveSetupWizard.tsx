@@ -10,7 +10,7 @@ import { deriveOneDriveSetupStep, isValidOneDriveClientId, oneDriveSetupRecovery
 const ENTRA_REGISTRATION_URL = "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade";
 const DESKTOP_REDIRECT = "http://localhost/plugin-auth/callback";
 const DOCKER_REDIRECT = "https://login.microsoftonline.com/common/oauth2/nativeclient";
-const STEP_LABELS = ["创建应用", "配置应用", "保存 Client ID", "登录验证", "完成"] as const;
+const STEP_LABELS = ["注册并配置应用", "保存 Client ID", "登录验证", "完成"] as const;
 
 interface Props {
   affectedLibraries?: number;
@@ -26,8 +26,7 @@ interface Props {
 
 export function OneDriveSetupWizard({ affectedLibraries = 0, auth, initialStep, onBeforeBegin, onCancelled, onFinish, onOpenChange, open, restoreFocusRef }: Props) {
   const [step, setStep] = useState<OneDriveSetupStep>(1);
-  const [created, setCreated] = useState(false);
-  const [checks, setChecks] = useState([false, false, false, false, false]);
+  const [checks, setChecks] = useState([false, false, false, false]);
   const [clientId, setClientId] = useState("");
   const [registrationError, setRegistrationError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -42,8 +41,7 @@ export function OneDriveSetupWizard({ affectedLibraries = 0, auth, initialStep, 
     if (!open) return;
     auth.clearConfigurationPlan();
     setStep(initialStep ?? deriveOneDriveSetupStep(auth.configuration, authenticated));
-    setCreated(false);
-    setChecks([false, false, false, false, false]);
+    setChecks([false, false, false, false]);
     setClientId("");
     setRegistrationError(null);
     previousAuthenticatedRef.current = authenticated;
@@ -52,7 +50,7 @@ export function OneDriveSetupWizard({ affectedLibraries = 0, auth, initialStep, 
   useEffect(() => {
     const previous = previousAuthenticatedRef.current;
     previousAuthenticatedRef.current = authenticated;
-    if (open && step === 4 && !previous && authenticated) setStep(5);
+    if (open && step === 3 && !previous && authenticated) setStep(4);
   }, [authenticated, open, step]);
 
   useEffect(() => {
@@ -63,9 +61,8 @@ export function OneDriveSetupWizard({ affectedLibraries = 0, auth, initialStep, 
 
   const platform = auth.flow?.completionMode === "manual-response-uri" || !getDesktopBridge() ? "docker" : "desktop";
   const stepDescription = useMemo(() => [
-    "创建一个由你管理的 Microsoft Entra 应用。",
-    "按清单完成公共客户端和 OneDrive 权限配置。",
-    "复制应用的 Client ID 到 Megle。",
+    "按照当前 Microsoft Entra 页面完成应用注册和必要设置。",
+    "从应用概述页复制客户端 ID 到 Megle。",
     "使用已有 Microsoft 账号完成授权。",
     "连接已就绪。",
   ][step - 1], [step]);
@@ -89,7 +86,7 @@ export function OneDriveSetupWizard({ affectedLibraries = 0, auth, initialStep, 
   async function commitConfiguration() {
     const confirmed = Boolean(auth.configurationPlan?.effectiveChanged && auth.configurationPlan.requiresConfirmation);
     await auth.commitConfiguration(confirmed);
-    setStep(4);
+    setStep(3);
   }
 
   async function beginAuthentication() {
@@ -106,26 +103,24 @@ export function OneDriveSetupWizard({ affectedLibraries = 0, auth, initialStep, 
     if (step > 1 && !auth.busy) setStep((step - 1) as OneDriveSetupStep);
   };
 
-  const forwardLabel = step === 3
+  const forwardLabel = step === 2
     ? auth.configuration?.readOnly ? "下一步" : auth.configurationPlan ? "确认并继续" : "检查配置"
-    : step === 4
+    : step === 3
       ? auth.flow?.completionMode === "manual-response-uri" ? "验证并连接" : auth.flow ? "等待授权" : "登录 Microsoft 账号"
-      : step === 5 ? "完成" : "下一步";
+      : step === 4 ? "完成" : "下一步";
   const forwardDisabled = auth.busy
-    || (step === 1 && !created)
-    || (step === 2 && !allConfigurationChecksComplete)
-    || (step === 3 && (auth.configuration?.readOnly ? !auth.configuration.configured : !auth.configurationPlan && !clientIdValid))
-    || (step === 4 && Boolean(auth.flow) && auth.flow?.completionMode !== "manual-response-uri")
-    || (step === 4 && auth.flow?.completionMode === "manual-response-uri" && !auth.responseUri.trim());
+    || (step === 1 && !allConfigurationChecksComplete)
+    || (step === 2 && (auth.configuration?.readOnly ? !auth.configuration.configured : !auth.configurationPlan && !clientIdValid))
+    || (step === 3 && Boolean(auth.flow) && auth.flow?.completionMode !== "manual-response-uri")
+    || (step === 3 && auth.flow?.completionMode === "manual-response-uri" && !auth.responseUri.trim());
 
   async function goForward() {
-    if (step === 1) setStep(2);
-    else if (step === 2) setStep(auth.configuration?.configured ? 4 : 3);
-    else if (step === 3) {
-      if (auth.configuration?.readOnly) setStep(4);
+    if (step === 1) setStep(auth.configuration?.configured ? 3 : 2);
+    else if (step === 2) {
+      if (auth.configuration?.readOnly) setStep(3);
       else if (auth.configurationPlan) await commitConfiguration();
       else await auth.planConfiguration(clientId.trim());
-    } else if (step === 4) {
+    } else if (step === 3) {
       if (!auth.flow) await beginAuthentication();
       else if (auth.flow.completionMode === "manual-response-uri") await auth.complete();
     } else finish();
@@ -141,36 +136,32 @@ export function OneDriveSetupWizard({ affectedLibraries = 0, auth, initialStep, 
           return <li aria-current={number === step ? "step" : undefined} data-state={state} key={label}><span>{number < step ? <Check size={12} /> : number}</span>{label}</li>;
         })}
       </ol>
-      <OverlayDialogBody className="onedrive-setup-body">
+      <OverlayDialogBody className="onedrive-setup-body" data-overlay-scroll-container>
         {step === 1 ? <section className="onedrive-setup-section">
-          <h3>创建 Microsoft Entra 应用</h3>
-          <p>打开“应用注册”，新建应用并选择“任何组织目录中的账户和个人 Microsoft 账户”。</p>
+          <h3>注册并配置 Microsoft Entra 应用</h3>
+          <p>打开“应用注册”并选择“新注册”，然后按页面顺序完成以下设置。</p>
           <LiquidGlassButton onClick={() => void openRegistrationPage()} ref={firstActionRef} tone="primary" type="button"><ExternalLink size={14} />打开 Microsoft Entra</LiquidGlassButton>
           {registrationError ? <OverlayInlineStatus tone="error">{registrationError}</OverlayInlineStatus> : null}
-          <label className="onedrive-setup-confirm"><input checked={created} onChange={(event) => setCreated(event.target.checked)} type="checkbox" /><span>应用已创建，账户类型已正确选择。</span></label>
+          <SetupConfirmation checked={checks[0]} label="注册应用程序" onChange={(value) => updateCheck(setChecks, 0, value)}><span><b>名称</b>：OneDrive Sync</span><span><b>受支持的帐户类型</b>：任何 Entra ID 租户 + 个人 Microsoft 帐户</span></SetupConfirmation>
+          <SetupConfirmation checked={checks[1]} label="重定向 URI (可选)" onChange={(value) => updateCheck(setChecks, 1, value)}><span><b>选择平台</b>：移动和桌面应用程序</span><CopyableValue onCopy={async (value) => { await copyText(value); }} value={platform === "docker" ? DOCKER_REDIRECT : DESKTOP_REDIRECT} /></SetupConfirmation>
+          <SetupConfirmation checked={checks[2]} label="允许公共客户端流" onChange={(value) => updateCheck(setChecks, 2, value)}>Authentication (Preview) → 设置 → 允许公共客户端流 → 已启用</SetupConfirmation>
+          <SetupConfirmation checked={checks[3]} label="API 权限" onChange={(value) => updateCheck(setChecks, 3, value)}>Microsoft Graph → 委托的权限 → <code>Files.ReadWrite.AppFolder</code></SetupConfirmation>
+          <small>{platform === "docker" ? "Docker 使用手动返回地址。" : "Windows 使用本机浏览器自动回调。"}</small>
         </section> : null}
 
         {step === 2 ? <section className="onedrive-setup-section">
-          <h3>配置身份验证和权限</h3>
-          <p>{platform === "docker" ? "Docker 使用手动返回地址。" : "Windows 使用本机浏览器自动回调。"}</p>
-          <SetupConfirmation checked={checks[0]} label="账户类型" onChange={(value) => updateCheck(setChecks, 0, value)}>任何组织目录中的账户和个人 Microsoft 账户</SetupConfirmation>
-          <SetupConfirmation checked={checks[1]} label="平台" onChange={(value) => updateCheck(setChecks, 1, value)}>身份验证 → 添加平台 → 移动和桌面应用程序（不要选择“单页应用程序”）</SetupConfirmation>
-          <SetupConfirmation checked={checks[2]} label="重定向 URI" onChange={(value) => updateCheck(setChecks, 2, value)}><CopyableValue onCopy={async (value) => { await copyText(value); }} value={platform === "docker" ? DOCKER_REDIRECT : DESKTOP_REDIRECT} /></SetupConfirmation>
-          <SetupConfirmation checked={checks[3]} label="公共客户端" onChange={(value) => updateCheck(setChecks, 3, value)}>开启“允许公共客户端流”；不要创建 Client Secret</SetupConfirmation>
-          <SetupConfirmation checked={checks[4]} label="API 权限" onChange={(value) => updateCheck(setChecks, 4, value)}>Microsoft Graph → 委托权限 → <code>Files.ReadWrite.AppFolder</code></SetupConfirmation>
-          <small>门户默认添加的 <code>User.Read</code> 可以保留，Megle 不依赖该权限。</small>
-        </section> : null}
-
-        {step === 3 ? <section className="onedrive-setup-section">
-          <h3>保存 Application (client) ID</h3>
+          <h3>保存 Client ID</h3>
           {auth.configuration?.readOnly ? <OverlayInlineStatus tone="info">Client ID 由部署环境管理（{configurationSourceLabel(auth.configuration.source)}）。请设置有效的 MEGLE_ONEDRIVE_CLIENT_ID 并重启 Megle。</OverlayInlineStatus> : <>
-            <label className="overlay-field"><span>Application (client) ID</span><input aria-invalid={clientId.length > 0 && !clientIdValid} autoComplete="off" onChange={(event) => { setClientId(event.target.value); auth.clearConfigurationPlan(); }} placeholder="00000000-0000-4000-8000-000000000000" spellCheck={false} value={clientId} /></label>
-            <small>{clientId.length === 0 || clientIdValid ? "填写应用概述页中的 Client ID，不是 Directory ID、Object ID 或 Client Secret。" : "请输入 Microsoft Entra 生成的有效 UUID。"}</small>
+            <div className="onedrive-client-id-card">
+              <div className="onedrive-client-id-heading"><strong>应用程序(客户端) ID</strong><span>在 Microsoft Entra 应用的“概述”页复制此值。</span></div>
+              <label className="overlay-field onedrive-client-id-field"><span>应用程序(客户端) ID</span><input aria-describedby="onedrive-client-id-feedback" aria-invalid={clientId.length > 0 && !clientIdValid} autoComplete="off" onChange={(event) => { setClientId(event.target.value); auth.clearConfigurationPlan(); }} placeholder="00000000-0000-4000-8000-000000000000" spellCheck={false} value={clientId} /></label>
+              <div aria-live="polite" className="onedrive-client-id-feedback" id="onedrive-client-id-feedback">{clientId.length === 0 || clientIdValid ? "粘贴后，Megle 会先检查格式和配置影响。" : "请输入 Microsoft Entra 生成的有效 UUID。"}</div>
+            </div>
             {auth.configurationPlan ? <div className="onedrive-config-impact" role="status"><strong>{auth.configurationPlan.effectiveChanged ? "配置将发生变化" : "配置有效"}</strong><span>{auth.configurationPlan.effectiveChanged ? `${auth.configurationPlan.affectedLibraries || affectedLibraries} 个资源库将暂停，旧账号凭据会安全退出。` : "Client ID 已保存，无需更改账号状态。"}</span><div><LiquidGlassButton onClick={auth.clearConfigurationPlan} type="button">修改 Client ID</LiquidGlassButton></div></div> : null}
           </>}
         </section> : null}
 
-        {step === 4 ? <section className="onedrive-setup-section">
+        {step === 3 ? <section className="onedrive-setup-section">
           <h3>登录并验证</h3>
           {!auth.flow ? <p>将在系统浏览器中打开 Microsoft 登录页。使用已有的 Personal 或 Business 账号登录。</p> : <div className="onedrive-auth-flow" aria-live="polite">
             <div><strong>在 Microsoft 页面完成授权</strong><span>剩余 {formatAuthRemaining(auth.flow.expiresAt, now)}</span></div>
@@ -179,14 +170,14 @@ export function OneDriveSetupWizard({ affectedLibraries = 0, auth, initialStep, 
           </div>}
         </section> : null}
 
-        {step === 5 ? <section className="onedrive-setup-section onedrive-setup-complete"><Check aria-hidden="true" size={24} /><h3>OneDrive 配置完成</h3><p><strong>{auth.plugin?.accountDisplayName ?? "Microsoft 账号"}</strong><span>{accountKindLabel(auth.plugin?.accountKind ?? null)}</span></p></section> : null}
+        {step === 4 ? <section className="onedrive-setup-section onedrive-setup-complete"><Check aria-hidden="true" size={24} /><h3>OneDrive 配置完成</h3><p><strong>{auth.plugin?.accountDisplayName ?? "Microsoft 账号"}</strong><span>{accountKindLabel(auth.plugin?.accountKind ?? null)}</span></p></section> : null}
         {auth.error ? <OverlayInlineStatus tone="error"><span>{auth.error}</span>{recoveryStep && recoveryStep < step ? <LiquidGlassButton onClick={() => setStep(recoveryStep)} type="button">返回第 {recoveryStep} 步检查</LiquidGlassButton> : null}</OverlayInlineStatus> : null}
         {auth.busy ? <div className="onedrive-setup-busy" role="status"><Loader2 className="spin" size={15} />正在处理…</div> : null}
       </OverlayDialogBody>
       <OverlayDialogActions className="onedrive-setup-actions">
-        {step < 5 ? <LiquidGlassButton disabled={auth.busy} onClick={dismiss} type="button">取消</LiquidGlassButton> : null}
+        {step < 4 ? <LiquidGlassButton disabled={auth.busy} onClick={dismiss} type="button">取消</LiquidGlassButton> : null}
         <LiquidGlassButton disabled={step === 1 || auth.busy} onClick={goBack} type="button">上一步</LiquidGlassButton>
-        <LiquidGlassButton disabled={forwardDisabled} onClick={() => void goForward().catch(() => undefined)} tone="primary" type="button">{step === 4 && !auth.flow ? <ExternalLink size={14} /> : null}{forwardLabel}</LiquidGlassButton>
+        <LiquidGlassButton disabled={forwardDisabled} onClick={() => void goForward().catch(() => undefined)} tone="primary" type="button">{step === 3 && !auth.flow ? <ExternalLink size={14} /> : null}{forwardLabel}</LiquidGlassButton>
       </OverlayDialogActions>
     </ModalSurface>
   );

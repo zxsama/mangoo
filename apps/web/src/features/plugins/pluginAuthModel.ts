@@ -4,8 +4,6 @@ export const ONEDRIVE_PLUGIN_ID = "com.megle.onedrive";
 
 export type PluginAuthPrimaryAction =
   | "unavailable"
-  | "enable"
-  | "approve"
   | "configure"
   | "connect"
   | "wait"
@@ -17,8 +15,7 @@ export function pluginAuthPrimaryAction(
   configuration: OneDriveConfiguration | null,
 ): PluginAuthPrimaryAction {
   if (!plugin) return "unavailable";
-  if (!plugin.enabledIntent) return "enable";
-  if (plugin.permissionRequired || plugin.runtimeState === "permission-required") return "approve";
+  if (!plugin.enabledIntent || plugin.permissionRequired || plugin.runtimeState === "permission-required") return "configure";
   if (plugin.runtimeState === "configuration-required" || configuration?.configured === false) return "configure";
   if (plugin.authState === "authorizing") return "wait";
   if (plugin.authState === "authenticated") return "manage";

@@ -99,6 +99,12 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
     await invalidate();
   }, [client, invalidate, plugin, pluginId, run]);
 
+  const prepareConfiguration = useCallback(async () => {
+    if (!plugin || (!plugin.permissionRequired && plugin.runtimeState !== "permission-required")) return;
+    await run.mutateAsync(() => client.updatePluginGrants(pluginId, { permissions: plugin.requestedPermissions }));
+    await invalidate();
+  }, [client, invalidate, plugin, pluginId, run]);
+
   const retry = useCallback(async () => {
     await run.mutateAsync(() => client.retryPlugin(pluginId));
     await invalidate();
@@ -239,6 +245,7 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
     refresh: invalidate,
     enable,
     approve,
+    prepareConfiguration,
     retry,
     begin,
     openAuthorizationUrl,

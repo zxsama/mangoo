@@ -52,16 +52,8 @@ export function PluginsView() {
               ) : (
                 plugins.plugins.map((plugin) => (
                   <PluginCard
-                    busy={plugins.busyPluginIds.has(plugin.pluginId)}
                     key={plugin.pluginId}
                     onSelect={() => plugins.selectPlugin(plugin.pluginId)}
-                    onToggleEnabled={() => {
-                      if (plugin.enabledIntent) {
-                        void plugins.disable(plugin.pluginId);
-                      } else {
-                        void plugins.enable(plugin.pluginId);
-                      }
-                    }}
                     plugin={plugin}
                     selected={plugins.selectedPluginId === plugin.pluginId}
                   />
@@ -80,6 +72,13 @@ export function PluginsView() {
               <PluginDetail
                 busy={plugins.busyPluginIds.has(selected.pluginId)}
                 onApprovePermissions={() => void plugins.approvePermissions(selected.pluginId)}
+                onToggleEnabled={() => {
+                  if (selected.enabledIntent) {
+                    void plugins.disable(selected.pluginId);
+                  } else {
+                    void plugins.enable(selected.pluginId);
+                  }
+                }}
                 onRetry={() => void plugins.retry(selected.pluginId)}
                 onRemove={() => void plugins.remove(selected.pluginId)}
                 onRefresh={plugins.refresh}

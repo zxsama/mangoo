@@ -26,7 +26,7 @@ declare global {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const pluginBase: HostPluginProjection = {
-  pluginId: "com.megle.onedrive", name: "Megle OneDrive Sync Provider", selectedVersion: "2.0.0", knownGoodVersion: "2.0.0",
+  pluginId: "com.megle.onedrive", name: "OneDrive Sync", selectedVersion: "2.0.0", knownGoodVersion: "2.0.0",
   enabledIntent: true, runtimeState: "ready", authState: "authenticated",
   capabilities: ["sync-provider.v1"], requestedPermissions: [], grantedPermissions: [], permissionRequired: false,
   accountUuid: "account-old", accountDisplayName: "Old account", accountKind: "personal",
@@ -43,6 +43,8 @@ let planChanged = true;
 let planRequestCount = 0;
 let activeContextRevision = 1;
 let remoteLibraryCalls = 0;
+let enableCalls = 0;
+const grantBodies: unknown[] = [];
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -53,6 +55,8 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const path = url.pathname;
   if (path.endsWith("/plugins") && (!init?.method || init.method === "GET")) return json({ items: [plugin] });
   if (path.endsWith("/configuration") && (!init?.method || init.method === "GET")) return json(configuration);
+  if (path.endsWith("/enable") && init?.method === "POST") { enableCalls += 1; plugin = { ...plugin, enabledIntent: true }; return json(plugin); }
+  if (path.endsWith("/grants") && init?.method === "PUT") { const body = JSON.parse(String(init.body)); grantBodies.push(body); plugin = { ...plugin, grantedPermissions: body.permissions, permissionRequired: false, runtimeState: plugin.enabledIntent ? "ready" : "disabled" }; return json(plugin); }
   if (path.endsWith("/auth/sign-out")) { plugin = { ...plugin, authState: "signed-out", accountUuid: null, accountDisplayName: null, accountKind: null }; return json({ accepted: true }); }
   if (path.endsWith("/auth/begin")) {
     if (beginFails) return json({ code: "begin_failed", message: "begin failed" }, 500);
@@ -78,9 +82,9 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 window.open = () => ({ focus() {} }) as Window;
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 }, mutations: { retry: false } } });
-function Fixture() {
+function Fixture({ fixtureKey }: { fixtureKey: number }) {
   const [mounted, setMounted] = useState(true);
-  return <LiquidGlassLayer><QueryClientProvider client={queryClient}><OverlayProvider><button id="toggle" onClick={() => setMounted((value) => !value)}>toggle</button>{mounted ? <OneDriveAccountSetup /> : null}</OverlayProvider></QueryClientProvider></LiquidGlassLayer>;
+  return <LiquidGlassLayer><QueryClientProvider client={queryClient}><OverlayProvider><button id="toggle" onClick={() => setMounted((value) => !value)}>toggle</button>{mounted ? <OneDriveAccountSetup key={fixtureKey} /> : null}</OverlayProvider></QueryClientProvider></LiquidGlassLayer>;
 }
 
 function TransientInputFixture() {
@@ -89,7 +93,7 @@ function TransientInputFixture() {
     plugin: { ...pluginBase, authState: "authorizing" }, configuration: configBase, configurationPlan: null,
     primaryAction: "wait", flow: { authorizationUrl: "https://example.invalid", flowId: "transient", expiresAt: Date.now() + 60_000, completionMode: "manual-response-uri", redirectUri: null },
     responseUri, setResponseUri, busy: false, loading: false, error: null,
-    refresh: async () => {}, enable: async () => {}, approve: async () => {}, retry: async () => {}, begin: async () => {}, openAuthorizationUrl: async () => {}, complete: async () => {}, cancel: async () => {}, signOut: async () => {}, copyAuthorizationUrl: async () => true, planConfiguration: async () => null, commitConfiguration: async () => {}, clearConfigurationPlan: () => {},
+    refresh: async () => {}, enable: async () => {}, approve: async () => {}, prepareConfiguration: async () => {}, retry: async () => {}, begin: async () => {}, openAuthorizationUrl: async () => {}, complete: async () => {}, cancel: async () => {}, signOut: async () => {}, copyAuthorizationUrl: async () => true, planConfiguration: async () => null, commitConfiguration: async () => {}, clearConfigurationPlan: () => {},
   } as PluginAuthController;
   return <OverlayProvider><OneDriveAccountSetupContent controller={controller} /></OverlayProvider>;
 }
@@ -104,14 +108,15 @@ function PluginPresentationFixture({ initialPlugin }: { initialPlugin: HostPlugi
   const renderedPlugin = { ...initialPlugin, enabledIntent: enabled };
   return (
     <LiquidGlassLayer>
-      <PluginCard busy={false} onSelect={() => setSelected(true)} onToggleEnabled={() => setEnabled((value) => !value)} plugin={renderedPlugin} selected={selected} />
-      <PluginDetail busy={false} onApprovePermissions={() => {}} onRefresh={() => {}} onRemove={() => {}} onRetry={() => {}} plugin={renderedPlugin} />
+      <PluginCard onSelect={() => setSelected(true)} plugin={renderedPlugin} selected={selected} />
+      <PluginDetail busy={false} onApprovePermissions={() => {}} onRefresh={() => {}} onRemove={() => {}} onRetry={() => {}} onToggleEnabled={() => setEnabled((value) => !value)} plugin={renderedPlugin} />
     </LiquidGlassLayer>
   );
 }
 
 const root = createRoot(document.getElementById("root")!);
-await act(async () => root.render(<Fixture />));
+let fixtureKey = 0;
+await act(async () => root.render(<Fixture fixtureKey={fixtureKey} />));
 
 let stage = "initial render";
 const waitFor = async (predicate: () => boolean) => {
@@ -161,14 +166,30 @@ try {
   const manualCompletion = { dispatched: (completeBody as { flowId?: string })?.flowId === "flow-1", terminalCleared: !document.querySelector("textarea") };
   await click("完成");
 
-  plugin = { ...plugin, authState: "authorization-required", accountUuid: null, accountDisplayName: null, accountKind: null };
+  plugin = { ...plugin, enabledIntent: false, runtimeState: "disabled", authState: "authorization-required", accountUuid: null, accountDisplayName: null, accountKind: null };
   configuration = { ...configuration, configured: false, source: "missing", errorCode: "onedrive-client-id-missing" };
-  stage = "configuration editor";
+  stage = "disabled configuration entry";
   await queryClient.invalidateQueries({ queryKey: ["plugins"] });
   await queryClient.invalidateQueries({ queryKey: ["plugins", "com.megle.onedrive", "configuration"] });
   await waitFor(() => Boolean(button("配置 OneDrive")));
   await click("配置 OneDrive");
-  await waitFor(() => document.body.textContent?.includes("创建 Microsoft Entra 应用") === true);
+  await waitFor(() => document.body.textContent?.includes("注册并配置 Microsoft Entra 应用") === true);
+  const disabledConfiguration = { wizardOpened: true, enableStayedExplicit: enableCalls === 0 };
+  await clickWizard("取消");
+
+  const requestedPermissions = [{ kind: "network", schemes: ["https"], hosts: ["login.microsoftonline.com"] }] as HostPluginProjection["requestedPermissions"];
+  plugin = { ...plugin, enabledIntent: true, runtimeState: "permission-required", permissionRequired: true, requestedPermissions, grantedPermissions: [] };
+  stage = "configuration editor";
+  const grantsBeforeConfiguration = grantBodies.length;
+  await queryClient.invalidateQueries({ queryKey: ["plugins"] });
+  fixtureKey += 1;
+  await act(async () => root.render(<Fixture fixtureKey={fixtureKey} />));
+  await waitFor(() => Boolean(button("配置 OneDrive")));
+  await click("配置 OneDrive");
+  await waitFor(() => document.body.textContent?.includes("注册并配置 Microsoft Entra 应用") === true);
+  await waitFor(() => grantBodies.length > grantsBeforeConfiguration);
+  const grantedPermissions = (grantBodies.at(-1) as { permissions?: HostPluginProjection["requestedPermissions"] } | undefined)?.permissions;
+  const configurationPreparation = { grantedRequestedPermissions: JSON.stringify(grantedPermissions) === JSON.stringify(requestedPermissions), separateApprovalHidden: !document.body.textContent?.includes("批准所需权限") };
   const successfulWindowOpen = window.open;
   window.open = () => null;
   await click("打开 Microsoft Entra");
@@ -178,20 +199,15 @@ try {
   const nextDisabledBeforeConfirmation = button("下一步")?.disabled === true;
   const wizard = document.querySelector("#onedrive-setup-wizard") as HTMLElement;
   const firstStepHeight = wizard.getBoundingClientRect().height;
-  const firstStepCheckbox = document.querySelector('.onedrive-setup-section input[type="checkbox"]') as HTMLInputElement;
-  await act(async () => firstStepCheckbox.click());
-  await click("下一步");
-  const secondStepHeight = wizard.getBoundingClientRect().height;
   const setupCheckboxes = [...document.querySelectorAll('.onedrive-setup-section input[type="checkbox"]')] as HTMLInputElement[];
-  const secondStepBlocked = button("下一步")?.disabled === true;
   for (const checkbox of setupCheckboxes) await act(async () => checkbox.click());
   await click("下一步");
-  const thirdStepHeight = wizard.getBoundingClientRect().height;
+  const secondStepHeight = wizard.getBoundingClientRect().height;
   const configurationInput = document.querySelector('.onedrive-setup-section input[placeholder]') as HTMLInputElement;
   await input('.onedrive-setup-section input[placeholder]', "11111111-1111-4111-8111-111111111111");
-  const wizardGates = { createBlocked: nextDisabledBeforeConfirmation, configurationBlocked: secondStepBlocked, clientIdAccepted: configurationInput.getAttribute("aria-invalid") !== "true" };
+  const wizardGates = { combinedSetupBlocked: nextDisabledBeforeConfirmation, clientIdAccepted: configurationInput.getAttribute("aria-invalid") !== "true" };
   const wizardLayout = {
-    stableHeight: firstStepHeight === secondStepHeight && secondStepHeight === thirdStepHeight,
+    stableHeight: firstStepHeight === secondStepHeight,
     bodyOwnsScroll: getComputedStyle(wizard.querySelector(".onedrive-setup-body") as HTMLElement).overflowY === "auto",
     footerVisible: (wizard.querySelector(".onedrive-setup-actions") as HTMLElement).getBoundingClientRect().bottom <= wizard.getBoundingClientRect().bottom,
     unifiedActions: !wizard.querySelector("button:not([data-liquid-glass='button'])")
@@ -199,9 +215,6 @@ try {
   await clickWizard("检查配置"); await waitFor(() => document.body.textContent?.includes("配置将发生变化") === true);
   await clickWizard("取消");
   await click("配置 OneDrive");
-  const reopenedFirstStepCheckbox = document.querySelector('.onedrive-setup-section input[type="checkbox"]') as HTMLInputElement;
-  await act(async () => reopenedFirstStepCheckbox.click());
-  await click("下一步");
   const reopenedSetupCheckboxes = [...document.querySelectorAll('.onedrive-setup-section input[type="checkbox"]')] as HTMLInputElement[];
   for (const checkbox of reopenedSetupCheckboxes) await act(async () => checkbox.click());
   await click("下一步");
@@ -307,13 +320,14 @@ try {
   const technicalDetails = presentationHost.querySelector("details.plugin-technical-details") as HTMLDetailsElement;
   const technicalSummary = technicalDetails.querySelector("summary") as HTMLElement;
   const removeButton = [...technicalDetails.querySelectorAll("button")].find((item) => item.textContent?.includes("从注册表移除"));
+  const detailPanel = technicalDetails.closest(".plugin-detail");
   const conciseCard = {
     friendlyNameVisible: cardText.includes("Presentation Check"),
     rawIdHidden: !cardText.includes("com.megle.presentation-check"),
     oneLineOrder: cardParts.join("|") === "plugin-card-icon|plugin-card-name|plugin-card-version|plugin-status-pill plugin-status-pill-degraded",
     rawErrorHidden: !cardText.includes("raw provider failure"),
-    toggleTextHidden: !cardText.includes("Disable"),
-    toggleAccessible: currentToggleInput.getAttribute("aria-label") === "Enable"
+    toggleMovedToDetail: !currentCard.querySelector(".plugin-toggle") && Boolean(detailPanel?.querySelector(".plugin-detail-enable-row .plugin-toggle")),
+    toggleAccessible: currentToggleInput.getAttribute("aria-label") === "启用插件"
   };
   const technicalDisclosure = {
     collapsedInitially: !technicalDetails.open,
@@ -322,7 +336,6 @@ try {
     diagnosticsNested: technicalDetails.textContent?.includes("raw provider failure") === true,
     removalNested: Boolean(removeButton)
   };
-  const detailPanel = technicalDetails.closest(".plugin-detail");
   const tabRelationship = {
     controlsPanel: currentCardBody.getAttribute("aria-controls") === detailPanel?.id,
     panelLabelledByTab: detailPanel?.getAttribute("aria-labelledby") === currentCardBody.id,
@@ -356,7 +369,7 @@ try {
   const wizardRevision = { staleIntentCleared: document.body.textContent?.includes("资源库上下文已变化") === true };
   await act(async () => staleWizardRoot.unmount()); wizardHost.remove();
 
-  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, configConfirm, configNoop, portalOpenFailureVisible, reopenState, wizardGates, wizardLayout, readOnly, unmountCleanup, pointerOptOut, cardInteraction, conciseCard, tabRelationship, technicalDisclosure, technicalOpenedWithKeyboard, wizardResume, wizardRevision };
+  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, disabledConfiguration, configurationPreparation, configConfirm, configNoop, portalOpenFailureVisible, reopenState, wizardGates, wizardLayout, readOnly, unmountCleanup, pointerOptOut, cardInteraction, conciseCard, tabRelationship, technicalDisclosure, technicalOpenedWithKeyboard, wizardResume, wizardRevision };
 } catch (error) {
   (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: false, error: error instanceof Error ? error.stack ?? error.message : String(error) };
 }

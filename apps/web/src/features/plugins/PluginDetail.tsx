@@ -1,4 +1,4 @@
-import { ChevronRight, Database, Trash2 } from "lucide-react";
+import { ChevronRight, Database, Loader2, Trash2 } from "lucide-react";
 import type { HostPluginProjection, PluginCapability } from "@megle/core-client";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import { StatusPill } from "./StatusPill";
@@ -10,6 +10,7 @@ interface PluginDetailProps {
   plugin: HostPluginProjection;
   busy: boolean;
   onApprovePermissions: () => void;
+  onToggleEnabled: () => void;
   onRetry: () => void;
   onRemove: () => void;
   onRefresh: () => void | Promise<void>;
@@ -23,11 +24,14 @@ export function PluginDetail({
   plugin,
   busy,
   onApprovePermissions,
+  onToggleEnabled,
   onRetry,
   onRemove,
   onRefresh
 }: PluginDetailProps) {
   const isOneDrive = plugin.pluginId === ONEDRIVE_PLUGIN_ID;
+  const toggleDisabled = busy || plugin.runtimeState === "incompatible";
+  const toggleLabel = plugin.enabledIntent ? "停用插件" : "启用插件";
 
   return (
     <section
@@ -42,6 +46,26 @@ export function PluginDetail({
             <div className="plugin-detail-title">{plugin.name}</div>
             <div className="plugin-detail-subtitle">
               <span>v{plugin.selectedVersion}</span>
+            </div>
+            <div className="plugin-detail-enable-row">
+              <span>启用插件</span>
+              <label
+                aria-disabled={toggleDisabled}
+                className={`plugin-toggle${plugin.enabledIntent ? " on" : ""}${toggleDisabled ? " disabled" : ""}`}
+                title={plugin.runtimeState === "incompatible" ? plugin.compatibilityReason ?? "插件不兼容" : toggleLabel}
+              >
+                <input
+                  aria-label={toggleLabel}
+                  checked={plugin.enabledIntent}
+                  disabled={toggleDisabled}
+                  onChange={onToggleEnabled}
+                  type="checkbox"
+                />
+                <span aria-hidden="true" className="plugin-toggle-track">
+                  <span className="plugin-toggle-thumb" />
+                </span>
+                {busy ? <Loader2 aria-hidden="true" className="plugin-toggle-busy spin" size={12} /> : null}
+              </label>
             </div>
           </div>
           {!isOneDrive ? (

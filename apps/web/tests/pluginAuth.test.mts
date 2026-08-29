@@ -26,7 +26,7 @@ const configuration: OneDriveConfiguration = {
 function plugin(overrides: Partial<HostPluginProjection> = {}): HostPluginProjection {
   return {
     pluginId: "com.megle.onedrive",
-    name: "Megle OneDrive Sync Provider",
+    name: "OneDrive Sync",
     selectedVersion: "2.0.0",
     knownGoodVersion: "2.0.0",
     enabledIntent: true,
@@ -51,8 +51,8 @@ function plugin(overrides: Partial<HostPluginProjection> = {}): HostPluginProjec
 describe("OneDrive plugin auth presentation", () => {
   it("derives one primary action from the Host projection", () => {
     assert.equal(pluginAuthPrimaryAction(null, configuration), "unavailable");
-    assert.equal(pluginAuthPrimaryAction(plugin({ enabledIntent: false }), configuration), "enable");
-    assert.equal(pluginAuthPrimaryAction(plugin({ permissionRequired: true }), configuration), "approve");
+    assert.equal(pluginAuthPrimaryAction(plugin({ enabledIntent: false }), configuration), "configure");
+    assert.equal(pluginAuthPrimaryAction(plugin({ permissionRequired: true }), configuration), "configure");
     assert.equal(pluginAuthPrimaryAction(plugin(), { ...configuration, configured: false }), "configure");
     assert.equal(pluginAuthPrimaryAction(plugin({ authState: "authorizing" }), configuration), "wait");
     assert.equal(pluginAuthPrimaryAction(plugin({ authState: "authenticated" }), configuration), "manage");
@@ -77,10 +77,10 @@ describe("OneDrive plugin auth presentation", () => {
     assert.equal(isValidOneDriveClientId("00000000-0000-0000-0000-000000000000"), false);
     assert.equal(isValidOneDriveClientId("directory-id"), false);
     assert.equal(deriveOneDriveSetupStep({ ...configuration, configured: false }, false), 1);
-    assert.equal(deriveOneDriveSetupStep(configuration, false), 4);
-    assert.equal(deriveOneDriveSetupStep(configuration, true), 5);
-    assert.equal(oneDriveSetupRecoveryStep("AADSTS700016 application not found"), 3);
-    assert.equal(oneDriveSetupRecoveryStep("redirect URI mismatch"), 2);
+    assert.equal(deriveOneDriveSetupStep(configuration, false), 3);
+    assert.equal(deriveOneDriveSetupStep(configuration, true), 4);
+    assert.equal(oneDriveSetupRecoveryStep("AADSTS700016 application not found"), 2);
+    assert.equal(oneDriveSetupRecoveryStep("redirect URI mismatch"), 1);
     assert.equal(oneDriveSetupRecoveryStep("network unavailable"), null);
   });
 
@@ -92,23 +92,26 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(controller, /cancelPluginAuth/);
     assert.match(controller, /requestOAuthReturnFocus/);
     assert.match(controller, /locallyStartedFlowRef/);
+    assert.match(controller, /prepareConfiguration/);
+    assert.match(controller, /permissions: plugin\.requestedPermissions/);
     assert.match(controller, /setResponseUri\(""\)/);
     assert.doesNotMatch(controller, /localStorage|sessionStorage/);
     const setupWizard = readFileSync(new URL("../src/features/plugins/OneDriveSetupWizard.tsx", import.meta.url), "utf8");
     assert.match(setupWizard, /manual-response-uri/);
     assert.match(setupWizard, /登录返回地址/);
-    assert.match(setupWizard, /Client Secret/);
+    assert.doesNotMatch(setupWizard, /Client Secret/);
     assert.match(setupWizard, /openAuthorizationUrl/);
     assert.doesNotMatch(setupWizard, /password|access token|refresh token/i);
     assert.match(setupWizard, /配置进度/);
     assert.match(setupWizard, /http:\/\/localhost\/plugin-auth\/callback/);
     assert.match(setupWizard, /移动和桌面应用程序/);
     assert.match(setupWizard, /允许公共客户端流/);
-    assert.match(setupWizard, /User\.Read/);
+    assert.doesNotMatch(setupWizard, /User\.Read/);
     assert.doesNotMatch(setupWizard, /<button\b/);
     assert.match(setupWizard, /onedrive-setup-actions/);
-    assert.match(setupWizard, /created/);
     assert.match(setupWizard, /allConfigurationChecksComplete/);
+    assert.match(setupWizard, /data-overlay-scroll-container/);
+    assert.match(setupWizard, /应用程序\(客户端\) ID/);
     assert.match(setupWizard, /clientIdValid/);
     assert.match(setupWizard, /auth\.plugin\?\.authState === "authenticated"/);
     assert.match(setup, /确认切换 OneDrive 账号/);
@@ -126,7 +129,7 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(setup, /配置 OneDrive/);
     assert.doesNotMatch(setup, /高级配置|检查更改|预览更改|收起高级配置/);
     assert.doesNotMatch(setup, /重新扫描/);
-    assert.match(card, /aria-label=\{toggleLabel\}/);
+    assert.doesNotMatch(card, /plugin-toggle|onToggleEnabled|aria-label=\{toggleLabel\}/);
     assert.match(card, /data-pointer-glow="off"/);
     assert.match(card, /role="tab"/);
     assert.match(card, /aria-selected=\{selected\}/);
@@ -140,6 +143,8 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(detail, /<details className="plugin-disclosure plugin-technical-details">/);
     assert.match(detail, /<summary[^>]*data-pointer-glow="off"[\s\S]*plugin-disclosure-chevron[\s\S]*plugin-disclosure-label">技术信息/);
     assert.match(detail, /plugin-detail-title">\{plugin\.name\}/);
+    assert.match(detail, /plugin-detail-enable-row/);
+    assert.match(detail, /aria-label=\{toggleLabel\}/);
     assert.match(detail, /aria-labelledby=\{pluginTabId\(plugin\.pluginId\)\}/);
     assert.match(detail, /id=\{pluginPanelId\(plugin\.pluginId\)\}/);
     assert.match(detail, /role="tabpanel"/);

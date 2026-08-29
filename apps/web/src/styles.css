@@ -4475,10 +4475,7 @@ button:disabled {
 }
 
 .plugin-card {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
+  display: block;
   min-width: 0;
   padding: 5px 8px;
   border: 0;
@@ -4554,11 +4551,6 @@ button:disabled {
   color: var(--text-muted);
   font-size: 11.5px;
   white-space: nowrap;
-}
-
-.plugin-card-actions {
-  display: flex;
-  align-items: center;
 }
 
 .plugin-status-pill {
@@ -4726,6 +4718,15 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.plugin-detail-enable-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
   color: var(--text-muted);
   font-size: 12px;
 }
@@ -5120,14 +5121,15 @@ button:disabled {
 
 .onedrive-setup-body {
   min-height: 0;
-  padding: 18px 24px;
+  padding: 18px 30px 18px 24px;
   overflow: auto;
   overscroll-behavior: contain;
+  --scrollbar-edge-inset: 7px;
 }
 
 .onedrive-setup-steps {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   margin: 0;
   padding: 14px 24px 12px;
@@ -5197,6 +5199,51 @@ button:disabled {
   color: var(--text-soft);
   font-size: 12.5px;
   line-height: 1.45;
+}
+
+.onedrive-setup-confirm > span > span {
+  display: block;
+}
+
+.onedrive-client-id-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface-elevated, #222) 74%, transparent);
+}
+
+.onedrive-client-id-heading {
+  display: grid;
+  gap: 4px;
+}
+
+.onedrive-client-id-heading strong {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.onedrive-client-id-heading span,
+.onedrive-client-id-feedback {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.onedrive-client-id-field {
+  margin: 0;
+}
+
+.onedrive-client-id-field input {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  letter-spacing: 0.015em;
+}
+
+.onedrive-client-id-feedback {
+  min-height: 18px;
 }
 
 .onedrive-setup-confirm input {

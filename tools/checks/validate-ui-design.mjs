@@ -153,6 +153,7 @@ const pluginCard = read("apps/web/src/features/plugins/PluginCard.tsx");
 const pluginDetail = read("apps/web/src/features/plugins/PluginDetail.tsx");
 const oneDriveAccountSetup = read("apps/web/src/features/plugins/OneDriveAccountSetup.tsx");
 const oneDriveSetupWizard = read("apps/web/src/features/plugins/OneDriveSetupWizard.tsx");
+const oneDriveManifestTemplate = read("bundled-plugins/com.megle.onedrive/plugin.template.json");
 const notificationWindow = read("apps/web/src/features/notifications/NotificationWindow.tsx");
 const notificationStatusView = read("apps/web/src/features/notifications/NotificationStatusView.tsx");
 const notificationHistoryView = read("apps/web/src/features/notifications/NotificationHistoryView.tsx");
@@ -1468,7 +1469,6 @@ for (const value of [
   "aria-controls={selected ? pluginPanelId(plugin.pluginId) : undefined}",
   "id={pluginTabId(plugin.pluginId)}",
   "onKeyDown={handleTabKeyDown}",
-  "aria-label={toggleLabel}",
   "{plugin.name}",
   "plugin-card-icon",
   "<StatusPill"
@@ -1477,7 +1477,7 @@ for (const value of [
     fail(`PluginCard concise row contract missing ${value}`);
   }
 }
-for (const retiredValue of ["LiquidGlassSurface", "aria-pressed", "plugin-card-error", "plugin-toggle-label"]) {
+for (const retiredValue of ["LiquidGlassSurface", "aria-pressed", "plugin-card-error", "plugin-toggle-label", "plugin-toggle", "onToggleEnabled"]) {
   if (pluginCard.includes(retiredValue)) {
     fail(`PluginCard must not render duplicate row detail ${retiredValue}`);
   }
@@ -1493,6 +1493,11 @@ for (const value of [
 ]) {
   if (!pluginDetail.includes(value)) {
     fail(`PluginDetail technical disclosure contract missing ${value}`);
+  }
+}
+for (const value of ["plugin-detail-enable-row", "aria-label={toggleLabel}", "onToggleEnabled"]) {
+  if (!pluginDetail.includes(value)) {
+    fail(`PluginDetail enable-control contract missing ${value}`);
   }
 }
 if (!/plugin-disclosure-chevron[\s\S]{0,180}plugin-disclosure-label/.test(pluginDetail)) {
@@ -1525,15 +1530,17 @@ for (const value of [
 for (const value of [
   "配置 OneDrive 应用",
   "配置进度",
-  "创建应用",
-  "配置应用",
+  "注册并配置应用",
   "保存 Client ID",
   "登录验证",
+  "应用程序(客户端) ID",
+  "任何 Entra ID 租户 + 个人 Microsoft 帐户",
+  "Authentication (Preview) → 设置 → 允许公共客户端流",
   "Files.ReadWrite.AppFolder",
   "http://localhost/plugin-auth/callback",
   "移动和桌面应用程序",
   "允许公共客户端流",
-  "User.Read",
+  "data-overlay-scroll-container",
   "manual-response-uri",
   "clientIdValid",
   "allConfigurationChecksComplete",
@@ -1543,12 +1550,21 @@ for (const value of [
     fail(`OneDrive sequential wizard contract missing ${value}`);
   }
 }
+for (const retiredValue of ["Megle OneDrive Sync Provider", "启用 OneDrive", "批准所需权限", "不要选择", "不要创建", "User.Read", '"创建应用"', '"配置应用"']) {
+  if (oneDriveSetupWizard.includes(retiredValue) || oneDriveAccountSetup.includes(retiredValue)) {
+    fail(`OneDrive retired setup contract must be absent: ${retiredValue}`);
+  }
+}
+if (!oneDriveManifestTemplate.includes('"name": "OneDrive Sync"')) {
+  fail("OneDrive bundled manifest must expose the concise display name");
+}
 if (/<button\b/.test(oneDriveSetupWizard) || /<button\b/.test(oneDriveAccountSetup)) {
   fail("OneDrive independent actions must use LiquidGlassButton rather than legacy raw buttons");
 }
 for (const value of [
   "grid-template-rows: auto auto minmax(0, 1fr) auto",
   "height: min(640px, calc(100vh - 40px))",
+  "grid-template-columns: repeat(4, minmax(0, 1fr))",
   ".onedrive-setup-actions",
   "justify-content: flex-end"
 ]) {

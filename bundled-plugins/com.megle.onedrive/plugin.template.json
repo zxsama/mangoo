@@ -1,7 +1,7 @@
 {
   "manifestVersion": 2,
   "id": "com.megle.onedrive",
-  "name": "Megle OneDrive Sync Provider",
+  "name": "OneDrive Sync",
   "version": "1.0.0",
   "engine": "process",
   "entry": { "windowsX64": "bin/megle-onedrive-provider.exe", "linuxX64": "bin/megle-onedrive-provider" },

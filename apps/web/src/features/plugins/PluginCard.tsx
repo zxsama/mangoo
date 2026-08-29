@@ -1,5 +1,5 @@
 import type { HostPluginProjection } from "@megle/core-client";
-import { Cloud, Loader2, Plug } from "lucide-react";
+import { Cloud, Plug } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { StatusPill } from "./StatusPill";
 import { ONEDRIVE_PLUGIN_ID } from "./pluginAuthModel";
@@ -7,9 +7,7 @@ import { ONEDRIVE_PLUGIN_ID } from "./pluginAuthModel";
 interface PluginCardProps {
   plugin: HostPluginProjection;
   selected: boolean;
-  busy: boolean;
   onSelect: () => void;
-  onToggleEnabled: () => void;
 }
 
 export function pluginTabId(pluginId: string) {
@@ -41,12 +39,8 @@ function handleTabKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
 export function PluginCard({
   plugin,
   selected,
-  busy,
-  onSelect,
-  onToggleEnabled
+  onSelect
 }: PluginCardProps) {
-  const toggleDisabled = busy || plugin.runtimeState === "incompatible";
-  const toggleLabel = plugin.enabledIntent ? "Disable" : "Enable";
   const errorTooltip = plugin.lastErrorDetail ?? undefined;
   const PluginIcon = plugin.pluginId === ONEDRIVE_PLUGIN_ID ? Cloud : Plug;
 
@@ -76,34 +70,6 @@ export function PluginCard({
         <span className="plugin-card-version">v{plugin.selectedVersion}</span>
         <StatusPill status={plugin.runtimeState} title={errorTooltip} />
       </button>
-      <div className="plugin-card-actions">
-        <label
-          className={`plugin-toggle${plugin.enabledIntent ? " on" : ""}${
-            toggleDisabled ? " disabled" : ""
-          }`}
-          aria-disabled={toggleDisabled}
-          title={
-            plugin.runtimeState === "incompatible"
-              ? plugin.compatibilityReason ?? "Incompatible provider"
-              : toggleLabel
-          }
-        >
-          <input
-            type="checkbox"
-            checked={plugin.enabledIntent}
-            disabled={toggleDisabled}
-            onChange={(event) => {
-              event.stopPropagation();
-              onToggleEnabled();
-            }}
-            aria-label={toggleLabel}
-          />
-          <span className="plugin-toggle-track" aria-hidden="true">
-            <span className="plugin-toggle-thumb" />
-          </span>
-          {busy ? <Loader2 aria-hidden="true" className="plugin-toggle-busy spin" size={12} /> : null}
-        </label>
-      </div>
     </div>
   );
 }
