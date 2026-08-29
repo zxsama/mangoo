@@ -99,7 +99,7 @@ export function DeleteConfirm({
         ) : null}
 
         <OverlayDialogActions>
-          <button
+          <LiquidGlassButton
             className="overlay-dialog-button"
             disabled={busy}
             onClick={onCancel}
@@ -107,7 +107,7 @@ export function DeleteConfirm({
             type="button"
           >
             Cancel
-          </button>
+          </LiquidGlassButton>
           <LiquidGlassButton
             className={`overlay-dialog-button ${
               permanent

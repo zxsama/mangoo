@@ -377,9 +377,9 @@ export function ManagedLibraryWizard({
       />
       <div className="managed-library-wizard-root">
         <span>{managedRoot ?? "尚未选择目录"}</span>
-        <button data-interactive-pointer-target="true" disabled={busy} onClick={() => void chooseRoot()} type="button">
+        <LiquidGlassButton disabled={busy} onClick={() => void chooseRoot()} type="button">
           选择目录…
-        </button>
+        </LiquidGlassButton>
       </div>
       <label className="managed-library-enable-sync">
         <input checked={enableSync} onChange={(event) => setEnableSync(event.target.checked)} type="checkbox" />
@@ -405,7 +405,7 @@ export function ManagedLibraryWizard({
               })} type="checkbox" />
               <span><strong>{remote.name}</strong><small>{remote.boundLocally ? "已在本机绑定" : remote.compatible ? "可恢复" : remote.errorCode ?? "描述损坏或版本不兼容"}</small>{remoteDetails ? <small>{remoteDetails}</small> : null}</span>
             </label>
-            {selected ? <div className="managed-library-wizard-root"><span>{restoreRoots[remote.libraryUuid] ?? "尚未选择目录"}</span><button data-interactive-pointer-target="true" disabled={busy} onClick={() => void chooseRestoreRoot(remote)} type="button">选择目录…</button></div> : null}
+            {selected ? <div className="managed-library-wizard-root"><span>{restoreRoots[remote.libraryUuid] ?? "尚未选择目录"}</span><LiquidGlassButton disabled={busy} onClick={() => void chooseRestoreRoot(remote)} type="button">选择目录…</LiquidGlassButton></div> : null}
           </div>;
         })}
       </div>}
@@ -418,14 +418,14 @@ export function ManagedLibraryWizard({
         {visibleRestorePlans.map((plan) => <div key={plan.restoreUuid}>
           <div className="managed-library-restore-progress-copy"><strong>{plan.name}</strong><span>{plan.phase} · {plan.mediaItemsDone}/{plan.mediaItemsTotal ?? "?"}</span><progress max={Math.max(plan.mediaItemsTotal ?? 1, 1)} value={plan.mediaItemsDone} /></div>
           <div className="managed-library-restore-progress-actions">
-            {plan.state === "paused" ? <button data-interactive-pointer-target={!busy ? "true" : undefined} disabled={busy} onClick={() => void changeRestoreState(plan, "resume")} type="button">继续</button> : !["complete", "cancelled", "failed"].includes(plan.state) ? <button data-interactive-pointer-target={!busy ? "true" : undefined} disabled={busy} onClick={() => void changeRestoreState(plan, "pause")} type="button">暂停</button> : null}
-            {!plan.catalogReady && !["complete", "cancelled", "failed"].includes(plan.state) ? <button data-interactive-pointer-target={!busy ? "true" : undefined} disabled={busy} onClick={() => void changeRestoreState(plan, "cancel")} type="button">取消恢复</button> : null}
+            {plan.state === "paused" ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "resume")} type="button">继续</LiquidGlassButton> : !["complete", "cancelled", "failed"].includes(plan.state) ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "pause")} type="button">暂停</LiquidGlassButton> : null}
+            {!plan.catalogReady && !["complete", "cancelled", "failed"].includes(plan.state) ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "cancel")} tone="danger" type="button">取消恢复</LiquidGlassButton> : null}
           </div>
         </div>)}
       </div> : null}
       {error ? <div className="settings-inline-error">{error}</div> : null}
       <OverlayDialogActions>
-        {!firstRun ? <button disabled={busy} onClick={onClose} type="button">取消</button> : null}
+        {!firstRun ? <LiquidGlassButton disabled={busy} onClick={onClose} type="button">取消</LiquidGlassButton> : null}
         {mode === "restore" && restorePlans.length ? <LiquidGlassButton onClick={onClose} type="button">完成</LiquidGlassButton> : <LiquidGlassButton disabled={busy || (mode === "restore" && selectedRemote.length === 0)} onClick={() => void (mode === "create" ? submit() : restorePreflight ? confirmRestore() : submitRestore())} type="button">
           {busy ? (mode === "restore" ? "正在处理…" : "正在创建…") : mode === "restore" ? restorePreflight ? `确认并恢复 ${restorePreflight.totalItems} 个资源库` : `预检 ${selectedRemote.length || ""} 个资源库` : "创建并打开"}
         </LiquidGlassButton>}

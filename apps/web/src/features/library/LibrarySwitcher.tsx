@@ -407,12 +407,12 @@ export function LibrarySwitcher({
 
   const footerActions = (
     <>
-      <button data-interactive-pointer-target="true" onClick={() => { setWizardMode("create"); void onCreate(); }} type="button">
+      <LiquidGlassButton onClick={() => { setWizardMode("create"); void onCreate(); }} type="button">
         创建资源库…
-      </button>
-      <button data-interactive-pointer-target="true" onClick={() => { setWizardMode("restore"); setFirstRun(false); onClose(); window.requestAnimationFrame(() => setWizardOpen(true)); }} type="button">
+      </LiquidGlassButton>
+      <LiquidGlassButton onClick={() => { setWizardMode("restore"); setFirstRun(false); onClose(); window.requestAnimationFrame(() => setWizardOpen(true)); }} type="button">
         从 OneDrive 恢复…
-      </button>
+      </LiquidGlassButton>
     </>
   );
 
@@ -461,15 +461,14 @@ export function LibrarySwitcher({
           titleId="library-remove-confirm-title"
         />
         <OverlayDialogActions>
-          <button
-            data-interactive-pointer-target={!removePending ? "true" : undefined}
+          <LiquidGlassButton
             disabled={removePending}
             onClick={() => dispatch({ type: "cancel-remove" })}
             ref={cancelRef}
             type="button"
           >
             取消
-          </button>
+          </LiquidGlassButton>
           <LiquidGlassButton
             disabled={removePending}
             onClick={() => void confirmRootRemoval()}

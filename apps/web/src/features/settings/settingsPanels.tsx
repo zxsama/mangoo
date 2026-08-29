@@ -25,7 +25,7 @@ import {
 } from "../../core/desktop";
 import type { LibrarySummary } from "../../core/libraryTypes";
 import type { LibraryState } from "../../core/useLibraryData";
-import type { InterfaceStyleController } from "../../design/liquid-glass";
+import { LiquidGlassButton, type InterfaceStyleController } from "../../design/liquid-glass";
 import { thumbnailFailureLogIntentForLibrary } from "../notifications/notificationModel";
 import { LibraryGlyph, LibraryIconPicker } from "../library/libraryGlyph";
 import { ManagedLibraryWizard } from "../library/ManagedLibraryWizard";
@@ -338,60 +338,55 @@ function ThumbnailsTab({
             value={stats ? formatCacheBytes(stats.totalBlobBytes) : "-"}
           />
         </dl>
-        <button
-          className="settings-inline-action"
+        <LiquidGlassButton
           disabled={library.thumbnailCacheStatsLoading}
           onClick={() => void library.refreshThumbnailCacheStats()}
           type="button"
         >
           <RefreshCw aria-hidden="true" size={13} />
           <span>{library.thumbnailCacheStatsLoading ? "刷新中…" : "刷新统计"}</span>
-        </button>
+        </LiquidGlassButton>
       </SettingsGroup>
 
       <SettingsGroup title="手动生成">
         <div className="settings-action-row">
-          <button
-            className="settings-inline-action"
+          <LiquidGlassButton
             disabled={currentFolderDisabled}
             onClick={() => void library.generateCurrentFolderThumbnailCache()}
             type="button"
           >
             生成当前文件夹
-          </button>
-          <button
-            className="settings-inline-action"
+          </LiquidGlassButton>
+          <LiquidGlassButton
             disabled={currentFolderDisabled}
             onClick={() => void library.generateCurrentTreeThumbnailCache()}
             type="button"
           >
             生成当前目录树
-          </button>
-          <button
-            className="settings-inline-action"
+          </LiquidGlassButton>
+          <LiquidGlassButton
             disabled={busy}
             onClick={() => void library.generateAllThumbnailCache()}
             type="button"
           >
             {busy ? "生成中…" : "生成全部缩略图"}
-          </button>
-          <button
-            className="settings-inline-action"
+          </LiquidGlassButton>
+          <LiquidGlassButton
             disabled={busy}
             onClick={() => void library.retryThumbnailCacheFailures()}
             type="button"
           >
             重试失败 / 过期
-          </button>
-          <button
-            className="settings-inline-action settings-inline-action-danger"
+          </LiquidGlassButton>
+          <LiquidGlassButton
             disabled={busy}
             onClick={() => void library.clearThumbnailCache()}
+            tone="danger"
             type="button"
           >
             <Trash2 aria-hidden="true" size={13} />
             <span>清空持久缓存</span>
-          </button>
+          </LiquidGlassButton>
         </div>
       </SettingsGroup>
     </>
@@ -436,9 +431,9 @@ function StatCell({
       <dt>{label}</dt>
       <dd>
         {onActivate ? (
-          <button className="settings-stat-action" onClick={onActivate} type="button">
+          <LiquidGlassButton onClick={onActivate} type="button">
             {value}
-          </button>
+          </LiquidGlassButton>
         ) : value}
       </dd>
     </div>
@@ -461,9 +456,9 @@ function AppearanceTab({
     <>
       <div className="settings-group-heading-row">
         <p className="settings-note">调整液态玻璃外观：圆角、材质模糊 / 透明度、颜色与交互高光。</p>
-        <button className="settings-inline-action" onClick={resetInterfaceStyle} type="button">
+        <LiquidGlassButton onClick={resetInterfaceStyle} type="button">
           恢复默认外观
-        </button>
+        </LiquidGlassButton>
       </div>
       <SettingsGroup title="网格">
         <StyleSlider
@@ -600,9 +595,9 @@ function ShortcutsTab() {
     <>
       <div className="settings-group-heading-row">
         <p className="settings-note">点击右侧按钮后按下新的组合键即可重新绑定。</p>
-        <button className="settings-inline-action" onClick={onReset} type="button">
+        <LiquidGlassButton onClick={onReset} type="button">
           恢复默认快捷键
-        </button>
+        </LiquidGlassButton>
       </div>
       <div className="shortcut-bindings-list">
         {actions.map((action) => {
@@ -752,14 +747,14 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                   </div>
                 </div>
                 <div className="settings-library-actions">
-                  <button
+                  <LiquidGlassButton
                     type="button"
                     disabled={l.active || l.availability !== "available"}
                     onClick={() => void onSwitch(l)}
                   >
                     切换
-                  </button>
-                  <button
+                  </LiquidGlassButton>
+                  <LiquidGlassButton
                     type="button"
                     aria-label="重命名"
                     title="重命名"
@@ -769,10 +764,9 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                     }}
                   >
                     <Pencil size={14} aria-hidden="true" />
-                  </button>
-                  <button
+                  </LiquidGlassButton>
+                  <LiquidGlassButton
                     type="button"
-                    className="settings-library-danger"
                     disabled={l.active}
                     aria-label="删除库文件"
                     title={l.active ? "无法删除当前资源库" : "删除库文件（不可撤销）"}
@@ -780,9 +774,10 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                       setConfirmDeleteId((cur) => (cur === l.libraryUuid ? null : l.libraryUuid));
                       setDeleteConfirmText("");
                     }}
+                    tone="danger"
                   >
                     <Trash2 size={14} aria-hidden="true" />
-                  </button>
+                  </LiquidGlassButton>
                 </div>
               </div>
               {confirmDeleteId === l.libraryUuid ? (
@@ -798,7 +793,7 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                       placeholder={l.name}
                       onChange={(event) => setDeleteConfirmText(event.target.value)}
                     />
-                    <button
+                    <LiquidGlassButton
                       type="button"
                       onClick={() => {
                         setConfirmDeleteId(null);
@@ -806,15 +801,15 @@ function LibrariesTab({ library }: { library: LibraryState }) {
                       }}
                     >
                       取消
-                    </button>
-                    <button
+                    </LiquidGlassButton>
+                    <LiquidGlassButton
                       type="button"
-                      className="settings-library-danger"
                       disabled={deleteConfirmText.trim() !== l.name}
                       onClick={() => void onDeleteFile(l)}
+                      tone="danger"
                     >
                       删除
-                    </button>
+                    </LiquidGlassButton>
                   </div>
                 </div>
               ) : null}
@@ -822,12 +817,12 @@ function LibrariesTab({ library }: { library: LibraryState }) {
           ))}
         </ul>
         <div className="settings-library-footer">
-          <button type="button" onClick={() => { setWizardMode("create"); setWizardOpen(true); }}>
+          <LiquidGlassButton type="button" onClick={() => { setWizardMode("create"); setWizardOpen(true); }}>
             创建资源库…
-          </button>
-          <button type="button" onClick={() => { setWizardMode("restore"); setWizardOpen(true); }}>
+          </LiquidGlassButton>
+          <LiquidGlassButton type="button" onClick={() => { setWizardMode("restore"); setWizardOpen(true); }}>
             从 OneDrive 恢复…
-          </button>
+          </LiquidGlassButton>
         </div>
       </SettingsGroup>
       <SyncManagementPanel

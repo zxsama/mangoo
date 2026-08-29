@@ -122,14 +122,14 @@ export function RenameDialog({
             value={value}
           />
           <OverlayDialogActions>
-            <button
+            <LiquidGlassButton
               className="overlay-dialog-button"
               disabled={busy}
               onClick={onCancel}
               type="button"
             >
               Cancel
-            </button>
+            </LiquidGlassButton>
             <LiquidGlassButton
               className="overlay-dialog-button overlay-dialog-button-primary"
               disabled={!canSubmit}

@@ -32,7 +32,7 @@ describe("REMOVE_ROOT_CONFIRM", () => {
     assert.ok(dialogActions);
     assert.match(
       dialogActions,
-      /<button[^]*?disabled=\{removePending\}[^]*?onClick=\{\(\) => dispatch\(\{ type: "cancel-remove" \}\)\}[^]*?ref=\{cancelRef\}/,
+      /<LiquidGlassButton[^]*?disabled=\{removePending\}[^]*?onClick=\{\(\) => dispatch\(\{ type: "cancel-remove" \}\)\}[^]*?ref=\{cancelRef\}/,
     );
     assert.doesNotMatch(dialogActions, /onClose/);
   });

@@ -101,11 +101,18 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(setupWizard, /openAuthorizationUrl/);
     assert.doesNotMatch(setupWizard, /password|access token|refresh token/i);
     assert.match(setupWizard, /配置进度/);
+    assert.match(setupWizard, /http:\/\/localhost\/plugin-auth\/callback/);
+    assert.match(setupWizard, /移动和桌面应用程序/);
+    assert.match(setupWizard, /允许公共客户端流/);
+    assert.match(setupWizard, /User\.Read/);
+    assert.doesNotMatch(setupWizard, /<button\b/);
+    assert.match(setupWizard, /onedrive-setup-actions/);
     assert.match(setupWizard, /created/);
     assert.match(setupWizard, /allConfigurationChecksComplete/);
     assert.match(setupWizard, /clientIdValid/);
     assert.match(setupWizard, /auth\.plugin\?\.authState === "authenticated"/);
     assert.match(setup, /确认切换 OneDrive 账号/);
+    assert.doesNotMatch(setup, /<button\b/);
     assert.match(wizard, /authResumeRef/);
     assert.match(wizard, /active\.contextRevision !== intent\.contextRevision/);
   });

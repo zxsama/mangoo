@@ -3551,7 +3551,7 @@ async function notificationWindowFixtureEvidence(client) {
         renderedLines: document.querySelectorAll(".notification-log-line").length,
         gap: document.querySelector(".notification-log-gap")?.textContent?.trim() ?? null,
         liveState: document.querySelector(".notification-log-live-state")?.textContent?.trim() ?? null,
-        actionMessage: document.querySelector(".notification-log-footer span:last-child")?.textContent?.trim() ?? null,
+        actionMessage: document.querySelector(".notification-log-footer > span:last-child")?.textContent?.trim() ?? null,
         controls: {
           pause: Boolean(document.querySelector('button[aria-label="暂停日志"], button[aria-label="继续日志"]')),
           follow: Boolean(document.querySelector('button[aria-label="自动跟随最新日志"]')),
@@ -3632,7 +3632,7 @@ async function notificationWindowFixtureEvidence(client) {
     );
     await waitFor(
       fixtureClient,
-      `document.querySelector(".notification-log-footer span:last-child")?.textContent?.includes("媒体")`,
+      `document.querySelector(".notification-log-footer > span:last-child")?.textContent?.includes("媒体")`,
       10000,
       "first-entry failure action"
     );
@@ -3640,7 +3640,7 @@ async function notificationWindowFixtureEvidence(client) {
       ...firstFailureBeforeAction,
       actionMessage: await evaluate(
         fixtureClient,
-        `document.querySelector(".notification-log-footer span:last-child")?.textContent?.trim() ?? null`
+        `document.querySelector(".notification-log-footer > span:last-child")?.textContent?.trim() ?? null`
       )
     };
 
@@ -3653,7 +3653,7 @@ async function notificationWindowFixtureEvidence(client) {
     );
     await delay(120);
     const historyInitial = await evaluate(fixtureClient, evidenceExpression);
-    const retrySelector = '[data-notification-operation$=":retry-error"] .notification-row-action';
+    const retrySelector = '[data-notification-operation$=":retry-error"] .liquid-glass-button';
     if (await evaluate(fixtureClient, `Boolean(document.querySelector(${JSON.stringify(retrySelector)}))`)) {
       await evaluate(
         fixtureClient,
@@ -3666,7 +3666,7 @@ async function notificationWindowFixtureEvidence(client) {
         "notification retry error fixture"
       );
     }
-    const loadMoreSelector = ".notification-history-footer .notification-primary-action";
+    const loadMoreSelector = ".notification-history-footer .liquid-glass-button";
     if (await evaluate(fixtureClient, `Boolean(document.querySelector(${JSON.stringify(loadMoreSelector)}))`)) {
       await clickSelector(fixtureClient, loadMoreSelector);
       await delay(120);
@@ -3722,7 +3722,7 @@ async function notificationWindowFixtureEvidence(client) {
     );
     await waitFor(
       fixtureClient,
-      `Boolean(document.querySelector(".notification-log-footer span:last-child")?.textContent?.trim())`,
+      `Boolean(document.querySelector(".notification-log-footer > span:last-child")?.textContent?.trim())`,
       10000,
       "notification log copy fixture"
     );
@@ -3732,7 +3732,7 @@ async function notificationWindowFixtureEvidence(client) {
     );
     await waitFor(
       fixtureClient,
-      `document.querySelector(".notification-log-footer span:last-child")?.textContent?.includes("已导出")`,
+      `document.querySelector(".notification-log-footer > span:last-child")?.textContent?.includes("已导出")`,
       10000,
       "notification log export fixture"
     );
@@ -3742,7 +3742,7 @@ async function notificationWindowFixtureEvidence(client) {
     );
     await waitFor(
       fixtureClient,
-      `document.querySelector(".notification-log-footer span:last-child")?.textContent?.includes("已清空")`,
+      `document.querySelector(".notification-log-footer > span:last-child")?.textContent?.includes("已清空")`,
       10000,
       "notification log clear fixture"
     );
@@ -4991,7 +4991,7 @@ async function settingsInterfaceStyleEvidence(client) {
           `(() => {
             const root = getComputedStyle(document.documentElement);
             const panel = document.querySelector(".settings-group-body");
-            const control = document.querySelector(".settings-inline-action");
+            const control = document.querySelector(".settings-window .liquid-glass-button");
             return root.getPropertyValue("--radius-panel").trim() === ${JSON.stringify(`${radius}px`)} &&
               root.getPropertyValue("--radius-control").trim() === ${JSON.stringify(`${radius}px`)} &&
               panel && getComputedStyle(panel).borderRadius === ${JSON.stringify(`${radius}px`)} &&
@@ -5005,7 +5005,7 @@ async function settingsInterfaceStyleEvidence(client) {
           `(() => {
             const root = getComputedStyle(document.documentElement);
             const panel = document.querySelector(".settings-group-body");
-            const control = document.querySelector(".settings-inline-action");
+            const control = document.querySelector(".settings-window .liquid-glass-button");
             return {
               panelVariable: root.getPropertyValue("--radius-panel").trim(),
               controlVariable: root.getPropertyValue("--radius-control").trim(),
@@ -5386,7 +5386,7 @@ async function notificationsSecondaryWindowEvidence(client) {
       `(() => ({
         filterCount: document.querySelectorAll(".notification-history-filters select").length,
         virtualRows: document.querySelectorAll(".notification-history-row").length,
-        actionCount: document.querySelectorAll(".notification-row-action").length,
+        actionCount: document.querySelectorAll(".notification-history-actions .liquid-glass-button").length,
         unreadControls: [...document.querySelectorAll("button, input, select")].filter((node) => /未读|已读/.test(node.textContent || node.getAttribute("aria-label") || "")).length
       }))()`
     );

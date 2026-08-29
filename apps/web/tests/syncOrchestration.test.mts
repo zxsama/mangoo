@@ -67,7 +67,8 @@ describe("sync orchestration presentation", () => {
     assert.match(wizard, /role="tablist"/);
     assert.match(wizard, /aria-busy=\{remoteLoading\}/);
     assert.match(panel, /allowedActions\s*\.filter/);
-    assert.match(panel, /data-interactive-pointer-target/);
+    assert.match(panel, /import \{ LiquidGlassButton \}/);
+    assert.match(panel, /<LiquidGlassButton/);
     assert.match(panel, /role="alertdialog"/);
     assert.match(panel, /exportLibrarySyncDiagnostics/);
     assert.match(panel, /onReconnectPreview/);

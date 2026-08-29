@@ -2,7 +2,7 @@ import { Heart, Star } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { useEffect, useId, useMemo, useState } from "react";
 import type { TagRecord, UserMetadataRecord } from "@megle/core-client";
-import { LiquidGlassSurface } from "../../design/liquid-glass";
+import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import { TagChip } from "../library/TagChip";
 
 interface InspectorMetadataProps {
@@ -247,14 +247,14 @@ export function InspectorMetadata({
               type="text"
               value={tagInput}
             />
-            <button
-              className="inspector-tag-submit"
+            <LiquidGlassButton
               disabled={tagInput.trim().length === 0}
               onClick={handleTagSubmit}
+              tone="primary"
               type="button"
             >
               {exactMatch ? "Add" : "Create"}
-            </button>
+            </LiquidGlassButton>
           </div>
           {showSuggestions ? (
             <LiquidGlassSurface

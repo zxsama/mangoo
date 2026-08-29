@@ -227,19 +227,18 @@ export function SyncManagementPanel({
                         {providers.filter((provider) => provider.pluginId === (providerByLibrary[library.libraryUuid] ?? providers[0]?.pluginId)).map((provider) => <option key={provider.accountUuid} value={provider.accountUuid}>{provider.accountDisplayName ?? provider.accountUuid}</option>)}
                       </select>
                     </label>
-                    <button data-interactive-pointer-target={!busy && providers.length ? "true" : undefined} disabled={busy || providers.length === 0} onClick={() => {
+                    <LiquidGlassButton disabled={busy || providers.length === 0} onClick={() => {
                       const pluginId = providerByLibrary[library.libraryUuid] ?? providers[0]?.pluginId;
                       const accountUuid = accountByLibrary[library.libraryUuid] ?? providers.find((provider) => provider.pluginId === pluginId)?.accountUuid;
                       const selected = providers.find((provider) => provider.pluginId === pluginId && provider.accountUuid === accountUuid);
                       if (selected) onEnable(status, selected);
-                    }} type="button"><Cloud aria-hidden="true" size={13} />启用同步</button>
+                    }} type="button"><Cloud aria-hidden="true" size={13} />启用同步</LiquidGlassButton>
                   </>
                 ) : null}
                 {status?.allowedActions
                   .filter((action) => ["pause", "resume", "retry", "sync-now", "cancel-before-catalog"].includes(action))
                   .map((action) => (
-                  <button
-                      data-interactive-pointer-target={!busy ? "true" : undefined}
+                  <LiquidGlassButton
                       disabled={busy}
                       key={action}
                       onClick={() => onAction(status, action)}
@@ -255,33 +254,32 @@ export function SyncManagementPanel({
                         <RefreshCw aria-hidden="true" size={13} />
                       )}
                       {actionLabel(action)}
-                    </button>
+                    </LiquidGlassButton>
                   ))}
                 {status &&
                 (status.allowedActions.includes("resolve-conflicts") || status.conflictCount > 0) ? (
-                  <button data-interactive-pointer-target={!busy ? "true" : undefined} disabled={busy} onClick={() => void openDetails(status)} type="button">
+                  <LiquidGlassButton disabled={busy} onClick={() => void openDetails(status)} type="button">
                     <ShieldAlert aria-hidden="true" size={13} />冲突与诊断
-                  </button>
+                  </LiquidGlassButton>
                 ) : null}
                 {status?.allowedActions.includes("unbind") ? (
-                  <button data-interactive-pointer-target={!busy ? "true" : undefined} disabled={busy} onClick={() => setConfirm({ kind: "unbind", status })} type="button">
+                  <LiquidGlassButton disabled={busy} onClick={() => setConfirm({ kind: "unbind", status })} tone="danger" type="button">
                     <Unlink aria-hidden="true" size={13} />取消同步
-                  </button>
+                  </LiquidGlassButton>
                 ) : null}
                 {status?.allowedActions.includes("reconnect") ? (
-                  <button data-interactive-pointer-target={!busy ? "true" : undefined} disabled={busy} onClick={() => void previewReconnect(status)} type="button">
+                  <LiquidGlassButton disabled={busy} onClick={() => void previewReconnect(status)} type="button">
                     <RefreshCw aria-hidden="true" size={13} />重新连接
-                  </button>
+                  </LiquidGlassButton>
                 ) : null}
                 {status?.catalogReadiness === "ready" && status.restoreUuid && !library.active ? (
-                  <button
-                    data-interactive-pointer-target={!busy ? "true" : undefined}
+                  <LiquidGlassButton
                     disabled={busy}
                     onClick={() => onRemoveLocalCopy(library)}
                     type="button"
                   >
                     <Unlink aria-hidden="true" size={13} />移除本机副本…
-                  </button>
+                  </LiquidGlassButton>
                 ) : null}
               </div>
             </article>
@@ -315,16 +313,16 @@ export function SyncManagementPanel({
           titleId="sync-confirm-title"
         />
         <OverlayDialogActions>
-          <button data-interactive-pointer-target="true" onClick={() => setConfirm(null)} ref={cancelRef} type="button">取消</button>
+          <LiquidGlassButton onClick={() => setConfirm(null)} ref={cancelRef} type="button">取消</LiquidGlassButton>
           {confirm?.kind === "unbind" ? (
             <>
-              <button data-interactive-pointer-target="true" onClick={() => { onUnbind(confirm.status, "keep-local-fork"); setConfirm(null); }} type="button">保留本机分叉</button>
+              <LiquidGlassButton onClick={() => { onUnbind(confirm.status, "keep-local-fork"); setConfirm(null); }} type="button">保留本机分叉</LiquidGlassButton>
               <LiquidGlassButton onClick={() => { onUnbind(confirm.status, "drain-before-unbind"); setConfirm(null); }} type="button">排空后取消同步</LiquidGlassButton>
             </>
           ) : null}
           {confirm?.kind === "reconnect" ? (
             <>
-              <button disabled={!confirm.plan?.publishNewAllowed} data-interactive-pointer-target="true" onClick={() => { if (confirm.plan) onReconnectCommit(confirm.status, confirm.plan, "publish-new-remote"); setConfirm(null); }} type="button">发布为新远端</button>
+              <LiquidGlassButton disabled={!confirm.plan?.publishNewAllowed} onClick={() => { if (confirm.plan) onReconnectCommit(confirm.status, confirm.plan, "publish-new-remote"); setConfirm(null); }} type="button">发布为新远端</LiquidGlassButton>
               <LiquidGlassButton disabled={!confirm.plan?.mergeAllowed} onClick={() => { if (confirm.plan) onReconnectCommit(confirm.status, confirm.plan, "merge-local-fork"); setConfirm(null); }} type="button">合并本机分叉</LiquidGlassButton>
             </>
           ) : null}
@@ -352,20 +350,20 @@ export function SyncManagementPanel({
               {details.conflicts.map((conflict) => (
                 <li key={conflict.conflictUuid}>
                   <div><strong>{conflict.conflictKind}</strong>{conflict.entityUuid ? <span>实体 {conflict.entityUuid}</span> : null}{conflict.details != null ? <pre>{JSON.stringify(conflict.details, null, 2)}</pre> : null}</div>
-                  <button data-interactive-pointer-target="true" onClick={() => void resolveConflict(conflict)} type="button">标记已解决</button>
+                  <LiquidGlassButton onClick={() => void resolveConflict(conflict)} type="button">标记已解决</LiquidGlassButton>
                 </li>
               ))}
             </ul>
           ) : (
             <p className="overlay-dialog-text">当前没有未解决冲突。</p>
           )}
-          {details?.nextCursor ? <button data-interactive-pointer-target="true" onClick={() => void loadMoreConflicts()} type="button">加载更多冲突</button> : null}
+          {details?.nextCursor ? <LiquidGlassButton onClick={() => void loadMoreConflicts()} type="button">加载更多冲突</LiquidGlassButton> : null}
           <pre className="settings-sync-diagnostics">
             {JSON.stringify(details?.diagnostics ?? {}, null, 2)}
           </pre>
         </OverlayDialogBody>
         <OverlayDialogActions>
-          <button data-interactive-pointer-target="true" onClick={() => setDetails(null)} type="button">关闭</button>
+          <LiquidGlassButton onClick={() => setDetails(null)} type="button">关闭</LiquidGlassButton>
           <LiquidGlassButton onClick={() => void exportDiagnostics()} type="button">
             <Download aria-hidden="true" size={13} />导出脱敏诊断
           </LiquidGlassButton>

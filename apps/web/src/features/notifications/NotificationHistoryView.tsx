@@ -16,6 +16,7 @@ import type {
   DesktopNotificationOperation,
   DesktopNotificationStatus
 } from "@megle/notification-contract";
+import { LiquidGlassButton } from "../../design/liquid-glass";
 import { OverlayField, OverlaySelect } from "../../design/overlays";
 import type {
   NotificationHistoryState,
@@ -207,15 +208,14 @@ export function NotificationHistoryView({
         <h1>历史记录</h1>
         <div className="notification-heading-actions">
           <span>{history.total.toLocaleString()} 条记录</span>
-          <button
+          <LiquidGlassButton
             aria-label="刷新通知历史"
-            className="notification-icon-action"
             disabled={history.loading}
             onClick={() => void Promise.all([loadCurrentQuery(query), loadFacets()])}
             type="button"
           >
             <RefreshCw aria-hidden="true" size={15} />
-          </button>
+          </LiquidGlassButton>
         </div>
       </header>
 
@@ -272,9 +272,9 @@ export function NotificationHistoryView({
           <option value="">所有类型</option>
           {facets.kinds.map((value) => <option key={value} value={value}>{kindLabel(value)}</option>)}
         </FilterSelect>
-        <button className="notification-text-action" onClick={resetFilters} type="button">
+        <LiquidGlassButton onClick={resetFilters} type="button">
           重置
-        </button>
+        </LiquidGlassButton>
       </div>
 
       {facetError ? <p className="notification-inline-error" role="alert">{facetError}</p> : null}
@@ -352,28 +352,27 @@ export function NotificationHistoryView({
                     </div>
                     <div className="notification-history-actions">
                       {operation.cancellable ? (
-                        <button
+                        <LiquidGlassButton
                           aria-label={`取消 ${operation.title}`}
-                          className="notification-row-action"
                           disabled={actionPending}
                           onClick={() => void runAction("cancel", operation)}
+                          tone="danger"
                           type="button"
                         >
                           <Square aria-hidden="true" size={13} />
                           {cancelPending ? "取消中…" : "取消"}
-                        </button>
+                        </LiquidGlassButton>
                       ) : null}
                       {operation.retryable ? (
-                        <button
+                        <LiquidGlassButton
                           aria-label={`重试 ${operation.title}`}
-                          className="notification-row-action"
                           disabled={actionPending}
                           onClick={() => void runAction("retry", operation)}
                           type="button"
                         >
                           <RotateCcw aria-hidden="true" size={13} />
                           {retryPending ? "重试中…" : "重试"}
-                        </button>
+                        </LiquidGlassButton>
                       ) : null}
                     </div>
                   </article>
@@ -389,14 +388,14 @@ export function NotificationHistoryView({
           已加载 {history.items.length.toLocaleString()} / {history.total.toLocaleString()}
         </span>
         {history.nextOffset !== null ? (
-          <button
-            className="notification-primary-action"
+          <LiquidGlassButton
             disabled={history.loading}
             onClick={() => void loadMoreHistory()}
+            tone="primary"
             type="button"
           >
             {history.loading ? "加载中…" : `再加载 ${PAGE_SIZE} 条`}
-          </button>
+          </LiquidGlassButton>
         ) : null}
       </footer>
     </div>

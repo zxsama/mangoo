@@ -12,6 +12,7 @@ import type {
   DesktopThumbnailCacheSummary,
   NotificationWindowIntent
 } from "@megle/notification-contract";
+import { LiquidGlassButton } from "../../design/liquid-glass";
 import type {
   CompactNotificationModel,
   NotificationOperationViewModel
@@ -281,16 +282,16 @@ function ActiveOperation({
       <div className="notification-status-operation-footer">
         <span className="notification-status-progress-caption">{operation.progress.label}</span>
         {operation.cancellable ? (
-          <button
+          <LiquidGlassButton
             aria-label={`取消 ${operation.title}`}
-            className="notification-row-action"
             disabled={cancelling}
             onClick={() => void onCancel()}
+            tone="danger"
             type="button"
           >
             <Square aria-hidden="true" size={13} />
             {cancelling ? "取消中…" : "取消"}
-          </button>
+          </LiquidGlassButton>
         ) : null}
       </div>
       {cancelError ? <p className="notification-row-action-error" role="alert">{cancelError}</p> : null}

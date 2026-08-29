@@ -29,6 +29,7 @@ import type {
   ThumbnailFailureSnapshot,
   ThumbnailFailureDetail
 } from "@megle/notification-contract";
+import { LiquidGlassButton } from "../../design/liquid-glass";
 import { OverlayField, OverlaySelect } from "../../design/overlays";
 import { copyText, getDesktopBridge } from "../../core/desktop";
 import type {
@@ -366,22 +367,22 @@ export function ProcessLogView({
           </OverlaySelect>
         </div>
         <div className="notification-log-actions">
-          <button aria-label={paused ? "继续日志" : "暂停日志"} className="notification-toolbar-action" onClick={togglePause} type="button">
+          <LiquidGlassButton aria-label={paused ? "继续日志" : "暂停日志"} onClick={togglePause} type="button">
             {paused ? <Play aria-hidden="true" size={14} /> : <Pause aria-hidden="true" size={14} />}
             {paused ? "继续" : "暂停"}
-          </button>
-          <button aria-label="自动跟随最新日志" aria-pressed={follow} className={`notification-toolbar-action${follow ? " active" : ""}`} onClick={() => setFollow((value) => !value)} type="button">
+          </LiquidGlassButton>
+          <LiquidGlassButton active={follow} aria-label="自动跟随最新日志" aria-pressed={follow} onClick={() => setFollow((value) => !value)} type="button">
             跟随
-          </button>
-          <button aria-label="复制选中或可见日志" className="notification-icon-action" onClick={() => void handleCopy()} type="button">
+          </LiquidGlassButton>
+          <LiquidGlassButton aria-label="复制选中或可见日志" onClick={() => void handleCopy()} type="button">
             <Clipboard aria-hidden="true" size={14} />
-          </button>
-          <button aria-label="导出当前日志" className="notification-icon-action" onClick={() => void handleExport()} type="button">
+          </LiquidGlassButton>
+          <LiquidGlassButton aria-label="导出当前日志" onClick={() => void handleExport()} type="button">
             <Download aria-hidden="true" size={14} />
-          </button>
-          <button aria-label="清空当前会话日志" className="notification-icon-action danger" onClick={() => void handleClear()} type="button">
+          </LiquidGlassButton>
+          <LiquidGlassButton aria-label="清空当前会话日志" onClick={() => void handleClear()} tone="danger" type="button">
             <Trash2 aria-hidden="true" size={14} />
-          </button>
+          </LiquidGlassButton>
         </div>
       </div>
 
@@ -447,14 +448,13 @@ export function ProcessLogView({
       <footer className="notification-log-footer">
         <span>{rows.length.toLocaleString()} 行 · 会话日志上限 {MAX_RENDERED_LOG_LINES.toLocaleString()}</span>
         {hasOlder ? (
-          <button
-            className="notification-text-action"
+          <LiquidGlassButton
             disabled={loadingOlder}
             onClick={() => void handleLoadOlder()}
             type="button"
           >
             {loadingOlder ? "加载中…" : "加载更早日志"}
-          </button>
+          </LiquidGlassButton>
         ) : null}
         <span aria-live="polite">{actionMessage}</span>
       </footer>

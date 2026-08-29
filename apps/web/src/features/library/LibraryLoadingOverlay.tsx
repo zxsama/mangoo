@@ -1,5 +1,5 @@
 import { Loader2 } from "lucide-react";
-import { LiquidGlassSurface } from "../../design/liquid-glass";
+import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import { isErrorPhase, type LibraryLoadPhase } from "../../core/libraryTypes";
 
 const PHASE_TEXT: Record<string, string> = {
@@ -41,13 +41,13 @@ export function LibraryLoadingOverlay({
           <>
             <div className="library-loading-error-text">{phase.message}</div>
             <div className="library-loading-actions">
-              <button type="button" onClick={onRetry}>重试</button>
-              <button
+              <LiquidGlassButton tone="primary" type="button" onClick={onRetry}>重试</LiquidGlassButton>
+              <LiquidGlassButton
                 type="button"
                 onClick={(event) => onSwitchLibrary(event.currentTarget, event.detail === 0)}
               >
                 切换其它库
-              </button>
+              </LiquidGlassButton>
             </div>
           </>
         ) : (

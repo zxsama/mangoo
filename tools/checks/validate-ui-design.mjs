@@ -1517,6 +1517,10 @@ for (const value of [
   "保存 Client ID",
   "登录验证",
   "Files.ReadWrite.AppFolder",
+  "http://localhost/plugin-auth/callback",
+  "移动和桌面应用程序",
+  "允许公共客户端流",
+  "User.Read",
   "manual-response-uri",
   "clientIdValid",
   "allConfigurationChecksComplete",
@@ -1524,6 +1528,19 @@ for (const value of [
 ]) {
   if (!oneDriveSetupWizard.includes(value)) {
     fail(`OneDrive sequential wizard contract missing ${value}`);
+  }
+}
+if (/<button\b/.test(oneDriveSetupWizard) || /<button\b/.test(oneDriveAccountSetup)) {
+  fail("OneDrive independent actions must use LiquidGlassButton rather than legacy raw buttons");
+}
+for (const value of [
+  "grid-template-rows: auto auto minmax(0, 1fr) auto",
+  "height: min(640px, calc(100vh - 40px))",
+  ".onedrive-setup-actions",
+  "justify-content: flex-end"
+]) {
+  if (!stylesForChecks.includes(value)) {
+    fail(`OneDrive stable wizard shell contract missing ${value}`);
   }
 }
 if (/type=["']password["']|client.?secret[^\n]{0,120}<input/i.test(oneDriveSetupWizard)) {
@@ -1801,11 +1818,6 @@ const migratedHoverFamilies = [
   ".library-switcher-row",
   ".library-switcher-main",
   ".library-switcher-actions",
-  ".notification-icon-action",
-  ".notification-text-action",
-  ".notification-primary-action",
-  ".notification-row-action",
-  ".notification-toolbar-action",
   ".overlay-dialog-button",
   ".context-menu-item"
 ];
@@ -2424,9 +2436,9 @@ if (!settingsPanelRadiusBlocks.some((block) => /border-radius:\s*var\(--radius-p
   fail("Settings panel surfaces must consume --radius-panel");
 }
 
-const settingsControlRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-inline-action");
+const settingsControlRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".liquid-glass-button");
 if (!settingsControlRadiusBlocks.some((block) => /border-radius:\s*var\(--radius-control\)/.test(block))) {
-  fail("Settings controls must consume --radius-control");
+  fail("Shared action buttons must consume --radius-control");
 }
 
 const settingsWindow = read("apps/web/src/features/settings/SettingsWindow.tsx");

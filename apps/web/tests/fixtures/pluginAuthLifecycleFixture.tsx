@@ -119,10 +119,10 @@ const waitFor = async (predicate: () => boolean) => {
   while (!predicate()) { if (Date.now() > deadline) throw new Error(`fixture wait timed out: ${stage}; active=${document.activeElement?.outerHTML}; ${document.body.textContent}`); await new Promise((resolve) => setTimeout(resolve, 20)); }
 };
 const button = (text: string) => [...document.querySelectorAll("button")].reverse().find((item) => item.textContent?.includes(text)) as HTMLButtonElement | undefined;
-const exactButton = (text: string) => [...document.querySelectorAll("button")].find((item) => item.textContent?.trim() === text) as HTMLButtonElement | undefined;
+const wizardButton = (text: string) => [...document.querySelectorAll("#onedrive-setup-wizard button")].find((item) => item.textContent?.trim() === text) as HTMLButtonElement | undefined;
 const control = (text: string) => [...document.querySelectorAll("button, summary")].reverse().find((item) => item.textContent?.includes(text)) as HTMLElement | undefined;
 const click = async (text: string) => { const target = button(text); if (!target) throw new Error(`button not found: ${text}`); await act(async () => target.click()); };
-const clickExact = async (text: string) => { const target = exactButton(text); if (!target) throw new Error(`exact button not found: ${text}`); await act(async () => target.click()); };
+const clickWizard = async (text: string) => { const target = wizardButton(text); if (!target) throw new Error(`wizard button not found: ${text}`); await act(async () => target.click()); };
 const clickControl = async (text: string) => { const target = control(text); if (!target) throw new Error(`control not found: ${text}`); await act(async () => target.click()); };
 const input = async (selector: string, value: string) => { const target = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement; const setter = Object.getOwnPropertyDescriptor(target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, "value")!.set!; await act(async () => { setter.call(target, value); target.dispatchEvent(new Event("input", { bubbles: true })); }); };
 const delay = (milliseconds = 0) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
@@ -148,16 +148,16 @@ try {
 
   cancelFails = true;
   stage = "begin manual";
-  await click("登录 Microsoft 账号");
+  await clickWizard("登录 Microsoft 账号");
   if (!document.querySelector("textarea")) await click("继续登录");
   await waitFor(() => Boolean(document.querySelector("textarea")));
-  await clickExact("取消"); await waitFor(() => document.body.textContent?.includes("cancel failed") === true);
-  const cancelFailure = { flowRetained: Boolean(document.querySelector("textarea")), retryAvailable: Boolean(button("取消")) };
+  await clickWizard("取消授权"); await waitFor(() => document.body.textContent?.includes("cancel failed") === true);
+  const cancelFailure = { flowRetained: Boolean(document.querySelector("textarea")), retryAvailable: Boolean(wizardButton("取消授权")) };
 
   cancelFails = false;
   stage = "complete manual";
   await input("textarea", "https://login.microsoftonline.com/common/oauth2/nativeclient?code=secret&state=s");
-  await click("验证并连接"); await waitFor(() => document.body.textContent?.includes("OneDrive 配置完成") === true);
+  await clickWizard("验证并连接"); await waitFor(() => document.body.textContent?.includes("OneDrive 配置完成") === true);
   const manualCompletion = { dispatched: (completeBody as { flowId?: string })?.flowId === "flow-1", terminalCleared: !document.querySelector("textarea") };
   await click("完成");
 
@@ -168,26 +168,36 @@ try {
   await queryClient.invalidateQueries({ queryKey: ["plugins", "com.megle.onedrive", "configuration"] });
   await waitFor(() => Boolean(button("配置 OneDrive")));
   await click("配置 OneDrive");
-  await waitFor(() => document.body.textContent?.includes("创建自己的 Entra 应用") === true);
+  await waitFor(() => document.body.textContent?.includes("创建 Microsoft Entra 应用") === true);
   const successfulWindowOpen = window.open;
   window.open = () => null;
-  await click("打开 Microsoft Entra 应用注册");
+  await click("打开 Microsoft Entra");
   await waitFor(() => document.body.textContent?.includes("浏览器阻止了新标签页") === true);
   const portalOpenFailureVisible = true;
   window.open = successfulWindowOpen;
   const nextDisabledBeforeConfirmation = button("下一步")?.disabled === true;
+  const wizard = document.querySelector("#onedrive-setup-wizard") as HTMLElement;
+  const firstStepHeight = wizard.getBoundingClientRect().height;
   const firstStepCheckbox = document.querySelector('.onedrive-setup-section input[type="checkbox"]') as HTMLInputElement;
   await act(async () => firstStepCheckbox.click());
   await click("下一步");
+  const secondStepHeight = wizard.getBoundingClientRect().height;
   const setupCheckboxes = [...document.querySelectorAll('.onedrive-setup-section input[type="checkbox"]')] as HTMLInputElement[];
   const secondStepBlocked = button("下一步")?.disabled === true;
   for (const checkbox of setupCheckboxes) await act(async () => checkbox.click());
   await click("下一步");
+  const thirdStepHeight = wizard.getBoundingClientRect().height;
   const configurationInput = document.querySelector('.onedrive-setup-section input[placeholder]') as HTMLInputElement;
   await input('.onedrive-setup-section input[placeholder]', "11111111-1111-4111-8111-111111111111");
   const wizardGates = { createBlocked: nextDisabledBeforeConfirmation, configurationBlocked: secondStepBlocked, clientIdAccepted: configurationInput.getAttribute("aria-invalid") !== "true" };
-  await click("检查并保存"); await waitFor(() => document.body.textContent?.includes("配置将发生变化") === true);
-  await clickExact("取消");
+  const wizardLayout = {
+    stableHeight: firstStepHeight === secondStepHeight && secondStepHeight === thirdStepHeight,
+    bodyOwnsScroll: getComputedStyle(wizard.querySelector(".onedrive-setup-body") as HTMLElement).overflowY === "auto",
+    footerVisible: (wizard.querySelector(".onedrive-setup-actions") as HTMLElement).getBoundingClientRect().bottom <= wizard.getBoundingClientRect().bottom,
+    unifiedActions: !wizard.querySelector("button:not([data-liquid-glass='button'])")
+  };
+  await clickWizard("检查配置"); await waitFor(() => document.body.textContent?.includes("配置将发生变化") === true);
+  await clickWizard("取消");
   await click("配置 OneDrive");
   const reopenedFirstStepCheckbox = document.querySelector('.onedrive-setup-section input[type="checkbox"]') as HTMLInputElement;
   await act(async () => reopenedFirstStepCheckbox.click());
@@ -195,22 +205,22 @@ try {
   const reopenedSetupCheckboxes = [...document.querySelectorAll('.onedrive-setup-section input[type="checkbox"]')] as HTMLInputElement[];
   for (const checkbox of reopenedSetupCheckboxes) await act(async () => checkbox.click());
   await click("下一步");
-  const reopenState = { stalePlanGone: !document.body.textContent?.includes("配置将发生变化"), emptyClientIdBlocked: button("检查并保存")?.disabled === true };
+  const reopenState = { stalePlanGone: !document.body.textContent?.includes("配置将发生变化"), emptyClientIdBlocked: wizardButton("检查配置")?.disabled === true };
   await input('.onedrive-setup-section input[placeholder]', "11111111-1111-4111-8111-111111111111");
-  await click("检查并保存"); await waitFor(() => document.body.textContent?.includes("配置将发生变化") === true);
+  await clickWizard("检查配置"); await waitFor(() => document.body.textContent?.includes("配置将发生变化") === true);
   stage = "configuration commit";
-  await click("确认应用"); await waitFor(() => configuration.revision === 2);
+  await clickWizard("确认并继续"); await waitFor(() => configuration.revision === 2);
   await waitFor(() => document.body.textContent?.includes("登录并验证") === true);
   const configConfirm = { confirmed: (commitBody as { confirmed?: boolean })?.confirmed === true };
 
   stage = "configuration noop";
   planChanged = false;
   commitBody = null;
-  await click("检查 Client ID");
+  await clickWizard("上一步");
   await input('.onedrive-setup-section input[placeholder]', "11111111-1111-4111-8111-111111111111");
-  await click("检查并保存");
-  await waitFor(() => document.body.textContent?.includes("有效配置没有变化") === true);
-  await click("确认应用");
+  await clickWizard("检查配置");
+  await waitFor(() => document.body.textContent?.includes("配置有效") === true);
+  await clickWizard("确认并继续");
   await waitFor(() => document.body.textContent?.includes("登录并验证") === true);
   const configNoop = { committed: (commitBody as { confirmed?: boolean } | null)?.confirmed === false };
   planChanged = true;
@@ -219,10 +229,10 @@ try {
   stage = "configuration readonly";
   await queryClient.invalidateQueries({ queryKey: ["plugins", "com.megle.onedrive", "configuration"] });
   await waitFor(() => document.body.textContent?.includes("登录并验证") === true);
-  await click("检查 Client ID");
-  await waitFor(() => document.body.textContent?.includes("部署环境（只读）") === true);
+  await clickWizard("上一步");
+  await waitFor(() => document.body.textContent?.includes("Client ID 由部署环境管理") === true);
   const readOnly = { editorHidden: !document.querySelector('.onedrive-setup-section input[placeholder]'), managedStatusVisible: true };
-  await clickExact("取消");
+  await clickWizard("取消");
 
   stage = "unmount setup";
   const transientHost = document.createElement("div"); document.body.append(transientHost);
@@ -346,7 +356,7 @@ try {
   const wizardRevision = { staleIntentCleared: document.body.textContent?.includes("资源库上下文已变化") === true };
   await act(async () => staleWizardRoot.unmount()); wizardHost.remove();
 
-  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, configConfirm, configNoop, portalOpenFailureVisible, reopenState, wizardGates, readOnly, unmountCleanup, pointerOptOut, cardInteraction, conciseCard, tabRelationship, technicalDisclosure, technicalOpenedWithKeyboard, wizardResume, wizardRevision };
+  (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: true, switchFailure, cancelFailure, manualCompletion, configConfirm, configNoop, portalOpenFailureVisible, reopenState, wizardGates, wizardLayout, readOnly, unmountCleanup, pointerOptOut, cardInteraction, conciseCard, tabRelationship, technicalDisclosure, technicalOpenedWithKeyboard, wizardResume, wizardRevision };
 } catch (error) {
   (window as unknown as { __overlayLifecycleResult: unknown }).__overlayLifecycleResult = { ok: false, error: error instanceof Error ? error.stack ?? error.message : String(error) };
 }
