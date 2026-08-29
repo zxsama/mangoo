@@ -25,6 +25,7 @@ struct GraphState {
     reject_next_graph_request: bool,
     reject_next_token_refresh: bool,
     next_upload_fault: Option<u16>,
+    token_redirect_uris: Vec<String>,
 }
 
 struct Emulator {
@@ -404,6 +405,62 @@ fn oauth_poll_is_non_destructive_and_cancel_is_idempotent() {
 }
 
 #[test]
+fn loopback_auth_advertises_localhost_and_completes_via_ipv4_listener() {
+    let emulator = Emulator::start();
+    let mut provider =
+        ProviderProcess::start(&emulator.base, Arc::new(Mutex::new(Secrets::default())));
+    hello(&mut provider);
+    let auth = provider.call("auth.begin", Value::Null);
+    assert_eq!(auth["completionMode"], "loopback");
+
+    let redirect = Url::parse(auth["redirectUri"].as_str().unwrap()).unwrap();
+    assert_eq!(redirect.scheme(), "http");
+    assert_eq!(redirect.host_str(), Some("localhost"));
+    assert_eq!(redirect.path(), "/plugin-auth/callback");
+    let port = redirect.port().expect("ephemeral callback port");
+
+    let authorization = Url::parse(auth["authorizationUrl"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        authorization
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .unwrap()
+            .1,
+        redirect.as_str()
+    );
+    let state = authorization
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+
+    let mut callback = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        callback,
+        "GET /plugin-auth/callback?code=emulator-code&state={state} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    callback.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+    let mut result = Value::Null;
+    for _ in 0..40 {
+        result = provider.call("auth.poll", json!({"flowId":auth["flowId"]}));
+        if result.get("pending") != Some(&Value::Bool(true)) {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(result["authenticated"], true, "{result}");
+    assert_eq!(
+        emulator.state.lock().unwrap().token_redirect_uris,
+        vec![redirect.to_string()]
+    );
+}
+
+#[test]
 fn manual_auth_uses_native_client_redirect() {
     let emulator = Emulator::start();
     let mut provider = ProviderProcess::start_with_mode(
@@ -446,7 +503,7 @@ fn real_child_runs_oauth_secret_delta_object_range_and_resumable_upload_against_
     assert_eq!(provider.call("health", Value::Null)["ready"], true);
     let auth = provider.call(
         "auth.begin",
-        json!({"callbackUrl":format!("{}callback", emulator.base)}),
+        json!({"callbackUrl":"https://megle.invalid/api/plugin-auth/callback/test"}),
     );
     let auth_url = Url::parse(auth["authorizationUrl"].as_str().unwrap()).unwrap();
     let state = auth_url
@@ -801,7 +858,7 @@ fn invalid_grant_retires_all_secrets_and_requires_authorization() {
     hello(&mut provider);
     let auth = provider.call(
         "auth.begin",
-        json!({"callbackUrl":format!("{}callback", emulator.base)}),
+        json!({"callbackUrl":"https://megle.invalid/api/plugin-auth/callback/test"}),
     );
     let auth_url = Url::parse(auth["authorizationUrl"].as_str().unwrap()).unwrap();
     let state = auth_url
@@ -911,6 +968,12 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
                 .into_bytes(),
         )
     } else if path.ends_with("/oauth2/v2.0/token") && method == "POST" {
+        if let Some(redirect_uri) = url::form_urlencoded::parse(body)
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.into_owned())
+        {
+            state.lock().unwrap().token_redirect_uris.push(redirect_uri);
+        }
         let reject_refresh = {
             let mut state = state.lock().unwrap();
             std::mem::take(&mut state.reject_next_token_refresh)

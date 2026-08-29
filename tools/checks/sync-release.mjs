@@ -60,8 +60,8 @@ async function productOAuthEvidenceRow({ name, file, commit, expected }) {
     if (expected.completionMode && evidence.completionMode !== expected.completionMode) mismatches.push(`completionMode is not ${expected.completionMode}`);
     if (expected.redirectUri) {
       if (evidence.redirectUri !== expected.redirectUri) mismatches.push("redirectUri does not match the native-client redirect");
-    } else if (expected.completionMode === "loopback" && !/^http:\/\/127\.0\.0\.1:\d+\/plugin-auth\/callback$/.test(evidence.redirectUri ?? "")) {
-      mismatches.push("redirectUri is not the ephemeral IPv4 loopback callback");
+    } else if (expected.completionMode === "loopback" && !/^http:\/\/localhost:\d+\/plugin-auth\/callback$/.test(evidence.redirectUri ?? "")) {
+      mismatches.push("redirectUri is not the ephemeral localhost callback");
     }
     if (expected.browserOpened && evidence.browserOpened !== true) mismatches.push("system-browser launch was not proven");
     if (expected.containerRestart && evidence.containerRestartPersisted !== true) mismatches.push("container restart persistence was not proven");

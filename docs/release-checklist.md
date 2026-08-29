@@ -67,8 +67,10 @@ as a follow-up issue rather than patching during release prep.
 - [ ] From the OneDrive plugin panel, complete the five-step self-managed app
       wizard and verify Login/Waiting/Cancel, account kind, Switch account, and
       Sign out. Desktop must open the system
-      browser and complete through the ephemeral `127.0.0.1` loopback without a
-      pasted URI.
+      browser using a `http://localhost:<ephemeral-port>/plugin-auth/callback`
+      redirect and complete through the IPv4 loopback listener without a pasted
+      URI. Verify the Entra platform is **Mobile and desktop applications** and
+      **Allow public client flows** is enabled.
 - [ ] In the Docker/Web build, verify the authorization link plus complete
       response-URI paste flow, then restart the container and confirm the
       encrypted SecretStore-backed account remains connected.

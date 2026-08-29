@@ -14,7 +14,7 @@ function authorizationUrl(overrides: Record<string, string> = {}): string {
   const values = {
     client_id: CLIENT_ID,
     response_type: "code",
-    redirect_uri: "http://127.0.0.1:53682/plugin-auth/callback",
+    redirect_uri: "http://localhost:53682/plugin-auth/callback",
     response_mode: "query",
     scope: "Files.ReadWrite.AppFolder offline_access openid profile",
     state: STATE,
@@ -74,8 +74,12 @@ describe("OneDrive external authorization URL boundary", () => {
       authorizationUrl({ code_challenge_method: "plain" }),
       authorizationUrl({ code_challenge: "short" }),
       authorizationUrl({ scope: "Files.ReadWrite.All offline_access openid profile" }),
-      authorizationUrl({ redirect_uri: "http://localhost:53682/plugin-auth/callback" }),
-      authorizationUrl({ redirect_uri: "http://127.0.0.1:53682/other" })
+      authorizationUrl({ redirect_uri: "http://127.0.0.1:53682/plugin-auth/callback" }),
+      authorizationUrl({ redirect_uri: "http://localhost/plugin-auth/callback" }),
+      authorizationUrl({ redirect_uri: "http://localhost:53682/other" }),
+      authorizationUrl({ redirect_uri: "http://user@localhost:53682/plugin-auth/callback" }),
+      authorizationUrl({ redirect_uri: "http://localhost:53682/plugin-auth/callback?code=unexpected" }),
+      authorizationUrl({ redirect_uri: "http://localhost:53682/plugin-auth/callback#fragment" })
     ];
     for (const invalid of invalidCases) {
       assert.equal(isAllowedExternalAuthorizationUrl(invalid), false, invalid);

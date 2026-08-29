@@ -93,7 +93,7 @@ function isValidLoopbackRedirect(value: string): boolean {
     const redirect = new URL(value);
     const port = Number(redirect.port);
     return redirect.protocol === "http:"
-      && redirect.hostname === "127.0.0.1"
+      && redirect.hostname === "localhost"
       && Number.isInteger(port)
       && port > 0
       && port <= 65_535

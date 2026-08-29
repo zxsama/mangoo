@@ -70,7 +70,7 @@ impl OAuthFlows {
         }
         let redirect_uri = match callback_url {
             Some(value) => validate_callback(value)?,
-            None => "http://127.0.0.1:53682/plugin-auth/callback".to_owned(),
+            None => "http://localhost:53682/plugin-auth/callback".to_owned(),
         };
         let id = Uuid::now_v7().to_string();
         let state = random_urlsafe(32);
@@ -154,19 +154,19 @@ impl OAuthFlows {
 fn validate_callback(value: &str) -> Result<String, ProviderError> {
     let url = Url::parse(value)
         .map_err(|_| ProviderError::new("invalid_argument", false, "invalid OAuth callback URL"))?;
-    let loopback = url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
+    let loopback = url.scheme() == "http" && url.host_str() == Some("localhost");
     if url.scheme() != "https" && !loopback {
         return Err(ProviderError::new(
             "invalid_argument",
             false,
-            "OAuth callback must be HTTPS or IPv4 loopback",
+            "OAuth callback must be HTTPS or localhost loopback",
         ));
     }
     if url.username() != ""
         || url.password().is_some()
         || url.fragment().is_some()
         || url.query().is_some()
-        || (loopback && url.port().is_none())
+        || (loopback && (url.port().is_none() || url.path() != "/plugin-auth/callback"))
         || (!loopback && url.port().is_some_and(|port| port != 443))
     {
         return Err(ProviderError::new(
@@ -229,8 +229,13 @@ mod tests {
     #[test]
     fn callback_rejects_query_fragment_credentials_and_unsafe_loopback_forms() {
         for value in [
-            "http://localhost:53682/plugin-auth/callback",
             "http://127.0.0.1/plugin-auth/callback",
+            "http://127.0.0.1:53682/plugin-auth/callback",
+            "http://localhost/plugin-auth/callback",
+            "http://localhost:53682/other",
+            "http://user@localhost:53682/plugin-auth/callback",
+            "http://localhost:53682/plugin-auth/callback?code=unexpected",
+            "http://localhost:53682/plugin-auth/callback#fragment",
             "https://user@example.invalid/plugin-auth/callback",
             "https://example.invalid/plugin-auth/callback?code=secret",
             "https://example.invalid/plugin-auth/callback#fragment",
@@ -238,7 +243,7 @@ mod tests {
         ] {
             assert!(validate_callback(value).is_err(), "accepted {value}");
         }
-        assert!(validate_callback("http://127.0.0.1:53682/plugin-auth/callback").is_ok());
+        assert!(validate_callback("http://localhost:53682/plugin-auth/callback").is_ok());
         assert!(validate_callback("https://example.invalid/plugin-auth/callback").is_ok());
     }
 

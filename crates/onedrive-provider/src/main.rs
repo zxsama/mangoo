@@ -339,7 +339,7 @@ impl ProviderState {
                 ProviderError::new("unavailable", true, "failed to bind OAuth loopback")
             })?;
             let uri = format!(
-                "http://127.0.0.1:{}/plugin-auth/callback",
+                "http://localhost:{}/plugin-auth/callback",
                 listener
                     .local_addr()
                     .map_err(|_| ProviderError::new(

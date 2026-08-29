@@ -176,13 +176,18 @@ Each user or deployment operator creates their own Microsoft Entra **public
 client** application. Megle release artifacts contain no publisher-owned Client
 ID. Choose the audience that supports accounts in any organizational directory
 and personal Microsoft accounts, add delegated Microsoft Graph permission
-`Files.ReadWrite.AppFolder`, and enable public-client flows. Register the native
-redirect form used by the target platform:
+`Files.ReadWrite.AppFolder`, and enable **Allow public client flows**. Register
+the native redirect form used by the target platform:
 
-- Windows Desktop: add `http://127.0.0.1/plugin-auth/callback` through the
-  application manifest; the Provider sends the same IPv4 host/path with an
-  ephemeral runtime port.
+- Windows Desktop: under **Authentication > Add a platform**, choose **Mobile
+  and desktop applications** and add `http://localhost/plugin-auth/callback`.
+  The Provider advertises the same host/path with an ephemeral runtime port;
+  Microsoft ignores the localhost port while matching the registered URI.
 - Docker/Web: `https://login.microsoftonline.com/common/oauth2/nativeclient`.
+
+Do not configure the Desktop callback as a Single-page application and do not
+create a Client Secret. A portal-added delegated `User.Read` permission may
+remain, but Megle does not require it.
 
 Open the OneDrive plugin and choose **配置 OneDrive**. The setup wizard
 walks through application creation, platform settings, the Application (client)

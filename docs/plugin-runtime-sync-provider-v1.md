@@ -78,7 +78,11 @@ configuration safely keeps OneDrive `configuration-required`. No mode uses or
 accepts a client secret.
 
 Desktop uses Authorization Code + PKCE S256 with a Provider-owned ephemeral
-`127.0.0.1` listener and fixed `/plugin-auth/callback` path. `auth.poll` observes
+IPv4 `127.0.0.1` listener while advertising
+`http://localhost:<port>/plugin-auth/callback`. The Entra public-client
+registration uses **Mobile and desktop applications** with
+`http://localhost/plugin-auth/callback`; localhost port matching is ignored but
+the path must match. `auth.poll` observes
 the pending flow without consuming it; only a callback terminal result,
 expiry, explicit `auth.cancel`, or runtime-session fencing ends the flow.
 Electron opens only a narrowly validated Microsoft authorize URL through the
