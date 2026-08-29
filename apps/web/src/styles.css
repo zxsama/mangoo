@@ -719,6 +719,15 @@ body {
   z-index: 1;
 }
 
+/* Structural pane seams use only the shared 1px stroke. The generic glass
+   surface's 28px inset glow doubles up across adjacent columns and creates a
+   broad vertical gradient on both sides of each divider. */
+.workbench-column::after {
+  box-shadow:
+    inset 0 1px 0 var(--glass-inner-light),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+}
+
 .workbench-column-left {
   --glass-fill: var(--glass-side-fill);
   --glass-blur-current: var(--glass-side-blur);

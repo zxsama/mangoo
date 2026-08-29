@@ -942,7 +942,15 @@ if (!/--radius-window:\s*8px/.test(stylesForChecks)) {
   fail("global window radius fallback must default to 8px to match the native Windows 11 DWM host corner");
 }
 
-if (/\.workbench-column::after[\s\S]*?border-color:\s*transparent/.test(stylesForChecks)) {
+const workbenchColumnAfterStrokeBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  ".workbench-column::after"
+);
+if (
+  workbenchColumnAfterStrokeBlocks.some(
+    (block) => latestDeclarationValue(block, "border-color") === "transparent"
+  )
+) {
   fail("workbench columns must keep their own liquid-glass layout strokes; do not hide global pane borders to fix the window edge");
 }
 
@@ -3583,6 +3591,26 @@ if (
   )
 ) {
   fail("structural workbench columns must own the titlebar/body join with a single titlebar + body grid");
+}
+
+const workbenchColumnAfterBlocks = cssBlocksForExactSelector(
+  stylesForChecks,
+  ".workbench-column::after"
+);
+const workbenchColumnAfterShadow = latestDeclarationValueAcrossBlocks(
+  workbenchColumnAfterBlocks,
+  "box-shadow"
+);
+if (
+  workbenchColumnAfterBlocks.length === 0 ||
+  workbenchColumnAfterShadow === null ||
+  !/inset\s+0\s+1px\s+0\s+var\(--glass-inner-light\)/i.test(workbenchColumnAfterShadow) ||
+  !/inset\s+0\s+-1px\s+0\s+rgba\(255,\s*255,\s*255,\s*0\.06\)/i.test(
+    workbenchColumnAfterShadow
+  ) ||
+  /inset\s+0\s+0\s+\d+px/i.test(workbenchColumnAfterShadow)
+) {
+  fail("structural pane dividers must keep the top/bottom 1px highlights without a broad four-edge inset glow");
 }
 
 for (const selector of [
