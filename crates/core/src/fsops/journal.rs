@@ -2215,7 +2215,8 @@ fn operation_record_in_transaction(
         r#"SELECT id, operation, source_path,
                   CASE WHEN operation LIKE 'delete_%' THEN NULL ELSE target_path END,
                   status,
-                  created_at, finished_at, error, operation_group_id
+                  created_at, finished_at, error, operation_group_id,
+                  root_uuid, local_binding_uuid, binding_generation
            FROM file_operations WHERE id = ?1"#,
         [operation_id],
         record_from_row,

@@ -49,6 +49,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0028_remove_catalog_plugins.sql",
     ROOT / "crates" / "core" / "migrations" / "0029_media_object_storage.sql",
     ROOT / "crates" / "core" / "migrations" / "0030_sync_root_identity.sql",
+    ROOT / "crates" / "core" / "migrations" / "0031_sync_root_generation_fence.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -116,6 +117,7 @@ REQUIRED_TABLES = {
     "media_remote_objects",
     "media_reachability",
     "sync_root_descriptors",
+    "sync_root_local_bindings",
 }
 
 REQUIRED_HOST_SYNC_ROOT_TABLES = {
@@ -188,6 +190,13 @@ REQUIRED_INDEXES = {
     "ux_folders_root_empty_sentinel",
     "idx_sync_root_descriptors_library_lifecycle",
     "idx_sync_root_descriptors_updated",
+    "idx_sync_root_local_bindings_library_state",
+    "idx_sync_root_local_bindings_generation",
+    "idx_tasks_root_binding_work",
+    "idx_file_operations_root_binding_work",
+    "idx_sync_publication_root_binding_work",
+    "idx_media_publication_root_binding_work",
+    "idx_media_materialization_root_binding_work",
 }
 
 EXPECTED_MEDIA_COLUMNS = {
@@ -508,6 +517,277 @@ def verify_sync_root_identity_contract() -> None:
         )
         if conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=30").fetchone()[0] != 1:
             fail("migration 30 was not registered exactly once")
+    finally:
+        conn.close()
+
+
+def verify_sync_root_generation_fence_contract() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        for migration in MIGRATIONS:
+            apply_migration(conn, migration)
+        library_uuid = bytes(range(32, 48))
+        root_uuid = bytes(range(16))
+        root_folder_uuid = bytes(range(16, 32))
+        binding_uuid = bytes(range(48, 64))
+        conn.execute(
+            "INSERT INTO sync_root_descriptors(root_uuid,root_folder_uuid,library_root_uuid,requested_name,materialized_name,materialization_fingerprint,lifecycle,updated_at) VALUES (?,?,?,?,?,?, 'active',1)",
+            (root_uuid, root_folder_uuid, library_uuid, "Photos", "Photos", bytes(32)),
+        )
+        conn.execute(
+            "INSERT INTO roots(path,display_name,enabled,created_at,root_uuid) VALUES ('D:/Photos','Photos',1,1,?)",
+            (root_uuid,),
+        )
+        root_id = conn.execute("SELECT id FROM roots").fetchone()[0]
+        conn.execute(
+            "INSERT INTO folders(root_id,parent_id,name,path_hash,folder_uuid) VALUES (?,NULL,'','root',?)",
+            (root_id, root_folder_uuid),
+        )
+        conn.execute(
+            "UPDATE roots SET root_folder_uuid=? WHERE id=?",
+            (root_folder_uuid, root_id),
+        )
+        conn.execute(
+            "INSERT INTO sync_local_state(singleton,library_uuid,device_uuid,catalog_stream_uuid,updated_at) VALUES (1,?,randomblob(16),randomblob(16),1)",
+            (library_uuid,),
+        )
+        conn.execute(
+            "INSERT INTO sync_root_local_bindings(root_uuid,library_uuid,local_binding_uuid,binding_generation,state,root_id,operation_revision,updated_at) VALUES (?,?,?,1,'active',?,1,1)",
+            (root_uuid, library_uuid, binding_uuid, root_id),
+        )
+        asset_uuid = bytes(range(64, 80))
+        revision_uuid = bytes(range(80, 96))
+        intent_uuid = bytes(range(96, 112))
+        conn.execute(
+            "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,asset_uuid) VALUES (?,?,'photo.jpg','jpg',3,1,?)",
+            (root_id, conn.execute("SELECT id FROM folders WHERE root_id=?", (root_id,)).fetchone()[0], asset_uuid),
+        )
+        conn.execute(
+            "INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?,?,3,1,1)",
+            (revision_uuid, asset_uuid),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE sync_root_local_bindings SET binding_generation=0,operation_revision=2 WHERE root_uuid=?",
+            (root_uuid,),
+        )
+        conn.execute(
+            "INSERT INTO tasks(kind,priority,status,root_id,created_at,updated_at) VALUES ('root_scan',0,'pending',?,1,1)",
+            (root_id,),
+        )
+        task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
+        if conn.execute(
+            "SELECT root_uuid,local_binding_uuid,binding_generation FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone() != (root_uuid, binding_uuid, 1):
+            fail("managed task did not snapshot Catalog root ownership")
+        conn.execute(
+            "INSERT INTO file_operations(operation,source_path,status,created_at,root_id) VALUES ('rename','D:/Photos/photo.jpg','pending',1,?)",
+            (root_id,),
+        )
+        file_operation_id = conn.execute(
+            "SELECT id FROM file_operations ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,local_mutation_generation,source_path,state,created_at,updated_at) VALUES (?,?,?,1,'D:/Photos/photo.jpg','pending-hash',1,1)",
+            (intent_uuid, asset_uuid, revision_uuid),
+        )
+        conn.execute(
+            "INSERT INTO media_publication_jobs(intent_uuid,phase,created_at,updated_at) VALUES (?,'pending-hash',1,1)",
+            (intent_uuid,),
+        )
+        conn.execute(
+            "INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,created_at,updated_at) VALUES (?,?,'photo.jpg','pending',3,1,1)",
+            (revision_uuid, asset_uuid),
+        )
+        for table, key_column, key_value in (
+            ("file_operations", "id", file_operation_id),
+            ("sync_publication_intents", "intent_uuid", intent_uuid),
+            ("media_publication_jobs", "intent_uuid", intent_uuid),
+            ("media_materialization_jobs", "content_revision_uuid", revision_uuid),
+        ):
+            if conn.execute(
+                f"SELECT root_uuid,local_binding_uuid,binding_generation FROM {table} WHERE {key_column}=?",
+                (key_value,),
+            ).fetchone() != (root_uuid, binding_uuid, 1):
+                fail(f"managed {table} row did not snapshot Catalog root ownership")
+        expect_integrity_error(
+            conn,
+            "INSERT INTO tasks(kind,priority,status,created_at,updated_at,root_uuid,local_binding_uuid,binding_generation) VALUES ('thumbnail',0,'pending',1,1,?,?,1)",
+            (root_uuid, binding_uuid),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE file_operations SET local_binding_uuid=NULL WHERE id=?",
+            (file_operation_id,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE sync_publication_intents SET binding_generation=NULL WHERE intent_uuid=?",
+            (intent_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE media_publication_jobs SET local_binding_uuid=? WHERE intent_uuid=?",
+            (bytes(reversed(binding_uuid)), intent_uuid),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE media_materialization_jobs SET root_uuid=NULL WHERE content_revision_uuid=?",
+            (revision_uuid,),
+        )
+        conn.execute(
+            "UPDATE sync_root_local_bindings SET binding_generation=2,operation_revision=2,updated_at=2 WHERE root_uuid=?",
+            (root_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE tasks SET status='running' WHERE id=?",
+            (task_id,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE file_operations SET journal_phase='executing' WHERE id=?",
+            (file_operation_id,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE sync_publication_intents SET state='pending-manifest' WHERE intent_uuid=?",
+            (intent_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE media_publication_jobs SET owner_token='worker' WHERE intent_uuid=?",
+            (intent_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE media_materialization_jobs SET owner_token='worker' WHERE content_revision_uuid=?",
+            (revision_uuid,),
+        )
+        conn.execute(
+            "INSERT INTO tasks(kind,priority,status,created_at,updated_at) VALUES ('thumbnail',0,'pending',1,1)"
+        )
+        legacy_task = conn.execute(
+            "SELECT root_uuid,local_binding_uuid,binding_generation FROM tasks ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if legacy_task != (None, None, None):
+            fail("legacy task must remain unowned")
+        expect_integrity_error(
+            conn,
+            "INSERT INTO tasks(kind,priority,status,created_at,updated_at,root_uuid) VALUES ('thumbnail',0,'pending',1,1,?)",
+            (root_uuid,),
+        )
+        if conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=31"
+        ).fetchone() != (1,):
+            fail("migration 31 was not registered exactly once")
+        for sql, params, expected_index in (
+            ("SELECT id FROM tasks WHERE root_uuid=? AND local_binding_uuid=? AND binding_generation<? AND status IN ('pending','running') ORDER BY id LIMIT 100", (root_uuid, binding_uuid, 2), "idx_tasks_root_binding_work"),
+            ("SELECT id FROM file_operations WHERE root_uuid=? AND local_binding_uuid=? AND binding_generation<? AND status='pending' ORDER BY id LIMIT 100", (root_uuid, binding_uuid, 2), "idx_file_operations_root_binding_work"),
+            ("SELECT intent_uuid FROM sync_publication_intents WHERE root_uuid=? AND local_binding_uuid=? AND binding_generation<? AND state='pending-hash' ORDER BY intent_uuid LIMIT 100", (root_uuid, binding_uuid, 2), "idx_sync_publication_root_binding_work"),
+            ("SELECT intent_uuid FROM media_publication_jobs WHERE root_uuid=? AND local_binding_uuid=? AND binding_generation<? AND phase='pending-hash' ORDER BY intent_uuid LIMIT 100", (root_uuid, binding_uuid, 2), "idx_media_publication_root_binding_work"),
+            ("SELECT content_revision_uuid FROM media_materialization_jobs WHERE root_uuid=? AND local_binding_uuid=? AND binding_generation<? AND phase='pending' ORDER BY content_revision_uuid LIMIT 100", (root_uuid, binding_uuid, 2), "idx_media_materialization_root_binding_work"),
+        ):
+            assert_query_plan_uses(conn, sql, params, expected_index)
+    finally:
+        conn.close()
+
+
+def verify_sync_root_generation_fence_upgrade_from_v30() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        for migration in MIGRATIONS:
+            if migration.name == "0031_sync_root_generation_fence.sql":
+                break
+            apply_migration(conn, migration)
+        library_uuid = bytes(range(32, 48))
+        root_uuid = bytes(range(16))
+        root_folder_uuid = bytes(range(16, 32))
+        conn.execute(
+            "INSERT INTO sync_root_descriptors(root_uuid,root_folder_uuid,library_root_uuid,requested_name,materialized_name,materialization_fingerprint,lifecycle,updated_at) VALUES (?,?,?,?,?,?, 'active',1)",
+            (root_uuid, root_folder_uuid, library_uuid, "Legacy", "Legacy", bytes(32)),
+        )
+        conn.execute(
+            "INSERT INTO roots(path,display_name,enabled,created_at,root_uuid) VALUES ('D:/Legacy','Legacy',1,1,?)",
+            (root_uuid,),
+        )
+        root_id = conn.execute("SELECT id FROM roots").fetchone()[0]
+        conn.execute(
+            "INSERT INTO folders(root_id,parent_id,name,path_hash,folder_uuid) VALUES (?,NULL,'','legacy-root',?)",
+            (root_id, root_folder_uuid),
+        )
+        conn.execute(
+            "UPDATE roots SET root_folder_uuid=? WHERE id=?",
+            (root_folder_uuid, root_id),
+        )
+        folder_id = conn.execute("SELECT id FROM folders").fetchone()[0]
+        conn.execute(
+            "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,asset_uuid) VALUES (?,?,'legacy.jpg','jpg',3,1,randomblob(16))",
+            (root_id, folder_id),
+        )
+        asset_uuid = conn.execute("SELECT asset_uuid FROM files").fetchone()[0]
+        revision_uuid = bytes(range(16))
+        intent_uuid = bytes(range(16, 32))
+        conn.execute(
+            "INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?,?,3,1,1)",
+            (revision_uuid, asset_uuid),
+        )
+        conn.execute(
+            "INSERT INTO tasks(kind,priority,status,root_id,created_at,updated_at) VALUES ('root_scan',0,'pending',?,1,1)",
+            (root_id,),
+        )
+        conn.execute(
+            "INSERT INTO file_operations(operation,source_path,status,created_at,root_id) VALUES ('rename','D:/Legacy/legacy.jpg','pending',1,?)",
+            (root_id,),
+        )
+        conn.execute(
+            "INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,local_mutation_generation,source_path,state,created_at,updated_at) VALUES (?,?,?,1,'D:/Legacy/legacy.jpg','pending-hash',1,1)",
+            (intent_uuid, asset_uuid, revision_uuid),
+        )
+        conn.execute(
+            "INSERT INTO media_publication_jobs(intent_uuid,phase,created_at,updated_at) VALUES (?,'pending-hash',1,1)",
+            (intent_uuid,),
+        )
+        conn.execute(
+            "INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,created_at,updated_at) VALUES (?,?,'legacy.jpg','pending',3,1,1)",
+            (revision_uuid, asset_uuid),
+        )
+        apply_migration(
+            conn,
+            ROOT / "crates" / "core" / "migrations" / "0031_sync_root_generation_fence.sql",
+        )
+        for table in (
+            "tasks",
+            "file_operations",
+            "sync_publication_intents",
+            "media_publication_jobs",
+            "media_materialization_jobs",
+        ):
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not {"root_uuid", "local_binding_uuid", "binding_generation"} <= columns:
+                fail(f"migration 31 did not add ownership triplet to {table}")
+            if conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE root_uuid IS NOT NULL OR local_binding_uuid IS NOT NULL OR binding_generation IS NOT NULL"
+            ).fetchone() != (0,):
+                fail(f"migration 31 guessed ownership for existing {table} rows")
+        if conn.execute("SELECT COUNT(*) FROM sync_root_local_bindings").fetchone() != (0,):
+            fail("migration 31 fabricated a Catalog binding from schema-30 path/name state")
+        expect_integrity_error(conn, "UPDATE tasks SET status='running'")
+        expect_integrity_error(
+            conn, "UPDATE file_operations SET journal_phase='executing'"
+        )
+        expect_integrity_error(
+            conn, "UPDATE sync_publication_intents SET state='pending-manifest'"
+        )
+        expect_integrity_error(
+            conn, "UPDATE media_publication_jobs SET owner_token='worker'"
+        )
+        expect_integrity_error(
+            conn, "UPDATE media_materialization_jobs SET owner_token='worker'"
+        )
     finally:
         conn.close()
 
@@ -1011,6 +1291,8 @@ def main() -> None:
     verify_sync_upgrade_from_populated_v26()
     verify_media_upgrade_from_populated_v28()
     verify_sync_root_identity_contract()
+    verify_sync_root_generation_fence_contract()
+    verify_sync_root_generation_fence_upgrade_from_v30()
     verify_host_sync_root_binding_contract()
     verify_host_plugin_upgrade_from_populated_v2()
 
@@ -1344,6 +1626,16 @@ def main() -> None:
             ).fetchone()
             if version is None:
                 fail("migration version 29 was not recorded")
+            version = conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 30"
+            ).fetchone()
+            if version is None:
+                fail("migration version 30 was not recorded")
+            version = conn.execute(
+                "SELECT version FROM schema_migrations WHERE version = 31"
+            ).fetchone()
+            if version is None:
+                fail("migration version 31 was not recorded")
 
             for table, column in (
                 ("roots", "root_uuid"),

@@ -4,7 +4,7 @@ mod sync_roots;
 pub mod writer;
 
 #[allow(unused_imports)]
-pub use sync_roots::SyncRootDescriptorRecord;
+pub use sync_roots::{SyncRootBindingToken, SyncRootDescriptorRecord, SyncRootLocalBindingRecord};
 pub use writer::{DbWriter, WriteDurability};
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
@@ -531,6 +531,15 @@ pub struct TaskRecord {
     pub thumbnail_source_fingerprint: Option<String>,
     #[serde(skip_serializing)]
     pub attempt_generation: i64,
+    #[allow(dead_code)]
+    #[serde(skip_serializing)]
+    pub root_uuid: Option<Vec<u8>>,
+    #[allow(dead_code)]
+    #[serde(skip_serializing)]
+    pub local_binding_uuid: Option<Vec<u8>>,
+    #[allow(dead_code)]
+    #[serde(skip_serializing)]
+    pub binding_generation: Option<i64>,
     pub error: Option<String>,
 }
 
@@ -1481,6 +1490,10 @@ impl Database {
         if !self.migration_applied(30)? {
             self.connection
                 .execute_batch(migrations::SYNC_ROOT_IDENTITY_MIGRATION)?;
+        }
+        if !self.migration_applied(31)? {
+            self.connection
+                .execute_batch(migrations::SYNC_ROOT_GENERATION_FENCE_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
@@ -2914,7 +2927,8 @@ impl Database {
         const RECENT_TASK_LIMIT: i64 = 2000;
         const TASK_COLUMNS: &str = "id, kind, priority, status, root_id, folder_id, file_id, \
              created_at, updated_at, items_seen, items_total, folders_seen, media_files_seen, \
-             skipped_files, thumbnail_source_fingerprint, attempt_generation, error";
+             skipped_files, thumbnail_source_fingerprint, attempt_generation, \
+             root_uuid, local_binding_uuid, binding_generation, error";
 
         let mut seen: HashSet<i64> = HashSet::new();
         let mut tasks: Vec<TaskRecord> = Vec::new();
@@ -2986,7 +3000,8 @@ impl Database {
             r#"
             SELECT id, kind, priority, status, root_id, folder_id, file_id, created_at, updated_at,
                    items_seen, items_total, folders_seen, media_files_seen, skipped_files,
-                   thumbnail_source_fingerprint, attempt_generation, error
+                   thumbnail_source_fingerprint, attempt_generation,
+                   root_uuid, local_binding_uuid, binding_generation, error
             FROM tasks
             WHERE id = ?1
             "#,
@@ -3001,7 +3016,8 @@ impl Database {
             r#"
             SELECT id, kind, priority, status, root_id, folder_id, file_id, created_at, updated_at,
                    items_seen, items_total, folders_seen, media_files_seen, skipped_files,
-                   thumbnail_source_fingerprint, attempt_generation, error
+                   thumbnail_source_fingerprint, attempt_generation,
+                   root_uuid, local_binding_uuid, binding_generation, error
             FROM tasks
             WHERE kind = 'thumbnail'
               AND file_id = ?1
@@ -10183,7 +10199,10 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         skipped_files: row.get(13)?,
         thumbnail_source_fingerprint: row.get(14)?,
         attempt_generation: row.get(15)?,
-        error: row.get(16)?,
+        root_uuid: row.get(16)?,
+        local_binding_uuid: row.get(17)?,
+        binding_generation: row.get(18)?,
+        error: row.get(19)?,
     })
 }
 
@@ -10196,7 +10215,8 @@ fn task_record_in_transaction(
             r#"
             SELECT id, kind, priority, status, root_id, folder_id, file_id, created_at, updated_at,
                    items_seen, items_total, folders_seen, media_files_seen, skipped_files,
-                   thumbnail_source_fingerprint, attempt_generation, error
+                   thumbnail_source_fingerprint, attempt_generation,
+                   root_uuid, local_binding_uuid, binding_generation, error
             FROM tasks
             WHERE id = ?1
             "#,

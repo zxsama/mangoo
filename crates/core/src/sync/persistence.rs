@@ -190,11 +190,34 @@ const RECOVERY_TABLES: &[&str] = &[
     "sync_publication_intents",
 ];
 
+const SYNC_PUBLICATION_INTENT_RECOVERY_COLUMNS: &[&str] = &[
+    "intent_uuid",
+    "asset_uuid",
+    "content_revision_uuid",
+    "event_uuid",
+    "binding_epoch",
+    "local_mutation_generation",
+    "source_path",
+    "state",
+    "attempt_count",
+    "next_attempt_at",
+    "error_code",
+    "created_at",
+    "updated_at",
+];
+
 fn capture_recovery_snapshot(connection: &Connection) -> anyhow::Result<CatalogRecoverySnapshot> {
     use rusqlite::types::ValueRef;
     let mut tables = Vec::new();
     for table in RECOVERY_TABLES {
-        let mut statement = connection.prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))?;
+        let selected_columns = if *table == "sync_publication_intents" {
+            SYNC_PUBLICATION_INTENT_RECOVERY_COLUMNS.join(",")
+        } else {
+            "*".to_owned()
+        };
+        let mut statement = connection.prepare(&format!(
+            "SELECT {selected_columns} FROM {table} ORDER BY rowid"
+        ))?;
         let columns: Vec<String> = statement
             .column_names()
             .iter()
@@ -221,7 +244,8 @@ fn capture_recovery_snapshot(connection: &Connection) -> anyhow::Result<CatalogR
         // Checkpoints are portable protocol objects. Publication source paths
         // are only useful to the originating device while the intent is live;
         // retaining them after publication would leak an absolute local path
-        // into every remote recovery snapshot.
+        // into every remote recovery snapshot. The fixed column list above
+        // omits Catalog-local root/binding/generation execution ownership.
         if *table == "sync_publication_intents" {
             let source_path_index = columns
                 .iter()
@@ -757,13 +781,20 @@ fn restore_recovery_snapshot(
                 table.table
             );
         }
-        let schema_sql = format!("SELECT * FROM {} LIMIT 0", table.table);
-        let schema_statement = transaction.prepare(&schema_sql)?;
-        let expected_columns = schema_statement
-            .column_names()
-            .iter()
-            .map(|value| (*value).to_owned())
-            .collect::<Vec<_>>();
+        let expected_columns = if table.table == "sync_publication_intents" {
+            SYNC_PUBLICATION_INTENT_RECOVERY_COLUMNS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        } else {
+            let schema_sql = format!("SELECT * FROM {} LIMIT 0", table.table);
+            let schema_statement = transaction.prepare(&schema_sql)?;
+            schema_statement
+                .column_names()
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
         if table.columns != expected_columns {
             anyhow::bail!(
                 "checkpoint recovery columns do not match schema for {}",
@@ -970,7 +1001,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Database, NewRoot};
+    use crate::db::{Database, NewRoot, SyncRootDescriptorRecord, SyncRootLocalBindingRecord};
 
     fn database() -> Database {
         let database = Database::open_in_memory().unwrap();
@@ -1106,15 +1137,14 @@ mod tests {
     fn checkpoint_round_trips_unfinished_recovery_state_and_blocks_portable_gate() {
         let database = database();
         let connection = database.connection_for_fsops();
-        let asset: Vec<u8> = connection
-            .query_row("SELECT asset_uuid FROM files LIMIT 1", [], |r| r.get(0))
-            .optional()
-            .unwrap()
-            .unwrap_or_else(|| uuid::Uuid::now_v7().as_bytes().to_vec());
-        let revision = uuid::Uuid::now_v7();
-        connection.execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,local_mutation_generation,created_at) VALUES (?1,?2,1,1)",params![revision.as_bytes().as_slice(),asset]).unwrap();
-        let source_path = r"D:\Private\Originals\secret.jpg";
-        connection.execute("INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,local_mutation_generation,source_path,state,attempt_count,created_at,updated_at) VALUES (?1,?2,?3,1,?4,'pending-hash',0,1,1)",params![uuid::Uuid::now_v7().as_bytes().as_slice(),asset,revision.as_bytes().as_slice(),source_path]).unwrap();
+        let (root_id, root_uuid): (i64, Vec<u8>) = connection
+            .query_row("SELECT id,root_uuid FROM roots LIMIT 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        let root_uuid = uuid::Uuid::from_slice(&root_uuid).unwrap();
+        let root_folder_uuid = uuid::Uuid::now_v7();
+        let binding_uuid = uuid::Uuid::now_v7();
         let library: Vec<u8> = connection
             .query_row(
                 "SELECT library_uuid FROM sync_local_state WHERE singleton=1",
@@ -1122,6 +1152,69 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
+        database
+            .upsert_sync_root_descriptor(&SyncRootDescriptorRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                root_folder_uuid: *root_folder_uuid.as_bytes(),
+                library_root_uuid: *root_uuid.as_bytes(),
+                creation_event_uuid: None,
+                winning_location_revision_uuid: None,
+                requested_name: "Managed".to_owned(),
+                materialized_name: "Managed".to_owned(),
+                materialization_fingerprint: [7; 32],
+                lifecycle: "active".to_owned(),
+                logical_revision: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,NULL,'','root','active',?2)",
+                params![root_id, root_folder_uuid.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let folder_id = connection.last_insert_rowid();
+        database
+            .link_sync_root_descriptor(root_id, root_uuid.as_bytes(), root_folder_uuid.as_bytes())
+            .unwrap();
+        database
+            .upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                library_uuid: *uuid::Uuid::from_slice(&library).unwrap().as_bytes(),
+                local_binding_uuid: *binding_uuid.as_bytes(),
+                binding_generation: 3,
+                state: "active".to_owned(),
+                root_id,
+                operation_revision: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let asset = uuid::Uuid::now_v7();
+        connection
+            .execute(
+                "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,asset_uuid) VALUES (?1,?2,'secret.jpg','jpg',3,1,?3)",
+                params![root_id, folder_id, asset.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let revision = uuid::Uuid::now_v7();
+        connection.execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,local_mutation_generation,created_at) VALUES (?1,?2,1,1)",params![revision.as_bytes().as_slice(),asset.as_bytes().as_slice()]).unwrap();
+        let source_path = r"D:\Private\Originals\secret.jpg";
+        connection.execute("INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,local_mutation_generation,source_path,state,attempt_count,created_at,updated_at) VALUES (?1,?2,?3,1,?4,'pending-hash',0,1,1)",params![uuid::Uuid::now_v7().as_bytes().as_slice(),asset.as_bytes().as_slice(),revision.as_bytes().as_slice(),source_path]).unwrap();
+        let source_token: (Vec<u8>, Vec<u8>, i64) = connection
+            .query_row(
+                "SELECT root_uuid,local_binding_uuid,binding_generation FROM sync_publication_intents",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            source_token,
+            (
+                root_uuid.as_bytes().to_vec(),
+                binding_uuid.as_bytes().to_vec(),
+                3
+            )
+        );
         let fence = capture_checkpoint_fence(
             connection,
             StreamVector::new(),
@@ -1145,6 +1238,18 @@ mod tests {
             !String::from_utf8_lossy(&encoded).contains(source_path),
             "portable checkpoint must redact the originating absolute path"
         );
+        let publication = checkpoint
+            .recovery
+            .tables
+            .iter()
+            .find(|table| table.table == "sync_publication_intents")
+            .unwrap();
+        for column in ["root_uuid", "local_binding_uuid", "binding_generation"] {
+            assert!(!publication
+                .columns
+                .iter()
+                .any(|candidate| candidate == column));
+        }
         let _ = std::fs::remove_dir_all(directory);
     }
 

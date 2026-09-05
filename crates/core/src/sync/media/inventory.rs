@@ -68,6 +68,9 @@ pub struct PublicationJob {
     pub phase: PublicationPhase,
     pub binding_epoch: Option<uuid::Uuid>,
     pub transport_generation: u64,
+    pub root_uuid: Option<uuid::Uuid>,
+    pub local_binding_uuid: Option<uuid::Uuid>,
+    pub binding_generation: Option<u64>,
     pub upload_object_key: Option<String>,
     pub upload_id: Option<String>,
     pub upload_offset: u64,
@@ -94,6 +97,9 @@ pub struct MaterializationJob {
     pub priority: u8,
     pub binding_epoch: Option<uuid::Uuid>,
     pub transport_generation: u64,
+    pub root_uuid: Option<uuid::Uuid>,
+    pub local_binding_uuid: Option<uuid::Uuid>,
+    pub binding_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +117,9 @@ pub struct ClaimedMaterializationJob {
     pub manifest_length: u64,
     pub binding_epoch: Option<uuid::Uuid>,
     pub transport_generation: u64,
+    pub root_uuid: Option<uuid::Uuid>,
+    pub local_binding_uuid: Option<uuid::Uuid>,
+    pub binding_generation: Option<u64>,
 }
 
 pub fn ensure_publication_jobs(
@@ -151,10 +160,10 @@ pub fn claim_publication_job(
     lease_ms: i64,
 ) -> anyhow::Result<Option<PublicationJob>> {
     let transaction = connection.unchecked_transaction()?;
-    let row: Option<(Vec<u8>, Vec<u8>, String, i64, Option<i64>, Option<String>, String, Option<Vec<u8>>, i64, Option<String>, Option<String>, i64, i64)> = transaction.query_row(
-        "SELECT j.intent_uuid,i.content_revision_uuid,i.source_path,r.byte_size,r.source_mtime_ms,json_extract(j.source_identity_json,'$.expectedContentSha256'),j.phase,j.binding_epoch,j.transport_generation,j.upload_object_key,j.upload_id,j.upload_offset,j.attempt_count FROM media_publication_jobs j JOIN sync_publication_intents i ON i.intent_uuid=j.intent_uuid JOIN asset_content_revisions r ON r.content_revision_uuid=i.content_revision_uuid WHERE j.binding_epoch=?1 AND j.transport_generation=?2 AND j.phase NOT IN ('canonicalized','event-published','cancelled','archived') AND COALESCE(j.next_attempt_at,0)<=?3 AND (j.owner_token IS NULL OR j.lease_expires_at<?3) ORDER BY j.priority DESC,j.updated_at,j.intent_uuid LIMIT 1",
+    let row: Option<(Vec<u8>, Vec<u8>, String, i64, Option<i64>, Option<String>, String, Option<Vec<u8>>, i64, Option<String>, Option<String>, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>)> = transaction.query_row(
+        "SELECT j.intent_uuid,i.content_revision_uuid,i.source_path,r.byte_size,r.source_mtime_ms,json_extract(j.source_identity_json,'$.expectedContentSha256'),j.phase,j.binding_epoch,j.transport_generation,j.upload_object_key,j.upload_id,j.upload_offset,j.attempt_count,j.root_uuid,j.local_binding_uuid,j.binding_generation FROM media_publication_jobs j JOIN sync_publication_intents i ON i.intent_uuid=j.intent_uuid JOIN asset_content_revisions r ON r.content_revision_uuid=i.content_revision_uuid WHERE j.binding_epoch=?1 AND j.transport_generation=?2 AND j.phase NOT IN ('canonicalized','event-published','cancelled','archived') AND COALESCE(j.next_attempt_at,0)<=?3 AND (j.owner_token IS NULL OR j.lease_expires_at<?3) ORDER BY j.priority DESC,j.updated_at,j.intent_uuid LIMIT 1",
         params![binding_epoch.as_bytes().as_slice(),transport_generation,now],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?)),
     ).optional()?;
     let Some((
         intent,
@@ -170,6 +179,9 @@ pub fn claim_publication_job(
         upload_id,
         upload_offset,
         attempts,
+        root_uuid,
+        local_binding_uuid,
+        binding_generation,
     )) = row
     else {
         return Ok(None);
@@ -196,6 +208,15 @@ pub fn claim_publication_job(
         phase: PublicationPhase::parse(&phase)?,
         binding_epoch: binding.as_deref().map(uuid::Uuid::from_slice).transpose()?,
         transport_generation: generation as u64,
+        root_uuid: root_uuid
+            .as_deref()
+            .map(uuid::Uuid::from_slice)
+            .transpose()?,
+        local_binding_uuid: local_binding_uuid
+            .as_deref()
+            .map(uuid::Uuid::from_slice)
+            .transpose()?,
+        binding_generation: binding_generation.map(u64::try_from).transpose()?,
         upload_object_key: object_key,
         upload_id,
         upload_offset: upload_offset as u64,
@@ -436,12 +457,15 @@ pub fn claim_materialization_job(
         i64,
         Option<Vec<u8>>,
         i64,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
     );
     let transaction = connection.unchecked_transaction()?;
     let row: Option<Row> = transaction.query_row(
-        "SELECT j.content_revision_uuid,j.asset_uuid,j.destination_relpath,root.path,j.expected_length,r.source_mtime_ms,l.manifest_hash,m.content_hash,m.manifest_pack_hash,m.pack_offset,m.record_length,j.binding_epoch,j.transport_generation FROM media_materialization_jobs j JOIN asset_content_revisions r ON r.content_revision_uuid=j.content_revision_uuid JOIN media_content_manifest_links l ON l.content_revision_uuid=j.content_revision_uuid JOIN media_manifests m ON m.manifest_hash=l.manifest_hash JOIN files f ON f.asset_uuid=j.asset_uuid JOIN roots root ON root.id=f.root_id WHERE j.binding_epoch=?1 AND j.transport_generation=?2 AND j.phase NOT IN ('complete','cancelled') AND COALESCE(j.next_attempt_at,0)<=?3 AND (j.owner_token IS NULL OR j.lease_expires_at<?3) AND root.path<>'sync-bootstrap' ORDER BY j.priority DESC,j.updated_at,j.content_revision_uuid LIMIT 1",
+        "SELECT j.content_revision_uuid,j.asset_uuid,j.destination_relpath,root.path,j.expected_length,r.source_mtime_ms,l.manifest_hash,m.content_hash,m.manifest_pack_hash,m.pack_offset,m.record_length,j.binding_epoch,j.transport_generation,j.root_uuid,j.local_binding_uuid,j.binding_generation FROM media_materialization_jobs j JOIN asset_content_revisions r ON r.content_revision_uuid=j.content_revision_uuid JOIN media_content_manifest_links l ON l.content_revision_uuid=j.content_revision_uuid JOIN media_manifests m ON m.manifest_hash=l.manifest_hash JOIN files f ON f.asset_uuid=j.asset_uuid JOIN roots root ON root.id=f.root_id WHERE j.binding_epoch=?1 AND j.transport_generation=?2 AND j.phase NOT IN ('complete','cancelled') AND COALESCE(j.next_attempt_at,0)<=?3 AND (j.owner_token IS NULL OR j.lease_expires_at<?3) AND root.path<>'sync-bootstrap' ORDER BY j.priority DESC,j.updated_at,j.content_revision_uuid LIMIT 1",
         params![binding_epoch.as_bytes().as_slice(),transport_generation,now],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?)),
     ).optional()?;
     let Some((
         revision,
@@ -457,6 +481,9 @@ pub fn claim_materialization_job(
         manifest_length,
         binding,
         generation,
+        root_uuid,
+        local_binding_uuid,
+        binding_generation,
     )) = row
     else {
         return Ok(None);
@@ -490,6 +517,15 @@ pub fn claim_materialization_job(
         manifest_length: u64::try_from(manifest_length)?,
         binding_epoch: binding.as_deref().map(uuid::Uuid::from_slice).transpose()?,
         transport_generation: u64::try_from(generation)?,
+        root_uuid: root_uuid
+            .as_deref()
+            .map(uuid::Uuid::from_slice)
+            .transpose()?,
+        local_binding_uuid: local_binding_uuid
+            .as_deref()
+            .map(uuid::Uuid::from_slice)
+            .transpose()?,
+        binding_generation: binding_generation.map(u64::try_from).transpose()?,
     }))
 }
 

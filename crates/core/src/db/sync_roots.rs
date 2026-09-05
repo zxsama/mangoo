@@ -20,6 +20,27 @@ pub struct SyncRootDescriptorRecord {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncRootBindingToken {
+    pub root_uuid: [u8; 16],
+    pub local_binding_uuid: [u8; 16],
+    pub binding_generation: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRootLocalBindingRecord {
+    pub root_uuid: [u8; 16],
+    pub library_uuid: [u8; 16],
+    pub local_binding_uuid: [u8; 16],
+    pub binding_generation: u64,
+    pub state: String,
+    pub root_id: i64,
+    pub operation_revision: u64,
+    pub updated_at: i64,
+}
+
+#[allow(dead_code)]
 fn fixed_bytes<const N: usize>(value: Vec<u8>, field: &str) -> anyhow::Result<[u8; N]> {
     value
         .try_into()
@@ -27,6 +48,122 @@ fn fixed_bytes<const N: usize>(value: Vec<u8>, field: &str) -> anyhow::Result<[u
 }
 
 impl Database {
+    /// Applies the Host binding projection without allowing a stale revision
+    /// or generation to roll the Catalog execution authority backward.
+    #[allow(dead_code)]
+    pub fn upsert_sync_root_local_binding(
+        &self,
+        binding: &SyncRootLocalBindingRecord,
+    ) -> anyhow::Result<()> {
+        if !is_local_binding_state(&binding.state) {
+            bail!("invalid local root binding state");
+        }
+        if binding.binding_generation == 0 {
+            bail!("binding generation must be positive");
+        }
+        let generation = i64::try_from(binding.binding_generation)
+            .context("binding generation exceeds SQLite integer range")?;
+        let operation_revision = i64::try_from(binding.operation_revision)
+            .context("binding operation revision exceeds SQLite integer range")?;
+        let changed = self.connection.execute(
+            "INSERT INTO sync_root_local_bindings(root_uuid,library_uuid,local_binding_uuid,binding_generation,state,root_id,operation_revision,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root_uuid) DO UPDATE SET local_binding_uuid=excluded.local_binding_uuid,binding_generation=excluded.binding_generation,state=excluded.state,operation_revision=excluded.operation_revision,updated_at=excluded.updated_at WHERE sync_root_local_bindings.library_uuid=excluded.library_uuid AND sync_root_local_bindings.root_id=excluded.root_id AND (excluded.binding_generation>sync_root_local_bindings.binding_generation OR (excluded.binding_generation=sync_root_local_bindings.binding_generation AND excluded.operation_revision>=sync_root_local_bindings.operation_revision))",
+            params![
+                binding.root_uuid.as_slice(),
+                binding.library_uuid.as_slice(),
+                binding.local_binding_uuid.as_slice(),
+                generation,
+                binding.state,
+                binding.root_id,
+                operation_revision,
+                binding.updated_at,
+            ],
+        )?;
+        if changed == 0 {
+            let current = self.sync_root_local_binding(&binding.root_uuid)?;
+            if current.as_ref() == Some(binding) {
+                return Ok(());
+            }
+            bail!("stale local root binding projection");
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn sync_root_local_binding(
+        &self,
+        root_uuid: &[u8; 16],
+    ) -> anyhow::Result<Option<SyncRootLocalBindingRecord>> {
+        self.connection
+            .query_row(
+                "SELECT root_uuid,library_uuid,local_binding_uuid,binding_generation,state,root_id,operation_revision,updated_at FROM sync_root_local_bindings WHERE root_uuid=?1",
+                [root_uuid.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(
+                |(
+                    root_uuid,
+                    library_uuid,
+                    local_binding_uuid,
+                    binding_generation,
+                    state,
+                    root_id,
+                    operation_revision,
+                    updated_at,
+                )| {
+                    Ok(SyncRootLocalBindingRecord {
+                        root_uuid: fixed_bytes(root_uuid, "root_uuid")?,
+                        library_uuid: fixed_bytes(library_uuid, "library_uuid")?,
+                        local_binding_uuid: fixed_bytes(
+                            local_binding_uuid,
+                            "local_binding_uuid",
+                        )?,
+                        binding_generation: u64::try_from(binding_generation)
+                            .context("negative binding generation")?,
+                        state,
+                        root_id,
+                        operation_revision: u64::try_from(operation_revision)
+                            .context("negative binding operation revision")?,
+                        updated_at,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    /// Validates a captured execution token through caller-owned transaction
+    /// state. Workers call this immediately before their claim/effect/complete
+    /// write so a Host read cannot become the final authority.
+    #[allow(dead_code)]
+    pub fn sync_root_binding_token_matches_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        token: &SyncRootBindingToken,
+    ) -> anyhow::Result<bool> {
+        transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND state IN ('materializing','active','local-only-fork','reconcile-required','relocating','local-rename-required'))",
+                params![
+                    token.root_uuid.as_slice(),
+                    token.local_binding_uuid.as_slice(),
+                    i64::try_from(token.binding_generation)
+                        .context("binding generation exceeds SQLite integer range")?,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     /// Upserts reducer-derived descriptor fields while preserving the immutable
     /// portable identity tuple. Paths and device-local selection never enter
     /// this Catalog projection.
@@ -160,6 +297,21 @@ impl Database {
         }
         Ok(())
     }
+}
+
+fn is_local_binding_state(state: &str) -> bool {
+    matches!(
+        state,
+        "materializing"
+            | "active"
+            | "paused"
+            | "local-only-fork"
+            | "reconcile-required"
+            | "relocating"
+            | "local-rename-required"
+            | "unavailable"
+            | "error"
+    )
 }
 
 #[cfg(test)]

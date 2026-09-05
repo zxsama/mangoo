@@ -2724,7 +2724,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(migration, 30);
+        assert_eq!(migration, 31);
         assert_eq!(
             Uuid::from_slice(&identity.0).unwrap().to_string(),
             created.library_uuid

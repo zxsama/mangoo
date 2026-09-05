@@ -63,6 +63,15 @@ pub struct FileOperationRecord {
     pub finished_at: Option<i64>,
     pub error: Option<String>,
     pub operation_group_id: Option<String>,
+    #[allow(dead_code)]
+    #[serde(skip_serializing)]
+    pub root_uuid: Option<Vec<u8>>,
+    #[allow(dead_code)]
+    #[serde(skip_serializing)]
+    pub local_binding_uuid: Option<Vec<u8>>,
+    #[allow(dead_code)]
+    #[serde(skip_serializing)]
+    pub binding_generation: Option<i64>,
 }
 
 /// Stable error codes that the API surfaces in JSON bodies.
@@ -238,7 +247,7 @@ pub fn list_recent(
     let guard = database.lock().expect("database mutex poisoned");
     let conn = guard.connection_for_fsops();
     let sql = format!(
-        "SELECT id, operation, source_path, CASE WHEN operation LIKE 'delete_%' THEN NULL ELSE target_path END, status, created_at, finished_at, error, operation_group_id \
+        "SELECT id, operation, source_path, CASE WHEN operation LIKE 'delete_%' THEN NULL ELSE target_path END, status, created_at, finished_at, error, operation_group_id, root_uuid, local_binding_uuid, binding_generation \
          FROM file_operations {} ORDER BY id DESC LIMIT {}",
         if cursor_id.is_some() {
             "WHERE status <> 'pending' AND id < ?1"
@@ -640,6 +649,9 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileOperationRec
         finished_at: row.get(6)?,
         error: row.get(7)?,
         operation_group_id: row.get(8)?,
+        root_uuid: row.get(9)?,
+        local_binding_uuid: row.get(10)?,
+        binding_generation: row.get(11)?,
     })
 }
 
@@ -1508,6 +1520,9 @@ mod tests {
             finished_at: Some(2),
             error: None,
             operation_group_id: None,
+            root_uuid: None,
+            local_binding_uuid: None,
+            binding_generation: None,
         };
         let legacy_json = serde_json::to_value(legacy).expect("serialize legacy response");
         assert!(legacy_json["operationGroupId"].is_null());

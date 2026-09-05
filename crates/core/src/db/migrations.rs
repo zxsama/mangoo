@@ -55,3 +55,5 @@ pub const MEDIA_OBJECT_STORAGE_MIGRATION: &str =
     include_str!("../../migrations/0029_media_object_storage.sql");
 pub const SYNC_ROOT_IDENTITY_MIGRATION: &str =
     include_str!("../../migrations/0030_sync_root_identity.sql");
+pub const SYNC_ROOT_GENERATION_FENCE_MIGRATION: &str =
+    include_str!("../../migrations/0031_sync_root_generation_fence.sql");
