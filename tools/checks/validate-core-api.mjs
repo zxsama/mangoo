@@ -39,6 +39,10 @@ const fsopsPlatformRs = read("crates/core/src/fsops/platform.rs");
 const fsopsImplementationRs = `${fsopsRs}\n${fsopsJournalRs}\n${fsopsPlatformRs}`;
 const coreCargo = read("crates/core/Cargo.toml");
 const pluginManifest = read("contracts/plugins/manifest.schema.json");
+const generatedContractTs = read("packages/core-client/src/generated-contract.ts");
+const coreClientTs = read("packages/core-client/src/client.ts");
+const syncRootMigrationSql = read("crates/core/migrations/0030_sync_root_identity.sql");
+const hostSyncRootMigrationSql = read("crates/core/host_migrations/0012_sync_root_bindings.sql");
 
 const openApiPaths = new Set(
   [...openApi.matchAll(/^  (\/[^:\n]+):/gm)].map((match) => `/api${match[1]}`)
@@ -1055,6 +1059,73 @@ if (!notificationProducerRs.includes("notify_waiters()")) {
 
 if (!coreCargo.includes("trash =")) {
   fail("crates/core/Cargo.toml must depend on trash");
+}
+
+for (const fragment of [
+  "  /libraries/{libraryUuid}/sync-folders:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}:",
+  "  /libraries/{libraryUuid}/sync-folders/settings:",
+  "  /libraries/{libraryUuid}/sync-folders/enrollment/preflight:",
+  "  /libraries/{libraryUuid}/sync-folders/enrollment/commit:",
+  "  /libraries/{libraryUuid}/sync-folders/selection/preflight:",
+  "  /libraries/{libraryUuid}/sync-folders/selection/commit:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/rebind/preflight:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/rebind/commit:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/commands/{command}:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/preflight:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/commit:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/rename/preflight:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/rename/commit:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/preflight:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations:",
+  "  /libraries/{libraryUuid}/sync-folders/{rootUuid}/conflicts:"
+]) {
+  if (!openApi.includes(fragment)) fail(`OpenAPI managed-root-v2 route missing ${fragment}`);
+}
+
+for (const schemaName of [
+  "SyncFolderDescriptor", "LocalRootBinding", "SyncFolderRecord", "SyncFolderListResponse",
+  "SyncFolderSettings", "RootPathPreflightRequest", "RootPathPreflightResult",
+  "RootOperation", "RootComparisonPlan", "RootComparisonItem",
+  "RootLogicalRenameRequest", "RootLogicalRenameCommitRequest",
+  "RootLocationConflictResolutionRequest", "SyncFolderErrorResponse"
+]) {
+  if (!openApi.includes(`    ${schemaName}:`)) fail(`OpenAPI missing ${schemaName}`);
+  if (!generatedContractTs.includes(`interface ${schemaName}`)) fail(`generated-contract.ts missing ${schemaName}`);
+}
+
+for (const fence of ["operationUuid", "expectedOperationRevision", "expectedBindingGeneration", "expectedLocationHeads", "supersedes"]) {
+  if (!openApi.includes(fence)) fail(`managed-root-v2 contract missing fence ${fence}`);
+}
+
+for (const method of [
+  "listSyncFolders", "getSyncFolder", "getSyncFolderSettings", "updateSyncFolderSettings",
+  "preflightSyncFolderEnrollment", "commitSyncFolderEnrollment",
+  "preflightSyncFolderSelection", "commitSyncFolderSelection",
+  "preflightSyncFolderRebind", "commitSyncFolderRebind", "commandSyncFolder",
+  "preflightSyncFolderReenable", "commitSyncFolderReenable", "getSyncFolderComparison",
+  "listSyncFolderComparisonItems", "resolveSyncFolderComparisonItem",
+  "preflightSyncFolderRename", "commitSyncFolderRename",
+  "preflightSyncFolderRelocation", "startSyncFolderRelocation",
+  "getSyncFolderRelocation", "commandSyncFolderRelocation",
+  "listSyncFolderConflicts", "resolveSyncFolderConflict"
+]) {
+  if (!coreClientTs.includes(`${method}:`)) fail(`core-client missing managed-root-v2 method ${method}`);
+}
+
+for (const fragment of [
+  "sync_root_descriptors", "root_folder_uuid", "sync root sentinel identity is immutable",
+  "library_local_settings", "remote_sync_roots", "local_root_bindings", "root_operations",
+  "root_cutover_snapshots", "root_comparison_plans", "root_comparison_items",
+  "root_relocation_operations", "ux_root_operations_one_open"
+]) {
+  if (!(`${syncRootMigrationSql}\n${hostSyncRootMigrationSql}`).includes(fragment)) {
+    fail(`managed-root-v2 migrations missing ${fragment}`);
+  }
+}
+
+if (!routesRs.includes("migration-required") || !routesRs.includes("sync_folder_v2_enabled")) {
+  fail("managed-root-v2 routes must remain executable but feature-gated with migration-required");
 }
 
 if (!process.exitCode) {

@@ -1,6 +1,10 @@
 pub mod migrations;
 pub mod notification_outbox;
+mod sync_roots;
 pub mod writer;
+
+#[allow(unused_imports)]
+pub use sync_roots::SyncRootDescriptorRecord;
 pub use writer::{DbWriter, WriteDurability};
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
@@ -1473,6 +1477,10 @@ impl Database {
         if !self.migration_applied(29)? {
             self.connection
                 .execute_batch(migrations::MEDIA_OBJECT_STORAGE_MIGRATION)?;
+        }
+        if !self.migration_applied(30)? {
+            self.connection
+                .execute_batch(migrations::SYNC_ROOT_IDENTITY_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;

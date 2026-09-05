@@ -94,6 +94,56 @@ export interface EnableLibrarySyncRequest {
   accountIdentity: string;
 }
 
+export type SyncFolderInventoryState = "unselected" | "placement-required" | "tombstoned" | "incompatible" | "inventory-error";
+export type LocalRootBindingState = "materializing" | "active" | "paused" | "local-only-fork" | "reconcile-required" | "relocating" | "local-rename-required" | "unavailable" | "error";
+export type SyncFolderAllowedAction = "select" | "pause" | "resume" | "stop-sync" | "re-enable" | "rebind-existing" | "relocate" | "rename" | "resolve-conflicts" | "publish-as-new" | "retry";
+export type RootPathPreflightMode = "enroll-existing" | "materialize-remote" | "relocate" | "rebind-existing";
+export type RootPathPreflightReason = "ok" | "invalid-path" | "path-unavailable" | "cloud-sync-root" | "reparse-point" | "path-changed" | "overlaps-active-root" | "placement-base-selected" | "marker-mismatch" | "directory-not-empty" | "insufficient-space" | "destination-exists" | "source-missing" | "root-not-selected" | "stale-binding-generation" | "stale-operation-revision" | "operation-in-progress" | "migration-required";
+export type RootOperationKind = "enroll" | "select" | "stop-sync" | "re-enable" | "logical-rename" | "relocate" | "automatic-rename" | "rebind";
+export type RootOperationState = "pending" | "running" | "waiting" | "completed" | "cancelled" | "failed";
+export type RootOperationPhase = "planned" | "preflighting" | "reserving-identity" | "capturing-seed" | "publishing-descriptor" | "creating-binding" | "restoring-catalog" | "materializing" | "reconciling" | "fencing" | "reconciling-visibility" | "sealing-cutover" | "local-only-fork" | "comparing" | "comparison-ready" | "committing" | "verifying-existing" | "validating-heads" | "emitting-location" | "awaiting-projection" | "fenced" | "quiescing" | "transferring" | "verifying" | "catalog-cutover" | "host-cutover" | "cleanup" | "preflight-failed" | "source-missing" | "target-conflict" | "transfer-failed" | "verification-failed" | "local-rename-required" | "completed" | "cancelled" | "failed";
+export type RootRelocationMode = "explicit-move" | "automatic-rename";
+export type SyncRootLifecycle = "active" | "tombstoned";
+export type RootComparisonStatus = "comparing" | "ready" | "committed" | "expired" | "cancelled" | "failed";
+export type RootComparisonClassification = "unchanged" | "local-only" | "remote-only" | "same-change" | "conflict" | "deleted-local" | "deleted-remote";
+export type RootComparisonResolution = "keep-local" | "keep-remote" | "keep-both";
+
+export interface SyncFolderDescriptor { libraryUuid: string; libraryRootUuid: string; rootUuid: string; rootFolderUuid: string; requestedName: string; materializedName: string; materializationFingerprint: string; logicalRevision: number; lifecycle: SyncRootLifecycle; inventoryState: SyncFolderInventoryState; inventoryRevision: number; operationRevision: number; logicalBytes?: number | null; checkpointUuid?: string | null; }
+export interface LocalRootBinding { localBindingUuid: string; localPath: string; placementParent: string; state: LocalRootBindingState; bindingGeneration: number; desiredMaterializedName: string; desiredMaterializationFingerprint: string; appliedMaterializedName?: string | null; appliedMaterializationFingerprint?: string | null; operationRevision: number; lastErrorCode?: string | null; }
+export interface SyncFolderRecord { descriptor: SyncFolderDescriptor; binding: LocalRootBinding | null; allowedActions: SyncFolderAllowedAction[]; }
+export interface SyncFolderListResponse { revision: number; items: SyncFolderRecord[]; }
+export interface SyncFolderSettings { libraryUuid: string; libraryRootUuid: string; defaultPlacementBase: string; operationRevision: number; }
+export interface UpdateSyncFolderSettingsRequest { operationUuid: string; expectedOperationRevision: number; defaultPlacementBase: string; }
+export interface RootMutationRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration?: number | null; }
+export interface RootOperationFenceRequest extends RootMutationRequest { expectedBindingGeneration: number; }
+export interface RootPathPreflightRequest extends RootMutationRequest { rootUuid?: string | null; mode: RootPathPreflightMode; path: string; }
+export interface RootPathPreflightResult { rootUuid: string | null; ok: boolean; reason: RootPathPreflightReason; normalizedPath: string; proposedMaterializedName?: string | null; preflightToken: string | null; expiresAt: number | null; availableBytes?: number | null; }
+export interface RootEnrollmentCommitRequest { operationUuid: string; expectedOperationRevision: number; rootUuid: string; rootFolderUuid: string; preflightToken: string; path: string; requestedName: string; }
+export interface RootSelectionItem { rootUuid: string; operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration?: number | null; selected: boolean; path: string; }
+export interface RootSelectionPreflightRequest { items: RootSelectionItem[]; }
+export interface RootSelectionPreflightResult { preflightToken: string; expiresAt: number; items: RootPathPreflightResult[]; }
+export interface RootSelectionCommitRequest { preflightToken: string; items: RootSelectionItem[]; }
+export interface RootRebindPreflightRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration?: number | null; path: string; markerIdentity: string; priorCutoverSnapshotUuid: string; }
+export interface RootRebindPlan { planUuid: string; rootUuid: string; path: string; markerMatches: boolean; contentEvidenceDigest: string; expiresAt: number; }
+export interface RootRebindCommitRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration?: number | null; planUuid: string; }
+export interface RootCommandRequest extends RootMutationRequest { expectedBindingGeneration: number; }
+export interface RootComparisonPlan { planUuid: string; operationUuid: string; rootUuid: string; baseDigest: string; localDigest: string; remoteDigest: string; baseFrontier: unknown; localFrontier: unknown; remoteFrontier: unknown; rootRevision: number; accountGeneration: number; providerGeneration: number; status: RootComparisonStatus; itemCount: number; conflictCount: number; chosenMode: "merge-local-fork" | "publish-as-new" | null; expiresAt: number; }
+export interface RootComparisonItem { itemOrdinal: number; entityUuid: string; fieldName: string; classification: RootComparisonClassification; suggestedAction?: RootComparisonResolution | null; resolution: RootComparisonResolution | null; conflictUuid?: string | null; redactedDetail?: unknown | null; }
+export interface RootComparisonItemListResponse { items: RootComparisonItem[]; nextCursor: number | null; }
+export interface RootComparisonItemResolutionRequest extends RootMutationRequest { expectedBindingGeneration: number; resolution: RootComparisonResolution; }
+export interface RootReenableCommitRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration: number; planUuid: string; mode: "merge-local-fork" | "publish-as-new"; }
+export interface RootLogicalRenameRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration?: number | null; requestedName: string; expectedLocationHeads: string[]; supersedes: string[]; }
+export interface RootLogicalRenamePlan { planUuid: string; requestedName: string; materializedName: string; materializationFingerprint: string; expectedLocationHeads: string[]; supersedes: string[]; expiresAt: number; }
+export interface RootLogicalRenameCommitRequest extends RootLogicalRenameRequest { planUuid: string; }
+export interface RootRelocationPreflightRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration: number; mode: RootRelocationMode; targetPath: string; }
+export interface RootRelocationCommitRequest extends RootRelocationPreflightRequest { preflightToken: string; desiredMaterializationFingerprint: string; }
+export interface RootOperation { operationUuid: string; libraryUuid: string; rootUuid: string; kind: RootOperationKind; state: RootOperationState; phase: RootOperationPhase; operationRevision: number; cutoverCommitted: boolean; errorCode?: string | null; createdAt: number; updatedAt: number; }
+export interface RootOperationListResponse { items: RootOperation[]; }
+export interface RootLocationConflict { conflictUuid: string; rootUuid: string; locationHeads: string[]; state: "open" | "resolved"; createdAt: number; resolvedAt?: number | null; }
+export interface RootConflictListResponse { items: RootLocationConflict[]; nextCursor: string | null; }
+export interface RootLocationConflictResolutionRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration?: number | null; expectedLocationHeads: string[]; supersedes: string[]; requestedName?: string | null; }
+export interface SyncFolderErrorResponse { code: "invalid-input" | "invalid-path" | "library-not-found" | "root-not-found" | "operation-not-found" | "conflict-not-found" | "stale_library_context" | "stale-operation-revision" | "stale-binding-generation" | "stale-location-heads" | "idempotency-key-reused" | "path-occupied" | "path-overlap" | "invalid-lifecycle-transition" | "operation-in-progress" | "cutover-committed" | "comparison-required" | "comparison-expired" | "migration-required" | "internal-error"; message: string; operationUuid?: string | null; }
+
 export type LibrarySyncLifecycleState = "local-only" | "enabling" | "syncing" | "paused" | "unbinding" | "restoring" | "error";
 export type LibrarySyncPhase = "preflight" | "capturing" | "uploading" | "publishing" | "active" | "reconcile" | "catalog-restore" | "catalog-ready" | "restoring-media" | "complete" | "retry-wait" | "compatibility-locked" | "cancelled";
 export type CatalogReadiness = "not-created" | "restoring" | "catalog-ready" | "ready";

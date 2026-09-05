@@ -17,6 +17,7 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0009_plugin_auth_cancellation.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0010_plugin_secret_handles.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0011_plugin_secret_creations.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0012_sync_root_bindings.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -47,6 +48,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0027_sync_protocol_foundation.sql",
     ROOT / "crates" / "core" / "migrations" / "0028_remove_catalog_plugins.sql",
     ROOT / "crates" / "core" / "migrations" / "0029_media_object_storage.sql",
+    ROOT / "crates" / "core" / "migrations" / "0030_sync_root_identity.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -113,6 +115,19 @@ REQUIRED_TABLES = {
     "media_verified_ranges",
     "media_remote_objects",
     "media_reachability",
+    "sync_root_descriptors",
+}
+
+REQUIRED_HOST_SYNC_ROOT_TABLES = {
+    "library_local_settings",
+    "remote_sync_roots",
+    "local_root_bindings",
+    "root_operations",
+    "root_cutover_snapshots",
+    "root_comparison_plans",
+    "root_comparison_items",
+    "root_comparison_resolutions",
+    "root_relocation_operations",
 }
 
 REQUIRED_INDEXES = {
@@ -169,6 +184,10 @@ REQUIRED_INDEXES = {
     "idx_media_publication_work",
     "idx_media_materialization_work",
     "idx_media_reachability_revision",
+    "ux_roots_root_folder_uuid",
+    "ux_folders_root_empty_sentinel",
+    "idx_sync_root_descriptors_library_lifecycle",
+    "idx_sync_root_descriptors_updated",
 }
 
 EXPECTED_MEDIA_COLUMNS = {
@@ -453,6 +472,444 @@ def verify_media_upgrade_from_populated_v28() -> None:
         conn.close()
 
 
+def verify_sync_root_identity_contract() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        for migration in MIGRATIONS:
+            apply_migration(conn, migration)
+        descriptor = bytes(range(16))
+        root_folder = bytes(range(16, 32))
+        library_root = bytes(range(32, 48))
+        conn.execute(
+            "INSERT INTO sync_root_descriptors(root_uuid,root_folder_uuid,library_root_uuid,requested_name,materialized_name,materialization_fingerprint,lifecycle,updated_at) VALUES (?,?,?,?,?,?,'active',1)",
+            (descriptor, root_folder, library_root, "Photos", "Photos", bytes(32)),
+        )
+        if conn.execute("SELECT COUNT(*) FROM roots").fetchone()[0] != 0:
+            fail("unselected sync root descriptor created browse roots")
+        expect_integrity_error(
+            conn,
+            "UPDATE sync_root_descriptors SET root_folder_uuid=? WHERE root_uuid=?",
+            (bytes(16), descriptor),
+        )
+        conn.execute(
+            "UPDATE sync_root_descriptors SET requested_name='Renamed',materialized_name='Renamed',logical_revision=2,updated_at=2 WHERE root_uuid=?",
+            (descriptor,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE sync_root_descriptors SET requested_name='Stale',logical_revision=1,updated_at=3 WHERE root_uuid=?",
+            (descriptor,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE sync_root_descriptors SET requested_name='Conflicting',updated_at=3 WHERE root_uuid=?",
+            (descriptor,),
+        )
+        if conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=30").fetchone()[0] != 1:
+            fail("migration 30 was not registered exactly once")
+    finally:
+        conn.close()
+
+
+def verify_host_sync_root_binding_contract() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        for migration in HOST_MIGRATIONS:
+            conn.executescript(migration.read_text(encoding="utf-8"))
+        library_uuid = "00000000-0000-7000-8000-000000000001"
+        library_root_uuid = "00000000-0000-7000-8000-000000000099"
+        conn.execute(
+            "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES (?,?,'Library','local','D:/Legacy','ready','local-only','available',1,'marker',1,1)",
+            (library_uuid, library_root_uuid),
+        )
+        expect_integrity_error(
+            conn,
+            "INSERT INTO library_local_settings(library_uuid,library_root_uuid,default_placement_base,canonical_placement_key,created_at,updated_at) VALUES (?,?,?,?,1,1)",
+            (
+                library_uuid,
+                "00000000-0000-7000-8000-000000000098",
+                "D:/Wrong",
+                "d:/wrong",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO library_local_settings(library_uuid,library_root_uuid,default_placement_base,canonical_placement_key,created_at,updated_at) VALUES (?,?,?,?,1,1)",
+            (
+                library_uuid,
+                library_root_uuid,
+                "D:/Library",
+                "d:/library",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES (?,?,'Library 2','local2','D:/Legacy2','ready','local-only','available',1,'marker2',1,1)",
+            (
+                "00000000-0000-7000-8000-000000000090",
+                "00000000-0000-7000-8000-000000000091",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO library_local_settings(library_uuid,library_root_uuid,default_placement_base,canonical_placement_key,created_at,updated_at) VALUES (?,?,?,?,1,1)",
+            (
+                "00000000-0000-7000-8000-000000000090",
+                "00000000-0000-7000-8000-000000000091",
+                "D:/Library",
+                "d:/library",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO remote_sync_roots(library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialized_name_key,materialization_fingerprint,lifecycle,inventory_state,updated_at) VALUES (?,?,?,?,?,?,?,'active','placement-required',1)",
+            (
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "00000000-0000-7000-8000-000000000003",
+                "Photos",
+                "Photos",
+                "photos",
+                "a" * 64,
+            ),
+        )
+        if conn.execute("SELECT COUNT(*) FROM local_root_bindings").fetchone()[0] != 0:
+            fail("placement-required remote root created a placeholder binding")
+        expect_integrity_error(
+            conn,
+            "UPDATE remote_sync_roots SET root_folder_uuid=? WHERE library_uuid=? AND root_uuid=?",
+            (
+                "00000000-0000-7000-8000-000000000004",
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+            ),
+        )
+        expect_integrity_error(
+            conn,
+            "INSERT INTO remote_sync_roots(library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialized_name_key,materialization_fingerprint,lifecycle,inventory_state,updated_at) VALUES (?,?,?,?,?,?,?,'active','unselected',1)",
+            (
+                library_uuid,
+                "00000000-0000-7000-8000-000000000004",
+                "00000000-0000-7000-8000-000000000005",
+                "PHOTOS",
+                "PHOTOS",
+                "photos",
+                "b" * 64,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO remote_sync_roots(library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialized_name_key,materialization_fingerprint,lifecycle,inventory_state,updated_at) VALUES (?,?,?,?,?,?,?,'tombstoned','tombstoned',1)",
+            (
+                library_uuid,
+                "00000000-0000-7000-8000-000000000025",
+                "00000000-0000-7000-8000-000000000026",
+                "Photos",
+                "Photos",
+                "photos",
+                "b" * 64,
+            ),
+        )
+        expect_integrity_error(
+            conn,
+            "INSERT INTO remote_sync_roots(library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialized_name_key,materialization_fingerprint,lifecycle,inventory_state,updated_at) VALUES (?,?,?,?,?,?,?,'active','unselected',1)",
+            (
+                library_uuid,
+                "not-a-canonical-uuid-value-00000000",
+                "00000000-0000-7000-8000-000000000006",
+                "Other",
+                "Other",
+                "other",
+                "c" * 64,
+            ),
+        )
+        expect_integrity_error(
+            conn,
+            "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,state,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "00000000-0000-7000-8000-000000000007",
+                "D:/Library",
+                "d:/library",
+                "D:/",
+                "d:/",
+                "materializing",
+                "Photos",
+                "photos",
+                "d" * 64,
+                1,
+                1,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,state,binding_generation,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,applied_materialized_name,applied_materialized_name_key,applied_materialization_fingerprint,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'active',1,?,?,?,?,?,?,1,1)",
+            (
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "00000000-0000-7000-8000-000000000007",
+                "D:/Library/Photos",
+                "d:/library/photos",
+                "D:/Library",
+                "d:/library",
+                "Photos",
+                "photos",
+                "d" * 64,
+                "Photos",
+                "photos",
+                "d" * 64,
+            ),
+        )
+        if conn.execute(
+            "SELECT operation_revision FROM remote_sync_roots WHERE library_uuid=? AND root_uuid=?",
+            (library_uuid, "00000000-0000-7000-8000-000000000002"),
+        ).fetchone() != (0,):
+            fail("remote sync root operation revision was not initialized")
+        expect_integrity_error(
+            conn,
+            "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,state,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "00000000-0000-7000-8000-000000000016",
+                "D:/Elsewhere/Photos",
+                "d:/elsewhere/photos",
+                "D:/Elsewhere",
+                "d:/elsewhere",
+                "materializing",
+                "Photos",
+                "photos",
+                "d" * 64,
+                1,
+                1,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO remote_sync_roots(library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialized_name_key,materialization_fingerprint,lifecycle,inventory_state,updated_at) VALUES (?,?,?,?,?,?,?,'active','placement-required',1)",
+            (
+                library_uuid,
+                "00000000-0000-7000-8000-000000000016",
+                "00000000-0000-7000-8000-000000000017",
+                "Videos",
+                "Videos",
+                "videos",
+                "4" * 64,
+            ),
+        )
+        expect_integrity_error(
+            conn,
+            "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,state,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                library_uuid,
+                "00000000-0000-7000-8000-000000000016",
+                "00000000-0000-7000-8000-000000000018",
+                "D:/Library/Photos/Nested",
+                "d:/library/photos/nested",
+                "D:/Library/Photos",
+                "d:/library/photos",
+                "materializing",
+                "Videos",
+                "videos",
+                "4" * 64,
+                1,
+                1,
+            ),
+        )
+        stop_operation_uuid = "00000000-0000-7000-8000-000000000010"
+        snapshot_uuid = "00000000-0000-7000-8000-000000000011"
+        conn.execute(
+            "INSERT INTO root_operations(operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,created_at,updated_at) VALUES (?,?,?,'stop-sync','completed','completed',?,'{}',0,1,1,1,1,1)",
+            (
+                stop_operation_uuid,
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "e" * 64,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO root_cutover_snapshots(snapshot_uuid,operation_uuid,library_uuid,root_uuid,binding_generation,event_frontier_json,catalog_snapshot_digest,provider_receipts_json,remote_visibility,created_at) VALUES (?,?,?,?,1,'{}',?,'[]','hidden',1)",
+            (
+                snapshot_uuid,
+                stop_operation_uuid,
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "f" * 64,
+            ),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE root_cutover_snapshots SET remote_visibility='visible' WHERE snapshot_uuid=?",
+            (snapshot_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "DELETE FROM root_cutover_snapshots WHERE snapshot_uuid=?",
+            (snapshot_uuid,),
+        )
+        reenable_operation_uuid = "00000000-0000-7000-8000-000000000012"
+        comparison_plan_uuid = "00000000-0000-7000-8000-000000000013"
+        conn.execute(
+            "INSERT INTO root_operations(operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,plan_uuid,created_at,updated_at) VALUES (?,?,?,'re-enable','running','comparison-ready',?,'{}',1,1,1,?,2,2)",
+            (
+                reenable_operation_uuid,
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "0" * 64,
+                comparison_plan_uuid,
+            ),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE root_operations SET phase='fencing' WHERE operation_uuid=?",
+            (reenable_operation_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE root_operations SET state='completed' WHERE operation_uuid=?",
+            (reenable_operation_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE root_operations SET state='failed',phase='planned' WHERE operation_uuid=?",
+            (reenable_operation_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE root_operations SET expected_binding_generation=2 WHERE operation_uuid=?",
+            (reenable_operation_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "INSERT INTO root_cutover_snapshots(snapshot_uuid,operation_uuid,library_uuid,root_uuid,binding_generation,event_frontier_json,catalog_snapshot_digest,provider_receipts_json,remote_visibility,created_at) VALUES (?,?,?,?,1,'{}',?,'[]','hidden',1)",
+            (
+                "00000000-0000-7000-8000-000000000019",
+                reenable_operation_uuid,
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "9" * 64,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO root_comparison_plans(plan_uuid,operation_uuid,cutover_snapshot_uuid,library_uuid,root_uuid,base_digest,local_digest,remote_digest,base_frontier_json,local_frontier_json,remote_frontier_json,root_revision,account_generation,provider_generation,item_count,conflict_count,status,expires_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,2,1,'ready',2,1,1)",
+            (
+                comparison_plan_uuid,
+                reenable_operation_uuid,
+                snapshot_uuid,
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                "{}",
+                "{}",
+                "{}",
+                3,
+                4,
+                5,
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO root_comparison_items(plan_uuid,item_ordinal,entity_uuid,field_name,classification,suggested_action,redacted_detail_json) VALUES (?,?,?,?,?,?,?)",
+            (
+                (
+                    comparison_plan_uuid,
+                    0,
+                    "00000000-0000-7000-8000-000000000014",
+                    "name",
+                    "same-change",
+                    None,
+                    "{}",
+                ),
+                (
+                    comparison_plan_uuid,
+                    1,
+                    "00000000-0000-7000-8000-000000000015",
+                    "parent",
+                    "conflict",
+                    "keep-local",
+                    "{}",
+                ),
+            ),
+        )
+        comparison_page = conn.execute(
+            "SELECT item_ordinal FROM root_comparison_items WHERE plan_uuid=? AND item_ordinal>? ORDER BY item_ordinal LIMIT 1",
+            (comparison_plan_uuid, 0),
+        ).fetchall()
+        if comparison_page != [(1,)]:
+            fail(f"comparison item cursor page was not stable: {comparison_page}")
+        conn.execute(
+            "INSERT INTO root_comparison_resolutions(plan_uuid,item_ordinal,resolution,resolved_at) VALUES (?,1,'keep-local',1)",
+            (comparison_plan_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE root_comparison_items SET classification='unchanged' WHERE plan_uuid=? AND item_ordinal=1",
+            (comparison_plan_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE root_comparison_plans SET base_digest=? WHERE plan_uuid=?",
+            ("8" * 64, comparison_plan_uuid),
+        )
+        expect_integrity_error(
+            conn,
+            "INSERT INTO root_comparison_resolutions(plan_uuid,item_ordinal,resolution,resolved_at) VALUES (?,0,'discard-both',1)",
+            (comparison_plan_uuid,),
+        )
+        conn.execute(
+            "UPDATE root_comparison_plans SET status='expired',updated_at=2 WHERE status='ready' AND expires_at<=2"
+        )
+        if conn.execute(
+            "SELECT status FROM root_comparison_plans WHERE plan_uuid=?",
+            (comparison_plan_uuid,),
+        ).fetchone() != ("expired",):
+            fail("expired comparison plan did not transition through the indexed expiry query")
+        conn.execute(
+            "UPDATE root_operations SET state='completed',phase='completed' WHERE operation_uuid=?",
+            (reenable_operation_uuid,),
+        )
+        relocation_operation_uuid = "00000000-0000-7000-8000-000000000027"
+        conn.execute(
+            "INSERT INTO root_operations(operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,created_at,updated_at) VALUES (?,?,?,'relocate','running','planned',?,'{}',0,1,3,3)",
+            (
+                relocation_operation_uuid,
+                library_uuid,
+                "00000000-0000-7000-8000-000000000002",
+                "7" * 64,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO root_relocation_operations(operation_uuid,mode,desired_materialization_fingerprint,source_path,source_canonical_key,target_path,target_canonical_key,updated_at) VALUES (?,'explicit-move',?,'D:/Library/Photos','d:/library/photos','E:/Photos','e:/photos',3)",
+            (relocation_operation_uuid, "6" * 64),
+        )
+        expect_integrity_error(
+            conn,
+            "UPDATE root_relocation_operations SET target_path='F:/Photos' WHERE operation_uuid=?",
+            (relocation_operation_uuid,),
+        )
+        expect_integrity_error(
+            conn,
+            "DELETE FROM remote_sync_roots WHERE library_uuid=? AND root_uuid=?",
+            (library_uuid, "00000000-0000-7000-8000-000000000002"),
+        )
+        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 12:
+            fail("host migration 12 did not update schema_version")
+        expected_host_tables = {
+            "library_local_settings",
+            "remote_sync_roots",
+            "local_root_bindings",
+            "root_operations",
+            "root_cutover_snapshots",
+            "root_comparison_plans",
+            "root_comparison_items",
+            "root_comparison_resolutions",
+            "root_relocation_operations",
+        }
+        actual = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = expected_host_tables - actual
+        if missing:
+            fail(f"missing managed-root-v2 Host tables: {sorted(missing)}")
+    finally:
+        conn.close()
+
+
 def verify_host_plugin_upgrade_from_populated_v2() -> None:
     conn = sqlite3.connect(":memory:")
     try:
@@ -553,6 +1010,8 @@ def main() -> None:
     verify_scan_reconciliation_repair_path()
     verify_sync_upgrade_from_populated_v26()
     verify_media_upgrade_from_populated_v28()
+    verify_sync_root_identity_contract()
+    verify_host_sync_root_binding_contract()
     verify_host_plugin_upgrade_from_populated_v2()
 
     for host_migration in HOST_MIGRATIONS:
@@ -603,13 +1062,14 @@ def main() -> None:
             "sync_restore_plans",
             "sync_restore_preflights",
         }
+        required_host_tables |= REQUIRED_HOST_SYNC_ROOT_TABLES
         missing_host_tables = required_host_tables - host_tables
         if missing_host_tables:
             fail(f"missing Host Registry tables: {sorted(missing_host_tables)}")
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (11, None, 0, "stopped"):
+        if meta != (12, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         auth_flow_columns = {
             row[1]
@@ -708,6 +1168,16 @@ def main() -> None:
             "idx_sync_restore_plans_state",
             "idx_sync_restore_plans_operation",
             "idx_sync_preflight_expiry",
+            "ux_libraries_library_root_identity",
+            "ux_remote_sync_roots_active_materialized_name",
+            "ux_local_root_bindings_sibling_name",
+            "ux_local_root_bindings_desired_sibling_name",
+            "idx_local_root_bindings_state",
+            "ux_root_operations_one_open",
+            "idx_root_operations_recovery",
+            "idx_remote_sync_roots_inventory",
+            "idx_root_comparison_items_page",
+            "idx_root_comparison_plans_expiry",
         }
         missing_host_indexes = required_host_indexes - host_indexes
         if missing_host_indexes:

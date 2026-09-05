@@ -18,7 +18,7 @@ function fail(message) {
 function dereference(value) {
   if (!value?.$ref) return value;
   const parts = value.$ref.replace(/^#\//, "").split("/");
-  let current = contract;
+  let current = parsedContract;
   for (const part of parts) {
     current = current?.[part];
   }
@@ -61,9 +61,11 @@ function expectedPropertyLine(name, schema, required) {
   return `${name}${optional}: ${schemaTsType(schema)}${nullable};`;
 }
 
-function interfaceBody(name) {
+function interfaceBody(name, seen = new Set()) {
+  if (seen.has(name)) return "";
+  seen.add(name);
   const declaration = new RegExp(
-    `export\\s+interface\\s+${name}(?:<[^>]+>)?(?:\\s+extends[^\\{]+)?\\s*{`
+    `export\\s+interface\\s+${name}(?:<[^>]+>)?(?:\\s+extends\\s+([^\\{]+))?\\s*{`
   ).exec(generated);
   if (!declaration) return "";
 
@@ -72,7 +74,16 @@ function interfaceBody(name) {
   for (let index = bodyStart; index < generated.length; index += 1) {
     if (generated[index] === "{") depth += 1;
     if (generated[index] === "}") depth -= 1;
-    if (depth === 0) return generated.slice(bodyStart, index);
+    if (depth === 0) {
+      const ownBody = generated.slice(bodyStart, index);
+      const inheritedBodies = (declaration[1] ?? "")
+        .split(",")
+        .map((parent) => parent.trim().replace(/<.*>$/, ""))
+        .filter(Boolean)
+        .map((parent) => interfaceBody(parent, seen))
+        .join("\n");
+      return `${ownBody}\n${inheritedBodies}`;
+    }
   }
   return "";
 }
@@ -134,7 +145,11 @@ function assertEnumMatchesGeneratedType(name) {
 }
 
 function parameterName(parameter) {
-  return dereference(parameter)?.name;
+  if (parameter?.$ref) {
+    const componentName = parameter.$ref.split("/").at(-1);
+    return componentName === "contextRevision" ? componentName : dereference(parameter)?.name;
+  }
+  return parameter?.name;
 }
 
 function operation(operationId) {
@@ -174,6 +189,15 @@ function assertOperationRoute(operationId, method, route) {
   if (!found) return;
   if (found.method !== method || found.route !== route) {
     fail(`OpenAPI operation ${operationId} must be ${method.toUpperCase()} ${route}`);
+  }
+}
+
+function assertOperationRequestSchema(operationId, schemaName) {
+  const found = operation(operationId);
+  if (!found) return;
+  const requestSchema = found.operation.requestBody?.content?.["application/json"]?.schema;
+  if (requestSchema?.$ref !== `#/components/schemas/${schemaName}`) {
+    fail(`OpenAPI operation ${operationId} request body must use ${schemaName}`);
   }
 }
 
@@ -227,7 +251,8 @@ function assertParamLine(interfaceName, parameterName, line) {
   requireLine(interfaceBody(interfaceName), line, `generated-contract.ts ${interfaceName}`);
 }
 
-const contract = parse(read("contracts/core-api/openapi.yaml"));
+const parsedContract = parse(read("contracts/core-api/openapi.yaml"));
+const contract = parsedContract;
 const generated = read("packages/core-client/src/generated-contract.ts");
 const client = read("packages/core-client/src/client.ts");
 
@@ -321,7 +346,52 @@ for (const name of [
   "SyncRestoreListResponse",
   "SyncConflictRecord",
   "SyncConflictListResponse",
-  "SyncConflictResolutionRequest"
+  "SyncConflictResolutionRequest",
+  "SyncFolderInventoryState",
+  "LocalRootBindingState",
+  "SyncFolderAllowedAction",
+  "RootPathPreflightMode",
+  "RootPathPreflightReason",
+  "RootOperationKind",
+  "RootOperationState",
+  "RootOperationPhase",
+  "RootRelocationMode",
+  "SyncRootLifecycle",
+  "RootComparisonStatus",
+  "RootComparisonClassification",
+  "RootComparisonResolution",
+  "SyncFolderDescriptor",
+  "LocalRootBinding",
+  "SyncFolderRecord",
+  "SyncFolderListResponse",
+  "SyncFolderSettings",
+  "UpdateSyncFolderSettingsRequest",
+  "RootMutationRequest",
+  "RootPathPreflightRequest",
+  "RootPathPreflightResult",
+  "RootEnrollmentCommitRequest",
+  "RootSelectionItem",
+  "RootSelectionPreflightRequest",
+  "RootSelectionPreflightResult",
+  "RootSelectionCommitRequest",
+  "RootRebindPreflightRequest",
+  "RootRebindPlan",
+  "RootRebindCommitRequest",
+  "RootComparisonPlan",
+  "RootComparisonItem",
+  "RootComparisonItemListResponse",
+  "RootComparisonItemResolutionRequest",
+  "RootReenableCommitRequest",
+  "RootLogicalRenameRequest",
+  "RootLogicalRenamePlan",
+  "RootRelocationPreflightRequest",
+  "RootRelocationCommitRequest",
+  "RootOperation",
+  "RootOperationListResponse",
+  "RootLocationConflict",
+  "RootConflictListResponse",
+  "RootLocationConflictResolutionRequest",
+  "SyncFolderErrorResponse"
 ]) {
   schema(name);
 }
@@ -377,8 +447,61 @@ for (const name of [
   "SyncReconnectPlan", "SyncReconnectCommitRequest", "RemoteLibrarySummary",
   "SyncRestoreStartItem", "SyncRestorePreflightRequest", "SyncRestorePreflight", "SyncRestoreStartRequest", "SyncRestorePlan",
   "SyncRestoreListResponse", "SyncConflictRecord", "SyncConflictListResponse",
-  "SyncConflictResolutionRequest"
+  "SyncConflictResolutionRequest", "SyncFolderDescriptor", "LocalRootBinding",
+  "SyncFolderRecord", "SyncFolderListResponse", "SyncFolderSettings",
+  "UpdateSyncFolderSettingsRequest", "RootMutationRequest", "RootPathPreflightRequest",
+  "RootPathPreflightResult", "RootEnrollmentCommitRequest", "RootSelectionItem",
+  "RootSelectionPreflightRequest", "RootSelectionPreflightResult", "RootSelectionCommitRequest",
+  "RootRebindPreflightRequest", "RootRebindPlan", "RootRebindCommitRequest",
+  "RootComparisonPlan", "RootComparisonItem", "RootComparisonItemListResponse",
+  "RootComparisonItemResolutionRequest", "RootReenableCommitRequest", "RootLogicalRenameRequest",
+  "RootLogicalRenamePlan", "RootLogicalRenameCommitRequest", "RootRelocationPreflightRequest", "RootRelocationCommitRequest",
+  "RootOperation", "RootOperationListResponse", "RootLocationConflict",
+  "RootConflictListResponse", "RootLocationConflictResolutionRequest", "SyncFolderErrorResponse"
 ]) assertInterfaceMatchesSchema(name);
+
+for (const name of [
+  "SyncFolderInventoryState", "LocalRootBindingState", "SyncFolderAllowedAction",
+  "RootPathPreflightMode", "RootPathPreflightReason", "RootOperationKind",
+  "RootOperationState", "RootOperationPhase", "RootRelocationMode", "SyncRootLifecycle",
+  "RootComparisonStatus", "RootComparisonClassification", "RootComparisonResolution"
+]) assertEnumMatchesGeneratedType(name);
+
+for (const [operationId, method, route] of [
+  ["listSyncFolders", "get", "/libraries/{libraryUuid}/sync-folders"],
+  ["getSyncFolder", "get", "/libraries/{libraryUuid}/sync-folders/{rootUuid}"],
+  ["getSyncFolderSettings", "get", "/libraries/{libraryUuid}/sync-folders/settings"],
+  ["updateSyncFolderSettings", "patch", "/libraries/{libraryUuid}/sync-folders/settings"],
+  ["preflightSyncFolderEnrollment", "post", "/libraries/{libraryUuid}/sync-folders/enrollment/preflight"],
+  ["commitSyncFolderEnrollment", "post", "/libraries/{libraryUuid}/sync-folders/enrollment/commit"],
+  ["preflightSyncFolderSelection", "post", "/libraries/{libraryUuid}/sync-folders/selection/preflight"],
+  ["commitSyncFolderSelection", "post", "/libraries/{libraryUuid}/sync-folders/selection/commit"],
+  ["preflightSyncFolderRebind", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/rebind/preflight"],
+  ["commitSyncFolderRebind", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/rebind/commit"],
+  ["commandSyncFolder", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/commands/{command}"],
+  ["preflightSyncFolderReenable", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/preflight"],
+  ["commitSyncFolderReenable", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/commit"],
+  ["getSyncFolderComparison", "get", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/comparisons/{planUuid}"],
+  ["listSyncFolderComparisonItems", "get", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/comparisons/{planUuid}/items"],
+  ["resolveSyncFolderComparisonItem", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/comparisons/{planUuid}/items/{itemOrdinal}/resolve"],
+  ["preflightSyncFolderRename", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/rename/preflight"],
+  ["commitSyncFolderRename", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/rename/commit"],
+  ["preflightSyncFolderRelocation", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/preflight"],
+  ["startSyncFolderRelocation", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations"],
+  ["getSyncFolderRelocation", "get", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/{operationUuid}"],
+  ["commandSyncFolderRelocation", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/{operationUuid}/{action}"],
+  ["listSyncFolderConflicts", "get", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/conflicts"],
+  ["resolveSyncFolderConflict", "post", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/conflicts/{conflictUuid}/resolve"]
+]) assertOperationRoute(operationId, method, route);
+
+assertOperationRequestSchema("preflightSyncFolderReenable", "RootOperationFenceRequest");
+
+for (const operationId of [
+  "updateSyncFolderSettings", "commitSyncFolderEnrollment", "commitSyncFolderSelection",
+  "commitSyncFolderRebind", "commandSyncFolder", "commitSyncFolderReenable",
+  "resolveSyncFolderComparisonItem", "commitSyncFolderRename", "startSyncFolderRelocation",
+  "commandSyncFolderRelocation", "resolveSyncFolderConflict"
+]) assertOperationParameters(operationId, ["contextRevision"]);
 
 const fileOperationSchema = schema("FileOperationRecord");
 const operationGroupSchema = fileOperationSchema.properties?.operationGroupId;

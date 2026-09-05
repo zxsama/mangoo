@@ -1164,6 +1164,90 @@ describe("createCoreClient", () => {
     assert.equal(JSON.parse(recorded[0].body!).items[0].managedRoot, "D:/Remote");
   });
 
+  test("managed-root-v2 endpoints encode identities and preserve revision fences", async () => {
+    const core = client();
+    mockFetch({ operationUuid: "00000000-0000-7000-8000-000000000010", libraryUuid: "library/one", rootUuid: "root/one", kind: "logical-rename", state: "running", phase: "validating-heads", operationRevision: 4, cutoverCommitted: false, createdAt: 1, updatedAt: 1 });
+    await core.commitSyncFolderRename("library/one", "root/one", 19, {
+      operationUuid: "00000000-0000-7000-8000-000000000010",
+      expectedOperationRevision: 3,
+      expectedBindingGeneration: 7,
+      requestedName: "Photos",
+      expectedLocationHeads: ["00000000-0000-7000-8000-000000000011"],
+      supersedes: ["00000000-0000-7000-8000-000000000011"],
+      planUuid: "00000000-0000-7000-8000-000000000012"
+    });
+    assert.match(recorded[0].url, /\/libraries\/library%2Fone\/sync-folders\/root%2Fone\/rename\/commit$/);
+    assert.equal(recorded[0].headers["x-megle-context-revision"], "19");
+    assert.deepEqual(JSON.parse(recorded[0].body!).expectedLocationHeads, ["00000000-0000-7000-8000-000000000011"]);
+    assert.deepEqual(JSON.parse(recorded[0].body!).supersedes, ["00000000-0000-7000-8000-000000000011"]);
+
+    recorded.length = 0;
+    mockFetch({ items: [], nextCursor: null });
+    await core.listSyncFolderConflicts("library one", "root one", { cursor: "head/1", limit: 25 });
+    assert.match(recorded[0].url, /\/libraries\/library%20one\/sync-folders\/root%20one\/conflicts\?cursor=head%2F1&limit=25$/);
+
+    recorded.length = 0;
+    mockFetch({ items: [], nextCursor: null });
+    const controller = new AbortController();
+    await core.listSyncFolderComparisonItems("library", "root", "plan/one", { cursor: 0, limit: 50 }, { signal: controller.signal });
+    assert.match(recorded[0].url, /\/reenable\/comparisons\/plan%2Fone\/items\?cursor=0&limit=50$/);
+    assert.equal(recorded[0].signal?.aborted, false);
+  });
+
+  test("managed-root-v2 mutation methods attach the active-library context fence", async () => {
+    const core = client();
+    const operationUuid = "00000000-0000-7000-8000-000000000020";
+    const mutation = { operationUuid, expectedOperationRevision: 2 };
+
+    mockFetch({ libraryUuid: "lib", libraryRootUuid: "00000000-0000-7000-8000-000000000021", defaultPlacementBase: "D:/Library", operationRevision: 3 });
+    await core.updateSyncFolderSettings("lib", 41, { ...mutation, defaultPlacementBase: "D:/Library" });
+    assert.equal(recorded[0].headers["x-megle-context-revision"], "41");
+
+    recorded.length = 0;
+    mockFetch({ operationUuid, libraryUuid: "lib", rootUuid: "root", kind: "stop-sync", state: "running", phase: "fencing", operationRevision: 3, cutoverCommitted: false, createdAt: 1, updatedAt: 1 });
+    await core.commandSyncFolder("lib", "root", "stop-sync", 42, {
+      ...mutation,
+      expectedBindingGeneration: 5
+    });
+    assert.equal(recorded[0].headers["x-megle-context-revision"], "42");
+
+    recorded.length = 0;
+    mockFetch({
+      planUuid: "00000000-0000-7000-8000-000000000022",
+      operationUuid,
+      rootUuid: "root",
+      baseDigest: "a".repeat(64),
+      localDigest: "b".repeat(64),
+      remoteDigest: "c".repeat(64),
+      baseFrontier: {},
+      localFrontier: {},
+      remoteFrontier: {},
+      rootRevision: 2,
+      accountGeneration: 3,
+      providerGeneration: 4,
+      status: "ready",
+      itemCount: 0,
+      conflictCount: 0,
+      chosenMode: null,
+      expiresAt: 100
+    });
+    await core.preflightSyncFolderReenable("lib", "root", {
+      ...mutation,
+      expectedBindingGeneration: 5
+    });
+    assert.equal(JSON.parse(recorded[0].body!).expectedBindingGeneration, 5);
+
+    recorded.length = 0;
+    mockFetch({ operationUuid, libraryUuid: "lib", rootUuid: "root", kind: "relocate", state: "running", phase: "preflighting", operationRevision: 3, cutoverCommitted: false, createdAt: 1, updatedAt: 1 });
+    await core.commandSyncFolderRelocation("lib", "root", operationUuid, "retry", 43, {
+      ...mutation,
+      expectedBindingGeneration: 5
+    });
+
+    assert.equal(recorded[0].headers["x-megle-context-revision"], "43");
+    assert.match(recorded[0].url, /\/relocations\/00000000-0000-7000-8000-000000000020\/retry$/);
+  });
+
   test("sync status uses background scheduling and diagnostics never alter context", async () => {
     mockFetch({ revision: 1, generatedAt: 1, schedulerState: "running", providers: [], libraries: [] });
     const core = client();

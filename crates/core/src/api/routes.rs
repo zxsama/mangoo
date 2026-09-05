@@ -1,5 +1,5 @@
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{OriginalUri, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -8,7 +8,7 @@ use axum_extra::extract::Query as ExtraQuery;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path as FilePath;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -119,6 +119,29 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/libraries/{libraryUuid}/sync/reconnect-commit",
     "/api/libraries/{libraryUuid}/sync/conflicts",
     "/api/libraries/{libraryUuid}/sync/conflicts/{conflictUuid}/resolve",
+    "/api/libraries/{libraryUuid}/sync-folders",
+    "/api/libraries/{libraryUuid}/sync-folders/settings",
+    "/api/libraries/{libraryUuid}/sync-folders/enrollment/preflight",
+    "/api/libraries/{libraryUuid}/sync-folders/enrollment/commit",
+    "/api/libraries/{libraryUuid}/sync-folders/selection/preflight",
+    "/api/libraries/{libraryUuid}/sync-folders/selection/commit",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/rebind/preflight",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/rebind/commit",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/commands/{command}",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/preflight",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/commit",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/comparisons/{planUuid}",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/comparisons/{planUuid}/items",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/comparisons/{planUuid}/items/{itemOrdinal}/resolve",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/rename/preflight",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/rename/commit",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/preflight",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/{operationUuid}",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/{operationUuid}/{action}",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/conflicts",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/conflicts/{conflictUuid}/resolve",
     "/api/libraries/{libraryUuid}/sync/diagnostics",
     "/api/libraries/{libraryUuid}/sync/diagnostics/export",
     "/api/roots",
@@ -785,6 +808,98 @@ pub fn router(state: AppState) -> Router {
             post(resolve_sync_conflict),
         )
         .route(
+            "/api/libraries/:library_uuid/sync-folders",
+            get(sync_folder_contract_read),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/settings",
+            get(sync_folder_contract_read).patch(sync_folder_contract_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/enrollment/preflight",
+            post(sync_folder_contract_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/enrollment/commit",
+            post(sync_folder_contract_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/selection/preflight",
+            post(sync_folder_contract_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/selection/commit",
+            post(sync_folder_contract_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid",
+            get(sync_folder_contract_root_read),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/rebind/preflight",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/rebind/commit",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/commands/:command",
+            post(sync_folder_contract_root_action),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/reenable/preflight",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/reenable/commit",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/reenable/comparisons/:plan_uuid",
+            get(sync_folder_contract_plan_read),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/reenable/comparisons/:plan_uuid/items",
+            get(sync_folder_contract_plan_read),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/reenable/comparisons/:plan_uuid/items/:item_ordinal/resolve",
+            post(sync_folder_contract_comparison_item_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/rename/preflight",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/rename/commit",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/relocations/preflight",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/relocations",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/relocations/:operation_uuid",
+            get(sync_folder_contract_operation_read),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/relocations/:operation_uuid/:action",
+            post(sync_folder_contract_operation_action),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/conflicts",
+            get(sync_folder_contract_root_read),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/conflicts/:conflict_uuid/resolve",
+            post(sync_folder_contract_conflict_write),
+        )
+        .route(
             "/api/libraries/:library_uuid/sync/diagnostics",
             get(sync_diagnostics),
         )
@@ -1126,6 +1241,215 @@ struct ConflictResolutionRequest {
     resolution: String,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderSettingsMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    default_placement_base: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SyncFolderPathMode {
+    EnrollExisting,
+    MaterializeRemote,
+    Relocate,
+    RebindExisting,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderPathPreflightMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: Option<u64>,
+    root_uuid: Option<String>,
+    mode: SyncFolderPathMode,
+    path: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderEnrollmentMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    root_uuid: String,
+    root_folder_uuid: String,
+    preflight_token: String,
+    path: String,
+    requested_name: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderSelectionItemMutation {
+    root_uuid: String,
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: Option<u64>,
+    selected: bool,
+    path: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderSelectionPreflightMutation {
+    items: Vec<SyncFolderSelectionItemMutation>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderSelectionCommitMutation {
+    preflight_token: String,
+    items: Vec<SyncFolderSelectionItemMutation>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderRebindPreflightMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: Option<u64>,
+    path: String,
+    marker_identity: String,
+    prior_cutover_snapshot_uuid: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderRebindCommitMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: Option<u64>,
+    plan_uuid: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderOperationFenceMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SyncFolderComparisonMode {
+    MergeLocalFork,
+    PublishAsNew,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderReenableMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: u64,
+    plan_uuid: String,
+    mode: SyncFolderComparisonMode,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderRenameMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: Option<u64>,
+    requested_name: String,
+    expected_location_heads: Vec<String>,
+    supersedes: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderRenameCommitMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: Option<u64>,
+    requested_name: String,
+    expected_location_heads: Vec<String>,
+    supersedes: Vec<String>,
+    plan_uuid: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SyncFolderRelocationMode {
+    ExplicitMove,
+    AutomaticRename,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderRelocationPreflightMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: u64,
+    mode: SyncFolderRelocationMode,
+    target_path: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderRelocationCommitMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: u64,
+    preflight_token: String,
+    mode: SyncFolderRelocationMode,
+    target_path: String,
+    desired_materialization_fingerprint: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SyncFolderComparisonResolution {
+    KeepLocal,
+    KeepRemote,
+    KeepBoth,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderComparisonResolutionMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: u64,
+    resolution: SyncFolderComparisonResolution,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderConflictResolutionMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: Option<u64>,
+    expected_location_heads: Vec<String>,
+    supersedes: Vec<String>,
+    requested_name: Option<String>,
+}
+
 fn require_context_revision(headers: &HeaderMap) -> ApiResult<u64> {
     headers
         .get("x-megle-context-revision")
@@ -1148,6 +1472,530 @@ fn library_manager(state: &AppState) -> ApiResult<Arc<crate::library_manager::Li
             "Library management is unavailable outside Core Host mode".to_string(),
         )
     })
+}
+
+fn sync_folder_library_manager(
+    state: &AppState,
+) -> ApiResult<Arc<crate::library_manager::LibraryManager>> {
+    state.library_manager.clone().ok_or_else(|| {
+        CoreError::coded(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal-error",
+            "Synchronized-folder management requires Core Host mode".to_string(),
+        )
+    })
+}
+
+fn validate_contract_uuid(value: &str, field: &str) -> ApiResult<()> {
+    let parsed = uuid::Uuid::parse_str(value).map_err(|_| {
+        CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            format!("{field} must be a canonical UUID"),
+        )
+    })?;
+    if parsed.to_string() != value {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            format!("{field} must be a lowercase canonical UUID"),
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_sync_folder_body<T: for<'de> Deserialize<'de>>(
+    body: &serde_json::Value,
+) -> ApiResult<T> {
+    serde_json::from_value(body.clone()).map_err(|error| {
+        CoreError::coded(StatusCode::BAD_REQUEST, "invalid-input", error.to_string())
+    })
+}
+
+fn validate_optional_contract_uuid_field(body: &serde_json::Value, field: &str) -> ApiResult<()> {
+    if let Some(value) = body.get(field).filter(|value| !value.is_null()) {
+        let value = value.as_str().ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                format!("{field} must be a UUID string"),
+            )
+        })?;
+        validate_contract_uuid(value, field)?;
+    }
+    Ok(())
+}
+
+fn validate_required_contract_uuid_field(body: &serde_json::Value, field: &str) -> ApiResult<()> {
+    let value = body
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                format!("{field} is required"),
+            )
+        })?;
+    validate_contract_uuid(value, field)
+}
+
+fn validate_sync_folder_write_shape(path: &str, body: &serde_json::Value) -> ApiResult<()> {
+    if path.ends_with("/settings") {
+        let _: SyncFolderSettingsMutation = deserialize_sync_folder_body(body)?;
+    } else if path.ends_with("/enrollment/preflight") {
+        let _: SyncFolderPathPreflightMutation = deserialize_sync_folder_body(body)?;
+        validate_optional_contract_uuid_field(body, "rootUuid")?;
+    } else if path.ends_with("/enrollment/commit") {
+        let request: SyncFolderEnrollmentMutation = deserialize_sync_folder_body(body)?;
+        if request.requested_name.is_empty() {
+            return Err(CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                "requestedName must not be empty".to_string(),
+            ));
+        }
+        for field in ["rootUuid", "rootFolderUuid", "preflightToken"] {
+            validate_required_contract_uuid_field(body, field)?;
+        }
+    } else if path.ends_with("/selection/preflight") {
+        let _: SyncFolderSelectionPreflightMutation = deserialize_sync_folder_body(body)?;
+    } else if path.ends_with("/selection/commit") {
+        let _: SyncFolderSelectionCommitMutation = deserialize_sync_folder_body(body)?;
+        validate_required_contract_uuid_field(body, "preflightToken")?;
+    } else {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            "Unknown synchronized-folder mutation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sync_folder_root_write_shape(path: &str, body: &serde_json::Value) -> ApiResult<()> {
+    if path.ends_with("/rebind/preflight") {
+        let _: SyncFolderRebindPreflightMutation = deserialize_sync_folder_body(body)?;
+        validate_required_contract_uuid_field(body, "priorCutoverSnapshotUuid")?;
+    } else if path.ends_with("/rebind/commit") {
+        let _: SyncFolderRebindCommitMutation = deserialize_sync_folder_body(body)?;
+        validate_required_contract_uuid_field(body, "planUuid")?;
+    } else if path.ends_with("/reenable/preflight") {
+        let _: SyncFolderOperationFenceMutation = deserialize_sync_folder_body(body)?;
+    } else if path.ends_with("/reenable/commit") {
+        let _: SyncFolderReenableMutation = deserialize_sync_folder_body(body)?;
+        validate_required_contract_uuid_field(body, "planUuid")?;
+    } else if path.ends_with("/rename/preflight") {
+        let request: SyncFolderRenameMutation = deserialize_sync_folder_body(body)?;
+        if request.requested_name.is_empty() {
+            return Err(CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                "requestedName must not be empty".to_string(),
+            ));
+        }
+    } else if path.ends_with("/rename/commit") {
+        let request: SyncFolderRenameCommitMutation = deserialize_sync_folder_body(body)?;
+        if request.requested_name.is_empty() {
+            return Err(CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                "requestedName must not be empty".to_string(),
+            ));
+        }
+        validate_required_contract_uuid_field(body, "planUuid")?;
+    } else if path.ends_with("/relocations/preflight") {
+        let _: SyncFolderRelocationPreflightMutation = deserialize_sync_folder_body(body)?;
+    } else if path.ends_with("/relocations") {
+        let request: SyncFolderRelocationCommitMutation = deserialize_sync_folder_body(body)?;
+        validate_required_contract_uuid_field(body, "preflightToken")?;
+        if request.desired_materialization_fingerprint.len() != 64 {
+            return Err(CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                "desiredMaterializationFingerprint must contain 64 characters".to_string(),
+            ));
+        }
+    } else {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            "Unknown synchronized-folder root mutation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sync_folder_mutation_body(
+    body: &serde_json::Value,
+    location_heads_required: bool,
+) -> ApiResult<()> {
+    let object = body.as_object().ok_or_else(|| {
+        CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            "Request body must be an object".to_string(),
+        )
+    })?;
+    let operation_uuid = object
+        .get("operationUuid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                "operationUuid is required".to_string(),
+            )
+        })?;
+    validate_contract_uuid(operation_uuid, "operationUuid")?;
+    if object
+        .get("expectedOperationRevision")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+    {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            "expectedOperationRevision is required".to_string(),
+        ));
+    }
+    if object.contains_key("expectedBindingGeneration")
+        && !matches!(
+            object.get("expectedBindingGeneration"),
+            Some(serde_json::Value::Null)
+        )
+        && !object
+            .get("expectedBindingGeneration")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|value| value >= 1)
+    {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            "expectedBindingGeneration must be a positive integer or null".to_string(),
+        ));
+    }
+    if location_heads_required {
+        let mut revision_sets = Vec::with_capacity(2);
+        for field in ["expectedLocationHeads", "supersedes"] {
+            let values = object
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .filter(|values| !values.is_empty())
+                .ok_or_else(|| {
+                    CoreError::coded(
+                        StatusCode::BAD_REQUEST,
+                        "invalid-input",
+                        format!("{field} must contain at least one live location revision"),
+                    )
+                })?;
+            for value in values {
+                let value = value.as_str().ok_or_else(|| {
+                    CoreError::coded(
+                        StatusCode::BAD_REQUEST,
+                        "invalid-input",
+                        format!("{field} must contain UUID strings"),
+                    )
+                })?;
+                validate_contract_uuid(value, field)?;
+            }
+            let revisions = values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<HashSet<_>>();
+            if revisions.len() != values.len() {
+                return Err(CoreError::coded(
+                    StatusCode::BAD_REQUEST,
+                    "invalid-input",
+                    format!("{field} must not contain duplicate revisions"),
+                ));
+            }
+            revision_sets.push(revisions);
+        }
+        if revision_sets[0] != revision_sets[1] {
+            return Err(CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                "supersedes must match the expected live location heads".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sync_folder_batch_body(body: &serde_json::Value) -> ApiResult<()> {
+    let items = body
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                "items must contain at least one synchronized folder".to_string(),
+            )
+        })?;
+    for item in items {
+        validate_sync_folder_mutation_body(item, false)?;
+        let root_uuid = item
+            .get("rootUuid")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                CoreError::coded(
+                    StatusCode::BAD_REQUEST,
+                    "invalid-input",
+                    "rootUuid is required for every selection item".to_string(),
+                )
+            })?;
+        validate_contract_uuid(root_uuid, "rootUuid")?;
+    }
+    Ok(())
+}
+
+fn require_sync_folder_binding_generation(
+    body: &serde_json::Value,
+    operation: &str,
+) -> ApiResult<()> {
+    if body
+        .get("expectedBindingGeneration")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|value| value >= 1)
+    {
+        return Ok(());
+    }
+    Err(CoreError::coded(
+        StatusCode::BAD_REQUEST,
+        "invalid-input",
+        format!("expectedBindingGeneration is required for {operation}"),
+    ))
+}
+
+fn sync_folder_v2_gate(state: &AppState, library_uuid: &str) -> ApiResult<()> {
+    validate_contract_uuid(library_uuid, "libraryUuid")?;
+    let manager = sync_folder_library_manager(state)?;
+    if manager.registry().library(library_uuid)?.is_none() {
+        return Err(CoreError::coded(
+            StatusCode::NOT_FOUND,
+            "library-not-found",
+            "Library not found".to_string(),
+        ));
+    }
+    if !manager.registry().sync_folder_v2_enabled() {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "migration-required",
+            "Synchronized-folder v2 is disabled until its runtime dependencies are installed"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn sync_folder_contract_read(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+) -> ApiResult<Response> {
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+}
+
+async fn sync_folder_contract_write(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(body) = body.map_err(|error| {
+        CoreError::coded(StatusCode::BAD_REQUEST, "invalid-input", error.body_text())
+    })?;
+    validate_sync_folder_write_shape(uri.path(), &body)?;
+    if uri.path().contains("/selection/") {
+        validate_sync_folder_batch_body(&body)?;
+    } else {
+        validate_sync_folder_mutation_body(&body, false)?;
+    }
+    if uri.path().ends_with("/settings") || uri.path().ends_with("/commit") {
+        let expected = require_context_revision(&headers)?;
+        sync_folder_library_manager(&state)?
+            .ensure_context_revision(expected)
+            .map_err(map_library_error)?;
+    }
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+}
+
+async fn sync_folder_contract_root_read(
+    State(state): State<AppState>,
+    Path((library_uuid, root_uuid)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    validate_contract_uuid(&root_uuid, "rootUuid")?;
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+}
+
+async fn sync_folder_contract_root_write(
+    State(state): State<AppState>,
+    Path((library_uuid, root_uuid)): Path<(String, String)>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> ApiResult<Response> {
+    validate_contract_uuid(&root_uuid, "rootUuid")?;
+    let Json(body) = body.map_err(|error| {
+        CoreError::coded(StatusCode::BAD_REQUEST, "invalid-input", error.body_text())
+    })?;
+    validate_sync_folder_root_write_shape(uri.path(), &body)?;
+    validate_sync_folder_mutation_body(&body, uri.path().contains("/rename/"))?;
+    if uri.path().ends_with("/reenable/preflight") {
+        require_sync_folder_binding_generation(&body, "re-enable comparison")?;
+    }
+    if uri.path().ends_with("/commit") || uri.path().ends_with("/relocations") {
+        let expected = require_context_revision(&headers)?;
+        sync_folder_library_manager(&state)?
+            .ensure_context_revision(expected)
+            .map_err(map_library_error)?;
+    }
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+}
+
+async fn sync_folder_contract_root_action(
+    State(state): State<AppState>,
+    Path((library_uuid, root_uuid, command)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> ApiResult<Response> {
+    if !matches!(command.as_str(), "pause" | "resume" | "stop-sync") {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            "Unknown synchronized-folder command".to_string(),
+        ));
+    }
+    validate_contract_uuid(&root_uuid, "rootUuid")?;
+    let Json(body) = body.map_err(|error| {
+        CoreError::coded(StatusCode::BAD_REQUEST, "invalid-input", error.body_text())
+    })?;
+    let _: SyncFolderOperationFenceMutation = deserialize_sync_folder_body(&body)?;
+    validate_sync_folder_mutation_body(&body, false)?;
+    require_sync_folder_binding_generation(&body, "synchronized-folder commands")?;
+    let expected = require_context_revision(&headers)?;
+    sync_folder_library_manager(&state)?
+        .ensure_context_revision(expected)
+        .map_err(map_library_error)?;
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+}
+
+async fn sync_folder_contract_operation_read(
+    State(state): State<AppState>,
+    Path((library_uuid, root_uuid, operation_uuid)): Path<(String, String, String)>,
+) -> ApiResult<Response> {
+    validate_contract_uuid(&root_uuid, "rootUuid")?;
+    validate_contract_uuid(&operation_uuid, "operationUuid")?;
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+}
+
+async fn sync_folder_contract_plan_read(
+    State(state): State<AppState>,
+    Path((library_uuid, root_uuid, plan_uuid)): Path<(String, String, String)>,
+) -> ApiResult<Response> {
+    validate_contract_uuid(&root_uuid, "rootUuid")?;
+    validate_contract_uuid(&plan_uuid, "planUuid")?;
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+}
+
+async fn sync_folder_contract_comparison_item_write(
+    State(state): State<AppState>,
+    Path((library_uuid, root_uuid, plan_uuid, _item_ordinal)): Path<(String, String, String, u64)>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> ApiResult<Response> {
+    validate_contract_uuid(&root_uuid, "rootUuid")?;
+    validate_contract_uuid(&plan_uuid, "planUuid")?;
+    let Json(body) = body.map_err(|error| {
+        CoreError::coded(StatusCode::BAD_REQUEST, "invalid-input", error.body_text())
+    })?;
+    let _: SyncFolderComparisonResolutionMutation = deserialize_sync_folder_body(&body)?;
+    validate_sync_folder_mutation_body(&body, false)?;
+    require_sync_folder_binding_generation(&body, "comparison resolution")?;
+    let expected = require_context_revision(&headers)?;
+    sync_folder_library_manager(&state)?
+        .ensure_context_revision(expected)
+        .map_err(map_library_error)?;
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+}
+
+async fn sync_folder_contract_operation_action(
+    State(state): State<AppState>,
+    Path((library_uuid, root_uuid, operation_uuid, action)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> ApiResult<Response> {
+    if !matches!(action.as_str(), "cancel" | "retry") {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            "Unknown synchronized-folder operation action".to_string(),
+        ));
+    }
+    validate_contract_uuid(&root_uuid, "rootUuid")?;
+    validate_contract_uuid(&operation_uuid, "operationUuid")?;
+    let Json(body) = body.map_err(|error| {
+        CoreError::coded(StatusCode::BAD_REQUEST, "invalid-input", error.body_text())
+    })?;
+    let _: SyncFolderOperationFenceMutation = deserialize_sync_folder_body(&body)?;
+    validate_sync_folder_mutation_body(&body, false)?;
+    require_sync_folder_binding_generation(&body, "relocation commands")?;
+    if body
+        .get("operationUuid")
+        .and_then(serde_json::Value::as_str)
+        != Some(operation_uuid.as_str())
+    {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            "operationUuid must match the operation path".to_string(),
+        ));
+    }
+    let expected = require_context_revision(&headers)?;
+    sync_folder_library_manager(&state)?
+        .ensure_context_revision(expected)
+        .map_err(map_library_error)?;
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+}
+
+async fn sync_folder_contract_conflict_write(
+    State(state): State<AppState>,
+    Path((library_uuid, root_uuid, conflict_uuid)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> ApiResult<Response> {
+    validate_contract_uuid(&root_uuid, "rootUuid")?;
+    validate_contract_uuid(&conflict_uuid, "conflictUuid")?;
+    let Json(body) = body.map_err(|error| {
+        CoreError::coded(StatusCode::BAD_REQUEST, "invalid-input", error.body_text())
+    })?;
+    let request: SyncFolderConflictResolutionMutation = deserialize_sync_folder_body(&body)?;
+    if request.requested_name.as_deref() == Some("") {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid-input",
+            "requestedName must not be empty".to_string(),
+        ));
+    }
+    validate_sync_folder_mutation_body(&body, true)?;
+    let expected = require_context_revision(&headers)?;
+    sync_folder_library_manager(&state)?
+        .ensure_context_revision(expected)
+        .map_err(map_library_error)?;
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
 }
 
 fn library_summary(
@@ -8297,6 +9145,263 @@ mod tests {
             .expect("wake sync before Library activation");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn sync_folder_v2_contract_rejects_invalid_uuid_and_remains_migration_gated() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
+            .await
+            .unwrap();
+        let manager = state.library_manager.clone().unwrap();
+        let created = manager
+            .create_library(
+                "Contract gate".to_string(),
+                None,
+                None,
+                base.join("managed"),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        let library_uuid = created.0.library_uuid;
+        let context_revision = manager.active_snapshot().context_revision;
+        let app = router(state);
+
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/libraries/not-a-uuid/sync-folders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let gated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/libraries/{library_uuid}/sync-folders"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gated.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(gated.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "migration-required");
+
+        let stale_rename_heads = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/rename/commit"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-megle-context-revision", context_revision.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": "00000000-0000-7000-8000-000000000011",
+                            "expectedOperationRevision": 0,
+                            "requestedName": "Photos",
+                            "expectedLocationHeads": [],
+                            "supersedes": []
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_rename_heads.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(stale_rename_heads.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "invalid-input");
+
+        let valid_rename_fence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/rename/commit"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-megle-context-revision", context_revision.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": "00000000-0000-7000-8000-000000000011",
+                            "expectedOperationRevision": 0,
+                            "requestedName": "Photos",
+                            "expectedLocationHeads": ["00000000-0000-7000-8000-000000000012"],
+                            "supersedes": ["00000000-0000-7000-8000-000000000012"],
+                            "planUuid": "00000000-0000-7000-8000-000000000013"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid_rename_fence.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(valid_rename_fence.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "migration-required");
+
+        let stale_context = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/commands/stop-sync"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-megle-context-revision", (context_revision + 1).to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": "00000000-0000-7000-8000-000000000014",
+                            "expectedOperationRevision": 0,
+                            "expectedBindingGeneration": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_context.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(stale_context.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "stale_library_context");
+
+        let missing_binding_generation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/commands/stop-sync"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-megle-context-revision", context_revision.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": "00000000-0000-7000-8000-000000000015",
+                            "expectedOperationRevision": 0
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_binding_generation.status(), StatusCode::BAD_REQUEST);
+
+        let reenable_without_generation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/reenable/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": "00000000-0000-7000-8000-000000000016",
+                            "expectedOperationRevision": 0
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reenable_without_generation.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let invalid_relocation_mode = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/relocations/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": "00000000-0000-7000-8000-000000000016",
+                            "expectedOperationRevision": 0,
+                            "expectedBindingGeneration": 1,
+                            "mode": "copy",
+                            "targetPath": "D:/Library/Photos"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_relocation_mode.status(), StatusCode::BAD_REQUEST);
+
+        let unexpected_field = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/reenable/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": "00000000-0000-7000-8000-000000000016",
+                            "expectedOperationRevision": 0,
+                            "expectedBindingGeneration": 1,
+                            "unexpected": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unexpected_field.status(), StatusCode::BAD_REQUEST);
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/libraries/00000000-0000-7000-8000-000000000099/sync-folders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// Empty-string env vars (e.g. `${MEGLE_SESSION_TOKEN:-}` from

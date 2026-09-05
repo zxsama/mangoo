@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use anyhow::{bail, Context};
 use rusqlite::{params, Connection, OptionalExtension};
 
 const HOST_MIGRATION_0001: &str = include_str!("../host_migrations/0001_host_registry.sql");
@@ -22,6 +23,7 @@ const HOST_MIGRATION_0009: &str =
 const HOST_MIGRATION_0010: &str = include_str!("../host_migrations/0010_plugin_secret_handles.sql");
 const HOST_MIGRATION_0011: &str =
     include_str!("../host_migrations/0011_plugin_secret_creations.sql");
+const HOST_MIGRATION_0012: &str = include_str!("../host_migrations/0012_sync_root_bindings.sql");
 
 pub const ONEDRIVE_SECRET_NAMESPACE: &str = "microsoft-onedrive";
 pub const ONEDRIVE_CREDENTIAL_PURPOSE: &str = "oauth-v1";
@@ -427,6 +429,42 @@ fn sync_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncOper
     })
 }
 
+#[allow(dead_code)]
+fn root_operation_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RootOperationRecord> {
+    let expected_operation_revision: i64 = row.get(8)?;
+    let expected_binding_generation: Option<i64> = row.get(9)?;
+    let operation_revision: i64 = row.get(10)?;
+    Ok(RootOperationRecord {
+        operation_uuid: row.get(0)?,
+        library_uuid: row.get(1)?,
+        root_uuid: row.get(2)?,
+        kind: row.get(3)?,
+        state: row.get(4)?,
+        phase: row.get(5)?,
+        request_hash: row.get(6)?,
+        request_json: row.get(7)?,
+        expected_operation_revision: expected_operation_revision.try_into().map_err(|_| {
+            rusqlite::Error::IntegralValueOutOfRange(8, expected_operation_revision)
+        })?,
+        expected_binding_generation: expected_binding_generation
+            .map(|value| {
+                value
+                    .try_into()
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, value))
+            })
+            .transpose()?,
+        operation_revision: operation_revision
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, operation_revision))?,
+        cutover_committed: row.get::<_, i64>(11)? != 0,
+        error_code: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    })
+}
+
 fn sync_public_state(
     state: Option<&str>,
 ) -> (&'static str, &'static str, &'static str, Vec<&'static str>) {
@@ -564,6 +602,7 @@ pub struct BindingFence {
     pub next_transport_generation: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRootTransport {
     pub plugin_id: String,
@@ -572,6 +611,45 @@ pub struct ProviderRootTransport {
     pub runtime_session_id: String,
     pub cursor: Option<String>,
     pub page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRootBindingRecord {
+    pub library_uuid: String,
+    pub root_uuid: String,
+    pub local_binding_uuid: String,
+    pub local_path: String,
+    pub canonical_path_key: String,
+    pub placement_parent: String,
+    pub placement_parent_key: String,
+    pub state: String,
+    pub binding_generation: u64,
+    pub desired_materialized_name: String,
+    pub desired_materialization_fingerprint: String,
+    pub applied_materialized_name: Option<String>,
+    pub applied_materialization_fingerprint: Option<String>,
+    pub operation_revision: u64,
+    pub last_error_code: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootOperationRecord {
+    pub operation_uuid: String,
+    pub library_uuid: String,
+    pub root_uuid: String,
+    pub kind: String,
+    pub state: String,
+    pub phase: String,
+    pub request_hash: String,
+    pub request_json: String,
+    pub expected_operation_revision: u64,
+    pub expected_binding_generation: Option<u64>,
+    pub operation_revision: u64,
+    pub cutover_committed: bool,
+    pub error_code: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 pub struct HostRegistry {
@@ -679,6 +757,198 @@ fn rollback_plugin_probation_in_transaction(
 }
 
 impl HostRegistry {
+    /// The managed-root-v2 contract remains disabled until all dependent
+    /// runtime/projection, enrollment, relocation, and UI children land.
+    pub fn sync_folder_v2_enabled(&self) -> bool {
+        false
+    }
+
+    #[allow(dead_code)]
+    pub fn local_root_binding(
+        &self,
+        library_uuid: &str,
+        root_uuid: &str,
+    ) -> anyhow::Result<Option<LocalRootBindingRecord>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let row = connection
+            .query_row(
+                "SELECT library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,state,binding_generation,desired_materialized_name,desired_materialization_fingerprint,applied_materialized_name,applied_materialization_fingerprint,operation_revision,last_error_code FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2",
+                params![library_uuid, root_uuid],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, Option<String>>(14)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(
+                library_uuid,
+                root_uuid,
+                local_binding_uuid,
+                local_path,
+                canonical_path_key,
+                placement_parent,
+                placement_parent_key,
+                state,
+                binding_generation,
+                desired_materialized_name,
+                desired_materialization_fingerprint,
+                applied_materialized_name,
+                applied_materialization_fingerprint,
+                operation_revision,
+                last_error_code,
+            )| {
+                Ok(LocalRootBindingRecord {
+                    library_uuid,
+                    root_uuid,
+                    local_binding_uuid,
+                    local_path,
+                    canonical_path_key,
+                    placement_parent,
+                    placement_parent_key,
+                    state,
+                    binding_generation: u64::try_from(binding_generation)
+                        .map_err(|_| anyhow::anyhow!("invalid binding generation"))?,
+                    desired_materialized_name,
+                    desired_materialization_fingerprint,
+                    applied_materialized_name,
+                    applied_materialization_fingerprint,
+                    operation_revision: u64::try_from(operation_revision)
+                        .map_err(|_| anyhow::anyhow!("invalid root operation revision"))?,
+                    last_error_code,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    /// Reserves a managed-root-v2 operation journal exactly once. Reusing the
+    /// operation UUID with the same immutable payload is idempotent; changing
+    /// any identity, kind, or request field is rejected.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub fn begin_root_operation_once(
+        &self,
+        operation_uuid: &str,
+        library_uuid: &str,
+        root_uuid: &str,
+        kind: &str,
+        phase: &str,
+        request_hash: &str,
+        request: &serde_json::Value,
+        expected_operation_revision: u64,
+        expected_binding_generation: Option<u64>,
+    ) -> anyhow::Result<(RootOperationRecord, bool)> {
+        let expected_operation_revision = i64::try_from(expected_operation_revision)
+            .context("root operation revision exceeds SQLite integer range")?;
+        let expected_binding_generation = expected_binding_generation
+            .map(i64::try_from)
+            .transpose()
+            .context("binding generation exceeds SQLite integer range")?;
+        let request_json = serde_json::to_string(request)?;
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+                [operation_uuid],
+                root_operation_record_from_row,
+            )
+            .optional()?;
+        if let Some(operation) = existing {
+            let stored: (String, String, String, String, String, i64, Option<i64>) = transaction
+                .query_row(
+                    "SELECT library_uuid,root_uuid,kind,request_hash,request_json,expected_operation_revision,expected_binding_generation FROM root_operations WHERE operation_uuid=?1",
+                    [operation_uuid],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+                )?;
+            if stored
+                != (
+                    library_uuid.to_string(),
+                    root_uuid.to_string(),
+                    kind.to_string(),
+                    request_hash.to_string(),
+                    request_json,
+                    expected_operation_revision,
+                    expected_binding_generation,
+                )
+            {
+                bail!("idempotency-key-reused");
+            }
+            transaction.commit()?;
+            return Ok((operation, false));
+        }
+
+        let root_state: (i64, Option<String>, Option<i64>, Option<i64>) = transaction
+            .query_row(
+                "SELECT remote.operation_revision,binding.state,binding.binding_generation,binding.operation_revision FROM remote_sync_roots remote LEFT JOIN local_root_bindings binding ON binding.library_uuid=remote.library_uuid AND binding.root_uuid=remote.root_uuid WHERE remote.library_uuid=?1 AND remote.root_uuid=?2",
+                params![library_uuid, root_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .context("root-not-found")?;
+        let current_operation_revision = root_state.3.unwrap_or(root_state.0);
+        if expected_operation_revision != current_operation_revision {
+            bail!("stale-operation-revision");
+        }
+        if root_state.2.is_some() && expected_binding_generation.is_none() {
+            bail!("stale-binding-generation");
+        }
+        if let Some(expected_generation) = expected_binding_generation {
+            if root_state.2 != Some(expected_generation) {
+                bail!("stale-binding-generation");
+            }
+        }
+        if root_state.1.as_deref() == Some("local-only-fork") && matches!(kind, "select" | "rebind")
+        {
+            bail!("comparison-required");
+        }
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root_operations WHERE library_uuid=?1 AND root_uuid=?2 AND state IN ('pending','running','waiting'))",
+            params![library_uuid, root_uuid],
+            |row| row.get::<_, bool>(0),
+        )? {
+            bail!("operation-in-progress");
+        }
+        transaction.execute(
+            "INSERT INTO root_operations(operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,created_at,updated_at) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7,?8,?9,?10,?10)",
+            params![
+                operation_uuid,
+                library_uuid,
+                root_uuid,
+                kind,
+                phase,
+                request_hash,
+                request_json,
+                expected_operation_revision,
+                expected_binding_generation,
+                now,
+            ],
+        )?;
+        let operation = transaction.query_row(
+            "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+            [operation_uuid],
+            root_operation_record_from_row,
+        )?;
+        transaction.commit()?;
+        Ok((operation, true))
+    }
+
     pub fn plugin_runtime_launch_is_current(
         &self,
         plugin_id: &str,
@@ -2940,6 +3210,14 @@ impl HostRegistry {
         if schema_version < 11 {
             connection.execute_batch(HOST_MIGRATION_0011)?;
         }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 12 {
+            connection.execute_batch(HOST_MIGRATION_0012)?;
+        }
         let now = unix_timestamp_millis();
         connection.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_creations", [now])?;
         connection.execute("DELETE FROM plugin_secret_creations", [])?;
@@ -4885,6 +5163,227 @@ mod tests {
             "megle-host-registry-{}.sqlite",
             uuid::Uuid::now_v7()
         ))
+    }
+
+    #[test]
+    fn managed_root_v2_schema_is_durable_and_feature_gated() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).expect("open host registry");
+        assert!(!registry.sync_folder_v2_enabled());
+        register_test_library(&registry, "00000000-0000-7000-8000-000000000001");
+        let library_uuid = "00000000-0000-7000-8000-000000000001";
+        let root_uuid = "00000000-0000-7000-8000-000000000002";
+        let root_folder_uuid = "00000000-0000-7000-8000-000000000003";
+        let binding_uuid = "00000000-0000-7000-8000-000000000004";
+        let connection = registry.connection.lock().unwrap();
+        let library_root_uuid = connection
+            .query_row(
+                "SELECT root_uuid FROM libraries WHERE library_uuid=?1",
+                [library_uuid],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO library_local_settings(library_uuid,library_root_uuid,default_placement_base,canonical_placement_key,created_at,updated_at) VALUES (?1,?2,'D:/Library','d:/library',1,1)",
+            params![library_uuid, library_root_uuid],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO remote_sync_roots(library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialized_name_key,materialization_fingerprint,lifecycle,inventory_state,updated_at) VALUES (?1,?2,?3,'Photos','Photos','photos',?4,'active','unselected',1)",
+            params![library_uuid,root_uuid,root_folder_uuid,"a".repeat(64)],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,state,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,applied_materialized_name,applied_materialized_name_key,applied_materialization_fingerprint,created_at,updated_at) VALUES (?1,?2,?3,'D:/Library/Photos','d:/library/photos','D:/Library','d:/library','active','Photos','photos',?4,'Photos','photos',?4,1,1)",
+            params![library_uuid,root_uuid,binding_uuid,"a".repeat(64)],
+        ).unwrap();
+        drop(connection);
+
+        let binding = registry
+            .local_root_binding(library_uuid, root_uuid)
+            .unwrap()
+            .expect("read local root binding");
+        assert_eq!(binding.local_binding_uuid, binding_uuid);
+        assert_eq!(binding.binding_generation, 1);
+
+        let request = serde_json::json!({"selected": true, "path": "D:/Library/Photos"});
+        let operation_uuid = "00000000-0000-7000-8000-000000000020";
+        let stale_revision = registry
+            .begin_root_operation_once(
+                "00000000-0000-7000-8000-000000000018",
+                library_uuid,
+                root_uuid,
+                "select",
+                "planned",
+                &"8".repeat(64),
+                &request,
+                1,
+                Some(1),
+            )
+            .unwrap_err();
+        assert!(stale_revision
+            .to_string()
+            .contains("stale-operation-revision"));
+        let missing_generation = registry
+            .begin_root_operation_once(
+                "00000000-0000-7000-8000-000000000019",
+                library_uuid,
+                root_uuid,
+                "select",
+                "planned",
+                &"9".repeat(64),
+                &request,
+                0,
+                None,
+            )
+            .unwrap_err();
+        assert!(missing_generation
+            .to_string()
+            .contains("stale-binding-generation"));
+        let (operation, inserted) = registry
+            .begin_root_operation_once(
+                operation_uuid,
+                library_uuid,
+                root_uuid,
+                "select",
+                "planned",
+                &"c".repeat(64),
+                &request,
+                0,
+                Some(1),
+            )
+            .unwrap();
+        assert!(inserted);
+        assert_eq!(operation.root_uuid, root_uuid);
+        let (retried, inserted) = registry
+            .begin_root_operation_once(
+                operation_uuid,
+                library_uuid,
+                root_uuid,
+                "select",
+                "planned",
+                &"c".repeat(64),
+                &request,
+                0,
+                Some(1),
+            )
+            .unwrap();
+        assert!(!inserted);
+        assert_eq!(operation, retried);
+        assert!(registry
+            .begin_root_operation_once(
+                operation_uuid,
+                library_uuid,
+                root_uuid,
+                "select",
+                "planned",
+                &"d".repeat(64),
+                &serde_json::json!({"selected": false}),
+                0,
+                Some(1),
+            )
+            .is_err());
+        assert!(registry
+            .begin_root_operation_once(
+                "00000000-0000-7000-8000-000000000021",
+                library_uuid,
+                root_uuid,
+                "select",
+                "planned",
+                &"e".repeat(64),
+                &request,
+                0,
+                Some(1),
+            )
+            .is_err());
+
+        {
+            let connection = registry.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE root_operations SET state='completed',phase='completed' WHERE operation_uuid=?1",
+                    [operation_uuid],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE local_root_bindings SET state='local-only-fork' WHERE library_uuid=?1 AND root_uuid=?2",
+                    params![library_uuid, root_uuid],
+                )
+                .unwrap();
+        }
+        let blocked_operation_uuid = "00000000-0000-7000-8000-000000000022";
+        let blocked = registry
+            .begin_root_operation_once(
+                blocked_operation_uuid,
+                library_uuid,
+                root_uuid,
+                "rebind",
+                "planned",
+                &"f".repeat(64),
+                &serde_json::json!({"planUuid": "00000000-0000-7000-8000-000000000023"}),
+                0,
+                Some(1),
+            )
+            .unwrap_err();
+        assert!(blocked.to_string().contains("comparison-required"));
+        assert!(
+            registry
+                .begin_root_operation_once(
+                    "00000000-0000-7000-8000-000000000024",
+                    library_uuid,
+                    root_uuid,
+                    "re-enable",
+                    "comparing",
+                    &"1".repeat(64),
+                    &serde_json::json!({"mode": "merge-local-fork"}),
+                    0,
+                    Some(1),
+                )
+                .unwrap()
+                .1
+        );
+
+        drop(registry);
+        let reopened = HostRegistry::open(&path).expect("reopen host registry");
+        assert!(reopened
+            .local_root_binding(library_uuid, root_uuid)
+            .unwrap()
+            .is_some());
+        let connection = reopened.connection.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT schema_version FROM host_meta WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            12
+        );
+        assert!(connection
+            .execute(
+                "UPDATE remote_sync_roots SET root_folder_uuid='00000000-0000-7000-8000-000000000008' WHERE library_uuid=?1 AND root_uuid=?2",
+                params![library_uuid, root_uuid],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "UPDATE root_operations SET request_hash=?2 WHERE operation_uuid=?1",
+                params![operation_uuid, "f".repeat(64)],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "DELETE FROM remote_sync_roots WHERE library_uuid=?1 AND root_uuid=?2",
+                params![library_uuid, root_uuid],
+            )
+            .is_err());
+        assert!(connection.execute(
+            "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,state,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,created_at,updated_at) VALUES (?1,?2,'00000000-0000-7000-8000-000000000006','D:/Library/Photos/Nested','d:/library/photos/nested','D:/Library/Photos','d:/library/photos','active','Nested','nested',?3,1,1)",
+            params![library_uuid,root_uuid,"b".repeat(64)],
+        ).is_err());
+        drop(connection);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
     }
 
     fn register_test_library(registry: &HostRegistry, library_uuid: &str) {
