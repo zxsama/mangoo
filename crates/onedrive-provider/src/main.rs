@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -329,18 +329,16 @@ impl ProviderState {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let manual = config.auth_mode == AuthMode::ManualResponseUri;
-        let (listener, callback) = if manual {
+        let (listeners, callback) = if manual {
             (
                 None,
                 Some("https://login.microsoftonline.com/common/oauth2/nativeclient".to_owned()),
             )
         } else if callback.is_none() {
-            let listener = TcpListener::bind("127.0.0.1:0").map_err(|_| {
-                ProviderError::new("unavailable", true, "failed to bind OAuth loopback")
-            })?;
+            let listeners = bind_localhost_listeners()?;
             let uri = format!(
                 "http://localhost:{}/plugin-auth/callback",
-                listener
+                listeners[0]
                     .local_addr()
                     .map_err(|_| ProviderError::new(
                         "unavailable",
@@ -349,12 +347,26 @@ impl ProviderState {
                     ))?
                     .port()
             );
-            (Some(listener), Some(uri))
+            (Some(listeners), Some(uri))
         } else {
             (None, callback)
         };
         let (flow_id, authorization_url) = self.flows.begin(&config, callback.as_deref())?;
-        if let Some(listener) = listener {
+        if let Some(listeners) = listeners {
+            let expected_state = url::Url::parse(&authorization_url)
+                .ok()
+                .and_then(|url| {
+                    url.query_pairs()
+                        .find(|(key, _)| key == "state")
+                        .map(|(_, value)| value.into_owned())
+                })
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        "unavailable",
+                        false,
+                        "OAuth authorization state was not generated",
+                    )
+                })?;
             let results = Arc::clone(&self.loopback_results);
             let cancellations = Arc::clone(&self.loopback_cancellations);
             let flow = flow_id.clone();
@@ -366,7 +378,7 @@ impl ProviderState {
                 })?
                 .insert(flow.clone(), Arc::clone(&cancelled));
             std::thread::spawn(move || {
-                receive_loopback(listener, results, flow.clone(), cancelled);
+                receive_loopback(listeners, results, flow.clone(), expected_state, cancelled);
                 if let Ok(mut guard) = cancellations.lock() {
                     guard.remove(&flow);
                 }
@@ -458,8 +470,8 @@ impl ProviderState {
         let graph = self.graph()?.clone();
         let token = graph.exchange_code(&config, &code, &verifier, &redirect_uri)?;
         let access_token = text(&token, "access_token")?;
-        let identity = graph.drive_identity(&access_token)?;
         graph.ensure_app_root(&access_token)?;
+        let identity = graph.drive_identity(&access_token)?;
         let refresh_token = text(&token, "refresh_token")?;
         let record = CredentialRecordV1 {
             format_version: 1,
@@ -478,7 +490,9 @@ impl ProviderState {
             account_kind: identity.account_kind,
             tenant_hint: identity.tenant_hint,
             object_hint: identity.object_hint,
-            display_hint: identity.display_hint,
+            display_hint: identity
+                .display_hint
+                .or_else(|| display_hint_from_token_response(&token)),
             scopes: token
                 .get("scope")
                 .and_then(Value::as_str)
@@ -494,7 +508,8 @@ impl ProviderState {
         // account reference atomically and retires the prior credential. This
         // makes cancellation reversible even when replacing an existing
         // account; an in-place CAS would destroy the prior credential bytes.
-        let created = create_secret(rpc, CREDENTIAL_PURPOSE, &record, false)?;
+        let persistent_record = credential_for_persistence(&record);
+        let created = create_secret(rpc, CREDENTIAL_PURPOSE, &persistent_record, false)?;
         self.credential_ref = Some(text(&created, "secretRef")?);
         self.credential_generation = created.get("generation").and_then(Value::as_u64);
         self.credential = Some(record);
@@ -582,6 +597,7 @@ impl ProviderState {
             .credential
             .as_ref()
             .ok_or_else(|| ProviderError::protocol("credential record missing"))?;
+        let persistent_record = credential_for_persistence(record);
         let secret_ref = self
             .credential_ref
             .clone()
@@ -594,7 +610,7 @@ impl ProviderState {
             CREDENTIAL_PURPOSE,
             &secret_ref,
             generation,
-            record,
+            &persistent_record,
             false,
         )?;
         self.credential_generation = result.get("generation").and_then(Value::as_u64);
@@ -715,6 +731,12 @@ impl ProviderState {
                 "Microsoft account identity changed; authorization is required",
             ));
         }
+        if let Some(display_hint) = identity
+            .display_hint
+            .or_else(|| display_hint_from_token_response(&token))
+        {
+            record.display_hint = Some(display_hint);
+        }
         record.access_token = Some(access_token);
         if let Some(refresh) = token.get("refresh_token").and_then(Value::as_str) {
             record.refresh_token = refresh.to_owned();
@@ -735,12 +757,13 @@ impl ProviderState {
         let generation = self
             .credential_generation
             .ok_or_else(|| ProviderError::protocol("credential generation missing"))?;
+        let persistent_record = credential_for_persistence(&record);
         let result = cas_secret(
             rpc,
             CREDENTIAL_PURPOSE,
             &secret_ref,
             generation,
-            &record,
+            &persistent_record,
             false,
         )?;
         self.credential_generation = result.get("generation").and_then(Value::as_u64);
@@ -853,81 +876,319 @@ impl Drop for WindowsSockets {
     }
 }
 
+fn bind_localhost_listeners() -> Result<Vec<TcpListener>, ProviderError> {
+    let addresses = ("localhost", 0)
+        .to_socket_addrs()
+        .map_err(|_| ProviderError::new("unavailable", true, "failed to resolve OAuth loopback"))?
+        .collect();
+    bind_loopback_addresses(addresses)
+}
+
+fn bind_loopback_addresses(
+    resolved_addresses: Vec<SocketAddr>,
+) -> Result<Vec<TcpListener>, ProviderError> {
+    let mut addresses = Vec::new();
+    for address in resolved_addresses {
+        if !address.ip().is_loopback() {
+            return Err(ProviderError::new(
+                "unavailable",
+                false,
+                "localhost resolved outside the loopback interface",
+            ));
+        }
+        if !addresses
+            .iter()
+            .any(|existing: &SocketAddr| existing.ip() == address.ip())
+        {
+            addresses.push(address);
+        }
+    }
+    let first = addresses.first().copied().ok_or_else(|| {
+        ProviderError::new(
+            "unavailable",
+            true,
+            "localhost did not resolve to a loopback address",
+        )
+    })?;
+    let first_listener = TcpListener::bind(first)
+        .map_err(|_| ProviderError::new("unavailable", true, "failed to bind OAuth loopback"))?;
+    let port = first_listener
+        .local_addr()
+        .map_err(|_| ProviderError::new("unavailable", true, "failed to inspect OAuth loopback"))?
+        .port();
+    let mut listeners = vec![first_listener];
+    for address in addresses.into_iter().skip(1) {
+        let listener = TcpListener::bind(SocketAddr::new(address.ip(), port)).map_err(|_| {
+            ProviderError::new(
+                "unavailable",
+                true,
+                "failed to bind all OAuth loopback addresses",
+            )
+        })?;
+        if !listener
+            .local_addr()
+            .map_err(|_| {
+                ProviderError::new("unavailable", true, "failed to inspect OAuth loopback")
+            })?
+            .ip()
+            .is_loopback()
+        {
+            return Err(ProviderError::new(
+                "unavailable",
+                false,
+                "OAuth callback listener escaped the loopback interface",
+            ));
+        }
+        listeners.push(listener);
+    }
+    for listener in &listeners {
+        listener.set_nonblocking(true).map_err(|_| {
+            ProviderError::new(
+                "unavailable",
+                true,
+                "failed to configure OAuth loopback listener",
+            )
+        })?;
+    }
+    Ok(listeners)
+}
+
 fn receive_loopback(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     results: Arc<Mutex<LoopbackResults>>,
     flow_id: String,
+    expected_state: String,
     cancelled: Arc<AtomicBool>,
 ) {
-    let _ = listener.set_nonblocking(true);
     let deadline = Instant::now() + FLOW_TTL;
+    let mut next_listener = 0usize;
     while Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
-        let Ok((mut stream, _)) = listener.accept() else {
-            std::thread::sleep(Duration::from_millis(50));
+        let mut accepted = None;
+        for offset in 0..listeners.len() {
+            let index = (next_listener + offset) % listeners.len();
+            if let Ok((stream, _)) = listeners[index].accept() {
+                next_listener = (index + 1) % listeners.len();
+                accepted = Some(stream);
+                break;
+            }
+        }
+        let Some(mut stream) = accepted else {
+            std::thread::sleep(Duration::from_millis(25));
             continue;
         };
-        let mut buffer = [0u8; 8192];
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let valid = if let Ok(size) = stream.read(&mut buffer) {
-            if size == buffer.len() {
-                false
-            } else {
-                let line = String::from_utf8_lossy(&buffer[..size]);
-                if let Some((method, target)) = line.lines().next().and_then(|line| {
-                    let mut parts = line.split_whitespace();
-                    Some((parts.next()?, parts.next()?))
-                }) {
-                    if let Ok(url) = url::Url::parse(&format!("http://127.0.0.1{target}")) {
-                        if method == "GET" && url.path() == "/plugin-auth/callback" {
-                            let mut fields = HashMap::new();
-                            let mut duplicate = false;
-                            for (key, value) in url.query_pairs() {
-                                if fields
-                                    .insert(key.into_owned(), value.into_owned())
-                                    .is_some()
-                                {
-                                    duplicate = true;
-                                    break;
+        let (callback_fields, status, body) =
+            match read_loopback_request(&mut stream, cancelled.as_ref(), deadline) {
+                LoopbackRequestRead::Complete(request) => {
+                    let line = String::from_utf8_lossy(&request);
+                    match line.lines().next().and_then(|line| {
+                        let mut parts = line.split_whitespace();
+                        Some((parts.next()?, parts.next()?))
+                    }) {
+                        Some((method, _)) if method != "GET" => (
+                            None,
+                            "405 Method Not Allowed",
+                            "Authorization callback must use GET.",
+                        ),
+                        Some((_, target)) => {
+                            match url::Url::parse(&format!("http://127.0.0.1{target}")) {
+                                Ok(url) if url.path() != "/plugin-auth/callback" => (
+                                    None,
+                                    "404 Not Found",
+                                    "Authorization callback path was not found.",
+                                ),
+                                Ok(url) => {
+                                    let mut fields = HashMap::new();
+                                    let mut duplicate = false;
+                                    for (key, value) in url.query_pairs() {
+                                        if fields
+                                            .insert(key.into_owned(), value.into_owned())
+                                            .is_some()
+                                        {
+                                            duplicate = true;
+                                            break;
+                                        }
+                                    }
+                                    let valid_fields = !duplicate
+                                        && fields.len() <= 5
+                                        && fields.keys().all(|key| {
+                                            matches!(
+                                                key.as_str(),
+                                                "state"
+                                                    | "code"
+                                                    | "error"
+                                                    | "error_description"
+                                                    | "session_state"
+                                            )
+                                        })
+                                        && fields.get("state") == Some(&expected_state)
+                                        && (fields
+                                            .get("code")
+                                            .is_some_and(|value| !value.is_empty())
+                                            ^ fields
+                                                .get("error")
+                                                .is_some_and(|value| !value.is_empty()));
+                                    if valid_fields && !cancelled.load(Ordering::Acquire) {
+                                        fields.remove("session_state");
+                                    }
+                                    if valid_fields && !cancelled.load(Ordering::Acquire) {
+                                        (
+                                            Some(fields),
+                                            "200 OK",
+                                            "Authorization received. You can return to Megle.",
+                                        )
+                                    } else {
+                                        (None, "400 Bad Request", "Invalid authorization callback.")
+                                    }
+                                }
+                                Err(_) => {
+                                    (None, "400 Bad Request", "Invalid authorization callback.")
                                 }
                             }
-                            if !duplicate
-                                && fields.len() <= 4
-                                && fields.keys().all(|key| {
-                                    matches!(
-                                        key.as_str(),
-                                        "state" | "code" | "error" | "error_description"
-                                    )
-                                })
-                            {
-                                if let Ok(mut guard) = results.lock() {
-                                    guard.insert(flow_id.clone(), (Instant::now(), fields));
-                                }
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
                         }
-                    } else {
-                        false
+                        None => (None, "400 Bad Request", "Invalid authorization callback."),
                     }
+                }
+                LoopbackRequestRead::Empty => {
+                    (None, "400 Bad Request", "Empty authorization callback.")
+                }
+                LoopbackRequestRead::Incomplete => (
+                    None,
+                    "408 Request Timeout",
+                    "Authorization callback headers were incomplete.",
+                ),
+                LoopbackRequestRead::TooLarge => (
+                    None,
+                    "413 Payload Too Large",
+                    "Authorization callback is too large.",
+                ),
+                LoopbackRequestRead::Cancelled => break,
+            };
+        let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        let response_sent = stream
+            .write_all(response.as_bytes())
+            .and_then(|_| stream.flush())
+            .is_ok();
+        if let Some(fields) = callback_fields {
+            if response_sent
+                && !cancelled.load(Ordering::Acquire)
+                && results.lock().is_ok_and(|mut guard| {
+                    guard.insert(flow_id.clone(), (Instant::now(), fields));
+                    true
+                })
+            {
+                break;
+            }
+        }
+    }
+}
+
+const MAX_LOOPBACK_REQUEST_BYTES: usize = 8 * 1024;
+const LOOPBACK_CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
+
+enum LoopbackRequestRead {
+    Complete(Vec<u8>),
+    Empty,
+    Incomplete,
+    TooLarge,
+    Cancelled,
+}
+
+fn read_loopback_request(
+    stream: &mut TcpStream,
+    cancelled: &AtomicBool,
+    flow_deadline: Instant,
+) -> LoopbackRequestRead {
+    let connection_deadline = flow_deadline.min(Instant::now() + LOOPBACK_CONNECTION_TIMEOUT);
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .is_err()
+    {
+        return LoopbackRequestRead::Incomplete;
+    }
+    let mut request = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return LoopbackRequestRead::Cancelled;
+        }
+        if Instant::now() >= connection_deadline {
+            return if request.is_empty() {
+                LoopbackRequestRead::Empty
+            } else {
+                LoopbackRequestRead::Incomplete
+            };
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                return if request.is_empty() {
+                    LoopbackRequestRead::Empty
                 } else {
-                    false
+                    LoopbackRequestRead::Incomplete
+                };
+            }
+            Ok(size) => {
+                if request.len().saturating_add(size) > MAX_LOOPBACK_REQUEST_BYTES {
+                    return LoopbackRequestRead::TooLarge;
+                }
+                request.extend_from_slice(&chunk[..size]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return LoopbackRequestRead::Complete(request);
+                }
+                if request.len() == MAX_LOOPBACK_REQUEST_BYTES {
+                    return LoopbackRequestRead::TooLarge;
                 }
             }
-        } else {
-            false
-        };
-        let (status, body) = if valid {
-            ("200 OK", "Authorization received. You can return to Megle.")
-        } else {
-            ("400 Bad Request", "Invalid authorization callback.")
-        };
-        let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-        let _ = stream.write_all(response.as_bytes());
-        break;
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => return LoopbackRequestRead::Incomplete,
+        }
     }
+}
+
+fn credential_for_persistence(record: &CredentialRecordV1) -> CredentialRecordV1 {
+    let mut persistent = record.clone();
+    persistent.access_token = None;
+    persistent.access_expires_at_ms = None;
+    persistent
+}
+
+fn display_hint_from_token_response(token: &Value) -> Option<String> {
+    token
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(display_hint_from_id_token)
+}
+
+fn display_hint_from_id_token(id_token: &str) -> Option<String> {
+    if id_token.len() > 16 * 1024 {
+        return None;
+    }
+    let mut segments = id_token.split('.');
+    segments.next()?;
+    let payload = segments.next()?;
+    segments.next()?;
+    if segments.next().is_some() || payload.len() > 8 * 1024 {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    if decoded.len() > 4 * 1024 {
+        return None;
+    }
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let claims = claims.as_object()?;
+    ["name", "preferred_username"]
+        .into_iter()
+        .find_map(|key| bounded_display_claim(claims.get(key)?.as_str()?))
+}
+
+fn bounded_display_claim(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.chars().take(128).collect())
 }
 
 fn secret_scope(purpose: &str) -> Value {
@@ -1092,4 +1353,15 @@ fn now_ms() -> u64 {
 }
 fn anonymize(value: &str) -> String {
     hex(&Sha256::digest(value.as_bytes()))[..16].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_loopback_addresses;
+
+    #[test]
+    fn oauth_callback_rejects_non_loopback_resolution() {
+        let address = "192.0.2.1:0".parse().expect("test address should parse");
+        assert!(bind_loopback_addresses(vec![address]).is_err());
+    }
 }

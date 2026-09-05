@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,6 +26,9 @@ struct GraphState {
     reject_next_token_refresh: bool,
     next_upload_fault: Option<u16>,
     token_redirect_uris: Vec<String>,
+    token_authorization_codes: Vec<String>,
+    drive_requires_app_root: bool,
+    app_root_requested: bool,
 }
 
 struct Emulator {
@@ -405,59 +408,172 @@ fn oauth_poll_is_non_destructive_and_cancel_is_idempotent() {
 }
 
 #[test]
-fn loopback_auth_advertises_localhost_and_completes_via_ipv4_listener() {
+fn loopback_auth_advertises_localhost_and_completes_via_every_resolved_address() {
     let emulator = Emulator::start();
     let mut provider =
         ProviderProcess::start(&emulator.base, Arc::new(Mutex::new(Secrets::default())));
     hello(&mut provider);
-    let auth = provider.call("auth.begin", Value::Null);
-    assert_eq!(auth["completionMode"], "loopback");
+    let probe = provider.call("auth.begin", Value::Null);
+    let probe_redirect = Url::parse(probe["redirectUri"].as_str().unwrap()).unwrap();
+    let addresses = localhost_addresses(probe_redirect.port().expect("ephemeral callback port"));
+    provider.call("auth.cancel", json!({"flowId":probe["flowId"]}));
+    assert!(!addresses.is_empty());
 
-    let redirect = Url::parse(auth["redirectUri"].as_str().unwrap()).unwrap();
-    assert_eq!(redirect.scheme(), "http");
-    assert_eq!(redirect.host_str(), Some("localhost"));
-    assert_eq!(redirect.path(), "/plugin-auth/callback");
-    let port = redirect.port().expect("ephemeral callback port");
-
-    let authorization = Url::parse(auth["authorizationUrl"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        authorization
+    let mut expected_redirects = Vec::new();
+    let mut expected_codes = Vec::new();
+    for address in addresses {
+        let auth = provider.call("auth.begin", Value::Null);
+        assert_eq!(auth["completionMode"], "loopback");
+        let redirect = Url::parse(auth["redirectUri"].as_str().unwrap()).unwrap();
+        assert_eq!(redirect.scheme(), "http");
+        assert_eq!(redirect.host_str(), Some("localhost"));
+        assert_eq!(redirect.path(), "/plugin-auth/callback");
+        let port = redirect.port().expect("ephemeral callback port");
+        let authorization = Url::parse(auth["authorizationUrl"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            authorization
+                .query_pairs()
+                .find(|(key, _)| key == "redirect_uri")
+                .unwrap()
+                .1,
+            redirect.as_str()
+        );
+        let state = authorization
             .query_pairs()
-            .find(|(key, _)| key == "redirect_uri")
+            .find(|(key, _)| key == "state")
             .unwrap()
-            .1,
-        redirect.as_str()
-    );
-    let state = authorization
-        .query_pairs()
-        .find(|(key, _)| key == "state")
-        .unwrap()
-        .1
-        .into_owned();
+            .1
+            .into_owned();
 
-    let mut callback = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    write!(
-        callback,
-        "GET /plugin-auth/callback?code=emulator-code&state={state} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut response = String::new();
-    callback.read_to_string(&mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        drop(TcpStream::connect(SocketAddr::new(address.ip(), port)).unwrap());
 
-    let mut result = Value::Null;
-    for _ in 0..40 {
-        result = provider.call("auth.poll", json!({"flowId":auth["flowId"]}));
-        if result.get("pending") != Some(&Value::Bool(true)) {
-            break;
+        let mut invalid_probe = TcpStream::connect(SocketAddr::new(address.ip(), port)).unwrap();
+        write!(
+            invalid_probe,
+            "GET /favicon.ico HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut invalid_response = String::new();
+        invalid_probe.read_to_string(&mut invalid_response).unwrap();
+        assert!(
+            invalid_response.starts_with("HTTP/1.1 404 Not Found"),
+            "{address}: {invalid_response}"
+        );
+
+        let mut wrong_state_probe =
+            TcpStream::connect(SocketAddr::new(address.ip(), port)).unwrap();
+        write!(
+            wrong_state_probe,
+            "GET /plugin-auth/callback?code=emulator-code&state=wrong-state HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut wrong_state_response = String::new();
+        wrong_state_probe
+            .read_to_string(&mut wrong_state_response)
+            .unwrap();
+        assert!(
+            wrong_state_response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{address}: {wrong_state_response}"
+        );
+        for invalid_query in [
+            format!("code=emulator-code&state={state}&session_state=one&session_state=two"),
+            format!("code=emulator-code&state={state}&unexpected=value"),
+        ] {
+            let mut invalid_callback =
+                TcpStream::connect(SocketAddr::new(address.ip(), port)).unwrap();
+            write!(
+                invalid_callback,
+                "GET /plugin-auth/callback?{invalid_query} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut invalid_callback_response = String::new();
+            invalid_callback
+                .read_to_string(&mut invalid_callback_response)
+                .unwrap();
+            assert!(
+                invalid_callback_response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{address}: {invalid_callback_response}"
+            );
         }
-        thread::sleep(std::time::Duration::from_millis(25));
+        let mut incomplete_callback =
+            TcpStream::connect(SocketAddr::new(address.ip(), port)).unwrap();
+        write!(
+            incomplete_callback,
+            "GET /plugin-auth/callback?code=partial&state={state}"
+        )
+        .unwrap();
+        incomplete_callback.flush().unwrap();
+        let mut incomplete_response = String::new();
+        incomplete_callback
+            .read_to_string(&mut incomplete_response)
+            .unwrap();
+        assert!(
+            incomplete_response.starts_with("HTTP/1.1 408 Request Timeout"),
+            "{address}: {incomplete_response}"
+        );
+        assert_eq!(
+            provider.call("auth.poll", json!({"flowId":auth["flowId"]}))["pending"],
+            true,
+            "{address}: an invalid callback must not consume the flow"
+        );
+
+        let long_code = "c".repeat(1523);
+        let callback_request = format!(
+            "GET /plugin-auth/callback?code={long_code}&state={state}&session_state=real-browser-session HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+        );
+        let mut callback = TcpStream::connect(SocketAddr::new(address.ip(), port)).unwrap();
+        for chunk in callback_request.as_bytes().chunks(257) {
+            callback.write_all(chunk).unwrap();
+            callback.flush().unwrap();
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut response = String::new();
+        callback.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "{address}: {response}"
+        );
+
+        let mut result = Value::Null;
+        for _ in 0..40 {
+            result = provider.call("auth.poll", json!({"flowId":auth["flowId"]}));
+            if result.get("pending") != Some(&Value::Bool(true)) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(result["authenticated"], true, "{address}: {result}");
+        let replay = provider.call_error(
+            "auth.complete",
+            json!({"flowId":auth["flowId"],"fields":{"state":state,"code":"emulator-code"}}),
+        );
+        assert_eq!(
+            replay["code"], "invalid_argument",
+            "{address}: a completed callback must remain single-use"
+        );
+        expected_redirects.push(redirect.to_string());
+        expected_codes.push(long_code);
     }
-    assert_eq!(result["authenticated"], true, "{result}");
-    assert_eq!(
-        emulator.state.lock().unwrap().token_redirect_uris,
-        vec![redirect.to_string()]
-    );
+    let graph_state = emulator.state.lock().unwrap();
+    assert_eq!(graph_state.token_redirect_uris, expected_redirects);
+    assert_eq!(graph_state.token_authorization_codes, expected_codes);
+}
+
+fn localhost_addresses(port: u16) -> Vec<SocketAddr> {
+    let mut addresses = Vec::new();
+    for address in ("localhost", port).to_socket_addrs().unwrap() {
+        assert!(
+            address.ip().is_loopback(),
+            "localhost resolved to {address}"
+        );
+        if !addresses
+            .iter()
+            .any(|existing: &SocketAddr| existing.ip() == address.ip())
+        {
+            addresses.push(address);
+        }
+    }
+    addresses
 }
 
 #[test]
@@ -491,6 +607,100 @@ impl Drop for ProviderProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn first_authorization_provisions_app_root_before_reading_drive_identity() {
+    let emulator = Emulator::start();
+    emulator.state.lock().unwrap().drive_requires_app_root = true;
+    let secrets = Arc::new(Mutex::new(Secrets::default()));
+    let mut provider = ProviderProcess::start(&emulator.base, Arc::clone(&secrets));
+    hello(&mut provider);
+
+    let auth = provider.call(
+        "auth.begin",
+        json!({"callbackUrl":"https://megle.invalid/api/plugin-auth/callback/first-login"}),
+    );
+    let authorization = Url::parse(auth["authorizationUrl"].as_str().unwrap()).unwrap();
+    let state = authorization
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let status = provider.call(
+        "auth.complete",
+        json!({"flowId":auth["flowId"],"fields":{"state":state,"code":"first-login-code"}}),
+    );
+
+    assert_eq!(status["authenticated"], true);
+    assert!(emulator.state.lock().unwrap().app_root_requested);
+    let secrets = secrets.lock().unwrap();
+    let current = secrets.current.as_ref().unwrap();
+    let credential: Value = serde_json::from_slice(&secrets.records[current].0).unwrap();
+    assert!(credential["refreshToken"].as_str().is_some());
+    assert_eq!(credential["accessToken"], Value::Null);
+    assert_eq!(credential["accessExpiresAtMs"], Value::Null);
+}
+
+#[test]
+fn refresh_backfills_legacy_account_display_name_without_persisting_access_token() {
+    let emulator = Emulator::start();
+    let secrets = Arc::new(Mutex::new(Secrets::default()));
+    let mut provider = ProviderProcess::start(&emulator.base, Arc::clone(&secrets));
+    hello(&mut provider);
+    let auth = provider.call(
+        "auth.begin",
+        json!({"callbackUrl":"https://megle.invalid/api/plugin-auth/callback/display-name"}),
+    );
+    let authorization = Url::parse(auth["authorizationUrl"].as_str().unwrap()).unwrap();
+    let state = authorization
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    assert_eq!(
+        provider.call(
+            "auth.complete",
+            json!({"flowId":auth["flowId"],"fields":{"state":state,"code":"display-name-code"}}),
+        )["accountDisplayName"],
+        "Emulator Account"
+    );
+    drop(provider);
+
+    {
+        let mut secrets = secrets.lock().unwrap();
+        let current = secrets.current.clone().unwrap();
+        let (bytes, generation) = secrets.records.get(&current).unwrap().clone();
+        let mut credential: Value = serde_json::from_slice(&bytes).unwrap();
+        credential["displayHint"] = Value::Null;
+        secrets.records.insert(
+            current,
+            (serde_json::to_vec(&credential).unwrap(), generation),
+        );
+    }
+
+    let mut provider = ProviderProcess::start(&emulator.base, Arc::clone(&secrets));
+    hello(&mut provider);
+    assert_eq!(
+        provider.call("auth.status", Value::Null)["accountDisplayName"],
+        Value::Null
+    );
+    provider.call(
+        "delta.list",
+        json!({"scope":{"kind":"root"},"cursor":null,"pageToken":null,"limit":100}),
+    );
+    assert_eq!(
+        provider.call("auth.status", Value::Null)["accountDisplayName"],
+        "Emulator Account"
+    );
+    let secrets = secrets.lock().unwrap();
+    let current = secrets.current.as_ref().unwrap();
+    let credential: Value = serde_json::from_slice(&secrets.records[current].0).unwrap();
+    assert_eq!(credential["displayHint"], "Emulator Account");
+    assert_eq!(credential["accessToken"], Value::Null);
+    assert_eq!(credential["accessExpiresAtMs"], Value::Null);
 }
 
 #[test]
@@ -687,6 +897,14 @@ fn real_child_runs_oauth_secret_delta_object_range_and_resumable_upload_against_
             .max(),
         Some(2)
     );
+    {
+        let secrets = secrets.lock().unwrap();
+        let current = secrets.current.as_ref().unwrap();
+        let credential: Value = serde_json::from_slice(&secrets.records[current].0).unwrap();
+        assert!(credential["refreshToken"].as_str().is_some());
+        assert_eq!(credential["accessToken"], Value::Null);
+        assert_eq!(credential["accessExpiresAtMs"], Value::Null);
+    }
 
     let cursor_reset = provider.call_error(
         "delta.list",
@@ -968,12 +1186,17 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
                 .into_bytes(),
         )
     } else if path.ends_with("/oauth2/v2.0/token") && method == "POST" {
-        if let Some(redirect_uri) = url::form_urlencoded::parse(body)
-            .find(|(key, _)| key == "redirect_uri")
-            .map(|(_, value)| value.into_owned())
-        {
-            state.lock().unwrap().token_redirect_uris.push(redirect_uri);
+        let token_fields = url::form_urlencoded::parse(body)
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        let mut state_guard = state.lock().unwrap();
+        if let Some(redirect_uri) = token_fields.get("redirect_uri") {
+            state_guard.token_redirect_uris.push(redirect_uri.clone());
         }
+        if let Some(code) = token_fields.get("code") {
+            state_guard.token_authorization_codes.push(code.clone());
+        }
+        drop(state_guard);
         let reject_refresh = {
             let mut state = state.lock().unwrap();
             std::mem::take(&mut state.reject_next_token_refresh)
@@ -1030,8 +1253,20 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
                 .into_bytes(),
         )
     } else if path == "/v1.0/me/drive" && method == "GET" {
-        (200, vec![], json!({"id":"drive-personal-1","driveType":"personal","owner":{"user":{"id":"object-1","displayName":"Emulator Account"}}}).to_string().into_bytes())
+        let state = state.lock().unwrap();
+        if state.drive_requires_app_root && !state.app_root_requested {
+            (
+                404,
+                vec![],
+                json!({"error":{"code":"itemNotFound"}})
+                    .to_string()
+                    .into_bytes(),
+            )
+        } else {
+            (200, vec![], json!({"id":"drive-personal-1","driveType":"personal","owner":{"user":{"id":"object-1","displayName":"Emulator Account"}}}).to_string().into_bytes())
+        }
     } else if path == "/v1.0/me/drive/special/approot" && method == "GET" {
+        state.lock().unwrap().app_root_requested = true;
         (
             200,
             vec![],
