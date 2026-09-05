@@ -4,7 +4,7 @@ const STATUS_LABEL: Record<PluginRuntimeState, string> = {
   disabled: "Disabled",
   "permission-required": "Permission required",
   starting: "Starting",
-  ready: "Ready",
+  ready: "Enable",
   degraded: "Degraded",
   "crashed-backoff": "Backoff",
   incompatible: "Incompatible",

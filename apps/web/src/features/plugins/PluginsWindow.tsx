@@ -1,11 +1,13 @@
 import { useCallback } from "react";
 import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
+import { useOverlayScrollbars } from "../../app-shell/useOverlayScrollbars";
 import { useSecondaryWindowInterfaceStyle } from "../../app-shell/useSecondaryWindowInterfaceStyle";
 import { getDesktopBridge } from "../../core/desktop";
 import { PluginsView } from "./PluginsView";
 
 export function PluginsWindow() {
   useSecondaryWindowInterfaceStyle();
+  useOverlayScrollbars();
   const handleClose = useCallback(async () => {
     const bridge = getDesktopBridge();
     if (bridge?.closePluginsWindow) {

@@ -103,6 +103,15 @@ interface LibrarySwitcherLifecycleResult {
     reports: number;
     unhandledRejections: number;
   };
+  managedLibraryWizard?: {
+    createPersisted: boolean;
+    explicitCloseRemoved: boolean;
+    firstRunPersisted: boolean;
+    focusRestored: boolean;
+    modeSwitchPersisted: boolean;
+    restoreModeSelected: boolean;
+    restorePersisted: boolean;
+  };
 }
 
 interface MountedScenario {
@@ -541,6 +550,78 @@ async function runProductionWiringScenario() {
   };
   await unmountScenario(mounted);
   return result;
+}
+
+async function runManagedLibraryWizardScenario() {
+  installBridge();
+  const control: ScenarioControl = { api: null };
+  const mounted = await mountScenario(
+    <OverlayProvider>
+      <ProductionLibrarySwitcherScenario control={control} />
+    </OverlayProvider>,
+  );
+  const trigger = await openFromTitlebar();
+  const switcher = await findOpenSurface("library-root");
+  if (!switcher) throw new Error("Library root was not available for create wizard");
+  await requestNativeClick(await findButton("创建资源库…", switcher));
+  const createWizard = await findOpenLayer("managed-library-wizard");
+  if (!createWizard) throw new Error("Create Library wizard did not remain open");
+  await settle(220);
+  const createPersisted =
+    document.getElementById("managed-library-wizard")?.dataset.overlayState === "open" &&
+    control.api?.activeRootId === "managed-library";
+  await requestNativeClick(await findButton("从 OneDrive 恢复", createWizard));
+  await settle(220);
+  const modeSwitchPersisted =
+    document.getElementById("managed-library-wizard")?.dataset.overlayState === "open" &&
+    createWizard.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.textContent?.trim() ===
+      "从 OneDrive 恢复";
+  await requestNativeClick(await findButton("取消", createWizard));
+  await waitForLayerRemoval("managed-library-wizard");
+  const explicitCloseRemoved = document.getElementById("managed-library-wizard") === null;
+  const focusRestored = document.activeElement === trigger;
+
+  await requestNativeClick(trigger);
+  const restoreSwitcher = await findOpenSurface("library-root");
+  if (!restoreSwitcher) throw new Error("Library root was not available for restore wizard");
+  await requestNativeClick(await findButton("从 OneDrive 恢复…", restoreSwitcher));
+  const restoreWizard = await findOpenLayer("managed-library-wizard");
+  if (!restoreWizard) throw new Error("Restore from OneDrive wizard did not remain open");
+  await settle(220);
+  const restorePersisted =
+    document.getElementById("managed-library-wizard")?.dataset.overlayState === "open" &&
+    control.api?.activeRootId === "managed-library";
+  const restoreModeSelected =
+    restoreWizard.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.textContent?.trim() ===
+    "从 OneDrive 恢复";
+  await requestNativeClick(await findButton("取消", restoreWizard));
+  await waitForLayerRemoval("managed-library-wizard");
+  await unmountScenario(mounted);
+
+  installBridge({ listLibraries: async () => [] });
+  const firstRunControl: ScenarioControl = { api: null };
+  const firstRunMounted = await mountScenario(
+    <OverlayProvider>
+      <ProductionLibrarySwitcherScenario control={firstRunControl} />
+    </OverlayProvider>,
+  );
+  const firstRunWizard = await findOpenLayer("managed-library-wizard");
+  if (!firstRunWizard) throw new Error("First-run library wizard did not remain open");
+  await settle(220);
+  const firstRunPersisted =
+    firstRunWizard.dataset.overlayState === "open" &&
+    firstRunControl.api?.activeRootId === "managed-library";
+  await unmountScenario(firstRunMounted);
+
+  return {
+    createPersisted,
+    explicitCloseRemoved,
+    firstRunPersisted,
+    focusRestored,
+    modeSwitchPersisted,
+    restoreModeSelected,
+    restorePersisted,
+  };
 }
 
 async function runLoadingSourceFocusScenario() {
@@ -1235,6 +1316,7 @@ async function run(): Promise<void> {
       requestOwnership: await runRequestOwnershipScenario(),
       hardMediaCancellation: await runHardMediaCancellationScenario(),
       mutationFailures: await runMutationFailureScenario(),
+      managedLibraryWizard: await runManagedLibraryWizardScenario(),
       ok: true,
     };
   } catch (error) {

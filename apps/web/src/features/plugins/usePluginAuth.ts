@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CoreApiError } from "@megle/core-client";
-import type {
-  OneDriveConfigurationPlan,
-  PluginAuthBeginResponse,
-} from "@megle/core-client";
+import type { PluginAuthBeginResponse } from "@megle/core-client";
 import { createCoreClient } from "../../core/client";
 import { copyText, openExternalAuthorizationUrl, requestOAuthReturnFocus } from "../../core/desktop";
 import { ONEDRIVE_PLUGIN_ID, pluginAuthPrimaryAction } from "./pluginAuthModel";
@@ -35,7 +32,6 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
   const [responseUri, setResponseUri] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
   const [directBusy, setDirectBusy] = useState(false);
-  const [configurationPlan, setConfigurationPlan] = useState<OneDriveConfigurationPlan | null>(null);
   const locallyStartedFlowRef = useRef<string | null>(null);
   const previousAuthStateRef = useRef<string | null | undefined>(undefined);
 
@@ -58,7 +54,7 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
     previousAuthStateRef.current = current;
     if (current === "authenticated" && previous !== "authenticated" && locallyStartedFlowRef.current) {
       locallyStartedFlowRef.current = null;
-      void requestOAuthReturnFocus();
+      void requestOAuthReturnFocus().catch(() => undefined);
     } else if (current === "error" || current === "expired" || current === "signed-out") {
       locallyStartedFlowRef.current = null;
     }
@@ -195,46 +191,41 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
     return copied;
   }, [flow]);
 
-  const planConfiguration = useCallback(async (clientId: string | null) => {
-    if (!configuration) return null;
-    if (directBusy) return null;
+  const saveConfiguration = useCallback(async (clientId: string) => {
+    if (!configuration) throw new Error("OneDrive 配置尚未加载，请稍后重试。");
+    if (directBusy) throw new Error("OneDrive 正在处理其他请求，请稍后重试。");
     setDirectBusy(true);
     setActionError(null);
     try {
-      const plan = await client.planOneDriveConfiguration({ clientId, expectedRevision: configuration.revision });
-      setConfigurationPlan(plan);
-      return plan;
-    } catch (cause) {
-      setActionError(errorMessage(cause));
-      throw cause;
-    } finally {
-      setDirectBusy(false);
-    }
-  }, [client, configuration, directBusy]);
-
-  const commitConfiguration = useCallback(async (confirmed: boolean) => {
-    if (!configurationPlan) return;
-    await run.mutateAsync(async () => {
+      const plan = await client.planOneDriveConfiguration({
+        clientId,
+        expectedRevision: configuration.revision,
+      });
       const committed = await client.commitOneDriveConfiguration({
-        planUuid: configurationPlan.planUuid,
-        expectedRevision: configurationPlan.expectedRevision,
-        confirmed,
+        planUuid: plan.planUuid,
+        expectedRevision: plan.expectedRevision,
+        confirmed: Boolean(plan.effectiveChanged && plan.requiresConfirmation),
       });
       if (!committed.configured) {
         throw new Error("OneDrive Client ID 保存后尚未生效，请重试。");
       }
+      setFlow(null);
+      setResponseUri("");
+      await Promise.all([
+        invalidate(),
+        queryClient.invalidateQueries({ queryKey: ONEDRIVE_CONFIGURATION_QUERY_KEY }),
+      ]);
       return committed;
-    });
-    setConfigurationPlan(null);
-    setFlow(null);
-    setResponseUri("");
-    await Promise.all([invalidate(), queryClient.invalidateQueries({ queryKey: ONEDRIVE_CONFIGURATION_QUERY_KEY })]);
-  }, [client, configurationPlan, invalidate, queryClient, run]);
+    } catch (cause) {
+      throw new Error(errorMessage(cause));
+    } finally {
+      setDirectBusy(false);
+    }
+  }, [client, configuration, directBusy, invalidate, queryClient]);
 
   return {
     plugin,
     configuration,
-    configurationPlan,
     primaryAction: pluginAuthPrimaryAction(plugin, configuration),
     flow,
     responseUri,
@@ -253,8 +244,6 @@ export function usePluginAuth(pluginId = ONEDRIVE_PLUGIN_ID, onChanged?: () => v
     cancel,
     signOut,
     copyAuthorizationUrl,
-    planConfiguration,
-    commitConfiguration,
-    clearConfigurationPlan: () => setConfigurationPlan(null),
+    saveConfiguration,
   };
 }

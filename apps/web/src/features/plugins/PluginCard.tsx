@@ -66,8 +66,10 @@ export function PluginCard({
         <span className="plugin-card-icon" data-direct-contact-content>
           <PluginIcon aria-hidden="true" size={16} strokeWidth={1.8} />
         </span>
-        <span className="plugin-card-name" data-direct-contact-content>{plugin.name}</span>
-        <span className="plugin-card-version">v{plugin.selectedVersion}</span>
+        <span className="plugin-card-identity" data-direct-contact-content>
+          <span className="plugin-card-name">{plugin.name}</span>
+          <span className="plugin-card-version">v{plugin.selectedVersion}</span>
+        </span>
         <StatusPill status={plugin.runtimeState} title={errorTooltip} />
       </button>
     </div>

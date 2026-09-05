@@ -751,6 +751,12 @@ for (const value of ["applyInterfaceStyleVariables(readInterfaceStyle())", "prel
     fail(`web entry must initialize/preload secondary material before first window paint: ${value}`);
   }
 }
+if (!main.includes("<OverlayProvider>{children}</OverlayProvider>")) {
+  fail("all renderer roles must receive the shared overlay stack through ApplicationProviders");
+}
+if (main.includes("<ApplicationProviders><OverlayProvider>")) {
+  fail("OverlayProvider must not be limited to the main renderer role");
+}
 if (!pluginsWindow.includes("<PluginsView />")) {
   fail("PluginsWindow must render the existing PluginsView data surface");
 }

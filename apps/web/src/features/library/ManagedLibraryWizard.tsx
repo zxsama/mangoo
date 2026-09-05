@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import type { RemoteLibrarySummary, SyncRestorePlan, SyncRestorePreflight } from "@megle/core-client";
 import {
@@ -10,7 +10,10 @@ import { LiquidGlassButton } from "../../design/liquid-glass";
 import {
   ModalSurface,
   OverlayDialogActions,
+  OverlayDialogBody,
   OverlayDialogHeader,
+  OverlayField,
+  OverlayInlineStatus,
 } from "../../design/overlays";
 import {
   DEFAULT_LIBRARY_COLOR,
@@ -28,6 +31,7 @@ export interface ManagedLibraryWizardProps {
   onCreated: () => void;
   onFailure: (cause: unknown) => void;
   open: boolean;
+  restoreFocusRef?: RefObject<HTMLElement | null>;
 }
 
 function formatRemoteSize(bytes: number | null) {
@@ -45,6 +49,7 @@ export function ManagedLibraryWizard({
   onCreated,
   onFailure,
   open,
+  restoreFocusRef,
 }: ManagedLibraryWizardProps) {
   const [mode, setMode] = useState<"create" | "restore">(initialMode);
   const [name, setName] = useState("Library");
@@ -332,14 +337,16 @@ export function ManagedLibraryWizard({
       ariaDescribedBy="managed-library-wizard-description"
       ariaLabelledBy="managed-library-wizard-title"
       busy={busy}
+      className="managed-library-wizard"
       id="managed-library-wizard"
-      initialFocusRef={nameRef}
+      initialFocusRef={mode === "create" ? nameRef : restoreModeRef}
       onDismiss={() => {
         if (!busy) onClose();
       }}
       open={open}
+      restoreFocusRef={restoreFocusRef}
       role="dialog"
-      rootId="library"
+      rootId="managed-library"
     >
       <OverlayDialogHeader
         description={mode === "restore" ? "选择一个或多个 OneDrive 资源库，并为每个资源库指定本机根目录。" : firstRun ? "选择固定根目录，创建此设备上的第一个资源库。" : "先创建本机资源库；同步可选且不会阻塞本地使用。"}
@@ -347,84 +354,98 @@ export function ManagedLibraryWizard({
         title={firstRun ? "开始使用 Megle" : mode === "restore" ? "从 OneDrive 恢复" : "创建资源库"}
         titleId="managed-library-wizard-title"
       />
-      <div aria-label="资源库来源" className="managed-library-mode" role="tablist">
-        <button aria-selected={mode === "create"} data-selected={mode === "create"} onClick={() => { authResumeRef.current = null; setAuthResumePending(false); setMode("create"); setRestorePreflight(null); setRestoreItems(null); }} role="tab" type="button">新建本机资源库</button>
-        <button aria-selected={mode === "restore"} data-selected={mode === "restore"} onClick={() => { authResumeRef.current = null; setAuthResumePending(false); setMode("restore"); setRestorePreflight(null); setRestoreItems(null); }} ref={restoreModeRef} role="tab" type="button">从 OneDrive 恢复</button>
-      </div>
-      {auth.plugin?.authState !== "authenticated" && (mode === "restore" || enableSync) ? (
-        <div className="managed-library-auth-required">
-          <p>连接 OneDrive 后会回到此流程；登录期间只在内存中保留当前模式和目标。</p>
-          <OneDriveAccountSetupContent
-            compact
-            controller={auth}
-            onBeforeBegin={prepareAuthResume}
-            onCancelled={() => { authResumeRef.current = null; setAuthResumePending(false); }}
-          />
+      <OverlayDialogBody className="managed-library-wizard-body" data-overlay-scroll-container>
+        <div aria-label="资源库来源" className="managed-library-mode" role="tablist">
+          <LiquidGlassButton active={mode === "create"} aria-selected={mode === "create"} onClick={() => { authResumeRef.current = null; setAuthResumePending(false); setMode("create"); setRestorePreflight(null); setRestoreItems(null); }} role="tab" type="button">新建本机资源库</LiquidGlassButton>
+          <LiquidGlassButton active={mode === "restore"} aria-selected={mode === "restore"} onClick={() => { authResumeRef.current = null; setAuthResumePending(false); setMode("restore"); setRestorePreflight(null); setRestoreItems(null); }} ref={restoreModeRef} role="tab" type="button">从 OneDrive 恢复</LiquidGlassButton>
         </div>
-      ) : null}
-      {mode === "create" ? <><label className="overlay-field">
-        <span>名称</span>
-        <input ref={nameRef} value={name} onChange={(event) => setName(event.target.value)} />
-      </label>
-      <LibraryIconPicker
-        color={color}
-        icon={icon}
-        onPick={(nextIcon, nextColor) => {
-          setIcon(nextIcon);
-          setColor(nextColor);
-        }}
-        presentation="overlay"
-      />
-      <div className="managed-library-wizard-root">
-        <span>{managedRoot ?? "尚未选择目录"}</span>
-        <LiquidGlassButton disabled={busy} onClick={() => void chooseRoot()} type="button">
-          选择目录…
-        </LiquidGlassButton>
-      </div>
-      <label className="managed-library-enable-sync">
-        <input checked={enableSync} onChange={(event) => setEnableSync(event.target.checked)} type="checkbox" />
-        <span>创建后启用 OneDrive 同步（登录或网络失败不会删除本机资源库）</span>
-      </label></> : <div aria-busy={remoteLoading} className="managed-library-remote-list" role="group">
-        {remoteLoading ? <p role="status">正在发现远端资源库…</p> : null}
-        {!remoteLoading && remoteLibraries.length === 0 ? <p role="status">{auth.plugin?.authState === "authenticated" ? "当前账户没有可恢复的远端资源库。" : "请先连接 OneDrive 以发现可恢复的资源库。"}</p> : null}
-        {remoteLibraries.map((remote) => {
-          const selected = selectedRemoteIds.has(remote.libraryUuid);
-          const remoteDetails = [
-            remote.mediaCount == null ? null : `${remote.mediaCount.toLocaleString()} 项`,
-            formatRemoteSize(remote.logicalBytes),
-            remote.lastSyncedAt == null ? null : `同步于 ${new Date(remote.lastSyncedAt).toLocaleString()}`,
-          ].filter(Boolean).join(" · ");
-          return <div className="managed-library-remote-card" key={`${remote.accountUuid}:${remote.libraryUuid}`}>
-            <label>
-              <input checked={selected} disabled={!remote.compatible || remote.boundLocally} onChange={(event) => setSelectedRemoteIds((current) => {
-                const next = new Set(current);
-                if (event.target.checked) next.add(remote.libraryUuid); else next.delete(remote.libraryUuid);
-                setRestorePreflight(null);
-                setRestoreItems(null);
-                return next;
-              })} type="checkbox" />
-              <span><strong>{remote.name}</strong><small>{remote.boundLocally ? "已在本机绑定" : remote.compatible ? "可恢复" : remote.errorCode ?? "描述损坏或版本不兼容"}</small>{remoteDetails ? <small>{remoteDetails}</small> : null}</span>
-            </label>
-            {selected ? <div className="managed-library-wizard-root"><span>{restoreRoots[remote.libraryUuid] ?? "尚未选择目录"}</span><LiquidGlassButton disabled={busy} onClick={() => void chooseRestoreRoot(remote)} type="button">选择目录…</LiquidGlassButton></div> : null}
-          </div>;
-        })}
-      </div>}
-      {mode === "restore" && restorePreflight ? <div className="managed-library-restore-confirm" role="status">
-        <strong>恢复预检已通过</strong>
-        <span>{restorePreflight.totalItems} 个资源库 · 预计占用 {formatRemoteSize(restorePreflight.totalBytes)}</span>
-        <small>确认后才会创建本机资源库和启动恢复任务。</small>
-      </div> : null}
-      {mode === "restore" && restorePlans.length ? <div aria-live="polite" className="managed-library-restore-progress">
-        {visibleRestorePlans.map((plan) => <div key={plan.restoreUuid}>
-          <div className="managed-library-restore-progress-copy"><strong>{plan.name}</strong><span>{plan.phase} · {plan.mediaItemsDone}/{plan.mediaItemsTotal ?? "?"}</span><progress max={Math.max(plan.mediaItemsTotal ?? 1, 1)} value={plan.mediaItemsDone} /></div>
-          <div className="managed-library-restore-progress-actions">
-            {plan.state === "paused" ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "resume")} type="button">继续</LiquidGlassButton> : !["complete", "cancelled", "failed"].includes(plan.state) ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "pause")} type="button">暂停</LiquidGlassButton> : null}
-            {!plan.catalogReady && !["complete", "cancelled", "failed"].includes(plan.state) ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "cancel")} tone="danger" type="button">取消恢复</LiquidGlassButton> : null}
+        {auth.plugin?.authState !== "authenticated" && (mode === "restore" || enableSync) ? (
+          <section className="managed-library-auth-required">
+            <p>连接 OneDrive 后会自动回到此流程，并保留当前模式和选择。</p>
+            <OneDriveAccountSetupContent
+              compact
+              controller={auth}
+              onBeforeBegin={prepareAuthResume}
+              onCancelled={() => { authResumeRef.current = null; setAuthResumePending(false); }}
+              overlayRootId="managed-library"
+            />
+          </section>
+        ) : null}
+        {mode === "create" ? <section className="managed-library-form-section">
+          <OverlayField
+            disabled={busy}
+            inputRef={nameRef}
+            label="名称"
+            onChange={(event) => setName(event.target.value)}
+            value={name}
+          />
+          <div className="managed-library-icon-field">
+            <span>图标与颜色</span>
+            <LibraryIconPicker
+              color={color}
+              icon={icon}
+              onPick={(nextIcon, nextColor) => {
+                setIcon(nextIcon);
+                setColor(nextColor);
+              }}
+              presentation="overlay"
+            />
           </div>
-        </div>)}
-      </div> : null}
-      {error ? <div className="settings-inline-error">{error}</div> : null}
-      <OverlayDialogActions>
+          <div className="managed-library-root-field">
+            <span className="managed-library-field-label">本机根目录</span>
+            <div className="managed-library-wizard-root">
+              <span>{managedRoot ?? "尚未选择目录"}</span>
+              <LiquidGlassButton disabled={busy} onClick={() => void chooseRoot()} type="button">
+                选择目录…
+              </LiquidGlassButton>
+            </div>
+          </div>
+          <label className="managed-library-enable-sync">
+            <input checked={enableSync} onChange={(event) => setEnableSync(event.target.checked)} type="checkbox" />
+            <span>创建后启用 OneDrive 同步（登录或网络失败不会删除本机资源库）</span>
+          </label>
+        </section> : <section aria-busy={remoteLoading} className="managed-library-remote-list" role="group">
+          {remoteLoading ? <p role="status">正在发现远端资源库…</p> : null}
+          {!remoteLoading && remoteLibraries.length === 0 ? <p role="status">{auth.plugin?.authState === "authenticated" ? "当前账户没有可恢复的远端资源库。" : "请先连接 OneDrive 以发现可恢复的资源库。"}</p> : null}
+          {remoteLibraries.map((remote) => {
+            const selected = selectedRemoteIds.has(remote.libraryUuid);
+            const remoteDetails = [
+              remote.mediaCount == null ? null : `${remote.mediaCount.toLocaleString()} 项`,
+              formatRemoteSize(remote.logicalBytes),
+              remote.lastSyncedAt == null ? null : `同步于 ${new Date(remote.lastSyncedAt).toLocaleString()}`,
+            ].filter(Boolean).join(" · ");
+            return <div className="managed-library-remote-card" key={`${remote.accountUuid}:${remote.libraryUuid}`}>
+              <label>
+                <input checked={selected} disabled={!remote.compatible || remote.boundLocally} onChange={(event) => setSelectedRemoteIds((current) => {
+                  const next = new Set(current);
+                  if (event.target.checked) next.add(remote.libraryUuid); else next.delete(remote.libraryUuid);
+                  setRestorePreflight(null);
+                  setRestoreItems(null);
+                  return next;
+                })} type="checkbox" />
+                <span><strong>{remote.name}</strong><small>{remote.boundLocally ? "已在本机绑定" : remote.compatible ? "可恢复" : remote.errorCode ?? "描述损坏或版本不兼容"}</small>{remoteDetails ? <small>{remoteDetails}</small> : null}</span>
+              </label>
+              {selected ? <div className="managed-library-wizard-root"><span>{restoreRoots[remote.libraryUuid] ?? "尚未选择目录"}</span><LiquidGlassButton disabled={busy} onClick={() => void chooseRestoreRoot(remote)} type="button">选择目录…</LiquidGlassButton></div> : null}
+            </div>;
+          })}
+        </section>}
+        {mode === "restore" && restorePreflight ? <div className="managed-library-restore-confirm" role="status">
+          <strong>恢复预检已通过</strong>
+          <span>{restorePreflight.totalItems} 个资源库 · 预计占用 {formatRemoteSize(restorePreflight.totalBytes)}</span>
+          <small>确认后才会创建本机资源库和启动恢复任务。</small>
+        </div> : null}
+        {mode === "restore" && restorePlans.length ? <div aria-live="polite" className="managed-library-restore-progress">
+          {visibleRestorePlans.map((plan) => <div key={plan.restoreUuid}>
+            <div className="managed-library-restore-progress-copy"><strong>{plan.name}</strong><span>{plan.phase} · {plan.mediaItemsDone}/{plan.mediaItemsTotal ?? "?"}</span><progress max={Math.max(plan.mediaItemsTotal ?? 1, 1)} value={plan.mediaItemsDone} /></div>
+            <div className="managed-library-restore-progress-actions">
+              {plan.state === "paused" ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "resume")} type="button">继续</LiquidGlassButton> : !["complete", "cancelled", "failed"].includes(plan.state) ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "pause")} type="button">暂停</LiquidGlassButton> : null}
+              {!plan.catalogReady && !["complete", "cancelled", "failed"].includes(plan.state) ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "cancel")} tone="danger" type="button">取消恢复</LiquidGlassButton> : null}
+            </div>
+          </div>)}
+        </div> : null}
+        {error ? <OverlayInlineStatus tone="error">{error}</OverlayInlineStatus> : null}
+      </OverlayDialogBody>
+      <OverlayDialogActions className="managed-library-wizard-actions">
         {!firstRun ? <LiquidGlassButton disabled={busy} onClick={onClose} type="button">取消</LiquidGlassButton> : null}
         {mode === "restore" && restorePlans.length ? <LiquidGlassButton onClick={onClose} type="button">完成</LiquidGlassButton> : <LiquidGlassButton disabled={busy || (mode === "restore" && selectedRemote.length === 0)} onClick={() => void (mode === "create" ? submit() : restorePreflight ? confirmRestore() : submitRestore())} type="button">
           {busy ? (mode === "restore" ? "正在处理…" : "正在创建…") : mode === "restore" ? restorePreflight ? `确认并恢复 ${restorePreflight.totalItems} 个资源库` : `预检 ${selectedRemote.length || ""} 个资源库` : "创建并打开"}

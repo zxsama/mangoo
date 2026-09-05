@@ -1,6 +1,7 @@
 import { AlertTriangle } from "lucide-react";
 import { MediaLoadingRing } from "../loading/MediaLoadingRing";
-import { LiquidGlassSurface } from "../../design/liquid-glass";
+import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
+import { ModalSurface, OverlayDialogActions, OverlayDialogBody, OverlayDialogHeader } from "../../design/overlays";
 import { PluginCard } from "./PluginCard";
 import { PluginDetail } from "./PluginDetail";
 import { usePluginsData } from "./usePluginsData";
@@ -94,6 +95,28 @@ export function PluginsView() {
           </LiquidGlassSurface>
         </div>
       </div>
+      <ModalSurface
+        ariaDescribedBy="plugin-removal-error-description"
+        ariaLabelledBy="plugin-removal-error-title"
+        id="plugin-removal-error-dialog"
+        onDismiss={plugins.dismissRemovalError}
+        open={Boolean(plugins.removalError)}
+        role="alertdialog"
+        rootId="library"
+      >
+        <OverlayDialogHeader
+          description="需要先解除使用关系"
+          descriptionId="plugin-removal-error-description"
+          title="无法移除插件"
+          titleId="plugin-removal-error-title"
+        />
+        <OverlayDialogBody>
+          <p className="overlay-dialog-text">{plugins.removalError}</p>
+        </OverlayDialogBody>
+        <OverlayDialogActions>
+          <LiquidGlassButton onClick={plugins.dismissRemovalError} tone="primary" type="button">知道了</LiquidGlassButton>
+        </OverlayDialogActions>
+      </ModalSurface>
     </section>
   );
 }

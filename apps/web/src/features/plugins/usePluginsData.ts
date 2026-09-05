@@ -26,6 +26,7 @@ export interface PluginsState {
   loading: boolean;
   busyPluginIds: Set<string>;
   error: string | null;
+  removalError: string | null;
   lastDiscovery: PluginsDiscoverySummary | null;
   selectPlugin: (id: string | null) => void;
   refresh: () => Promise<void>;
@@ -34,6 +35,7 @@ export interface PluginsState {
   approvePermissions: (id: string) => Promise<void>;
   retry: (id: string) => Promise<void>;
   remove: (id: string) => Promise<void>;
+  dismissRemovalError: () => void;
 }
 
 interface PluginDiscoveryCoordinatorOptions {
@@ -110,6 +112,7 @@ export function usePluginsData(): PluginsState {
   const [selectedPluginId, setSelectedPluginId] = useState<string | null>(null);
   const [busyPluginIds, setBusyPluginIds] = useState<Set<string>>(() => new Set());
   const [actionError, setActionError] = useState<string | null>(null);
+  const [removalError, setRemovalError] = useState<string | null>(null);
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [lastDiscovery, setLastDiscovery] = useState<PluginsDiscoverySummary | null>(null);
 
@@ -210,6 +213,7 @@ export function usePluginsData(): PluginsState {
     },
     onMutate: (request) => {
       setActionError(null);
+      if (request.kind === "remove") setRemovalError(null);
       markBusy(pluginMutationId(request), true);
     },
     onSuccess: async (result) => {
@@ -227,7 +231,14 @@ export function usePluginsData(): PluginsState {
       }
       await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY, exact: true });
     },
-    onError: (cause) => setActionError(errorMessage(cause)),
+    onError: (cause, request) => {
+      const message = errorMessage(cause);
+      if (request.kind === "remove" && cause instanceof CoreApiError && cause.status === 409) {
+        setRemovalError("此插件仍被账号或资源库使用，暂时无法移除。请先退出账号并解除相关资源库绑定。");
+      } else {
+        setActionError(message);
+      }
+    },
     onSettled: (_data, _error, request) => markBusy(pluginMutationId(request), false)
   });
 
@@ -281,6 +292,7 @@ export function usePluginsData(): PluginsState {
       actionError ??
       discoveryError ??
       (pluginsQueryError ? errorMessage(pluginsQueryError) : null),
+    removalError,
     lastDiscovery,
     selectPlugin,
     refresh,
@@ -288,7 +300,8 @@ export function usePluginsData(): PluginsState {
     disable,
     approvePermissions,
     retry,
-    remove
+    remove,
+    dismissRemovalError: () => setRemovalError(null)
   };
 }
 

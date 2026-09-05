@@ -91,6 +91,7 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(controller, /useQuery\(/);
     assert.match(controller, /cancelPluginAuth/);
     assert.match(controller, /requestOAuthReturnFocus/);
+    assert.match(controller, /requestOAuthReturnFocus\(\)\.catch\(\(\) => undefined\)/);
     assert.match(controller, /locallyStartedFlowRef/);
     assert.match(controller, /prepareConfiguration/);
     assert.match(controller, /permissions: plugin\.requestedPermissions/);
@@ -105,7 +106,7 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(setupWizard, /配置进度/);
     assert.match(setupWizard, /http:\/\/localhost\/plugin-auth\/callback/);
     assert.match(setupWizard, /移动和桌面应用程序/);
-    assert.match(setupWizard, /允许公共客户端流/);
+    assert.match(setupWizard, /Authentication \(Preview\) → 设置 → 允许公共客户端流 → 已启用/);
     assert.doesNotMatch(setupWizard, /User\.Read/);
     assert.doesNotMatch(setupWizard, /<button\b/);
     assert.match(setupWizard, /onedrive-setup-actions/);
@@ -113,13 +114,21 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(setupWizard, /data-overlay-scroll-container/);
     assert.match(setupWizard, /应用程序\(客户端\) ID/);
     assert.match(setupWizard, /clientIdValid/);
+    assert.match(setupWizard, /OverlayField/);
+    assert.match(setupWizard, /应用注册 → 新注册 → 新注册应用程序/);
+    assert.match(setupWizard, /Authentication \(Preview\) → 重定向 URI 配置 → 添加重定向 URI → 移动和桌面应用程序 → 重定向 URI/);
+    assert.match(setupWizard, /API 权限 → 添加权限 → Microsoft Graph → 委托的权限 → Files\.ReadWrite\.AppFolder → 添加权限/);
+    assert.match(setupWizard, /await auth\.saveConfiguration\(normalizedClientId\)/);
+    assert.doesNotMatch(setupWizard, /检查配置|确认并继续|配置将发生变化|配置有效|修改 Client ID|onedrive-client-id-card|粘贴后/);
     assert.match(setupWizard, /auth\.plugin\?\.authState === "authenticated"/);
-    assert.match(setup, /确认切换 OneDrive 账号/);
-    assert.match(setup, /配置已生效/);
-    assert.match(setup, /配置未生效/);
-    assert.match(setup, /configurationStatusDescription/);
+    assert.match(setup, /重新配置/);
+    assert.match(setup, /切换账号/);
+    assert.match(setup, /退出账号/);
+    assert.match(setup, /onedrive-connection-status/);
+    assert.doesNotMatch(setup, /配置状态|configurationStatus/);
+    assert.doesNotMatch(setup, /accountStatusDescription/);
     assert.doesNotMatch(setup, />登录 Microsoft 账号<|>继续登录<|>重新连接</);
-    assert.match(setup, /oneDriveSetupRecoveryStep\(auth\.error \?\? auth\.plugin\?\.lastErrorDetail \?\? null\) \?\? deriveOneDriveSetupStep\(auth\.configuration, false\)/);
+    assert.match(setup, /authenticated \? 2 : deriveOneDriveSetupStep\(auth\.configuration, false\)/);
     assert.match(setup, /auth\.plugin\?\.runtimeState === "degraded" \|\| auth\.plugin\?\.runtimeState === "crashed-backoff"/);
     assert.doesNotMatch(setup, /<button\b/);
     assert.match(wizard, /authResumeRef/);
@@ -133,6 +142,9 @@ describe("OneDrive plugin auth presentation", () => {
 
     assert.match(setup, /OneDriveSetupWizard/);
     assert.match(setup, /配置 OneDrive/);
+    assert.match(setup, /重新配置/);
+    assert.match(setup, /切换账号/);
+    assert.match(setup, /退出账号/);
     assert.doesNotMatch(setup, /高级配置|检查更改|预览更改|收起高级配置/);
     assert.doesNotMatch(setup, /重新扫描/);
     assert.doesNotMatch(card, /plugin-toggle|onToggleEnabled|aria-label=\{toggleLabel\}/);
@@ -143,6 +155,7 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(card, /id=\{pluginTabId\(plugin\.pluginId\)\}/);
     assert.match(card, /onKeyDown=\{handleTabKeyDown\}/);
     assert.match(card, /\{plugin\.name\}/);
+    assert.match(card, /plugin-card-identity/);
     assert.match(card, /plugin-card-icon/);
     assert.doesNotMatch(card, /LiquidGlassSurface|aria-pressed/);
     assert.doesNotMatch(card, /plugin-card-error|plugin-toggle-label/);
@@ -155,6 +168,7 @@ describe("OneDrive plugin auth presentation", () => {
     assert.match(detail, /id=\{pluginPanelId\(plugin\.pluginId\)\}/);
     assert.match(detail, /role="tabpanel"/);
     assert.match(detail, /tone="danger"/);
+    assert.doesNotMatch(detail, /账号或资源库仍引用此 Provider 时无法移除/);
     assert.doesNotMatch(detail, /<dt>Intent<\/dt>|<dt>Authentication<\/dt>|plugin-detail-id/);
   });
 });

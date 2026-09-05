@@ -151,6 +151,7 @@ const pluginsView = read("apps/web/src/features/plugins/PluginsView.tsx");
 const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
 const pluginCard = read("apps/web/src/features/plugins/PluginCard.tsx");
 const pluginDetail = read("apps/web/src/features/plugins/PluginDetail.tsx");
+const statusPill = read("apps/web/src/features/plugins/StatusPill.tsx");
 const oneDriveAccountSetup = read("apps/web/src/features/plugins/OneDriveAccountSetup.tsx");
 const oneDriveSetupWizard = read("apps/web/src/features/plugins/OneDriveSetupWizard.tsx");
 const oneDriveManifestTemplate = read("bundled-plugins/com.megle.onedrive/plugin.template.json");
@@ -1471,6 +1472,8 @@ for (const value of [
   "onKeyDown={handleTabKeyDown}",
   "{plugin.name}",
   "plugin-card-icon",
+  "plugin-card-identity",
+  "plugin-card-version",
   "<StatusPill"
 ]) {
   if (!pluginCard.includes(value)) {
@@ -1521,13 +1524,25 @@ for (const value of [
 for (const value of [
   "OneDriveSetupWizard",
   "配置 OneDrive",
-  "配置未生效",
-  "配置已生效",
-  "configurationStatusDescription"
+  "onedrive-connection-status",
+  "重新配置",
+  "切换账号",
+  "退出账号"
 ]) {
   if (!oneDriveAccountSetup.includes(value)) {
     fail(`OneDrive concise setup entry contract missing ${value}`);
   }
+}
+for (const retiredValue of ["配置状态", "configurationStatus", "configurationStatusDescription"]) {
+  if (oneDriveAccountSetup.includes(retiredValue)) {
+    fail(`OneDrive setup must keep connection state in one location; found ${retiredValue}`);
+  }
+}
+if (!statusPill.includes('ready: "Enable"')) {
+  fail('Plugin ready status must use the product label "Enable"');
+}
+if (pluginDetail.includes("账号或资源库仍引用此 Provider 时无法移除。")) {
+  fail("PluginDetail must show the dependency explanation only after a rejected removal");
 }
 for (const retiredAction of [">登录 Microsoft 账号<", ">继续登录<", ">重新连接<"]) {
   if (oneDriveAccountSetup.includes(retiredAction)) {
@@ -1538,15 +1553,20 @@ for (const value of [
   "配置 OneDrive 应用",
   "配置进度",
   "注册并配置应用",
+  "新注册应用程序",
   "保存 Client ID",
   "登录验证",
   "应用程序(客户端) ID",
   "任何 Entra ID 租户 + 个人 Microsoft 帐户",
-  "Authentication (Preview) → 设置 → 允许公共客户端流",
+  "Authentication (Preview) → 设置 → 允许公共客户端流 → 已启用",
   "Files.ReadWrite.AppFolder",
   "http://localhost/plugin-auth/callback",
   "移动和桌面应用程序",
   "允许公共客户端流",
+  "应用注册 → 新注册 → 新注册应用程序",
+  "Authentication (Preview) → 重定向 URI 配置 → 添加重定向 URI → 移动和桌面应用程序 → 重定向 URI",
+  "API 权限 → 添加权限 → Microsoft Graph → 委托的权限 → Files.ReadWrite.AppFolder → 添加权限",
+  "OverlayField",
   "data-overlay-scroll-container",
   "manual-response-uri",
   "clientIdValid",
@@ -1562,6 +1582,14 @@ for (const retiredValue of ["Megle OneDrive Sync Provider", "启用 OneDrive", "
     fail(`OneDrive retired setup contract must be absent: ${retiredValue}`);
   }
 }
+for (const retiredValue of ["检查配置", "确认并继续", "配置将发生变化", "配置有效", "修改 Client ID", "onedrive-client-id-card", "粘贴后，Megle 会先检查格式和配置影响。"]) {
+  if (oneDriveSetupWizard.includes(retiredValue) || stylesForChecks.includes(retiredValue)) {
+    fail(`OneDrive wizard must not retain intermediate Client ID presentation: ${retiredValue}`);
+  }
+}
+if (oneDriveSetupWizard.includes("Windows 使用本机浏览器自动回调。")) {
+  fail("OneDrive wizard must not retain the Windows callback helper sentence");
+}
 if (!oneDriveManifestTemplate.includes('"name": "OneDrive Sync"')) {
   fail("OneDrive bundled manifest must expose the concise display name");
 }
@@ -1573,7 +1601,16 @@ for (const value of [
   "height: min(640px, calc(100vh - 40px))",
   "grid-template-columns: repeat(4, minmax(0, 1fr))",
   ".onedrive-setup-actions",
-  "justify-content: flex-end"
+  "justify-content: flex-end",
+  ".onedrive-setup-body[data-step=\"1\"]",
+  ".onedrive-setup-body:is([data-step=\"2\"], [data-step=\"4\"])",
+  ".onedrive-setup-client-id .overlay-field-control",
+  ".onedrive-setup-client-id .overlay-field-control:focus-within",
+  ".onedrive-setup-client-id .overlay-field-control:has(.overlay-field-input[aria-invalid=\"true\"])",
+  ".onedrive-setup-client-id .overlay-field[data-disabled=\"true\"] .overlay-field-control",
+  ".onedrive-client-id-input::placeholder",
+  ".onedrive-setup-client-id .overlay-field-error",
+  "appearance: none"
 ]) {
   if (!stylesForChecks.includes(value)) {
     fail(`OneDrive stable wizard shell contract missing ${value}`);

@@ -24,6 +24,7 @@ import {
   OverlayMenuList,
   OVERLAY_VIEWPORT_GUTTER_PX,
   pointOverlayAnchor,
+  useOverlayStack,
 } from "../../design/overlays";
 import {
   DEFAULT_LIBRARY_COLOR,
@@ -75,6 +76,7 @@ export function LibrarySwitcher({
   open,
   restoreFocusTarget,
 }: LibrarySwitcherProps) {
+  const overlays = useOverlayStack();
   const sync = useSyncOrchestration();
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [query, setQuery] = useState("");
@@ -89,9 +91,11 @@ export function LibrarySwitcher({
   const removeTriggerRef = useRef<HTMLButtonElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const mountedRef = useRef(false);
+  const previousOpenRef = useRef(open);
   const reloadGenerationRef = useRef(0);
   const sessionGenerationRef = useRef(0);
   const removePendingRef = useRef<number | null>(null);
+  const wizardRestoreFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -104,14 +108,18 @@ export function LibrarySwitcher({
   }, []);
 
   useEffect(() => {
+    const wasOpen = previousOpenRef.current;
+    previousOpenRef.current = open;
     sessionGenerationRef.current += 1;
     if (open) {
       void reload();
       return;
     }
-    reloadGenerationRef.current += 1;
-    removePendingRef.current = null;
-    dispatch({ type: "close-root" });
+    if (wasOpen) {
+      reloadGenerationRef.current += 1;
+      removePendingRef.current = null;
+      dispatch({ type: "close-root" });
+    }
   }, [open]);
 
   function ownsSession(generation: number): boolean {
@@ -136,6 +144,8 @@ export function LibrarySwitcher({
       setLibs(nextLibraries);
       if (detectFirstRun && nextLibraries.length === 0) {
         setFirstRun(true);
+        wizardRestoreFocusRef.current = restoreFocusTarget;
+        overlays.openRoot("managed-library");
         setWizardOpen(true);
       }
     } catch (cause) {
@@ -174,10 +184,17 @@ export function LibrarySwitcher({
     });
   }
 
-  async function onCreate() {
+  function openManagedLibraryWizard(mode: "create" | "restore") {
+    wizardRestoreFocusRef.current = restoreFocusTarget;
+    setWizardMode(mode);
     setFirstRun(false);
-    onClose();
-    window.requestAnimationFrame(() => setWizardOpen(true));
+    overlays.openRoot("managed-library");
+    setWizardOpen(true);
+  }
+
+  function closeManagedLibraryWizard() {
+    setWizardOpen(false);
+    overlays.closeRoot("managed-library");
   }
 
   async function onAddFolder() {
@@ -407,10 +424,10 @@ export function LibrarySwitcher({
 
   const footerActions = (
     <>
-      <LiquidGlassButton onClick={() => { setWizardMode("create"); void onCreate(); }} type="button">
+      <LiquidGlassButton onClick={() => openManagedLibraryWizard("create")} type="button">
         创建资源库…
       </LiquidGlassButton>
-      <LiquidGlassButton onClick={() => { setWizardMode("restore"); setFirstRun(false); onClose(); window.requestAnimationFrame(() => setWizardOpen(true)); }} type="button">
+      <LiquidGlassButton onClick={() => openManagedLibraryWizard("restore")} type="button">
         从 OneDrive 恢复…
       </LiquidGlassButton>
     </>
@@ -482,13 +499,14 @@ export function LibrarySwitcher({
       <ManagedLibraryWizard
         firstRun={firstRun}
         initialMode={wizardMode}
-        onClose={() => setWizardOpen(false)}
+        onClose={closeManagedLibraryWizard}
         onCreated={() => {
           setFirstRun(false);
           void reload();
         }}
         onFailure={(cause) => void reportFailure("library-create", "managed-root", cause)}
         open={wizardOpen}
+        restoreFocusRef={wizardRestoreFocusRef}
       />
     </>
   );

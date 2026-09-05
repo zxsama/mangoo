@@ -99,11 +99,20 @@ describe("shared overlay source contract", () => {
     "index.ts"
   ].map((path) => read(`src/design/overlays/${path}`)).join("\n");
 
-  it("mounts overlays only around the main app", () => {
+  it("mounts the shared overlay stack around every renderer role", () => {
     assert.match(mainSource, /design\/overlays\/overlay\.css/);
-    assert.match(mainSource, /<OverlayProvider>/);
+    assert.match(mainSource, /<OverlayProvider>\{children\}<\/OverlayProvider>/);
+    assert.match(mainSource, /<ApplicationProviders><SettingsWindow \/><\/ApplicationProviders>/);
+    assert.match(mainSource, /<ApplicationProviders><PluginsWindow \/><\/ApplicationProviders>/);
+    assert.match(mainSource, /<ApplicationProviders><NotificationWindow \/><\/ApplicationProviders>/);
+    assert.doesNotMatch(mainSource, /<ApplicationProviders><OverlayProvider>/);
     assert.doesNotMatch(settingsWindowSource, /OverlayProvider|AnchoredOverlay|ModalSurface/);
     assert.doesNotMatch(pluginsWindowSource, /OverlayProvider|AnchoredOverlay|ModalSurface/);
+  });
+
+  it("installs the shared overlay scrollbar controller in secondary dialog windows", () => {
+    assert.match(settingsWindowSource, /useOverlayScrollbars\(\)/);
+    assert.match(pluginsWindowSource, /useOverlayScrollbars\(\)/);
   });
 
   it("uses existing material variables and no forbidden dependencies", () => {

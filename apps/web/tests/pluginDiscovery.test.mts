@@ -145,5 +145,9 @@ describe("plugin automatic discovery", () => {
     assert.match(viewSource, /detected automatically/);
     assert.match(viewSource, /role="tablist"/);
     assert.match(viewSource, /aria-orientation="vertical"/);
+    assert.match(hookSource, /cause instanceof CoreApiError && cause\.status === 409/);
+    assert.match(viewSource, /title="无法移除插件"/);
+    assert.match(viewSource, /plugins\.removalError/);
+    assert.doesNotMatch(viewSource, /账号或资源库仍引用此 Provider 时无法移除/);
   });
 });

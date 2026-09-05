@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
+import { useOverlayScrollbars } from "../../app-shell/useOverlayScrollbars";
 import { useSecondaryWindowInterfaceStyle } from "../../app-shell/useSecondaryWindowInterfaceStyle";
 import { getDesktopBridge, listLibraries, subscribeLibraryPhase } from "../../core/desktop";
 import { createLibraryContextTracker } from "../../core/libraryContextTracker";
@@ -24,6 +25,7 @@ import { SettingsPanels } from "./settingsPanels";
 // BroadcastChannel reaches across them without any per-setting IPC.
 export function SettingsWindow() {
   const interfaceStyle = useSecondaryWindowInterfaceStyle({ broadcastChanges: true });
+  useOverlayScrollbars();
   const [gridPreferences, setGridPreferences] = useState<LibraryGridPreferences>(() =>
     readStoredLibraryGridPreferences()
   );

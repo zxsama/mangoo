@@ -14,7 +14,7 @@ import {
   Trash2,
   XCircle
 } from "lucide-react";
-import { useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
   deleteLibraryFile,
   listLibraries,
@@ -26,6 +26,7 @@ import {
 import type { LibrarySummary } from "../../core/libraryTypes";
 import type { LibraryState } from "../../core/useLibraryData";
 import { LiquidGlassButton, type InterfaceStyleController } from "../../design/liquid-glass";
+import { useOverlayStack } from "../../design/overlays";
 import { thumbnailFailureLogIntentForLibrary } from "../notifications/notificationModel";
 import { LibraryGlyph, LibraryIconPicker } from "../library/libraryGlyph";
 import { ManagedLibraryWizard } from "../library/ManagedLibraryWizard";
@@ -637,6 +638,7 @@ function ShortcutsTab() {
 // ---- Libraries tab: full library management (superset of the switcher) -----
 
 function LibrariesTab({ library }: { library: LibraryState }) {
+  const overlays = useOverlayStack();
   const sync = useSyncOrchestration();
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [iconMenuId, setIconMenuId] = useState<string | null>(null);
@@ -647,6 +649,22 @@ function LibrariesTab({ library }: { library: LibraryState }) {
   const [error, setError] = useState<string | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [wizardMode, setWizardMode] = useState<"create" | "restore">("create");
+  const wizardRestoreFocusRef = useRef<HTMLElement | null>(null);
+
+  const openManagedLibraryWizard = (
+    mode: "create" | "restore",
+    source: HTMLButtonElement,
+  ) => {
+    wizardRestoreFocusRef.current = source;
+    setWizardMode(mode);
+    overlays.openRoot("managed-library");
+    setWizardOpen(true);
+  };
+
+  const closeManagedLibraryWizard = () => {
+    setWizardOpen(false);
+    overlays.closeRoot("managed-library");
+  };
 
   const reload = () => void listLibraries().then(setLibs);
   useEffect(() => {
@@ -817,10 +835,10 @@ function LibrariesTab({ library }: { library: LibraryState }) {
           ))}
         </ul>
         <div className="settings-library-footer">
-          <LiquidGlassButton type="button" onClick={() => { setWizardMode("create"); setWizardOpen(true); }}>
+          <LiquidGlassButton type="button" onClick={(event) => openManagedLibraryWizard("create", event.currentTarget)}>
             创建资源库…
           </LiquidGlassButton>
-          <LiquidGlassButton type="button" onClick={() => { setWizardMode("restore"); setWizardOpen(true); }}>
+          <LiquidGlassButton type="button" onClick={(event) => openManagedLibraryWizard("restore", event.currentTarget)}>
             从 OneDrive 恢复…
           </LiquidGlassButton>
         </div>
@@ -843,10 +861,11 @@ function LibrariesTab({ library }: { library: LibraryState }) {
       />
       <ManagedLibraryWizard
         initialMode={wizardMode}
-        onClose={() => setWizardOpen(false)}
+        onClose={closeManagedLibraryWizard}
         onCreated={reload}
         onFailure={(cause) => setError(cause instanceof Error ? cause.message : String(cause))}
         open={wizardOpen}
+        restoreFocusRef={wizardRestoreFocusRef}
       />
     </>
   );

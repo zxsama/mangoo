@@ -80,6 +80,15 @@ interface LibrarySwitcherLifecycleResult {
     reports: number;
     unhandledRejections: number;
   };
+  managedLibraryWizard: {
+    createPersisted: boolean;
+    explicitCloseRemoved: boolean;
+    firstRunPersisted: boolean;
+    focusRestored: boolean;
+    modeSwitchPersisted: boolean;
+    restoreModeSelected: boolean;
+    restorePersisted: boolean;
+  };
 }
 
 const webRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -278,6 +287,18 @@ describe("mounted LibrarySwitcher lifecycle", () => {
     assert.deepEqual(result.mutationFailures, {
       reports: 3,
       unhandledRejections: 0,
+    });
+  });
+
+  it("keeps create, restore, and first-run library dialogs open until explicit close", () => {
+    assert.deepEqual(result.managedLibraryWizard, {
+      createPersisted: true,
+      explicitCloseRemoved: true,
+      firstRunPersisted: true,
+      focusRestored: true,
+      modeSwitchPersisted: true,
+      restoreModeSelected: true,
+      restorePersisted: true,
     });
   });
 });

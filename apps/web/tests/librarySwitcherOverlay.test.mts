@@ -10,6 +10,7 @@ describe("library switcher overlay migration", () => {
   const switcherSource = read("src/features/library/LibrarySwitcher.tsx");
   const libraryGlyphSource = read("src/features/library/libraryGlyph.tsx");
   const settingsPanelsSource = read("src/features/settings/settingsPanels.tsx");
+  const managedLibraryWizardSource = read("src/features/library/ManagedLibraryWizard.tsx");
   const stylesSource = read("src/styles.css");
   const uiValidatorSource = read("../../tools/checks/validate-ui-design.mjs");
 
@@ -18,6 +19,17 @@ describe("library switcher overlay migration", () => {
     assert.match(switcherSource, /AnchoredOverlay/);
     assert.match(switcherSource, /ModalSurface/);
     assert.match(switcherSource, /surfaceRole="nested"/);
+  });
+
+  it("gives managed library flows independent modal ownership and shared dialog controls", () => {
+    assert.match(switcherSource, /openRoot\("managed-library"\)/);
+    assert.match(settingsPanelsSource, /openRoot\("managed-library"\)/);
+    assert.match(managedLibraryWizardSource, /rootId="managed-library"/);
+    assert.match(managedLibraryWizardSource, /overlayRootId="managed-library"/);
+    assert.match(managedLibraryWizardSource, /OverlayDialogBody/);
+    assert.match(managedLibraryWizardSource, /OverlayField/);
+    assert.match(managedLibraryWizardSource, /data-overlay-scroll-container/);
+    assert.doesNotMatch(switcherSource, /requestAnimationFrame\(\(\) => setWizardOpen/);
   });
 
   it("removes local popup and backdrop implementations", () => {

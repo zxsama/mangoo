@@ -15,7 +15,11 @@ applyInterfaceStyleVariables(readInterfaceStyle());
 installSyncWakeBridge();
 
 function ApplicationProviders({ children }: { children: React.ReactNode }) {
-  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+  return (
+    <QueryClientProvider client={queryClient}>
+      <OverlayProvider>{children}</OverlayProvider>
+    </QueryClientProvider>
+  );
 }
 
 // Secondary OS windows load this same bundle with a role + matching hash route.
@@ -57,7 +61,7 @@ if (isNotificationsWindow) {
   void import("./app/App").then(({ App }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>
-        <ApplicationProviders><OverlayProvider><App /></OverlayProvider></ApplicationProviders>
+        <ApplicationProviders><App /></ApplicationProviders>
       </React.StrictMode>
     );
     preloadSecondaryWindowRenderers();

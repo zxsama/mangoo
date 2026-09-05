@@ -6,6 +6,7 @@ export const NESTED_OVERLAY_OFFSET_PX = 4;
 
 export type OverlayRootId =
   | "library"
+  | "managed-library"
   | "filter"
   | "sort"
   | "layout"

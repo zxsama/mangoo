@@ -169,9 +169,6 @@ export function PluginDetail({
               <Trash2 aria-hidden="true" size={14} />
               <span>从注册表移除</span>
             </LiquidGlassButton>
-            <p className="plugin-delete-hint">
-              账号或资源库仍引用此 Provider 时无法移除。
-            </p>
           </div>
         </div>
       </details>
