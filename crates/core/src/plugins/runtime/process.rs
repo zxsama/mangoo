@@ -13,7 +13,7 @@ pub struct LaunchSpec {
 pub struct ChildProcess {
     child: Child,
     #[cfg(windows)]
-    job: WindowsJob,
+    _job: WindowsJob,
 }
 impl ChildProcess {
     pub fn spawn_verified(
@@ -51,11 +51,8 @@ impl ChildProcess {
         Ok(Self {
             child,
             #[cfg(windows)]
-            job,
+            _job: job,
         })
-    }
-    pub fn id(&self) -> Option<u32> {
-        self.child.id()
     }
     pub fn take_stdio(&mut self) -> std::io::Result<(ChildStdin, ChildStdout, ChildStderr)> {
         Ok((

@@ -109,6 +109,7 @@ pub struct FramedSession {
 }
 
 impl FramedSession {
+    #[cfg(test)]
     pub fn start<R, W>(reader: R, writer: W, limits: FrameLimits, wire_version: u16) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,

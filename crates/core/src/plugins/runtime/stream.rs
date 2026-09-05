@@ -40,6 +40,7 @@ pub struct Streams {
 }
 
 impl Streams {
+    #[cfg(test)]
     pub fn new(owner: Peer, max_streams: usize) -> Self {
         Self::with_object_limit(owner, max_streams, u64::MAX)
     }
@@ -108,12 +109,6 @@ impl Streams {
         self.streams
             .get(&id)
             .map(|s| s.credit)
-            .ok_or(ProtocolError::InvalidStreamId)
-    }
-    pub fn transferred(&self, id: u64) -> Result<u64, ProtocolError> {
-        self.streams
-            .get(&id)
-            .map(|s| s.transferred)
             .ok_or(ProtocolError::InvalidStreamId)
     }
     pub fn next_sequence(&self, id: u64) -> Result<u32, ProtocolError> {
@@ -199,9 +194,6 @@ impl Streams {
     }
     pub fn discard(&mut self, id: u64) {
         self.streams.remove(&id);
-    }
-    pub fn owner(&self) -> Peer {
-        self.owner
     }
 }
 

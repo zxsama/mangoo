@@ -1,15 +1,16 @@
+use aes_gcm::aead::{rand_core::RngCore, OsRng};
+#[cfg(any(not(windows), test))]
 use aes_gcm::{
-    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+#[cfg(any(not(windows), test))]
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+#[cfg(any(not(windows), test))]
+use std::path::{Path, PathBuf};
+use std::{collections::HashMap, sync::Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SecretScope {
@@ -39,6 +40,7 @@ impl SecretScope {
         Ok(())
     }
 
+    #[cfg(any(not(windows), test))]
     fn aad(&self, opaque_ref: &str, generation: u64) -> anyhow::Result<Vec<u8>> {
         self.validate()?;
         Ok(serde_json::to_vec(&(self, opaque_ref, generation))?)
@@ -56,6 +58,7 @@ pub enum SecretStoreError {
     NotFound,
     ScopeDenied,
     GenerationConflict,
+    #[cfg(any(not(windows), test))]
     ConfigurationRequired(String),
     Corrupt(String),
     Storage(String),
@@ -67,6 +70,7 @@ impl std::fmt::Display for SecretStoreError {
             Self::NotFound => write!(f, "secret not found"),
             Self::ScopeDenied => write!(f, "secret scope denied"),
             Self::GenerationConflict => write!(f, "secret generation conflict"),
+            #[cfg(any(not(windows), test))]
             Self::ConfigurationRequired(v) => write!(f, "secret store configuration required: {v}"),
             Self::Corrupt(v) => write!(f, "secret record is corrupt: {v}"),
             Self::Storage(v) => write!(f, "secret store failed: {v}"),
@@ -227,6 +231,7 @@ impl SecretStore for MemorySecretStore {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg(any(not(windows), test))]
 struct EncryptedRecord {
     version: u8,
     scope: SecretScope,
@@ -235,12 +240,14 @@ struct EncryptedRecord {
     ciphertext: String,
 }
 
+#[cfg(any(not(windows), test))]
 pub struct EncryptedFileSecretStore {
     directory: PathBuf,
     key: [u8; 32],
     operation_lock: Mutex<()>,
 }
 
+#[cfg(any(not(windows), test))]
 impl EncryptedFileSecretStore {
     pub fn from_key_file(
         directory: impl Into<PathBuf>,
@@ -411,6 +418,7 @@ impl EncryptedFileSecretStore {
     }
 }
 
+#[cfg(any(not(windows), test))]
 impl SecretStore for EncryptedFileSecretStore {
     fn create_with_ref(
         &self,
@@ -490,6 +498,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+#[cfg(not(windows))]
 pub fn key_file_from_environment() -> Result<PathBuf, SecretStoreError> {
     std::env::var_os("MEGLE_SECRET_KEY_FILE")
         .filter(|v| !v.is_empty())

@@ -137,11 +137,3 @@ pub fn reconcile_bundled(
     }
     (registered, errors)
 }
-
-#[cfg(test)]
-pub fn resolve_plugins_dir(db_path: &Path) -> PathBuf {
-    db_path
-        .parent()
-        .filter(|v| !v.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("./plugins"), |v| v.join("plugins"))
-}

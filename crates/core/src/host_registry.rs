@@ -539,7 +539,6 @@ fn plugin_runtime_launch_matches(
 #[derive(Debug, Clone)]
 pub struct PluginAccountSecret {
     pub account_uuid: String,
-    pub plugin_id: String,
     pub secret_ref: Option<String>,
     pub generation: i64,
 }
@@ -736,7 +735,7 @@ impl HostRegistry {
         let capabilities = serde_json::from_str::<Vec<String>>(&capabilities_json)?;
         if !capabilities
             .iter()
-            .any(|capability| capability == "sync-provider.v1")
+            .any(|capability| capability == crate::plugins::SYNC_PROVIDER_V1_CAPABILITY)
         {
             anyhow::bail!("provider-incompatible");
         }
@@ -748,9 +747,23 @@ impl HostRegistry {
         plugin_id: &str,
     ) -> anyhow::Result<Option<PluginAccountSecret>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        connection.query_row("SELECT account_uuid,plugin_id,secret_ref,generation FROM plugin_accounts WHERE plugin_id=?1", [plugin_id], |row| Ok(PluginAccountSecret { account_uuid: row.get(0)?, plugin_id: row.get(1)?, secret_ref: row.get(2)?, generation: row.get(3)? })).optional().map_err(Into::into)
+        connection
+            .query_row(
+                "SELECT account_uuid,secret_ref,generation FROM plugin_accounts WHERE plugin_id=?1",
+                [plugin_id],
+                |row| {
+                    Ok(PluginAccountSecret {
+                        account_uuid: row.get(0)?,
+                        secret_ref: row.get(1)?,
+                        generation: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub fn set_plugin_account_secret(
         &self,
         plugin_id: &str,
@@ -1871,6 +1884,7 @@ impl HostRegistry {
         Ok(fences)
     }
 
+    #[cfg(test)]
     pub fn upsert_plugin_account(
         &self,
         account_uuid: &str,
@@ -1993,6 +2007,7 @@ impl HostRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn update_plugin_account_auth(
         &self,
         plugin_id: &str,
@@ -2305,6 +2320,7 @@ impl HostRegistry {
 
     /// Marks a candidate healthy only after the supervisor probation window.
     /// The version switch and durable journal terminal state share one commit.
+    #[cfg(test)]
     pub fn commit_plugin_probation(&self, plugin_id: &str) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let tx = connection.transaction()?;

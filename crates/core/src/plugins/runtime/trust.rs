@@ -58,10 +58,38 @@ pub enum TrustError {
     MissingEntry,
     EntryEscapesRoot,
     SymbolicLink,
+    #[cfg(unix)]
     UnsafeOwnership,
     HashMismatch,
     IdentityMismatch,
     Io(std::io::Error),
+}
+
+impl std::fmt::Display for TrustError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingEntry => write!(formatter, "trusted executable entry is missing"),
+            Self::EntryEscapesRoot => write!(formatter, "trusted executable escapes its root"),
+            Self::SymbolicLink => write!(
+                formatter,
+                "trusted executable path contains a symbolic link"
+            ),
+            #[cfg(unix)]
+            Self::UnsafeOwnership => write!(formatter, "trusted executable ownership is unsafe"),
+            Self::HashMismatch => write!(formatter, "trusted executable hash does not match"),
+            Self::IdentityMismatch => write!(formatter, "trusted executable identity changed"),
+            Self::Io(error) => write!(formatter, "trusted executable I/O failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TrustError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 impl From<std::io::Error> for TrustError {
@@ -76,7 +104,7 @@ impl From<std::io::Error> for TrustError {
 pub struct VerifiedExecutable {
     path: PathBuf,
     expected_sha256: [u8; 32],
-    file: File,
+    _file: File,
     identity: StableIdentity,
 }
 
@@ -95,10 +123,12 @@ impl VerifiedExecutable {
         self.expected_sha256
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn file(&self) -> &File {
-        &self.file
+        &self._file
     }
 
+    #[cfg(test)]
     pub(crate) fn path_matches_verified_file(&self) -> Result<bool, TrustError> {
         self.matches_path(&self.path)
     }
@@ -173,7 +203,7 @@ fn verified_from_path(
     Ok(VerifiedExecutable {
         path: path.to_path_buf(),
         expected_sha256: actual,
-        file,
+        _file: file,
         identity: after,
     })
 }
@@ -291,10 +321,14 @@ mod tests {
         #[cfg(windows)]
         assert!(verify_bundled_entry(&manifest, &root, Platform::LinuxX64, &allowlist).is_ok());
         std::fs::write(bin.join("provider"), b"swapped").unwrap();
+        let result = verify_bundled_entry(&manifest, &root, Platform::LinuxX64, &allowlist);
+        #[cfg(unix)]
         assert!(matches!(
-            verify_bundled_entry(&manifest, &root, Platform::LinuxX64, &allowlist),
+            result,
             Err(TrustError::HashMismatch) | Err(TrustError::UnsafeOwnership)
         ));
+        #[cfg(not(unix))]
+        assert!(matches!(result, Err(TrustError::HashMismatch)));
         let _ = std::fs::remove_dir_all(root);
     }
 

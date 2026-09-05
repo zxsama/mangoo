@@ -13,6 +13,7 @@ pub const MAX_CALLBACK_FIELDS: usize = 8;
 pub const MAX_CALLBACK_QUERY_BYTES: usize = 128 * 1024;
 pub const MAX_ACTIVE_AUTH_FLOWS: usize = 1024;
 pub const MAX_MANUAL_RESPONSE_URI_BYTES: usize = 16 * 1024;
+#[cfg(test)]
 const MANUAL_REDIRECT_URI: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +143,7 @@ impl AuthFlowRegistry {
         }
         Ok(stored.binding)
     }
+    #[cfg(test)]
     pub fn consume(
         &self,
         flow_id: &str,
@@ -165,15 +167,6 @@ impl AuthFlowRegistry {
             anyhow::bail!("OAuth flow binding mismatch")
         }
         Ok(())
-    }
-    pub fn purge_expired(&self) -> usize {
-        let Ok(mut flows) = self.flows.lock() else {
-            return 0;
-        };
-        let before = flows.len();
-        let now = SystemTime::now();
-        flows.retain(|_, v| v.expires_at >= now);
-        before - flows.len()
     }
 }
 

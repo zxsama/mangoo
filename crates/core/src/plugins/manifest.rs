@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 pub const MAX_PLUGIN_ID_LEN: usize = 255;
@@ -345,6 +346,7 @@ impl ManifestRecord {
         }
     }
 }
+#[cfg(test)]
 pub fn sha256_file(path: &Path) -> Result<[u8; 32], std::io::Error> {
     let mut file = fs::File::open(path)?;
     let mut hash = Sha256::new();

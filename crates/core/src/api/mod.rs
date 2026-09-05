@@ -236,6 +236,7 @@ impl AppState {
         let bundled_plugins_dir = crate::plugins::bundled_root_from_environment()?;
         let secret_store = match crate::plugins::secret_store::platform_secret_store() {
             Ok(store) => Some(store),
+            #[cfg(any(not(windows), test))]
             Err(crate::plugins::secret_store::SecretStoreError::ConfigurationRequired(detail)) => {
                 tracing::warn!(%detail, "plugin Secret Store is not configured; local browsing remains available");
                 None

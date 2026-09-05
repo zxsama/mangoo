@@ -14,13 +14,10 @@ use crate::sync::provider::{ProviderManager, SyncProvider};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeState {
     Disabled,
-    PermissionRequired,
     Starting,
     Ready,
     Degraded,
     CrashedBackoff,
-    Incompatible,
-    ConfigurationRequired,
 }
 #[derive(Debug, Clone)]
 pub struct BackoffPolicy {
@@ -63,6 +60,7 @@ impl Supervisor {
             consecutive_health_failures: 0,
         }
     }
+    #[cfg(test)]
     pub fn state(&self) -> RuntimeState {
         self.state
     }
@@ -488,7 +486,7 @@ pub async fn activate_and_register(
             .iter()
             .map(|capability| match capability {
                 crate::plugins::manifest::Capability::SyncProviderV1 => {
-                    "sync-provider.v1".to_owned()
+                    crate::plugins::SYNC_PROVIDER_V1_CAPABILITY.to_owned()
                 }
             })
             .collect(),
@@ -521,7 +519,7 @@ pub async fn activate_and_register(
         || !description
             .capabilities
             .iter()
-            .any(|v| v == "sync-provider.v1")
+            .any(|v| v == crate::plugins::SYNC_PROVIDER_V1_CAPABILITY)
         || description.max_object_bytes == 0
         || description.max_object_bytes > hello.limits.max_object_bytes
     {
