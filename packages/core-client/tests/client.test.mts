@@ -1192,6 +1192,21 @@ describe("createCoreClient", () => {
     await core.listSyncFolderComparisonItems("library", "root", "plan/one", { cursor: 0, limit: 50 }, { signal: controller.signal });
     assert.match(recorded[0].url, /\/reenable\/comparisons\/plan%2Fone\/items\?cursor=0&limit=50$/);
     assert.equal(recorded[0].signal?.aborted, false);
+
+    recorded.length = 0;
+    mockFetch({ items: [], nextCursor: null });
+    await core.listRemoteLibraryRoots("account/one", "library/one", { cursor: "00000000-0000-7000-8000-000000000001", limit: 25 });
+    assert.match(recorded[0].url, /\/sync\/remote-libraries\/account%2Fone\/library%2Fone\/roots\?cursor=00000000-0000-7000-8000-000000000001&limit=25$/);
+
+    recorded.length = 0;
+    mockFetch({ items: [], nextCursor: null });
+    await core.listSyncFolderOperations("library/one", "root/one", { limit: 10, state: "active" });
+    assert.match(recorded[0].url, /\/sync-folders\/root%2Fone\/operations\?limit=10&state=active$/);
+
+    recorded.length = 0;
+    mockFetch({ operationUuid: "00000000-0000-7000-8000-000000000010" });
+    await core.getSyncFolderOperation("library/one", "root/one", "operation/one");
+    assert.match(recorded[0].url, /\/sync-folders\/root%2Fone\/operations\/operation%2Fone$/);
   });
 
   test("managed-root-v2 mutation methods attach the active-library context fence", async () => {

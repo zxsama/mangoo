@@ -185,6 +185,30 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RemoteLibraryListResponse"
+  /sync/remote-libraries/{accountUuid}/{libraryUuid}/roots:
+    get:
+      operationId: listRemoteLibraryRoots
+      parameters:
+        - name: accountUuid
+          in: path
+          required: true
+          schema: { type: string, minLength: 1 }
+        - $ref: "#/components/parameters/libraryUuid"
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: Cached Provider-backed root inventory for one remote Library.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RemoteLibraryRootListResponse"
   /sync/restores:
     post:
       operationId: startSyncRestore
@@ -590,6 +614,38 @@ paths:
         "400": { $ref: "#/components/responses/SyncFolderBadRequest" }
         "404": { $ref: "#/components/responses/SyncFolderNotFound" }
         "409": { $ref: "#/components/responses/SyncFolderConflict" }
+        "500": { $ref: "#/components/responses/SyncFolderFailure" }
+  /libraries/{libraryUuid}/sync-folders/{rootUuid}/operations:
+    get:
+      operationId: listSyncFolderOperations
+      parameters:
+        - $ref: "#/components/parameters/libraryUuid"
+        - $ref: "#/components/parameters/rootUuid"
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [all, active, terminal], default: all }
+      responses:
+        "200": { description: Root-scoped operation history., content: { application/json: { schema: { $ref: "#/components/schemas/RootOperationPageResponse" } } } }
+        "400": { $ref: "#/components/responses/SyncFolderBadRequest" }
+        "404": { $ref: "#/components/responses/SyncFolderNotFound" }
+        "500": { $ref: "#/components/responses/SyncFolderFailure" }
+  /libraries/{libraryUuid}/sync-folders/{rootUuid}/operations/{operationUuid}:
+    get:
+      operationId: getSyncFolderOperation
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/rootUuid" }, { $ref: "#/components/parameters/operationUuid" }]
+      responses:
+        "200": { description: Root-scoped operation detail., content: { application/json: { schema: { $ref: "#/components/schemas/RootOperation" } } } }
+        "400": { $ref: "#/components/responses/SyncFolderBadRequest" }
+        "404": { $ref: "#/components/responses/SyncFolderNotFound" }
         "500": { $ref: "#/components/responses/SyncFolderFailure" }
   /libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/{operationUuid}/{action}:
     post:
@@ -2368,6 +2424,28 @@ components:
             - $ref: "#/components/schemas/LocalRootBinding"
             - type: "null"
         allowedActions: { type: array, items: { $ref: "#/components/schemas/SyncFolderAllowedAction" } }
+        selectedByDefault: { type: boolean }
+        proposedLocalPath: { anyOf: [{ type: string }, { type: "null" }] }
+        locationHeads: { type: array, items: { type: string, format: uuid } }
+        rebindEvidence:
+          anyOf:
+            - $ref: "#/components/schemas/RootRebindEvidence"
+            - type: "null"
+        lastSyncedAt: { anyOf: [{ type: integer }, { type: "null" }] }
+        activeOperation:
+          anyOf:
+            - $ref: "#/components/schemas/RootOperation"
+            - type: "null"
+        latestOperation:
+          anyOf:
+            - $ref: "#/components/schemas/RootOperation"
+            - type: "null"
+    RootRebindEvidence:
+      type: object
+      required: [markerIdentity, priorCutoverSnapshotUuid]
+      properties:
+        markerIdentity: { type: string, minLength: 1 }
+        priorCutoverSnapshotUuid: { type: string, format: uuid }
     SyncFolderListResponse:
       type: object
       required: [revision, items]
@@ -2664,6 +2742,15 @@ components:
         operationRevision: { type: integer, minimum: 0 }
         cutoverCommitted: { type: boolean }
         errorCode: { anyOf: [{ type: string }, { type: "null" }] }
+        transferMode: { anyOf: [{ $ref: "#/components/schemas/RootRelocationMode" }, { type: "null" }] }
+        bytesDone: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        bytesTotal: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        itemsDone: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        itemsTotal: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        availableBytes: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        canCancel: { type: boolean }
+        cancellationBoundary: { anyOf: [{ type: string, enum: [before-cutover, after-cutover] }, { type: "null" }] }
+        recoveryState: { anyOf: [{ type: string }, { type: "null" }] }
         createdAt: { type: integer }
         updatedAt: { type: integer }
     RootOperationListResponse:
@@ -2671,6 +2758,35 @@ components:
       required: [items]
       properties:
         items: { type: array, items: { $ref: "#/components/schemas/RootOperation" } }
+    RootOperationPageResponse:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/RootOperation" } }
+        nextCursor: { anyOf: [{ type: string, format: uuid }, { type: "null" }] }
+    RemoteLibraryRoot:
+      type: object
+      required: [accountUuid, libraryUuid, rootUuid, rootFolderUuid, requestedName, materializedName, materializationFingerprint, logicalRevision, logicalBytes, proposedLocalPath, selectedByDefault, compatible, errorCode]
+      properties:
+        accountUuid: { type: string }
+        libraryUuid: { type: string, format: uuid }
+        rootUuid: { type: string, format: uuid }
+        rootFolderUuid: { type: string, format: uuid }
+        requestedName: { type: string, minLength: 1 }
+        materializedName: { type: string, minLength: 1 }
+        materializationFingerprint: { type: string, minLength: 64, maxLength: 64 }
+        logicalRevision: { type: integer, minimum: 0 }
+        logicalBytes: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        proposedLocalPath: { anyOf: [{ type: string }, { type: "null" }] }
+        selectedByDefault: { type: boolean }
+        compatible: { type: boolean }
+        errorCode: { anyOf: [{ type: string }, { type: "null" }] }
+    RemoteLibraryRootListResponse:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/RemoteLibraryRoot" } }
+        nextCursor: { anyOf: [{ type: string, format: uuid }, { type: "null" }] }
     RootLocationConflict:
       type: object
       required: [conflictUuid, rootUuid, locationHeads, state, createdAt]
@@ -3228,6 +3344,14 @@ components:
           nullable: true
         rootId:
           type: integer
+          nullable: true
+        libraryUuid:
+          type: string
+          format: uuid
+          nullable: true
+        rootUuid:
+          type: string
+          format: uuid
           nullable: true
         folderId:
           type: integer

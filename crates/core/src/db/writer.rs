@@ -993,6 +993,8 @@ mod tests {
             summary: None,
             task_id: Some(1),
             root_id: Some(1),
+            library_uuid: None,
+            root_uuid: None,
             folder_id: None,
             file_id: None,
             current_value: 0,

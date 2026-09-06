@@ -7,6 +7,10 @@ const source = readFileSync(path.join(process.cwd(), "src", "index.ts"), "utf8")
 if (!/import type \{[\s\S]*NotificationOperationSnapshot[\s\S]*\} from "@megle\/core-client\/generated-contract"/.test(source)) {
   throw new Error("notification contract must reuse the generated Core notification operation type");
 }
+const generated = readFileSync(path.join(process.cwd(), "..", "core-client", "src", "generated-contract.ts"), "utf8");
+if (!generated.includes("libraryUuid?: string | null;") || !generated.includes("rootUuid?: string | null;")) {
+  throw new Error("notification operation snapshots must expose optional nullable stable Library/root UUID context");
+}
 if (/from "node:|require\(["']node:/.test(source)) {
   throw new Error("notification contract must not introduce runtime Node dependencies");
 }

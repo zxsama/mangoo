@@ -25,6 +25,10 @@ pub struct NotificationOperation {
     pub summary: Option<String>,
     pub task_id: Option<i64>,
     pub root_id: Option<i64>,
+    #[serde(default)]
+    pub library_uuid: Option<String>,
+    #[serde(default)]
+    pub root_uuid: Option<String>,
     pub folder_id: Option<i64>,
     pub file_id: Option<i64>,
     pub current_value: i64,
@@ -444,6 +448,8 @@ mod tests {
             summary: None,
             task_id: Some(7),
             root_id: Some(3),
+            library_uuid: None,
+            root_uuid: None,
             folder_id: None,
             file_id: None,
             current_value: 10,
@@ -459,6 +465,26 @@ mod tests {
             updated_at,
             completed_at: None,
         }
+    }
+
+    #[test]
+    fn stable_uuid_context_round_trips_and_legacy_payload_defaults_to_null() {
+        let mut operation = fixture_operation("sync-folder:one", "sync-folder", "running", 10);
+        operation.library_uuid = Some("00000000-0000-7000-8000-000000000001".to_owned());
+        operation.root_uuid = Some("00000000-0000-7000-8000-000000000002".to_owned());
+        let value = serde_json::to_value(&operation).unwrap();
+        assert_eq!(
+            value["libraryUuid"].as_str(),
+            operation.library_uuid.as_deref()
+        );
+        assert_eq!(value["rootUuid"].as_str(), operation.root_uuid.as_deref());
+
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("libraryUuid");
+        legacy.as_object_mut().unwrap().remove("rootUuid");
+        let decoded: NotificationOperation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.library_uuid, None);
+        assert_eq!(decoded.root_uuid, None);
     }
 
     #[test]

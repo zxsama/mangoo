@@ -1253,6 +1253,15 @@ impl Database {
             .collect()
     }
 
+    pub fn sync_root_logical_bytes(&self, root_uuid: &[u8; 16]) -> anyhow::Result<u64> {
+        let bytes: i64 = self.connection.query_row(
+            "SELECT COALESCE(SUM(file.size),0) FROM files file JOIN roots root ON root.id=file.root_id WHERE root.root_uuid=?1 AND file.status='active'",
+            [root_uuid.as_slice()],
+            |row| row.get(0),
+        )?;
+        Ok(bytes.max(0) as u64)
+    }
+
     /// Links an already-created Catalog root to its existing empty-name
     /// sentinel. The migration trigger rejects any mismatched descriptor or
     /// sentinel UUID and makes the link immutable after this point.

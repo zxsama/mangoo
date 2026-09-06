@@ -99,7 +99,9 @@ function operation(index: number, overrides: Partial<DesktopNotificationOperatio
     completedAt: now - index * 2_000,
     libraryId,
     libraryName: libraryId === "artists" ? "Artists" : "References",
-    ...overrides
+    ...overrides,
+    libraryUuid: overrides.libraryUuid ?? libraryId,
+    rootUuid: overrides.rootUuid ?? null
   };
 }
 

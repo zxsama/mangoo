@@ -1113,7 +1113,7 @@ export class NotificationService {
     const operations: NotificationOperationInput[] = [];
     for (const aggregate of groupedOperations.values()) {
       if (await store.getOperation(library.id, aggregate.operationId)) continue;
-      operations.push(this.legacyOperation(aggregate));
+      operations.push(this.legacyOperation(library.id, aggregate));
     }
     if (ungroupedSummary.total > 0) {
       operations.push(this.legacyImportSummaryOperation(library.id, ungroupedSummary));
@@ -1175,10 +1175,15 @@ export class NotificationService {
     return { items, nextCursor: nextCursor ?? null };
   }
 
-  private legacyOperation(aggregate: LegacyOperationAggregate): NotificationOperationInput {
+  private legacyOperation(
+    libraryUuid: string,
+    aggregate: LegacyOperationAggregate
+  ): NotificationOperationInput {
     const status = aggregate.failed > 0 ? "failed" : "succeeded";
     return {
       operationId: aggregate.operationId,
+      libraryUuid,
+      rootUuid: null,
       revision: 0,
       kind: aggregate.operation,
       category: "file_operation",
@@ -1223,6 +1228,8 @@ export class NotificationService {
     const completedAt = aggregate.completedAt ?? this.now();
     return {
       operationId: `legacy-import:${libraryId}`,
+      libraryUuid: libraryId,
+      rootUuid: null,
       revision: 0,
       kind: "legacy_file_operations",
       category: "file_operation",
@@ -1627,6 +1634,8 @@ export class NotificationService {
     const occurrenceCount = (existing?.occurrenceCount ?? 0) + 1;
     const value: DesktopNotificationOperation = {
       operationId,
+      libraryUuid: library.id,
+      rootUuid: null,
       revision: (existing?.revision ?? 0) + 1,
       kind: "renderer_error",
       category: "error",

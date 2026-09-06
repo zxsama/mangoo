@@ -59,6 +59,8 @@ pub struct RelocationEvidence {
     pub source_digest: String,
     #[serde(default)]
     pub source_bytes: u64,
+    #[serde(default)]
+    pub available_bytes: Option<u64>,
     pub target_path: String,
     pub target_canonical_key: String,
     pub target_parent_identity: String,
@@ -160,7 +162,8 @@ pub fn validate_relocation_paths(
             directory_evidence_size(&source)?,
         )
     };
-    if !same_volume && free_space_bytes(target_parent).context("path-unavailable")? < source_bytes {
+    let available_bytes = free_space_bytes(target_parent).context("path-unavailable")?;
+    if !same_volume && available_bytes < source_bytes {
         bail!("insufficient-space");
     }
     Ok(RelocationEvidence {
@@ -169,6 +172,7 @@ pub fn validate_relocation_paths(
         source_filesystem_identity,
         source_digest,
         source_bytes,
+        available_bytes: Some(available_bytes),
         target_path: target.to_string_lossy().into_owned(),
         target_canonical_key: canonical_path_key(&target),
         target_parent_identity: target_parent_identity.clone(),
@@ -208,6 +212,7 @@ pub fn capture_relocation_retry_evidence(
         source_filesystem_identity,
         source_digest,
         source_bytes,
+        available_bytes: free_space_bytes(target.parent().context("invalid-path")?).ok(),
         target_path: target.to_string_lossy().into_owned(),
         target_canonical_key: canonical_path_key(&target),
         target_parent_identity,

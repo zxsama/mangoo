@@ -1009,6 +1009,8 @@ class NotificationStoreDatabase {
       assertSafeInteger(nextOccurrenceCount, "renderer error occurrenceCount", 1);
       const operation: StoredNotificationOperation = {
         operationId,
+        libraryUuid: library.id,
+        rootUuid: null,
         revision,
         kind: "renderer_error",
         category: "error",

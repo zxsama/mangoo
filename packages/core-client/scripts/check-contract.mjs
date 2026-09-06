@@ -338,6 +338,8 @@ for (const name of [
   "SyncReconnectPlan",
   "SyncReconnectCommitRequest",
   "RemoteLibrarySummary",
+  "RemoteLibraryRoot",
+  "RemoteLibraryRootListResponse",
   "SyncRestoreStartItem",
   "SyncRestorePreflightRequest",
   "SyncRestorePreflight",
@@ -363,6 +365,7 @@ for (const name of [
   "SyncFolderDescriptor",
   "LocalRootBinding",
   "SyncFolderRecord",
+  "RootRebindEvidence",
   "SyncFolderListResponse",
   "SyncFolderSettings",
   "UpdateSyncFolderSettingsRequest",
@@ -388,6 +391,7 @@ for (const name of [
   "RootRelocationCommitRequest",
   "RootOperation",
   "RootOperationListResponse",
+  "RootOperationPageResponse",
   "RootLocationConflict",
   "RootConflictListResponse",
   "RootLocationConflictResolutionRequest",
@@ -445,10 +449,12 @@ for (const name of [
   "SyncCommandRequest", "SyncPreflightRequest", "SyncPreflightResponse", "SyncEnableRequest",
   "SyncUnbindPlan", "SyncUnbindCommitRequest", "SyncReconnectPreflightRequest",
   "SyncReconnectPlan", "SyncReconnectCommitRequest", "RemoteLibrarySummary",
+  "RemoteLibraryRoot", "RemoteLibraryRootListResponse",
   "SyncRestoreStartItem", "SyncRestorePreflightRequest", "SyncRestorePreflight", "SyncRestoreStartRequest", "SyncRestorePlan",
   "SyncRestoreListResponse", "SyncConflictRecord", "SyncConflictListResponse",
   "SyncConflictResolutionRequest", "SyncFolderDescriptor", "LocalRootBinding",
   "SyncFolderRecord", "SyncFolderListResponse", "SyncFolderSettings",
+  "RootRebindEvidence",
   "UpdateSyncFolderSettingsRequest", "RootMutationRequest", "RootPathPreflightRequest",
   "RootPathPreflightResult", "RootEnrollmentCommitRequest", "RootSelectionItem",
   "RootSelectionPreflightRequest", "RootSelectionPreflightResult", "RootSelectionCommitRequest",
@@ -456,7 +462,7 @@ for (const name of [
   "RootComparisonPlan", "RootComparisonItem", "RootComparisonItemListResponse",
   "RootComparisonItemResolutionRequest", "RootReenableCommitRequest", "RootLogicalRenameRequest",
   "RootLogicalRenamePlan", "RootLogicalRenameCommitRequest", "RootRelocationPreflightRequest", "RootRelocationCommitRequest",
-  "RootOperation", "RootOperationListResponse", "RootLocationConflict",
+  "RootOperation", "RootOperationListResponse", "RootOperationPageResponse", "RootLocationConflict",
   "RootConflictListResponse", "RootLocationConflictResolutionRequest", "SyncFolderErrorResponse"
 ]) assertInterfaceMatchesSchema(name);
 
@@ -468,8 +474,11 @@ for (const name of [
 ]) assertEnumMatchesGeneratedType(name);
 
 for (const [operationId, method, route] of [
+  ["listRemoteLibraryRoots", "get", "/sync/remote-libraries/{accountUuid}/{libraryUuid}/roots"],
   ["listSyncFolders", "get", "/libraries/{libraryUuid}/sync-folders"],
   ["getSyncFolder", "get", "/libraries/{libraryUuid}/sync-folders/{rootUuid}"],
+  ["listSyncFolderOperations", "get", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/operations"],
+  ["getSyncFolderOperation", "get", "/libraries/{libraryUuid}/sync-folders/{rootUuid}/operations/{operationUuid}"],
   ["getSyncFolderSettings", "get", "/libraries/{libraryUuid}/sync-folders/settings"],
   ["updateSyncFolderSettings", "patch", "/libraries/{libraryUuid}/sync-folders/settings"],
   ["preflightSyncFolderEnrollment", "post", "/libraries/{libraryUuid}/sync-folders/enrollment/preflight"],

@@ -340,6 +340,21 @@ impl LibraryManager {
         .await
     }
 
+    pub async fn sync_folder_location_heads(
+        &self,
+        library_uuid: &str,
+        root_uuid: Uuid,
+    ) -> anyhow::Result<Vec<String>> {
+        self.write_sync_folder_catalog(library_uuid, move |database| {
+            Ok(database
+                .sync_location_heads(root_uuid)?
+                .into_iter()
+                .map(|head| head.to_string())
+                .collect())
+        })
+        .await
+    }
+
     pub async fn sync_folder_stop_work(
         &self,
         library_uuid: &str,
@@ -513,6 +528,8 @@ impl LibraryManager {
             summary: Some(logical_name.to_owned()),
             task_id: None,
             root_id: None,
+            library_uuid: Some(library_uuid.to_owned()),
+            root_uuid: Some(root_uuid.to_owned()),
             folder_id: None,
             file_id: None,
             current_value: 0,
@@ -1739,6 +1756,8 @@ impl LibraryManager {
                 .or_else(|| Some(operation.phase.clone())),
             task_id: None,
             root_id: None,
+            library_uuid: operation.library_uuid.clone(),
+            root_uuid: None,
             folder_id: None,
             file_id: None,
             current_value: 0,
@@ -1822,6 +1841,8 @@ impl LibraryManager {
             summary: plan.error_code.clone().or_else(|| Some(plan.phase.clone())),
             task_id: None,
             root_id: None,
+            library_uuid: Some(plan.library_uuid.clone()),
+            root_uuid: None,
             folder_id: None,
             file_id: None,
             current_value: i64::try_from(plan.media_items_done).unwrap_or(i64::MAX),

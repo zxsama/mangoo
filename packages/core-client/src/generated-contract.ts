@@ -110,7 +110,8 @@ export type RootComparisonResolution = "keep-local" | "keep-remote" | "keep-both
 
 export interface SyncFolderDescriptor { libraryUuid: string; libraryRootUuid: string; rootUuid: string; rootFolderUuid: string; requestedName: string; materializedName: string; materializationFingerprint: string; logicalRevision: number; lifecycle: SyncRootLifecycle; inventoryState: SyncFolderInventoryState; inventoryRevision: number; operationRevision: number; logicalBytes?: number | null; checkpointUuid?: string | null; }
 export interface LocalRootBinding { localBindingUuid: string; localPath: string; placementParent: string; state: LocalRootBindingState; bindingGeneration: number; desiredMaterializedName: string; desiredMaterializationFingerprint: string; appliedMaterializedName?: string | null; appliedMaterializationFingerprint?: string | null; operationRevision: number; lastErrorCode?: string | null; }
-export interface SyncFolderRecord { descriptor: SyncFolderDescriptor; binding: LocalRootBinding | null; allowedActions: SyncFolderAllowedAction[]; }
+export interface RootRebindEvidence { markerIdentity: string; priorCutoverSnapshotUuid: string; }
+export interface SyncFolderRecord { descriptor: SyncFolderDescriptor; binding: LocalRootBinding | null; allowedActions: SyncFolderAllowedAction[]; selectedByDefault?: boolean; proposedLocalPath?: string | null; locationHeads?: string[]; rebindEvidence?: RootRebindEvidence | null; lastSyncedAt?: number | null; activeOperation?: RootOperation | null; latestOperation?: RootOperation | null; }
 export interface SyncFolderListResponse { revision: number; items: SyncFolderRecord[]; }
 export interface SyncFolderSettings { libraryUuid: string; libraryRootUuid: string; defaultPlacementBase: string; operationRevision: number; }
 export interface UpdateSyncFolderSettingsRequest { operationUuid: string; expectedOperationRevision: number; defaultPlacementBase: string; }
@@ -139,8 +140,11 @@ export interface RootLogicalRenamePlan { planUuid: string; requestedName: string
 export interface RootLogicalRenameCommitRequest extends RootLogicalRenameRequest { planUuid: string; }
 export interface RootRelocationPreflightRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration: number; mode: RootRelocationMode; targetPath: string; }
 export interface RootRelocationCommitRequest extends RootRelocationPreflightRequest { preflightToken: string; desiredMaterializationFingerprint: string; }
-export interface RootOperation { operationUuid: string; libraryUuid: string; rootUuid: string; kind: RootOperationKind; state: RootOperationState; phase: RootOperationPhase; operationRevision: number; cutoverCommitted: boolean; errorCode?: string | null; createdAt: number; updatedAt: number; }
+export interface RootOperation { operationUuid: string; libraryUuid: string; rootUuid: string; kind: RootOperationKind; state: RootOperationState; phase: RootOperationPhase; operationRevision: number; cutoverCommitted: boolean; errorCode?: string | null; transferMode?: RootRelocationMode | null; bytesDone?: number | null; bytesTotal?: number | null; itemsDone?: number | null; itemsTotal?: number | null; availableBytes?: number | null; canCancel?: boolean; cancellationBoundary?: "before-cutover" | "after-cutover" | null; recoveryState?: string | null; createdAt: number; updatedAt: number; }
 export interface RootOperationListResponse { items: RootOperation[]; }
+export interface RootOperationPageResponse { items: RootOperation[]; nextCursor: string | null; }
+export interface RemoteLibraryRoot { accountUuid: string; libraryUuid: string; rootUuid: string; rootFolderUuid: string; requestedName: string; materializedName: string; materializationFingerprint: string; logicalRevision: number; logicalBytes: number | null; proposedLocalPath: string | null; selectedByDefault: boolean; compatible: boolean; errorCode: string | null; }
+export interface RemoteLibraryRootListResponse { items: RemoteLibraryRoot[]; nextCursor: string | null; }
 export interface RootLocationConflict { conflictUuid: string; rootUuid: string; locationHeads: string[]; state: "open" | "resolved"; createdAt: number; resolvedAt?: number | null; }
 export interface RootConflictListResponse { items: RootLocationConflict[]; nextCursor: string | null; }
 export interface RootLocationConflictResolutionRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration?: number | null; expectedLocationHeads: string[]; supersedes: string[]; requestedName?: string | null; }
@@ -329,6 +333,8 @@ export interface NotificationOperationSnapshot {
   summary: string | null;
   taskId: number | null;
   rootId: number | null;
+  libraryUuid?: string | null;
+  rootUuid?: string | null;
   folderId: number | null;
   fileId: number | null;
   currentValue: number;

@@ -21,6 +21,7 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0013_sync_root_reenable_generation.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0014_sync_root_preflights.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0015_sync_root_recovery.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0016_remote_root_inventory.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -1180,7 +1181,7 @@ def verify_host_sync_root_binding_contract() -> None:
             "DELETE FROM remote_sync_roots WHERE library_uuid=? AND root_uuid=?",
             (library_uuid, "00000000-0000-7000-8000-000000000002"),
         )
-        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 15:
+        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 16:
             fail("managed-root orchestration migrations did not update schema_version")
         expected_host_tables = {
             "library_local_settings",
@@ -1205,6 +1206,60 @@ def verify_host_sync_root_binding_contract() -> None:
             fail(f"missing managed-root-v2 Host tables: {sorted(missing)}")
     finally:
         conn.close()
+
+
+def verify_host_remote_root_inventory_upgrade_and_rollback() -> None:
+    upgrade = sqlite3.connect(":memory:")
+    upgrade.execute("PRAGMA foreign_keys = ON")
+    try:
+        for migration in HOST_MIGRATIONS[:-1]:
+            upgrade.executescript(migration.read_text(encoding="utf-8"))
+        if upgrade.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone() != (15,):
+            fail("remote-root inventory upgrade fixture did not stop at Host schema 15")
+        upgrade.execute(
+            "INSERT INTO plugin_installations(plugin_id,manifest_version,selected_version,enabled_intent,install_root,trust_policy_id,requested_permissions_json,granted_permissions_json,created_at,updated_at) VALUES ('provider',2,'1',1,'provider','test','[]','[]',1,1)"
+        )
+        upgrade.execute(
+            "INSERT INTO plugin_accounts(account_uuid,plugin_id,display_name,auth_state,generation,created_at,updated_at) VALUES ('account','provider','Account','authenticated',1,1,1)"
+        )
+        upgrade.execute(
+            "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at) VALUES ('account','00000000-0000-7000-8000-000000000001',1,zeroblob(32),1,1)"
+        )
+        upgrade.commit()
+        upgrade.executescript(HOST_MIGRATIONS[-1].read_text(encoding="utf-8"))
+        if upgrade.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone() != (16,):
+            fail("remote-root inventory migration did not upgrade Host schema 15 to 16")
+        upgrade.execute(
+            "INSERT INTO provider_remote_sync_roots(account_uuid,library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialization_fingerprint,logical_revision,logical_bytes,updated_at) VALUES ('account','00000000-0000-7000-8000-000000000001','00000000-0000-7000-8000-000000000002','00000000-0000-7000-8000-000000000003','Photos','Photos',?,7,41,1)",
+            ("a" * 64,),
+        )
+        upgrade.execute(
+            "DELETE FROM provider_remote_libraries WHERE account_uuid='account' AND library_uuid='00000000-0000-7000-8000-000000000001'"
+        )
+        if upgrade.execute("SELECT COUNT(*) FROM provider_remote_sync_roots").fetchone() != (0,):
+            fail("remote-root inventory rows did not cascade with their cached Library")
+    finally:
+        upgrade.close()
+
+    rollback = sqlite3.connect(":memory:")
+    try:
+        for migration in HOST_MIGRATIONS[:-1]:
+            rollback.executescript(migration.read_text(encoding="utf-8"))
+        rollback.execute("CREATE TABLE provider_remote_sync_roots(sentinel TEXT NOT NULL)")
+        rollback.commit()
+        try:
+            rollback.executescript(HOST_MIGRATIONS[-1].read_text(encoding="utf-8"))
+        except sqlite3.OperationalError:
+            rollback.rollback()
+        else:
+            fail("remote-root inventory migration unexpectedly succeeded over a conflicting table")
+        if rollback.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone() != (15,):
+            fail("failed remote-root inventory migration advanced the Host schema version")
+        columns = [row[1] for row in rollback.execute("PRAGMA table_info(provider_remote_sync_roots)")]
+        if columns != ["sentinel"]:
+            fail("failed remote-root inventory migration left partial schema changes")
+    finally:
+        rollback.close()
 
 
 def verify_host_plugin_upgrade_from_populated_v2() -> None:
@@ -1311,6 +1366,7 @@ def main() -> None:
     verify_sync_root_generation_fence_contract()
     verify_sync_root_generation_fence_upgrade_from_v30()
     verify_host_sync_root_binding_contract()
+    verify_host_remote_root_inventory_upgrade_and_rollback()
     verify_host_plugin_upgrade_from_populated_v2()
 
     for host_migration in HOST_MIGRATIONS:
@@ -1344,6 +1400,7 @@ def main() -> None:
             "plugin_accounts",
             "provider_account_root_cursors",
             "provider_remote_libraries",
+            "provider_remote_sync_roots",
             "provider_binding_cursors",
             "provider_object_receipts",
             "plugin_activation_journal",
@@ -1368,7 +1425,7 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (15, None, 0, "stopped"):
+        if meta != (16, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         auth_flow_columns = {
             row[1]

@@ -101,6 +101,7 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/sync/status",
     "/api/sync/wake",
     "/api/sync/remote-libraries",
+    "/api/sync/remote-libraries/{accountUuid}/{libraryUuid}/roots",
     "/api/sync/restores/preflight",
     "/api/sync/restores",
     "/api/sync/restores/{restoreUuid}",
@@ -141,6 +142,8 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/preflight",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/{operationUuid}",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/operations",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/operations/{operationUuid}",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/relocations/{operationUuid}/{action}",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/conflicts",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/conflicts/{conflictUuid}/resolve",
@@ -746,6 +749,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sync/status", get(get_sync_status))
         .route("/api/sync/wake", post(wake_sync))
         .route("/api/sync/remote-libraries", get(list_remote_libraries))
+        .route(
+            "/api/sync/remote-libraries/:account_uuid/:library_uuid/roots",
+            get(list_remote_library_roots),
+        )
         .route("/api/sync/restores/preflight", post(preflight_restore))
         .route("/api/sync/restores", post(start_restore))
         .route("/api/sync/restores/:restore_uuid", get(get_restore))
@@ -895,6 +902,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/libraries/:library_uuid/sync-folders/:root_uuid/relocations/:operation_uuid",
+            get(sync_folder_contract_operation_read),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/operations",
+            get(sync_folder_contract_operations_read),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/operations/:operation_uuid",
             get(sync_folder_contract_operation_read),
         )
         .route(
@@ -1221,6 +1236,21 @@ struct RestoreListResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConflictQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RootOperationQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemoteRootQuery {
     limit: Option<usize>,
     cursor: Option<String>,
 }
@@ -1812,9 +1842,65 @@ fn root_operation_json(operation: &crate::host_registry::RootOperationRecord) ->
         "operationRevision":operation.operation_revision,
         "cutoverCommitted":operation.cutover_committed,
         "errorCode":operation.error_code,
+        "transferMode":serde_json::Value::Null,
+        "bytesDone":serde_json::Value::Null,
+        "bytesTotal":serde_json::Value::Null,
+        "itemsDone":serde_json::Value::Null,
+        "itemsTotal":serde_json::Value::Null,
+        "availableBytes":serde_json::Value::Null,
+        "canCancel":false,
+        "cancellationBoundary":serde_json::Value::Null,
+        "recoveryState":serde_json::Value::Null,
         "createdAt":operation.created_at,
         "updatedAt":operation.updated_at,
     })
+}
+
+fn root_operation_detail_json(
+    registry: &crate::host_registry::HostRegistry,
+    operation: &crate::host_registry::RootOperationRecord,
+) -> anyhow::Result<serde_json::Value> {
+    let relocation = registry.root_relocation_operation(&operation.operation_uuid)?;
+    let result = registry.root_operation_result(&operation.operation_uuid)?;
+    let transfer_progress = result
+        .as_ref()
+        .and_then(|value| value.get("transferProgress"));
+    let evidence = result.as_ref();
+    let mut value = root_operation_json(operation);
+    value["transferMode"] = serde_json::json!(relocation.as_ref().map(|item| item.mode.as_str()));
+    value["bytesDone"] = serde_json::json!(relocation.as_ref().map(|item| item.transferred_bytes));
+    value["bytesTotal"] = serde_json::json!(evidence
+        .and_then(|item| item.get("sourceBytes"))
+        .and_then(serde_json::Value::as_u64));
+    value["itemsDone"] = serde_json::json!(transfer_progress
+        .and_then(|item| item.get("completedEntries"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len()));
+    value["itemsTotal"] = serde_json::json!(transfer_progress
+        .and_then(|item| item.get("totalEntries"))
+        .and_then(serde_json::Value::as_u64));
+    value["availableBytes"] = serde_json::json!(evidence
+        .and_then(|item| item.get("availableBytes"))
+        .and_then(serde_json::Value::as_u64));
+    value["canCancel"] = serde_json::json!(
+        relocation.is_some()
+            && matches!(operation.state.as_str(), "pending" | "running" | "waiting")
+            && !operation.cutover_committed
+    );
+    value["cancellationBoundary"] = serde_json::json!(if operation.kind == "relocate"
+        || operation.kind == "automatic-rename"
+    {
+        Some(if operation.cutover_committed {
+            "after-cutover"
+        } else {
+            "before-cutover"
+        })
+    } else {
+        None
+    });
+    value["recoveryState"] =
+        serde_json::json!(relocation.as_ref().map(|item| item.cleanup_state.as_str()));
+    Ok(value)
 }
 
 fn sync_folder_allowed_actions(
@@ -1835,7 +1921,7 @@ fn sync_folder_allowed_actions(
     }
 }
 
-fn sync_folder_record_json(
+async fn sync_folder_record_json(
     manager: &crate::library_manager::LibraryManager,
     descriptor: &crate::host_registry::RemoteSyncRootRecord,
     settings: &crate::host_registry::SyncFolderSettingsRecord,
@@ -1847,12 +1933,52 @@ fn sync_folder_record_json(
         .join(&descriptor.materialized_name)
         .to_string_lossy()
         .into_owned();
+    let mut allowed_actions = sync_folder_allowed_actions(descriptor, binding.as_ref());
+    let rebind_evidence = manager
+        .registry()
+        .root_rebind_evidence(&descriptor.library_uuid, &descriptor.root_uuid)?;
+    if rebind_evidence.is_none() {
+        allowed_actions.retain(|action| *action != "rebind-existing");
+    }
+    let location_heads = manager
+        .sync_folder_location_heads(
+            &descriptor.library_uuid,
+            uuid::Uuid::parse_str(&descriptor.root_uuid)?,
+        )
+        .await?;
+    let latest_operations = manager.registry().root_operations(
+        &descriptor.library_uuid,
+        &descriptor.root_uuid,
+        None,
+        1,
+        "all",
+    )?;
+    let active_operations = manager.registry().root_operations(
+        &descriptor.library_uuid,
+        &descriptor.root_uuid,
+        None,
+        1,
+        "active",
+    )?;
+    let latest_operation = latest_operations
+        .first()
+        .map(|operation| root_operation_detail_json(manager.registry(), operation))
+        .transpose()?;
+    let active_operation = active_operations
+        .first()
+        .map(|operation| root_operation_detail_json(manager.registry(), operation))
+        .transpose()?;
     Ok(serde_json::json!({
         "descriptor":descriptor,
         "binding":binding,
-        "allowedActions":sync_folder_allowed_actions(descriptor,binding.as_ref()),
+        "allowedActions":allowed_actions,
         "selectedByDefault":binding.is_none() && descriptor.lifecycle=="active",
         "proposedLocalPath":proposal,
+        "locationHeads":location_heads,
+        "rebindEvidence":rebind_evidence,
+        "lastSyncedAt":manager.registry().library_sync_last_success_at(&descriptor.library_uuid)?,
+        "activeOperation":active_operation,
+        "latestOperation":latest_operation,
     }))
 }
 
@@ -2022,7 +2148,11 @@ async fn sync_folder_contract_read(
         .map_err(sync_folder_error)?;
     let mut items = Vec::with_capacity(roots.len());
     for root in &roots {
-        items.push(sync_folder_record_json(&manager, root, &settings).map_err(sync_folder_error)?);
+        items.push(
+            sync_folder_record_json(&manager, root, &settings)
+                .await
+                .map_err(sync_folder_error)?,
+        );
     }
     Ok(
         Json(serde_json::json!({"revision":settings.operation_revision,"items":items}))
@@ -2924,7 +3054,9 @@ async fn sync_folder_contract_root_read(
             .sync_folder_settings(&library_uuid)
             .map_err(sync_folder_error)?;
         return Ok(Json(
-            sync_folder_record_json(&manager, &root, &settings).map_err(sync_folder_error)?,
+            sync_folder_record_json(&manager, &root, &settings)
+                .await
+                .map_err(sync_folder_error)?,
         )
         .into_response());
     }
@@ -4253,7 +4385,13 @@ async fn sync_folder_contract_operation_read(
                 "Root operation not found".to_owned(),
             )
         })?;
-    Ok(Json(root_operation_json(&operation)).into_response())
+    Ok(
+        Json(
+            root_operation_detail_json(manager.registry(), &operation)
+                .map_err(sync_folder_error)?,
+        )
+        .into_response(),
+    )
 }
 
 async fn sync_folder_contract_plan_read(
@@ -4685,6 +4823,79 @@ async fn list_remote_libraries(
         next_cursor: None,
         total_count: None,
     }))
+}
+
+async fn list_remote_library_roots(
+    State(state): State<AppState>,
+    Path((account_uuid, library_uuid)): Path<(String, String)>,
+    Query(query): Query<RemoteRootQuery>,
+) -> ApiResult<Json<ListResponse<crate::host_registry::RemoteLibraryRootSummary>>> {
+    validate_contract_uuid(&library_uuid, "libraryUuid")?;
+    if let Some(cursor) = query.cursor.as_deref() {
+        validate_contract_uuid(cursor, "cursor")?;
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let mut items = library_manager(&state)?
+        .registry()
+        .list_remote_library_roots(
+            &account_uuid,
+            &library_uuid,
+            query.cursor.as_deref(),
+            limit + 1,
+        )?;
+    let next_cursor = if items.len() > limit {
+        items.truncate(limit);
+        items.last().map(|item| item.root_uuid.clone())
+    } else {
+        None
+    };
+    Ok(Json(ListResponse {
+        items,
+        next_cursor,
+        total_count: None,
+    }))
+}
+
+async fn sync_folder_contract_operations_read(
+    State(state): State<AppState>,
+    Path((library_uuid, root_uuid)): Path<(String, String)>,
+    Query(query): Query<RootOperationQuery>,
+) -> ApiResult<Response> {
+    validate_contract_uuid(&root_uuid, "rootUuid")?;
+    if let Some(cursor) = query.cursor.as_deref() {
+        validate_contract_uuid(cursor, "cursor")?;
+    }
+    sync_folder_v2_gate(&state, &library_uuid)?;
+    let state_filter = query.state.as_deref().unwrap_or("all");
+    if !matches!(state_filter, "all" | "active" | "terminal") {
+        return Err(CoreError::bad_request(
+            "invalid operation state filter".to_owned(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let manager = sync_folder_library_manager(&state)?;
+    let mut operations = manager
+        .registry()
+        .root_operations(
+            &library_uuid,
+            &root_uuid,
+            query.cursor.as_deref(),
+            limit + 1,
+            state_filter,
+        )
+        .map_err(sync_folder_error)?;
+    let next_cursor = if operations.len() > limit {
+        operations.truncate(limit);
+        operations.last().map(|item| item.operation_uuid.clone())
+    } else {
+        None
+    };
+    let items = operations
+        .iter()
+        .map(|operation| root_operation_detail_json(manager.registry(), operation))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(sync_folder_error)?;
+    Ok(Json(serde_json::json!({"items":items,"nextCursor":next_cursor})).into_response())
 }
 
 async fn sync_preflight(
@@ -8460,6 +8671,33 @@ mod tests {
         assert_eq!(fallback_display_name("D:\\Media\\Photos\\"), "Photos");
         assert_eq!(fallback_display_name("D:/Media/Videos"), "Videos");
         assert_eq!(fallback_display_name("D:\\"), "D:");
+    }
+
+    #[test]
+    fn non_relocation_root_operation_is_not_advertised_as_cancellable() {
+        let path = unique_temp_dir().join("host.sqlite");
+        let registry = crate::host_registry::HostRegistry::open(&path).unwrap();
+        let operation = crate::host_registry::RootOperationRecord {
+            operation_uuid: "00000000-0000-7000-8000-000000000001".into(),
+            library_uuid: "00000000-0000-7000-8000-000000000002".into(),
+            root_uuid: "00000000-0000-7000-8000-000000000003".into(),
+            kind: "re-enable".into(),
+            state: "running".into(),
+            phase: "reconciling".into(),
+            request_hash: "a".repeat(64),
+            request_json: "{}".into(),
+            expected_operation_revision: 0,
+            expected_binding_generation: Some(1),
+            operation_revision: 1,
+            cutover_committed: false,
+            error_code: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let json = super::root_operation_detail_json(&registry, &operation).unwrap();
+        assert_eq!(json["canCancel"], false);
+        assert!(json["cancellationBoundary"].is_null());
     }
 
     #[tokio::test]
@@ -13259,6 +13497,8 @@ mod tests {
             summary: None,
             task_id: None,
             root_id: None,
+            library_uuid: None,
+            root_uuid: None,
             folder_id: None,
             file_id: None,
             current_value: 0,

@@ -29,6 +29,7 @@ const HOST_MIGRATION_0013: &str =
     include_str!("../host_migrations/0013_sync_root_reenable_generation.sql");
 const HOST_MIGRATION_0014: &str = include_str!("../host_migrations/0014_sync_root_preflights.sql");
 const HOST_MIGRATION_0015: &str = include_str!("../host_migrations/0015_sync_root_recovery.sql");
+const HOST_MIGRATION_0016: &str = include_str!("../host_migrations/0016_remote_root_inventory.sql");
 
 pub const ONEDRIVE_SECRET_NAMESPACE: &str = "microsoft-onedrive";
 pub const ONEDRIVE_CREDENTIAL_PURPOSE: &str = "oauth-v1";
@@ -125,6 +126,38 @@ pub struct DiscoveredRemoteLibrary {
     pub media_count: Option<u64>,
     pub logical_bytes: Option<u64>,
     pub last_synced_at: Option<i64>,
+    pub compatible: bool,
+    pub error_code: Option<String>,
+    pub roots: Vec<DiscoveredRemoteRoot>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredRemoteRoot {
+    pub root_uuid: String,
+    pub root_folder_uuid: String,
+    pub requested_name: String,
+    pub materialized_name: String,
+    pub materialization_fingerprint: String,
+    pub logical_revision: u64,
+    #[serde(default)]
+    pub logical_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteLibraryRootSummary {
+    pub account_uuid: String,
+    pub library_uuid: String,
+    pub root_uuid: String,
+    pub root_folder_uuid: String,
+    pub requested_name: String,
+    pub materialized_name: String,
+    pub materialization_fingerprint: String,
+    pub logical_revision: u64,
+    pub logical_bytes: Option<u64>,
+    pub proposed_local_path: Option<String>,
+    pub selected_by_default: bool,
     pub compatible: bool,
     pub error_code: Option<String>,
 }
@@ -875,6 +908,13 @@ pub struct RemoteSyncRootRecord {
     pub operation_revision: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootRebindEvidenceRecord {
+    pub marker_identity: String,
+    pub prior_cutover_snapshot_uuid: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewLocalRootBinding {
     pub library_uuid: String,
@@ -1305,6 +1345,64 @@ impl HostRegistry {
             "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
             [operation_uuid],root_operation_record_from_row,
         ).optional().map_err(Into::into)
+    }
+
+    pub fn root_operations(
+        &self,
+        library_uuid: &str,
+        root_uuid: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        state_filter: &str,
+    ) -> anyhow::Result<Vec<RootOperationRecord>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE library_uuid=?1 AND root_uuid=?2 AND (?3='all' OR (?3='active' AND state IN ('pending','running','waiting')) OR (?3='terminal' AND state IN ('completed','cancelled','failed'))) AND (?4 IS NULL OR (updated_at,operation_uuid)<(SELECT updated_at,operation_uuid FROM root_operations WHERE operation_uuid=?4 AND library_uuid=?1 AND root_uuid=?2)) ORDER BY updated_at DESC,operation_uuid DESC LIMIT ?5",
+        )?;
+        let rows = statement.query_map(
+            params![
+                library_uuid,
+                root_uuid,
+                state_filter,
+                cursor,
+                i64::try_from(limit)?
+            ],
+            root_operation_record_from_row,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn root_rebind_evidence(
+        &self,
+        library_uuid: &str,
+        root_uuid: &str,
+    ) -> anyhow::Result<Option<RootRebindEvidenceRecord>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection
+            .query_row(
+                "SELECT marker_identity FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2 AND state='unavailable' AND marker_identity IS NOT NULL AND NOT EXISTS (SELECT 1 FROM root_cutover_snapshots snapshot WHERE snapshot.library_uuid=?1 AND snapshot.root_uuid=?2)",
+                params![library_uuid, root_uuid],
+                |row| Ok(RootRebindEvidenceRecord {
+                    marker_identity: row.get(0)?,
+                    prior_cutover_snapshot_uuid: uuid::Uuid::nil().to_string(),
+                }),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn library_sync_last_success_at(&self, library_uuid: &str) -> anyhow::Result<Option<i64>> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT last_success_at FROM library_sync_bindings WHERE library_uuid=?1",
+                [library_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(Into::into)
     }
 
     pub fn root_relocation_operation(
@@ -5512,6 +5610,26 @@ impl HostRegistry {
                 "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,descriptor_etag,account_generation,updated_at,name,icon,media_count,logical_bytes,last_synced_at,compatible,descriptor_error_code) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(account_uuid,library_uuid) DO UPDATE SET descriptor_size=excluded.descriptor_size,descriptor_sha256=excluded.descriptor_sha256,descriptor_etag=excluded.descriptor_etag,account_generation=excluded.account_generation,updated_at=excluded.updated_at,name=excluded.name,icon=excluded.icon,media_count=excluded.media_count,logical_bytes=excluded.logical_bytes,last_synced_at=excluded.last_synced_at,compatible=excluded.compatible,descriptor_error_code=excluded.descriptor_error_code",
                 params![account_uuid,library_uuid,metadata.size as i64,metadata.sha256.as_slice(),metadata.etag,account_generation,now,discovered.name,discovered.icon,discovered.media_count.map(|v|v as i64),discovered.logical_bytes.map(|v|v as i64),discovered.last_synced_at,discovered.compatible as i64,discovered.error_code],
             )?;
+            transaction.execute(
+                "DELETE FROM provider_remote_sync_roots WHERE account_uuid=?1 AND library_uuid=?2",
+                params![account_uuid, library_uuid],
+            )?;
+            if discovered.compatible {
+                for root in &discovered.roots {
+                    let root_uuid = uuid::Uuid::parse_str(&root.root_uuid)?;
+                    let root_folder_uuid = uuid::Uuid::parse_str(&root.root_folder_uuid)?;
+                    if root_uuid.to_string() != root.root_uuid
+                        || root_folder_uuid.to_string() != root.root_folder_uuid
+                        || root.materialization_fingerprint.len() != 64
+                    {
+                        anyhow::bail!("invalid remote root descriptor");
+                    }
+                    transaction.execute(
+                        "INSERT INTO provider_remote_sync_roots(account_uuid,library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialization_fingerprint,logical_revision,logical_bytes,compatible,error_code,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,NULL,?10)",
+                        params![account_uuid,library_uuid,root.root_uuid,root.root_folder_uuid,root.requested_name,root.materialized_name,root.materialization_fingerprint,i64::try_from(root.logical_revision)?,root.logical_bytes.map(i64::try_from).transpose()?,now],
+                    )?;
+                }
+            }
         }
         transaction.execute(
             "INSERT INTO provider_account_root_cursors(account_uuid,scope,cursor,page_token,generation,updated_at) VALUES (?1,'root',?2,?3,?4,?5) ON CONFLICT(account_uuid,scope) DO UPDATE SET cursor=excluded.cursor,page_token=excluded.page_token,generation=excluded.generation,updated_at=excluded.updated_at",
@@ -5948,6 +6066,14 @@ impl HostRegistry {
         if schema_version < 15 {
             connection.execute_batch(HOST_MIGRATION_0015)?;
         }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 16 {
+            connection.execute_batch(HOST_MIGRATION_0016)?;
+        }
         let now = unix_timestamp_millis();
         connection.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_creations", [now])?;
         connection.execute("DELETE FROM plugin_secret_creations", [])?;
@@ -6368,6 +6494,55 @@ impl HostRegistry {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn list_remote_library_roots(
+        &self,
+        account_uuid: &str,
+        library_uuid: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RemoteLibraryRootSummary>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let placement_base: Option<String> = connection
+            .query_row(
+                "SELECT settings.default_placement_base FROM library_sync_bindings binding JOIN library_local_settings settings ON settings.library_uuid=binding.library_uuid WHERE binding.account_uuid=?1 AND COALESCE(binding.remote_namespace,binding.library_uuid)=?2 LIMIT 1",
+                params![account_uuid, library_uuid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut statement = connection.prepare(
+            "SELECT root.account_uuid,root.library_uuid,root.root_uuid,root.root_folder_uuid,root.requested_name,root.materialized_name,root.materialization_fingerprint,root.logical_revision,root.logical_bytes,root.compatible,root.error_code FROM provider_remote_sync_roots root JOIN provider_remote_libraries library ON library.account_uuid=root.account_uuid AND library.library_uuid=root.library_uuid JOIN plugin_accounts account ON account.account_uuid=root.account_uuid WHERE root.account_uuid=?1 AND root.library_uuid=?2 AND library.account_generation=account.generation AND (?3 IS NULL OR root.root_uuid>?3) ORDER BY root.root_uuid LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![account_uuid, library_uuid, cursor, i64::try_from(limit)?],
+            |row| {
+                let materialized_name: String = row.get(5)?;
+                Ok(RemoteLibraryRootSummary {
+                    account_uuid: row.get(0)?,
+                    library_uuid: row.get(1)?,
+                    root_uuid: row.get(2)?,
+                    root_folder_uuid: row.get(3)?,
+                    requested_name: row.get(4)?,
+                    proposed_local_path: placement_base.as_ref().map(|base| {
+                        PathBuf::from(base)
+                            .join(&materialized_name)
+                            .to_string_lossy()
+                            .into_owned()
+                    }),
+                    materialized_name,
+                    materialization_fingerprint: row.get(6)?,
+                    logical_revision: row.get::<_, i64>(7)?.max(0) as u64,
+                    logical_bytes: row
+                        .get::<_, Option<i64>>(8)?
+                        .map(|value| value.max(0) as u64),
+                    selected_by_default: row.get::<_, i64>(9)? != 0,
+                    compatible: row.get::<_, i64>(9)? != 0,
+                    error_code: row.get(10)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn begin_sync_operation_once(
@@ -8089,6 +8264,48 @@ mod tests {
                 .unwrap()
                 .1
         );
+        let active_operations = registry
+            .root_operations(library_uuid, root_uuid, None, 50, "active")
+            .unwrap();
+        assert_eq!(active_operations.len(), 1);
+        assert_eq!(
+            active_operations[0].operation_uuid,
+            "00000000-0000-7000-8000-000000000024"
+        );
+        let first_page = registry
+            .root_operations(library_uuid, root_uuid, None, 1, "all")
+            .unwrap();
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(
+            first_page[0].operation_uuid,
+            "00000000-0000-7000-8000-000000000024"
+        );
+        let second_page = registry
+            .root_operations(
+                library_uuid,
+                root_uuid,
+                Some(&first_page[0].operation_uuid),
+                1,
+                "all",
+            )
+            .unwrap();
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].operation_uuid, operation_uuid);
+        let terminal_operations = registry
+            .root_operations(library_uuid, root_uuid, None, 50, "terminal")
+            .unwrap();
+        assert_eq!(terminal_operations.len(), 1);
+        assert_eq!(terminal_operations[0].operation_uuid, operation_uuid);
+        assert!(registry
+            .root_operations(
+                library_uuid,
+                "00000000-0000-7000-8000-000000000099",
+                None,
+                50,
+                "all",
+            )
+            .unwrap()
+            .is_empty());
 
         drop(registry);
         let reopened = HostRegistry::open(&path).expect("reopen host registry");
@@ -8105,7 +8322,7 @@ mod tests {
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
-            15
+            16
         );
         assert!(connection
             .execute(
@@ -8169,6 +8386,7 @@ mod tests {
             source_filesystem_identity: "source".into(),
             source_digest: "b".repeat(64),
             source_bytes: 0,
+            available_bytes: None,
             target_path: "D:/Library/Renamed".into(),
             target_canonical_key: "d:/library/renamed".into(),
             target_parent_identity: "parent".into(),
@@ -9849,6 +10067,26 @@ mod tests {
             last_synced_at: Some(1234),
             compatible: true,
             error_code: None,
+            roots: vec![
+                DiscoveredRemoteRoot {
+                    root_uuid: "00000000-0000-7000-8000-000000000002".into(),
+                    root_folder_uuid: "00000000-0000-7000-8000-000000000003".into(),
+                    requested_name: "Photos".into(),
+                    materialized_name: "Photos".into(),
+                    materialization_fingerprint: "a".repeat(64),
+                    logical_revision: 7,
+                    logical_bytes: Some(41_000),
+                },
+                DiscoveredRemoteRoot {
+                    root_uuid: "00000000-0000-7000-8000-000000000004".into(),
+                    root_folder_uuid: "00000000-0000-7000-8000-000000000005".into(),
+                    requested_name: "Videos".into(),
+                    materialized_name: "Videos".into(),
+                    materialization_fingerprint: "b".repeat(64),
+                    logical_revision: 8,
+                    logical_bytes: Some(1_000),
+                },
+            ],
         };
         registry
             .commit_provider_root_page(
@@ -9876,7 +10114,7 @@ mod tests {
         let inventory: (i64, Vec<u8>, String) = connection
             .query_row(
                 "SELECT descriptor_size,descriptor_sha256,descriptor_etag FROM provider_remote_libraries WHERE account_uuid='account' AND library_uuid=?1",
-                [library_uuid],
+                [&library_uuid],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
@@ -9896,6 +10134,29 @@ mod tests {
         assert_eq!(remote.media_count, Some(12));
         assert_eq!(remote.logical_bytes, Some(42_000));
         assert_eq!(remote.last_synced_at, Some(1234));
+        let roots = registry
+            .list_remote_library_roots("account", &library_uuid, None, 50)
+            .unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].root_uuid, "00000000-0000-7000-8000-000000000002");
+        assert_eq!(roots[0].logical_bytes, Some(41_000));
+        let second_page = registry
+            .list_remote_library_roots(
+                "account",
+                &library_uuid,
+                Some("00000000-0000-7000-8000-000000000002"),
+                1,
+            )
+            .unwrap();
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(
+            second_page[0].root_uuid,
+            "00000000-0000-7000-8000-000000000004"
+        );
+        assert!(registry
+            .list_remote_library_roots("other-account", &library_uuid, None, 50)
+            .unwrap()
+            .is_empty());
         assert!(remote.compatible);
         assert_eq!(remote.error_code, None);
         assert!(registry

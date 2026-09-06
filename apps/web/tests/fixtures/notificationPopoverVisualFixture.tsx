@@ -110,7 +110,9 @@ function operation(
     progress: { determinate: true, percent: 42, label: "42 / 100" },
     sourceOperations: [],
     scanPaths: [],
-    ...overrides
+    ...overrides,
+    libraryUuid: overrides.libraryUuid ?? "artists",
+    rootUuid: overrides.rootUuid ?? null
   };
 }
 

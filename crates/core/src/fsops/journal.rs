@@ -2473,6 +2473,8 @@ fn new_group_operation(
         summary: None,
         task_id: None,
         root_id: None,
+        library_uuid: None,
+        root_uuid: None,
         folder_id: None,
         file_id: None,
         current_value: 0,

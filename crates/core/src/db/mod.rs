@@ -890,6 +890,8 @@ impl Database {
             summary: task_notification_summary_in_transaction(transaction, &task)?,
             task_id: Some(task.id),
             root_id: task.root_id,
+            library_uuid: None,
+            root_uuid: None,
             folder_id: task.folder_id,
             file_id: None,
             current_value: task.items_seen,

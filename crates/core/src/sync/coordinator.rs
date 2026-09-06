@@ -741,6 +741,16 @@ impl SyncCoordinator {
                         {
                             anyhow::bail!("remote descriptor is incompatible");
                         }
+                        let roots = value
+                            .get("roots")
+                            .cloned()
+                            .map(
+                                serde_json::from_value::<
+                                    Vec<crate::host_registry::DiscoveredRemoteRoot>,
+                                >,
+                            )
+                            .transpose()?
+                            .unwrap_or_default();
                         Ok::<_, anyhow::Error>((
                             value
                                 .get("name")
@@ -757,11 +767,12 @@ impl SyncCoordinator {
                             value
                                 .get("lastSyncedAt")
                                 .and_then(serde_json::Value::as_i64),
+                            roots,
                         ))
                     }
                     .await;
                     discovered.push(match parsed {
-                        Ok((name, icon, media_count, logical_bytes, last_synced_at)) => {
+                        Ok((name, icon, media_count, logical_bytes, last_synced_at, roots)) => {
                             crate::host_registry::DiscoveredRemoteLibrary {
                                 metadata: metadata.clone(),
                                 name,
@@ -771,6 +782,7 @@ impl SyncCoordinator {
                                 last_synced_at,
                                 compatible: true,
                                 error_code: None,
+                                roots,
                             }
                         }
                         Err(error) => {
@@ -784,6 +796,7 @@ impl SyncCoordinator {
                                 last_synced_at: None,
                                 compatible: false,
                                 error_code: Some("descriptor-invalid".to_owned()),
+                                roots: Vec::new(),
                             }
                         }
                     });
@@ -1215,6 +1228,8 @@ impl SyncCoordinator {
                     summary: Some(descriptor.requested_name.clone()),
                     task_id: None,
                     root_id: None,
+                    library_uuid: Some(library_uuid.to_owned()),
+                    root_uuid: Some(root_uuid.clone()),
                     folder_id: None,
                     file_id: None,
                     current_value: 0,
@@ -1403,6 +1418,8 @@ impl SyncCoordinator {
                 summary: plan.error_code.clone().or_else(|| Some(plan.phase.clone())),
                 task_id: None,
                 root_id: None,
+                library_uuid: Some(library_uuid.to_owned()),
+                root_uuid: None,
                 folder_id: None,
                 file_id: None,
                 current_value: i64::try_from(plan.media_items_done).unwrap_or(i64::MAX),
@@ -1863,6 +1880,24 @@ impl SyncCoordinator {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             drop(connection);
+            let catalog = crate::db::Database::open(catalog_path)?;
+            let roots = catalog
+                .sync_root_descriptors()?
+                .into_iter()
+                .filter(|root| root.lifecycle == "active")
+                .map(|root| -> anyhow::Result<serde_json::Value> {
+                    let logical_bytes = catalog.sync_root_logical_bytes(&root.root_uuid)?;
+                    Ok(serde_json::json!({
+                        "rootUuid":uuid::Uuid::from_bytes(root.root_uuid),
+                        "rootFolderUuid":uuid::Uuid::from_bytes(root.root_folder_uuid),
+                        "requestedName":root.requested_name,
+                        "materializedName":root.materialized_name,
+                        "materializationFingerprint":hex_hash(&root.materialization_fingerprint),
+                        "logicalRevision":root.logical_revision,
+                        "logicalBytes":logical_bytes,
+                    }))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
             let descriptor = serde_json::to_vec(&serde_json::json!({
                 "version":1,
                 "libraryUuid":library_uuid,
@@ -1879,6 +1914,7 @@ impl SyncCoordinator {
                     "sha256":hex_hash(&checkpoint_hash)
                 },
                 "dependencies":dependencies
+                ,"roots":roots
             }))?;
             let hash: [u8; 32] = sha2::Sha256::digest(&descriptor).into();
             let result = provider
