@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use anyhow::Context;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -284,6 +285,410 @@ impl LibraryManager {
     pub fn wake_sync_for_foreground_or_network(&self) {
         let _ = self.registry.wake_all_sync_bindings();
         self.sync_coordinator.wake();
+    }
+
+    pub(crate) async fn write_sync_folder_catalog<T, F>(
+        &self,
+        library_uuid: &str,
+        operation: F,
+    ) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
+    {
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        let active = self.active_snapshot();
+        if active.library_uuid.as_deref() == Some(library_uuid) {
+            let runtime = active
+                .runtime
+                .ok_or_else(|| anyhow::anyhow!("library-runtime-unavailable"))?;
+            runtime.writer.write_authoritative(operation).await
+        } else {
+            let runtime = crate::sync::runtime::DormantSyncRuntime::new(
+                library_uuid,
+                descriptor.local_data_dir.join("catalog.sqlite"),
+                self.runtime_leases.clone(),
+            );
+            runtime.run_turn(operation).await
+        }
+    }
+
+    pub async fn sync_folder_snapshot(
+        &self,
+        library_uuid: &str,
+        root_uuid: Uuid,
+    ) -> anyhow::Result<crate::sync_folders::RootSnapshot> {
+        self.write_sync_folder_catalog(library_uuid, move |database| {
+            database.canonical_root_snapshot(root_uuid)
+        })
+        .await
+    }
+
+    pub async fn sync_folder_stop_work(
+        &self,
+        library_uuid: &str,
+        root_uuid: Uuid,
+    ) -> anyhow::Result<crate::sync_folders::RootStopWork> {
+        self.write_sync_folder_catalog(library_uuid, move |database| {
+            database.root_stop_work(root_uuid)
+        })
+        .await
+    }
+
+    pub async fn refresh_sync_folder_inventory(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let descriptors = self
+            .write_sync_folder_catalog(library_uuid, |database| database.sync_root_descriptors())
+            .await?;
+        let mut actionable = Vec::new();
+        for descriptor in descriptors {
+            let root_uuid = Uuid::from_bytes(descriptor.root_uuid).to_string();
+            let checkpoint_uuid = None;
+            if self.registry.upsert_remote_sync_root(
+                library_uuid,
+                &root_uuid,
+                &Uuid::from_bytes(descriptor.root_folder_uuid).to_string(),
+                &descriptor.requested_name,
+                &descriptor.materialized_name,
+                &crate::sync::media::hex_hash(&descriptor.materialization_fingerprint),
+                descriptor.logical_revision,
+                &descriptor.lifecycle,
+                None,
+                checkpoint_uuid,
+            )? {
+                actionable.push(root_uuid);
+            }
+        }
+        Ok(actionable)
+    }
+
+    pub async fn publish_sync_folder_placement_required(
+        &self,
+        library_uuid: &str,
+        root_uuid: &str,
+        revision: u64,
+        logical_name: &str,
+    ) -> anyhow::Result<()> {
+        let operation_id = format!("sync-folder-placement:{library_uuid}:{root_uuid}:{revision}");
+        let now = crate::host_registry::unix_timestamp_millis_for_runtime();
+        let mut notification = crate::db::notification_outbox::NotificationOperation {
+            operation_id,
+            revision: 0,
+            kind: "sync-folder-placement-required".to_owned(),
+            category: "sync".to_owned(),
+            origin: "background".to_owned(),
+            presentation: "important".to_owned(),
+            status: "pending".to_owned(),
+            phase: Some("placement-required".to_owned()),
+            title: "选择同步文件夹位置".to_owned(),
+            summary: Some(logical_name.to_owned()),
+            task_id: None,
+            root_id: None,
+            folder_id: None,
+            file_id: None,
+            current_value: 0,
+            total_value: None,
+            unit: None,
+            error_code: None,
+            error_detail: None,
+            cancellable: false,
+            retryable: false,
+            attempt: 1,
+            occurrence_count: 1,
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        self.write_sync_folder_catalog(library_uuid, move |database| {
+            database
+                .publish_notification_operation(
+                    &mut notification,
+                    crate::db::notification_outbox::PublishMode::Phase,
+                )
+                .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn current_remote_root_snapshot(
+        &self,
+        library_uuid: &str,
+        root_uuid: Uuid,
+    ) -> anyhow::Result<(crate::sync_folders::RootSnapshot, Option<String>)> {
+        self.sync_coordinator
+            .fetch_remote_root_snapshot(library_uuid, root_uuid)
+            .await
+    }
+
+    pub fn wake_sync_folder_workers(&self) {
+        self.sync_coordinator.wake();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ensure_selected_sync_root(
+        &self,
+        library_uuid: &str,
+        root_uuid: Uuid,
+        root_folder_uuid: Uuid,
+        path: String,
+        requested_name: String,
+        materialized_name: String,
+        materialization_fingerprint: [u8; 32],
+        local_binding_uuid: Uuid,
+        root_capture_epoch: Uuid,
+        root_actor_epoch: Uuid,
+        binding_generation: u64,
+        state: String,
+        operation_revision: u64,
+        enqueue_scan: bool,
+    ) -> anyhow::Result<Option<i64>> {
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        let library_uuid_parsed = Uuid::parse_str(library_uuid)?;
+        let library_root_uuid = Uuid::parse_str(&descriptor.root_uuid)?;
+        let task = self
+            .write_sync_folder_catalog(library_uuid, move |database| {
+                database.ensure_selected_sync_root(
+                    library_uuid_parsed,
+                    root_uuid,
+                    root_folder_uuid,
+                    library_root_uuid,
+                    &path,
+                    &requested_name,
+                    &materialized_name,
+                    materialization_fingerprint,
+                    local_binding_uuid,
+                    root_capture_epoch,
+                    root_actor_epoch,
+                    binding_generation,
+                    &state,
+                    operation_revision,
+                    enqueue_scan,
+                )
+            })
+            .await?;
+        if let Some(task_id) = task {
+            let active = self.active_snapshot();
+            if active.library_uuid.as_deref() == Some(library_uuid) {
+                if let Some(runtime) = active.runtime {
+                    let _ = runtime.task_queue.send(task_id).await;
+                }
+            }
+        }
+        Ok(task)
+    }
+
+    pub async fn fence_sync_root_local_only(
+        &self,
+        library_uuid: &str,
+        root_uuid: Uuid,
+        local_binding_uuid: Uuid,
+        old_generation: u64,
+        new_generation: u64,
+        root_capture_epoch: Uuid,
+        root_actor_epoch: Uuid,
+        operation_revision: u64,
+    ) -> anyhow::Result<()> {
+        self.write_sync_folder_catalog(library_uuid, move |database| {
+            database.fence_root_as_local_only(
+                root_uuid,
+                local_binding_uuid,
+                old_generation,
+                new_generation,
+                root_capture_epoch,
+                root_actor_epoch,
+                operation_revision,
+            )
+        })
+        .await?;
+        let active = self.active_snapshot();
+        if active.library_uuid.as_deref() == Some(library_uuid) {
+            if let Some(runtime) = active.runtime {
+                runtime
+                    .root_runtime_registry
+                    .replace_all(self.registry.local_root_binding_tokens(library_uuid)?);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn recover_root_reconciliation(
+        &self,
+        library_uuid: &str,
+        root_uuid: &str,
+    ) -> anyhow::Result<Option<crate::host_registry::RootOperationRecord>> {
+        let work = self
+            .registry
+            .pending_root_reconciliation_work(library_uuid, root_uuid)?;
+        if work.is_empty() {
+            let binding = self.registry.local_root_binding(library_uuid, root_uuid)?;
+            if binding
+                .as_ref()
+                .is_none_or(|binding| binding.state != "reconcile-required")
+            {
+                return Ok(None);
+            }
+        }
+        for item in &work {
+            let plan_uuid = Uuid::parse_str(&item.plan_uuid)?;
+            let item_ordinal = item.item_ordinal;
+            let root_uuid_value = Uuid::parse_str(root_uuid)?;
+            let binding_uuid = Uuid::parse_str(&item.local_binding_uuid)?;
+            let entity_uuid = Uuid::parse_str(&item.entity_uuid)?;
+            let field = item.field_name.clone();
+            let resolution = item.resolution.clone();
+            let selected = item.selected_value.clone();
+            let selected_entity = item.selected_entity.clone();
+            let generation = item.binding_generation;
+            let result = self
+                .write_sync_folder_catalog(library_uuid, move |database| {
+                    database.apply_root_reconciliation_item(
+                        plan_uuid,
+                        item_ordinal,
+                        root_uuid_value,
+                        binding_uuid,
+                        generation,
+                        entity_uuid,
+                        &field,
+                        &resolution,
+                        selected.as_deref(),
+                        selected_entity.as_deref(),
+                    )
+                })
+                .await;
+            match result {
+                Ok(()) => self
+                    .registry
+                    .complete_root_reconciliation_item(&item.plan_uuid, item.item_ordinal)?,
+                Err(error) => {
+                    self.registry.fail_root_reconciliation_item(
+                        &item.plan_uuid,
+                        item.item_ordinal,
+                        "catalog-apply-failed",
+                    )?;
+                    return Err(error);
+                }
+            }
+        }
+        let plan_uuid = work
+            .first()
+            .map(|item| item.plan_uuid.clone())
+            .or_else(|| {
+                self.registry
+                    .pending_reenable_plan_uuid(library_uuid, root_uuid)
+                    .ok()
+                    .flatten()
+            })
+            .context("comparison-plan-not-found")?;
+        let binding = self
+            .registry
+            .local_root_binding(library_uuid, root_uuid)?
+            .context("local-root-binding-not-found")?;
+        let root_uuid_value = Uuid::parse_str(root_uuid)?;
+        let binding_uuid = Uuid::parse_str(&binding.local_binding_uuid)?;
+        let revision = binding.operation_revision.saturating_add(1);
+        self.write_sync_folder_catalog(library_uuid, move |database| {
+            database.complete_root_reconciliation_projection(
+                root_uuid_value,
+                binding_uuid,
+                binding.binding_generation,
+                revision,
+            )
+        })
+        .await?;
+        let operation =
+            self.registry
+                .complete_root_reconciliation(library_uuid, root_uuid, &plan_uuid)?;
+        self.sync_coordinator.wake();
+        Ok(Some(operation))
+    }
+
+    pub async fn recover_publish_as_new(
+        &self,
+        operation_uuid: &str,
+    ) -> anyhow::Result<crate::host_registry::RootOperationRecord> {
+        let publish = self
+            .registry
+            .publish_as_new(operation_uuid)?
+            .context("publish-as-new-not-found")?;
+        let descriptor = self
+            .registry
+            .remote_sync_root(&publish.library_uuid, &publish.new_root_uuid)?
+            .context("root-not-found")?;
+        let binding = self
+            .registry
+            .local_root_binding(&publish.library_uuid, &publish.new_root_uuid)?
+            .context("local-root-binding-not-found")?;
+        let operation = Uuid::parse_str(&publish.operation_uuid)?;
+        let library = Uuid::parse_str(&publish.library_uuid)?;
+        let source_root = Uuid::parse_str(&publish.source_root_uuid)?;
+        let new_root = Uuid::parse_str(&publish.new_root_uuid)?;
+        let new_root_folder = Uuid::parse_str(&publish.new_root_folder_uuid)?;
+        let local_binding = Uuid::parse_str(&publish.new_local_binding_uuid)?;
+        let capture_epoch = Uuid::parse_str(&publish.root_capture_epoch)?;
+        let actor_epoch = Uuid::parse_str(&publish.root_actor_epoch)?;
+        let requested_name = descriptor.requested_name.clone();
+        let materialized_name = descriptor.materialized_name.clone();
+        let fingerprint = crate::sync::media::parse_hash(&descriptor.materialization_fingerprint)?;
+        self.write_sync_folder_catalog(&publish.library_uuid, move |database| {
+            database.publish_root_as_new(
+                operation,
+                library,
+                source_root,
+                new_root,
+                new_root_folder,
+                &requested_name,
+                &materialized_name,
+                fingerprint,
+                local_binding,
+                capture_epoch,
+                actor_epoch,
+                binding.operation_revision,
+            )
+        })
+        .await?;
+        let marker = crate::sync_folders::SyncRootMarker {
+            format_version: 1,
+            library_uuid: publish.library_uuid.clone(),
+            root_uuid: publish.new_root_uuid.clone(),
+            root_folder_uuid: publish.new_root_folder_uuid.clone(),
+            local_binding_uuid: publish.new_local_binding_uuid.clone(),
+            binding_generation: binding.binding_generation,
+        };
+        crate::sync_folders::replace_root_marker_for_publish(
+            Path::new(&binding.local_path),
+            &publish.source_root_uuid,
+            &marker,
+        )?;
+        let marker_identity = crate::library_path::local_file_identity(
+            &Path::new(&binding.local_path).join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+        )?;
+        self.registry.update_local_root_marker_identity(
+            &publish.library_uuid,
+            &publish.new_root_uuid,
+            &publish.new_local_binding_uuid,
+            binding.binding_generation,
+            &marker_identity,
+        )?;
+        let completed = self.registry.complete_publish_as_new(operation_uuid)?;
+        let active = self.active_snapshot();
+        if active.library_uuid.as_deref() == Some(&publish.library_uuid) {
+            if let Some(runtime) = active.runtime {
+                runtime.root_runtime_registry.replace_all(
+                    self.registry
+                        .local_root_binding_tokens(&publish.library_uuid)?,
+                );
+            }
+        }
+        self.sync_coordinator.wake();
+        Ok(completed)
     }
 
     pub async fn publish_sync_operation_notification(
@@ -2272,27 +2677,163 @@ impl LibraryManager {
             Uuid::parse_str(&descriptor.root_uuid)?,
             self.registry.device_uuid()?,
         )?;
+        for publish in self
+            .registry
+            .pending_publish_as_new(&descriptor.library_uuid)?
+        {
+            let remote = self
+                .registry
+                .remote_sync_root(&descriptor.library_uuid, &publish.new_root_uuid)?
+                .context("root-not-found")?;
+            let binding = self
+                .registry
+                .local_root_binding(&descriptor.library_uuid, &publish.new_root_uuid)?
+                .context("local-root-binding-not-found")?;
+            database.publish_root_as_new(
+                Uuid::parse_str(&publish.operation_uuid)?,
+                Uuid::parse_str(&publish.library_uuid)?,
+                Uuid::parse_str(&publish.source_root_uuid)?,
+                Uuid::parse_str(&publish.new_root_uuid)?,
+                Uuid::parse_str(&publish.new_root_folder_uuid)?,
+                &remote.requested_name,
+                &remote.materialized_name,
+                crate::sync::media::parse_hash(&remote.materialization_fingerprint)?,
+                Uuid::parse_str(&publish.new_local_binding_uuid)?,
+                Uuid::parse_str(&publish.root_capture_epoch)?,
+                Uuid::parse_str(&publish.root_actor_epoch)?,
+                binding.operation_revision,
+            )?;
+            crate::sync_folders::replace_root_marker_for_publish(
+                Path::new(&binding.local_path),
+                &publish.source_root_uuid,
+                &crate::sync_folders::SyncRootMarker {
+                    format_version: 1,
+                    library_uuid: publish.library_uuid.clone(),
+                    root_uuid: publish.new_root_uuid.clone(),
+                    root_folder_uuid: publish.new_root_folder_uuid.clone(),
+                    local_binding_uuid: publish.new_local_binding_uuid.clone(),
+                    binding_generation: binding.binding_generation,
+                },
+            )?;
+            self.registry
+                .complete_publish_as_new(&publish.operation_uuid)?;
+        }
         for host_binding in self
             .registry
             .local_root_bindings(&descriptor.library_uuid)?
         {
             let root_uuid = Uuid::parse_str(&host_binding.root_uuid)?;
-            let Some(root_id) = database.sync_root_id(root_uuid.as_bytes())? else {
-                continue;
-            };
-            database.upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+            let remote = self
+                .registry
+                .remote_sync_root(&descriptor.library_uuid, &host_binding.root_uuid)?;
+            if database.sync_root_id(root_uuid.as_bytes())?.is_none() {
+                let remote = remote
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("root-not-found"))?;
+                database.ensure_selected_sync_root(
+                    Uuid::parse_str(&descriptor.library_uuid)?,
+                    root_uuid,
+                    Uuid::parse_str(&remote.root_folder_uuid)?,
+                    Uuid::parse_str(&descriptor.root_uuid)?,
+                    &host_binding.local_path,
+                    &remote.requested_name,
+                    &remote.materialized_name,
+                    crate::sync::media::parse_hash(&remote.materialization_fingerprint)?,
+                    Uuid::parse_str(&host_binding.local_binding_uuid)?,
+                    Uuid::parse_str(
+                        host_binding
+                            .root_capture_epoch
+                            .as_deref()
+                            .unwrap_or(&host_binding.local_binding_uuid),
+                    )?,
+                    Uuid::parse_str(
+                        host_binding
+                            .root_actor_epoch
+                            .as_deref()
+                            .unwrap_or(&host_binding.local_binding_uuid),
+                    )?,
+                    host_binding.binding_generation,
+                    &host_binding.state,
+                    host_binding.operation_revision,
+                    false,
+                )?;
+            }
+            let root_id = database
+                .sync_root_id(root_uuid.as_bytes())?
+                .ok_or_else(|| anyhow::anyhow!("root-not-found"))?;
+            let projected = SyncRootLocalBindingRecord {
                 root_uuid: *root_uuid.as_bytes(),
                 library_uuid: *Uuid::parse_str(&descriptor.library_uuid)?.as_bytes(),
                 local_binding_uuid: *Uuid::parse_str(&host_binding.local_binding_uuid)?.as_bytes(),
                 binding_generation: host_binding.binding_generation,
-                state: host_binding.state,
+                root_capture_epoch: *Uuid::parse_str(
+                    host_binding
+                        .root_capture_epoch
+                        .as_deref()
+                        .unwrap_or(&host_binding.local_binding_uuid),
+                )?
+                .as_bytes(),
+                root_actor_epoch: *Uuid::parse_str(
+                    host_binding
+                        .root_actor_epoch
+                        .as_deref()
+                        .unwrap_or(&host_binding.local_binding_uuid),
+                )?
+                .as_bytes(),
+                state: host_binding.state.clone(),
                 root_id,
                 operation_revision: host_binding.operation_revision,
                 updated_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_millis() as i64)
                     .unwrap_or(0),
-            })?;
+            };
+            let current = database.sync_root_local_binding(root_uuid.as_bytes())?;
+            if host_binding.state == "local-only-fork"
+                && current.as_ref().is_some_and(|current| {
+                    current.local_binding_uuid == projected.local_binding_uuid
+                        && current.binding_generation < projected.binding_generation
+                })
+            {
+                let current = current.expect("checked above");
+                database.fence_root_as_local_only(
+                    root_uuid,
+                    Uuid::from_bytes(current.local_binding_uuid),
+                    current.binding_generation,
+                    projected.binding_generation,
+                    Uuid::from_bytes(projected.root_capture_epoch),
+                    Uuid::from_bytes(projected.root_actor_epoch),
+                    projected.operation_revision,
+                )?;
+            } else {
+                database.upsert_sync_root_local_binding(&projected)?;
+            }
+
+            if let Some(remote) = remote {
+                let local_path = Path::new(&host_binding.local_path);
+                if local_path
+                    .join(crate::sync_folders::ROOT_MARKER_FILE_NAME)
+                    .is_file()
+                {
+                    if let Ok(marker) = crate::sync_folders::read_root_marker(local_path) {
+                        if marker.library_uuid == descriptor.library_uuid
+                            && marker.root_uuid == host_binding.root_uuid
+                            && marker.root_folder_uuid == remote.root_folder_uuid
+                            && (marker.local_binding_uuid != host_binding.local_binding_uuid
+                                || marker.binding_generation != host_binding.binding_generation)
+                        {
+                            crate::sync_folders::replace_root_marker(
+                                local_path,
+                                &crate::sync_folders::SyncRootMarker {
+                                    local_binding_uuid: host_binding.local_binding_uuid.clone(),
+                                    binding_generation: host_binding.binding_generation,
+                                    ..marker
+                                },
+                            )?;
+                        }
+                    }
+                }
+            }
         }
         let registry = Arc::clone(&self.registry);
         let coordinator = self.sync_coordinator.clone();
@@ -2754,7 +3295,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(migration, 31);
+        assert_eq!(migration, 32);
         assert_eq!(
             Uuid::from_slice(&identity.0).unwrap().to_string(),
             created.library_uuid

@@ -1,9 +1,17 @@
 use anyhow::{bail, Context};
 use rusqlite::{params, OptionalExtension};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 use super::Database;
+
+fn root_now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +44,8 @@ pub struct SyncRootLocalBindingRecord {
     pub library_uuid: [u8; 16],
     pub local_binding_uuid: [u8; 16],
     pub binding_generation: u64,
+    pub root_capture_epoch: [u8; 16],
+    pub root_actor_epoch: [u8; 16],
     pub state: String,
     pub root_id: i64,
     pub operation_revision: u64,
@@ -50,6 +60,494 @@ fn fixed_bytes<const N: usize>(value: Vec<u8>, field: &str) -> anyhow::Result<[u
 }
 
 impl Database {
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_selected_sync_root(
+        &self,
+        library_uuid: uuid::Uuid,
+        root_uuid: uuid::Uuid,
+        root_folder_uuid: uuid::Uuid,
+        library_root_uuid: uuid::Uuid,
+        path: &str,
+        requested_name: &str,
+        materialized_name: &str,
+        materialization_fingerprint: [u8; 32],
+        local_binding_uuid: uuid::Uuid,
+        root_capture_epoch: uuid::Uuid,
+        root_actor_epoch: uuid::Uuid,
+        binding_generation: u64,
+        state: &str,
+        operation_revision: u64,
+        enqueue_scan: bool,
+    ) -> anyhow::Result<Option<i64>> {
+        if let Some(root_id) = self.sync_root_id(root_uuid.as_bytes())? {
+            self.upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                library_uuid: *library_uuid.as_bytes(),
+                local_binding_uuid: *local_binding_uuid.as_bytes(),
+                binding_generation,
+                root_capture_epoch: *root_capture_epoch.as_bytes(),
+                root_actor_epoch: *root_actor_epoch.as_bytes(),
+                state: state.to_owned(),
+                root_id,
+                operation_revision,
+                updated_at: root_now_millis(),
+            })?;
+            return Ok(None);
+        }
+        let root_id = self.add_root(crate::db::NewRoot {
+            path: path.to_owned(),
+            display_name: materialized_name.to_owned(),
+        })?;
+        self.connection.execute(
+            "UPDATE roots SET root_uuid=?1 WHERE id=?2",
+            params![root_uuid.as_bytes().as_slice(), root_id],
+        )?;
+        self.connection.execute("INSERT OR IGNORE INTO folders(root_id,parent_id,name,path_hash,mtime,status,folder_uuid) VALUES (?1,NULL,'','',NULL,'active',?2)",params![root_id,root_folder_uuid.as_bytes().as_slice()])?;
+        self.upsert_sync_root_descriptor(&SyncRootDescriptorRecord {
+            root_uuid: *root_uuid.as_bytes(),
+            root_folder_uuid: *root_folder_uuid.as_bytes(),
+            library_root_uuid: *library_root_uuid.as_bytes(),
+            creation_event_uuid: None,
+            winning_location_revision_uuid: None,
+            requested_name: requested_name.to_owned(),
+            materialized_name: materialized_name.to_owned(),
+            materialization_fingerprint,
+            lifecycle: "active".to_owned(),
+            logical_revision: 0,
+            updated_at: root_now_millis(),
+        })?;
+        self.link_sync_root_descriptor(root_id, root_uuid.as_bytes(), root_folder_uuid.as_bytes())?;
+        self.upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+            root_uuid: *root_uuid.as_bytes(),
+            library_uuid: *library_uuid.as_bytes(),
+            local_binding_uuid: *local_binding_uuid.as_bytes(),
+            binding_generation,
+            root_capture_epoch: *root_capture_epoch.as_bytes(),
+            root_actor_epoch: *root_actor_epoch.as_bytes(),
+            state: state.to_owned(),
+            root_id,
+            operation_revision,
+            updated_at: root_now_millis(),
+        })?;
+        if enqueue_scan {
+            let token = SyncRootBindingToken {
+                root_uuid: *root_uuid.as_bytes(),
+                local_binding_uuid: *local_binding_uuid.as_bytes(),
+                binding_generation,
+            };
+            return Ok(Some(
+                self.create_root_scan_task_with_origin_for_root_token(
+                    root_id,
+                    Some(&token),
+                    crate::db::NotificationOrigin::User,
+                )?,
+            ));
+        }
+        Ok(None)
+    }
+
+    pub fn fence_root_as_local_only(
+        &self,
+        root_uuid: uuid::Uuid,
+        local_binding_uuid: uuid::Uuid,
+        old_generation: u64,
+        new_generation: u64,
+        root_capture_epoch: uuid::Uuid,
+        root_actor_epoch: uuid::Uuid,
+        operation_revision: u64,
+    ) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let current:(i64,String,Vec<u8>,Vec<u8>,i64)=transaction.query_row("SELECT binding_generation,state,COALESCE(root_capture_epoch,local_binding_uuid),COALESCE(root_actor_epoch,local_binding_uuid),operation_revision FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2",params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        if current.0 == i64::try_from(new_generation)?
+            && current.1 == "local-only-fork"
+            && current.2 == root_capture_epoch.as_bytes()
+            && current.3 == root_actor_epoch.as_bytes()
+            && current.4 >= i64::try_from(operation_revision)?
+        {
+            transaction.commit()?;
+            return Ok(());
+        }
+        if current.0 != i64::try_from(old_generation)? {
+            bail!("stale root binding generation");
+        }
+        let old_actor_epoch = current.3;
+        let changed=transaction.execute("UPDATE sync_root_local_bindings SET state='local-only-fork',binding_generation=?1,root_capture_epoch=?2,root_actor_epoch=?3,operation_revision=?4,updated_at=?5 WHERE root_uuid=?6 AND local_binding_uuid=?7 AND binding_generation=?8",params![i64::try_from(new_generation)?,root_capture_epoch.as_bytes().as_slice(),root_actor_epoch.as_bytes().as_slice(),i64::try_from(operation_revision)?,root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?])?;
+        if changed != 1 {
+            let already_fenced: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND operation_revision>=?4 AND state='local-only-fork')",
+                params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(new_generation)?,i64::try_from(operation_revision)?],
+                |row| row.get(0),
+            )?;
+            if !already_fenced {
+                bail!("stale root binding generation");
+            }
+        }
+        transaction.execute("UPDATE tasks SET status='cancelled',error='stale-root-binding' WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND status IN ('pending','running')",params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?])?;
+        transaction.execute("UPDATE file_operations SET status='cancelled',journal_phase='cancelled',error='stale-root-binding' WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND status IN ('pending','running')",params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?])?;
+        transaction.execute("UPDATE sync_publication_intents SET state='archived',error_code='root-local-only-fork',updated_at=?1 WHERE root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND state NOT IN ('canonicalized','cancelled','archived')",params![root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?])?;
+        transaction.execute("UPDATE media_publication_jobs SET phase='archived',error_code='root-local-only-fork',updated_at=?1 WHERE root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND phase NOT IN ('event-published','cancelled','archived')",params![root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?])?;
+        transaction.execute("UPDATE media_materialization_jobs SET phase='cancelled',error_code='root-local-only-fork',updated_at=?1 WHERE root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND phase NOT IN ('complete','cancelled')",params![root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?])?;
+        transaction.execute("UPDATE sync_outbox SET state='archived' WHERE event_uuid IN (SELECT event.event_uuid FROM sync_events event WHERE event.entity_uuid IN (SELECT asset_uuid FROM files WHERE root_id=(SELECT root_id FROM sync_root_local_bindings WHERE root_uuid=?1)) OR event.entity_uuid IN (SELECT folder_uuid FROM folders WHERE root_id=(SELECT root_id FROM sync_root_local_bindings WHERE root_uuid=?1))) AND state IN ('pending','sealed')",[root_uuid.as_bytes().as_slice()])?;
+        let (device, stream): (Vec<u8>, Vec<u8>) = transaction.query_row(
+            "SELECT device_uuid,catalog_stream_uuid FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        transaction.execute(
+            "UPDATE sync_actor_epochs SET state='closed' WHERE actor_epoch=?1",
+            [old_actor_epoch],
+        )?;
+        transaction.execute("INSERT INTO sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,stream_kind,binding_epoch,state,next_actor_seq,published_through_seq,created_at) VALUES (?1,?2,?3,'catalog',?4,'forked',1,0,?5) ON CONFLICT(actor_epoch) DO UPDATE SET state='forked',binding_epoch=excluded.binding_epoch",params![root_actor_epoch.as_bytes().as_slice(),device,stream,root_capture_epoch.as_bytes().as_slice(),root_now_millis()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn canonical_root_snapshot(
+        &self,
+        root_uuid: uuid::Uuid,
+    ) -> anyhow::Result<crate::sync_folders::RootSnapshot> {
+        let (state, frontier) = crate::sync::persistence::capture_protocol_state(&self.connection)?;
+        crate::sync_folders::snapshot_from_protocol_state(
+            &state,
+            root_uuid,
+            serde_json::to_value(frontier)?,
+        )
+    }
+
+    pub fn root_stop_work(
+        &self,
+        root_uuid: Uuid,
+    ) -> anyhow::Result<crate::sync_folders::RootStopWork> {
+        let actor:Vec<u8>=self.connection.query_row("SELECT COALESCE(root_actor_epoch,local_binding_uuid) FROM sync_root_local_bindings WHERE root_uuid=?1",[root_uuid.as_bytes().as_slice()],|row|row.get(0)).context("local root binding not found")?;
+        let pending:i64=self.connection.query_row("SELECT COUNT(*) FROM sync_outbox outbox JOIN sync_events event ON event.event_uuid=outbox.event_uuid WHERE event.actor_epoch=?1 AND outbox.state IN ('pending','sealed')",[&actor],|row|row.get(0))?;
+        let mut statement=self.connection.prepare("SELECT spool_path FROM sync_segments WHERE actor_epoch=?1 AND state IN ('published','acked') ORDER BY first_seq")?;
+        let paths = statement
+            .query_map([actor], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut receipt_keys = Vec::with_capacity(paths.len());
+        for path in paths {
+            let bytes = std::fs::read(path)?;
+            receipt_keys.push(format!(
+                "segments/{}.json",
+                crate::sync::media::hex_hash(&crate::sync::codec::sha256(&bytes))
+            ));
+        }
+        Ok(crate::sync_folders::RootStopWork {
+            pending_work: pending.max(0) as u64,
+            published_work: receipt_keys.len() as u64,
+            receipt_keys,
+        })
+    }
+
+    pub fn apply_root_reconciliation_item(
+        &self,
+        plan_uuid: Uuid,
+        item_ordinal: u64,
+        root_uuid: Uuid,
+        local_binding_uuid: Uuid,
+        binding_generation: u64,
+        entity_uuid: Uuid,
+        field_name: &str,
+        resolution: &str,
+        selected_value: Option<&str>,
+        selected_entity: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let already:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM sync_root_reconciliation_applied WHERE plan_uuid=?1 AND item_ordinal=?2)",params![plan_uuid.as_bytes().as_slice(),i64::try_from(item_ordinal)?],|row|row.get(0))?;
+        if already {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let current:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND state='reconcile-required')",params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(binding_generation)?],|row|row.get(0))?;
+        if !current {
+            bail!("stale root binding generation");
+        }
+        if matches!(resolution, "keep-local" | "keep-remote") {
+            ensure_reconciliation_entity(&transaction, root_uuid, entity_uuid, selected_entity)?;
+            capture_selected_snapshot_value(
+                &transaction,
+                plan_uuid,
+                item_ordinal,
+                b"selected",
+                entity_uuid,
+                field_name,
+                selected_value,
+                false,
+            )?;
+        } else if resolution == "keep-both" {
+            let selected_values: serde_json::Value = selected_value
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or_default();
+            let selected_entities: serde_json::Value = selected_entity
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or_default();
+            for side in ["local", "remote"] {
+                let entity = selected_entities
+                    .get(side)
+                    .filter(|value| !value.is_null())
+                    .map(serde_json::to_string)
+                    .transpose()?;
+                ensure_reconciliation_entity(
+                    &transaction,
+                    root_uuid,
+                    entity_uuid,
+                    entity.as_deref(),
+                )?;
+            }
+            if field_name == "set:tags" {
+                let mut members = BTreeSet::new();
+                for side in ["local", "remote"] {
+                    if let Some(value) = selected_values
+                        .get(side)
+                        .filter(|value| !value.is_null())
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        members.extend(serde_json::from_str::<BTreeSet<String>>(value)?);
+                    }
+                }
+                let merged = serde_json::to_string(&members)?;
+                capture_selected_snapshot_value(
+                    &transaction,
+                    plan_uuid,
+                    item_ordinal,
+                    b"merged",
+                    entity_uuid,
+                    field_name,
+                    Some(&merged),
+                    false,
+                )?;
+            } else {
+                for (side, variant, preserve_concurrent) in [
+                    ("local", b"local".as_slice(), false),
+                    ("remote", b"remote".as_slice(), true),
+                ] {
+                    let value = selected_values
+                        .get(side)
+                        .filter(|value| !value.is_null())
+                        .and_then(serde_json::Value::as_str);
+                    capture_selected_snapshot_value(
+                        &transaction,
+                        plan_uuid,
+                        item_ordinal,
+                        variant,
+                        entity_uuid,
+                        field_name,
+                        value,
+                        preserve_concurrent,
+                    )?;
+                }
+            }
+            preserve_both_reconciliation_versions(
+                &transaction,
+                entity_uuid,
+                field_name,
+                selected_value,
+            )?;
+        }
+        transaction.execute("INSERT INTO sync_root_reconciliation_applied(plan_uuid,item_ordinal,root_uuid,local_binding_uuid,binding_generation,applied_at) VALUES (?1,?2,?3,?4,?5,?6)",params![plan_uuid.as_bytes().as_slice(),i64::try_from(item_ordinal)?,root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(binding_generation)?,root_now_millis()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn complete_root_reconciliation_projection(
+        &self,
+        root_uuid: Uuid,
+        local_binding_uuid: Uuid,
+        binding_generation: u64,
+        operation_revision: u64,
+    ) -> anyhow::Result<()> {
+        let changed=self.connection.execute("UPDATE sync_root_local_bindings SET state='active',operation_revision=?1,updated_at=?2 WHERE root_uuid=?3 AND local_binding_uuid=?4 AND binding_generation=?5 AND state IN ('reconcile-required','active')",params![i64::try_from(operation_revision)?,root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(binding_generation)?])?;
+        if changed != 1 {
+            bail!("stale root binding generation");
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_root_as_new(
+        &self,
+        operation_uuid: Uuid,
+        library_uuid: Uuid,
+        source_root_uuid: Uuid,
+        new_root_uuid: Uuid,
+        new_root_folder_uuid: Uuid,
+        requested_name: &str,
+        materialized_name: &str,
+        materialization_fingerprint: [u8; 32],
+        local_binding_uuid: Uuid,
+        root_capture_epoch: Uuid,
+        root_actor_epoch: Uuid,
+        operation_revision: u64,
+    ) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        if let Some(state) = transaction
+            .query_row(
+                "SELECT state FROM sync_root_publish_cutovers WHERE operation_uuid=?1",
+                [operation_uuid.as_bytes().as_slice()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if state == "complete" {
+                transaction.commit()?;
+                return Ok(());
+            }
+        }
+        let source_root_id: i64 = transaction
+            .query_row(
+                "SELECT id FROM roots WHERE root_uuid=?1 AND root_folder_uuid IS NOT NULL",
+                [source_root_uuid.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .context("source sync root not found")?;
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_root_publish_cutovers WHERE operation_uuid=?1)",
+            [operation_uuid.as_bytes().as_slice()],
+            |row| row.get::<_, bool>(0),
+        )? == false
+        {
+            transaction.execute("INSERT INTO sync_root_publish_cutovers(operation_uuid,source_root_uuid,new_root_uuid,source_root_id,state,created_at,updated_at) VALUES (?1,?2,?3,?4,'planned',?5,?5)",params![operation_uuid.as_bytes().as_slice(),source_root_uuid.as_bytes().as_slice(),new_root_uuid.as_bytes().as_slice(),source_root_id,root_now_millis()])?;
+        }
+        let library_root_uuid: Vec<u8> = transaction.query_row(
+            "SELECT library_root_uuid FROM sync_root_descriptors WHERE root_uuid=?1",
+            [source_root_uuid.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        transaction.execute("INSERT OR IGNORE INTO sync_root_descriptors(root_uuid,root_folder_uuid,library_root_uuid,creation_event_uuid,winning_location_revision_uuid,requested_name,materialized_name,materialization_fingerprint,lifecycle,logical_revision,updated_at) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,'active',0,?8)",params![new_root_uuid.as_bytes().as_slice(),new_root_folder_uuid.as_bytes().as_slice(),library_root_uuid,derived_publish_uuid(operation_uuid,b"root-location").as_bytes().as_slice(),requested_name,materialized_name,materialization_fingerprint.as_slice(),root_now_millis()])?;
+        transaction.execute("UPDATE tasks SET status='cancelled',error='root-published-as-new' WHERE root_uuid=?1 AND status IN ('pending','running')",[source_root_uuid.as_bytes().as_slice()])?;
+        transaction.execute("UPDATE file_operations SET status='cancelled',journal_phase='cancelled',error='root-published-as-new' WHERE root_uuid=?1 AND status IN ('pending','running')",[source_root_uuid.as_bytes().as_slice()])?;
+        transaction.execute("UPDATE sync_publication_intents SET state='archived',error_code='root-published-as-new',updated_at=?1 WHERE root_uuid=?2 AND state NOT IN ('canonicalized','cancelled','archived')",params![root_now_millis(),source_root_uuid.as_bytes().as_slice()])?;
+        transaction.execute("UPDATE media_publication_jobs SET phase='archived',error_code='root-published-as-new',updated_at=?1 WHERE root_uuid=?2 AND phase NOT IN ('event-published','cancelled','archived')",params![root_now_millis(),source_root_uuid.as_bytes().as_slice()])?;
+        transaction.execute("UPDATE media_materialization_jobs SET phase='cancelled',error_code='root-published-as-new',updated_at=?1 WHERE root_uuid=?2 AND phase NOT IN ('complete','cancelled')",params![root_now_millis(),source_root_uuid.as_bytes().as_slice()])?;
+        transaction.execute("UPDATE sync_outbox SET state='archived' WHERE event_uuid IN (SELECT event_uuid FROM sync_events WHERE entity_uuid IN (SELECT asset_uuid FROM files WHERE root_id=?1) OR entity_uuid IN (SELECT folder_uuid FROM folders WHERE root_id=?1)) AND state IN ('pending','sealed')",[source_root_id])?;
+        let old_actor_epoch:Vec<u8>=transaction.query_row("SELECT COALESCE(root_actor_epoch,local_binding_uuid) FROM sync_root_local_bindings WHERE root_uuid=?1",[source_root_uuid.as_bytes().as_slice()],|row|row.get(0))?;
+        transaction.execute(
+            "UPDATE sync_actor_epochs SET state='archived' WHERE actor_epoch=?1",
+            [old_actor_epoch],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_local_bindings WHERE root_uuid=?1",
+            [source_root_uuid.as_bytes().as_slice()],
+        )?;
+        transaction.execute("UPDATE folders SET folder_uuid=?1 WHERE root_id=?2 AND parent_id IS NULL AND name='' AND folder_uuid=(SELECT root_folder_uuid FROM roots WHERE id=?2)",params![new_root_folder_uuid.as_bytes().as_slice(),source_root_id])?;
+        transaction.execute(
+            "UPDATE roots SET root_uuid=?1,root_folder_uuid=?2,display_name=?3 WHERE id=?4",
+            params![
+                new_root_uuid.as_bytes().as_slice(),
+                new_root_folder_uuid.as_bytes().as_slice(),
+                materialized_name,
+                source_root_id
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_root_descriptors WHERE root_uuid=?1",
+            [source_root_uuid.as_bytes().as_slice()],
+        )?;
+        let generation = 1i64;
+        transaction.execute("INSERT INTO sync_root_local_bindings(root_uuid,library_uuid,local_binding_uuid,binding_generation,state,root_id,operation_revision,updated_at,root_capture_epoch,root_actor_epoch) VALUES (?1,?2,?3,?4,'active',?5,?6,?7,?8,?9)",params![new_root_uuid.as_bytes().as_slice(),library_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),generation,source_root_id,i64::try_from(operation_revision)?,root_now_millis(),root_capture_epoch.as_bytes().as_slice(),root_actor_epoch.as_bytes().as_slice()])?;
+        let (device, stream): (Vec<u8>, Vec<u8>) = transaction.query_row(
+            "SELECT device_uuid,catalog_stream_uuid FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        transaction.execute("INSERT INTO sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,stream_kind,binding_epoch,state,next_actor_seq,published_through_seq,created_at) VALUES (?1,?2,?3,'catalog',?4,'active',1,0,?5) ON CONFLICT(actor_epoch) DO NOTHING",params![root_actor_epoch.as_bytes().as_slice(),device,stream,root_capture_epoch.as_bytes().as_slice(),root_now_millis()])?;
+        crate::sync::capture::capture_catalog_mutation(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            crate::sync::types::EntityUuid(new_root_folder_uuid),
+            crate::sync::types::Operation::SetField {
+                field: "entity-kind".into(),
+                value: serde_json::json!("folder"),
+            },
+        )?;
+        commit_location_mutation_once(
+            &transaction,
+            derived_publish_uuid(operation_uuid, b"root-location"),
+            new_root_folder_uuid,
+            crate::sync::types::EntityUuid(Uuid::from_slice(&library_root_uuid)?),
+            requested_name,
+            &BTreeSet::new(),
+        )?;
+        let direct_children = {
+            let sentinel_id: i64 = transaction.query_row(
+                "SELECT id FROM folders WHERE root_id=?1 AND parent_id IS NULL AND name=''",
+                [source_root_id],
+                |row| row.get(0),
+            )?;
+            let mut children = Vec::new();
+            let mut folders = transaction.prepare(
+                "SELECT folder_uuid,name FROM folders WHERE parent_id=?1 ORDER BY folder_uuid",
+            )?;
+            for row in folders.query_map([sentinel_id], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })? {
+                children.push(row?);
+            }
+            drop(folders);
+            let mut files = transaction.prepare(
+                "SELECT asset_uuid,name FROM files WHERE folder_id=?1 ORDER BY asset_uuid",
+            )?;
+            for row in files.query_map([sentinel_id], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })? {
+                children.push(row?);
+            }
+            children
+        };
+        for (index, (entity, name)) in direct_children.into_iter().enumerate() {
+            let entity = Uuid::from_slice(&entity)?;
+            let heads = location_heads(&transaction, entity)?;
+            let label = format!("child-location-{index}");
+            commit_location_mutation_once(
+                &transaction,
+                derived_publish_uuid(operation_uuid, label.as_bytes()),
+                entity,
+                crate::sync::types::EntityUuid(new_root_folder_uuid),
+                &name,
+                &heads,
+            )?;
+        }
+        // The prior fork actor is permanently sealed. Re-emit the complete
+        // retained tree through the fresh root actor so publication of the
+        // new identity never depends on reopening old queued work.
+        let (state, _) = crate::sync::persistence::capture_protocol_state(&transaction)?;
+        let snapshot = crate::sync_folders::snapshot_from_protocol_state(
+            &state,
+            new_root_uuid,
+            serde_json::json!({}),
+        )?;
+        let mut publish_ordinal = 0u64;
+        for (entity, fields) in &snapshot.entities {
+            let entity_uuid = Uuid::parse_str(entity)?;
+            for (field, value) in fields {
+                if entity_uuid == new_root_folder_uuid
+                    && matches!(field.as_str(), "field:entity-kind" | "location")
+                {
+                    continue;
+                }
+                if field.starts_with("root:") {
+                    continue;
+                }
+                capture_selected_snapshot_value(
+                    &transaction,
+                    operation_uuid,
+                    publish_ordinal,
+                    b"publish-as-new",
+                    entity_uuid,
+                    field,
+                    Some(value),
+                    false,
+                )?;
+                publish_ordinal = publish_ordinal.saturating_add(1);
+            }
+        }
+        transaction.execute("UPDATE sync_root_publish_cutovers SET new_root_id=?1,state='complete',updated_at=?2 WHERE operation_uuid=?3",params![source_root_id,root_now_millis(),operation_uuid.as_bytes().as_slice()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn sync_root_id(&self, root_uuid: &[u8; 16]) -> anyhow::Result<Option<i64>> {
         self.connection
             .query_row(
@@ -191,7 +689,7 @@ impl Database {
         let operation_revision = i64::try_from(binding.operation_revision)
             .context("binding operation revision exceeds SQLite integer range")?;
         let changed = self.connection.execute(
-            "INSERT INTO sync_root_local_bindings(root_uuid,library_uuid,local_binding_uuid,binding_generation,state,root_id,operation_revision,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root_uuid) DO UPDATE SET local_binding_uuid=excluded.local_binding_uuid,binding_generation=excluded.binding_generation,state=excluded.state,operation_revision=excluded.operation_revision,updated_at=excluded.updated_at WHERE sync_root_local_bindings.library_uuid=excluded.library_uuid AND sync_root_local_bindings.root_id=excluded.root_id AND (excluded.binding_generation>sync_root_local_bindings.binding_generation OR (excluded.binding_generation=sync_root_local_bindings.binding_generation AND excluded.operation_revision>=sync_root_local_bindings.operation_revision))",
+            "INSERT INTO sync_root_local_bindings(root_uuid,library_uuid,local_binding_uuid,binding_generation,state,root_id,operation_revision,updated_at,root_capture_epoch,root_actor_epoch) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(root_uuid) DO UPDATE SET local_binding_uuid=excluded.local_binding_uuid,binding_generation=excluded.binding_generation,state=excluded.state,operation_revision=excluded.operation_revision,updated_at=excluded.updated_at,root_capture_epoch=excluded.root_capture_epoch,root_actor_epoch=excluded.root_actor_epoch WHERE sync_root_local_bindings.library_uuid=excluded.library_uuid AND sync_root_local_bindings.root_id=excluded.root_id AND (excluded.binding_generation>sync_root_local_bindings.binding_generation OR (excluded.binding_generation=sync_root_local_bindings.binding_generation AND excluded.operation_revision>=sync_root_local_bindings.operation_revision))",
             params![
                 binding.root_uuid.as_slice(),
                 binding.library_uuid.as_slice(),
@@ -201,8 +699,29 @@ impl Database {
                 binding.root_id,
                 operation_revision,
                 binding.updated_at,
+                binding.root_capture_epoch.as_slice(),
+                binding.root_actor_epoch.as_slice(),
             ],
         )?;
+        let actor_context: Option<(Vec<u8>, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT device_uuid,catalog_stream_uuid FROM sync_local_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((device, stream)) = actor_context {
+            let actor_state = if binding.state == "local-only-fork" {
+                "forked"
+            } else {
+                "active"
+            };
+            self.connection.execute(
+                "INSERT INTO sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,stream_kind,binding_epoch,state,next_actor_seq,published_through_seq,created_at) VALUES (?1,?2,?3,'catalog',?4,?5,1,0,?6) ON CONFLICT(actor_epoch) DO UPDATE SET state=excluded.state,binding_epoch=excluded.binding_epoch",
+                params![binding.root_actor_epoch.as_slice(),device,stream,binding.root_capture_epoch.as_slice(),actor_state,root_now_millis()],
+            )?;
+        }
         if changed == 0 {
             let current = self.sync_root_local_binding(&binding.root_uuid)?;
             if current.as_ref() == Some(binding) {
@@ -220,7 +739,7 @@ impl Database {
     ) -> anyhow::Result<Option<SyncRootLocalBindingRecord>> {
         self.connection
             .query_row(
-                "SELECT root_uuid,library_uuid,local_binding_uuid,binding_generation,state,root_id,operation_revision,updated_at FROM sync_root_local_bindings WHERE root_uuid=?1",
+                "SELECT root_uuid,library_uuid,local_binding_uuid,binding_generation,state,root_id,operation_revision,updated_at,COALESCE(root_capture_epoch,local_binding_uuid),COALESCE(root_actor_epoch,local_binding_uuid) FROM sync_root_local_bindings WHERE root_uuid=?1",
                 [root_uuid.as_slice()],
                 |row| {
                     Ok((
@@ -232,6 +751,8 @@ impl Database {
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, Vec<u8>>(9)?,
                     ))
                 },
             )
@@ -246,6 +767,8 @@ impl Database {
                     root_id,
                     operation_revision,
                     updated_at,
+                    root_capture_epoch,
+                    root_actor_epoch,
                 )| {
                     Ok(SyncRootLocalBindingRecord {
                         root_uuid: fixed_bytes(root_uuid, "root_uuid")?,
@@ -261,6 +784,8 @@ impl Database {
                         operation_revision: u64::try_from(operation_revision)
                             .context("negative binding operation revision")?,
                         updated_at,
+                        root_capture_epoch: fixed_bytes(root_capture_epoch, "root_capture_epoch")?,
+                        root_actor_epoch: fixed_bytes(root_actor_epoch, "root_actor_epoch")?,
                     })
                 },
             )
@@ -413,6 +938,24 @@ impl Database {
             .transpose()
     }
 
+    pub fn sync_root_descriptors(&self) -> anyhow::Result<Vec<SyncRootDescriptorRecord>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT root_uuid FROM sync_root_descriptors ORDER BY root_uuid")?;
+        let roots = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        roots
+            .into_iter()
+            .map(|root| {
+                let root: [u8; 16] = fixed_bytes(root, "root_uuid")?;
+                self.sync_root_descriptor(&root)?
+                    .context("sync root descriptor disappeared")
+            })
+            .collect()
+    }
+
     /// Links an already-created Catalog root to its existing empty-name
     /// sentinel. The migration trigger rejects any mismatched descriptor or
     /// sentinel UUID and makes the link immutable after this point.
@@ -508,6 +1051,487 @@ fn is_local_binding_state(state: &str) -> bool {
             | "unavailable"
             | "error"
     )
+}
+
+fn ensure_reconciliation_entity(
+    transaction: &rusqlite::Transaction<'_>,
+    root_uuid: Uuid,
+    entity_uuid: Uuid,
+    selected_entity: Option<&str>,
+) -> anyhow::Result<()> {
+    let exists:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM files WHERE asset_uuid=?1) OR EXISTS(SELECT 1 FROM folders WHERE folder_uuid=?1) OR EXISTS(SELECT 1 FROM sync_root_descriptors WHERE root_folder_uuid=?1)",[entity_uuid.as_bytes().as_slice()],|row|row.get(0))?;
+    if exists {
+        return Ok(());
+    }
+    let Some(selected_entity) = selected_entity else {
+        return Ok(());
+    };
+    let fields: BTreeMap<String, String> = serde_json::from_str(selected_entity)?;
+    let kind = fields
+        .get("field:entity-kind")
+        .map(|value| serde_json::from_str::<String>(value))
+        .transpose()?
+        .unwrap_or_default();
+    let location = fields
+        .get("location")
+        .map(|value| serde_json::from_str::<serde_json::Value>(value))
+        .transpose()?
+        .context("reconciliation location missing")?;
+    let name = location
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .context("reconciliation location name missing")?;
+    let parent = location
+        .get("parentUuid")
+        .and_then(serde_json::Value::as_str)
+        .context("reconciliation location parent missing")?;
+    let parent = Uuid::parse_str(parent)?;
+    let root_id: i64 = transaction.query_row(
+        "SELECT id FROM roots WHERE root_uuid=?1",
+        [root_uuid.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let parent_id: i64 = transaction
+        .query_row(
+            "SELECT id FROM folders WHERE folder_uuid=?1 AND root_id=?2",
+            params![parent.as_bytes().as_slice(), root_id],
+            |row| row.get(0),
+        )
+        .context("reconciliation parent missing")?;
+    match kind.as_str() {
+        "folder" => {
+            transaction.execute("INSERT INTO folders(root_id,parent_id,name,path_hash,mtime,status,folder_uuid) VALUES (?1,?2,?3,'',NULL,'active',?4)",params![root_id,parent_id,name,entity_uuid.as_bytes().as_slice()])?;
+        }
+        "asset" => {
+            let extension = fields
+                .get("field:extension")
+                .map(|value| serde_json::from_str::<String>(value))
+                .transpose()?
+                .unwrap_or_default();
+            let content = fields
+                .get("content")
+                .map(|value| serde_json::from_str::<serde_json::Value>(value))
+                .transpose()?;
+            let size = content
+                .as_ref()
+                .and_then(|value| value.get("byteLength"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let mtime = content
+                .as_ref()
+                .and_then(|value| value.get("sourceMtimeMs"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            transaction.execute("INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status,asset_uuid) VALUES (?1,?2,?3,?4,?5,?6,'active',?7)",params![root_id,parent_id,name,extension,i64::try_from(size)?,mtime,entity_uuid.as_bytes().as_slice()])?;
+            if let Some(content) = content {
+                if let Some(revision) = content
+                    .get("revisionUuid")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let revision = Uuid::parse_str(revision)?;
+                    let manifest = content
+                        .get("manifestHash")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(crate::sync::media::parse_hash)
+                        .transpose()?;
+                    let generation:i64=transaction.query_row("SELECT next_local_mutation_generation FROM sync_local_state WHERE singleton=1",[],|row|row.get(0))?;
+                    transaction.execute("INSERT OR IGNORE INTO asset_content_revisions(content_revision_uuid,asset_uuid,manifest_hash,byte_size,local_mutation_generation,created_at) VALUES (?1,?2,?3,?4,?5,?6)",params![revision.as_bytes().as_slice(),entity_uuid.as_bytes().as_slice(),manifest.as_ref().map(|value|value.as_slice()),i64::try_from(size)?,generation.max(1),root_now_millis()])?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_selected_snapshot_value(
+    transaction: &rusqlite::Transaction<'_>,
+    entity_uuid: Uuid,
+    field_name: &str,
+    selected_value: Option<&str>,
+) -> anyhow::Result<()> {
+    let entity = entity_uuid.as_bytes().as_slice();
+    match field_name {
+        "existence" => {
+            let status = if selected_value == Some("deleted") {
+                "trashed"
+            } else {
+                "active"
+            };
+            transaction.execute(
+                "UPDATE files SET status=?1 WHERE asset_uuid=?2",
+                params![status, entity],
+            )?;
+            transaction.execute(
+                "UPDATE folders SET status=?1 WHERE folder_uuid=?2 AND parent_id IS NOT NULL",
+                params![status, entity],
+            )?;
+            transaction.execute("UPDATE sync_root_descriptors SET lifecycle=CASE WHEN ?1='trashed' THEN 'tombstoned' ELSE 'active' END,updated_at=?2 WHERE root_folder_uuid=?3",params![status,root_now_millis(),entity])?;
+        }
+        "location" => {
+            if let Some(value) = selected_value {
+                let location: serde_json::Value = serde_json::from_str(value)?;
+                let name = location
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .context("reconciliation location name missing")?;
+                let parent = location
+                    .get("parentUuid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(Uuid::parse_str)
+                    .transpose()?;
+                if transaction.execute("UPDATE files SET name=?1,folder_id=(SELECT id FROM folders WHERE folder_uuid=?2) WHERE asset_uuid=?3",params![name,parent.map(|v|v.as_bytes().to_vec()),entity])?==0 {
+                transaction.execute("UPDATE folders SET name=?1,parent_id=(SELECT id FROM folders WHERE folder_uuid=?2) WHERE folder_uuid=?3 AND parent_id IS NOT NULL",params![name,parent.map(|v|v.as_bytes().to_vec()),entity])?;
+            }
+                transaction.execute("UPDATE sync_root_descriptors SET requested_name=?1,materialized_name=?1,materialization_fingerprint=?2,updated_at=?3 WHERE root_folder_uuid=?4",params![name,crate::sync::media::parse_hash(&crate::sync_folders::materialization_fingerprint(name))?.as_slice(),root_now_millis(),entity])?;
+                transaction.execute(
+                    "UPDATE roots SET display_name=?1 WHERE root_folder_uuid=?2",
+                    params![name, entity],
+                )?;
+            }
+        }
+        "content" => {
+            if let Some(value) = selected_value {
+                let content: serde_json::Value = serde_json::from_str(value)?;
+                let revision = Uuid::parse_str(
+                    content
+                        .get("revisionUuid")
+                        .and_then(serde_json::Value::as_str)
+                        .context("reconciliation content revision missing")?,
+                )?;
+                transaction.execute(
+                    "UPDATE asset_content_heads SET is_display_winner=0 WHERE asset_uuid=?1",
+                    [entity],
+                )?;
+                transaction.execute("INSERT INTO asset_content_heads(asset_uuid,content_revision_uuid,is_display_winner) SELECT ?1,?2,1 WHERE EXISTS(SELECT 1 FROM asset_content_revisions WHERE asset_uuid=?1 AND content_revision_uuid=?2) ON CONFLICT(asset_uuid,content_revision_uuid) DO UPDATE SET is_display_winner=1",params![entity,revision.as_bytes().as_slice()])?;
+            }
+        }
+        field if field.starts_with("field:") => {
+            if let Some(value) = selected_value {
+                let field = &field[6..];
+                let value: serde_json::Value = serde_json::from_str(value)?;
+                let file_id: Option<i64> = transaction
+                    .query_row(
+                        "SELECT id FROM files WHERE asset_uuid=?1",
+                        [entity],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(file_id) = file_id {
+                    match field {
+                        "rating" => {
+                            transaction.execute("INSERT INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,?2,0,NULL,?3) ON CONFLICT(file_id) DO UPDATE SET rating=excluded.rating,updated_at=excluded.updated_at",params![file_id,value.as_i64(),root_now_millis()/1000])?;
+                        }
+                        "favorite" => {
+                            transaction.execute("INSERT INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,NULL,?2,NULL,?3) ON CONFLICT(file_id) DO UPDATE SET favorite=excluded.favorite,updated_at=excluded.updated_at",params![file_id,value.as_bool().unwrap_or(false) as i64,root_now_millis()/1000])?;
+                        }
+                        "note" => {
+                            transaction.execute("INSERT INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,NULL,0,?2,?3) ON CONFLICT(file_id) DO UPDATE SET note=excluded.note,updated_at=excluded.updated_at",params![file_id,value.as_str(),root_now_millis()/1000])?;
+                        }
+                        "extension" => {
+                            transaction.execute(
+                                "UPDATE files SET ext=?1 WHERE id=?2",
+                                params![value.as_str(), file_id],
+                            )?;
+                        }
+                        _ => {}
+                    }
+                } else if matches!(field, "name" | "color") {
+                    transaction.execute(
+                        &format!("UPDATE tags SET {field}=?1 WHERE tag_uuid=?2"),
+                        params![value.as_str(), entity],
+                    )?;
+                }
+            }
+        }
+        field if field.starts_with("set:") => {
+            if field == "set:tags" {
+                let members: Vec<String> = selected_value
+                    .map(serde_json::from_str)
+                    .transpose()?
+                    .unwrap_or_default();
+                if let Some(file_id) = transaction
+                    .query_row(
+                        "SELECT id FROM files WHERE asset_uuid=?1",
+                        [entity],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                {
+                    transaction.execute("DELETE FROM file_tags WHERE file_id=?1", [file_id])?;
+                    for member in members {
+                        let member = Uuid::parse_str(&member)?;
+                        transaction.execute("INSERT OR IGNORE INTO file_tags(file_id,tag_id) SELECT ?1,id FROM tags WHERE tag_uuid=?2",params![file_id,member.as_bytes().as_slice()])?;
+                    }
+                }
+            }
+        }
+        "root:requested-name" => {
+            if let Some(value) = selected_value {
+                transaction.execute("UPDATE sync_root_descriptors SET requested_name=?1,updated_at=?2 WHERE root_folder_uuid=?3",params![value,root_now_millis(),entity])?;
+            }
+        }
+        "root:materialized-name" => {
+            if let Some(value) = selected_value {
+                transaction.execute("UPDATE sync_root_descriptors SET materialized_name=?1,updated_at=?2 WHERE root_folder_uuid=?3",params![value,root_now_millis(),entity])?;
+                transaction.execute(
+                    "UPDATE roots SET display_name=?1 WHERE root_folder_uuid=?2",
+                    params![value, entity],
+                )?;
+            }
+        }
+        "root:materialization-fingerprint" => {
+            if let Some(value) = selected_value {
+                transaction.execute("UPDATE sync_root_descriptors SET materialization_fingerprint=?1,updated_at=?2 WHERE root_folder_uuid=?3",params![crate::sync::media::parse_hash(value)?.as_slice(),root_now_millis(),entity])?;
+            }
+        }
+        "root:lifecycle" => {
+            if let Some(value) = selected_value {
+                transaction.execute("UPDATE sync_root_descriptors SET lifecycle=?1,updated_at=?2 WHERE root_folder_uuid=?3",params![value,root_now_millis(),entity])?;
+            }
+        }
+        "root:logical-revision" | "root:winning-location-revision" => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+fn capture_selected_snapshot_value(
+    transaction: &rusqlite::Transaction<'_>,
+    plan_uuid: Uuid,
+    item_ordinal: u64,
+    variant: &[u8],
+    entity_uuid: Uuid,
+    field_name: &str,
+    selected_value: Option<&str>,
+    preserve_both: bool,
+) -> anyhow::Result<()> {
+    use crate::sync::capture::{capture_catalog_mutation, observed_tag_adds, MutationOrigin};
+    use crate::sync::types::{EntityUuid, EventUuid, Operation, RevisionUuid};
+
+    let entity = EntityUuid(entity_uuid);
+    let capture = |operation| {
+        capture_catalog_mutation(transaction, MutationOrigin::LocalApi, entity, operation)
+            .map(|_| ())
+    };
+    match field_name {
+        "existence" => match selected_value {
+            Some("deleted") => capture(Operation::Delete {
+                token: EventUuid(derived_reconciliation_uuid(
+                    plan_uuid,
+                    item_ordinal,
+                    &[b"delete-token".as_slice(), variant].concat(),
+                )),
+            })?,
+            Some("live") => {
+                let mut statement = transaction.prepare(
+                    "SELECT token_uuid FROM sync_tombstone_tokens token WHERE token.entity_uuid=?1 AND NOT EXISTS(SELECT 1 FROM sync_tombstone_removals removal WHERE removal.observed_token_uuid=token.token_uuid) ORDER BY token_uuid",
+                )?;
+                let observed_tokens = statement
+                    .query_map([entity_uuid.as_bytes().as_slice()], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })?
+                    .map(|row| Ok(EventUuid(Uuid::from_slice(&row?)?)))
+                    .collect::<anyhow::Result<BTreeSet<_>>>()?;
+                drop(statement);
+                if !observed_tokens.is_empty() {
+                    capture(Operation::Restore { observed_tokens })?;
+                }
+            }
+            None => {}
+            Some(_) => bail!("invalid reconciliation existence value"),
+        },
+        "location" => {
+            if let Some(value) = selected_value {
+                let location: serde_json::Value = serde_json::from_str(value)?;
+                let parent_uuid = location
+                    .get("parentUuid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(Uuid::parse_str)
+                    .transpose()?
+                    .map(EntityUuid);
+                let name = location
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .context("reconciliation location name missing")?
+                    .to_owned();
+                let supersedes = if preserve_both {
+                    BTreeSet::new()
+                } else {
+                    location_heads(transaction, entity_uuid)?
+                        .into_iter()
+                        .map(RevisionUuid)
+                        .collect()
+                };
+                capture(Operation::SetLocation {
+                    revision_uuid: RevisionUuid(derived_reconciliation_uuid(
+                        plan_uuid,
+                        item_ordinal,
+                        &[b"location-revision".as_slice(), variant].concat(),
+                    )),
+                    parent_uuid,
+                    name,
+                    supersedes,
+                })?;
+            }
+        }
+        "content" => {
+            if let Some(value) = selected_value {
+                let content: serde_json::Value = serde_json::from_str(value)?;
+                let manifest_id = content
+                    .get("manifestId")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        content
+                            .get("manifestHash")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .context("reconciliation content manifest missing")?
+                    .to_owned();
+                let supersedes = if preserve_both {
+                    BTreeSet::new()
+                } else {
+                    content_heads(transaction, entity_uuid)?
+                        .into_iter()
+                        .map(RevisionUuid)
+                        .collect()
+                };
+                capture(Operation::SetContent {
+                    revision_uuid: RevisionUuid(derived_reconciliation_uuid(
+                        plan_uuid,
+                        item_ordinal,
+                        &[b"content-revision".as_slice(), variant].concat(),
+                    )),
+                    manifest_id,
+                    supersedes,
+                    manifest_pack_id: content
+                        .get("manifestPackId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    manifest_offset: content
+                        .get("manifestOffset")
+                        .and_then(serde_json::Value::as_u64),
+                    manifest_length: content
+                        .get("manifestLength")
+                        .and_then(serde_json::Value::as_u64),
+                    byte_length: content
+                        .get("byteLength")
+                        .and_then(serde_json::Value::as_u64),
+                    source_mtime_ms: content
+                        .get("sourceMtimeMs")
+                        .and_then(serde_json::Value::as_i64),
+                })?;
+            }
+        }
+        field if field.starts_with("field:") => {
+            capture(Operation::SetField {
+                field: field[6..].to_owned(),
+                value: selected_value
+                    .map(serde_json::from_str)
+                    .transpose()?
+                    .unwrap_or(serde_json::Value::Null),
+            })?;
+        }
+        "set:tags" => {
+            let selected = selected_value
+                .map(serde_json::from_str::<BTreeSet<String>>)
+                .transpose()?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|value| Ok(EntityUuid(Uuid::parse_str(&value)?)))
+                .collect::<anyhow::Result<BTreeSet<_>>>()?;
+            let current = current_tag_members(transaction, entity_uuid)?;
+            for member in current.difference(&selected) {
+                let observed_adds = observed_tag_adds(transaction, entity, *member)?;
+                if !observed_adds.is_empty() {
+                    capture(Operation::SetRemove {
+                        set: "tags".to_owned(),
+                        member_uuid: *member,
+                        observed_adds,
+                    })?;
+                }
+            }
+            // Re-add every selected member under the fresh actor epoch. This
+            // republishes local-fork-only membership without reopening the
+            // sealed fork actor, while remaining an idempotent OR-set add.
+            for member in selected {
+                capture(Operation::SetAdd {
+                    set: "tags".to_owned(),
+                    member_uuid: member,
+                })?;
+            }
+        }
+        field if field.starts_with("root:") => {
+            // Root descriptor fields are derived from portable root location,
+            // existence and descriptor events. Keep the local projection
+            // aligned for redundant comparison rows; the corresponding
+            // portable field work above remains the synchronization truth.
+            apply_selected_snapshot_value(transaction, entity_uuid, field, selected_value)?;
+        }
+        _ => apply_selected_snapshot_value(transaction, entity_uuid, field_name, selected_value)?,
+    }
+    Ok(())
+}
+
+fn derived_reconciliation_uuid(plan_uuid: Uuid, item_ordinal: u64, label: &[u8]) -> Uuid {
+    let mut input = Vec::with_capacity(16 + 8 + label.len());
+    input.extend_from_slice(plan_uuid.as_bytes());
+    input.extend_from_slice(&item_ordinal.to_be_bytes());
+    input.extend_from_slice(label);
+    let mut bytes = crate::sync::codec::sha256(&input);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes[..16].try_into().expect("sha256 prefix"))
+}
+
+fn content_heads(
+    transaction: &rusqlite::Transaction<'_>,
+    entity_uuid: Uuid,
+) -> anyhow::Result<BTreeSet<Uuid>> {
+    let mut statement = transaction.prepare(
+        "SELECT content_revision_uuid FROM asset_content_heads WHERE asset_uuid=?1 ORDER BY content_revision_uuid",
+    )?;
+    let heads = statement
+        .query_map([entity_uuid.as_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .map(|row| Ok(Uuid::from_slice(&row?)?))
+        .collect();
+    heads
+}
+
+fn current_tag_members(
+    transaction: &rusqlite::Transaction<'_>,
+    entity_uuid: Uuid,
+) -> anyhow::Result<BTreeSet<crate::sync::types::EntityUuid>> {
+    let mut statement = transaction.prepare(
+        "SELECT DISTINCT addition.member_uuid FROM sync_set_adds addition WHERE addition.owner_uuid=?1 AND NOT EXISTS(SELECT 1 FROM sync_set_removals removal WHERE removal.observed_add_event_uuid=addition.add_event_uuid) ORDER BY addition.member_uuid",
+    )?;
+    let members = statement
+        .query_map([entity_uuid.as_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .map(|row| Ok(crate::sync::types::EntityUuid(Uuid::from_slice(&row?)?)))
+        .collect();
+    members
+}
+
+fn preserve_both_reconciliation_versions(
+    transaction: &rusqlite::Transaction<'_>,
+    entity_uuid: Uuid,
+    field_name: &str,
+    selected_value: Option<&str>,
+) -> anyhow::Result<()> {
+    transaction.execute("INSERT OR IGNORE INTO sync_identity_conflicts(conflict_uuid,old_asset_uuid,new_asset_uuid,reason,state,created_at) VALUES (?1,?2,?2,?3,'resolved',?4)",params![Uuid::now_v7().as_bytes().as_slice(),entity_uuid.as_bytes().as_slice(),format!("re-enable-keep-both:{field_name}:{}",selected_value.unwrap_or("none")),root_now_millis()])?;
+    Ok(())
+}
+
+fn derived_publish_uuid(operation_uuid: Uuid, label: &[u8]) -> Uuid {
+    let mut bytes = crate::sync::codec::sha256(&[operation_uuid.as_bytes(), label].concat());
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes[..16].try_into().expect("sha256 prefix"))
 }
 
 fn commit_location_mutation_once(
@@ -739,6 +1763,8 @@ mod tests {
                 library_uuid: [8; 16],
                 local_binding_uuid: [9; 16],
                 binding_generation: 1,
+                root_capture_epoch: [10; 16],
+                root_actor_epoch: [11; 16],
                 state: "active".into(),
                 root_id,
                 operation_revision: 1,
@@ -899,6 +1925,8 @@ mod tests {
                     library_uuid,
                     local_binding_uuid: binding_uuid,
                     binding_generation: 1,
+                    root_capture_epoch: [31; 16],
+                    root_actor_epoch: [32; 16],
                     state: "active".into(),
                     root_id,
                     operation_revision: 1,
@@ -1016,6 +2044,400 @@ mod tests {
         let _ = std::fs::remove_file(&database_path);
         let _ = std::fs::remove_file(database_path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(database_path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn local_only_fork_keeps_local_edits_out_of_the_provider_queue() {
+        let database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_uuid = Uuid::from_bytes([31; 16]);
+        let root_folder_uuid = Uuid::from_bytes([32; 16]);
+        let library_uuid = Uuid::from_bytes([33; 16]);
+        let binding_uuid = Uuid::from_bytes([34; 16]);
+        database
+            .upsert_sync_root_descriptor(&SyncRootDescriptorRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                root_folder_uuid: *root_folder_uuid.as_bytes(),
+                library_root_uuid: [35; 16],
+                creation_event_uuid: None,
+                winning_location_revision_uuid: None,
+                requested_name: "Photos".into(),
+                materialized_name: "Photos".into(),
+                materialization_fingerprint: [36; 32],
+                lifecycle: "active".into(),
+                logical_revision: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO roots(path,display_name,enabled,created_at,root_uuid) VALUES ('D:/Photos','Photos',1,1,?1)",
+                [root_uuid.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let root_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,folder_uuid) VALUES (?1,NULL,'','root',?2)",
+                params![root_id, root_folder_uuid.as_bytes().as_slice()],
+            )
+            .unwrap();
+        database
+            .link_sync_root_descriptor(root_id, root_uuid.as_bytes(), root_folder_uuid.as_bytes())
+            .unwrap();
+        database
+            .initialize_sync_identity(library_uuid, Uuid::from_bytes([37; 16]), Uuid::now_v7())
+            .unwrap();
+        database.enable_fake_sync_capture_for_test().unwrap();
+        database
+            .upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                library_uuid: *library_uuid.as_bytes(),
+                local_binding_uuid: *binding_uuid.as_bytes(),
+                binding_generation: 1,
+                root_capture_epoch: [41; 16],
+                root_actor_epoch: [42; 16],
+                state: "active".into(),
+                root_id,
+                operation_revision: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let first_head = database
+            .connection
+            .query_row(
+                "SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1",
+                [root_folder_uuid.as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        database
+            .commit_location_rename_once(
+                Uuid::now_v7(),
+                root_folder_uuid,
+                "Before stop",
+                &BTreeSet::from([Uuid::from_slice(&first_head).unwrap()]),
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_outbox WHERE state='pending'",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+        let stop_work = database.root_stop_work(root_uuid).unwrap();
+        assert_eq!(stop_work.pending_work, 1);
+        assert_eq!(stop_work.published_work, 0);
+        database
+            .fence_root_as_local_only(
+                root_uuid,
+                binding_uuid,
+                1,
+                2,
+                Uuid::from_u128(301),
+                Uuid::from_u128(302),
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_outbox WHERE state='archived'",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+        let second_head = database
+            .connection
+            .query_row(
+                "SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1",
+                [root_folder_uuid.as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        database
+            .commit_location_rename_once(
+                Uuid::now_v7(),
+                root_folder_uuid,
+                "After stop",
+                &BTreeSet::from([Uuid::from_slice(&second_head).unwrap()]),
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM sync_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+
+        let fork_binding = database
+            .sync_root_local_binding(root_uuid.as_bytes())
+            .unwrap()
+            .unwrap();
+        let reconciled_binding_uuid = Uuid::from_u128(401);
+        let reconciled_capture_epoch = Uuid::from_u128(402);
+        let reconciled_actor_epoch = Uuid::from_u128(403);
+        database
+            .upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+                local_binding_uuid: *reconciled_binding_uuid.as_bytes(),
+                binding_generation: 3,
+                root_capture_epoch: *reconciled_capture_epoch.as_bytes(),
+                root_actor_epoch: *reconciled_actor_epoch.as_bytes(),
+                state: "reconcile-required".into(),
+                operation_revision: 3,
+                updated_at: 3,
+                ..fork_binding
+            })
+            .unwrap();
+        let plan_uuid = Uuid::from_u128(404);
+        let selected_location = serde_json::to_string(&serde_json::json!({
+            "revisionUuid": Uuid::from_u128(405),
+            "parentUuid": Uuid::from_bytes([35; 16]),
+            "name": "After stop"
+        }))
+        .unwrap();
+        database
+            .apply_root_reconciliation_item(
+                plan_uuid,
+                0,
+                root_uuid,
+                reconciled_binding_uuid,
+                3,
+                root_folder_uuid,
+                "location",
+                "keep-local",
+                Some(&selected_location),
+                None,
+            )
+            .unwrap();
+        database
+            .apply_root_reconciliation_item(
+                plan_uuid,
+                0,
+                root_uuid,
+                reconciled_binding_uuid,
+                3,
+                root_folder_uuid,
+                "location",
+                "keep-local",
+                Some(&selected_location),
+                None,
+            )
+            .unwrap();
+        let (pending, actor): (i64, Vec<u8>) = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*),MAX(event.actor_epoch) FROM sync_outbox outbox JOIN sync_events event ON event.event_uuid=outbox.event_uuid WHERE outbox.state='pending'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+        assert_eq!(actor, reconciled_actor_epoch.as_bytes());
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_root_reconciliation_applied WHERE plan_uuid=?1",
+                    [plan_uuid.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn publish_as_new_reuses_catalog_tree_with_fresh_root_and_actor_identity() {
+        let database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let library_uuid = Uuid::from_u128(410);
+        let library_root_uuid = Uuid::from_u128(411);
+        let source_root_uuid = Uuid::from_u128(412);
+        let source_folder_uuid = Uuid::from_u128(413);
+        let source_binding_uuid = Uuid::from_u128(414);
+        database
+            .upsert_sync_root_descriptor(&SyncRootDescriptorRecord {
+                root_uuid: *source_root_uuid.as_bytes(),
+                root_folder_uuid: *source_folder_uuid.as_bytes(),
+                library_root_uuid: *library_root_uuid.as_bytes(),
+                creation_event_uuid: None,
+                winning_location_revision_uuid: None,
+                requested_name: "Photos".into(),
+                materialized_name: "Photos".into(),
+                materialization_fingerprint: [7; 32],
+                lifecycle: "active".into(),
+                logical_revision: 2,
+                updated_at: 1,
+            })
+            .unwrap();
+        database.connection.execute("INSERT INTO roots(path,display_name,enabled,created_at,root_uuid) VALUES ('D:/Photos','Photos',1,1,?1)",[source_root_uuid.as_bytes().as_slice()]).unwrap();
+        let root_id = database.connection.last_insert_rowid();
+        database.connection.execute("INSERT INTO folders(root_id,parent_id,name,path_hash,folder_uuid) VALUES (?1,NULL,'','root',?2)",params![root_id,source_folder_uuid.as_bytes().as_slice()]).unwrap();
+        database
+            .link_sync_root_descriptor(
+                root_id,
+                source_root_uuid.as_bytes(),
+                source_folder_uuid.as_bytes(),
+            )
+            .unwrap();
+        database
+            .initialize_sync_identity(library_uuid, library_root_uuid, Uuid::from_u128(415))
+            .unwrap();
+        database.enable_fake_sync_capture_for_test().unwrap();
+        database
+            .upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+                root_uuid: *source_root_uuid.as_bytes(),
+                library_uuid: *library_uuid.as_bytes(),
+                local_binding_uuid: *source_binding_uuid.as_bytes(),
+                binding_generation: 2,
+                root_capture_epoch: *Uuid::from_u128(416).as_bytes(),
+                root_actor_epoch: *Uuid::from_u128(417).as_bytes(),
+                state: "local-only-fork".into(),
+                root_id,
+                operation_revision: 3,
+                updated_at: 1,
+            })
+            .unwrap();
+        let sentinel_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM folders WHERE root_id=?1 AND parent_id IS NULL",
+                [root_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let asset_uuid = Uuid::from_u128(418);
+        database
+            .connection
+            .execute(
+                "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status,asset_uuid) VALUES (?1,?2,'local.jpg','jpg',1,1,'active',?3)",
+                params![root_id, sentinel_id, asset_uuid.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let transaction = database.connection.unchecked_transaction().unwrap();
+        crate::sync::capture::capture_catalog_mutation(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            crate::sync::types::EntityUuid(asset_uuid),
+            crate::sync::types::Operation::SetField {
+                field: "entity-kind".into(),
+                value: serde_json::json!("asset"),
+            },
+        )
+        .unwrap();
+        crate::sync::capture::capture_catalog_mutation(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            crate::sync::types::EntityUuid(asset_uuid),
+            crate::sync::types::Operation::SetLocation {
+                revision_uuid: crate::sync::types::RevisionUuid(Uuid::from_u128(419)),
+                parent_uuid: Some(crate::sync::types::EntityUuid(source_folder_uuid)),
+                name: "local.jpg".into(),
+                supersedes: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let new_root_uuid = Uuid::from_u128(420);
+        let new_folder_uuid = Uuid::from_u128(421);
+        let new_binding_uuid = Uuid::from_u128(422);
+        let capture_epoch = Uuid::from_u128(423);
+        let actor_epoch = Uuid::from_u128(424);
+        let operation_uuid = Uuid::from_u128(425);
+        database
+            .publish_root_as_new(
+                operation_uuid,
+                library_uuid,
+                source_root_uuid,
+                new_root_uuid,
+                new_folder_uuid,
+                "Photos",
+                "Photos (00000000)",
+                [8; 32],
+                new_binding_uuid,
+                capture_epoch,
+                actor_epoch,
+                1,
+            )
+            .unwrap();
+        database
+            .publish_root_as_new(
+                operation_uuid,
+                library_uuid,
+                source_root_uuid,
+                new_root_uuid,
+                new_folder_uuid,
+                "Photos",
+                "Photos (00000000)",
+                [8; 32],
+                new_binding_uuid,
+                capture_epoch,
+                actor_epoch,
+                1,
+            )
+            .unwrap();
+        assert!(database
+            .sync_root_descriptor(source_root_uuid.as_bytes())
+            .unwrap()
+            .is_none());
+        assert!(database
+            .sync_root_descriptor(new_root_uuid.as_bytes())
+            .unwrap()
+            .is_some());
+        let binding = database
+            .sync_root_local_binding(new_root_uuid.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.local_binding_uuid, *new_binding_uuid.as_bytes());
+        assert_eq!(binding.root_capture_epoch, *capture_epoch.as_bytes());
+        assert_eq!(binding.root_actor_epoch, *actor_epoch.as_bytes());
+        assert_eq!(binding.state, "active");
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM roots", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT root_uuid FROM roots WHERE id=?1",
+                    [root_id],
+                    |row| row.get::<_, Vec<u8>>(0)
+                )
+                .unwrap(),
+            new_root_uuid.as_bytes()
+        );
+        assert_eq!(database.connection.query_row("SELECT COUNT(*) FROM sync_outbox outbox JOIN sync_events event ON event.event_uuid=outbox.event_uuid WHERE event.actor_epoch=?1 AND outbox.state='pending'",[actor_epoch.as_bytes().as_slice()],|row|row.get::<_,i64>(0)).unwrap(),5);
+        let state = crate::sync::persistence::capture_protocol_state(&database.connection)
+            .unwrap()
+            .0;
+        assert!(state
+            .entities
+            .contains_key(&crate::sync::types::EntityUuid(asset_uuid)));
     }
 
     #[test]

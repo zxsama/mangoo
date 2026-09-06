@@ -132,6 +132,102 @@ impl SyncCoordinator {
         self.providers.clone()
     }
 
+    pub async fn fetch_remote_root_snapshot(
+        &self,
+        library_uuid: &str,
+        root_uuid: uuid::Uuid,
+    ) -> anyhow::Result<(crate::sync_folders::RootSnapshot, Option<String>)> {
+        let binding = self
+            .registry
+            .binding_transport(library_uuid, "library")?
+            .ok_or_else(|| anyhow::anyhow!("provider-binding-unavailable"))?;
+        if !matches!(
+            binding.state.as_str(),
+            "preparing" | "capturing" | "seed_ready" | "publishing" | "active" | "restoring"
+        ) {
+            anyhow::bail!("provider-binding-unavailable");
+        }
+        let provider = self
+            .providers
+            .resolve(&binding.plugin_id, &binding.account_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("provider-not-ready"))?;
+        let namespace = binding
+            .remote_namespace
+            .clone()
+            .unwrap_or_else(|| library_uuid.to_owned());
+        let context = super::provider::TransportContext {
+            namespace: namespace.clone(),
+            binding_epoch: binding.binding_epoch.to_string(),
+            transport_generation: binding.transport_generation as u64,
+        };
+        let mut page_token = None;
+        let mut checkpoints = Vec::new();
+        let mut listing_complete = false;
+        for _ in 0..1024 {
+            let requested_page = page_token.clone();
+            let page = provider
+                .delta_list(
+                    super::provider::DeltaScope::Library {
+                        namespace: namespace.clone(),
+                        binding_epoch: binding.binding_epoch.to_string(),
+                        transport_generation: binding.transport_generation as u64,
+                    },
+                    None,
+                    page_token.as_deref(),
+                    100,
+                )
+                .await
+                .map_err(anyhow::Error::new)?;
+            for metadata in page
+                .objects
+                .iter()
+                .filter(|metadata| metadata.key.starts_with("checkpoints/"))
+            {
+                let object = provider
+                    .object_get(&context, &metadata.key, 64 * 1024 * 1024)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                super::provider::validate_download(&object, 64 * 1024 * 1024)
+                    .map_err(anyhow::Error::new)?;
+                if object.metadata.key != metadata.key
+                    || object.metadata.size != metadata.size
+                    || object.metadata.sha256 != metadata.sha256
+                {
+                    anyhow::bail!("provider-checkpoint-metadata-mismatch");
+                }
+                let checkpoint: super::checkpoint::Checkpoint =
+                    serde_json::from_slice(&std::fs::read(&object.path)?)?;
+                checkpoint.verify()?;
+                if checkpoint
+                    .state
+                    .roots
+                    .contains_key(&super::types::EntityUuid(root_uuid))
+                {
+                    checkpoints.push(checkpoint);
+                }
+            }
+            page_token = page.page_token;
+            if page_token.is_none() {
+                listing_complete = true;
+                break;
+            }
+            if page_token == requested_page {
+                anyhow::bail!("provider-non-advancing-page");
+            }
+        }
+        if !listing_complete {
+            anyhow::bail!("provider-pagination-limit");
+        }
+        let checkpoint = super::checkpoint::maximal_checkpoints(&checkpoints)
+            .into_iter()
+            .max_by_key(|checkpoint| checkpoint.catalog_vector.values().sum::<u64>())
+            .context("remote-checkpoint-unavailable")?;
+        Ok((
+            crate::sync_folders::snapshot_from_checkpoint(checkpoint, root_uuid)?,
+            Some(checkpoint.checkpoint_uuid.0.to_string()),
+        ))
+    }
+
     /// Wake the single Host scheduler after a local commit, a manual command,
     /// or an external connectivity transition. Notifications coalesce, so a
     /// burst never creates one task per Library.
@@ -190,6 +286,82 @@ impl SyncCoordinator {
                         15_000,
                     )?;
                 }
+            }
+        }
+        Ok(completed)
+    }
+
+    pub async fn reconcile_pending_root_visibility(&self) -> anyhow::Result<usize> {
+        let mut completed = 0usize;
+        for pending in self.registry.pending_root_visibility_reconciliations()? {
+            let Some(provider) = self
+                .providers
+                .resolve(&pending.provider_id, &pending.account_uuid)?
+            else {
+                self.registry.retry_root_visibility_reconciliation(
+                    &pending.operation_uuid,
+                    "provider-not-ready",
+                    15_000,
+                )?;
+                continue;
+            };
+            let context = super::provider::TransportContext {
+                namespace: pending.remote_namespace.clone(),
+                binding_epoch: pending.provider_binding_epoch.clone(),
+                transport_generation: pending.provider_transport_generation,
+            };
+            let receipts = pending.receipts.as_array().cloned().unwrap_or_default();
+            let mut visible = 0usize;
+            let mut hidden = 0usize;
+            let mut evidence = Vec::new();
+            let mut retry_error: Option<String> = None;
+            for receipt in receipts {
+                let Some(key) = receipt.get("objectKey").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let expected = receipt
+                    .get("sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                match provider.object_head(&context, key).await {
+                    Ok(Some(metadata)) if hex_hash(&metadata.sha256) == expected => {
+                        visible += 1;
+                        evidence.push(serde_json::json!({"objectKey":key,"visibility":"visible","etag":metadata.etag,"sha256":expected}));
+                    }
+                    Ok(None) => {
+                        hidden += 1;
+                        evidence.push(serde_json::json!({"objectKey":key,"visibility":"hidden","sha256":expected}));
+                    }
+                    Ok(Some(_)) => {
+                        retry_error = Some("remote-object-mismatch".to_owned());
+                        break;
+                    }
+                    Err(error) => {
+                        retry_error = Some(normalize_sync_error_code(&anyhow::Error::new(error)));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = retry_error {
+                self.registry.retry_root_visibility_reconciliation(
+                    &pending.operation_uuid,
+                    &error,
+                    15_000,
+                )?;
+            } else if visible > 0 && hidden > 0 {
+                self.registry.retry_root_visibility_reconciliation(
+                    &pending.operation_uuid,
+                    "mixed-remote-visibility",
+                    15_000,
+                )?;
+            } else {
+                let state = if visible > 0 { "visible" } else { "hidden" };
+                self.registry.finish_root_visibility_reconciliation(
+                    &pending.operation_uuid,
+                    state,
+                    &serde_json::json!({"snapshotUuid":pending.snapshot_uuid,"objects":evidence}),
+                )?;
+                completed += 1;
             }
         }
         Ok(completed)
@@ -308,6 +480,9 @@ impl SyncCoordinator {
                 };
                 if let Err(error) = coordinator.reconcile_pending_unbinds().await {
                     tracing::warn!(%error, "unbind remote reconciliation turn failed");
+                }
+                if let Err(error) = coordinator.reconcile_pending_root_visibility().await {
+                    tracing::warn!(%error, "root stop visibility reconciliation turn failed");
                 }
                 let active = active_runtime().and_then(|runtime| {
                     libraries
@@ -711,10 +886,20 @@ impl SyncCoordinator {
             })
             .await
             .context("apply dormant Catalog turn")?;
+        self.reconcile_remote_root_inventory(library_uuid, catalog_path)
+            .context("reconcile remote synchronized-root inventory")?;
         self.finish_seed_if_ready(library_uuid, &result)
             .context("finish seed checkpoint")?;
         self.commit_host_published_frontier(library_uuid, &published)
             .context("commit Host published frontier")?;
+        let reconciliation_writer =
+            crate::db::DbWriter::spawn(crate::db::Database::open(catalog_path)?);
+        let reconciliation = self
+            .reconcile_root_work(library_uuid, &reconciliation_writer)
+            .await;
+        let reconciliation_shutdown = reconciliation_writer.shutdown().await;
+        reconciliation.context("reconcile dormant root work")?;
+        reconciliation_shutdown?;
         if restoring_catalog {
             self.registry
                 .mark_restore_catalog_ready(library_uuid)
@@ -869,9 +1054,165 @@ impl SyncCoordinator {
                 perform_turn(database, host_vector, host_metadata, spool_dir)
             })
             .await?;
+        self.reconcile_remote_root_inventory(library_uuid, catalog_path)?;
         self.finish_seed_if_ready(library_uuid, &result)?;
         self.commit_host_published_frontier(library_uuid, &published)?;
+        self.reconcile_root_work(library_uuid, writer).await?;
         Ok(result)
+    }
+
+    async fn reconcile_root_work(
+        &self,
+        library_uuid: &str,
+        writer: &crate::db::DbWriter,
+    ) -> anyhow::Result<()> {
+        let roots = self.registry.pending_root_reconciliations()?;
+        for (_, root_uuid) in roots
+            .into_iter()
+            .filter(|(library, _)| library == library_uuid)
+        {
+            let work = self
+                .registry
+                .pending_root_reconciliation_work(library_uuid, &root_uuid)?;
+            for item in &work {
+                let plan_uuid = uuid::Uuid::parse_str(&item.plan_uuid)?;
+                let root_uuid_value = uuid::Uuid::parse_str(&root_uuid)?;
+                let binding_uuid = uuid::Uuid::parse_str(&item.local_binding_uuid)?;
+                let entity_uuid = uuid::Uuid::parse_str(&item.entity_uuid)?;
+                let ordinal = item.item_ordinal;
+                let generation = item.binding_generation;
+                let field = item.field_name.clone();
+                let resolution = item.resolution.clone();
+                let selected = item.selected_value.clone();
+                let selected_entity = item.selected_entity.clone();
+                let applied = writer
+                    .write_authoritative_without_wake(move |database| {
+                        database.apply_root_reconciliation_item(
+                            plan_uuid,
+                            ordinal,
+                            root_uuid_value,
+                            binding_uuid,
+                            generation,
+                            entity_uuid,
+                            &field,
+                            &resolution,
+                            selected.as_deref(),
+                            selected_entity.as_deref(),
+                        )
+                    })
+                    .await;
+                match applied {
+                    Ok(()) => self
+                        .registry
+                        .complete_root_reconciliation_item(&item.plan_uuid, item.item_ordinal)?,
+                    Err(error) => {
+                        self.registry.fail_root_reconciliation_item(
+                            &item.plan_uuid,
+                            item.item_ordinal,
+                            "catalog-apply-failed",
+                        )?;
+                        return Err(error);
+                    }
+                }
+            }
+            if self
+                .registry
+                .pending_root_reconciliation_work(library_uuid, &root_uuid)?
+                .is_empty()
+            {
+                let binding = self
+                    .registry
+                    .local_root_binding(library_uuid, &root_uuid)?
+                    .context("local-root-binding-not-found")?;
+                let plan_uuid = self
+                    .registry
+                    .pending_reenable_plan_uuid(library_uuid, &root_uuid)?
+                    .context("comparison-plan-not-found")?;
+                let root_uuid_value = uuid::Uuid::parse_str(&root_uuid)?;
+                let binding_uuid = uuid::Uuid::parse_str(&binding.local_binding_uuid)?;
+                let generation = binding.binding_generation;
+                let revision = binding.operation_revision.saturating_add(1);
+                writer
+                    .write_authoritative_without_wake(move |database| {
+                        database.complete_root_reconciliation_projection(
+                            root_uuid_value,
+                            binding_uuid,
+                            generation,
+                            revision,
+                        )
+                    })
+                    .await?;
+                self.registry
+                    .complete_root_reconciliation(library_uuid, &root_uuid, &plan_uuid)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_remote_root_inventory(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+    ) -> anyhow::Result<()> {
+        let database = crate::db::Database::open(catalog_path)?;
+        for descriptor in database.sync_root_descriptors()? {
+            let root_uuid = uuid::Uuid::from_bytes(descriptor.root_uuid).to_string();
+            let actionable = self.registry.upsert_remote_sync_root(
+                library_uuid,
+                &root_uuid,
+                &uuid::Uuid::from_bytes(descriptor.root_folder_uuid).to_string(),
+                &descriptor.requested_name,
+                &descriptor.materialized_name,
+                &super::media::hex_hash(&descriptor.materialization_fingerprint),
+                descriptor.logical_revision,
+                &descriptor.lifecycle,
+                None,
+                None,
+            )?;
+            if actionable {
+                let inventory_revision = self
+                    .registry
+                    .remote_sync_root(library_uuid, &root_uuid)?
+                    .map(|root| root.inventory_revision)
+                    .unwrap_or(1);
+                let now = crate::host_registry::unix_timestamp_millis_for_runtime();
+                let mut notification = crate::db::notification_outbox::NotificationOperation {
+                    operation_id: format!(
+                        "sync-folder-placement:{library_uuid}:{root_uuid}:{inventory_revision}"
+                    ),
+                    revision: 0,
+                    kind: "sync-folder-placement-required".to_owned(),
+                    category: "sync".to_owned(),
+                    origin: "background".to_owned(),
+                    presentation: "important".to_owned(),
+                    status: "pending".to_owned(),
+                    phase: Some("placement-required".to_owned()),
+                    title: "选择同步文件夹位置".to_owned(),
+                    summary: Some(descriptor.requested_name.clone()),
+                    task_id: None,
+                    root_id: None,
+                    folder_id: None,
+                    file_id: None,
+                    current_value: 0,
+                    total_value: None,
+                    unit: None,
+                    error_code: None,
+                    error_detail: None,
+                    cancellable: false,
+                    retryable: false,
+                    attempt: 1,
+                    occurrence_count: 1,
+                    started_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                };
+                database.publish_notification_operation(
+                    &mut notification,
+                    crate::db::notification_outbox::PublishMode::Phase,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     async fn run_dormant_media_turn(
@@ -916,6 +1257,20 @@ impl SyncCoordinator {
                 library_uuid: library_uuid_bytes,
                 local_binding_uuid: *uuid::Uuid::parse_str(&binding.local_binding_uuid)?.as_bytes(),
                 binding_generation: binding.binding_generation,
+                root_capture_epoch: *uuid::Uuid::parse_str(
+                    binding
+                        .root_capture_epoch
+                        .as_deref()
+                        .unwrap_or(&binding.local_binding_uuid),
+                )?
+                .as_bytes(),
+                root_actor_epoch: *uuid::Uuid::parse_str(
+                    binding
+                        .root_actor_epoch
+                        .as_deref()
+                        .unwrap_or(&binding.local_binding_uuid),
+                )?
+                .as_bytes(),
                 state: binding.state,
                 root_id: 0,
                 operation_revision: binding.operation_revision,
@@ -934,7 +1289,26 @@ impl SyncCoordinator {
                 continue;
             };
             record.root_id = root_id;
-            database.upsert_sync_root_local_binding(&record)?;
+            let current = database.sync_root_local_binding(&record.root_uuid)?;
+            if record.state == "local-only-fork"
+                && current.as_ref().is_some_and(|current| {
+                    current.local_binding_uuid == record.local_binding_uuid
+                        && current.binding_generation < record.binding_generation
+                })
+            {
+                let current = current.expect("checked above");
+                database.fence_root_as_local_only(
+                    uuid::Uuid::from_bytes(record.root_uuid),
+                    uuid::Uuid::from_bytes(current.local_binding_uuid),
+                    current.binding_generation,
+                    record.binding_generation,
+                    uuid::Uuid::from_bytes(record.root_capture_epoch),
+                    uuid::Uuid::from_bytes(record.root_actor_epoch),
+                    record.operation_revision,
+                )?;
+            } else {
+                database.upsert_sync_root_local_binding(&record)?;
+            }
         }
         Ok(())
     }
@@ -1355,10 +1729,7 @@ impl SyncCoordinator {
                 let bytes = std::fs::read(&path)?;
                 let segment = match serde_json::from_slice::<super::segment::SealedSegment>(&bytes)
                 {
-                    Ok(segment)
-                        if segment.header.library_uuid.to_string() == library_uuid
-                            && segment.header.actor.actor_epoch.0 == binding.actor_epoch =>
-                    {
+                    Ok(segment) if segment.header.library_uuid.to_string() == library_uuid => {
                         segment
                     }
                     _ => continue,
@@ -1705,7 +2076,7 @@ fn seal_next_outbox_segment(
 ) -> anyhow::Result<bool> {
     let actor: Option<Vec<u8>> = connection
         .query_row(
-            "SELECT active_actor_epoch FROM sync_local_state WHERE singleton=1 AND capture_enabled=1",
+            "SELECT e.actor_epoch FROM sync_outbox o JOIN sync_events e ON e.event_uuid=o.event_uuid JOIN sync_actor_epochs actor ON actor.actor_epoch=e.actor_epoch WHERE o.state='pending' AND actor.state IN ('active','forked') ORDER BY o.created_at,e.actor_epoch,e.actor_seq LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -1975,6 +2346,8 @@ mod tests {
                 library_uuid: *uuid::Uuid::from_u128(40).as_bytes(),
                 local_binding_uuid: *local_binding_uuid.as_bytes(),
                 binding_generation: 7,
+                root_capture_epoch: [50; 16],
+                root_actor_epoch: [51; 16],
                 state: "active".into(),
                 root_id: 0,
                 operation_revision: 3,

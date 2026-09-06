@@ -18,6 +18,9 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0010_plugin_secret_handles.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0011_plugin_secret_creations.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0012_sync_root_bindings.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0013_sync_root_reenable_generation.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0014_sync_root_preflights.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0015_sync_root_recovery.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -50,6 +53,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0029_media_object_storage.sql",
     ROOT / "crates" / "core" / "migrations" / "0030_sync_root_identity.sql",
     ROOT / "crates" / "core" / "migrations" / "0031_sync_root_generation_fence.sql",
+    ROOT / "crates" / "core" / "migrations" / "0032_sync_root_reconciliation.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -118,6 +122,8 @@ REQUIRED_TABLES = {
     "media_reachability",
     "sync_root_descriptors",
     "sync_root_local_bindings",
+    "sync_root_reconciliation_applied",
+    "sync_root_publish_cutovers",
 }
 
 REQUIRED_HOST_SYNC_ROOT_TABLES = {
@@ -130,6 +136,11 @@ REQUIRED_HOST_SYNC_ROOT_TABLES = {
     "root_comparison_items",
     "root_comparison_resolutions",
     "root_relocation_operations",
+    "root_stop_plans",
+    "root_visibility_reconciliations",
+    "root_comparison_snapshots",
+    "root_reconciliation_work",
+    "root_publish_as_new",
 }
 
 REQUIRED_INDEXES = {
@@ -1169,8 +1180,8 @@ def verify_host_sync_root_binding_contract() -> None:
             "DELETE FROM remote_sync_roots WHERE library_uuid=? AND root_uuid=?",
             (library_uuid, "00000000-0000-7000-8000-000000000002"),
         )
-        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 12:
-            fail("host migration 12 did not update schema_version")
+        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 15:
+            fail("managed-root orchestration migrations did not update schema_version")
         expected_host_tables = {
             "library_local_settings",
             "remote_sync_roots",
@@ -1181,6 +1192,12 @@ def verify_host_sync_root_binding_contract() -> None:
             "root_comparison_items",
             "root_comparison_resolutions",
             "root_relocation_operations",
+            "root_path_preflights",
+            "root_stop_plans",
+            "root_visibility_reconciliations",
+            "root_comparison_snapshots",
+            "root_reconciliation_work",
+            "root_publish_as_new",
         }
         actual = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         missing = expected_host_tables - actual
@@ -1351,7 +1368,7 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (12, None, 0, "stopped"):
+        if meta != (15, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         auth_flow_columns = {
             row[1]

@@ -102,6 +102,8 @@ export type {
   LocalRootBinding,
   LocalRootBindingState,
   RootCommandRequest,
+  RootStopCommitRequest,
+  RootStopPlan,
   RootComparisonClassification,
   RootComparisonItem,
   RootComparisonItemListResponse,

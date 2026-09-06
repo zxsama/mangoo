@@ -11,6 +11,7 @@ mod plugins;
 mod roots;
 mod scan;
 mod sync;
+mod sync_folders;
 mod tasks;
 mod thumbnails;
 mod watch;

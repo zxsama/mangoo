@@ -110,10 +110,20 @@ pub fn capture_catalog_mutation(
         });
     }
 
-    let (library, device, stream, actor_epoch, binding_epoch, actor_seq): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64) = transaction.query_row(
+    let (library, device, stream, active_actor_epoch, active_binding_epoch, library_actor_seq): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64) = transaction.query_row(
         "SELECT library_uuid,device_uuid,catalog_stream_uuid,active_actor_epoch,active_binding_epoch,next_actor_seq FROM sync_local_state WHERE singleton=1", [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
     )?;
+    let root_capture = entity_root_capture_context(transaction, entity_uuid.0)?;
+    let (actor_epoch, binding_epoch, actor_seq, root_scoped) = root_capture
+        .as_ref()
+        .map(|(_, actor, binding, sequence)| (actor.clone(), binding.clone(), *sequence, true))
+        .unwrap_or((
+            active_actor_epoch,
+            active_binding_epoch,
+            library_actor_seq,
+            false,
+        ));
     let event_uuid = EventUuid::new();
     let hlc = Hlc {
         wall_ms: old_wall.max(0) as u64,
@@ -145,14 +155,59 @@ pub fn capture_catalog_mutation(
     })?;
     persist_local_event(transaction, &event, generation)?;
     super::fault::hit("capture.after-ledger-truth-frontier");
-    transaction.execute("INSERT INTO sync_outbox(event_uuid,binding_epoch,state,attempt_count,created_at) VALUES (?1,?2,'pending',0,?3)", params![event_uuid.0.as_bytes().as_slice(), binding_epoch, unix_timestamp_millis()])?;
-    super::fault::hit("capture.after-outbox");
-    transaction.execute("UPDATE sync_local_state SET next_actor_seq=?1,hlc_wall_ms=?2,hlc_logical=?3,updated_at=?4 WHERE singleton=1", params![actor_seq.checked_add(1).ok_or_else(|| anyhow::anyhow!("actor sequence exhausted"))?, hlc.wall_ms as i64, hlc.logical as i64, unix_timestamp_millis()])?;
+    // A stopped synchronized root remains fully editable, but its fork-local
+    // events must never leak into the sealed Provider queue. Root ownership is
+    // resolved from stable entity UUIDs inside the same Catalog transaction.
+    if root_capture.as_ref().map(|value| value.0.as_str()) != Some("local-only-fork") {
+        transaction.execute("INSERT INTO sync_outbox(event_uuid,binding_epoch,state,attempt_count,created_at) VALUES (?1,?2,'pending',0,?3)", params![event_uuid.0.as_bytes().as_slice(), binding_epoch, unix_timestamp_millis()])?;
+        super::fault::hit("capture.after-outbox");
+    }
+    let next_actor_seq = actor_seq
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("actor sequence exhausted"))?;
+    transaction.execute(
+        "UPDATE sync_local_state SET next_actor_seq=CASE WHEN ?1=0 THEN ?2 ELSE next_actor_seq END,hlc_wall_ms=?3,hlc_logical=?4,updated_at=?5 WHERE singleton=1",
+        params![root_scoped as i64,next_actor_seq,hlc.wall_ms as i64,hlc.logical as i64,unix_timestamp_millis()],
+    )?;
+    if root_scoped {
+        transaction.execute(
+            "UPDATE sync_actor_epochs SET next_actor_seq=?1 WHERE actor_epoch=?2",
+            params![next_actor_seq, actor_epoch],
+        )?;
+    }
     Ok(CaptureResult {
         local_mutation_generation: generation,
         event_uuid: Some(event_uuid.0.as_bytes().to_vec()),
         actor_seq: Some(actor_seq),
     })
+}
+
+fn entity_root_binding_state(
+    transaction: &Transaction<'_>,
+    entity_uuid: Uuid,
+) -> anyhow::Result<Option<String>> {
+    transaction
+        .query_row(
+            "SELECT binding.state FROM sync_root_local_bindings binding JOIN roots root ON root.id=binding.root_id WHERE root.id=COALESCE((SELECT root_id FROM files WHERE asset_uuid=?1),(SELECT root_id FROM folders WHERE folder_uuid=?1),(SELECT id FROM roots WHERE root_folder_uuid=?1))",
+            [entity_uuid.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn entity_root_capture_context(
+    transaction: &Transaction<'_>,
+    entity_uuid: Uuid,
+) -> anyhow::Result<Option<(String, Vec<u8>, Vec<u8>, i64)>> {
+    transaction
+        .query_row(
+            "SELECT binding.state,COALESCE(binding.root_actor_epoch,binding.local_binding_uuid),COALESCE(binding.root_capture_epoch,binding.local_binding_uuid),COALESCE(actor.next_actor_seq,1) FROM sync_root_local_bindings binding JOIN roots root ON root.id=binding.root_id LEFT JOIN sync_actor_epochs actor ON actor.actor_epoch=COALESCE(binding.root_actor_epoch,binding.local_binding_uuid) WHERE root.id=COALESCE((SELECT root_id FROM files WHERE asset_uuid=?1),(SELECT root_id FROM folders WHERE folder_uuid=?1),(SELECT id FROM roots WHERE root_folder_uuid=?1))",
+            [entity_uuid.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn persist_local_event(
@@ -166,7 +221,7 @@ fn persist_local_event(
         "INSERT INTO sync_events(event_uuid,library_uuid,entity_uuid,stream_uuid,stream_kind,device_uuid,actor_epoch,binding_epoch,actor_seq,local_mutation_generation,hlc_wall_ms,hlc_logical,wire_version,envelope_version,reducer_version,key_version,operation,apply_state,integrity_hash,created_at,applied_at,payload) VALUES (?1,?2,?3,?4,'catalog',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'local',?17,?18,?18,?19)",
         params![event.event_uuid.0.as_bytes().as_slice(),event.library_uuid.0.as_bytes().as_slice(),event.entity_uuid.0.as_bytes().as_slice(),event.stream_uuid.0.as_bytes().as_slice(),event.actor.device_uuid.0.as_bytes().as_slice(),event.actor.actor_epoch.0.as_bytes().as_slice(),event.binding_epoch.0.as_bytes().as_slice(),event.actor_seq as i64,generation,event.hlc.wall_ms as i64,event.hlc.logical as i64,event.wire_version,event.envelope_version,event.reducer_version,event.key_version,super::inbox::operation_name(&event.operation),event.integrity_hash.as_slice(),now,bytes],
     )?;
-    super::inbox::materialize_truth(transaction, event)?;
+    super::inbox::materialize_truth(transaction, event, false)?;
     super::inbox::upsert_frontier_state(
         transaction,
         &event.actor,

@@ -965,7 +965,7 @@ fn platform_known_cloud_roots() -> Vec<PathBuf> {
 }
 
 #[cfg(windows)]
-fn is_platform_sync_root(path: &Path) -> bool {
+pub(crate) fn is_platform_sync_root(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::CloudFilters::{
         CfGetSyncRootInfoByPath, CF_SYNC_ROOT_INFO_BASIC,
@@ -990,7 +990,7 @@ fn is_platform_sync_root(path: &Path) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_platform_sync_root(_path: &Path) -> bool {
+pub(crate) fn is_platform_sync_root(_path: &Path) -> bool {
     false
 }
 
@@ -999,7 +999,7 @@ fn platform_known_cloud_roots() -> Vec<PathBuf> {
     Vec::new()
 }
 
-fn probe_writable(root: &Path) -> bool {
+pub(crate) fn probe_writable(root: &Path) -> bool {
     let parent = if root.exists() {
         root
     } else {
@@ -1020,7 +1020,7 @@ fn probe_writable(root: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn free_space_bytes(path: &Path) -> io::Result<u64> {
+pub(crate) fn free_space_bytes(path: &Path) -> io::Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let existing = if path.exists() {
@@ -1046,7 +1046,7 @@ fn free_space_bytes(path: &Path) -> io::Result<u64> {
 }
 
 #[cfg(unix)]
-fn free_space_bytes(path: &Path) -> io::Result<u64> {
+pub(crate) fn free_space_bytes(path: &Path) -> io::Result<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let existing = if path.exists() {
@@ -1065,7 +1065,7 @@ fn free_space_bytes(path: &Path) -> io::Result<u64> {
 }
 
 #[cfg(not(any(windows, unix)))]
-fn free_space_bytes(_path: &Path) -> io::Result<u64> {
+pub(crate) fn free_space_bytes(_path: &Path) -> io::Result<u64> {
     Ok(u64::MAX)
 }
 
@@ -1097,7 +1097,7 @@ fn rejected(path: &Path, reason: PreflightReason) -> PreflightResult {
     }
 }
 
-fn has_existing_reparse_component(path: &Path) -> bool {
+pub(crate) fn has_existing_reparse_component(path: &Path) -> bool {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);

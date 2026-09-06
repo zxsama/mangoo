@@ -1238,6 +1238,24 @@ describe("createCoreClient", () => {
     assert.equal(JSON.parse(recorded[0].body!).expectedBindingGeneration, 5);
 
     recorded.length = 0;
+    mockFetch({ planUuid: "00000000-0000-7000-8000-000000000023", operationUuid, rootUuid: "root", localBindingUuid: "binding", bindingGeneration: 5, rootCaptureEpoch: "capture", rootActorEpoch: "actor", pendingWork: 1, publishedWork: 2, checkpointUuid: null, eventFrontier: {}, catalogSnapshotDigest: "d".repeat(64), providerReceipts: [], expiresAt: 100 });
+    await core.preflightSyncFolderStop("lib", "root", {
+      ...mutation,
+      expectedBindingGeneration: 5
+    });
+    assert.match(recorded[0].url, /\/sync-folders\/root\/stop\/preflight$/);
+
+    recorded.length = 0;
+    mockFetch({ operationUuid, libraryUuid: "lib", rootUuid: "root", kind: "stop-sync", state: "running", phase: "reconciling-visibility", operationRevision: 3, cutoverCommitted: true, createdAt: 1, updatedAt: 1 });
+    await core.commitSyncFolderStop("lib", "root", 43, {
+      ...mutation,
+      expectedBindingGeneration: 5,
+      planUuid: "00000000-0000-7000-8000-000000000023"
+    });
+    assert.equal(recorded[0].headers["x-megle-context-revision"], "43");
+    assert.match(recorded[0].url, /\/sync-folders\/root\/stop\/commit$/);
+
+    recorded.length = 0;
     mockFetch({ operationUuid, libraryUuid: "lib", rootUuid: "root", kind: "relocate", state: "running", phase: "preflighting", operationRevision: 3, cutoverCommitted: false, createdAt: 1, updatedAt: 1 });
     await core.commandSyncFolderRelocation("lib", "root", operationUuid, "retry", 43, {
       ...mutation,

@@ -72,7 +72,7 @@ pub fn apply_remote_batch(
             params![event.event_uuid.0.as_bytes().as_slice(),event.library_uuid.0.as_bytes().as_slice(),event.entity_uuid.0.as_bytes().as_slice(),event.stream_uuid.0.as_bytes().as_slice(),stream_kind(event.stream_kind),actor.device_uuid.0.as_bytes().as_slice(),actor.actor_epoch.0.as_bytes().as_slice(),event.binding_epoch.0.as_bytes().as_slice(),event.actor_seq as i64,event.hlc.wall_ms as i64,event.hlc.logical as i64,event.wire_version,event.envelope_version,event.reducer_version,event.key_version,operation_name(&event.operation),event.integrity_hash.as_slice(),unix_timestamp_millis(),bytes],
         )?;
         super::fault::hit("remote.after-ledger");
-        materialize_truth(transaction, event)?;
+        materialize_truth(transaction, event, true)?;
         super::fault::hit("remote.after-truth-projection");
         upsert_frontier_state(transaction, actor, event.actor_seq as i64, "ready")?;
         super::fault::hit("remote.after-frontier");
@@ -85,6 +85,7 @@ pub fn apply_remote_batch(
 pub(crate) fn materialize_truth(
     transaction: &Transaction<'_>,
     event: &super::types::EventEnvelope,
+    remote_apply: bool,
 ) -> anyhow::Result<()> {
     use super::types::Operation;
     let entity = event.entity_uuid.0.as_bytes().as_slice();
@@ -112,9 +113,13 @@ pub(crate) fn materialize_truth(
                 |row| row.get(0),
             )?;
             let winning_value: serde_json::Value = serde_json::from_slice(&winning_value)?;
-            materialize_scalar_projection(transaction, entity, field, &winning_value)?;
+            let preserve_local_fork =
+                remote_apply && entity_is_in_local_only_root(transaction, entity)?;
+            if !preserve_local_fork {
+                materialize_scalar_projection(transaction, entity, field, &winning_value)?;
+            }
             if field == "entity-kind" {
-                rematerialize_location_projection(transaction)?;
+                rematerialize_location_projection(transaction, remote_apply)?;
             }
         }
         Operation::SetAdd { member_uuid, .. } => {
@@ -122,7 +127,9 @@ pub(crate) fn materialize_truth(
                 "INSERT OR IGNORE INTO sync_set_adds(owner_uuid,member_uuid,add_event_uuid) VALUES (?1,?2,?3)",
                 params![entity,member_uuid.0.as_bytes().as_slice(),event_uuid],
             )?;
-            materialize_tag_projection(transaction, entity)?;
+            if !(remote_apply && entity_is_in_local_only_root(transaction, entity)?) {
+                materialize_tag_projection(transaction, entity)?;
+            }
         }
         Operation::SetRemove { observed_adds, .. } => {
             for observed in observed_adds {
@@ -131,7 +138,9 @@ pub(crate) fn materialize_truth(
                     params![event_uuid,observed.0.as_bytes().as_slice()],
                 )?;
             }
-            materialize_tag_projection(transaction, entity)?;
+            if !(remote_apply && entity_is_in_local_only_root(transaction, entity)?) {
+                materialize_tag_projection(transaction, entity)?;
+            }
         }
         Operation::SetLocation {
             revision_uuid,
@@ -150,21 +159,25 @@ pub(crate) fn materialize_truth(
                 )?;
             }
             rebuild_location_heads(transaction, entity)?;
-            rematerialize_location_projection(transaction)?;
+            rematerialize_location_projection(transaction, remote_apply)?;
         }
         Operation::Delete { token } => {
             transaction.execute(
                 "INSERT OR IGNORE INTO sync_tombstone_tokens(token_uuid,entity_uuid,event_uuid,local_mutation_generation,created_at) VALUES (?1,?2,?3,1,?4)",
                 params![token.0.as_bytes().as_slice(),entity,event_uuid,unix_timestamp_millis()],
             )?;
-            transaction.execute(
-                "UPDATE files SET status='trashed' WHERE asset_uuid=?1",
-                [entity],
-            )?;
-            transaction.execute(
-                "UPDATE folders SET status='trashed' WHERE folder_uuid=?1 AND parent_id IS NOT NULL",
-                [entity],
-            )?;
+            let preserve_local_fork =
+                remote_apply && entity_is_in_local_only_root(transaction, entity)?;
+            if !preserve_local_fork {
+                transaction.execute(
+                    "UPDATE files SET status='trashed' WHERE asset_uuid=?1",
+                    [entity],
+                )?;
+                transaction.execute(
+                    "UPDATE folders SET status='trashed' WHERE folder_uuid=?1 AND parent_id IS NOT NULL",
+                    [entity],
+                )?;
+            }
             transaction.execute(
                 "UPDATE sync_root_descriptors SET lifecycle='tombstoned',logical_revision=logical_revision+1,updated_at=?1 WHERE root_folder_uuid=?2",
                 params![unix_timestamp_millis(), entity],
@@ -182,21 +195,25 @@ pub(crate) fn materialize_truth(
                 [entity],
                 |row| row.get(0),
             )?;
-            transaction.execute(
-                "UPDATE files SET status=CASE WHEN ?1=0 THEN 'active' ELSE 'trashed' END WHERE asset_uuid=?2",
-                params![live_tokens, entity],
-            )?;
-            transaction.execute(
-                "UPDATE folders SET status=CASE WHEN ?1=0 THEN 'active' ELSE 'trashed' END WHERE folder_uuid=?2 AND parent_id IS NOT NULL",
-                params![live_tokens, entity],
-            )?;
+            let preserve_local_fork =
+                remote_apply && entity_is_in_local_only_root(transaction, entity)?;
+            if !preserve_local_fork {
+                transaction.execute(
+                    "UPDATE files SET status=CASE WHEN ?1=0 THEN 'active' ELSE 'trashed' END WHERE asset_uuid=?2",
+                    params![live_tokens, entity],
+                )?;
+                transaction.execute(
+                    "UPDATE folders SET status=CASE WHEN ?1=0 THEN 'active' ELSE 'trashed' END WHERE folder_uuid=?2 AND parent_id IS NOT NULL",
+                    params![live_tokens, entity],
+                )?;
+            }
             if live_tokens == 0 {
                 transaction.execute(
                     "UPDATE sync_root_descriptors SET lifecycle='active',logical_revision=logical_revision+1,updated_at=?1 WHERE root_folder_uuid=?2",
                     params![unix_timestamp_millis(), entity],
                 )?;
             }
-            rematerialize_location_projection(transaction)?;
+            rematerialize_location_projection(transaction, remote_apply)?;
         }
         Operation::SetContent {
             revision_uuid,
@@ -390,7 +407,10 @@ fn rebuild_location_heads(transaction: &Transaction<'_>, entity: &[u8]) -> anyho
     Ok(())
 }
 
-fn rematerialize_location_projection(transaction: &Transaction<'_>) -> anyhow::Result<()> {
+fn rematerialize_location_projection(
+    transaction: &Transaction<'_>,
+    preserve_local_only_roots: bool,
+) -> anyhow::Result<()> {
     use super::reducer::{legalize_locations, LocationRevision, ProtocolState};
     use super::types::{ActorEpochUuid, DeviceUuid, EventUuid, Hlc, RevisionUuid, Version};
 
@@ -476,10 +496,13 @@ fn rematerialize_location_projection(transaction: &Transaction<'_>) -> anyhow::R
                 "UPDATE sync_root_descriptors SET winning_location_revision_uuid=?1,requested_name=?2,materialized_name=?3,materialization_fingerprint=?4,logical_revision=?5,updated_at=?6 WHERE root_folder_uuid=?7 AND (NOT (winning_location_revision_uuid IS ?1) OR requested_name<>?2 OR materialized_name<>?3 OR materialization_fingerprint<>?4)",
                 params![winning_revision, location.requested_name, location.display_name, location.materialization_fingerprint.as_slice(), old_revision.saturating_add(1), unix_timestamp_millis(), entity],
             )?;
-            transaction.execute(
-                "UPDATE roots SET display_name=?1 WHERE root_uuid=?2",
-                params![location.display_name, root_uuid],
-            )?;
+            let local_only = root_is_local_only(transaction, &root_uuid)?;
+            if !local_only || !preserve_local_only_roots {
+                transaction.execute(
+                    "UPDATE roots SET display_name=?1 WHERE root_uuid=?2",
+                    params![location.display_name, root_uuid],
+                )?;
+            }
             continue;
         }
         let parent = location.parent_uuid.and_then(|parent_uuid| {
@@ -496,6 +519,14 @@ fn rematerialize_location_projection(transaction: &Transaction<'_>) -> anyhow::R
         let Some((parent_id, root_id)) = parent else {
             continue;
         };
+        let local_only: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_id=?1 AND state='local-only-fork')",
+            [root_id],
+            |row| row.get(0),
+        )?;
+        if local_only && preserve_local_only_roots {
+            continue;
+        }
         if let Some(file_id) = transaction
             .query_row(
                 "SELECT id FROM files WHERE asset_uuid=?1",
@@ -537,6 +568,59 @@ fn rematerialize_location_projection(transaction: &Transaction<'_>) -> anyhow::R
         }
     }
     Ok(())
+}
+
+fn root_is_local_only(transaction: &Transaction<'_>, root_uuid: &[u8]) -> anyhow::Result<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_uuid=?1 AND state='local-only-fork')",
+            [root_uuid],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn entity_is_in_local_only_root(
+    transaction: &Transaction<'_>,
+    entity: &[u8],
+) -> anyhow::Result<bool> {
+    let directly_bound: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings b WHERE b.state='local-only-fork' AND (b.root_id IN (SELECT root_id FROM files WHERE asset_uuid=?1) OR b.root_id IN (SELECT root_id FROM folders WHERE folder_uuid=?1) OR b.root_uuid IN (SELECT root_uuid FROM sync_root_descriptors WHERE root_folder_uuid=?1)))",
+        [entity],
+        |row| row.get(0),
+    )?;
+    if directly_bound {
+        return Ok(true);
+    }
+
+    let mut cursor = entity.to_vec();
+    let mut visited = std::collections::BTreeSet::new();
+    for _ in 0..64 {
+        if !visited.insert(cursor.clone()) {
+            break;
+        }
+        let root_is_local_only: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_root_descriptors d JOIN sync_root_local_bindings b ON b.root_uuid=d.root_uuid WHERE d.root_folder_uuid=?1 AND b.state='local-only-fork')",
+            [&cursor],
+            |row| row.get(0),
+        )?;
+        if root_is_local_only {
+            return Ok(true);
+        }
+        let parent: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT r.parent_uuid FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=?1 AND h.is_display_winner=1",
+                [&cursor],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(parent) = parent else {
+            break;
+        };
+        cursor = parent;
+    }
+    Ok(false)
 }
 
 fn materialize_legacy_location_projection(transaction: &Transaction<'_>) -> anyhow::Result<()> {
@@ -1015,5 +1099,107 @@ mod tests {
         assert_eq!(sentinel, "");
         assert_eq!(root_name, "Renamed");
         assert_eq!(nested, ("Nested".into(), root_id));
+    }
+
+    #[test]
+    fn remote_truth_advances_without_overwriting_a_local_only_root_projection() {
+        let database = crate::db::Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root_uuid = uuid::Uuid::from_u128(110);
+        let root_folder_uuid = uuid::Uuid::from_u128(120);
+        let library_root_uuid = uuid::Uuid::from_u128(999);
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "D:/LocalFork".into(),
+                display_name: "Local Photos".into(),
+            })
+            .unwrap();
+        database
+            .upsert_sync_root_descriptor(&crate::db::SyncRootDescriptorRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                root_folder_uuid: *root_folder_uuid.as_bytes(),
+                library_root_uuid: *library_root_uuid.as_bytes(),
+                creation_event_uuid: None,
+                winning_location_revision_uuid: None,
+                requested_name: "Photos".into(),
+                materialized_name: "Photos".into(),
+                materialization_fingerprint: [1; 32],
+                lifecycle: "active".into(),
+                logical_revision: 0,
+                updated_at: 1,
+            })
+            .unwrap();
+        database
+            .connection_for_fsops()
+            .execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,NULL,'','root','active',?2)",
+                params![root_id, root_folder_uuid.as_bytes().as_slice()],
+            )
+            .unwrap();
+        database
+            .link_sync_root_descriptor(root_id, root_uuid.as_bytes(), root_folder_uuid.as_bytes())
+            .unwrap();
+        database
+            .upsert_sync_root_local_binding(&crate::db::SyncRootLocalBindingRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                library_uuid: *uuid::Uuid::from_u128(1).as_bytes(),
+                local_binding_uuid: *uuid::Uuid::from_u128(130).as_bytes(),
+                binding_generation: 2,
+                root_capture_epoch: *uuid::Uuid::from_u128(131).as_bytes(),
+                root_actor_epoch: *uuid::Uuid::from_u128(132).as_bytes(),
+                state: "local-only-fork".into(),
+                root_id,
+                operation_revision: 2,
+                updated_at: 1,
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::from_u128(1),
+                library_root_uuid,
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        let bootstrap_head: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1",
+                [root_folder_uuid.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remote_rename = event(
+            1,
+            120,
+            Operation::SetLocation {
+                revision_uuid: RevisionUuid(uuid::Uuid::from_u128(140)),
+                parent_uuid: Some(EntityUuid(library_root_uuid)),
+                name: "Remote Photos".into(),
+                supersedes: std::collections::BTreeSet::from([RevisionUuid(
+                    uuid::Uuid::from_slice(&bootstrap_head).unwrap(),
+                )]),
+            },
+        );
+
+        database.apply_remote_sync_events(&[remote_rename]).unwrap();
+
+        let projected_name: String = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT display_name FROM roots WHERE root_uuid=?1",
+                [root_uuid.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remote_truth_name: String = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT requested_name FROM sync_root_descriptors WHERE root_uuid=?1",
+                [root_uuid.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(projected_name, "Local Photos");
+        assert_eq!(remote_truth_name, "Remote Photos");
     }
 }

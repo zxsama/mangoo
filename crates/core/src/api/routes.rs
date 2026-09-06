@@ -129,6 +129,8 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/rebind/preflight",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/rebind/commit",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/commands/{command}",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/stop/preflight",
+    "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/stop/commit",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/preflight",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/commit",
     "/api/libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/comparisons/{planUuid}",
@@ -848,6 +850,14 @@ pub fn router(state: AppState) -> Router {
             post(sync_folder_contract_root_action),
         )
         .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/stop/preflight",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
+            "/api/libraries/:library_uuid/sync-folders/:root_uuid/stop/commit",
+            post(sync_folder_contract_root_write),
+        )
+        .route(
             "/api/libraries/:library_uuid/sync-folders/:root_uuid/reenable/preflight",
             post(sync_folder_contract_root_write),
         )
@@ -1215,6 +1225,13 @@ struct ConflictQuery {
     cursor: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncFolderComparisonItemsQuery {
+    cursor: Option<u64>,
+    limit: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SyncConflictRecord {
@@ -1286,7 +1303,7 @@ struct SyncFolderEnrollmentMutation {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncFolderSelectionItemMutation {
     root_uuid: String,
@@ -1298,7 +1315,7 @@ struct SyncFolderSelectionItemMutation {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncFolderSelectionPreflightMutation {
     items: Vec<SyncFolderSelectionItemMutation>,
@@ -1341,6 +1358,15 @@ struct SyncFolderOperationFenceMutation {
     operation_uuid: String,
     expected_operation_revision: u64,
     expected_binding_generation: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncFolderStopCommitMutation {
+    operation_uuid: String,
+    expected_operation_revision: u64,
+    expected_binding_generation: u64,
+    plan_uuid: String,
 }
 
 #[allow(dead_code)]
@@ -1582,6 +1608,11 @@ fn validate_sync_folder_root_write_shape(path: &str, body: &serde_json::Value) -
         validate_required_contract_uuid_field(body, "planUuid")?;
     } else if path.ends_with("/reenable/preflight") {
         let _: SyncFolderOperationFenceMutation = deserialize_sync_folder_body(body)?;
+    } else if path.ends_with("/stop/preflight") {
+        let _: SyncFolderOperationFenceMutation = deserialize_sync_folder_body(body)?;
+    } else if path.ends_with("/stop/commit") {
+        let _: SyncFolderStopCommitMutation = deserialize_sync_folder_body(body)?;
+        validate_required_contract_uuid_field(body, "planUuid")?;
     } else if path.ends_with("/reenable/commit") {
         let _: SyncFolderReenableMutation = deserialize_sync_folder_body(body)?;
         validate_required_contract_uuid_field(body, "planUuid")?;
@@ -1770,6 +1801,160 @@ fn require_sync_folder_binding_generation(
     ))
 }
 
+fn root_operation_json(operation: &crate::host_registry::RootOperationRecord) -> serde_json::Value {
+    serde_json::json!({
+        "operationUuid":operation.operation_uuid,
+        "libraryUuid":operation.library_uuid,
+        "rootUuid":operation.root_uuid,
+        "kind":operation.kind,
+        "state":operation.state,
+        "phase":operation.phase,
+        "operationRevision":operation.operation_revision,
+        "cutoverCommitted":operation.cutover_committed,
+        "errorCode":operation.error_code,
+        "createdAt":operation.created_at,
+        "updatedAt":operation.updated_at,
+    })
+}
+
+fn sync_folder_allowed_actions(
+    descriptor: &crate::host_registry::RemoteSyncRootRecord,
+    binding: Option<&crate::host_registry::LocalRootBindingRecord>,
+) -> Vec<&'static str> {
+    match binding.map(|value| value.state.as_str()) {
+        None if descriptor.lifecycle == "active" => vec!["select", "rebind-existing"],
+        Some("active") => vec!["pause", "stop-sync", "relocate", "rename"],
+        Some("paused") => vec!["resume", "stop-sync", "relocate", "rename"],
+        Some("local-only-fork") => vec!["re-enable", "publish-as-new"],
+        Some("reconcile-required") => vec!["retry"],
+        Some("materializing") => vec!["retry"],
+        Some("unavailable") => vec!["rebind-existing", "retry"],
+        Some("error") => vec!["retry"],
+        _ => Vec::new(),
+    }
+}
+
+fn sync_folder_record_json(
+    manager: &crate::library_manager::LibraryManager,
+    descriptor: &crate::host_registry::RemoteSyncRootRecord,
+    settings: &crate::host_registry::SyncFolderSettingsRecord,
+) -> anyhow::Result<serde_json::Value> {
+    let binding = manager
+        .registry()
+        .local_root_binding(&descriptor.library_uuid, &descriptor.root_uuid)?;
+    let proposal = FilePath::new(&settings.default_placement_base)
+        .join(&descriptor.materialized_name)
+        .to_string_lossy()
+        .into_owned();
+    Ok(serde_json::json!({
+        "descriptor":descriptor,
+        "binding":binding,
+        "allowedActions":sync_folder_allowed_actions(descriptor,binding.as_ref()),
+        "selectedByDefault":binding.is_none() && descriptor.lifecycle=="active",
+        "proposedLocalPath":proposal,
+    }))
+}
+
+fn sync_folder_error(error: anyhow::Error) -> CoreError {
+    let message = error.to_string();
+    let mapped = [
+        ("stale-library-context", "stale_library_context"),
+        ("stale-operation-revision", "stale-operation-revision"),
+        ("stale-remote-root-revision", "stale-operation-revision"),
+        ("stale-binding-generation", "stale-binding-generation"),
+        ("idempotency-key-reused", "idempotency-key-reused"),
+        ("comparison-required", "comparison-required"),
+        ("comparison-plan-stale", "comparison-expired"),
+        ("stale-plan", "comparison-expired"),
+        ("operation-in-progress", "operation-in-progress"),
+        ("root-operation-not-found", "operation-not-found"),
+        ("comparison-plan-not-found", "operation-not-found"),
+        ("comparison-item-not-found", "operation-not-found"),
+        ("local-root-binding-not-found", "root-not-found"),
+        ("root-not-found", "root-not-found"),
+        ("library-not-found", "library-not-found"),
+        ("overlaps-active-root", "path-overlap"),
+        ("root-overlap", "path-overlap"),
+        ("placement-base-selected", "path-overlap"),
+        ("path-changed", "path-occupied"),
+        ("marker-mismatch", "path-occupied"),
+        ("directory-not-empty", "path-occupied"),
+        ("destination-exists", "path-occupied"),
+        ("insufficient-space", "path-occupied"),
+        ("root-not-active", "invalid-lifecycle-transition"),
+        ("root-already-selected", "invalid-lifecycle-transition"),
+        ("invalid-root-state", "invalid-lifecycle-transition"),
+        (
+            "comparison-resolution-not-required",
+            "invalid-lifecycle-transition",
+        ),
+        ("invalid-path", "invalid-path"),
+        ("path-unavailable", "invalid-path"),
+        ("path-not-writable", "invalid-path"),
+        ("cloud-sync-root", "invalid-path"),
+        ("reparse-point", "invalid-path"),
+        ("directory-inventory-too-large", "invalid-path"),
+        ("duplicate-root", "invalid-input"),
+        ("duplicate-operation", "invalid-input"),
+    ];
+    let Some((internal_code, response_code)) = mapped
+        .iter()
+        .copied()
+        .find(|(internal_code, _)| message.contains(internal_code))
+    else {
+        tracing::error!(%error, "synchronized-folder orchestration failed");
+        return CoreError::coded(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal-error",
+            "Synchronized-folder operation failed".to_owned(),
+        );
+    };
+    let status = if matches!(
+        response_code,
+        "library-not-found" | "root-not-found" | "operation-not-found"
+    ) {
+        StatusCode::NOT_FOUND
+    } else if matches!(response_code, "invalid-input" | "invalid-path") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::CONFLICT
+    };
+    CoreError::coded(status, response_code, internal_code.replace('-', " "))
+}
+
+fn preflight_mode_name(
+    mode: &SyncFolderPathMode,
+) -> (&'static str, crate::sync_folders::RootPathMode) {
+    match mode {
+        SyncFolderPathMode::EnrollExisting => (
+            "enroll-existing",
+            crate::sync_folders::RootPathMode::EnrollExisting,
+        ),
+        SyncFolderPathMode::MaterializeRemote => (
+            "materialize-remote",
+            crate::sync_folders::RootPathMode::MaterializeRemote,
+        ),
+        SyncFolderPathMode::RebindExisting => (
+            "rebind-existing",
+            crate::sync_folders::RootPathMode::RebindExisting,
+        ),
+        SyncFolderPathMode::Relocate => (
+            "relocate",
+            crate::sync_folders::RootPathMode::MaterializeRemote,
+        ),
+    }
+}
+
+fn validated_path_result(
+    root_uuid: Option<&str>,
+    path: &crate::sync_folders::ValidatedRootPath,
+    token: &str,
+    expires_at: i64,
+    materialized_name: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({"rootUuid":root_uuid,"ok":true,"reason":"ok","normalizedPath":path.normalized_path,"proposedMaterializedName":materialized_name,"preflightToken":token,"expiresAt":expires_at,"availableBytes":path.available_bytes,"pathEvidence":path})
+}
+
 fn sync_folder_v2_gate(state: &AppState, library_uuid: &str) -> ApiResult<()> {
     validate_contract_uuid(library_uuid, "libraryUuid")?;
     let manager = sync_folder_library_manager(state)?;
@@ -1794,9 +1979,50 @@ fn sync_folder_v2_gate(state: &AppState, library_uuid: &str) -> ApiResult<()> {
 async fn sync_folder_contract_read(
     State(state): State<AppState>,
     Path(library_uuid): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> ApiResult<Response> {
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    let manager = sync_folder_library_manager(&state)?;
+    let actionable = manager
+        .refresh_sync_folder_inventory(&library_uuid)
+        .await
+        .map_err(sync_folder_error)?;
+    for root_uuid in actionable {
+        if let Some(root) = manager
+            .registry()
+            .remote_sync_root(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+        {
+            manager
+                .publish_sync_folder_placement_required(
+                    &library_uuid,
+                    &root_uuid,
+                    root.inventory_revision,
+                    &root.requested_name,
+                )
+                .await
+                .map_err(sync_folder_error)?;
+        }
+    }
+    let settings = manager
+        .registry()
+        .sync_folder_settings(&library_uuid)
+        .map_err(sync_folder_error)?;
+    if uri.path().ends_with("/settings") {
+        return Ok(Json(settings).into_response());
+    }
+    let roots = manager
+        .registry()
+        .remote_sync_roots(&library_uuid)
+        .map_err(sync_folder_error)?;
+    let mut items = Vec::with_capacity(roots.len());
+    for root in &roots {
+        items.push(sync_folder_record_json(&manager, root, &settings).map_err(sync_folder_error)?);
+    }
+    Ok(
+        Json(serde_json::json!({"revision":settings.operation_revision,"items":items}))
+            .into_response(),
+    )
 }
 
 async fn sync_folder_contract_write(
@@ -1822,7 +2048,858 @@ async fn sync_folder_contract_write(
             .map_err(map_library_error)?;
     }
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    let manager = sync_folder_library_manager(&state)?;
+    if uri.path().ends_with("/settings") {
+        let request: SyncFolderSettingsMutation = deserialize_sync_folder_body(&body)?;
+        let settings = manager
+            .registry()
+            .update_sync_folder_settings(
+                &library_uuid,
+                request.expected_operation_revision,
+                FilePath::new(&request.default_placement_base),
+            )
+            .map_err(sync_folder_error)?;
+        return Ok(Json(settings).into_response());
+    }
+    let settings = manager
+        .registry()
+        .sync_folder_settings(&library_uuid)
+        .map_err(sync_folder_error)?;
+    if uri.path().ends_with("/enrollment/preflight") {
+        let request: SyncFolderPathPreflightMutation = deserialize_sync_folder_body(&body)?;
+        let (mode_name, mode) = preflight_mode_name(&request.mode);
+        if mode != crate::sync_folders::RootPathMode::EnrollExisting {
+            return Err(CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid-input",
+                "Enrollment preflight requires enroll-existing mode".to_owned(),
+            ));
+        }
+        let token = request.operation_uuid.clone();
+        let request_hash = crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
+        if let Ok((_root, stored_mode, stored_hash, _request, result, expires_at, _)) = manager
+            .registry()
+            .root_path_preflight(&token, &library_uuid)
+        {
+            if stored_mode != mode_name || stored_hash != request_hash {
+                return Err(sync_folder_error(anyhow::anyhow!("idempotency-key-reused")));
+            }
+            if expires_at < crate::host_registry::unix_timestamp_millis_for_runtime() {
+                return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+            }
+            return Ok(Json(result).into_response());
+        }
+        let bindings = manager
+            .registry()
+            .local_root_bindings(&library_uuid)
+            .map_err(sync_folder_error)?;
+        let paths = bindings
+            .iter()
+            .map(|value| std::path::PathBuf::from(&value.local_path))
+            .collect::<Vec<_>>();
+        let validated = crate::sync_folders::validate_root_path(
+            FilePath::new(&request.path),
+            mode,
+            FilePath::new(&settings.default_placement_base),
+            &paths,
+        )
+        .map_err(sync_folder_error)?;
+        let root_uuid = request
+            .root_uuid
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        let occupied = manager
+            .registry()
+            .remote_sync_roots(&library_uuid)
+            .map_err(sync_folder_error)?
+            .into_iter()
+            .map(|item| {
+                crate::sync::reducer::materialized_name_compare_key(&item.materialized_name)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let requested_name = FilePath::new(&validated.normalized_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("invalid-path")))?;
+        let materialized_name = crate::sync_folders::default_materialized_name(
+            requested_name,
+            uuid::Uuid::parse_str(&root_uuid).map_err(|error| sync_folder_error(error.into()))?,
+            &occupied,
+        );
+        let expires_at = crate::host_registry::unix_timestamp_millis_for_runtime()
+            + crate::sync_folders::PLAN_TTL_MILLIS;
+        let mut result = validated_path_result(
+            Some(&root_uuid),
+            &validated,
+            &token,
+            expires_at,
+            Some(&materialized_name),
+        );
+        result["bindingUuid"] = serde_json::json!(uuid::Uuid::now_v7().to_string());
+        manager
+            .registry()
+            .store_root_path_preflight(
+                &token,
+                &library_uuid,
+                Some(&root_uuid),
+                mode_name,
+                &request_hash,
+                &body,
+                &result,
+                expires_at,
+            )
+            .map_err(sync_folder_error)?;
+        return Ok(Json(result).into_response());
+    }
+    if uri.path().ends_with("/enrollment/commit") {
+        let request: SyncFolderEnrollmentMutation = deserialize_sync_folder_body(&body)?;
+        if let Some(operation) = manager
+            .registry()
+            .root_operation(&request.operation_uuid)
+            .map_err(sync_folder_error)?
+        {
+            let request_hash =
+                crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
+            if operation.library_uuid != library_uuid
+                || operation.root_uuid != request.root_uuid
+                || operation.kind != "enroll"
+                || operation.request_hash != request_hash
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("idempotency-key-reused")));
+            }
+            if operation.state == "completed" {
+                let descriptor = manager
+                    .registry()
+                    .remote_sync_root(&library_uuid, &request.root_uuid)
+                    .map_err(sync_folder_error)?
+                    .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-not-found")))?;
+                let binding = manager
+                    .registry()
+                    .local_root_binding(&library_uuid, &request.root_uuid)
+                    .map_err(sync_folder_error)?
+                    .ok_or_else(|| {
+                        sync_folder_error(anyhow::anyhow!("local-root-binding-not-found"))
+                    })?;
+                manager
+                    .ensure_selected_sync_root(
+                        &library_uuid,
+                        uuid::Uuid::parse_str(&request.root_uuid)
+                            .map_err(|error| sync_folder_error(error.into()))?,
+                        uuid::Uuid::parse_str(&descriptor.root_folder_uuid)
+                            .map_err(|error| sync_folder_error(error.into()))?,
+                        binding.local_path,
+                        descriptor.requested_name,
+                        descriptor.materialized_name,
+                        crate::sync::media::parse_hash(&descriptor.materialization_fingerprint)
+                            .map_err(sync_folder_error)?,
+                        uuid::Uuid::parse_str(&binding.local_binding_uuid)
+                            .map_err(|error| sync_folder_error(error.into()))?,
+                        uuid::Uuid::parse_str(
+                            binding
+                                .root_capture_epoch
+                                .as_deref()
+                                .unwrap_or(&binding.local_binding_uuid),
+                        )
+                        .map_err(|error| sync_folder_error(error.into()))?,
+                        uuid::Uuid::parse_str(
+                            binding
+                                .root_actor_epoch
+                                .as_deref()
+                                .unwrap_or(&binding.local_binding_uuid),
+                        )
+                        .map_err(|error| sync_folder_error(error.into()))?,
+                        binding.binding_generation,
+                        binding.state,
+                        binding.operation_revision,
+                        true,
+                    )
+                    .await
+                    .map_err(sync_folder_error)?;
+                return Ok(
+                    (StatusCode::ACCEPTED, Json(root_operation_json(&operation))).into_response(),
+                );
+            }
+        }
+        let (planned_root, mode, _hash, planned, result, expires_at, _) = manager
+            .registry()
+            .root_path_preflight(&request.preflight_token, &library_uuid)
+            .map_err(sync_folder_error)?;
+        if mode != "enroll-existing"
+            || planned_root.as_deref() != Some(&request.root_uuid)
+            || expires_at < crate::host_registry::unix_timestamp_millis_for_runtime()
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+        }
+        let planned_request: SyncFolderPathPreflightMutation =
+            serde_json::from_value(planned).map_err(|error| sync_folder_error(error.into()))?;
+        if planned_request.path != request.path {
+            return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+        }
+        let evidence: crate::sync_folders::ValidatedRootPath = serde_json::from_value(
+            result
+                .get("pathEvidence")
+                .cloned()
+                .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?,
+        )
+        .map_err(|error| sync_folder_error(error.into()))?;
+        let current = crate::sync_folders::validate_root_path(
+            FilePath::new(&request.path),
+            crate::sync_folders::RootPathMode::EnrollExisting,
+            FilePath::new(&settings.default_placement_base),
+            &manager
+                .registry()
+                .local_root_bindings(&library_uuid)
+                .map_err(sync_folder_error)?
+                .iter()
+                .map(|value| std::path::PathBuf::from(&value.local_path))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(sync_folder_error)?;
+        if current.identity_token != evidence.identity_token
+            || current.content_evidence_digest != evidence.content_evidence_digest
+            || current.normalized_path != evidence.normalized_path
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+        }
+        let root_uuid = uuid::Uuid::parse_str(&request.root_uuid)
+            .map_err(|error| sync_folder_error(error.into()))?;
+        let root_folder_uuid = uuid::Uuid::parse_str(&request.root_folder_uuid)
+            .map_err(|error| sync_folder_error(error.into()))?;
+        let occupied = manager
+            .registry()
+            .remote_sync_roots(&library_uuid)
+            .map_err(sync_folder_error)?
+            .into_iter()
+            .filter(|item| item.root_uuid != request.root_uuid)
+            .map(|item| {
+                crate::sync::reducer::materialized_name_compare_key(&item.materialized_name)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let materialized = crate::sync_folders::default_materialized_name(
+            &request.requested_name,
+            root_uuid,
+            &occupied,
+        );
+        let fingerprint = crate::sync_folders::materialization_fingerprint(&materialized);
+        manager
+            .registry()
+            .upsert_remote_sync_root(
+                &library_uuid,
+                &request.root_uuid,
+                &request.root_folder_uuid,
+                &request.requested_name,
+                &materialized,
+                &fingerprint,
+                0,
+                "active",
+                None,
+                None,
+            )
+            .map_err(sync_folder_error)?;
+        let request_hash = crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
+        let (operation, _) = manager
+            .registry()
+            .begin_root_operation_once(
+                &request.operation_uuid,
+                &library_uuid,
+                &request.root_uuid,
+                "enroll",
+                "preflighting",
+                &request_hash,
+                &body,
+                request.expected_operation_revision,
+                None,
+            )
+            .map_err(sync_folder_error)?;
+        if operation.state == "completed" {
+            return Ok(
+                (StatusCode::ACCEPTED, Json(root_operation_json(&operation))).into_response(),
+            );
+        }
+        let plan =
+            serde_json::json!({"preflightToken":request.preflight_token,"pathEvidence":current});
+        manager
+            .registry()
+            .set_root_operation_plan(
+                &request.operation_uuid,
+                &request.preflight_token,
+                &plan,
+                "capturing-seed",
+            )
+            .map_err(sync_folder_error)?;
+        let local_binding_uuid = result
+            .get("bindingUuid")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?
+            .parse::<uuid::Uuid>()
+            .map_err(|error| sync_folder_error(error.into()))?;
+        let marker = crate::sync_folders::SyncRootMarker {
+            format_version: 1,
+            library_uuid: library_uuid.clone(),
+            root_uuid: request.root_uuid.clone(),
+            root_folder_uuid: request.root_folder_uuid.clone(),
+            local_binding_uuid: local_binding_uuid.to_string(),
+            binding_generation: 1,
+        };
+        crate::sync_folders::write_root_marker(FilePath::new(&current.normalized_path), &marker)
+            .map_err(sync_folder_error)?;
+        let marker_identity = match crate::library_path::local_file_identity(
+            &FilePath::new(&current.normalized_path)
+                .join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = crate::sync_folders::remove_root_marker_if_matches(
+                    FilePath::new(&current.normalized_path),
+                    &marker,
+                    false,
+                );
+                return Err(sync_folder_error(error.into()));
+            }
+        };
+        let binding = crate::host_registry::NewLocalRootBinding {
+            library_uuid: library_uuid.clone(),
+            root_uuid: request.root_uuid.clone(),
+            local_binding_uuid: local_binding_uuid.to_string(),
+            local_path: current.normalized_path.clone(),
+            canonical_path_key: current.canonical_path_key.clone(),
+            placement_parent: current.placement_parent.clone(),
+            placement_parent_key: current.placement_parent_key.clone(),
+            marker_identity,
+            filesystem_identity: current.filesystem_identity.clone(),
+            state: "active".to_owned(),
+            binding_generation: 1,
+            root_capture_epoch: Some(uuid::Uuid::now_v7().to_string()),
+            root_actor_epoch: Some(uuid::Uuid::now_v7().to_string()),
+            desired_materialized_name: materialized.clone(),
+            desired_materialization_fingerprint: fingerprint.clone(),
+            operation_revision: request.expected_operation_revision + 1,
+            verification_json: plan,
+        };
+        let stored = match manager.registry().commit_local_root_binding(
+            &request.operation_uuid,
+            &request.preflight_token,
+            &binding,
+        ) {
+            Ok(stored) => stored,
+            Err(error) => {
+                let _ = crate::sync_folders::remove_root_marker_if_matches(
+                    FilePath::new(&current.normalized_path),
+                    &marker,
+                    false,
+                );
+                return Err(sync_folder_error(error));
+            }
+        };
+        manager
+            .ensure_selected_sync_root(
+                &library_uuid,
+                root_uuid,
+                root_folder_uuid,
+                current.normalized_path.clone(),
+                request.requested_name,
+                materialized,
+                crate::sync::media::parse_hash(&fingerprint).map_err(sync_folder_error)?,
+                local_binding_uuid,
+                uuid::Uuid::parse_str(
+                    stored
+                        .root_capture_epoch
+                        .as_deref()
+                        .unwrap_or(&stored.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                uuid::Uuid::parse_str(
+                    stored
+                        .root_actor_epoch
+                        .as_deref()
+                        .unwrap_or(&stored.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                stored.binding_generation,
+                stored.state,
+                stored.operation_revision,
+                true,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        manager
+            .registry()
+            .consume_root_path_preflight(&request.preflight_token, &library_uuid)
+            .map_err(sync_folder_error)?;
+        let completed = manager
+            .registry()
+            .root_operation(&request.operation_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-operation-not-found")))?;
+        return Ok((StatusCode::ACCEPTED, Json(root_operation_json(&completed))).into_response());
+    }
+    if uri.path().ends_with("/selection/preflight") {
+        let request: SyncFolderSelectionPreflightMutation = deserialize_sync_folder_body(&body)?;
+        let token = request.items[0].operation_uuid.clone();
+        let request_hash = crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
+        if let Ok((_root, stored_mode, stored_hash, _request, result, expires_at, _)) = manager
+            .registry()
+            .root_path_preflight(&token, &library_uuid)
+        {
+            if stored_mode != "materialize-remote" || stored_hash != request_hash {
+                return Err(sync_folder_error(anyhow::anyhow!("idempotency-key-reused")));
+            }
+            if expires_at < crate::host_registry::unix_timestamp_millis_for_runtime() {
+                return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+            }
+            return Ok(Json(result).into_response());
+        }
+        let existing = manager
+            .registry()
+            .local_root_bindings(&library_uuid)
+            .map_err(sync_folder_error)?;
+        let existing_paths = existing
+            .iter()
+            .map(|value| std::path::PathBuf::from(&value.local_path))
+            .collect::<Vec<_>>();
+        let mut proposed = Vec::new();
+        let mut selected_keys = HashSet::new();
+        let mut selected_paths: Vec<std::path::PathBuf> = Vec::new();
+        let mut root_uuids = HashSet::new();
+        let mut operation_uuids = HashSet::new();
+        for item in &request.items {
+            if !root_uuids.insert(item.root_uuid.clone()) {
+                return Err(sync_folder_error(anyhow::anyhow!("duplicate-root")));
+            }
+            if !operation_uuids.insert(item.operation_uuid.clone()) {
+                return Err(sync_folder_error(anyhow::anyhow!("duplicate-operation")));
+            }
+            let descriptor = manager
+                .registry()
+                .remote_sync_root(&library_uuid, &item.root_uuid)
+                .map_err(sync_folder_error)?
+                .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-not-found")))?;
+            if descriptor.operation_revision != item.expected_operation_revision {
+                return Err(sync_folder_error(anyhow::anyhow!(
+                    "stale-operation-revision"
+                )));
+            }
+            if !item.selected {
+                proposed.push(serde_json::json!({"rootUuid":item.root_uuid,"ok":true,"reason":"ok","normalizedPath":item.path,"proposedMaterializedName":descriptor.materialized_name,"preflightToken":null,"expiresAt":null}));
+                continue;
+            }
+            if FilePath::new(&item.path)
+                .join(crate::sync_folders::ROOT_MARKER_FILE_NAME)
+                .exists()
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("marker-mismatch")));
+            }
+            if descriptor.lifecycle != "active" {
+                return Err(sync_folder_error(anyhow::anyhow!("root-not-active")));
+            }
+            let existing_binding = manager
+                .registry()
+                .local_root_binding(&library_uuid, &item.root_uuid)
+                .map_err(sync_folder_error)?;
+            if existing_binding
+                .as_ref()
+                .is_some_and(|binding| binding.state == "local-only-fork")
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("comparison-required")));
+            }
+            if existing_binding.is_some() {
+                return Err(sync_folder_error(anyhow::anyhow!("root-already-selected")));
+            }
+            if manager
+                .registry()
+                .root_has_cutover_lineage(&library_uuid, &item.root_uuid)
+                .map_err(sync_folder_error)?
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("comparison-required")));
+            }
+            let validated = crate::sync_folders::validate_root_path(
+                FilePath::new(&item.path),
+                crate::sync_folders::RootPathMode::MaterializeRemote,
+                FilePath::new(&settings.default_placement_base),
+                &existing_paths,
+            )
+            .map_err(sync_folder_error)?;
+            if !selected_keys.insert(validated.canonical_path_key.clone()) {
+                return Err(sync_folder_error(anyhow::anyhow!("destination-exists")));
+            }
+            let validated_path = std::path::PathBuf::from(&validated.normalized_path);
+            if selected_paths
+                .iter()
+                .any(|path| crate::library_path::paths_overlap(&validated_path, path))
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("root-overlap")));
+            }
+            if descriptor
+                .logical_bytes
+                .zip(validated.available_bytes)
+                .is_some_and(|(required, available)| required > available)
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("insufficient-space")));
+            }
+            selected_paths.push(validated_path);
+            proposed.push(serde_json::json!({"rootUuid":item.root_uuid,"ok":true,"reason":"ok","normalizedPath":validated.normalized_path,"proposedMaterializedName":descriptor.materialized_name,"preflightToken":null,"expiresAt":null,"pathEvidence":validated,"remoteRevision":descriptor.operation_revision,"bindingUuid":uuid::Uuid::now_v7().to_string()}));
+        }
+        let expires_at = crate::host_registry::unix_timestamp_millis_for_runtime()
+            + crate::sync_folders::PLAN_TTL_MILLIS;
+        let result =
+            serde_json::json!({"preflightToken":token,"expiresAt":expires_at,"items":proposed});
+        manager
+            .registry()
+            .store_root_path_preflight(
+                &token,
+                &library_uuid,
+                None,
+                "materialize-remote",
+                &request_hash,
+                &body,
+                &result,
+                expires_at,
+            )
+            .map_err(sync_folder_error)?;
+        return Ok(Json(result).into_response());
+    }
+    if uri.path().ends_with("/selection/commit") {
+        let request: SyncFolderSelectionCommitMutation = deserialize_sync_folder_body(&body)?;
+        let (_root, mode, _hash, planned, plan_result, expires_at, _) = manager
+            .registry()
+            .root_path_preflight(&request.preflight_token, &library_uuid)
+            .map_err(sync_folder_error)?;
+        if mode != "materialize-remote"
+            || expires_at < crate::host_registry::unix_timestamp_millis_for_runtime()
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+        }
+        let planned_request: SyncFolderSelectionPreflightMutation =
+            serde_json::from_value(planned).map_err(|error| sync_folder_error(error.into()))?;
+        if serde_json::to_value(&planned_request.items).ok()
+            != serde_json::to_value(&request.items).ok()
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+        }
+        for item in &request.items {
+            if item.selected {
+                continue;
+            }
+            let descriptor = manager
+                .registry()
+                .remote_sync_root(&library_uuid, &item.root_uuid)
+                .map_err(sync_folder_error)?
+                .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-not-found")))?;
+            let already_acknowledged = descriptor.inventory_state == "unselected"
+                && descriptor.operation_revision
+                    == item.expected_operation_revision.saturating_add(1);
+            if descriptor.operation_revision != item.expected_operation_revision
+                && !already_acknowledged
+            {
+                return Err(sync_folder_error(anyhow::anyhow!(
+                    "stale-operation-revision"
+                )));
+            }
+        }
+        let selected_items = request
+            .items
+            .iter()
+            .filter(|item| item.selected)
+            .collect::<Vec<_>>();
+        let completed_operations = selected_items
+            .iter()
+            .map(|item| manager.registry().root_operation(&item.operation_uuid))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(sync_folder_error)?;
+        if !selected_items.is_empty()
+            && completed_operations.iter().all(|operation| {
+                operation
+                    .as_ref()
+                    .is_some_and(|value| value.state == "completed")
+            })
+        {
+            for (item, operation) in selected_items.iter().zip(&completed_operations) {
+                let operation = operation
+                    .as_ref()
+                    .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?;
+                let item_value =
+                    serde_json::to_value(item).map_err(|error| sync_folder_error(error.into()))?;
+                if operation.library_uuid != library_uuid
+                    || operation.root_uuid != item.root_uuid
+                    || operation.kind != "select"
+                    || operation.request_hash
+                        != crate::sync_folders::request_hash(&item_value)
+                            .map_err(sync_folder_error)?
+                {
+                    return Err(sync_folder_error(anyhow::anyhow!("idempotency-key-reused")));
+                }
+                let descriptor = manager
+                    .registry()
+                    .remote_sync_root(&library_uuid, &item.root_uuid)
+                    .map_err(sync_folder_error)?
+                    .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-not-found")))?;
+                let binding = manager
+                    .registry()
+                    .local_root_binding(&library_uuid, &item.root_uuid)
+                    .map_err(sync_folder_error)?
+                    .ok_or_else(|| {
+                        sync_folder_error(anyhow::anyhow!("local-root-binding-not-found"))
+                    })?;
+                manager
+                    .ensure_selected_sync_root(
+                        &library_uuid,
+                        uuid::Uuid::parse_str(&item.root_uuid)
+                            .map_err(|error| sync_folder_error(error.into()))?,
+                        uuid::Uuid::parse_str(&descriptor.root_folder_uuid)
+                            .map_err(|error| sync_folder_error(error.into()))?,
+                        binding.local_path,
+                        descriptor.requested_name,
+                        descriptor.materialized_name,
+                        crate::sync::media::parse_hash(&descriptor.materialization_fingerprint)
+                            .map_err(sync_folder_error)?,
+                        uuid::Uuid::parse_str(&binding.local_binding_uuid)
+                            .map_err(|error| sync_folder_error(error.into()))?,
+                        uuid::Uuid::parse_str(
+                            binding
+                                .root_capture_epoch
+                                .as_deref()
+                                .unwrap_or(&binding.local_binding_uuid),
+                        )
+                        .map_err(|error| sync_folder_error(error.into()))?,
+                        uuid::Uuid::parse_str(
+                            binding
+                                .root_actor_epoch
+                                .as_deref()
+                                .unwrap_or(&binding.local_binding_uuid),
+                        )
+                        .map_err(|error| sync_folder_error(error.into()))?,
+                        binding.binding_generation,
+                        binding.state,
+                        binding.operation_revision,
+                        false,
+                    )
+                    .await
+                    .map_err(sync_folder_error)?;
+            }
+            let completed = completed_operations
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            return Ok((StatusCode::ACCEPTED,Json(serde_json::json!({"items":completed.iter().map(root_operation_json).collect::<Vec<_>>() }))).into_response());
+        }
+        if completed_operations.iter().any(Option::is_some) {
+            return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+        }
+        let result_items = plan_result
+            .get("items")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?;
+        let mut operations = Vec::new();
+        let mut evidences = Vec::new();
+        for item in request.items.iter().filter(|item| item.selected) {
+            let descriptor = manager
+                .registry()
+                .remote_sync_root(&library_uuid, &item.root_uuid)
+                .map_err(sync_folder_error)?
+                .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-not-found")))?;
+            let result = result_items
+                .iter()
+                .find(|value| {
+                    value.get("rootUuid").and_then(|value| value.as_str()) == Some(&item.root_uuid)
+                })
+                .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?;
+            let evidence: crate::sync_folders::ValidatedRootPath = serde_json::from_value(
+                result
+                    .get("pathEvidence")
+                    .cloned()
+                    .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?,
+            )
+            .map_err(|error| sync_folder_error(error.into()))?;
+            let binding_uuid = result
+                .get("bindingUuid")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?
+                .parse::<uuid::Uuid>()
+                .map_err(|error| sync_folder_error(error.into()))?;
+            let current = crate::sync_folders::validate_root_path(
+                FilePath::new(&item.path),
+                crate::sync_folders::RootPathMode::MaterializeRemote,
+                FilePath::new(&settings.default_placement_base),
+                &manager
+                    .registry()
+                    .local_root_bindings(&library_uuid)
+                    .map_err(sync_folder_error)?
+                    .iter()
+                    .map(|value| std::path::PathBuf::from(&value.local_path))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(sync_folder_error)?;
+            let expected_marker = crate::sync_folders::SyncRootMarker {
+                format_version: 1,
+                library_uuid: library_uuid.clone(),
+                root_uuid: item.root_uuid.clone(),
+                root_folder_uuid: descriptor.root_folder_uuid.clone(),
+                local_binding_uuid: binding_uuid.to_string(),
+                binding_generation: 1,
+            };
+            if !crate::sync_folders::preflight_evidence_still_matches(
+                &evidence,
+                &current,
+                Some(&expected_marker),
+            ) || descriptor.operation_revision != item.expected_operation_revision
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+            }
+            let request_value =
+                serde_json::to_value(item).map_err(|error| sync_folder_error(error.into()))?;
+            let request_hash =
+                crate::sync_folders::request_hash(&request_value).map_err(sync_folder_error)?;
+            evidences.push((
+                item,
+                descriptor,
+                current,
+                request_value,
+                request_hash,
+                binding_uuid,
+            ));
+        }
+        for (item, _, current, request_value, request_hash, _) in &evidences {
+            operations.push(crate::host_registry::PlannedRootOperation{operation_uuid:item.operation_uuid.clone(),root_uuid:item.root_uuid.clone(),kind:"select".to_owned(),phase:"preflighting".to_owned(),request_hash:request_hash.clone(),request:request_value.clone(),expected_operation_revision:item.expected_operation_revision,expected_binding_generation:item.expected_binding_generation,result:serde_json::json!({"preflightToken":request.preflight_token,"pathEvidence":current})});
+        }
+        manager
+            .registry()
+            .begin_root_operations_aggregate(&library_uuid, &request.preflight_token, &operations)
+            .map_err(sync_folder_error)?;
+        let mut owned = Vec::new();
+        let mut staged_markers: Vec<(
+            std::path::PathBuf,
+            crate::sync_folders::SyncRootMarker,
+            bool,
+        )> = Vec::new();
+        for (item, descriptor, current, _, _, binding_uuid) in &evidences {
+            let marker = crate::sync_folders::SyncRootMarker {
+                format_version: 1,
+                library_uuid: library_uuid.clone(),
+                root_uuid: item.root_uuid.clone(),
+                root_folder_uuid: descriptor.root_folder_uuid.clone(),
+                local_binding_uuid: binding_uuid.to_string(),
+                binding_generation: 1,
+            };
+            let marker_preexisted = FilePath::new(&current.normalized_path)
+                .join(crate::sync_folders::ROOT_MARKER_FILE_NAME)
+                .is_file();
+            if let Err(error) = crate::sync_folders::write_root_marker(
+                FilePath::new(&current.normalized_path),
+                &marker,
+            ) {
+                for (path, marker, remove_empty_directory) in staged_markers.iter().rev() {
+                    let _ = crate::sync_folders::remove_root_marker_if_matches(
+                        path,
+                        marker,
+                        *remove_empty_directory,
+                    );
+                }
+                return Err(sync_folder_error(error));
+            }
+            staged_markers.push((
+                std::path::PathBuf::from(&current.normalized_path),
+                marker,
+                !current.path_existed && !marker_preexisted,
+            ));
+            let marker_identity = match crate::library_path::local_file_identity(
+                &FilePath::new(&current.normalized_path)
+                    .join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    for (path, marker, remove_empty_directory) in staged_markers.iter().rev() {
+                        let _ = crate::sync_folders::remove_root_marker_if_matches(
+                            path,
+                            marker,
+                            *remove_empty_directory,
+                        );
+                    }
+                    return Err(sync_folder_error(error.into()));
+                }
+            };
+            owned.push((item, descriptor, current, *binding_uuid, marker_identity));
+        }
+        let mut bindings = Vec::new();
+        for (item, descriptor, current, binding_uuid, marker_identity) in &owned {
+            bindings.push(crate::host_registry::NewLocalRootBinding{library_uuid:library_uuid.clone(),root_uuid:item.root_uuid.clone(),local_binding_uuid:binding_uuid.to_string(),local_path:current.normalized_path.clone(),canonical_path_key:current.canonical_path_key.clone(),placement_parent:current.placement_parent.clone(),placement_parent_key:current.placement_parent_key.clone(),marker_identity:marker_identity.clone(),filesystem_identity:current.filesystem_identity.clone(),state:"materializing".to_owned(),binding_generation:1,root_capture_epoch:Some(uuid::Uuid::now_v7().to_string()),root_actor_epoch:Some(uuid::Uuid::now_v7().to_string()),desired_materialized_name:descriptor.materialized_name.clone(),desired_materialization_fingerprint:descriptor.materialization_fingerprint.clone(),operation_revision:item.expected_operation_revision+1,verification_json:serde_json::json!({"preflightToken":request.preflight_token,"pathEvidence":current})});
+        }
+        let deselections = request
+            .items
+            .iter()
+            .filter(|item| !item.selected)
+            .map(|item| (item.root_uuid.clone(), item.expected_operation_revision))
+            .collect::<Vec<_>>();
+        let completed = match manager.registry().complete_root_operations_aggregate(
+            &library_uuid,
+            &request.preflight_token,
+            &bindings,
+            &deselections,
+        ) {
+            Ok(completed) => completed,
+            Err(error) => {
+                for (path, marker, remove_empty_directory) in staged_markers.iter().rev() {
+                    let _ = crate::sync_folders::remove_root_marker_if_matches(
+                        path,
+                        marker,
+                        *remove_empty_directory,
+                    );
+                }
+                return Err(sync_folder_error(error));
+            }
+        };
+        for (_, descriptor, current, binding_uuid, _) in &owned {
+            let stored_binding = manager
+                .registry()
+                .local_root_binding(&library_uuid, &descriptor.root_uuid)
+                .map_err(sync_folder_error)?
+                .ok_or_else(|| {
+                    sync_folder_error(anyhow::anyhow!("local-root-binding-not-found"))
+                })?;
+            manager
+                .ensure_selected_sync_root(
+                    &library_uuid,
+                    uuid::Uuid::parse_str(&descriptor.root_uuid)
+                        .map_err(|error| sync_folder_error(error.into()))?,
+                    uuid::Uuid::parse_str(&descriptor.root_folder_uuid)
+                        .map_err(|error| sync_folder_error(error.into()))?,
+                    current.normalized_path.clone(),
+                    descriptor.requested_name.clone(),
+                    descriptor.materialized_name.clone(),
+                    crate::sync::media::parse_hash(&descriptor.materialization_fingerprint)
+                        .map_err(sync_folder_error)?,
+                    *binding_uuid,
+                    uuid::Uuid::parse_str(
+                        stored_binding
+                            .root_capture_epoch
+                            .as_deref()
+                            .unwrap_or(&stored_binding.local_binding_uuid),
+                    )
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                    uuid::Uuid::parse_str(
+                        stored_binding
+                            .root_actor_epoch
+                            .as_deref()
+                            .unwrap_or(&stored_binding.local_binding_uuid),
+                    )
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                    1,
+                    "materializing".to_owned(),
+                    descriptor.operation_revision + 1,
+                    false,
+                )
+                .await
+                .map_err(sync_folder_error)?;
+        }
+        manager
+            .registry()
+            .consume_root_path_preflight(&request.preflight_token, &library_uuid)
+            .map_err(sync_folder_error)?;
+        return Ok((StatusCode::ACCEPTED,Json(serde_json::json!({"items":completed.iter().map(root_operation_json).collect::<Vec<_>>() }))).into_response());
+    }
+    Err(CoreError::coded(
+        StatusCode::NOT_IMPLEMENTED,
+        "not-implemented",
+        "Synchronized-folder operation is owned by another task".to_owned(),
+    ))
 }
 
 async fn sync_folder_contract_root_read(
@@ -1831,7 +2908,26 @@ async fn sync_folder_contract_root_read(
 ) -> ApiResult<Response> {
     validate_contract_uuid(&root_uuid, "rootUuid")?;
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    let manager = sync_folder_library_manager(&state)?;
+    if let Some(root) = manager
+        .registry()
+        .remote_sync_root(&library_uuid, &root_uuid)
+        .map_err(sync_folder_error)?
+    {
+        let settings = manager
+            .registry()
+            .sync_folder_settings(&library_uuid)
+            .map_err(sync_folder_error)?;
+        return Ok(Json(
+            sync_folder_record_json(&manager, &root, &settings).map_err(sync_folder_error)?,
+        )
+        .into_response());
+    }
+    Err(CoreError::coded(
+        StatusCode::NOT_FOUND,
+        "root-not-found",
+        "Synchronized folder not found".to_owned(),
+    ))
 }
 
 async fn sync_folder_contract_root_write(
@@ -1847,7 +2943,7 @@ async fn sync_folder_contract_root_write(
     })?;
     validate_sync_folder_root_write_shape(uri.path(), &body)?;
     validate_sync_folder_mutation_body(&body, uri.path().contains("/rename/"))?;
-    if uri.path().ends_with("/reenable/preflight") {
+    if uri.path().ends_with("/reenable/preflight") || uri.path().ends_with("/stop/preflight") {
         require_sync_folder_binding_generation(&body, "re-enable comparison")?;
     }
     if uri.path().ends_with("/commit") || uri.path().ends_with("/relocations") {
@@ -1857,7 +2953,647 @@ async fn sync_folder_contract_root_write(
             .map_err(map_library_error)?;
     }
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    let manager = sync_folder_library_manager(&state)?;
+    if uri.path().contains("/rename/") || uri.path().contains("/relocations") {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "migration-required",
+            "Folder relocation and automatic rename are not installed".to_owned(),
+        ));
+    }
+    if uri.path().ends_with("/stop/preflight") {
+        let request: SyncFolderOperationFenceMutation = deserialize_sync_folder_body(&body)?;
+        let snapshot = manager
+            .sync_folder_snapshot(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let work = manager
+            .sync_folder_stop_work(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let plan = manager
+            .registry()
+            .create_stop_sync_plan(
+                &request.operation_uuid,
+                &library_uuid,
+                &root_uuid,
+                &crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?,
+                &body,
+                request.expected_operation_revision,
+                request.expected_binding_generation,
+                &snapshot,
+                &work,
+            )
+            .map_err(sync_folder_error)?;
+        return Ok(Json(plan).into_response());
+    }
+    if uri.path().ends_with("/stop/commit") {
+        let request: SyncFolderStopCommitMutation = deserialize_sync_folder_body(&body)?;
+        let binding = manager
+            .registry()
+            .local_root_binding(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("local-root-binding-not-found")))?;
+        let snapshot = manager
+            .sync_folder_snapshot(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let work = manager
+            .sync_folder_stop_work(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let planned_body = serde_json::json!({"operationUuid":request.operation_uuid,"expectedOperationRevision":request.expected_operation_revision,"expectedBindingGeneration":request.expected_binding_generation});
+        let operation = manager
+            .registry()
+            .commit_stop_sync(
+                &request.operation_uuid,
+                &request.plan_uuid,
+                &library_uuid,
+                &root_uuid,
+                &crate::sync_folders::request_hash(&planned_body).map_err(sync_folder_error)?,
+                &planned_body,
+                request.expected_operation_revision,
+                request.expected_binding_generation,
+                &snapshot,
+                &work,
+            )
+            .map_err(sync_folder_error)?;
+        let stopped = manager
+            .registry()
+            .local_root_binding(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("local-root-binding-not-found")))?;
+        manager
+            .fence_sync_root_local_only(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                uuid::Uuid::parse_str(&binding.local_binding_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                request.expected_binding_generation,
+                request.expected_binding_generation + 1,
+                uuid::Uuid::parse_str(
+                    stopped
+                        .root_capture_epoch
+                        .as_deref()
+                        .unwrap_or(&stopped.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                uuid::Uuid::parse_str(
+                    stopped
+                        .root_actor_epoch
+                        .as_deref()
+                        .unwrap_or(&stopped.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                binding.operation_revision + 1,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        manager.wake_sync_folder_workers();
+        return Ok((StatusCode::ACCEPTED, Json(root_operation_json(&operation))).into_response());
+    }
+    if uri.path().ends_with("/rebind/preflight") {
+        let request: SyncFolderRebindPreflightMutation = deserialize_sync_folder_body(&body)?;
+        let existing_binding = manager
+            .registry()
+            .local_root_binding(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?;
+        if existing_binding
+            .as_ref()
+            .is_some_and(|binding| binding.state == "local-only-fork")
+            || manager
+                .registry()
+                .root_has_cutover_lineage(&library_uuid, &root_uuid)
+                .map_err(sync_folder_error)?
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("comparison-required")));
+        }
+        if existing_binding.as_ref().is_some_and(|binding| {
+            !matches!(
+                binding.state.as_str(),
+                "materializing" | "unavailable" | "error"
+            )
+        }) {
+            return Err(sync_folder_error(anyhow::anyhow!("invalid-root-state")));
+        }
+        let settings = manager
+            .registry()
+            .sync_folder_settings(&library_uuid)
+            .map_err(sync_folder_error)?;
+        let existing = manager
+            .registry()
+            .local_root_bindings(&library_uuid)
+            .map_err(sync_folder_error)?
+            .into_iter()
+            .filter(|binding| binding.root_uuid != root_uuid)
+            .map(|binding| std::path::PathBuf::from(binding.local_path))
+            .collect::<Vec<_>>();
+        let validated = crate::sync_folders::validate_root_path(
+            FilePath::new(&request.path),
+            crate::sync_folders::RootPathMode::RebindExisting,
+            FilePath::new(&settings.default_placement_base),
+            &existing,
+        )
+        .map_err(sync_folder_error)?;
+        let marker =
+            crate::sync_folders::read_root_marker(FilePath::new(&validated.normalized_path))
+                .map_err(sync_folder_error)?;
+        if marker.library_uuid != library_uuid
+            || marker.root_uuid != root_uuid
+            || existing_binding.as_ref().is_some_and(|binding| {
+                marker.local_binding_uuid != binding.local_binding_uuid
+                    || marker.binding_generation != binding.binding_generation
+            })
+            || request.marker_identity
+                != crate::library_path::local_file_identity(
+                    &FilePath::new(&validated.normalized_path)
+                        .join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("marker-mismatch")));
+        }
+        if request.prior_cutover_snapshot_uuid != "00000000-0000-0000-0000-000000000000" {
+            let _ = manager
+                .registry()
+                .cutover_base_snapshot(&library_uuid, &root_uuid)
+                .map_err(|_| sync_folder_error(anyhow::anyhow!("comparison-required")))?;
+            return Err(sync_folder_error(anyhow::anyhow!("comparison-required")));
+        }
+        let descriptor = manager
+            .registry()
+            .remote_sync_root(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-not-found")))?;
+        let plan_uuid = request.operation_uuid.clone();
+        let expires_at = crate::host_registry::unix_timestamp_millis_for_runtime()
+            + crate::sync_folders::PLAN_TTL_MILLIS;
+        let next_generation = existing_binding
+            .as_ref()
+            .map(|binding| binding.binding_generation)
+            .unwrap_or(marker.binding_generation)
+            .saturating_add(1);
+        let plan = serde_json::json!({"planUuid":plan_uuid,"rootUuid":root_uuid,"path":validated.normalized_path,"markerMatches":true,"markerIdentity":request.marker_identity,"contentEvidenceDigest":validated.content_evidence_digest,"pathEvidence":validated,"remoteRevision":descriptor.operation_revision,"remoteMaterializationFingerprint":descriptor.materialization_fingerprint,"nextBindingUuid":uuid::Uuid::now_v7().to_string(),"nextBindingGeneration":next_generation,"expiresAt":expires_at});
+        let request_hash = crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
+        manager
+            .registry()
+            .begin_root_operation_once(
+                &request.operation_uuid,
+                &library_uuid,
+                &root_uuid,
+                "rebind",
+                "preflighting",
+                &request_hash,
+                &body,
+                request.expected_operation_revision,
+                request.expected_binding_generation,
+            )
+            .map_err(sync_folder_error)?;
+        manager
+            .registry()
+            .set_root_operation_plan(
+                &request.operation_uuid,
+                &plan_uuid,
+                &plan,
+                "verifying-existing",
+            )
+            .map_err(sync_folder_error)?;
+        return Ok(Json(plan).into_response());
+    }
+    if uri.path().ends_with("/rebind/commit") {
+        let request: SyncFolderRebindCommitMutation = deserialize_sync_folder_body(&body)?;
+        if let Some(operation) = manager
+            .registry()
+            .root_operation(&request.operation_uuid)
+            .map_err(sync_folder_error)?
+        {
+            if operation.library_uuid != library_uuid
+                || operation.root_uuid != root_uuid
+                || operation.kind != "rebind"
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("idempotency-key-reused")));
+            }
+        }
+        let plan = manager
+            .registry()
+            .root_operation_result(&request.operation_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?;
+        if plan.get("planUuid").and_then(|value| value.as_str()) != Some(&request.plan_uuid)
+            || plan
+                .get("expiresAt")
+                .and_then(|value| value.as_i64())
+                .is_none_or(|value| {
+                    value < crate::host_registry::unix_timestamp_millis_for_runtime()
+                })
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+        }
+        let descriptor = manager
+            .registry()
+            .remote_sync_root(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-not-found")))?;
+        let evidence: crate::sync_folders::ValidatedRootPath = serde_json::from_value(
+            plan.get("pathEvidence")
+                .cloned()
+                .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?,
+        )
+        .map_err(|error| sync_folder_error(error.into()))?;
+        let marker =
+            crate::sync_folders::read_root_marker(FilePath::new(&evidence.normalized_path))
+                .map_err(sync_folder_error)?;
+        let current_marker_identity = crate::library_path::local_file_identity(
+            &FilePath::new(&evidence.normalized_path)
+                .join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+        )
+        .map_err(|error| sync_folder_error(error.into()))?;
+        let binding_uuid = plan
+            .get("nextBindingUuid")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?
+            .parse::<uuid::Uuid>()
+            .map_err(|error| sync_folder_error(error.into()))?;
+        let generation = plan
+            .get("nextBindingGeneration")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?;
+        let marker_already_advanced = marker.binding_generation == generation
+            && marker.local_binding_uuid == binding_uuid.to_string();
+        if marker.library_uuid != library_uuid
+            || marker.root_uuid != root_uuid
+            || (!marker_already_advanced
+                && plan
+                    .get("markerIdentity")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(current_marker_identity.as_str()))
+            || plan
+                .get("remoteRevision")
+                .and_then(serde_json::Value::as_u64)
+                != Some(descriptor.operation_revision)
+            || plan
+                .get("remoteMaterializationFingerprint")
+                .and_then(serde_json::Value::as_str)
+                != Some(descriptor.materialization_fingerprint.as_str())
+            || crate::sync_folders::directory_evidence_digest(FilePath::new(
+                &evidence.normalized_path,
+            ))
+            .map_err(sync_folder_error)?
+                != evidence.content_evidence_digest
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+        }
+        if marker.binding_generation != generation.saturating_sub(1)
+            && (marker.binding_generation != generation
+                || marker.local_binding_uuid != binding_uuid.to_string())
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+        }
+        let original_marker = marker.clone();
+        let marker_advanced = marker.binding_generation != generation;
+        if marker_advanced {
+            let next_marker = crate::sync_folders::SyncRootMarker {
+                local_binding_uuid: binding_uuid.to_string(),
+                binding_generation: generation,
+                ..marker
+            };
+            crate::sync_folders::replace_root_marker(
+                FilePath::new(&evidence.normalized_path),
+                &next_marker,
+            )
+            .map_err(sync_folder_error)?;
+        }
+        let marker_identity = match crate::library_path::local_file_identity(
+            &FilePath::new(&evidence.normalized_path)
+                .join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                if marker_advanced {
+                    let _ = crate::sync_folders::replace_root_marker(
+                        FilePath::new(&evidence.normalized_path),
+                        &original_marker,
+                    );
+                }
+                return Err(sync_folder_error(error.into()));
+            }
+        };
+        let binding = crate::host_registry::NewLocalRootBinding {
+            library_uuid: library_uuid.clone(),
+            root_uuid: root_uuid.clone(),
+            local_binding_uuid: binding_uuid.to_string(),
+            local_path: evidence.normalized_path.clone(),
+            canonical_path_key: evidence.canonical_path_key.clone(),
+            placement_parent: evidence.placement_parent.clone(),
+            placement_parent_key: evidence.placement_parent_key.clone(),
+            marker_identity,
+            filesystem_identity: evidence.filesystem_identity.clone(),
+            state: "materializing".to_owned(),
+            binding_generation: generation,
+            root_capture_epoch: Some(uuid::Uuid::now_v7().to_string()),
+            root_actor_epoch: Some(uuid::Uuid::now_v7().to_string()),
+            desired_materialized_name: descriptor.materialized_name.clone(),
+            desired_materialization_fingerprint: descriptor.materialization_fingerprint.clone(),
+            operation_revision: request.expected_operation_revision + 1,
+            verification_json: plan,
+        };
+        let stored = match manager.registry().commit_local_root_binding(
+            &request.operation_uuid,
+            &request.plan_uuid,
+            &binding,
+        ) {
+            Ok(stored) => stored,
+            Err(error) => {
+                if marker_advanced {
+                    let _ = crate::sync_folders::replace_root_marker(
+                        FilePath::new(&evidence.normalized_path),
+                        &original_marker,
+                    );
+                }
+                return Err(sync_folder_error(error));
+            }
+        };
+        manager
+            .ensure_selected_sync_root(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                uuid::Uuid::parse_str(&descriptor.root_folder_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                evidence.normalized_path,
+                descriptor.requested_name,
+                descriptor.materialized_name,
+                crate::sync::media::parse_hash(&descriptor.materialization_fingerprint)
+                    .map_err(sync_folder_error)?,
+                binding_uuid,
+                uuid::Uuid::parse_str(
+                    stored
+                        .root_capture_epoch
+                        .as_deref()
+                        .unwrap_or(&stored.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                uuid::Uuid::parse_str(
+                    stored
+                        .root_actor_epoch
+                        .as_deref()
+                        .unwrap_or(&stored.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                stored.binding_generation,
+                stored.state,
+                stored.operation_revision,
+                false,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        manager.wake_sync_folder_workers();
+        let operation = manager
+            .registry()
+            .root_operation(&request.operation_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-operation-not-found")))?;
+        return Ok((StatusCode::ACCEPTED, Json(root_operation_json(&operation))).into_response());
+    }
+    if uri.path().ends_with("/reenable/preflight") {
+        let request: SyncFolderOperationFenceMutation = deserialize_sync_folder_body(&body)?;
+        let (cutover_uuid, base, sealed_generation) = manager
+            .registry()
+            .cutover_base_snapshot(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?;
+        if request.expected_binding_generation <= sealed_generation {
+            return Err(sync_folder_error(anyhow::anyhow!(
+                "stale-binding-generation"
+            )));
+        }
+        let local = manager
+            .sync_folder_snapshot(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let (remote, _) = manager
+            .current_remote_root_snapshot(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let differences = crate::sync_folders::compare_snapshots(&base, &local, &remote);
+        let generations = manager
+            .registry()
+            .sync_transport_generations(&library_uuid)
+            .map_err(sync_folder_error)?;
+        let plan = manager
+            .registry()
+            .create_comparison_plan(
+                &request.operation_uuid,
+                &library_uuid,
+                &root_uuid,
+                &crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?,
+                &body,
+                request.expected_operation_revision,
+                request.expected_binding_generation,
+                &cutover_uuid,
+                &base,
+                &local,
+                &remote,
+                &differences,
+                generations.0,
+                generations.1,
+            )
+            .map_err(sync_folder_error)?;
+        return Ok(Json(plan).into_response());
+    }
+    if uri.path().ends_with("/reenable/commit") {
+        let request: SyncFolderReenableMutation = deserialize_sync_folder_body(&body)?;
+        if let Some(publish) = manager
+            .registry()
+            .publish_as_new(&request.operation_uuid)
+            .map_err(sync_folder_error)?
+        {
+            let completed = manager
+                .recover_publish_as_new(&request.operation_uuid)
+                .await
+                .map_err(sync_folder_error)?;
+            let mut response = root_operation_json(&completed);
+            response["newRootUuid"] = serde_json::json!(publish.new_root_uuid);
+            response["newRootFolderUuid"] = serde_json::json!(publish.new_root_folder_uuid);
+            response["enrollmentOperationUuid"] =
+                serde_json::json!(publish.enrollment_operation_uuid);
+            return Ok((StatusCode::ACCEPTED, Json(response)).into_response());
+        }
+        let _plan = manager
+            .registry()
+            .root_comparison_plan(&library_uuid, &root_uuid, &request.plan_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("comparison-plan-not-found")))?;
+        let local = manager
+            .sync_folder_snapshot(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let (remote, _) = manager
+            .current_remote_root_snapshot(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let generations = manager
+            .registry()
+            .sync_transport_generations(&library_uuid)
+            .map_err(sync_folder_error)?;
+        let mode = match request.mode {
+            SyncFolderComparisonMode::MergeLocalFork => "merge-local-fork",
+            SyncFolderComparisonMode::PublishAsNew => "publish-as-new",
+        };
+        if mode == "publish-as-new" {
+            let (operation, publish) = manager
+                .registry()
+                .commit_publish_as_new(
+                    &request.operation_uuid,
+                    &library_uuid,
+                    &root_uuid,
+                    &request.plan_uuid,
+                    request.expected_operation_revision,
+                    request.expected_binding_generation,
+                    &local.digest,
+                    &remote.digest,
+                    generations.0,
+                    generations.1,
+                )
+                .map_err(sync_folder_error)?;
+            let completed = manager
+                .recover_publish_as_new(&request.operation_uuid)
+                .await
+                .map_err(sync_folder_error)?;
+            let mut response = root_operation_json(&completed);
+            response["newRootUuid"] = serde_json::json!(publish.new_root_uuid);
+            response["newRootFolderUuid"] = serde_json::json!(publish.new_root_folder_uuid);
+            response["enrollmentOperationUuid"] =
+                serde_json::json!(publish.enrollment_operation_uuid);
+            let _ = operation;
+            return Ok((StatusCode::ACCEPTED, Json(response)).into_response());
+        }
+        let (operation, binding) = manager
+            .registry()
+            .commit_reenable(
+                &request.operation_uuid,
+                &library_uuid,
+                &root_uuid,
+                &request.plan_uuid,
+                request.expected_operation_revision,
+                request.expected_binding_generation,
+                &local.digest,
+                &remote.digest,
+                generations.0,
+                generations.1,
+                mode,
+            )
+            .map_err(sync_folder_error)?;
+        let descriptor = manager
+            .registry()
+            .remote_sync_root(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-not-found")))?;
+        let marker = crate::sync_folders::read_root_marker(FilePath::new(&binding.local_path))
+            .map_err(sync_folder_error)?;
+        let binding_uuid = uuid::Uuid::parse_str(&binding.local_binding_uuid)
+            .map_err(|error| sync_folder_error(error.into()))?;
+        crate::sync_folders::replace_root_marker(
+            FilePath::new(&binding.local_path),
+            &crate::sync_folders::SyncRootMarker {
+                local_binding_uuid: binding.local_binding_uuid.clone(),
+                binding_generation: binding.binding_generation,
+                ..marker
+            },
+        )
+        .map_err(sync_folder_error)?;
+        let marker_identity = crate::library_path::local_file_identity(
+            &FilePath::new(&binding.local_path).join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+        )
+        .map_err(|error| sync_folder_error(error.into()))?;
+        manager
+            .registry()
+            .update_local_root_marker_identity(
+                &library_uuid,
+                &root_uuid,
+                &binding.local_binding_uuid,
+                binding.binding_generation,
+                &marker_identity,
+            )
+            .map_err(sync_folder_error)?;
+        manager
+            .ensure_selected_sync_root(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                uuid::Uuid::parse_str(&descriptor.root_folder_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                binding.local_path.clone(),
+                descriptor.requested_name,
+                descriptor.materialized_name,
+                crate::sync::media::parse_hash(&descriptor.materialization_fingerprint)
+                    .map_err(sync_folder_error)?,
+                binding_uuid,
+                uuid::Uuid::parse_str(
+                    binding
+                        .root_capture_epoch
+                        .as_deref()
+                        .unwrap_or(&binding.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                uuid::Uuid::parse_str(
+                    binding
+                        .root_actor_epoch
+                        .as_deref()
+                        .unwrap_or(&binding.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                binding.binding_generation,
+                binding.state,
+                binding.operation_revision,
+                false,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let completed = manager
+            .recover_root_reconciliation(&library_uuid, &root_uuid)
+            .await
+            .map_err(sync_folder_error)?
+            .unwrap_or(operation);
+        return Ok((StatusCode::ACCEPTED, Json(root_operation_json(&completed))).into_response());
+    }
+    Err(CoreError::coded(
+        StatusCode::NOT_IMPLEMENTED,
+        "not-implemented",
+        "Synchronized-folder operation is owned by another task".to_owned(),
+    ))
 }
 
 async fn sync_folder_contract_root_action(
@@ -1885,7 +3621,164 @@ async fn sync_folder_contract_root_action(
         .ensure_context_revision(expected)
         .map_err(map_library_error)?;
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    let manager = sync_folder_library_manager(&state)?;
+    let request: SyncFolderOperationFenceMutation = deserialize_sync_folder_body(&body)?;
+    let request_hash = crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
+    let operation = if command == "stop-sync" {
+        let binding = manager
+            .registry()
+            .local_root_binding(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("local-root-binding-not-found")))?;
+        let snapshot = manager
+            .sync_folder_snapshot(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let work = manager
+            .sync_folder_stop_work(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let plan = manager
+            .registry()
+            .create_stop_sync_plan(
+                &request.operation_uuid,
+                &library_uuid,
+                &root_uuid,
+                &request_hash,
+                &body,
+                request.expected_operation_revision,
+                request.expected_binding_generation,
+                &snapshot,
+                &work,
+            )
+            .map_err(sync_folder_error)?;
+        let operation = manager
+            .registry()
+            .commit_stop_sync(
+                &request.operation_uuid,
+                &plan.plan_uuid,
+                &library_uuid,
+                &root_uuid,
+                &request_hash,
+                &body,
+                request.expected_operation_revision,
+                request.expected_binding_generation,
+                &snapshot,
+                &work,
+            )
+            .map_err(sync_folder_error)?;
+        let stopped = manager
+            .registry()
+            .local_root_binding(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("local-root-binding-not-found")))?;
+        manager
+            .fence_sync_root_local_only(
+                &library_uuid,
+                uuid::Uuid::parse_str(&root_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                uuid::Uuid::parse_str(&binding.local_binding_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?,
+                request.expected_binding_generation,
+                request.expected_binding_generation + 1,
+                uuid::Uuid::parse_str(
+                    stopped
+                        .root_capture_epoch
+                        .as_deref()
+                        .unwrap_or(&stopped.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                uuid::Uuid::parse_str(
+                    stopped
+                        .root_actor_epoch
+                        .as_deref()
+                        .unwrap_or(&stopped.local_binding_uuid),
+                )
+                .map_err(|error| sync_folder_error(error.into()))?,
+                binding.operation_revision + 1,
+            )
+            .await
+            .map_err(sync_folder_error)?;
+        let updated = manager
+            .registry()
+            .local_root_binding(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("local-root-binding-not-found")))?;
+        if FilePath::new(&updated.local_path)
+            .join(crate::sync_folders::ROOT_MARKER_FILE_NAME)
+            .is_file()
+        {
+            let marker = crate::sync_folders::read_root_marker(FilePath::new(&updated.local_path))
+                .map_err(sync_folder_error)?;
+            crate::sync_folders::replace_root_marker(
+                FilePath::new(&updated.local_path),
+                &crate::sync_folders::SyncRootMarker {
+                    binding_generation: updated.binding_generation,
+                    ..marker
+                },
+            )
+            .map_err(sync_folder_error)?;
+            let marker_identity = crate::library_path::local_file_identity(
+                &FilePath::new(&updated.local_path)
+                    .join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+            )
+            .map_err(|error| sync_folder_error(error.into()))?;
+            manager
+                .registry()
+                .update_local_root_marker_identity(
+                    &library_uuid,
+                    &root_uuid,
+                    &updated.local_binding_uuid,
+                    updated.binding_generation,
+                    &marker_identity,
+                )
+                .map_err(sync_folder_error)?;
+        }
+        operation
+    } else {
+        let operation = manager
+            .registry()
+            .set_root_binding_state(
+                &request.operation_uuid,
+                &library_uuid,
+                &root_uuid,
+                &command,
+                &request_hash,
+                &body,
+                request.expected_operation_revision,
+                request.expected_binding_generation,
+            )
+            .map_err(sync_folder_error)?;
+        let binding = manager
+            .registry()
+            .local_root_binding(&library_uuid, &root_uuid)
+            .map_err(sync_folder_error)?
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("local-root-binding-not-found")))?;
+        let root_uuid_parsed =
+            uuid::Uuid::parse_str(&root_uuid).map_err(|error| sync_folder_error(error.into()))?;
+        manager
+            .write_sync_folder_catalog(&library_uuid, move |database| {
+                let mut projected = database
+                    .sync_root_local_binding(root_uuid_parsed.as_bytes())?
+                    .ok_or_else(|| anyhow::anyhow!("local-root-binding-not-found"))?;
+                projected.state = binding.state;
+                projected.operation_revision = binding.operation_revision;
+                projected.updated_at = crate::host_registry::unix_timestamp_millis_for_runtime();
+                database.upsert_sync_root_local_binding(&projected)
+            })
+            .await
+            .map_err(sync_folder_error)?;
+        operation
+    };
+    Ok((StatusCode::ACCEPTED, Json(root_operation_json(&operation))).into_response())
 }
 
 async fn sync_folder_contract_operation_read(
@@ -1895,22 +3788,63 @@ async fn sync_folder_contract_operation_read(
     validate_contract_uuid(&root_uuid, "rootUuid")?;
     validate_contract_uuid(&operation_uuid, "operationUuid")?;
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    let manager = sync_folder_library_manager(&state)?;
+    let operation = manager
+        .registry()
+        .root_operation(&operation_uuid)
+        .map_err(sync_folder_error)?
+        .filter(|operation| {
+            operation.library_uuid == library_uuid && operation.root_uuid == root_uuid
+        })
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::NOT_FOUND,
+                "operation-not-found",
+                "Root operation not found".to_owned(),
+            )
+        })?;
+    Ok(Json(root_operation_json(&operation)).into_response())
 }
 
 async fn sync_folder_contract_plan_read(
     State(state): State<AppState>,
     Path((library_uuid, root_uuid, plan_uuid)): Path<(String, String, String)>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<SyncFolderComparisonItemsQuery>,
 ) -> ApiResult<Response> {
     validate_contract_uuid(&root_uuid, "rootUuid")?;
     validate_contract_uuid(&plan_uuid, "planUuid")?;
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    let manager = sync_folder_library_manager(&state)?;
+    if uri.path().ends_with("/items") {
+        let cursor = query.cursor.unwrap_or(0);
+        let limit = query.limit.unwrap_or(200).clamp(1, 500);
+        let items = manager
+            .registry()
+            .root_comparison_items(&library_uuid, &root_uuid, &plan_uuid, cursor, limit)
+            .map_err(sync_folder_error)?;
+        let next = (items.len() == limit as usize)
+            .then(|| items.last().map(|item| item.item_ordinal.saturating_add(1)))
+            .flatten();
+        return Ok(Json(serde_json::json!({"items":items,"nextCursor":next})).into_response());
+    }
+    let plan = manager
+        .registry()
+        .root_comparison_plan(&library_uuid, &root_uuid, &plan_uuid)
+        .map_err(sync_folder_error)?
+        .ok_or_else(|| {
+            CoreError::coded(
+                StatusCode::NOT_FOUND,
+                "operation-not-found",
+                "Comparison plan not found".to_owned(),
+            )
+        })?;
+    Ok(Json(plan).into_response())
 }
 
 async fn sync_folder_contract_comparison_item_write(
     State(state): State<AppState>,
-    Path((library_uuid, root_uuid, plan_uuid, _item_ordinal)): Path<(String, String, String, u64)>,
+    Path((library_uuid, root_uuid, plan_uuid, item_ordinal)): Path<(String, String, String, u64)>,
     headers: HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> ApiResult<Response> {
@@ -1927,7 +3861,26 @@ async fn sync_folder_contract_comparison_item_write(
         .ensure_context_revision(expected)
         .map_err(map_library_error)?;
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    let request: SyncFolderComparisonResolutionMutation = deserialize_sync_folder_body(&body)?;
+    let resolution = match request.resolution {
+        SyncFolderComparisonResolution::KeepLocal => "keep-local",
+        SyncFolderComparisonResolution::KeepRemote => "keep-remote",
+        SyncFolderComparisonResolution::KeepBoth => "keep-both",
+    };
+    let item = sync_folder_library_manager(&state)?
+        .registry()
+        .resolve_comparison_item(
+            &library_uuid,
+            &root_uuid,
+            &plan_uuid,
+            item_ordinal,
+            &request.operation_uuid,
+            resolution,
+            request.expected_operation_revision,
+            request.expected_binding_generation,
+        )
+        .map_err(sync_folder_error)?;
+    Ok(Json(item).into_response())
 }
 
 async fn sync_folder_contract_operation_action(
@@ -1967,7 +3920,11 @@ async fn sync_folder_contract_operation_action(
         .ensure_context_revision(expected)
         .map_err(map_library_error)?;
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    Err(CoreError::coded(
+        StatusCode::CONFLICT,
+        "migration-required",
+        "Relocation orchestration is not installed".to_owned(),
+    ))
 }
 
 async fn sync_folder_contract_conflict_write(
@@ -1995,7 +3952,11 @@ async fn sync_folder_contract_conflict_write(
         .ensure_context_revision(expected)
         .map_err(map_library_error)?;
     sync_folder_v2_gate(&state, &library_uuid)?;
-    unreachable!("managed-root-v2 feature gate must remain closed in this contract task")
+    Err(CoreError::coded(
+        StatusCode::CONFLICT,
+        "migration-required",
+        "Root conflict resolution is not installed".to_owned(),
+    ))
 }
 
 fn library_summary(
@@ -9169,7 +11130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_folder_v2_contract_rejects_invalid_uuid_and_remains_migration_gated() {
+    async fn sync_folder_v2_contract_rejects_invalid_uuid_and_keeps_deferred_children_gated() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
@@ -9204,7 +11165,7 @@ mod tests {
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 
-        let gated = app
+        let listed = app
             .clone()
             .oneshot(
                 Request::builder()
@@ -9215,12 +11176,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(gated.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(gated.into_body(), usize::MAX)
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["code"], "migration-required");
+        assert!(json["items"].is_array());
 
         let stale_rename_heads = app
             .clone()

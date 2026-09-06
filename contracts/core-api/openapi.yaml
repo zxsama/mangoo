@@ -447,6 +447,28 @@ paths:
         "404": { $ref: "#/components/responses/SyncFolderNotFound" }
         "409": { $ref: "#/components/responses/SyncFolderConflict" }
         "500": { $ref: "#/components/responses/SyncFolderFailure" }
+  /libraries/{libraryUuid}/sync-folders/{rootUuid}/stop/preflight:
+    post:
+      operationId: preflightSyncFolderStop
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/rootUuid" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/RootOperationFenceRequest" } } } }
+      responses:
+        "200": { description: Persisted root stop plan., content: { application/json: { schema: { $ref: "#/components/schemas/RootStopPlan" } } } }
+        "400": { $ref: "#/components/responses/SyncFolderBadRequest" }
+        "404": { $ref: "#/components/responses/SyncFolderNotFound" }
+        "409": { $ref: "#/components/responses/SyncFolderConflict" }
+        "500": { $ref: "#/components/responses/SyncFolderFailure" }
+  /libraries/{libraryUuid}/sync-folders/{rootUuid}/stop/commit:
+    post:
+      operationId: commitSyncFolderStop
+      parameters: [{ $ref: "#/components/parameters/libraryUuid" }, { $ref: "#/components/parameters/rootUuid" }, { $ref: "#/components/parameters/contextRevision" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/RootStopCommitRequest" } } } }
+      responses:
+        "202": { description: Root stop operation accepted., content: { application/json: { schema: { $ref: "#/components/schemas/RootOperation" } } } }
+        "400": { $ref: "#/components/responses/SyncFolderBadRequest" }
+        "404": { $ref: "#/components/responses/SyncFolderNotFound" }
+        "409": { $ref: "#/components/responses/SyncFolderConflict" }
+        "500": { $ref: "#/components/responses/SyncFolderFailure" }
   /libraries/{libraryUuid}/sync-folders/{rootUuid}/reenable/preflight:
     post:
       operationId: preflightSyncFolderReenable
@@ -2488,6 +2510,33 @@ components:
         operationUuid: { type: string, format: uuid }
         expectedOperationRevision: { type: integer, minimum: 0 }
         expectedBindingGeneration: { type: integer, minimum: 1 }
+    RootStopCommitRequest:
+      type: object
+      required: [operationUuid, expectedOperationRevision, expectedBindingGeneration, planUuid]
+      additionalProperties: false
+      properties:
+        operationUuid: { type: string, format: uuid }
+        expectedOperationRevision: { type: integer, minimum: 0 }
+        expectedBindingGeneration: { type: integer, minimum: 1 }
+        planUuid: { type: string, format: uuid }
+    RootStopPlan:
+      type: object
+      required: [planUuid, operationUuid, rootUuid, localBindingUuid, bindingGeneration, rootCaptureEpoch, rootActorEpoch, pendingWork, publishedWork, eventFrontier, catalogSnapshotDigest, providerReceipts, expiresAt]
+      properties:
+        planUuid: { type: string, format: uuid }
+        operationUuid: { type: string, format: uuid }
+        rootUuid: { type: string, format: uuid }
+        localBindingUuid: { type: string, format: uuid }
+        bindingGeneration: { type: integer, minimum: 1 }
+        rootCaptureEpoch: { type: string, format: uuid }
+        rootActorEpoch: { type: string, format: uuid }
+        pendingWork: { type: integer, minimum: 0 }
+        publishedWork: { type: integer, minimum: 0 }
+        checkpointUuid: { anyOf: [{ type: string, format: uuid }, { type: "null" }] }
+        eventFrontier: { type: object, additionalProperties: true }
+        catalogSnapshotDigest: { type: string, minLength: 64, maxLength: 64 }
+        providerReceipts: { type: array, items: { type: object, additionalProperties: true } }
+        expiresAt: { type: integer }
     RootComparisonPlan:
       type: object
       required: [planUuid, operationUuid, rootUuid, baseDigest, localDigest, remoteDigest, baseFrontier, localFrontier, remoteFrontier, rootRevision, accountGeneration, providerGeneration, status, itemCount, conflictCount, chosenMode, expiresAt]

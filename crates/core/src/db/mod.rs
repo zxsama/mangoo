@@ -1554,6 +1554,10 @@ impl Database {
             self.connection
                 .execute_batch(migrations::SYNC_ROOT_GENERATION_FENCE_MIGRATION)?;
         }
+        if !self.migration_applied(32)? {
+            self.connection
+                .execute_batch(migrations::SYNC_ROOT_RECONCILIATION_MIGRATION)?;
+        }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
         Ok(())

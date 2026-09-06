@@ -41,6 +41,16 @@ pub struct SyncRootTruth {
 pub struct ContentRevision {
     pub revision_uuid: RevisionUuid,
     pub manifest_id: String,
+    #[serde(default)]
+    pub manifest_pack_id: Option<String>,
+    #[serde(default)]
+    pub manifest_offset: Option<u64>,
+    #[serde(default)]
+    pub manifest_length: Option<u64>,
+    #[serde(default)]
+    pub byte_length: Option<u64>,
+    #[serde(default)]
+    pub source_mtime_ms: Option<i64>,
     pub version: Version,
 }
 
@@ -192,11 +202,11 @@ impl ProtocolState {
                 revision_uuid,
                 manifest_id,
                 supersedes,
-                manifest_pack_id: _,
-                manifest_offset: _,
-                manifest_length: _,
-                byte_length: _,
-                source_mtime_ms: _,
+                manifest_pack_id,
+                manifest_offset,
+                manifest_length,
+                byte_length,
+                source_mtime_ms,
             } => {
                 entity.content_superseded.extend(supersedes);
                 entity.content_heads = entity
@@ -210,6 +220,11 @@ impl ProtocolState {
                     .or_insert_with(|| ContentRevision {
                         revision_uuid: *revision_uuid,
                         manifest_id: manifest_id.clone(),
+                        manifest_pack_id: manifest_pack_id.clone(),
+                        manifest_offset: *manifest_offset,
+                        manifest_length: *manifest_length,
+                        byte_length: *byte_length,
+                        source_mtime_ms: *source_mtime_ms,
                         version,
                     });
                 if !entity.content_superseded.contains(revision_uuid) {

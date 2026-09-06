@@ -191,6 +191,67 @@ pub fn build_checkpoint(
     Ok(final_path)
 }
 
+/// Captures the same canonical protocol truth used by checkpoints without
+/// writing a checkpoint file. Re-enable comparison uses this boundary so it
+/// never falls back to filesystem mtimes or other projection-only metadata.
+pub fn capture_protocol_state(
+    connection: &Connection,
+) -> anyhow::Result<(ProtocolState, StreamVector)> {
+    let library = connection.query_row(
+        "SELECT library_uuid FROM sync_local_state WHERE singleton=1",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let library = LibraryUuid(uuid::Uuid::from_slice(&library)?);
+    let mut state = ProtocolState::default();
+    let mut events = Vec::new();
+    let mut statement = connection.prepare("SELECT payload FROM sync_events ORDER BY rowid")?;
+    for payload in statement.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
+        let payload = payload?;
+        let event = decode_event(&payload)?;
+        state.apply(&event);
+        events.push(event);
+    }
+    drop(statement);
+    capture_root_truth(connection, &mut state)?;
+    let projection = capture_projection(connection)?;
+    for event in bootstrap_projection_events(library, &projection, &state)? {
+        if !state.applied_events.contains(&event.event_uuid) {
+            state.apply(&event);
+            events.push(event);
+        }
+    }
+    let mut vector = StreamVector::new();
+    let mut statement = connection.prepare(
+        "SELECT device_uuid,stream_uuid,actor_epoch,applied_through_seq FROM sync_actor_frontiers ORDER BY device_uuid,stream_uuid,actor_epoch",
+    )?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })? {
+        let (device, stream, epoch, sequence) = row?;
+        vector.insert(
+            ActorId {
+                device_uuid: DeviceUuid(uuid::Uuid::from_slice(&device)?),
+                stream_uuid: StreamUuid(uuid::Uuid::from_slice(&stream)?),
+                actor_epoch: ActorEpochUuid(uuid::Uuid::from_slice(&epoch)?),
+            },
+            sequence.max(0) as u64,
+        );
+    }
+    for event in events {
+        vector
+            .entry(event.actor)
+            .and_modify(|sequence| *sequence = (*sequence).max(event.actor_seq))
+            .or_insert(event.actor_seq);
+    }
+    Ok((state, vector))
+}
+
 const RECOVERY_TABLES: &[&str] = &[
     "sync_conflicts",
     "sync_bulk_operations",
@@ -1699,6 +1760,8 @@ mod tests {
                 library_uuid: *uuid::Uuid::from_slice(&library).unwrap().as_bytes(),
                 local_binding_uuid: *binding_uuid.as_bytes(),
                 binding_generation: 3,
+                root_capture_epoch: [70; 16],
+                root_actor_epoch: [71; 16],
                 state: "active".to_owned(),
                 root_id,
                 operation_revision: 1,
