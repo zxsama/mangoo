@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -206,6 +207,7 @@ pub struct LibraryManager {
     active: Arc<RwLock<ActiveSnapshot>>,
     request_gate: Arc<tokio::sync::RwLock<()>>,
     operation: AsyncMutex<()>,
+    root_relocation_operations: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     runtime_generation: AtomicU64,
     libraries_dir: PathBuf,
     bundled_plugins_dir: PathBuf,
@@ -213,6 +215,7 @@ pub struct LibraryManager {
     runtime_leases: RuntimeLeases,
     sync_coordinator: crate::sync::coordinator::SyncCoordinator,
     sync_scheduler: Mutex<Option<crate::sync::coordinator::SyncSchedulerHandle>>,
+    root_relocation_scheduler: Mutex<Option<(CancellationToken, tokio::task::JoinHandle<()>)>>,
     plugin_runtime_scheduler: Mutex<Option<PluginRuntimeSchedulerHandle>>,
 }
 
@@ -230,6 +233,16 @@ enum PluginRuntimeCommand {
 }
 
 impl LibraryManager {
+    fn root_relocation_operation_lock(&self, root_uuid: &str) -> Arc<AsyncMutex<()>> {
+        Arc::clone(
+            self.root_relocation_operations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(root_uuid.to_owned())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+
     pub fn host_registry(&self) -> &Arc<HostRegistry> {
         &self.registry
     }
@@ -364,6 +377,117 @@ impl LibraryManager {
                 actionable.push(root_uuid);
             }
         }
+        for (binding, descriptor) in self.registry.pending_automatic_root_renames(library_uuid)? {
+            let target = Path::new(&binding.placement_parent).join(&descriptor.materialized_name);
+            let operation_uuid = Uuid::now_v7().to_string();
+            let resume_state = if binding.state == "paused" {
+                "paused"
+            } else {
+                "active"
+            };
+            let mut request = serde_json::json!({
+                "operationUuid": operation_uuid,
+                "expectedOperationRevision": binding.operation_revision,
+                "expectedBindingGeneration": binding.binding_generation,
+                "mode": "automatic-rename",
+                "targetPath": target.to_string_lossy(),
+                "desiredMaterializationFingerprint": descriptor.materialization_fingerprint,
+                "localBindingUuid": binding.local_binding_uuid,
+                "resumeState": resume_state,
+            });
+            let marker = crate::sync_folders::SyncRootMarker {
+                format_version: 1,
+                library_uuid: library_uuid.to_owned(),
+                root_uuid: descriptor.root_uuid.clone(),
+                root_folder_uuid: descriptor.root_folder_uuid.clone(),
+                local_binding_uuid: binding.local_binding_uuid.clone(),
+                binding_generation: binding.binding_generation,
+            };
+            let other_paths = self
+                .registry
+                .local_root_bindings(library_uuid)?
+                .into_iter()
+                .filter(|candidate| candidate.root_uuid != descriptor.root_uuid)
+                .map(|candidate| PathBuf::from(candidate.local_path))
+                .collect::<Vec<_>>();
+            let source = PathBuf::from(&binding.local_path);
+            let placement_base = PathBuf::from(
+                self.registry
+                    .sync_folder_settings(library_uuid)?
+                    .default_placement_base,
+            );
+            let target_for_preflight = target.clone();
+            let marker_for_preflight = marker.clone();
+            let evidence = match tokio::task::spawn_blocking(move || {
+                crate::sync_folders::validate_relocation_paths(
+                    &source,
+                    &target_for_preflight,
+                    &placement_base,
+                    &other_paths,
+                    &marker_for_preflight,
+                )
+            })
+            .await
+            .context("automatic rename preflight task failed")?
+            {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    tracing::warn!(root_uuid=%descriptor.root_uuid,%error,"automatic synchronized-folder rename preflight failed");
+                    let retry_source = PathBuf::from(&binding.local_path);
+                    let retry_target = target.clone();
+                    let retry_marker = marker.clone();
+                    if let Ok(Ok(retry_evidence)) = tokio::task::spawn_blocking(move || {
+                        crate::sync_folders::capture_relocation_retry_evidence(
+                            &retry_source,
+                            &retry_target,
+                            &retry_marker,
+                        )
+                    })
+                    .await
+                    {
+                        request["pathEvidence"] = serde_json::to_value(retry_evidence)?;
+                    }
+                    let request_hash = crate::sync_folders::request_hash(&request)?;
+                    self.registry
+                        .record_automatic_root_rename_preflight_failure(
+                            request["operationUuid"].as_str().expect("operation UUID"),
+                            library_uuid,
+                            &descriptor.root_uuid,
+                            &request_hash,
+                            &request,
+                            binding.operation_revision,
+                            binding.binding_generation,
+                            &descriptor.materialization_fingerprint,
+                            &target,
+                        )?;
+                    continue;
+                }
+            };
+            let evidence_for_request = evidence.clone();
+            request["targetPath"] = serde_json::json!(evidence.target_path);
+            request["pathEvidence"] = serde_json::to_value(evidence_for_request)?;
+            let request_hash = crate::sync_folders::request_hash(&request)?;
+            match self.registry.begin_root_relocation(
+                request["operationUuid"].as_str().expect("operation UUID"),
+                library_uuid,
+                &descriptor.root_uuid,
+                "automatic-rename",
+                &request_hash,
+                &request,
+                binding.operation_revision,
+                binding.binding_generation,
+                &descriptor.materialization_fingerprint,
+                &evidence,
+            ) {
+                Ok((relocation, _)) => {
+                    let _ = self
+                        .execute_root_relocation(&relocation.operation.operation_uuid, marker)
+                        .await;
+                }
+                Err(error) if error.to_string().contains("operation-in-progress") => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(actionable)
     }
 
@@ -427,6 +551,892 @@ impl LibraryManager {
 
     pub fn wake_sync_folder_workers(&self) {
         self.sync_coordinator.wake();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_root_relocation(
+        &self,
+        operation_uuid: &str,
+        expected_marker: crate::sync_folders::SyncRootMarker,
+    ) -> anyhow::Result<crate::host_registry::RootOperationRecord> {
+        let relocation = self
+            .registry
+            .root_relocation_operation(operation_uuid)?
+            .context("root-relocation-not-found")?;
+        let root_lock = self.root_relocation_operation_lock(&relocation.operation.root_uuid);
+        let _operation = root_lock.lock().await;
+        self.execute_root_relocation_locked(operation_uuid, expected_marker)
+            .await
+    }
+
+    async fn execute_root_relocation_locked(
+        &self,
+        operation_uuid: &str,
+        expected_marker: crate::sync_folders::SyncRootMarker,
+    ) -> anyhow::Result<crate::host_registry::RootOperationRecord> {
+        let mut relocation = self
+            .registry
+            .root_relocation_operation(operation_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("root-relocation-not-found"))?;
+        if relocation.operation.state == "completed" {
+            return Ok(relocation.operation);
+        }
+        if !matches!(
+            relocation.operation.state.as_str(),
+            "pending" | "running" | "waiting"
+        ) {
+            anyhow::bail!("invalid-root-state");
+        }
+        let library_uuid = relocation.operation.library_uuid.clone();
+        let root_uuid = Uuid::parse_str(&relocation.operation.root_uuid)?;
+        let binding = self
+            .registry
+            .local_root_binding(&library_uuid, &relocation.operation.root_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("local-root-binding-not-found"))?;
+        let local_binding_uuid = Uuid::parse_str(&binding.local_binding_uuid)?;
+        let old_generation = relocation
+            .operation
+            .expected_binding_generation
+            .context("stale-binding-generation")?;
+        let generation = old_generation.saturating_add(1);
+        let automatic_rename = relocation.operation.kind == "automatic-rename";
+        if binding.local_binding_uuid != expected_marker.local_binding_uuid
+            || binding.binding_generation != generation
+        {
+            anyhow::bail!("stale-binding-generation");
+        }
+        if !matches!(binding.state.as_str(), "relocating" | "reconcile-required") {
+            anyhow::bail!("invalid-root-state");
+        }
+        let resume_state =
+            crate::host_registry::relocation_resume_state(&relocation.operation.request_json);
+
+        let result: anyhow::Result<crate::host_registry::RootOperationRecord> = async {
+            if automatic_rename
+                && !relocation.operation.cutover_committed
+                && matches!(relocation.operation.phase.as_str(), "fenced" | "quiescing")
+                && binding.desired_materialization_fingerprint
+                    != relocation.desired_materialization_fingerprint
+            {
+                anyhow::bail!("stale-operation-revision");
+            }
+            if matches!(relocation.operation.phase.as_str(), "fenced" | "quiescing") {
+                // Drain turns registered before the Catalog generation fence and
+                // prevent a new turn from registering until that fence is durable.
+                // This preserves unrelated-root workers without allowing a turn
+                // that already opened the old root to outlive the fence.
+                let media_registration_fence =
+                    match self.registry.binding_transport(&library_uuid, "library")? {
+                        Some(transport) => Some(
+                            self.sync_coordinator
+                                .fence_media_binding_registration(transport.binding_epoch)
+                                .await?,
+                        ),
+                        None => None,
+                    };
+                let operation_revision = binding.operation_revision;
+                self.write_sync_folder_catalog(&library_uuid, move |database| {
+                    database.fence_sync_root_relocation(
+                        root_uuid,
+                        local_binding_uuid,
+                        old_generation,
+                        generation,
+                        operation_revision,
+                    )
+                })
+                .await?;
+                let active = self.active_snapshot();
+                if active.library_uuid.as_deref() == Some(library_uuid.as_str()) {
+                    if let Some(runtime) = active.runtime {
+                        runtime
+                            .root_runtime_registry
+                            .invalidate(&root_uuid.to_string());
+                        if let Some(watcher) = runtime
+                            .watcher
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_ref()
+                        {
+                            watcher.quiesce_path(Path::new(&relocation.source_path))?;
+                        }
+                    }
+                }
+                drop(media_registration_fence);
+                relocation = self.registry.advance_root_relocation(
+                    operation_uuid,
+                    relocation.operation.operation_revision,
+                    "transferring",
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    false,
+                )?;
+            }
+
+            if matches!(
+                relocation.operation.phase.as_str(),
+                "transferring" | "verifying"
+            ) {
+                let current_binding = self
+                    .registry
+                    .local_root_binding(&library_uuid, &relocation.operation.root_uuid)?
+                    .context("local-root-binding-not-found")?;
+                if automatic_rename
+                    && relocation.operation.phase == "transferring"
+                    && current_binding.desired_materialization_fingerprint
+                        != relocation.desired_materialization_fingerprint
+                    && !Path::new(&relocation.target_path).exists()
+                {
+                    anyhow::bail!("stale-operation-revision");
+                }
+                let evidence: crate::sync_folders::RelocationEvidence =
+                    serde_json::from_str(&relocation.operation.request_json)
+                        .ok()
+                        .and_then(|value: serde_json::Value| value.get("pathEvidence").cloned())
+                        .map(serde_json::from_value)
+                        .transpose()?
+                        .ok_or_else(|| anyhow::anyhow!("stale-plan"))?;
+                let transfer_marker = expected_marker.clone();
+                let transfer_operation_uuid = operation_uuid.to_owned();
+                let transfer_evidence = evidence.clone();
+                let transfer_checkpoint = self
+                    .registry
+                    .root_relocation_transfer_checkpoint(operation_uuid)?;
+                let transfer = tokio::task::spawn_blocking(move || {
+                    crate::sync_folders::transfer_relocation_tree(
+                        &transfer_evidence,
+                        &transfer_marker,
+                        &transfer_operation_uuid,
+                        transfer_checkpoint,
+                    )
+                })
+                .await
+                .context("relocation transfer task failed")??;
+                if !transfer.complete {
+                    let staging_path = transfer
+                        .staging_path
+                        .as_deref()
+                        .context("transfer-failed")?;
+                    relocation = self.registry.record_root_relocation_transfer_progress(
+                        operation_uuid,
+                        relocation.operation.operation_revision,
+                        staging_path,
+                        transfer.transferred_bytes,
+                        &transfer.checkpoint,
+                    )?;
+                    return Ok(relocation.operation);
+                }
+                let target = Path::new(&evidence.target_path);
+                let target_identity = crate::library_path::local_file_identity(target)?;
+                let bytes = evidence.source_bytes;
+                let verification_digest = transfer
+                    .verification_digest
+                    .as_deref()
+                    .context("verification-failed")?;
+                relocation = self.registry.advance_root_relocation(
+                    operation_uuid,
+                    relocation.operation.operation_revision,
+                    "catalog-cutover",
+                    transfer.staging_path.as_deref(),
+                    Some(&target_identity),
+                    Some(verification_digest),
+                    bytes,
+                    bytes,
+                    false,
+                )?;
+            }
+
+            if relocation.operation.phase == "catalog-cutover" {
+                let target_path = relocation.target_path.clone();
+                let desired_name = self
+                    .registry
+                    .local_root_binding(&library_uuid, &relocation.operation.root_uuid)?
+                    .context("local-root-binding-not-found")?
+                    .desired_materialized_name;
+                let revision = relocation.operation.operation_revision.saturating_add(1);
+                let cutover = self
+                    .write_sync_folder_catalog(&library_uuid, move |database| {
+                        database.cutover_sync_root_relocation(
+                            root_uuid,
+                            local_binding_uuid,
+                            old_generation,
+                            generation,
+                            Path::new(&target_path),
+                            &desired_name,
+                            revision,
+                        )
+                    })
+                    .await?;
+                let active = self.active_snapshot();
+                if active.library_uuid.as_deref() == Some(library_uuid.as_str()) {
+                    if let Some(runtime) = active.runtime {
+                        let _ = runtime.task_queue.send(cutover.scan_task_id).await;
+                    }
+                }
+                relocation = self.registry.advance_root_relocation(
+                    operation_uuid,
+                    relocation.operation.operation_revision,
+                    "host-cutover",
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    true,
+                )?;
+            }
+
+            if relocation.operation.phase == "host-cutover" {
+                let target = Path::new(&relocation.target_path);
+                let marker = crate::sync_folders::SyncRootMarker {
+                    binding_generation: generation,
+                    ..expected_marker.clone()
+                };
+                crate::sync_folders::replace_root_marker(target, &marker)?;
+                let marker_identity = crate::library_path::local_file_identity(
+                    &target.join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+                )?;
+                let filesystem_identity = crate::library_path::local_file_identity(target)?;
+                let placement_parent = target.parent().context("path-unavailable")?;
+                let descriptor = self
+                    .registry
+                    .remote_sync_root(&library_uuid, &relocation.operation.root_uuid)?
+                    .context("root-not-found")?;
+                relocation = self.registry.commit_root_relocation_host_cutover(
+                    operation_uuid,
+                    relocation.operation.operation_revision,
+                    &binding.local_binding_uuid,
+                    generation,
+                    &relocation.target_path,
+                    &relocation.target_canonical_key,
+                    &placement_parent.to_string_lossy(),
+                    &crate::sync_folders::canonical_path_key(placement_parent),
+                    &marker_identity,
+                    &filesystem_identity,
+                    &descriptor.materialized_name,
+                    &relocation.desired_materialization_fingerprint,
+                )?;
+                let active = self.active_snapshot();
+                if active.library_uuid.as_deref() == Some(library_uuid.as_str()) {
+                    if let Some(runtime) = active.runtime {
+                        runtime.root_runtime_registry.install(
+                            crate::sync::runtime::RootExecutionToken {
+                                library_uuid: library_uuid.clone(),
+                                root_uuid: relocation.operation.root_uuid.clone(),
+                                local_binding_uuid: binding.local_binding_uuid.clone(),
+                                binding_generation: generation,
+                            },
+                        );
+                        if let Some(watcher) = runtime
+                            .watcher
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_ref()
+                        {
+                            watcher.refresh()?;
+                        }
+                    }
+                }
+                if let Some(transport) =
+                    self.registry.binding_transport(&library_uuid, "library")?
+                {
+                    self.sync_coordinator
+                        .resume_media_binding(transport.binding_epoch)
+                        .await;
+                }
+            }
+
+            if relocation.operation.phase == "reconciling" {
+                let status = self
+                    .write_sync_folder_catalog(&library_uuid, move |database| {
+                        database.sync_root_relocation_reconciliation_status(
+                            root_uuid,
+                            local_binding_uuid,
+                            generation,
+                        )
+                    })
+                    .await?;
+                if !relocation_reconciliation_succeeded(status.as_deref())? {
+                    return Ok(relocation.operation);
+                }
+                relocation = self.registry.advance_root_relocation(
+                    operation_uuid,
+                    relocation.operation.operation_revision,
+                    "cleanup",
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    true,
+                )?;
+            }
+
+            if relocation.operation.phase == "cleanup" {
+                let source = Path::new(&relocation.source_path);
+                let target = Path::new(&relocation.target_path);
+                let target_identity = relocation
+                    .target_filesystem_identity
+                    .as_deref()
+                    .context("verification-failed")?;
+                if crate::library_path::local_file_identity(target)
+                    .ok()
+                    .as_deref()
+                    != Some(target_identity)
+                {
+                    anyhow::bail!("verification-failed");
+                }
+                let target_marker = crate::sync_folders::read_root_marker(target)?;
+                let expected_target_marker = crate::sync_folders::SyncRootMarker {
+                    binding_generation: generation,
+                    ..expected_marker.clone()
+                };
+                if target_marker != expected_target_marker {
+                    anyhow::bail!("marker-mismatch");
+                }
+                if source.exists() && source != target {
+                    let expected_identity = relocation
+                        .source_filesystem_identity
+                        .as_deref()
+                        .context("source-missing")?;
+                    let evidence: crate::sync_folders::RelocationEvidence =
+                        serde_json::from_str(&relocation.operation.request_json)
+                            .ok()
+                            .and_then(|value: serde_json::Value| value.get("pathEvidence").cloned())
+                            .map(serde_json::from_value)
+                            .transpose()?
+                            .context("stale-plan")?;
+                    let cleanup_source = source.to_path_buf();
+                    let cleanup_identity = expected_identity.to_owned();
+                    let cleanup_digest = evidence.source_digest;
+                    let cleanup_marker = expected_marker.clone();
+                    let cleanup = tokio::task::spawn_blocking(move || {
+                        crate::sync_folders::remove_relocation_source_if_unchanged(
+                            &cleanup_source,
+                            &cleanup_identity,
+                            &cleanup_digest,
+                            &cleanup_marker,
+                        )
+                    })
+                    .await
+                    .context("relocation cleanup task failed")?;
+                    if let Err(error) = cleanup {
+                        if error.to_string().contains("cleanup-source-changed") {
+                            return self.registry.fail_root_relocation_cleanup(
+                                operation_uuid,
+                                relocation.operation.operation_revision,
+                                generation,
+                                "cleanup-source-changed",
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+                let revision = relocation.operation.operation_revision.saturating_add(1);
+                self.write_sync_folder_catalog(&library_uuid, move |database| {
+                    database.complete_sync_root_relocation_projection(
+                        root_uuid,
+                        local_binding_uuid,
+                        generation,
+                        revision,
+                        resume_state,
+                    )
+                })
+                .await?;
+                let operation = self.registry.complete_root_relocation(
+                    operation_uuid,
+                    relocation.operation.operation_revision,
+                    generation,
+                )?;
+                self.refresh_active_root_runtime(&library_uuid)?;
+                return Ok(operation);
+            }
+            Ok(relocation.operation)
+        }
+        .await;
+        match result {
+            Ok(operation) => Ok(operation),
+            Err(error) => {
+                let message = error.to_string();
+                let phase = if automatic_rename {
+                    "local-rename-required"
+                } else if message.contains("source-missing") {
+                    "source-missing"
+                } else if message.contains("target-conflict")
+                    || message.contains("destination-exists")
+                {
+                    "target-conflict"
+                } else if message.contains("verification") {
+                    "verification-failed"
+                } else {
+                    "transfer-failed"
+                };
+                let failure_revision = self
+                    .registry
+                    .root_operation(operation_uuid)
+                    .ok()
+                    .flatten()
+                    .map(|operation| operation.operation_revision)
+                    .unwrap_or_default();
+                let _ = self.registry.fail_root_relocation(
+                    operation_uuid,
+                    failure_revision,
+                    phase,
+                    phase,
+                );
+                let cutover_committed = self
+                    .registry
+                    .root_operation(operation_uuid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|operation| operation.cutover_committed);
+                let target_path = self
+                    .registry
+                    .root_relocation_operation(operation_uuid)
+                    .ok()
+                    .flatten()
+                    .map(|operation| operation.target_path);
+                let catalog_cutover_committed = if let Some(target_path) = target_path {
+                    match self
+                        .write_sync_folder_catalog(&library_uuid, move |database| {
+                            database.sync_root_relocation_catalog_cutover_is_current(
+                                root_uuid,
+                                local_binding_uuid,
+                                generation,
+                                Path::new(&target_path),
+                            )
+                        })
+                        .await
+                    {
+                        Ok(committed) => committed,
+                        Err(inspect_error) => {
+                            tracing::warn!(
+                                operation_uuid = %operation_uuid,
+                                error = %inspect_error,
+                                "could not inspect relocation catalog cutover; preserving fenced state"
+                            );
+                            let _ = self.refresh_active_root_runtime(&library_uuid);
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    false
+                };
+                if catalog_cutover_committed && !cutover_committed {
+                    if let Ok(Some(operation)) = self.registry.root_operation(operation_uuid) {
+                        if operation.state == "failed" {
+                            let _ = self.registry.repair_root_relocation_after_catalog_cutover(
+                                operation_uuid,
+                                operation.operation_revision,
+                            );
+                        }
+                    }
+                    let _ = self.refresh_active_root_runtime(&library_uuid);
+                    return Err(error);
+                }
+                let source_still_authoritative = self
+                    .registry
+                    .root_relocation_operation(operation_uuid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|operation| {
+                        let source = Path::new(&operation.source_path);
+                        source.is_dir()
+                            && operation.source_filesystem_identity.as_deref()
+                                == crate::library_path::local_file_identity(source)
+                                    .ok()
+                                    .as_deref()
+                    });
+                if !cutover_committed && source_still_authoritative {
+                    let revision = binding.operation_revision.saturating_add(2);
+                    let rollback_state = if automatic_rename {
+                        "local-rename-required"
+                    } else {
+                        resume_state
+                    };
+                    let repaired = self
+                        .write_sync_folder_catalog(&library_uuid, move |database| {
+                            database.abort_sync_root_relocation_projection(
+                                root_uuid,
+                                local_binding_uuid,
+                                generation,
+                                revision,
+                                rollback_state,
+                            )
+                        })
+                        .await
+                        .is_ok();
+                    if repaired {
+                        let _ = self
+                            .registry
+                            .mark_root_relocation_projection_repaired(operation_uuid);
+                    }
+                    let _ = self.refresh_active_root_runtime(&library_uuid);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn cancel_root_relocation(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        expected_binding_generation: u64,
+    ) -> anyhow::Result<crate::host_registry::RootOperationRecord> {
+        let relocation = self
+            .registry
+            .root_relocation_operation(operation_uuid)?
+            .context("root-relocation-not-found")?;
+        let root_lock = self.root_relocation_operation_lock(&relocation.operation.root_uuid);
+        let _operation = root_lock.lock().await;
+        if relocation.operation.cutover_committed {
+            anyhow::bail!("cutover-committed");
+        }
+        let binding = self
+            .registry
+            .local_root_binding(
+                &relocation.operation.library_uuid,
+                &relocation.operation.root_uuid,
+            )?
+            .context("local-root-binding-not-found")?;
+        if binding.binding_generation != expected_binding_generation {
+            anyhow::bail!("stale-binding-generation");
+        }
+        if relocation.operation.state == "cancelled"
+            && relocation.operation.operation_revision
+                == expected_operation_revision.saturating_add(1)
+        {
+            let root_uuid = Uuid::parse_str(&relocation.operation.root_uuid)?;
+            let local_binding_uuid = Uuid::parse_str(&binding.local_binding_uuid)?;
+            let resume_state =
+                crate::host_registry::relocation_resume_state(&relocation.operation.request_json);
+            let revision = binding.operation_revision;
+            self.write_sync_folder_catalog(&relocation.operation.library_uuid, move |database| {
+                database.abort_sync_root_relocation_projection(
+                    root_uuid,
+                    local_binding_uuid,
+                    expected_binding_generation,
+                    revision,
+                    resume_state,
+                )
+            })
+            .await?;
+            self.registry
+                .mark_root_relocation_projection_repaired(operation_uuid)?;
+            self.refresh_active_root_runtime(&relocation.operation.library_uuid)?;
+            return Ok(relocation.operation);
+        }
+        let source = Path::new(&relocation.source_path);
+        if Path::new(&relocation.target_path).exists() {
+            anyhow::bail!("cutover-committed");
+        }
+        if !source.is_dir()
+            || relocation.source_filesystem_identity.as_deref()
+                != crate::library_path::local_file_identity(source)
+                    .ok()
+                    .as_deref()
+        {
+            anyhow::bail!("source-missing");
+        }
+        let descriptor = self
+            .registry
+            .remote_sync_root(
+                &relocation.operation.library_uuid,
+                &relocation.operation.root_uuid,
+            )?
+            .context("root-not-found")?;
+        let expected_marker = crate::sync_folders::SyncRootMarker {
+            format_version: 1,
+            library_uuid: relocation.operation.library_uuid.clone(),
+            root_uuid: relocation.operation.root_uuid.clone(),
+            root_folder_uuid: descriptor.root_folder_uuid,
+            local_binding_uuid: binding.local_binding_uuid.clone(),
+            binding_generation: relocation
+                .operation
+                .expected_binding_generation
+                .context("stale-binding-generation")?,
+        };
+        if crate::sync_folders::read_root_marker(source)? != expected_marker {
+            anyhow::bail!("marker-mismatch");
+        }
+        let operation = self.registry.cancel_root_relocation(
+            operation_uuid,
+            expected_operation_revision,
+            expected_binding_generation,
+        )?;
+        let root_uuid = Uuid::parse_str(&operation.root_uuid)?;
+        let local_binding_uuid = Uuid::parse_str(&binding.local_binding_uuid)?;
+        let resume_state = crate::host_registry::relocation_resume_state(&operation.request_json);
+        let revision = binding.operation_revision.saturating_add(1);
+        self.write_sync_folder_catalog(&operation.library_uuid, move |database| {
+            database.abort_sync_root_relocation_projection(
+                root_uuid,
+                local_binding_uuid,
+                expected_binding_generation,
+                revision,
+                resume_state,
+            )
+        })
+        .await?;
+        self.registry
+            .mark_root_relocation_projection_repaired(operation_uuid)?;
+        self.refresh_active_root_runtime(&operation.library_uuid)?;
+        Ok(operation)
+    }
+
+    pub async fn retry_root_relocation(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        expected_binding_generation: u64,
+    ) -> anyhow::Result<crate::host_registry::RootOperationRecord> {
+        let relocation = self
+            .registry
+            .root_relocation_operation(operation_uuid)?
+            .context("root-relocation-not-found")?;
+        let root_lock = self.root_relocation_operation_lock(&relocation.operation.root_uuid);
+        let _operation = root_lock.lock().await;
+        let binding = self
+            .registry
+            .local_root_binding(
+                &relocation.operation.library_uuid,
+                &relocation.operation.root_uuid,
+            )?
+            .context("local-root-binding-not-found")?;
+        if binding.binding_generation != expected_binding_generation {
+            anyhow::bail!("stale-binding-generation");
+        }
+        if relocation.operation.state == "completed" {
+            return Ok(relocation.operation);
+        }
+        if relocation.operation.kind == "automatic-rename"
+            && !relocation.operation.cutover_committed
+            && binding.desired_materialization_fingerprint
+                != relocation.desired_materialization_fingerprint
+        {
+            anyhow::bail!("stale-operation-revision");
+        }
+        let descriptor = self
+            .registry
+            .remote_sync_root(
+                &relocation.operation.library_uuid,
+                &relocation.operation.root_uuid,
+            )?
+            .context("root-not-found")?;
+        let marker = crate::sync_folders::SyncRootMarker {
+            format_version: 1,
+            library_uuid: relocation.operation.library_uuid.clone(),
+            root_uuid: relocation.operation.root_uuid.clone(),
+            root_folder_uuid: descriptor.root_folder_uuid,
+            local_binding_uuid: binding.local_binding_uuid.clone(),
+            binding_generation: relocation
+                .operation
+                .expected_binding_generation
+                .context("stale-binding-generation")?,
+        };
+        let source_path = PathBuf::from(&relocation.source_path);
+        let target_path = PathBuf::from(&relocation.target_path);
+        if !relocation.operation.cutover_committed && source_path.is_dir() && !target_path.exists()
+        {
+            let placement_base = PathBuf::from(
+                self.registry
+                    .sync_folder_settings(&relocation.operation.library_uuid)?
+                    .default_placement_base,
+            );
+            let other_paths = self
+                .registry
+                .local_root_bindings(&relocation.operation.library_uuid)?
+                .into_iter()
+                .filter(|candidate| candidate.root_uuid != relocation.operation.root_uuid)
+                .map(|candidate| PathBuf::from(candidate.local_path))
+                .collect::<Vec<_>>();
+            let marker_for_preflight = marker.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::sync_folders::validate_relocation_paths(
+                    &source_path,
+                    &target_path,
+                    &placement_base,
+                    &other_paths,
+                    &marker_for_preflight,
+                )
+            })
+            .await
+            .context("root relocation retry preflight task failed")??;
+        }
+        let authoritative_path = if relocation.operation.cutover_committed {
+            Path::new(&relocation.target_path)
+        } else if Path::new(&relocation.source_path).is_dir() {
+            Path::new(&relocation.source_path)
+        } else {
+            Path::new(&relocation.target_path)
+        };
+        let actual_marker = crate::sync_folders::read_root_marker(authoritative_path)?;
+        if actual_marker.library_uuid != marker.library_uuid
+            || actual_marker.root_uuid != marker.root_uuid
+            || actual_marker.root_folder_uuid != marker.root_folder_uuid
+            || actual_marker.local_binding_uuid != marker.local_binding_uuid
+            || !matches!(
+                actual_marker.binding_generation,
+                value if value == marker.binding_generation
+                    || value == marker.binding_generation.saturating_add(1)
+            )
+        {
+            anyhow::bail!("marker-mismatch");
+        }
+        self.registry.retry_root_relocation(
+            operation_uuid,
+            expected_operation_revision,
+            expected_binding_generation,
+        )?;
+        self.execute_root_relocation_locked(operation_uuid, marker)
+            .await
+    }
+
+    pub fn refresh_active_root_runtime(&self, library_uuid: &str) -> anyhow::Result<()> {
+        let active = self.active_snapshot();
+        if active.library_uuid.as_deref() != Some(library_uuid) {
+            return Ok(());
+        }
+        if let Some(runtime) = active.runtime {
+            runtime
+                .root_runtime_registry
+                .replace_all(self.registry.local_root_binding_tokens(library_uuid)?);
+            if let Some(watcher) = runtime
+                .watcher
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            {
+                watcher.refresh()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn resume_pending_root_relocations(&self) -> anyhow::Result<usize> {
+        let operations = self.registry.pending_root_relocations()?;
+        let mut resumed = 0;
+        for relocation in operations {
+            let binding = self
+                .registry
+                .local_root_binding(
+                    &relocation.operation.library_uuid,
+                    &relocation.operation.root_uuid,
+                )?
+                .context("local-root-binding-not-found")?;
+            let descriptor = self
+                .registry
+                .remote_sync_root(
+                    &relocation.operation.library_uuid,
+                    &relocation.operation.root_uuid,
+                )?
+                .context("root-not-found")?;
+            let marker = crate::sync_folders::SyncRootMarker {
+                format_version: 1,
+                library_uuid: relocation.operation.library_uuid.clone(),
+                root_uuid: relocation.operation.root_uuid.clone(),
+                root_folder_uuid: descriptor.root_folder_uuid,
+                local_binding_uuid: binding.local_binding_uuid.clone(),
+                binding_generation: relocation
+                    .operation
+                    .expected_binding_generation
+                    .unwrap_or(binding.binding_generation),
+            };
+            if matches!(relocation.operation.state.as_str(), "cancelled" | "failed") {
+                let source = Path::new(&relocation.source_path);
+                let root_uuid = Uuid::parse_str(&relocation.operation.root_uuid)?;
+                let local_binding_uuid = Uuid::parse_str(&binding.local_binding_uuid)?;
+                let generation = binding.binding_generation;
+                let catalog_binding = self
+                    .write_sync_folder_catalog(
+                        &relocation.operation.library_uuid,
+                        move |database| database.sync_root_local_binding(root_uuid.as_bytes()),
+                    )
+                    .await?;
+                if relocation.operation.state == "failed"
+                    && catalog_binding.as_ref().is_some_and(|candidate| {
+                        candidate.local_binding_uuid == *local_binding_uuid.as_bytes()
+                            && candidate.binding_generation == generation
+                            && candidate.state == "reconcile-required"
+                    })
+                {
+                    let repaired = if relocation.operation.cutover_committed {
+                        self.registry.retry_root_relocation(
+                            &relocation.operation.operation_uuid,
+                            relocation.operation.operation_revision,
+                            generation,
+                        )?
+                    } else {
+                        self.registry.repair_root_relocation_after_catalog_cutover(
+                            &relocation.operation.operation_uuid,
+                            relocation.operation.operation_revision,
+                        )?
+                    };
+                    let _ = self
+                        .execute_root_relocation(&repaired.operation.operation_uuid, marker)
+                        .await;
+                    resumed += 1;
+                    continue;
+                }
+                let source_is_authoritative = source.is_dir()
+                    && relocation.source_filesystem_identity.as_deref()
+                        == crate::library_path::local_file_identity(source)
+                            .ok()
+                            .as_deref();
+                if relocation.operation.state == "failed" && !source_is_authoritative {
+                    if catalog_binding.as_ref().is_some_and(|candidate| {
+                        candidate.local_binding_uuid == *local_binding_uuid.as_bytes()
+                            && candidate.binding_generation == generation
+                            && candidate.state == "relocating"
+                    }) {
+                        let retried = self.registry.retry_root_relocation(
+                            &relocation.operation.operation_uuid,
+                            relocation.operation.operation_revision,
+                            generation,
+                        )?;
+                        let _ = self
+                            .execute_root_relocation(&retried.operation.operation_uuid, marker)
+                            .await;
+                        resumed += 1;
+                    }
+                    continue;
+                }
+                let revision = binding.operation_revision;
+                let resume_state = if relocation.operation.kind == "automatic-rename" {
+                    "local-rename-required"
+                } else {
+                    crate::host_registry::relocation_resume_state(
+                        &relocation.operation.request_json,
+                    )
+                };
+                self.write_sync_folder_catalog(
+                    &relocation.operation.library_uuid,
+                    move |database| {
+                        database.abort_sync_root_relocation_projection(
+                            root_uuid,
+                            local_binding_uuid,
+                            generation,
+                            revision,
+                            resume_state,
+                        )
+                    },
+                )
+                .await?;
+                self.registry.mark_root_relocation_projection_repaired(
+                    &relocation.operation.operation_uuid,
+                )?;
+                resumed += 1;
+                continue;
+            }
+            let _ = self
+                .execute_root_relocation(&relocation.operation.operation_uuid, marker)
+                .await;
+            resumed += 1;
+        }
+        Ok(resumed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -997,6 +2007,7 @@ impl LibraryManager {
             active,
             request_gate,
             operation: AsyncMutex::new(()),
+            root_relocation_operations: Mutex::new(HashMap::new()),
             runtime_generation: AtomicU64::new(0),
             libraries_dir,
             bundled_plugins_dir,
@@ -1004,6 +2015,7 @@ impl LibraryManager {
             runtime_leases,
             sync_coordinator,
             sync_scheduler: Mutex::new(None),
+            root_relocation_scheduler: Mutex::new(None),
             plugin_runtime_scheduler: Mutex::new(None),
         }
     }
@@ -1253,10 +2265,60 @@ impl LibraryManager {
             .sync_scheduler
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(scheduler);
+
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let weak = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = task_cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        let Some(manager) = weak.upgrade() else { break; };
+                        if let Err(error) = manager.resume_pending_root_relocations().await {
+                            tracing::warn!(%error, "root relocation recovery turn failed");
+                        }
+                        match manager.registry.sync_bound_libraries() {
+                            Ok(libraries) => {
+                                for library in libraries {
+                                    if let Err(error) = manager
+                                        .refresh_sync_folder_inventory(&library.library_uuid)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            library_uuid = %library.library_uuid,
+                                            %error,
+                                            "synchronized-folder materialization turn failed"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => tracing::warn!(%error, "could not list synchronized libraries for materialization"),
+                        }
+                    }
+                }
+            }
+        });
+        *self
+            .root_relocation_scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((cancellation, task));
     }
 
     #[allow(dead_code)]
     pub async fn shutdown_sync_coordinator(&self) -> anyhow::Result<()> {
+        let relocation_scheduler = self
+            .root_relocation_scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some((cancellation, task)) = relocation_scheduler {
+            cancellation.cancel();
+            task.await
+                .map_err(|error| anyhow::anyhow!("root relocation scheduler failed: {error}"))?;
+        }
         let plugin_scheduler = self
             .plugin_runtime_scheduler
             .lock()
@@ -1308,6 +2370,9 @@ impl LibraryManager {
         self.recover_journals()?;
         self.registry.recover_activation_journal()?;
         self.registry.recover_sync_orchestration_journals()?;
+        // Resolve ambiguous source/target journal states before prepare_runtime
+        // starts ordinary root workers and publishes their execution tokens.
+        let _ = self.resume_pending_root_relocations().await?;
         let snapshot = self.registry.snapshot()?;
         if let Some(library_uuid) = snapshot.active_library_uuid {
             let descriptor = self
@@ -1329,7 +2394,9 @@ impl LibraryManager {
                 runtime: None,
             };
         }
-        self.recover_sync_runtime_journals().await
+        self.recover_sync_runtime_journals().await?;
+        let _ = self.resume_pending_root_relocations().await?;
+        Ok(())
     }
 
     async fn recover_sync_runtime_journals(&self) -> anyhow::Result<()> {
@@ -2872,6 +3939,15 @@ fn verify_descriptor_identity(descriptor: &LibraryDescriptor) -> anyhow::Result<
     Ok(())
 }
 
+fn relocation_reconciliation_succeeded(status: Option<&str>) -> anyhow::Result<bool> {
+    match status {
+        Some("succeeded") => Ok(true),
+        Some("failed" | "cancelled") => anyhow::bail!("reconciliation-failed"),
+        Some("pending" | "running") | None => Ok(false),
+        Some(_) => anyhow::bail!("invalid-reconciliation-state"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2900,6 +3976,34 @@ mod tests {
 
     fn test_manager(base: &Path) -> LibraryManager {
         isolated_manager(base, base.join("bundled-plugins"))
+    }
+
+    #[test]
+    fn relocation_serialization_is_scoped_per_root() {
+        let base = std::env::temp_dir().join(format!("megle-root-locks-{}", Uuid::now_v7()));
+        fs::create_dir_all(&base).unwrap();
+        let manager = test_manager(&base);
+        let first = manager.root_relocation_operation_lock("root-a");
+        let same = manager.root_relocation_operation_lock("root-a");
+        let other = manager.root_relocation_operation_lock("root-b");
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+        drop(first);
+        drop(same);
+        drop(other);
+        drop(manager);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn relocation_reconciliation_waits_only_for_non_terminal_scan_states() {
+        assert!(!relocation_reconciliation_succeeded(None).unwrap());
+        assert!(!relocation_reconciliation_succeeded(Some("pending")).unwrap());
+        assert!(!relocation_reconciliation_succeeded(Some("running")).unwrap());
+        assert!(relocation_reconciliation_succeeded(Some("succeeded")).unwrap());
+        assert!(relocation_reconciliation_succeeded(Some("failed")).is_err());
+        assert!(relocation_reconciliation_succeeded(Some("cancelled")).is_err());
+        assert!(relocation_reconciliation_succeeded(Some("unknown")).is_err());
     }
 
     fn platform() -> crate::plugins::manifest::Platform {

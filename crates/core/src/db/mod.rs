@@ -6425,8 +6425,9 @@ impl Database {
             |row| row.get(0),
         )?;
         let asset = uuid::Uuid::from_slice(&asset)?;
-        let content_changed = result.identity_changed
-            || fingerprint.is_some_and(|value| previous_fingerprint.as_deref() != Some(value));
+        let content_changed = fingerprint.map_or(result.identity_changed, |value| {
+            previous_fingerprint.as_deref() != Some(value)
+        });
         if fingerprint_candidates.len() > 1 {
             for old_id in fingerprint_candidates {
                 let old: Vec<u8> = transaction.query_row(
@@ -8457,7 +8458,7 @@ fn mark_task_failed_in_transaction(
     )?)
 }
 
-fn hash_path(path: &Path) -> String {
+pub(super) fn hash_path(path: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -11409,6 +11410,42 @@ mod tests {
         assert_eq!(
             unchanged_count, 1,
             "unchanged rescan must not duplicate content"
+        );
+
+        database
+            .commit_scan_batch(ScanWriteBatch {
+                folders: Vec::new(),
+                files: vec![ScanFileUpsert {
+                    file: FileUpsert {
+                        root_id,
+                        folder_id: root_folder_id,
+                        name: "same-size.jpg".to_string(),
+                        ext: ".jpg".to_string(),
+                        size: 4,
+                        mtime: 10,
+                        ctime: None,
+                        file_key: Some("relocated-file-id".to_string()),
+                    },
+                    media_kind: "image".to_string(),
+                    external_identity: Some(ExternalFileIdentity {
+                        volume_identity: b"relocated-volume".to_vec(),
+                        file_identity: b"relocated-file-id".to_vec(),
+                        content_fingerprint: Some(vec![0xa1; 32]),
+                        path: PathBuf::from("E:/Relocated/same-size.jpg"),
+                    }),
+                }],
+                scan_generation: None,
+            })
+            .expect("same-content relocation scan");
+        let relocated_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM sync_publication_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            relocated_count, 1,
+            "a local file-identity change with the same content fingerprint must not publish portable content"
         );
 
         let first_intent: Vec<u8> = database
@@ -19162,12 +19199,15 @@ mod tests {
 
         let blocker = Database::open(&db_path).expect("open blocker database");
         let (blocker_ready_sender, blocker_ready_receiver) = std::sync::mpsc::channel();
+        let (blocker_release_sender, blocker_release_receiver) = std::sync::mpsc::channel::<()>();
         let blocker_thread = std::thread::spawn(move || {
             let transaction =
                 Transaction::new_unchecked(&blocker.connection, TransactionBehavior::Immediate)
                     .expect("begin immediate blocker transaction");
             blocker_ready_sender.send(()).expect("signal blocker ready");
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            blocker_release_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("receive blocker release");
             transaction.commit().expect("commit blocker transaction");
         });
         blocker_ready_receiver
@@ -19205,6 +19245,9 @@ mod tests {
             Err(error) => panic!("thumbnail attempt update channel closed unexpectedly: {error}"),
         }
 
+        blocker_release_sender
+            .send(())
+            .expect("release blocker transaction");
         blocker_thread.join().expect("join blocker thread");
         let updated = update_receiver
             .recv_timeout(std::time::Duration::from_secs(2))

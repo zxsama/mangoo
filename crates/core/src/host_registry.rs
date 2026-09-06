@@ -470,6 +470,35 @@ fn root_operation_record_from_row(
     })
 }
 
+pub(crate) fn relocation_resume_state(request_json: &str) -> &'static str {
+    if serde_json::from_str::<serde_json::Value>(request_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("resumeState")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("paused")
+    {
+        "paused"
+    } else {
+        "active"
+    }
+}
+
+fn relocation_local_binding_uuid(request_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(request_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("localBindingUuid")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+}
+
 fn root_publish_as_new_record_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<RootPublishAsNewRecord> {
@@ -798,6 +827,24 @@ pub struct RootOperationRecord {
     pub error_code: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootRelocationRecord {
+    pub operation: RootOperationRecord,
+    pub mode: String,
+    pub desired_materialization_fingerprint: String,
+    pub source_path: String,
+    pub source_canonical_key: String,
+    pub source_filesystem_identity: Option<String>,
+    pub target_path: String,
+    pub target_canonical_key: String,
+    pub target_filesystem_identity: Option<String>,
+    pub staging_path: Option<String>,
+    pub transferred_bytes: u64,
+    pub verified_bytes: u64,
+    pub verification_digest: Option<String>,
+    pub cleanup_state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1178,9 +1225,35 @@ impl HostRegistry {
             "INSERT INTO remote_sync_roots(library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialized_name_key,materialization_fingerprint,logical_revision,lifecycle,inventory_state,logical_bytes,checkpoint_uuid,inventory_revision,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13) ON CONFLICT(library_uuid,root_uuid) DO UPDATE SET requested_name=excluded.requested_name,materialized_name=excluded.materialized_name,materialized_name_key=excluded.materialized_name_key,materialization_fingerprint=excluded.materialization_fingerprint,logical_revision=excluded.logical_revision,lifecycle=excluded.lifecycle,inventory_state=excluded.inventory_state,logical_bytes=excluded.logical_bytes,checkpoint_uuid=excluded.checkpoint_uuid,inventory_revision=CASE WHEN remote_sync_roots.logical_revision<>excluded.logical_revision OR remote_sync_roots.lifecycle<>excluded.lifecycle THEN remote_sync_roots.inventory_revision+1 ELSE remote_sync_roots.inventory_revision END,operation_revision=CASE WHEN remote_sync_roots.logical_revision<>excluded.logical_revision OR remote_sync_roots.lifecycle<>excluded.lifecycle THEN remote_sync_roots.operation_revision+1 ELSE remote_sync_roots.operation_revision END,updated_at=excluded.updated_at WHERE remote_sync_roots.root_folder_uuid=excluded.root_folder_uuid",
             params![library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialized_name.to_lowercase(),materialization_fingerprint,i64::try_from(logical_revision)?,lifecycle,inventory_state,logical_bytes.map(i64::try_from).transpose()?,checkpoint_uuid,now],
         )?;
+        transaction.execute(
+            "UPDATE local_root_bindings SET desired_materialized_name=?1,desired_materialized_name_key=?2,desired_materialization_fingerprint=?3,updated_at=?4 WHERE library_uuid=?5 AND root_uuid=?6 AND (desired_materialized_name<>?1 OR desired_materialization_fingerprint<>?3)",
+            params![materialized_name,materialized_name.to_lowercase(),materialization_fingerprint,now,library_uuid,root_uuid],
+        )?;
         let _ = settings;
         transaction.commit()?;
         Ok(actionable)
+    }
+
+    pub fn pending_automatic_root_renames(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Vec<(LocalRootBindingRecord, RemoteSyncRootRecord)>> {
+        let bindings = self.local_root_bindings(library_uuid)?;
+        let mut pending = Vec::new();
+        for binding in bindings {
+            if !matches!(
+                binding.state.as_str(),
+                "active" | "paused" | "local-rename-required"
+            ) || binding.applied_materialization_fingerprint.as_deref()
+                == Some(binding.desired_materialization_fingerprint.as_str())
+            {
+                continue;
+            }
+            if let Some(descriptor) = self.remote_sync_root(library_uuid, &binding.root_uuid)? {
+                pending.push((binding, descriptor));
+            }
+        }
+        Ok(pending)
     }
 
     pub fn remote_sync_roots(
@@ -1232,6 +1305,78 @@ impl HostRegistry {
             "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
             [operation_uuid],root_operation_record_from_row,
         ).optional().map_err(Into::into)
+    }
+
+    pub fn root_relocation_operation(
+        &self,
+        operation_uuid: &str,
+    ) -> anyhow::Result<Option<RootRelocationRecord>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection
+            .query_row(
+                "SELECT operation.operation_uuid,operation.library_uuid,operation.root_uuid,operation.kind,operation.state,operation.phase,operation.request_hash,operation.request_json,operation.expected_operation_revision,operation.expected_binding_generation,operation.operation_revision,operation.cutover_committed,operation.error_code,operation.created_at,operation.updated_at,relocation.mode,relocation.desired_materialization_fingerprint,relocation.source_path,relocation.source_canonical_key,relocation.source_filesystem_identity,relocation.target_path,relocation.target_canonical_key,relocation.target_filesystem_identity,relocation.staging_path,relocation.transferred_bytes,relocation.verified_bytes,relocation.verification_digest,relocation.cleanup_state FROM root_operations operation JOIN root_relocation_operations relocation ON relocation.operation_uuid=operation.operation_uuid WHERE operation.operation_uuid=?1",
+                [operation_uuid],
+                |row| {
+                    let expected_binding_generation: Option<i64> = row.get(9)?;
+                    let operation_revision: i64 = row.get(10)?;
+                    let transferred_bytes: i64 = row.get(24)?;
+                    let verified_bytes: i64 = row.get(25)?;
+                    Ok(RootRelocationRecord {
+                        operation: RootOperationRecord {
+                            operation_uuid: row.get(0)?,
+                            library_uuid: row.get(1)?,
+                            root_uuid: row.get(2)?,
+                            kind: row.get(3)?,
+                            state: row.get(4)?,
+                            phase: row.get(5)?,
+                            request_hash: row.get(6)?,
+                            request_json: row.get(7)?,
+                            expected_operation_revision: row.get::<_, i64>(8)?.max(0) as u64,
+                            expected_binding_generation: expected_binding_generation.map(|value| value.max(0) as u64),
+                            operation_revision: operation_revision.max(0) as u64,
+                            cutover_committed: row.get::<_, i64>(11)? != 0,
+                            error_code: row.get(12)?,
+                            created_at: row.get(13)?,
+                            updated_at: row.get(14)?,
+                        },
+                        mode: row.get(15)?,
+                        desired_materialization_fingerprint: row.get(16)?,
+                        source_path: row.get(17)?,
+                        source_canonical_key: row.get(18)?,
+                        source_filesystem_identity: row.get(19)?,
+                        target_path: row.get(20)?,
+                        target_canonical_key: row.get(21)?,
+                        target_filesystem_identity: row.get(22)?,
+                        staging_path: row.get(23)?,
+                        transferred_bytes: transferred_bytes.max(0) as u64,
+                        verified_bytes: verified_bytes.max(0) as u64,
+                        verification_digest: row.get(26)?,
+                        cleanup_state: row.get(27)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn pending_root_relocations(&self) -> anyhow::Result<Vec<RootRelocationRecord>> {
+        let operation_uuids = {
+            let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+            let mut statement = connection.prepare(
+            "SELECT operation.operation_uuid FROM root_operations operation JOIN root_relocation_operations relocation ON relocation.operation_uuid=operation.operation_uuid WHERE operation.kind IN ('relocate','automatic-rename') AND (operation.state IN ('pending','running','waiting') OR (operation.state IN ('cancelled','failed') AND relocation.cleanup_state NOT IN ('not-required','failed'))) ORDER BY operation.created_at,operation.operation_uuid",
+            )?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        operation_uuids
+            .into_iter()
+            .map(|operation_uuid| {
+                self.root_relocation_operation(&operation_uuid)?
+                    .context("root-relocation-not-found")
+            })
+            .collect()
     }
 
     pub fn pending_reenable_plan_uuid(
@@ -2689,6 +2834,799 @@ impl HostRegistry {
         )?;
         transaction.commit()?;
         Ok((operation, true))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_root_relocation(
+        &self,
+        operation_uuid: &str,
+        library_uuid: &str,
+        root_uuid: &str,
+        mode: &str,
+        request_hash: &str,
+        request: &serde_json::Value,
+        expected_operation_revision: u64,
+        expected_binding_generation: u64,
+        desired_materialization_fingerprint: &str,
+        evidence: &crate::sync_folders::RelocationEvidence,
+    ) -> anyhow::Result<(RootRelocationRecord, bool)> {
+        let kind = match mode {
+            "explicit-move" => "relocate",
+            "automatic-rename" => "automatic-rename",
+            _ => bail!("invalid relocation mode"),
+        };
+        let request_json = serde_json::to_string(request)?;
+        let result_json = serde_json::to_string(evidence)?;
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT operation_uuid FROM root_operations WHERE operation_uuid=?1",
+                [operation_uuid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            transaction.commit()?;
+            drop(connection);
+            let relocation = self
+                .root_relocation_operation(&existing)?
+                .context("root-relocation-not-found")?;
+            if relocation.operation.library_uuid != library_uuid
+                || relocation.operation.root_uuid != root_uuid
+                || relocation.operation.kind != kind
+                || relocation.operation.request_hash != request_hash
+                || relocation.operation.request_json != request_json
+                || relocation.desired_materialization_fingerprint
+                    != desired_materialization_fingerprint
+                || relocation.source_canonical_key != evidence.source_canonical_key
+                || relocation.target_canonical_key != evidence.target_canonical_key
+            {
+                bail!("idempotency-key-reused");
+            }
+            return Ok((relocation, false));
+        }
+        let binding: (String, String, String, i64, i64) = transaction
+            .query_row(
+                "SELECT local_binding_uuid,local_path,state,binding_generation,operation_revision FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2",
+                params![library_uuid, root_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?
+            .context("local-root-binding-not-found")?;
+        if !matches!(
+            binding.2.as_str(),
+            "active" | "paused" | "local-rename-required"
+        ) {
+            bail!("invalid-root-state");
+        }
+        if binding.3 != i64::try_from(expected_binding_generation)? {
+            bail!("stale-binding-generation");
+        }
+        if binding.4 != i64::try_from(expected_operation_revision)? {
+            bail!("stale-operation-revision");
+        }
+        if evidence.source_filesystem_identity.is_empty() {
+            bail!("source-missing");
+        }
+        if crate::sync_folders::canonical_path_key(Path::new(&binding.1))
+            != evidence.source_canonical_key
+        {
+            bail!("path-changed");
+        }
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root_operations WHERE library_uuid=?1 AND root_uuid=?2 AND state IN ('pending','running','waiting'))",
+            params![library_uuid,root_uuid],
+            |row| row.get::<_, bool>(0),
+        )? {
+            bail!("operation-in-progress");
+        }
+        let next_generation = expected_binding_generation.saturating_add(1);
+        transaction.execute(
+            "INSERT INTO root_operations(operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,result_json,expected_operation_revision,expected_binding_generation,operation_revision,created_at,updated_at) VALUES (?1,?2,?3,?4,'running','fenced',?5,?6,?7,?8,?9,1,?10,?10)",
+            params![operation_uuid,library_uuid,root_uuid,kind,request_hash,request_json,result_json,i64::try_from(expected_operation_revision)?,i64::try_from(expected_binding_generation)?,now],
+        )?;
+        transaction.execute(
+            "INSERT INTO root_relocation_operations(operation_uuid,mode,desired_materialization_fingerprint,source_path,source_canonical_key,source_filesystem_identity,target_path,target_canonical_key,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![operation_uuid,mode,desired_materialization_fingerprint,evidence.source_path,evidence.source_canonical_key,evidence.source_filesystem_identity,evidence.target_path,evidence.target_canonical_key,now],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE local_root_bindings SET state='relocating',binding_generation=?1,operation_revision=operation_revision+1,last_error_code=NULL,last_error_detail=NULL,updated_at=?2 WHERE library_uuid=?3 AND root_uuid=?4 AND local_binding_uuid=?5 AND binding_generation=?6 AND operation_revision=?7",
+            params![i64::try_from(next_generation)?,now,library_uuid,root_uuid,binding.0,i64::try_from(expected_binding_generation)?,i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-binding-generation");
+        }
+        transaction.commit()?;
+        drop(connection);
+        Ok((
+            self.root_relocation_operation(operation_uuid)?
+                .context("root-relocation-not-found")?,
+            true,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_automatic_root_rename_preflight_failure(
+        &self,
+        operation_uuid: &str,
+        library_uuid: &str,
+        root_uuid: &str,
+        request_hash: &str,
+        request: &serde_json::Value,
+        expected_operation_revision: u64,
+        expected_binding_generation: u64,
+        desired_materialization_fingerprint: &str,
+        target_path: &Path,
+    ) -> anyhow::Result<RootOperationRecord> {
+        let request_json = serde_json::to_string(request)?;
+        let target_path = target_path.to_string_lossy().into_owned();
+        let target_canonical_key = crate::sync_folders::canonical_path_key(Path::new(&target_path));
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT operation.operation_uuid FROM root_operations operation JOIN root_relocation_operations relocation ON relocation.operation_uuid=operation.operation_uuid WHERE operation.operation_uuid=?1 AND operation.library_uuid=?2 AND operation.root_uuid=?3 AND operation.kind='automatic-rename' AND operation.request_hash=?4 AND operation.request_json=?5 AND relocation.desired_materialization_fingerprint=?6 AND relocation.target_canonical_key=?7",
+                params![operation_uuid, library_uuid, root_uuid, request_hash, request_json, desired_materialization_fingerprint, target_canonical_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let result = transaction.query_row(
+                "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+                [existing],
+                root_operation_record_from_row,
+            )?;
+            transaction.commit()?;
+            return Ok(result);
+        }
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root_operations WHERE operation_uuid=?1)",
+            [operation_uuid],
+            |row| row.get::<_, bool>(0),
+        )? {
+            bail!("idempotency-key-reused");
+        }
+        let binding: (String, String, String, String, i64, i64) = transaction
+            .query_row(
+                "SELECT local_binding_uuid,local_path,canonical_path_key,state,binding_generation,operation_revision FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2",
+                params![library_uuid, root_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()?
+            .context("local-root-binding-not-found")?;
+        if !matches!(
+            binding.3.as_str(),
+            "active" | "paused" | "local-rename-required"
+        ) {
+            bail!("invalid-root-state");
+        }
+        if binding.4 != i64::try_from(expected_binding_generation)? {
+            bail!("stale-binding-generation");
+        }
+        if binding.5 != i64::try_from(expected_operation_revision)? {
+            bail!("stale-operation-revision");
+        }
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT operation.operation_uuid FROM root_operations operation JOIN root_relocation_operations relocation ON relocation.operation_uuid=operation.operation_uuid WHERE operation.library_uuid=?1 AND operation.root_uuid=?2 AND operation.kind='automatic-rename' AND operation.state='failed' AND operation.phase='local-rename-required' AND operation.error_code='local-rename-required' AND relocation.desired_materialization_fingerprint=?3 AND relocation.target_canonical_key=?4 ORDER BY operation.updated_at DESC LIMIT 1",
+                params![library_uuid, root_uuid, desired_materialization_fingerprint, target_canonical_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            transaction.execute(
+                "UPDATE local_root_bindings SET state='local-rename-required',last_error_code='local-rename-required',last_error_detail=NULL,updated_at=?1 WHERE library_uuid=?2 AND root_uuid=?3 AND local_binding_uuid=?4 AND binding_generation=?5 AND operation_revision=?6",
+                params![now, library_uuid, root_uuid, binding.0, binding.4, binding.5],
+            )?;
+            let result = transaction.query_row(
+                "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+                [existing],
+                root_operation_record_from_row,
+            )?;
+            transaction.commit()?;
+            return Ok(result);
+        }
+        let source_filesystem_identity =
+            crate::library_path::local_file_identity(Path::new(&binding.1)).ok();
+        let result_json = serde_json::json!({"preflightErrorCode":"local-rename-required"});
+        transaction.execute(
+            "INSERT INTO root_operations(operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,result_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at) VALUES (?1,?2,?3,'automatic-rename','failed','local-rename-required',?4,?5,?6,?7,?8,1,0,'local-rename-required',?9,?9)",
+            params![operation_uuid, library_uuid, root_uuid, request_hash, request_json, serde_json::to_string(&result_json)?, i64::try_from(expected_operation_revision)?, i64::try_from(expected_binding_generation)?, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO root_relocation_operations(operation_uuid,mode,desired_materialization_fingerprint,source_path,source_canonical_key,source_filesystem_identity,target_path,target_canonical_key,cleanup_state,updated_at) VALUES (?1,'automatic-rename',?2,?3,?4,?5,?6,?7,'not-required',?8)",
+            params![operation_uuid, desired_materialization_fingerprint, binding.1, binding.2, source_filesystem_identity, target_path, target_canonical_key, now],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE local_root_bindings SET state='local-rename-required',operation_revision=operation_revision+1,last_error_code='local-rename-required',last_error_detail=NULL,updated_at=?1 WHERE library_uuid=?2 AND root_uuid=?3 AND local_binding_uuid=?4 AND binding_generation=?5 AND operation_revision=?6",
+            params![now, library_uuid, root_uuid, binding.0, binding.4, binding.5],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        let result = transaction.query_row(
+            "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+            [operation_uuid],
+            root_operation_record_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn advance_root_relocation(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        phase: &str,
+        staging_path: Option<&str>,
+        target_filesystem_identity: Option<&str>,
+        verification_digest: Option<&str>,
+        transferred_bytes: u64,
+        verified_bytes: u64,
+        cutover_committed: bool,
+    ) -> anyhow::Result<RootRelocationRecord> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let state = if phase == "completed" {
+            "completed"
+        } else {
+            "running"
+        };
+        let changed = transaction.execute(
+            "UPDATE root_operations SET state=?1,phase=?2,operation_revision=operation_revision+1,cutover_committed=MAX(cutover_committed,?3),error_code=NULL,error_detail=NULL,updated_at=?4 WHERE operation_uuid=?5 AND kind IN ('relocate','automatic-rename') AND state IN ('pending','running','waiting') AND operation_revision=?6 AND EXISTS(SELECT 1 FROM local_root_bindings binding WHERE binding.library_uuid=root_operations.library_uuid AND binding.root_uuid=root_operations.root_uuid AND binding.local_binding_uuid=COALESCE(json_extract(root_operations.request_json,'$.localBindingUuid'),binding.local_binding_uuid) AND binding.binding_generation=root_operations.expected_binding_generation+1)",
+            params![state,phase,cutover_committed as i64,now,operation_uuid,i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            let completed: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM root_operations WHERE operation_uuid=?1 AND state='completed')",
+                [operation_uuid],
+                |row| row.get(0),
+            )?;
+            if completed {
+                transaction.commit()?;
+                drop(connection);
+                return self
+                    .root_relocation_operation(operation_uuid)?
+                    .context("root-relocation-not-found");
+            }
+            bail!("stale-operation-revision");
+        }
+        transaction.execute(
+            "UPDATE root_relocation_operations SET staging_path=COALESCE(?1,staging_path),target_filesystem_identity=COALESCE(?2,target_filesystem_identity),verification_digest=COALESCE(?3,verification_digest),transferred_bytes=MAX(transferred_bytes,?4),verified_bytes=MAX(verified_bytes,?5),cleanup_state=CASE WHEN ?6='cleanup' THEN 'ready' WHEN ?6='completed' THEN 'complete' ELSE cleanup_state END,updated_at=?7 WHERE operation_uuid=?8",
+            params![staging_path,target_filesystem_identity,verification_digest,i64::try_from(transferred_bytes)?,i64::try_from(verified_bytes)?,phase,now,operation_uuid],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.root_relocation_operation(operation_uuid)?
+            .context("root-relocation-not-found")
+    }
+
+    pub fn record_root_relocation_transfer_progress(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        staging_path: &str,
+        transferred_bytes: u64,
+        checkpoint: &crate::sync_folders::RelocationTransferCheckpoint,
+    ) -> anyhow::Result<RootRelocationRecord> {
+        let now = unix_timestamp_millis();
+        let checkpoint = serde_json::to_string(checkpoint)?;
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE root_operations SET operation_revision=operation_revision+1,result_json=json_set(COALESCE(result_json,'{}'),'$.transferProgress',json(?1),'$.transferProgress.updatedAt',?2),updated_at=?2 WHERE operation_uuid=?3 AND kind IN ('relocate','automatic-rename') AND state='running' AND phase='transferring' AND operation_revision=?4",
+            params![checkpoint,now,operation_uuid,i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        transaction.execute(
+            "UPDATE root_relocation_operations SET staging_path=?1,transferred_bytes=MAX(transferred_bytes,?2),updated_at=?3 WHERE operation_uuid=?4",
+            params![staging_path,i64::try_from(transferred_bytes)?,now,operation_uuid],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.root_relocation_operation(operation_uuid)?
+            .context("root-relocation-not-found")
+    }
+
+    pub fn root_relocation_transfer_checkpoint(
+        &self,
+        operation_uuid: &str,
+    ) -> anyhow::Result<crate::sync_folders::RelocationTransferCheckpoint> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT json_extract(result_json,'$.transferProgress') FROM root_operations WHERE operation_uuid=?1",
+                [operation_uuid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(Into::into)
+            .map(|value| value.unwrap_or_default())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_root_relocation_host_cutover(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        local_binding_uuid: &str,
+        binding_generation: u64,
+        target_path: &str,
+        target_canonical_key: &str,
+        placement_parent: &str,
+        placement_parent_key: &str,
+        marker_identity: &str,
+        filesystem_identity: &str,
+        applied_materialized_name: &str,
+        applied_materialization_fingerprint: &str,
+    ) -> anyhow::Result<RootRelocationRecord> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let operation: (String, String, String, String, i64, String, i64) = transaction.query_row(
+            "SELECT operation.library_uuid,operation.root_uuid,operation.state,operation.phase,operation.cutover_committed,relocation.desired_materialization_fingerprint,operation.operation_revision FROM root_operations operation JOIN root_relocation_operations relocation ON relocation.operation_uuid=operation.operation_uuid WHERE operation.operation_uuid=?1 AND operation.kind IN ('relocate','automatic-rename')",
+            [operation_uuid],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+        ).context("root-operation-not-found")?;
+        if operation.2 == "completed" {
+            transaction.commit()?;
+            drop(connection);
+            return self
+                .root_relocation_operation(operation_uuid)?
+                .context("root-relocation-not-found");
+        }
+        if operation.3 == "reconciling" && operation.4 != 0 {
+            let already: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND canonical_path_key=?5 AND state IN ('reconcile-required','active','paused'))",
+                params![operation.0,operation.1,local_binding_uuid,i64::try_from(binding_generation)?,target_canonical_key],
+                |row| row.get(0),
+            )?;
+            if !already {
+                bail!("stale-binding-generation");
+            }
+            transaction.commit()?;
+            drop(connection);
+            return self
+                .root_relocation_operation(operation_uuid)?
+                .context("root-relocation-not-found");
+        }
+        if operation.3 != "host-cutover"
+            || operation.6 != i64::try_from(expected_operation_revision)?
+        {
+            bail!("stale-operation-revision");
+        }
+        if operation.5 != applied_materialization_fingerprint {
+            bail!("stale-operation-revision");
+        }
+        let changed = transaction.execute(
+            "UPDATE local_root_bindings SET local_path=?1,canonical_path_key=?2,placement_parent=?3,placement_parent_key=?4,marker_identity=?5,filesystem_identity=?6,state='reconcile-required',applied_materialized_name=CASE WHEN desired_materialization_fingerprint=?9 THEN ?7 ELSE applied_materialized_name END,applied_materialized_name_key=CASE WHEN desired_materialization_fingerprint=?9 THEN ?8 ELSE applied_materialized_name_key END,applied_materialization_fingerprint=CASE WHEN desired_materialization_fingerprint=?9 THEN ?9 ELSE applied_materialization_fingerprint END,operation_revision=operation_revision+1,last_error_code=NULL,last_error_detail=NULL,updated_at=?10 WHERE library_uuid=?11 AND root_uuid=?12 AND local_binding_uuid=?13 AND binding_generation=?14 AND state IN ('relocating','reconcile-required')",
+            params![target_path,target_canonical_key,placement_parent,placement_parent_key,marker_identity,filesystem_identity,applied_materialized_name,applied_materialized_name.to_lowercase(),applied_materialization_fingerprint,now,operation.0,operation.1,local_binding_uuid,i64::try_from(binding_generation)?],
+        )?;
+        if changed != 1 {
+            let already: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND canonical_path_key=?5 AND state IN ('reconcile-required','active'))",
+                params![operation.0,operation.1,local_binding_uuid,i64::try_from(binding_generation)?,target_canonical_key],
+                |row| row.get(0),
+            )?;
+            if !already {
+                bail!("stale-binding-generation");
+            }
+        }
+        let changed = transaction.execute(
+            "UPDATE root_operations SET state='running',phase='reconciling',cutover_committed=1,operation_revision=operation_revision+1,updated_at=?1 WHERE operation_uuid=?2 AND state='running' AND phase='host-cutover' AND operation_revision=?3",
+            params![now,operation_uuid,i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        transaction.execute(
+            "UPDATE root_relocation_operations SET target_filesystem_identity=?1,updated_at=?2 WHERE operation_uuid=?3",
+            params![filesystem_identity,now,operation_uuid],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.root_relocation_operation(operation_uuid)?
+            .context("root-relocation-not-found")
+    }
+
+    pub fn complete_root_relocation(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        binding_generation: u64,
+    ) -> anyhow::Result<RootOperationRecord> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let identity: (String, String, String, String, String, i64) = transaction.query_row(
+            "SELECT library_uuid,root_uuid,request_json,state,phase,operation_revision FROM root_operations WHERE operation_uuid=?1 AND kind IN ('relocate','automatic-rename')",
+            [operation_uuid],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).context("root-operation-not-found")?;
+        if identity.3 == "completed" {
+            let result = transaction.query_row(
+                "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+                [operation_uuid],root_operation_record_from_row,
+            )?;
+            transaction.commit()?;
+            return Ok(result);
+        }
+        if identity.3 != "running"
+            || identity.4 != "cleanup"
+            || identity.5 != i64::try_from(expected_operation_revision)?
+        {
+            bail!("stale-operation-revision");
+        }
+        let resume_state = relocation_resume_state(&identity.2);
+        let changed = transaction.execute(
+            "UPDATE local_root_bindings SET state=?1,operation_revision=operation_revision+1,last_error_code=NULL,last_error_detail=NULL,updated_at=?2 WHERE library_uuid=?3 AND root_uuid=?4 AND binding_generation=?5 AND state IN ('reconcile-required','active','paused')",
+            params![resume_state,now,identity.0,identity.1,i64::try_from(binding_generation)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-binding-generation");
+        }
+        let changed = transaction.execute(
+            "UPDATE root_operations SET state='completed',phase='completed',cutover_committed=1,operation_revision=operation_revision+1,error_code=NULL,error_detail=NULL,updated_at=?1 WHERE operation_uuid=?2 AND state='running' AND phase='cleanup' AND operation_revision=?3",
+            params![now,operation_uuid,i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        transaction.execute(
+            "UPDATE root_relocation_operations SET cleanup_state='complete',updated_at=?1 WHERE operation_uuid=?2",
+            params![now,operation_uuid],
+        )?;
+        let result = transaction.query_row(
+            "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+            [operation_uuid],root_operation_record_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn fail_root_relocation_cleanup(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        binding_generation: u64,
+        error_code: &str,
+    ) -> anyhow::Result<RootOperationRecord> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let identity: (String, String, String, i64) = transaction.query_row(
+            "SELECT library_uuid,root_uuid,request_json,operation_revision FROM root_operations WHERE operation_uuid=?1 AND kind IN ('relocate','automatic-rename') AND state='running' AND phase='cleanup'",
+            [operation_uuid],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).context("stale-operation-revision")?;
+        if identity.3 != i64::try_from(expected_operation_revision)? {
+            bail!("stale-operation-revision");
+        }
+        let resume_state = relocation_resume_state(&identity.2);
+        let changed = transaction.execute(
+            "UPDATE local_root_bindings SET state=?1,operation_revision=operation_revision+1,last_error_code=?2,last_error_detail=NULL,updated_at=?3 WHERE library_uuid=?4 AND root_uuid=?5 AND binding_generation=?6 AND state IN ('reconcile-required','active','paused')",
+            params![resume_state,error_code,now,identity.0,identity.1,i64::try_from(binding_generation)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-binding-generation");
+        }
+        let changed = transaction.execute(
+            "UPDATE root_operations SET state='failed',phase='transfer-failed',error_code=?1,error_detail=NULL,operation_revision=operation_revision+1,updated_at=?2 WHERE operation_uuid=?3 AND operation_revision=?4 AND state='running' AND phase='cleanup'",
+            params![error_code,now,operation_uuid,i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        transaction.execute(
+            "UPDATE root_relocation_operations SET cleanup_state='failed',updated_at=?1 WHERE operation_uuid=?2",
+            params![now,operation_uuid],
+        )?;
+        let result = transaction.query_row(
+            "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+            [operation_uuid],root_operation_record_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn repair_root_relocation_after_catalog_cutover(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+    ) -> anyhow::Result<RootRelocationRecord> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let operation: (String, String, i64, String) = transaction.query_row(
+            "SELECT library_uuid,root_uuid,expected_binding_generation,request_json FROM root_operations WHERE operation_uuid=?1 AND kind IN ('relocate','automatic-rename') AND state='failed' AND cutover_committed=0 AND operation_revision=?2",
+            params![operation_uuid, i64::try_from(expected_operation_revision)?],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).context("stale-operation-revision")?;
+        let local_binding_uuid =
+            relocation_local_binding_uuid(&operation.3).context("stale-binding-generation")?;
+        let changed = transaction.execute(
+            "UPDATE local_root_bindings SET state='relocating',operation_revision=operation_revision+1,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE library_uuid=?2 AND root_uuid=?3 AND local_binding_uuid=?4 AND binding_generation=?5 AND state IN ('active','paused','local-rename-required','relocating')",
+            params![now,operation.0,operation.1,local_binding_uuid,operation.2.saturating_add(1)],
+        )?;
+        if changed != 1 {
+            bail!("stale-binding-generation");
+        }
+        let changed = transaction.execute(
+            "UPDATE root_operations SET state='running',phase='host-cutover',cutover_committed=1,operation_revision=operation_revision+1,error_code=NULL,error_detail=NULL,updated_at=?1 WHERE operation_uuid=?2 AND state='failed' AND operation_revision=?3",
+            params![now, operation_uuid, i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        transaction.commit()?;
+        drop(connection);
+        self.root_relocation_operation(operation_uuid)?
+            .context("root-relocation-not-found")
+    }
+
+    pub fn complete_logical_root_rename(
+        &self,
+        operation_uuid: &str,
+    ) -> anyhow::Result<RootOperationRecord> {
+        let now = unix_timestamp_millis();
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = connection.execute(
+            "UPDATE root_operations SET state='completed',phase='completed',operation_revision=operation_revision+1,updated_at=?1 WHERE operation_uuid=?2 AND kind='logical-rename' AND state IN ('pending','running','waiting')",
+            params![now,operation_uuid],
+        )?;
+        if changed != 1 {
+            let completed: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM root_operations WHERE operation_uuid=?1 AND kind='logical-rename' AND state='completed')",
+                [operation_uuid],|row|row.get(0),
+            )?;
+            if !completed {
+                bail!("root-operation-not-found");
+            }
+        }
+        drop(connection);
+        self.root_operation(operation_uuid)?
+            .context("root-operation-not-found")
+    }
+
+    pub fn fail_root_relocation(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        phase: &str,
+        error_code: &str,
+    ) -> anyhow::Result<RootOperationRecord> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let identity: (String, String, String, String, i64, String, i64, i64) = transaction.query_row(
+            "SELECT library_uuid,root_uuid,kind,state,cutover_committed,request_json,operation_revision,expected_binding_generation FROM root_operations WHERE operation_uuid=?1 AND kind IN ('relocate','automatic-rename')",
+            [operation_uuid],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+        ).context("root-operation-not-found")?;
+        if identity.3 == "failed" {
+            let result = transaction.query_row(
+                "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+                [operation_uuid],root_operation_record_from_row,
+            )?;
+            transaction.commit()?;
+            return Ok(result);
+        }
+        if !matches!(identity.3.as_str(), "pending" | "running" | "waiting")
+            || identity.6 != i64::try_from(expected_operation_revision)?
+        {
+            bail!("stale-operation-revision");
+        }
+        let binding_state = if identity.4 != 0 {
+            "reconcile-required"
+        } else if identity.2 == "automatic-rename" {
+            "local-rename-required"
+        } else {
+            relocation_resume_state(&identity.5)
+        };
+        let changed = transaction.execute(
+            "UPDATE local_root_bindings SET state=?1,last_error_code=?2,last_error_detail=NULL,operation_revision=operation_revision+1,updated_at=?3 WHERE library_uuid=?4 AND root_uuid=?5 AND binding_generation=?6",
+            params![binding_state,error_code,now,identity.0,identity.1,identity.7.saturating_add(1)],
+        )?;
+        if changed != 1 {
+            bail!("stale-binding-generation");
+        }
+        let changed = transaction.execute(
+            "UPDATE root_operations SET state='failed',phase=?1,error_code=?2,error_detail=NULL,operation_revision=operation_revision+1,updated_at=?3 WHERE operation_uuid=?4 AND operation_revision=?5 AND state IN ('pending','running','waiting')",
+            params![phase,error_code,now,operation_uuid,i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        let result = transaction.query_row(
+            "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+            [operation_uuid],root_operation_record_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn cancel_root_relocation(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        expected_binding_generation: u64,
+    ) -> anyhow::Result<RootOperationRecord> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let identity: (String, String, String, i64, i64, String) = transaction.query_row(
+            "SELECT library_uuid,root_uuid,state,operation_revision,cutover_committed,request_json FROM root_operations WHERE operation_uuid=?1 AND kind IN ('relocate','automatic-rename')",
+            [operation_uuid],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).context("root-operation-not-found")?;
+        if identity.4 != 0 {
+            bail!("cutover-committed");
+        }
+        let binding_generation: i64 = transaction.query_row(
+            "SELECT binding_generation FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2",
+            params![identity.0,identity.1],|row|row.get(0),
+        )?;
+        if binding_generation != i64::try_from(expected_binding_generation)? {
+            bail!("stale-binding-generation");
+        }
+        if let Some(expected_local_binding_uuid) = relocation_local_binding_uuid(&identity.5) {
+            let current_local_binding_uuid: String = transaction.query_row(
+                "SELECT local_binding_uuid FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2",
+                params![identity.0, identity.1],
+                |row| row.get(0),
+            )?;
+            if current_local_binding_uuid != expected_local_binding_uuid {
+                bail!("stale-binding-generation");
+            }
+        }
+        if identity.2 == "cancelled"
+            && identity.3 == i64::try_from(expected_operation_revision.saturating_add(1))?
+        {
+            let result = transaction.query_row(
+                "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+                [operation_uuid],root_operation_record_from_row,
+            )?;
+            transaction.commit()?;
+            return Ok(result);
+        }
+        if !matches!(
+            identity.2.as_str(),
+            "pending" | "running" | "waiting" | "failed"
+        ) {
+            bail!("invalid-root-state");
+        }
+        if identity.3 != i64::try_from(expected_operation_revision)? {
+            bail!("stale-operation-revision");
+        }
+        let resume_state = relocation_resume_state(&identity.5);
+        let changed = transaction.execute(
+            "UPDATE local_root_bindings SET state=?1,operation_revision=operation_revision+1,last_error_code=NULL,last_error_detail=NULL,updated_at=?2 WHERE library_uuid=?3 AND root_uuid=?4 AND binding_generation=?5 AND state IN ('relocating','active','paused','local-rename-required')",
+            params![resume_state,now,identity.0,identity.1,i64::try_from(expected_binding_generation)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-binding-generation");
+        }
+        let changed = transaction.execute(
+            "UPDATE root_operations SET state='cancelled',phase='cancelled',operation_revision=operation_revision+1,error_code=NULL,error_detail=NULL,updated_at=?1 WHERE operation_uuid=?2 AND operation_revision=?3 AND state IN ('pending','running','waiting','failed')",
+            params![now,operation_uuid,i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        let result = transaction.query_row(
+            "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+            [operation_uuid],root_operation_record_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn retry_root_relocation(
+        &self,
+        operation_uuid: &str,
+        expected_operation_revision: u64,
+        expected_binding_generation: u64,
+    ) -> anyhow::Result<RootRelocationRecord> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let operation: (String, String, String, String, i64, i64, String, Option<String>, String, i64) = transaction.query_row(
+            "SELECT operation.library_uuid,operation.root_uuid,operation.kind,operation.state,operation.operation_revision,operation.cutover_committed,relocation.desired_materialization_fingerprint,relocation.source_filesystem_identity,operation.request_json,operation.expected_binding_generation FROM root_operations operation JOIN root_relocation_operations relocation ON relocation.operation_uuid=operation.operation_uuid WHERE operation.operation_uuid=?1 AND operation.kind IN ('relocate','automatic-rename')",
+            [operation_uuid],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+        ).context("root-operation-not-found")?;
+        let binding: (String, i64, String, String) = transaction.query_row(
+            "SELECT local_binding_uuid,binding_generation,state,desired_materialization_fingerprint FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2",
+            params![operation.0,operation.1],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).context("local-root-binding-not-found")?;
+        if binding.1 != i64::try_from(expected_binding_generation)? {
+            bail!("stale-binding-generation");
+        }
+        if relocation_local_binding_uuid(&operation.8)
+            .as_deref()
+            .is_some_and(|expected| expected != binding.0)
+        {
+            bail!("stale-binding-generation");
+        }
+        if operation.2 == "automatic-rename" && binding.3 != operation.6 {
+            bail!("stale-operation-revision");
+        }
+        if operation.7.as_deref().is_none_or(str::is_empty) {
+            bail!("stale-plan");
+        }
+        if serde_json::from_str::<serde_json::Value>(&operation.8)
+            .ok()
+            .and_then(|request| request.get("pathEvidence").cloned())
+            .is_none()
+        {
+            bail!("stale-plan");
+        }
+        if operation.3 == "running"
+            && operation.4 == i64::try_from(expected_operation_revision.saturating_add(1))?
+        {
+            transaction.commit()?;
+            drop(connection);
+            return self
+                .root_relocation_operation(operation_uuid)?
+                .context("root-relocation-not-found");
+        }
+        if operation.3 != "failed" {
+            bail!("invalid-root-state");
+        }
+        if operation.4 != i64::try_from(expected_operation_revision)? {
+            bail!("stale-operation-revision");
+        }
+        let next_binding_state = if operation.5 != 0 {
+            "reconcile-required"
+        } else {
+            "relocating"
+        };
+        let next_binding_generation = if operation.5 == 0 && binding.1 == operation.9 {
+            operation.9.saturating_add(1)
+        } else {
+            binding.1
+        };
+        let changed = transaction.execute(
+            "UPDATE local_root_bindings SET state=?1,binding_generation=?2,last_error_code=NULL,last_error_detail=NULL,operation_revision=operation_revision+1,updated_at=?3 WHERE library_uuid=?4 AND root_uuid=?5 AND local_binding_uuid=?6 AND binding_generation=?7 AND state IN ('active','paused','local-rename-required','relocating','reconcile-required')",
+            params![next_binding_state,next_binding_generation,now,operation.0,operation.1,binding.0,i64::try_from(expected_binding_generation)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-binding-generation");
+        }
+        let changed = transaction.execute(
+            "UPDATE root_operations SET state='running',phase=CASE WHEN cutover_committed=1 THEN 'reconciling' ELSE 'fenced' END,operation_revision=operation_revision+1,error_code=NULL,error_detail=NULL,updated_at=?1 WHERE operation_uuid=?2 AND state='failed' AND operation_revision=?3",
+            params![now,operation_uuid,i64::try_from(expected_operation_revision)?],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        transaction.commit()?;
+        drop(connection);
+        self.root_relocation_operation(operation_uuid)?
+            .context("root-relocation-not-found")
+    }
+
+    pub fn mark_root_relocation_projection_repaired(
+        &self,
+        operation_uuid: &str,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = connection.execute(
+            "UPDATE root_relocation_operations SET cleanup_state='not-required',updated_at=?1 WHERE operation_uuid=?2 AND EXISTS(SELECT 1 FROM root_operations operation WHERE operation.operation_uuid=root_relocation_operations.operation_uuid AND operation.state IN ('cancelled','failed') AND operation.cutover_committed=0)",
+            params![unix_timestamp_millis(), operation_uuid],
+        )?;
+        if changed != 1 {
+            bail!("stale-operation-revision");
+        }
+        Ok(())
     }
 
     pub fn plugin_runtime_launch_is_current(
@@ -7192,6 +8130,238 @@ mod tests {
             params![library_uuid,root_uuid,"b".repeat(64)],
         ).is_err());
         drop(connection);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn relocation_journal_fences_only_one_binding_and_is_idempotent() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let library_uuid = "00000000-0000-7000-8000-000000000201";
+        let root_uuid = "00000000-0000-7000-8000-000000000202";
+        let root_folder_uuid = "00000000-0000-7000-8000-000000000203";
+        let binding_uuid = "00000000-0000-7000-8000-000000000204";
+        let operation_uuid = "00000000-0000-7000-8000-000000000205";
+        register_test_library(&registry, library_uuid);
+        registry
+            .upsert_remote_sync_root(
+                library_uuid,
+                root_uuid,
+                root_folder_uuid,
+                "Photos",
+                "Photos",
+                &"a".repeat(64),
+                1,
+                "active",
+                None,
+                None,
+            )
+            .unwrap();
+        let now = unix_timestamp_millis();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,state,binding_generation,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,applied_materialized_name,applied_materialized_name_key,applied_materialization_fingerprint,created_at,updated_at) VALUES (?1,?2,?3,'D:/Library/Photos','d:/library/photos','D:/Library','d:/library','paused',1,'Photos','photos',?4,'Photos','photos',?4,?5,?5)",
+            params![library_uuid,root_uuid,binding_uuid,"a".repeat(64),now],
+        ).unwrap();
+        let evidence = crate::sync_folders::RelocationEvidence {
+            source_path: "D:/Library/Photos".into(),
+            source_canonical_key: "d:/library/photos".into(),
+            source_filesystem_identity: "source".into(),
+            source_digest: "b".repeat(64),
+            source_bytes: 0,
+            target_path: "D:/Library/Renamed".into(),
+            target_canonical_key: "d:/library/renamed".into(),
+            target_parent_identity: "parent".into(),
+            same_volume: true,
+        };
+        let request = serde_json::json!({
+            "localBindingUuid": binding_uuid,
+            "pathEvidence": evidence,
+            "resumeState": "paused",
+        });
+        let hash = crate::sync_folders::request_hash(&request).unwrap();
+        let evidence: crate::sync_folders::RelocationEvidence =
+            serde_json::from_value(request["pathEvidence"].clone()).unwrap();
+        let (first, created) = registry
+            .begin_root_relocation(
+                operation_uuid,
+                library_uuid,
+                root_uuid,
+                "explicit-move",
+                &hash,
+                &request,
+                0,
+                1,
+                &"a".repeat(64),
+                &evidence,
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(first.operation.phase, "fenced");
+        assert_eq!(
+            registry
+                .local_root_binding(library_uuid, root_uuid)
+                .unwrap()
+                .unwrap()
+                .binding_generation,
+            2
+        );
+        let (retry, created) = registry
+            .begin_root_relocation(
+                operation_uuid,
+                library_uuid,
+                root_uuid,
+                "explicit-move",
+                &hash,
+                &request,
+                0,
+                1,
+                &"a".repeat(64),
+                &evidence,
+            )
+            .unwrap();
+        assert!(!created);
+        assert_eq!(retry.operation.operation_uuid, operation_uuid);
+        assert_eq!(
+            registry
+                .advance_root_relocation(
+                    operation_uuid,
+                    0,
+                    "transferring",
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    false
+                )
+                .unwrap_err()
+                .to_string(),
+            "stale-operation-revision"
+        );
+
+        let failed = registry
+            .fail_root_relocation(
+                operation_uuid,
+                first.operation.operation_revision,
+                "transfer-failed",
+                "transfer-failed",
+            )
+            .unwrap();
+        assert_eq!(failed.operation_revision, 2);
+        assert_eq!(
+            registry
+                .local_root_binding(library_uuid, root_uuid)
+                .unwrap()
+                .unwrap()
+                .state,
+            "paused"
+        );
+        let retried = registry
+            .retry_root_relocation(operation_uuid, failed.operation_revision, 2)
+            .unwrap();
+        assert_eq!(retried.operation.state, "running");
+        let idempotent_retry = registry
+            .retry_root_relocation(operation_uuid, failed.operation_revision, 2)
+            .unwrap();
+        assert_eq!(idempotent_retry.operation.operation_revision, 3);
+        let cancelled = registry
+            .cancel_root_relocation(
+                operation_uuid,
+                idempotent_retry.operation.operation_revision,
+                2,
+            )
+            .unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        let idempotent_cancel = registry
+            .cancel_root_relocation(
+                operation_uuid,
+                idempotent_retry.operation.operation_revision,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            idempotent_cancel.operation_revision,
+            cancelled.operation_revision
+        );
+        assert_eq!(
+            registry
+                .local_root_binding(library_uuid, root_uuid)
+                .unwrap()
+                .unwrap()
+                .state,
+            "paused"
+        );
+
+        let failure_operation_uuid = "00000000-0000-7000-8000-000000000206";
+        let binding = registry
+            .local_root_binding(library_uuid, root_uuid)
+            .unwrap()
+            .unwrap();
+        let failure_request = serde_json::json!({
+            "localBindingUuid": binding_uuid,
+            "operationUuid": failure_operation_uuid,
+            "resumeState": "paused",
+            "targetPath": "D:/Library/Blocked",
+        });
+        let failure_hash = crate::sync_folders::request_hash(&failure_request).unwrap();
+        let failure = registry
+            .record_automatic_root_rename_preflight_failure(
+                failure_operation_uuid,
+                library_uuid,
+                root_uuid,
+                &failure_hash,
+                &failure_request,
+                binding.operation_revision,
+                binding.binding_generation,
+                &"c".repeat(64),
+                Path::new("D:/Library/Blocked"),
+            )
+            .unwrap();
+        assert_eq!(failure.state, "failed");
+        assert_eq!(failure.phase, "local-rename-required");
+        assert_eq!(failure.error_code.as_deref(), Some("local-rename-required"));
+        let failed_binding = registry
+            .local_root_binding(library_uuid, root_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_binding.state, "local-rename-required");
+        assert_eq!(
+            failed_binding.last_error_code.as_deref(),
+            Some("local-rename-required")
+        );
+        let duplicate = registry
+            .record_automatic_root_rename_preflight_failure(
+                failure_operation_uuid,
+                library_uuid,
+                root_uuid,
+                &failure_hash,
+                &failure_request,
+                failed_binding.operation_revision,
+                failed_binding.binding_generation,
+                &"c".repeat(64),
+                Path::new("D:/Library/Blocked"),
+            )
+            .unwrap();
+        assert_eq!(duplicate.operation_uuid, failure.operation_uuid);
+        assert_eq!(
+            registry
+                .local_root_binding(library_uuid, root_uuid)
+                .unwrap()
+                .unwrap()
+                .operation_revision,
+            failed_binding.operation_revision
+        );
+        drop(registry);
+        let reopened = HostRegistry::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .local_root_binding(library_uuid, root_uuid)
+                .unwrap()
+                .unwrap()
+                .state,
+            "local-rename-required"
+        );
         drop(reopened);
         let _ = std::fs::remove_file(path);
     }

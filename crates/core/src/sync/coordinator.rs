@@ -392,6 +392,30 @@ impl SyncCoordinator {
         workers.shutdown().await
     }
 
+    pub async fn fence_media_binding_registration(
+        &self,
+        binding_epoch: uuid::Uuid,
+    ) -> anyhow::Result<super::media::worker::MediaRegistrationFence> {
+        let workers = self
+            .media_workers
+            .lock()
+            .await
+            .entry(binding_epoch)
+            .or_insert_with(|| {
+                super::media::worker::MediaWorkerSet::new(
+                    super::media::worker::MediaWorkLimiter::new_with_temp_budget(
+                        1,
+                        128,
+                        128 * 1024 * 1024,
+                        16 * 1024 * 1024 * 1024,
+                    )
+                    .expect("production media limits are nonzero"),
+                )
+            })
+            .clone();
+        workers.registration_fence().await
+    }
+
     pub async fn resume_media_binding(&self, binding_epoch: uuid::Uuid) {
         // Pause leaves a cancelled worker set behind as an epoch tombstone so
         // an already-started turn cannot recreate work after the fence. Once

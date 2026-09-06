@@ -18,8 +18,14 @@ const EVENT_COALESCE_WINDOW: Duration = Duration::from_millis(100);
 const ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct WatcherHandle {
-    shutdown_sender: Option<std_mpsc::Sender<()>>,
+    command_sender: Option<std_mpsc::Sender<WatcherCommand>>,
     join_handle: Option<thread::JoinHandle<()>>,
+}
+
+enum WatcherCommand {
+    Refresh(std_mpsc::Sender<Result<(), String>>),
+    QuiescePath(PathBuf, std_mpsc::Sender<Result<(), String>>),
+    Shutdown,
 }
 
 pub fn start_watcher(
@@ -27,27 +33,49 @@ pub fn start_watcher(
     task_queue: TaskSender,
     writer: DbWriter,
 ) -> WatcherHandle {
-    let (shutdown_sender, shutdown_receiver) = std_mpsc::channel();
+    let (command_sender, command_receiver) = std_mpsc::channel();
     let (ready_sender, ready_receiver) = std_mpsc::channel();
     let join_handle = thread::spawn(move || {
-        if let Err(error) = run_watcher(
-            database,
-            task_queue,
-            writer,
-            shutdown_receiver,
-            ready_sender,
-        ) {
+        if let Err(error) =
+            run_watcher(database, task_queue, writer, command_receiver, ready_sender)
+        {
             tracing::warn!(%error, "watcher stopped unexpectedly");
         }
     });
     let _ = ready_receiver.recv_timeout(Duration::from_secs(2));
     WatcherHandle {
-        shutdown_sender: Some(shutdown_sender),
+        command_sender: Some(command_sender),
         join_handle: Some(join_handle),
     }
 }
 
 impl WatcherHandle {
+    pub fn refresh(&self) -> anyhow::Result<()> {
+        let (completed, receiver) = std_mpsc::channel();
+        self.command_sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("watcher is stopped"))?
+            .send(WatcherCommand::Refresh(completed))
+            .map_err(|_| anyhow::anyhow!("watcher is stopped"))?;
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| anyhow::anyhow!("watcher refresh timed out"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub fn quiesce_path(&self, path: &Path) -> anyhow::Result<()> {
+        let (completed, receiver) = std_mpsc::channel();
+        self.command_sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("watcher is stopped"))?
+            .send(WatcherCommand::QuiescePath(path.to_path_buf(), completed))
+            .map_err(|_| anyhow::anyhow!("watcher is stopped"))?;
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| anyhow::anyhow!("watcher quiesce timed out"))?
+            .map_err(anyhow::Error::msg)
+    }
+
     #[allow(dead_code)]
     pub fn thread_id(&self) -> thread::ThreadId {
         self.join_handle
@@ -58,8 +86,8 @@ impl WatcherHandle {
     }
 
     pub fn shutdown(&mut self) -> anyhow::Result<()> {
-        if let Some(sender) = self.shutdown_sender.take() {
-            let _ = sender.send(());
+        if let Some(sender) = self.command_sender.take() {
+            let _ = sender.send(WatcherCommand::Shutdown);
         }
         if let Some(join_handle) = self.join_handle.take() {
             join_handle
@@ -103,7 +131,7 @@ fn run_watcher(
     database: Database,
     task_queue: TaskSender,
     writer: DbWriter,
-    shutdown_receiver: std_mpsc::Receiver<()>,
+    command_receiver: std_mpsc::Receiver<WatcherCommand>,
     ready_sender: std_mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
     let (event_tx, event_rx) = std_mpsc::channel();
@@ -124,8 +152,40 @@ fn run_watcher(
     let mut last_refresh = Instant::now();
 
     loop {
-        if shutdown_receiver.try_recv().is_ok() {
-            break;
+        match command_receiver.try_recv() {
+            Ok(WatcherCommand::Shutdown) => break,
+            Ok(WatcherCommand::Refresh(completed)) => {
+                let result = sync_enabled_roots(&mut state).map_err(|error| error.to_string());
+                last_refresh = Instant::now();
+                let _ = completed.send(result);
+            }
+            Ok(WatcherCommand::QuiescePath(path, completed)) => {
+                let root_ids = state
+                    .watched_roots
+                    .iter()
+                    .filter_map(|(root_id, root)| (root.path == path).then_some(*root_id))
+                    .collect::<Vec<_>>();
+                let result = (|| {
+                    for root_id in root_ids {
+                        if let Some(root) = state.watched_roots.remove(&root_id) {
+                            state.watcher.unwatch(&root.path)?;
+                        }
+                    }
+                    state.pending_events.retain(|event| {
+                        event.as_ref().is_ok_and(|event| {
+                            !event
+                                .paths
+                                .iter()
+                                .any(|candidate| candidate.starts_with(&path))
+                        })
+                    });
+                    Ok::<_, anyhow::Error>(())
+                })()
+                .map_err(|error| error.to_string());
+                let _ = completed.send(result);
+            }
+            Err(std_mpsc::TryRecvError::Empty) => {}
+            Err(std_mpsc::TryRecvError::Disconnected) => break,
         }
         match event_rx.recv_timeout(EVENT_COALESCE_WINDOW) {
             Ok(result) => {
@@ -501,7 +561,7 @@ fn sync_enabled_roots(state: &mut WatcherState) -> anyhow::Result<()> {
         if token.as_ref().is_some_and(|token| {
             !state
                 .database
-                .sync_root_binding_token_is_current(token)
+                .sync_root_binding_token_is_watchable(token)
                 .unwrap_or(false)
         }) {
             if let Some(previous) = state.watched_roots.remove(&root_id) {

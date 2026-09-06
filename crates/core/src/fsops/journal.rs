@@ -501,6 +501,7 @@ trait JournalStore {
         source_identity: &str,
         target_parent_identity: Option<&str>,
     ) -> FsOpsResult<()>;
+    fn require_current(&self, intent: &JournalIntent) -> FsOpsResult<()>;
     fn record_recycle_phase(
         &self,
         intent: &mut JournalIntent,
@@ -557,6 +558,18 @@ impl JournalStore for DirectJournalStore<'_> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         update_recycle_phase(&guard, intent, phase)
+    }
+
+    fn require_current(&self, intent: &JournalIntent) -> FsOpsResult<()> {
+        let guard = self
+            .database
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let transaction = Transaction::new_unchecked(
+            guard.connection_for_fsops(),
+            TransactionBehavior::Deferred,
+        )?;
+        require_current_journal_root_token(&transaction, intent)
     }
 
     fn finalize(
@@ -645,6 +658,20 @@ impl JournalStore for WriterJournalStore {
         Ok(())
     }
 
+    fn require_current(&self, intent: &JournalIntent) -> FsOpsResult<()> {
+        let intent = intent.clone();
+        self.writer
+            .write_blocking(move |database| {
+                let transaction = Transaction::new_unchecked(
+                    database.connection_for_fsops(),
+                    TransactionBehavior::Deferred,
+                )?;
+                require_current_journal_root_token(&transaction, &intent)
+                    .map_err(anyhow::Error::new)
+            })
+            .map_err(FsOpsError::from)
+    }
+
     fn finalize(
         &self,
         intent: &JournalIntent,
@@ -685,6 +712,7 @@ fn execute_intent_with_store(
         source.identity(),
         target_parent.as_ref().map(|parent| parent.identity()),
     )?;
+    store.require_current(intent)?;
     let fs_result = if intent.kind == FileOperationKind::DeleteRecycle {
         match perform_recycle_action_with_store(
             store,
@@ -739,6 +767,12 @@ fn execute_intent(
         target_parent.as_ref().map(|parent| parent.identity()),
     )?;
     mark_attempt(database, intent)?;
+    let transaction = Transaction::new_unchecked(
+        database.connection_for_fsops(),
+        TransactionBehavior::Deferred,
+    )?;
+    require_current_journal_root_token(&transaction, intent)?;
+    transaction.commit()?;
     let fs_result = if intent.kind == FileOperationKind::DeleteRecycle {
         perform_recycle_action_direct(
             database,
@@ -1583,6 +1617,7 @@ fn perform_recycle_action_with_store(
         Ok(guard) => guard,
         Err(error) => return Ok(Err(error)),
     };
+    store.require_current(intent)?;
     // trash 5.2.6 creates an IShellItem from a parsing name. Keep a second
     // same-object handle that shares DELETE while releasing the exclusive
     // source handle; after Shell returns, the guard proves that this file id
@@ -1623,6 +1658,12 @@ fn perform_recycle_action_direct(
         Ok(guard) => guard,
         Err(error) => return Ok(Err(error)),
     };
+    let transaction = Transaction::new_unchecked(
+        database.connection_for_fsops(),
+        TransactionBehavior::Deferred,
+    )?;
+    require_current_journal_root_token(&transaction, intent)?;
+    transaction.commit()?;
     drop(source);
     if let Err(error) = trash::delete(&staging_path) {
         return Ok(Err(std::io::Error::other(error.to_string())));

@@ -330,6 +330,24 @@ impl AppState {
         Ok(self.resources()?.root_reachability.clone())
     }
 
+    pub fn require_current_root_token(
+        &self,
+        token: &crate::db::SyncRootBindingToken,
+    ) -> anyhow::Result<()> {
+        let resources = self.resources()?;
+        let Some(library_uuid) = resources.library_uuid.clone() else {
+            return Ok(());
+        };
+        resources
+            .root_runtime_registry
+            .require_current(&crate::sync::runtime::RootExecutionToken {
+                library_uuid,
+                root_uuid: uuid::Uuid::from_bytes(token.root_uuid).to_string(),
+                local_binding_uuid: uuid::Uuid::from_bytes(token.local_binding_uuid).to_string(),
+                binding_generation: token.binding_generation,
+            })
+    }
+
     pub fn request_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
         Arc::clone(&self.request_gate)
     }

@@ -241,6 +241,11 @@ pub struct MediaWorkerSet {
     limiter: MediaWorkLimiter,
     tasks: Arc<tokio::sync::Mutex<JoinSet<()>>>,
 }
+
+pub struct MediaRegistrationFence {
+    _tasks: tokio::sync::OwnedMutexGuard<JoinSet<()>>,
+}
+
 impl MediaWorkerSet {
     pub fn new(limiter: MediaWorkLimiter) -> Self {
         Self {
@@ -283,11 +288,23 @@ impl MediaWorkerSet {
     }
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.cancel();
+        self.drain().await
+    }
+
+    pub async fn drain(&self) -> anyhow::Result<()> {
         let mut tasks = self.tasks.lock().await;
         while let Some(result) = tasks.join_next().await {
             result?;
         }
         Ok(())
+    }
+
+    pub async fn registration_fence(&self) -> anyhow::Result<MediaRegistrationFence> {
+        let mut tasks = Arc::clone(&self.tasks).lock_owned().await;
+        while let Some(result) = tasks.join_next().await {
+            result?;
+        }
+        Ok(MediaRegistrationFence { _tasks: tasks })
     }
 }
 
@@ -934,9 +951,18 @@ impl MediaPublicationWorker {
             let object_root = self.object_root.clone();
             let cancelled = self.limiter.cancellation();
             let job_for_build = job.clone();
+            let root_binding_database = self.writer.write(|database| database.reopen()).await?;
+            if root_binding_guard.is_some() && root_binding_database.is_none() {
+                anyhow::bail!("managed root publication requires a reopenable Catalog");
+            }
             let publication = self
                 .limiter
                 .run_bounded(1, super::DATA_PACK_MAX_BYTES, move || {
+                    if let (Some(database), Some(token)) =
+                        (root_binding_database.as_ref(), root_binding_guard)
+                    {
+                        database.require_sync_root_binding_token_for_publication(&token)?;
+                    }
                     super::publication::build_publication(
                         &job_for_build,
                         &object_root,
@@ -1688,6 +1714,52 @@ mod tests {
         drop(registration_guard);
         assert!(task.await.unwrap().is_err());
         workers.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn draining_registered_turns_does_not_cancel_the_shared_worker_set() {
+        let workers = MediaWorkerSet::new(MediaWorkLimiter::new(1, 1, 1).unwrap());
+        let running = workers.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            running
+                .run(async move {
+                    let _ = released.await;
+                    Ok(7)
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        workers.drain().await.unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 7);
+        assert_eq!(workers.run(async { Ok(9) }).await.unwrap(), 9);
+    }
+
+    #[tokio::test]
+    async fn registration_fence_drains_old_turns_and_blocks_new_turns() {
+        let workers = MediaWorkerSet::new(MediaWorkLimiter::new(1, 1, 1).unwrap());
+        let running = workers.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let old = tokio::spawn(async move {
+            running
+                .run(async move {
+                    let _ = released.await;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        let fence = workers.registration_fence().await.unwrap();
+        assert!(!old.is_finished());
+        let late_workers = workers.clone();
+        let late = tokio::spawn(async move { late_workers.run(async { Ok(11) }).await });
+        tokio::task::yield_now().await;
+        assert!(!late.is_finished());
+        drop(fence);
+        old.await.unwrap().unwrap();
+        assert_eq!(late.await.unwrap().unwrap(), 11);
     }
 
     #[test]

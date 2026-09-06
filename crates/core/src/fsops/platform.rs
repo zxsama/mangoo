@@ -58,6 +58,10 @@ impl VerifiedSource {
         &self.identity
     }
 
+    pub(super) fn is_safe_directory(&self) -> bool {
+        self.is_directory && !self.is_reparse_or_link
+    }
+
     pub(super) fn rename_no_replace(
         &self,
         target_parent: &VerifiedTargetParent,

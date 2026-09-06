@@ -26,6 +26,35 @@ use serde::Serialize;
 
 use crate::db::{Database, Page};
 
+pub(crate) fn rename_verified_directory_no_replace(
+    source: &Path,
+    target: &Path,
+    expected_source_identity: &str,
+    expected_target_parent_identity: &str,
+) -> std::io::Result<()> {
+    let target_parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
+    })?;
+    let target_name = target.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no leaf name")
+    })?;
+    let source = platform::VerifiedSource::open(source)?;
+    if !source.is_safe_directory() || source.identity() != expected_source_identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "relocation source identity changed",
+        ));
+    }
+    let target_parent = platform::VerifiedTargetParent::open(target_parent)?;
+    if target_parent.identity() != expected_target_parent_identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "relocation target parent identity changed",
+        ));
+    }
+    source.rename_no_replace(&target_parent, target_name)
+}
+
 /// Discriminants for `file_operations.operation`.
 #[allow(dead_code)]
 pub const FILE_OPERATION_VALUES: &[&str] =

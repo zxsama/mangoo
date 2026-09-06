@@ -1,6 +1,7 @@
 use anyhow::{bail, Context};
 use rusqlite::{params, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use uuid::Uuid;
 
 use super::Database;
@@ -52,6 +53,12 @@ pub struct SyncRootLocalBindingRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootRelocationCatalogCutover {
+    pub root_id: i64,
+    pub scan_task_id: i64,
+}
+
 #[allow(dead_code)]
 fn fixed_bytes<const N: usize>(value: Vec<u8>, field: &str) -> anyhow::Result<[u8; N]> {
     value
@@ -60,6 +67,278 @@ fn fixed_bytes<const N: usize>(value: Vec<u8>, field: &str) -> anyhow::Result<[u
 }
 
 impl Database {
+    pub fn sync_location_heads(&self, entity_uuid: Uuid) -> anyhow::Result<BTreeSet<Uuid>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let heads = location_heads(&transaction, entity_uuid)?;
+        transaction.commit()?;
+        Ok(heads)
+    }
+
+    pub fn fence_sync_root_relocation(
+        &self,
+        root_uuid: Uuid,
+        local_binding_uuid: Uuid,
+        old_generation: u64,
+        new_generation: u64,
+        operation_revision: u64,
+    ) -> anyhow::Result<i64> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (root_id, current_generation, current_state): (i64, i64, String) = transaction
+            .query_row(
+                "SELECT root_id,binding_generation,state FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2",
+                params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )
+            .context("local root binding not found")?;
+        if current_generation == i64::try_from(new_generation)? {
+            if current_state != "relocating" {
+                transaction.execute(
+                    "UPDATE sync_root_local_bindings SET state='relocating',operation_revision=?1,updated_at=?2 WHERE root_uuid=?3 AND local_binding_uuid=?4 AND binding_generation=?5 AND state IN ('active','unavailable','local-rename-required')",
+                    params![i64::try_from(operation_revision)?,root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(new_generation)?],
+                )?;
+            }
+            transaction.commit()?;
+            return Ok(root_id);
+        }
+        if current_generation != i64::try_from(old_generation)? {
+            bail!("stale root binding generation");
+        }
+        let changed = transaction.execute(
+            "UPDATE sync_root_local_bindings SET binding_generation=?1,state='relocating',operation_revision=?2,updated_at=?3 WHERE root_uuid=?4 AND local_binding_uuid=?5 AND binding_generation=?6",
+            params![i64::try_from(new_generation)?,i64::try_from(operation_revision)?,root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?],
+        )?;
+        if changed != 1 {
+            bail!("stale root binding generation");
+        }
+        transaction.execute(
+            "UPDATE tasks SET status='cancelled',error='stale-root-binding',updated_at=?1 WHERE root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND status IN ('pending','running')",
+            params![root_now_millis()/1000,root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?],
+        )?;
+        transaction.execute(
+            "UPDATE file_operations SET status='cancelled',journal_phase='cancelled',error='stale-root-binding' WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND status IN ('pending','running')",
+            params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?],
+        )?;
+        transaction.execute(
+            "UPDATE media_publication_jobs SET phase='cancelled',owner_token=NULL,lease_expires_at=NULL,error_code='stale-root-binding',updated_at=?1 WHERE root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND phase NOT IN ('event-published','archived')",
+            params![root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?],
+        )?;
+        transaction.execute(
+            "UPDATE media_materialization_jobs SET phase='cancelled',owner_token=NULL,lease_expires_at=NULL,error_code='stale-root-binding',updated_at=?1 WHERE root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND phase<>'complete'",
+            params![root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?],
+        )?;
+        transaction.execute(
+            "UPDATE sync_publication_intents SET state='cancelled',error_code='stale-root-binding',next_attempt_at=NULL,updated_at=?1 WHERE root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND state IN ('pending-hash','pending-manifest','ready','failed')",
+            params![root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?],
+        )?;
+        transaction.commit()?;
+        Ok(root_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn cutover_sync_root_relocation(
+        &self,
+        root_uuid: Uuid,
+        local_binding_uuid: Uuid,
+        old_generation: u64,
+        new_generation: u64,
+        new_path: &Path,
+        materialized_name: &str,
+        operation_revision: u64,
+    ) -> anyhow::Result<RootRelocationCatalogCutover> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (root_id, current_generation, current_state): (i64, i64, String) = transaction
+            .query_row(
+                "SELECT root_id,binding_generation,state FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2",
+                params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )
+            .context("local root binding not found")?;
+        if current_generation == i64::try_from(new_generation)?
+            && matches!(current_state.as_str(), "reconcile-required" | "active")
+        {
+            let scan_task_id = transaction
+                .query_row(
+                    "SELECT id FROM tasks WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND kind='root_scan' AND status IN ('pending','running','succeeded') ORDER BY id DESC LIMIT 1",
+                    params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(new_generation)?],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            transaction.commit()?;
+            return Ok(RootRelocationCatalogCutover {
+                root_id,
+                scan_task_id,
+            });
+        }
+        if current_generation != i64::try_from(new_generation)? || current_state != "relocating" {
+            bail!("stale root binding generation");
+        }
+        let path = new_path.to_string_lossy().into_owned();
+        transaction.execute(
+            "UPDATE roots SET path=?1,display_name=?2,active_scan_generation=NULL,last_scan_at=NULL WHERE id=?3",
+            params![path,materialized_name,root_id],
+        )?;
+
+        let mut folder_rows = transaction.prepare(
+            "SELECT id,parent_id,name FROM folders WHERE root_id=?1 ORDER BY CASE WHEN parent_id IS NULL THEN 0 ELSE 1 END,id",
+        )?;
+        let rows = folder_rows
+            .query_map([root_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(folder_rows);
+        let mut resolved = BTreeMap::<i64, std::path::PathBuf>::new();
+        let mut pending = rows;
+        while !pending.is_empty() {
+            let mut next = Vec::new();
+            let mut progressed = false;
+            for (id, parent_id, name) in pending {
+                let full = match parent_id {
+                    None => Some(new_path.to_path_buf()),
+                    Some(parent_id) => resolved.get(&parent_id).map(|parent| parent.join(&name)),
+                };
+                if let Some(full) = full {
+                    transaction.execute(
+                        "UPDATE folders SET path_hash=?1 WHERE id=?2",
+                        params![super::hash_path(&full), id],
+                    )?;
+                    resolved.insert(id, full);
+                    progressed = true;
+                } else {
+                    next.push((id, parent_id, name));
+                }
+            }
+            if !progressed {
+                bail!("folder hierarchy is not resolvable");
+            }
+            pending = next;
+        }
+        transaction.execute(
+            "UPDATE sync_publication_intents SET source_path=(WITH RECURSIVE paths(id,parent_id,relpath) AS (SELECT id,parent_id,'' FROM folders WHERE root_id=?1 AND parent_id IS NULL UNION ALL SELECT folder.id,folder.parent_id,CASE WHEN paths.relpath='' THEN folder.name ELSE paths.relpath||'/'||folder.name END FROM folders folder JOIN paths ON paths.id=folder.parent_id) SELECT ?2||CASE WHEN paths.relpath='' THEN '' ELSE '/'||paths.relpath END||'/'||files.name FROM files JOIN paths ON paths.id=files.folder_id WHERE files.asset_uuid=sync_publication_intents.asset_uuid),updated_at=?3 WHERE root_uuid=?4 AND local_binding_uuid=?5 AND binding_generation=?6",
+            params![root_id,path.replace('\\', "/"),root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(old_generation)?],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE sync_root_local_bindings SET state='reconcile-required',operation_revision=?1,updated_at=?2 WHERE root_uuid=?3 AND local_binding_uuid=?4 AND binding_generation=?5 AND state='relocating'",
+            params![i64::try_from(operation_revision)?,root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(new_generation)?],
+        )?;
+        if changed != 1 {
+            bail!("stale root binding generation");
+        }
+        transaction.execute(
+            "INSERT INTO tasks(kind,priority,status,root_id,folder_id,file_id,created_at,updated_at,root_uuid,local_binding_uuid,binding_generation,error) VALUES ('root_scan',100,'pending',?1,NULL,NULL,?2,?2,?3,?4,?5,NULL)",
+            params![root_id,root_now_millis()/1000,root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(new_generation)?],
+        )?;
+        let scan_task_id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(RootRelocationCatalogCutover {
+            root_id,
+            scan_task_id,
+        })
+    }
+
+    pub fn sync_root_relocation_reconciliation_status(
+        &self,
+        root_uuid: Uuid,
+        local_binding_uuid: Uuid,
+        binding_generation: u64,
+    ) -> anyhow::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT status FROM tasks WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND kind='root_scan' ORDER BY id DESC LIMIT 1",
+                params![root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(binding_generation)?],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn sync_root_relocation_catalog_cutover_is_current(
+        &self,
+        root_uuid: Uuid,
+        local_binding_uuid: Uuid,
+        binding_generation: u64,
+        target_path: &Path,
+    ) -> anyhow::Result<bool> {
+        let current = self
+            .connection
+            .query_row(
+                "SELECT binding.state,roots.path FROM sync_root_local_bindings binding JOIN roots ON roots.id=binding.root_id WHERE binding.root_uuid=?1 AND binding.local_binding_uuid=?2 AND binding.binding_generation=?3",
+                params![
+                    root_uuid.as_bytes().as_slice(),
+                    local_binding_uuid.as_bytes().as_slice(),
+                    i64::try_from(binding_generation)?
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(current.is_some_and(|(state, path)| {
+            matches!(state.as_str(), "reconcile-required" | "active" | "paused")
+                && crate::sync_folders::canonical_path_key(Path::new(&path))
+                    == crate::sync_folders::canonical_path_key(target_path)
+        }))
+    }
+
+    pub fn complete_sync_root_relocation_projection(
+        &self,
+        root_uuid: Uuid,
+        local_binding_uuid: Uuid,
+        binding_generation: u64,
+        operation_revision: u64,
+        resume_state: &str,
+    ) -> anyhow::Result<()> {
+        if !matches!(resume_state, "active" | "paused") {
+            bail!("invalid root resume state");
+        }
+        let changed = self.connection.execute(
+            "UPDATE sync_root_local_bindings SET state=?1,operation_revision=MAX(operation_revision,?2),updated_at=?3 WHERE root_uuid=?4 AND local_binding_uuid=?5 AND binding_generation=?6 AND state IN ('reconcile-required','active','paused')",
+            params![resume_state,i64::try_from(operation_revision)?,root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(binding_generation)?],
+        )?;
+        if changed != 1 {
+            bail!("stale root binding generation");
+        }
+        Ok(())
+    }
+
+    pub fn abort_sync_root_relocation_projection(
+        &self,
+        root_uuid: Uuid,
+        local_binding_uuid: Uuid,
+        binding_generation: u64,
+        operation_revision: u64,
+        resume_state: &str,
+    ) -> anyhow::Result<()> {
+        if !matches!(resume_state, "active" | "paused" | "local-rename-required") {
+            bail!("invalid root resume state");
+        }
+        let current_generation: i64 = self.connection.query_row(
+            "SELECT binding_generation FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2",
+            params![root_uuid.as_bytes().as_slice(), local_binding_uuid.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        if current_generation.saturating_add(1) == i64::try_from(binding_generation)? {
+            self.fence_sync_root_relocation(
+                root_uuid,
+                local_binding_uuid,
+                u64::try_from(current_generation)?,
+                binding_generation,
+                operation_revision,
+            )?;
+        }
+        let changed = self.connection.execute(
+            "UPDATE sync_root_local_bindings SET state=?1,operation_revision=MAX(operation_revision,?2),updated_at=?3 WHERE root_uuid=?4 AND local_binding_uuid=?5 AND binding_generation=?6 AND (state='relocating' OR state=?1)",
+            params![resume_state,i64::try_from(operation_revision)?,root_now_millis(),root_uuid.as_bytes().as_slice(),local_binding_uuid.as_bytes().as_slice(),i64::try_from(binding_generation)?],
+        )?;
+        if changed != 1 {
+            bail!("stale root binding generation");
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_selected_sync_root(
         &self,
@@ -621,6 +900,24 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub(crate) fn sync_root_binding_token_is_watchable(
+        &self,
+        token: &SyncRootBindingToken,
+    ) -> anyhow::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND state IN ('materializing','active','local-only-fork','reconcile-required'))",
+                params![
+                    token.root_uuid.as_slice(),
+                    token.local_binding_uuid.as_slice(),
+                    i64::try_from(token.binding_generation)
+                        .context("binding generation exceeds SQLite integer range")?,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub(crate) fn require_sync_root_binding_token(
         &self,
         token: &SyncRootBindingToken,
@@ -986,8 +1283,9 @@ impl Database {
         entity_uuid: Uuid,
         requested_name: &str,
         expected_heads: &BTreeSet<Uuid>,
+        supersedes: &BTreeSet<Uuid>,
     ) -> anyhow::Result<Uuid> {
-        if requested_name.is_empty() || expected_heads.is_empty() {
+        if requested_name.is_empty() || expected_heads.is_empty() || supersedes != expected_heads {
             bail!("invalid-location-rename");
         }
         let transaction = self.connection.unchecked_transaction()?;
@@ -1852,6 +2150,185 @@ mod tests {
     }
 
     #[test]
+    fn relocation_cutover_preserves_catalog_ids_and_fences_old_work() {
+        let database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let descriptor = descriptor();
+        let library_uuid = Uuid::from_bytes([9; 16]);
+        let binding_uuid = Uuid::from_bytes([8; 16]);
+        let _root_id = database
+            .ensure_selected_sync_root(
+                library_uuid,
+                Uuid::from_bytes(descriptor.root_uuid),
+                Uuid::from_bytes(descriptor.root_folder_uuid),
+                Uuid::from_bytes(descriptor.library_root_uuid),
+                "D:/Library/Photos",
+                "Photos",
+                "Photos",
+                descriptor.materialization_fingerprint,
+                binding_uuid,
+                Uuid::from_bytes([7; 16]),
+                Uuid::from_bytes([6; 16]),
+                1,
+                "active",
+                1,
+                false,
+            )
+            .unwrap();
+        let root_id = database
+            .sync_root_id(&descriptor.root_uuid)
+            .unwrap()
+            .unwrap();
+        let folder_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM folders WHERE root_id=?1 AND parent_id IS NULL",
+                [root_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let asset_uuid = Uuid::from_bytes([5; 16]);
+        database
+            .connection
+            .execute(
+                "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,file_key,status,asset_uuid) VALUES (?1,?2,'one.jpg','jpg',1,1,'file-key','active',?3)",
+                params![root_id, folder_id, asset_uuid.as_bytes().as_slice()],
+            )
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO sync_local_file_identities(volume_identity,file_identity,asset_uuid,last_path,last_seen_at) VALUES ('volume','file',?1,'D:/Library/Photos/one.jpg',1)",
+                [asset_uuid.as_bytes().as_slice()],
+            )
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO tasks(kind,priority,status,root_id,created_at,updated_at,root_uuid,local_binding_uuid,binding_generation) VALUES ('root_scan',1,'pending',?1,1,1,?2,?3,1)",
+                params![
+                    root_id,
+                    descriptor.root_uuid.as_slice(),
+                    binding_uuid.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        let old_task_id = database.connection.last_insert_rowid();
+        database
+            .fence_sync_root_relocation(
+                Uuid::from_bytes(descriptor.root_uuid),
+                binding_uuid,
+                1,
+                2,
+                2,
+            )
+            .unwrap();
+        let cutover = database
+            .cutover_sync_root_relocation(
+                Uuid::from_bytes(descriptor.root_uuid),
+                binding_uuid,
+                1,
+                2,
+                Path::new("E:/Moved/Photos"),
+                "Photos",
+                3,
+            )
+            .unwrap();
+        assert_eq!(cutover.root_id, root_id);
+        assert!(cutover.scan_task_id > 0);
+        let (old_status, old_generation): (String, i64) = database
+            .connection
+            .query_row(
+                "SELECT status,binding_generation FROM tasks WHERE id=?1",
+                [old_task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(old_status, "cancelled");
+        assert_eq!(old_generation, 1);
+        let new_generation: i64 = database
+            .connection
+            .query_row(
+                "SELECT binding_generation FROM tasks WHERE id=?1",
+                [cutover.scan_task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_generation, 2);
+        let current = database.get_root(root_id).unwrap().unwrap();
+        assert_eq!(current.path, "E:/Moved/Photos");
+        let identity_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_local_file_identities WHERE asset_uuid=?1",
+                [asset_uuid.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(identity_count, 1);
+        assert!(database
+            .sync_root_relocation_catalog_cutover_is_current(
+                Uuid::from_bytes(descriptor.root_uuid),
+                binding_uuid,
+                2,
+                Path::new("E:/Moved/Photos"),
+            )
+            .unwrap());
+        assert!(!database
+            .sync_root_relocation_catalog_cutover_is_current(
+                Uuid::from_bytes(descriptor.root_uuid),
+                binding_uuid,
+                2,
+                Path::new("D:/Library/Photos"),
+            )
+            .unwrap());
+        let current_folder_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM folders WHERE root_id=?1 AND parent_id IS NULL",
+                [root_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current_folder_id, folder_id);
+        let token = database
+            .sync_root_binding_token_for_root_id(root_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.binding_generation, 2);
+        assert!(database
+            .sync_root_binding_token_is_watchable(&token)
+            .unwrap());
+        assert!(database
+            .require_sync_root_binding_token(&SyncRootBindingToken {
+                binding_generation: 1,
+                ..token.clone()
+            })
+            .is_err());
+        database
+            .complete_sync_root_relocation_projection(
+                Uuid::from_bytes(descriptor.root_uuid),
+                binding_uuid,
+                2,
+                4,
+                "paused",
+            )
+            .unwrap();
+        assert!(!database
+            .sync_root_binding_token_is_watchable(&token)
+            .unwrap());
+        database
+            .abort_sync_root_relocation_projection(
+                Uuid::from_bytes(descriptor.root_uuid),
+                binding_uuid,
+                2,
+                5,
+                "paused",
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn local_binding_projection_is_monotonic_and_fences_stale_work_after_restart() {
         let database_path = std::env::temp_dir().join(format!(
             "megle-sync-root-generation-fence-{}.sqlite",
@@ -2119,6 +2596,7 @@ mod tests {
                 root_folder_uuid,
                 "Before stop",
                 &BTreeSet::from([Uuid::from_slice(&first_head).unwrap()]),
+                &BTreeSet::from([Uuid::from_slice(&first_head).unwrap()]),
             )
             .unwrap();
         assert_eq!(
@@ -2170,6 +2648,7 @@ mod tests {
                 Uuid::now_v7(),
                 root_folder_uuid,
                 "After stop",
+                &BTreeSet::from([Uuid::from_slice(&second_head).unwrap()]),
                 &BTreeSet::from([Uuid::from_slice(&second_head).unwrap()]),
             )
             .unwrap();
@@ -2482,22 +2961,33 @@ mod tests {
         let heads = BTreeSet::from([Uuid::from_slice(&head).unwrap()]);
         let operation = Uuid::now_v7();
         let first = database
-            .commit_location_rename_once(operation, Uuid::from_bytes([2; 16]), "Renamed", &heads)
+            .commit_location_rename_once(
+                operation,
+                Uuid::from_bytes([2; 16]),
+                "Renamed",
+                &heads,
+                &heads,
+            )
             .unwrap();
         let retry = database
-            .commit_location_rename_once(operation, Uuid::from_bytes([2; 16]), "Renamed", &heads)
+            .commit_location_rename_once(
+                operation,
+                Uuid::from_bytes([2; 16]),
+                "Renamed",
+                &heads,
+                &heads,
+            )
             .unwrap();
         assert_eq!(first, retry);
-        assert!(
-            database
-                .commit_location_rename_once(
-                    Uuid::now_v7(),
-                    Uuid::from_bytes([2; 16]),
-                    "Stale",
-                    &heads,
-                )
-                .is_err()
-        );
+        assert!(database
+            .commit_location_rename_once(
+                Uuid::now_v7(),
+                Uuid::from_bytes([2; 16]),
+                "Stale",
+                &heads,
+                &heads,
+            )
+            .is_err());
         assert_eq!(
             database
                 .sync_root_descriptor(&[1; 16])
