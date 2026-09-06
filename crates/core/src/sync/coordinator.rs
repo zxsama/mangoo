@@ -633,11 +633,14 @@ impl SyncCoordinator {
     ) -> anyhow::Result<SyncTurnResult> {
         let result = self
             .run_library_metadata_turn(library_uuid, catalog_path)
-            .await?;
+            .await
+            .context("run Library metadata turn")?;
         self.run_dormant_media_turn(library_uuid, catalog_path)
-            .await?;
+            .await
+            .context("run dormant Library media turn")?;
         self.record_restore_progress(library_uuid, catalog_path)
-            .await?;
+            .await
+            .context("record Library restore progress")?;
         Ok(result)
     }
 
@@ -650,11 +653,14 @@ impl SyncCoordinator {
         let restoring_catalog = !catalog_path.exists();
         let published = self
             .provider_transport_turn(library_uuid, catalog_path)
-            .await?;
+            .await
+            .context("run provider transport turn")?;
         if !catalog_path.exists() {
-            self.bootstrap_missing_catalog(library_uuid, catalog_path)?;
+            self.bootstrap_missing_catalog(library_uuid, catalog_path)
+                .context("bootstrap missing Catalog")?;
         }
         let runtime = DormantSyncRuntime::new(library_uuid, catalog_path, self.leases.clone());
+        let root_bindings = self.catalog_root_binding_records(library_uuid)?;
         let (host_vector, host_metadata) = self.registry.host_checkpoint_snapshot(library_uuid)?;
         let spool_dir = catalog_path
             .parent()
@@ -665,6 +671,7 @@ impl SyncCoordinator {
         let _apply_permit = self.apply_budget.acquire().await?;
         let result = runtime
             .run_turn(move |database| {
+                Self::project_root_binding_records(database, root_bindings)?;
                 let connection = database.connection_for_fsops();
                 commit_published_segments(connection, &published_for_catalog)?;
                 super::persistence::recover_interrupted_checkpoints(connection)?;
@@ -674,12 +681,8 @@ impl SyncCoordinator {
                 let applied_events = super::spool::apply_next_durable_segment(connection)?;
                 let apply_transaction_micros = apply_started.elapsed().as_micros() as u64;
                 advance_bulk_turn(connection)?;
-                let ready: i64 = connection.query_row(
-                    "SELECT COUNT(*) FROM sync_checkpoints WHERE state='ready'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let (checkpoint_built, seed_checkpoint) = if ready == 0 {
+                let portable_checkpoint = latest_portable_checkpoint(connection)?;
+                let (checkpoint_built, seed_checkpoint) = if portable_checkpoint.is_none() {
                     let fence = super::persistence::capture_checkpoint_fence(
                         connection,
                         host_vector,
@@ -690,14 +693,14 @@ impl SyncCoordinator {
                         &fence,
                         &spool_dir.join("checkpoints"),
                     )?;
-                    let ready = super::persistence::descriptor_ready(connection, fence.checkpoint_uuid)?;
-                    (true, ready.then_some((fence.checkpoint_uuid.0, fence.local_generation)))
+                    let ready =
+                        super::persistence::descriptor_ready(connection, fence.checkpoint_uuid)?;
+                    (
+                        true,
+                        ready.then_some((fence.checkpoint_uuid.0, fence.local_generation)),
+                    )
                 } else {
-                    let seed = connection.query_row(
-                        "SELECT checkpoint_uuid,capture_local_mutation_generation FROM sync_checkpoints WHERE state='ready' ORDER BY ready_at DESC LIMIT 1",
-                        [], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?)),
-                    ).optional()?.and_then(|(id,generation)| uuid::Uuid::from_slice(&id).ok().map(|id|(id,generation)));
-                    (false, seed)
+                    (false, portable_checkpoint)
                 };
                 Ok(SyncTurnResult {
                     applied_events,
@@ -706,11 +709,16 @@ impl SyncCoordinator {
                     seed_checkpoint,
                 })
             })
-            .await?;
-        self.finish_seed_if_ready(library_uuid, &result)?;
-        self.commit_host_published_frontier(library_uuid, &published)?;
+            .await
+            .context("apply dormant Catalog turn")?;
+        self.finish_seed_if_ready(library_uuid, &result)
+            .context("finish seed checkpoint")?;
+        self.commit_host_published_frontier(library_uuid, &published)
+            .context("commit Host published frontier")?;
         if restoring_catalog {
-            self.registry.mark_restore_catalog_ready(library_uuid)?;
+            self.registry
+                .mark_restore_catalog_ready(library_uuid)
+                .context("mark restored Catalog ready")?;
         }
         Ok(result)
     }
@@ -741,30 +749,82 @@ impl SyncCoordinator {
                 }
             }
         }
-        let checkpoint = super::checkpoint::maximal_checkpoints(&candidates)
+        let portable_candidates = candidates
+            .into_iter()
+            .filter(|checkpoint| checkpoint.recovery.portable_complete)
+            .collect::<Vec<_>>();
+        let checkpoint = super::checkpoint::maximal_checkpoints(&portable_candidates)
             .into_iter()
             .max_by_key(|value| value.catalog_vector.values().sum::<u64>())
             .ok_or_else(|| {
-                anyhow::anyhow!("synchronized Library is awaiting a valid checkpoint")
+                anyhow::anyhow!("synchronized Library is awaiting a portable checkpoint")
             })?;
         let staging = catalog_path.with_extension("sqlite.sync-staging");
-        super::persistence::materialize_staging_catalog(
-            checkpoint,
-            &staging,
-            uuid::Uuid::parse_str(&descriptor.root_uuid)?,
-            self.registry.device_uuid()?,
-            &descriptor.managed_root,
-        )?;
+        let host_bindings = self.registry.local_root_bindings(library_uuid)?;
+        if checkpoint.projection.roots.len() > 1 || !host_bindings.is_empty() {
+            let selected_roots = host_bindings
+                .iter()
+                .filter(|binding| binding.state != "local-only-fork")
+                .map(|binding| {
+                    Ok((
+                        uuid::Uuid::parse_str(&binding.root_uuid)?,
+                        PathBuf::from(&binding.local_path),
+                    ))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if selected_roots.is_empty() && checkpoint.projection.roots.len() > 1 {
+                anyhow::bail!(
+                    "multi-root checkpoint restore is awaiting selected local root bindings"
+                );
+            }
+            let library_root_uuid = checkpoint
+                .state
+                .roots
+                .values()
+                .map(|root| root.library_root_uuid.0)
+                .next()
+                .unwrap_or(uuid::Uuid::parse_str(&descriptor.root_uuid)?);
+            if checkpoint
+                .state
+                .roots
+                .values()
+                .any(|root| root.library_root_uuid.0 != library_root_uuid)
+            {
+                anyhow::bail!("checkpoint contains inconsistent Library-root identities");
+            }
+            super::persistence::materialize_staging_catalog_with_roots(
+                checkpoint,
+                &staging,
+                library_root_uuid,
+                self.registry.device_uuid()?,
+                &selected_roots,
+            )
+            .context("materialize multi-root staging Catalog")?;
+        } else {
+            super::persistence::materialize_staging_catalog(
+                checkpoint,
+                &staging,
+                uuid::Uuid::parse_str(&descriptor.root_uuid)?,
+                self.registry.device_uuid()?,
+                &descriptor.managed_root,
+            )
+            .context("materialize staging Catalog")?;
+        }
         let transport = self
             .registry
             .binding_transport(library_uuid, "library")?
             .ok_or_else(|| anyhow::anyhow!("sync binding is missing during restore bootstrap"))?;
-        let restored = crate::db::Database::open(&staging)?;
-        restored.begin_restored_sync_capture(transport.binding_epoch, transport.actor_epoch)?;
+        let restored =
+            crate::db::Database::open(&staging).context("open restored staging Catalog")?;
+        restored
+            .begin_restored_sync_capture(transport.binding_epoch, transport.actor_epoch)
+            .context("begin restored sync capture")?;
         drop(restored);
         self.registry
-            .restore_host_checkpoint_metadata(&checkpoint.host_metadata)?;
+            .restore_host_checkpoint_metadata(&checkpoint.host_metadata)
+            .context("restore Host checkpoint metadata")?;
         super::persistence::promote_new_staging_catalog(&staging, catalog_path)
+            .context("promote restored staging Catalog")
     }
 
     pub async fn run_active_turn(
@@ -794,6 +854,7 @@ impl SyncCoordinator {
             .provider_transport_turn(library_uuid, catalog_path)
             .await?;
         let (host_vector, host_metadata) = self.registry.host_checkpoint_snapshot(library_uuid)?;
+        let root_bindings = self.catalog_root_binding_records(library_uuid)?;
         let spool_dir = catalog_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -803,6 +864,7 @@ impl SyncCoordinator {
         let _apply_permit = self.apply_budget.acquire().await?;
         let result = writer
             .write_authoritative_without_wake(move |database| {
+                Self::project_root_binding_records(database, root_bindings)?;
                 commit_published_segments(database.connection_for_fsops(), &published_for_catalog)?;
                 perform_turn(database, host_vector, host_metadata, spool_dir)
             })
@@ -820,6 +882,7 @@ impl SyncCoordinator {
         let _media_permit = self.media_budget.acquire().await?;
         let database = crate::db::Database::open(catalog_path)?;
         database.apply_migrations()?;
+        self.project_root_binding_tokens(library_uuid, &database)?;
         let writer = crate::db::DbWriter::spawn(database);
         let result = self
             .run_media_turn(library_uuid, catalog_path, &writer)
@@ -827,6 +890,53 @@ impl SyncCoordinator {
         let shutdown = writer.shutdown().await;
         result?;
         shutdown
+    }
+
+    fn project_root_binding_tokens(
+        &self,
+        library_uuid: &str,
+        database: &crate::db::Database,
+    ) -> anyhow::Result<()> {
+        Self::project_root_binding_records(
+            database,
+            self.catalog_root_binding_records(library_uuid)?,
+        )
+    }
+
+    fn catalog_root_binding_records(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Vec<crate::db::SyncRootLocalBindingRecord>> {
+        let library_uuid_bytes = *uuid::Uuid::parse_str(library_uuid)?.as_bytes();
+        let mut records = Vec::new();
+        for binding in self.registry.local_root_bindings(library_uuid)? {
+            let root_uuid = uuid::Uuid::parse_str(&binding.root_uuid)?;
+            records.push(crate::db::SyncRootLocalBindingRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                library_uuid: library_uuid_bytes,
+                local_binding_uuid: *uuid::Uuid::parse_str(&binding.local_binding_uuid)?.as_bytes(),
+                binding_generation: binding.binding_generation,
+                state: binding.state,
+                root_id: 0,
+                operation_revision: binding.operation_revision,
+                updated_at: unix_timestamp_millis(),
+            });
+        }
+        Ok(records)
+    }
+
+    fn project_root_binding_records(
+        database: &crate::db::Database,
+        records: Vec<crate::db::SyncRootLocalBindingRecord>,
+    ) -> anyhow::Result<()> {
+        for mut record in records {
+            let Some(root_id) = database.sync_root_id(&record.root_uuid)? else {
+                continue;
+            };
+            record.root_id = root_id;
+            database.upsert_sync_root_local_binding(&record)?;
+        }
+        Ok(())
     }
 
     async fn record_restore_progress(
@@ -1511,12 +1621,8 @@ fn perform_turn(
     let applied_events = super::spool::apply_next_durable_segment(connection)?;
     let apply_transaction_micros = apply_started.elapsed().as_micros() as u64;
     advance_bulk_turn(connection)?;
-    let ready: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sync_checkpoints WHERE state='ready'",
-        [],
-        |r| r.get(0),
-    )?;
-    let (checkpoint_built, seed_checkpoint) = if ready == 0 {
+    let portable_checkpoint = latest_portable_checkpoint(connection)?;
+    let (checkpoint_built, seed_checkpoint) = if portable_checkpoint.is_none() {
         let fence =
             super::persistence::capture_checkpoint_fence(connection, host_vector, host_metadata)?;
         super::persistence::build_checkpoint(connection, &fence, &spool_dir.join("checkpoints"))?;
@@ -1526,11 +1632,7 @@ fn perform_turn(
             ready.then_some((fence.checkpoint_uuid.0, fence.local_generation)),
         )
     } else {
-        let seed = connection.query_row(
-            "SELECT checkpoint_uuid,capture_local_mutation_generation FROM sync_checkpoints WHERE state='ready' ORDER BY ready_at DESC LIMIT 1",
-            [], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?)),
-        ).optional()?.and_then(|(id,generation)| uuid::Uuid::from_slice(&id).ok().map(|id|(id,generation)));
-        (false, seed)
+        (false, portable_checkpoint)
     };
     Ok(SyncTurnResult {
         applied_events,
@@ -1538,6 +1640,26 @@ fn perform_turn(
         apply_transaction_micros,
         seed_checkpoint,
     })
+}
+
+fn latest_portable_checkpoint(
+    connection: &rusqlite::Connection,
+) -> anyhow::Result<Option<(uuid::Uuid, i64)>> {
+    let mut statement = connection.prepare(
+        "SELECT checkpoint_uuid,capture_local_mutation_generation FROM sync_checkpoints WHERE state='ready' ORDER BY ready_at DESC",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, generation) in rows {
+        let checkpoint_uuid = super::types::CheckpointUuid(uuid::Uuid::from_slice(&id)?);
+        if super::persistence::descriptor_ready(connection, checkpoint_uuid)? {
+            return Ok(Some((checkpoint_uuid.0, generation)));
+        }
+    }
+    Ok(None)
 }
 
 fn commit_published_segments(
@@ -1799,6 +1921,78 @@ mod tests {
         registry
             .record_plugin_runtime_ready(plugin_id, "test-session", &["sync-provider.v1".into()])
             .unwrap();
+    }
+
+    #[test]
+    fn root_binding_projection_is_available_before_remote_apply() {
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root_uuid = uuid::Uuid::from_u128(41);
+        let root_folder_uuid = uuid::Uuid::from_u128(42);
+        let root_id = database
+            .add_root(NewRoot {
+                path: "D:/SelectedRoot".into(),
+                display_name: "SelectedRoot".into(),
+            })
+            .unwrap();
+        database
+            .upsert_sync_root_descriptor(&crate::db::SyncRootDescriptorRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                root_folder_uuid: *root_folder_uuid.as_bytes(),
+                library_root_uuid: *uuid::Uuid::from_u128(40).as_bytes(),
+                creation_event_uuid: None,
+                winning_location_revision_uuid: None,
+                requested_name: "SelectedRoot".into(),
+                materialized_name: "SelectedRoot".into(),
+                materialization_fingerprint: [1; 32],
+                lifecycle: "active".into(),
+                logical_revision: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        database
+            .connection_for_fsops()
+            .execute(
+                "UPDATE roots SET root_uuid=?1 WHERE id=?2",
+                rusqlite::params![root_uuid.as_bytes().as_slice(), root_id],
+            )
+            .unwrap();
+        database
+            .connection_for_fsops()
+            .execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,NULL,'','root','active',?2)",
+                rusqlite::params![root_id, root_folder_uuid.as_bytes().as_slice()],
+            )
+            .unwrap();
+        database
+            .link_sync_root_descriptor(root_id, root_uuid.as_bytes(), root_folder_uuid.as_bytes())
+            .unwrap();
+        let local_binding_uuid = uuid::Uuid::from_u128(43);
+        SyncCoordinator::project_root_binding_records(
+            &database,
+            vec![crate::db::SyncRootLocalBindingRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                library_uuid: *uuid::Uuid::from_u128(40).as_bytes(),
+                local_binding_uuid: *local_binding_uuid.as_bytes(),
+                binding_generation: 7,
+                state: "active".into(),
+                root_id: 0,
+                operation_revision: 3,
+                updated_at: 1,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            database
+                .sync_root_binding_token_for_root_id(root_id)
+                .unwrap(),
+            Some(crate::db::SyncRootBindingToken {
+                root_uuid: *root_uuid.as_bytes(),
+                local_binding_uuid: *local_binding_uuid.as_bytes(),
+                binding_generation: 7,
+            })
+        );
     }
 
     #[tokio::test]

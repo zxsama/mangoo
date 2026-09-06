@@ -3,14 +3,15 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::checkpoint::{
     CatalogProjectionSnapshot, CatalogRecoverySnapshot, Checkpoint, FileSnapshot, FolderSnapshot,
-    HostMetadataSnapshot, MetadataSnapshot, SqlValueSnapshot, StreamVector, TableSnapshot,
-    TagSnapshot,
+    HostMetadataSnapshot, MetadataSnapshot, RootProjectionSnapshot, SqlValueSnapshot, StreamVector,
+    TableSnapshot, TagSnapshot, CHECKPOINT_SCHEMA_VERSION,
 };
-use super::codec::{canonical_bytes, decode_event, seal_event, sha256};
+use super::codec::{canonical_bytes, decode_event, seal_event, sha256, REDUCER_VERSION};
 use super::reducer::ProtocolState;
 use super::types::{
     ActorEpochUuid, ActorId, BindingEpochUuid, CheckpointUuid, DeviceUuid, EntityUuid,
@@ -64,7 +65,16 @@ pub fn capture_checkpoint_fence(
     }
     drop(statement);
     let checkpoint_uuid = CheckpointUuid::new();
-    transaction.execute("INSERT INTO sync_checkpoints(checkpoint_uuid,schema_version,reducer_version,state,capture_local_mutation_generation,created_at) VALUES (?1,1,1,'building',?2,?3)", params![checkpoint_uuid.0.as_bytes().as_slice(),generation,now_ms()])?;
+    transaction.execute(
+        "INSERT INTO sync_checkpoints(checkpoint_uuid,schema_version,reducer_version,state,capture_local_mutation_generation,created_at) VALUES (?1,?2,?3,'building',?4,?5)",
+        params![
+            checkpoint_uuid.0.as_bytes().as_slice(),
+            CHECKPOINT_SCHEMA_VERSION,
+            REDUCER_VERSION,
+            generation,
+            now_ms()
+        ],
+    )?;
     transaction.commit()?;
     // A private SQLite backup is the immutable fence image. It is created
     // after the short fence transaction and lets the keyset builder release
@@ -119,6 +129,7 @@ pub fn build_checkpoint(
         }
     }
     let projection = capture_projection(&snapshot)?;
+    capture_root_truth(&snapshot, &mut state)?;
     let bootstrap = bootstrap_projection_events(fence.library_uuid, &projection, &state)?;
     for event in bootstrap {
         if !state.applied_events.contains(&event.event_uuid) {
@@ -215,8 +226,13 @@ fn capture_recovery_snapshot(connection: &Connection) -> anyhow::Result<CatalogR
         } else {
             "*".to_owned()
         };
+        let recovery_filter = if *table == "sync_publication_intents" {
+            " WHERE state IN ('pending-hash','pending-manifest','ready','failed')"
+        } else {
+            ""
+        };
         let mut statement = connection.prepare(&format!(
-            "SELECT {selected_columns} FROM {table} ORDER BY rowid"
+            "SELECT {selected_columns} FROM {table}{recovery_filter} ORDER BY rowid"
         ))?;
         let columns: Vec<String> = statement
             .column_names()
@@ -484,6 +500,11 @@ fn bootstrap_projection_events(
     ));
     let mut seq = 0u64;
     let mut output = Vec::new();
+    let root_folders = projection
+        .roots
+        .iter()
+        .map(|root| root.root_folder_uuid)
+        .collect::<std::collections::BTreeSet<_>>();
     let mut push = |entity: EntityUuid, operation: Operation| -> anyhow::Result<()> {
         seq += 1;
         let event_uuid = EventUuid(deterministic_uuid(
@@ -491,9 +512,9 @@ fn bootstrap_projection_events(
             format!("bootstrap-{seq}").as_bytes(),
         ));
         output.push(seal_event(EventEnvelope {
-            wire_version: 1,
-            envelope_version: 1,
-            reducer_version: 1,
+            wire_version: super::codec::WIRE_VERSION,
+            envelope_version: super::codec::ENVELOPE_VERSION,
+            reducer_version: super::codec::REDUCER_VERSION,
             library_uuid: library,
             event_uuid,
             entity_uuid: entity,
@@ -514,7 +535,7 @@ fn bootstrap_projection_events(
         Ok(())
     };
     for folder in &projection.folders {
-        if existing.entities.contains_key(&folder.uuid) {
+        if root_folders.contains(&folder.uuid) || existing.entities.contains_key(&folder.uuid) {
             continue;
         }
         push(
@@ -659,7 +680,7 @@ pub fn load_and_validate_checkpoint(
         anyhow::bail!("checkpoint payload hash mismatch");
     }
     let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
-    checkpoint.verify()?;
+    checkpoint.verify().context("verify checkpoint")?;
     Ok(checkpoint)
 }
 
@@ -704,24 +725,153 @@ pub fn materialize_staging_catalog(
     device_uuid: uuid::Uuid,
     managed_root: &Path,
 ) -> anyhow::Result<()> {
+    if checkpoint.projection.roots.len() > 1 {
+        anyhow::bail!("multi-root checkpoint restore requires explicit root bindings");
+    }
+    let selected_root = checkpoint
+        .projection
+        .roots
+        .first()
+        .map(|root| root.root_uuid.0)
+        .unwrap_or(root_uuid);
+    let library_root_uuid = checkpoint
+        .state
+        .roots
+        .get(&EntityUuid(selected_root))
+        .map(|root| root.library_root_uuid.0)
+        .unwrap_or(root_uuid);
+    materialize_staging_catalog_internal(
+        checkpoint,
+        staging_path,
+        library_root_uuid,
+        device_uuid,
+        &[(selected_root, managed_root.to_path_buf())],
+        false,
+    )
+}
+
+/// Restores portable truth for every synchronized root while materializing
+/// browse rows only for the caller-selected device-local bindings.
+pub fn materialize_staging_catalog_with_roots(
+    checkpoint: &Checkpoint,
+    staging_path: &Path,
+    library_root_uuid: uuid::Uuid,
+    device_uuid: uuid::Uuid,
+    selected_roots: &[(uuid::Uuid, PathBuf)],
+) -> anyhow::Result<()> {
+    materialize_staging_catalog_internal(
+        checkpoint,
+        staging_path,
+        library_root_uuid,
+        device_uuid,
+        selected_roots,
+        true,
+    )
+}
+
+fn materialize_staging_catalog_internal(
+    checkpoint: &Checkpoint,
+    staging_path: &Path,
+    library_root_uuid: uuid::Uuid,
+    device_uuid: uuid::Uuid,
+    selected_roots: &[(uuid::Uuid, PathBuf)],
+    link_managed_roots: bool,
+) -> anyhow::Result<()> {
     checkpoint.verify()?;
+    if !checkpoint.recovery.portable_complete {
+        anyhow::bail!("checkpoint contains unfinished device-local work");
+    }
     if staging_path.exists() {
         std::fs::remove_file(staging_path)?;
     }
-    let database = crate::db::Database::open(staging_path)?;
-    database.apply_migrations()?;
-    database.add_root(crate::db::NewRoot {
-        path: "sync-bootstrap".into(),
-        display_name: checkpoint.host_metadata.name.clone(),
-    })?;
-    database.initialize_sync_identity(checkpoint.library_uuid.0, root_uuid, device_uuid)?;
-    restore_projection(database.connection_for_fsops(), checkpoint, root_uuid)?;
+    let database = crate::db::Database::open(staging_path).context("open staging database")?;
+    database
+        .apply_migrations()
+        .context("apply staging migrations")?;
+    for (root_uuid, path) in selected_roots {
+        let descriptor = checkpoint
+            .state
+            .roots
+            .get(&EntityUuid(*root_uuid))
+            .ok_or_else(|| anyhow::anyhow!("selected root is absent from checkpoint truth"))?;
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: path.to_string_lossy().into_owned(),
+                display_name: descriptor.materialized_name.clone(),
+            })
+            .context("add selected root")?;
+        database.connection_for_fsops().execute(
+            "UPDATE roots SET root_uuid=?1 WHERE id=?2",
+            params![root_uuid.as_bytes().as_slice(), root_id],
+        )?;
+        database.connection_for_fsops().execute(
+            "INSERT INTO folders(root_id,parent_id,name,path_hash,mtime,status,folder_uuid) VALUES (?1,NULL,'','',NULL,'active',?2)",
+            params![root_id, descriptor.root_folder_uuid.0.as_bytes().as_slice()],
+        )?;
+        let record = crate::db::SyncRootDescriptorRecord {
+            root_uuid: *root_uuid.as_bytes(),
+            root_folder_uuid: *descriptor.root_folder_uuid.0.as_bytes(),
+            library_root_uuid: *descriptor.library_root_uuid.0.as_bytes(),
+            creation_event_uuid: descriptor
+                .creation_event_uuid
+                .map(|value| *value.0.as_bytes()),
+            winning_location_revision_uuid: descriptor
+                .winning_location_revision_uuid
+                .map(|value| *value.0.as_bytes()),
+            requested_name: descriptor.requested_name.clone(),
+            materialized_name: descriptor.materialized_name.clone(),
+            materialization_fingerprint: descriptor.materialization_fingerprint,
+            lifecycle: descriptor.lifecycle.clone(),
+            logical_revision: descriptor.logical_revision,
+            updated_at: now_ms(),
+        };
+        database.upsert_sync_root_descriptor(&record)?;
+        if link_managed_roots {
+            database.link_sync_root_descriptor(
+                root_id,
+                root_uuid.as_bytes(),
+                descriptor.root_folder_uuid.0.as_bytes(),
+            )?;
+        }
+    }
+    for descriptor in checkpoint.state.roots.values() {
+        if database
+            .sync_root_descriptor(descriptor.root_uuid.0.as_bytes())?
+            .is_none()
+        {
+            database.upsert_sync_root_descriptor(&crate::db::SyncRootDescriptorRecord {
+                root_uuid: *descriptor.root_uuid.0.as_bytes(),
+                root_folder_uuid: *descriptor.root_folder_uuid.0.as_bytes(),
+                library_root_uuid: *descriptor.library_root_uuid.0.as_bytes(),
+                creation_event_uuid: descriptor
+                    .creation_event_uuid
+                    .map(|value| *value.0.as_bytes()),
+                winning_location_revision_uuid: descriptor
+                    .winning_location_revision_uuid
+                    .map(|value| *value.0.as_bytes()),
+                requested_name: descriptor.requested_name.clone(),
+                materialized_name: descriptor.materialized_name.clone(),
+                materialization_fingerprint: descriptor.materialization_fingerprint,
+                lifecycle: descriptor.lifecycle.clone(),
+                logical_revision: descriptor.logical_revision,
+                updated_at: now_ms(),
+            })?;
+        }
+    }
+    database
+        .initialize_sync_identity(checkpoint.library_uuid.0, library_root_uuid, device_uuid)
+        .context("initialize restored sync identity")?;
+    restore_projection(database.connection_for_fsops(), checkpoint, selected_roots)
+        .context("restore browse projection")?;
     let mut by_actor = checkpoint.events.clone();
     by_actor.sort_by(|a, b| a.actor.cmp(&b.actor).then(a.actor_seq.cmp(&b.actor_seq)));
     for event in by_actor {
-        database.apply_remote_sync_events(std::slice::from_ref(&event))?;
+        database
+            .apply_remote_sync_events(std::slice::from_ref(&event))
+            .context("apply restored event")?;
     }
-    restore_recovery_snapshot(database.connection_for_fsops(), &checkpoint.recovery)?;
+    restore_recovery_snapshot(database.connection_for_fsops(), &checkpoint.recovery)
+        .context("restore recovery snapshot")?;
     ingest_media_index_shards(
         database.connection_for_fsops(),
         &checkpoint.media_index_shards,
@@ -730,17 +880,14 @@ pub fn materialize_staging_catalog(
             .unwrap_or_else(|| Path::new("."))
             .join("sync-spool")
             .join("indexes"),
-    )?;
-    restore_catalog_frontiers(database.connection_for_fsops(), &checkpoint.catalog_vector)?;
-    database.connection_for_fsops().execute(
-        "UPDATE roots SET path=?1 WHERE root_uuid=?2",
-        rusqlite::params![
-            managed_root.to_string_lossy(),
-            root_uuid.as_bytes().as_slice()
-        ],
-    )?;
-    validate_genesis_replay(database.connection_for_fsops(), checkpoint, i64::MAX)?;
-    validate_browse_projection(database.connection_for_fsops(), checkpoint)?;
+    )
+    .context("restore media index shards")?;
+    restore_catalog_frontiers(database.connection_for_fsops(), &checkpoint.catalog_vector)
+        .context("restore Catalog frontiers")?;
+    validate_genesis_replay(database.connection_for_fsops(), checkpoint, i64::MAX)
+        .context("validate restored genesis replay")?;
+    validate_browse_projection(database.connection_for_fsops(), checkpoint, selected_roots)
+        .context("validate restored browse projection")?;
     database
         .connection_for_fsops()
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -808,19 +955,38 @@ fn restore_recovery_snapshot(
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(",");
+        // Immutable content rows may already have been reconstructed by the
+        // checkpoint event replay. REPLACE would delete the referenced row
+        // before reinserting it and trip the event foreign key. Recovery only
+        // needs to add rows that replay did not materialize.
+        let insert_mode = if matches!(
+            table.table.as_str(),
+            "asset_content_revisions" | "asset_content_supersedes"
+        ) {
+            "INSERT OR IGNORE"
+        } else {
+            "INSERT OR REPLACE"
+        };
         let sql = format!(
-            "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
+            "{insert_mode} INTO {} ({}) VALUES ({})",
             table.table,
             table.columns.join(","),
             placeholders
         );
         let mut statement = transaction.prepare(&sql)?;
-        for row in &table.rows {
+        for (row_index, row) in table.rows.iter().enumerate() {
             if row.len() != table.columns.len() {
                 anyhow::bail!("checkpoint recovery row width mismatch");
             }
             let values = row.iter().map(bind_snapshot_value).collect::<Vec<_>>();
-            statement.execute(rusqlite::params_from_iter(values))?;
+            statement
+                .execute(rusqlite::params_from_iter(values))
+                .with_context(|| {
+                    format!(
+                        "restore checkpoint recovery row {row_index} for {}",
+                        table.table
+                    )
+                })?;
         }
     }
     transaction.commit()?;
@@ -837,10 +1003,37 @@ fn restore_catalog_frontiers(connection: &Connection, vector: &StreamVector) -> 
 }
 
 fn capture_projection(connection: &Connection) -> anyhow::Result<CatalogProjectionSnapshot> {
-    let folders = connection.prepare("SELECT f.folder_uuid,p.folder_uuid,f.name,f.path_hash,f.mtime,f.status FROM folders f LEFT JOIN folders p ON p.id=f.parent_id ORDER BY f.folder_uuid")?
-        .query_map([], |r| Ok(FolderSnapshot { uuid: super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(0)?).map_err(sql_uuid)?), parent_uuid: r.get::<_,Option<Vec<u8>>>(1)?.map(|v| uuid::Uuid::from_slice(&v).map(super::types::EntityUuid).map_err(sql_uuid)).transpose()?, name:r.get(2)?,path_hash:r.get(3)?,mtime:r.get(4)?,status:r.get(5)? }))?.collect::<Result<Vec<_>,_>>()?;
-    let files = connection.prepare("SELECT f.asset_uuid,d.folder_uuid,f.name,f.ext,f.size,f.mtime,f.ctime,f.status,m.kind FROM files f JOIN folders d ON d.id=f.folder_id LEFT JOIN media m ON m.file_id=f.id ORDER BY f.asset_uuid")?
-        .query_map([], |r| Ok(FileSnapshot { uuid: super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(0)?).map_err(sql_uuid)?), folder_uuid:super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(1)?).map_err(sql_uuid)?),name:r.get(2)?,ext:r.get(3)?,size:r.get(4)?,mtime:r.get(5)?,ctime:r.get(6)?,status:r.get(7)?,media_kind:r.get(8)? }))?.collect::<Result<Vec<_>,_>>()?;
+    let roots = connection.prepare("SELECT r.root_uuid,COALESCE(r.root_folder_uuid,s.folder_uuid),r.display_name FROM roots r LEFT JOIN folders s ON s.root_id=r.id AND s.parent_id IS NULL AND s.name='' ORDER BY r.root_uuid")?
+        .query_map([], |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,Option<Vec<u8>>>(1)?,r.get::<_,String>(2)?)))?
+        .map(|row| {
+            let (root, folder, display_name) = row?;
+            let root_uuid = uuid::Uuid::from_slice(&root).map_err(sql_uuid)?;
+            let root_folder_uuid = folder
+                .map(|value| uuid::Uuid::from_slice(&value).map_err(sql_uuid))
+                .transpose()?
+                .unwrap_or_else(|| deterministic_uuid(root_uuid.as_bytes(), b"root-folder"));
+            Ok(RootProjectionSnapshot { root_uuid: super::types::EntityUuid(root_uuid), root_folder_uuid: super::types::EntityUuid(root_folder_uuid), display_name })
+        }).collect::<Result<Vec<_>,rusqlite::Error>>()?;
+    let mut folders = connection.prepare("SELECT f.folder_uuid,r.root_uuid,p.folder_uuid,f.name,f.mtime,f.status FROM folders f JOIN roots r ON r.id=f.root_id LEFT JOIN folders p ON p.id=f.parent_id ORDER BY f.folder_uuid")?
+        .query_map([], |r| Ok(FolderSnapshot { uuid: super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(0)?).map_err(sql_uuid)?), root_uuid: super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(1)?).map_err(sql_uuid)?), parent_uuid: r.get::<_,Option<Vec<u8>>>(2)?.map(|v| uuid::Uuid::from_slice(&v).map(super::types::EntityUuid).map_err(sql_uuid)).transpose()?, name:r.get(3)?,mtime:r.get(4)?,status:r.get(5)? }))?.collect::<Result<Vec<_>,_>>()?;
+    for root in &roots {
+        if !folders
+            .iter()
+            .any(|folder| folder.uuid == root.root_folder_uuid)
+        {
+            folders.push(FolderSnapshot {
+                uuid: root.root_folder_uuid,
+                root_uuid: root.root_uuid,
+                parent_uuid: None,
+                name: String::new(),
+                mtime: None,
+                status: "active".to_owned(),
+            });
+        }
+    }
+    folders.sort_by_key(|folder| folder.uuid);
+    let files = connection.prepare("SELECT f.asset_uuid,r.root_uuid,d.folder_uuid,f.name,f.ext,f.size,f.mtime,f.ctime,f.status,m.kind FROM files f JOIN roots r ON r.id=f.root_id JOIN folders d ON d.id=f.folder_id LEFT JOIN media m ON m.file_id=f.id ORDER BY f.asset_uuid")?
+        .query_map([], |r| Ok(FileSnapshot { uuid: super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(0)?).map_err(sql_uuid)?), root_uuid: super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(1)?).map_err(sql_uuid)?), folder_uuid:super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(2)?).map_err(sql_uuid)?),name:r.get(3)?,ext:r.get(4)?,size:r.get(5)?,mtime:r.get(6)?,ctime:r.get(7)?,status:r.get(8)?,media_kind:r.get(9)? }))?.collect::<Result<Vec<_>,_>>()?;
     let tags = connection
         .prepare("SELECT tag_uuid,name,color FROM tags ORDER BY tag_uuid")?
         .query_map([], |r| {
@@ -856,12 +1049,110 @@ fn capture_projection(connection: &Connection) -> anyhow::Result<CatalogProjecti
     let metadata = connection.prepare("SELECT f.asset_uuid,u.rating,u.favorite,u.note,u.updated_at FROM user_metadata u JOIN files f ON f.id=u.file_id ORDER BY f.asset_uuid")?.query_map([], |r| Ok(MetadataSnapshot { asset_uuid:super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(0)?).map_err(sql_uuid)?),rating:r.get(1)?,favorite:r.get::<_,i64>(2)?!=0,note:r.get(3)?,updated_at:r.get(4)? }))?.collect::<Result<Vec<_>,_>>()?;
     let memberships = connection.prepare("SELECT f.asset_uuid,t.tag_uuid FROM file_tags x JOIN files f ON f.id=x.file_id JOIN tags t ON t.id=x.tag_id ORDER BY f.asset_uuid,t.tag_uuid")?.query_map([], |r| Ok((super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(0)?).map_err(sql_uuid)?),super::types::EntityUuid(uuid::Uuid::from_slice(&r.get::<_,Vec<u8>>(1)?).map_err(sql_uuid)?))))?.collect::<Result<Vec<_>,_>>()?;
     Ok(CatalogProjectionSnapshot {
+        roots,
         folders,
         files,
         tags,
         metadata,
         memberships,
     })
+}
+
+fn capture_root_truth(connection: &Connection, state: &mut ProtocolState) -> anyhow::Result<()> {
+    let mut statement = connection.prepare("SELECT root_uuid,root_folder_uuid,library_root_uuid,creation_event_uuid,winning_location_revision_uuid,requested_name,materialized_name,materialization_fingerprint,lifecycle,logical_revision FROM sync_root_descriptors ORDER BY root_uuid")?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Vec<u8>>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, i64>(9)?,
+        ))
+    })? {
+        let (
+            root,
+            folder,
+            library_root,
+            creation,
+            winning,
+            requested,
+            materialized,
+            fingerprint,
+            lifecycle,
+            revision,
+        ) = row?;
+        let root_uuid = EntityUuid(uuid::Uuid::from_slice(&root)?);
+        state.roots.insert(
+            root_uuid,
+            super::reducer::SyncRootTruth {
+                root_uuid,
+                root_folder_uuid: EntityUuid(uuid::Uuid::from_slice(&folder)?),
+                library_root_uuid: EntityUuid(uuid::Uuid::from_slice(&library_root)?),
+                creation_event_uuid: creation
+                    .map(|value| uuid::Uuid::from_slice(&value).map(EventUuid))
+                    .transpose()?,
+                winning_location_revision_uuid: winning
+                    .map(|value| uuid::Uuid::from_slice(&value).map(RevisionUuid))
+                    .transpose()?,
+                requested_name: requested,
+                materialized_name: materialized,
+                materialization_fingerprint: fingerprint
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid root materialization fingerprint"))?,
+                lifecycle,
+                logical_revision: u64::try_from(revision)?,
+            },
+        );
+    }
+    let mut legacy = connection.prepare("SELECT r.root_uuid,COALESCE(r.root_folder_uuid,s.folder_uuid),r.display_name FROM roots r LEFT JOIN folders s ON s.root_id=r.id AND s.parent_id IS NULL AND s.name='' WHERE NOT EXISTS (SELECT 1 FROM sync_root_descriptors d WHERE d.root_uuid=r.root_uuid) ORDER BY r.root_uuid")?;
+    for row in legacy.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Option<Vec<u8>>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (root, folder, requested_name) = row?;
+        let root_uuid = EntityUuid(uuid::Uuid::from_slice(&root)?);
+        // Before managed-root v2 the one Catalog root UUID doubled as the
+        // virtual Library-root parent used by bootstrap location events.
+        let library_root_uuid = root_uuid;
+        let root_folder_uuid = EntityUuid(
+            folder
+                .map(|value| uuid::Uuid::from_slice(&value))
+                .transpose()?
+                .unwrap_or_else(|| deterministic_uuid(root_uuid.0.as_bytes(), b"root-folder")),
+        );
+        let materialized_name =
+            super::reducer::canonicalize_materialized_component(&requested_name, None);
+        state.roots.insert(
+            root_uuid,
+            super::reducer::SyncRootTruth {
+                root_uuid,
+                root_folder_uuid,
+                library_root_uuid,
+                creation_event_uuid: None,
+                winning_location_revision_uuid: None,
+                requested_name,
+                materialized_name: materialized_name.clone(),
+                materialization_fingerprint: sha256(&canonical_bytes(&(
+                    super::reducer::MATERIALIZED_NAME_VERSION,
+                    root_uuid,
+                    root_folder_uuid,
+                    materialized_name,
+                ))?),
+                lifecycle: "active".to_owned(),
+                logical_revision: 0,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn sql_uuid(error: uuid::Error) -> rusqlite::Error {
@@ -871,19 +1162,45 @@ fn sql_uuid(error: uuid::Error) -> rusqlite::Error {
 fn restore_projection(
     connection: &Connection,
     checkpoint: &Checkpoint,
-    root_uuid: uuid::Uuid,
+    selected_roots: &[(uuid::Uuid, PathBuf)],
 ) -> anyhow::Result<()> {
     let transaction = connection.unchecked_transaction()?;
-    let root_id: i64 = transaction.query_row(
-        "SELECT id FROM roots WHERE root_uuid=?1",
-        [root_uuid.as_bytes().as_slice()],
-        |r| r.get(0),
-    )?;
-    let mut pending = checkpoint.projection.folders.clone();
+    let selected = selected_roots
+        .iter()
+        .map(|(root_uuid, _)| *root_uuid)
+        .collect::<std::collections::BTreeSet<_>>();
+    let root_folders = checkpoint
+        .projection
+        .roots
+        .iter()
+        .filter(|root| selected.contains(&root.root_uuid.0))
+        .map(|root| root.root_folder_uuid)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut pending = checkpoint
+        .projection
+        .folders
+        .iter()
+        .filter(|folder| selected.contains(&folder.root_uuid.0))
+        .cloned()
+        .collect::<Vec<_>>();
     while !pending.is_empty() {
         let before = pending.len();
         let mut rest = Vec::new();
         for folder in pending {
+            let root_id: i64 = transaction
+                .query_row(
+                    "SELECT id FROM roots WHERE root_uuid=?1",
+                    [folder.root_uuid.0.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .with_context(|| format!("resolve restored folder root {}", folder.root_uuid.0))?;
+            if root_folders.contains(&folder.uuid) {
+                transaction.execute(
+                    "UPDATE folders SET mtime=?1,status=?2 WHERE root_id=?3 AND parent_id IS NULL AND name='' AND folder_uuid=?4",
+                    params![folder.mtime, folder.status, root_id, folder.uuid.0.as_bytes().as_slice()],
+                )?;
+                continue;
+            }
             let parent_id: Option<i64> = folder.parent_uuid.and_then(|u| {
                 transaction
                     .query_row(
@@ -899,19 +1216,38 @@ fn restore_projection(
                 rest.push(folder);
                 continue;
             }
-            transaction.execute("INSERT INTO folders(root_id,parent_id,name,path_hash,mtime,status,folder_uuid) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![root_id,parent_id,folder.name,folder.path_hash,folder.mtime,folder.status,folder.uuid.0.as_bytes().as_slice()])?;
+            transaction.execute("INSERT INTO folders(root_id,parent_id,name,path_hash,mtime,status,folder_uuid) VALUES (?1,?2,?3,'',?4,?5,?6)",params![root_id,parent_id,folder.name,folder.mtime,folder.status,folder.uuid.0.as_bytes().as_slice()])?;
         }
         if rest.len() == before {
             anyhow::bail!("checkpoint folder graph cannot be materialized");
         }
         pending = rest;
     }
-    for file in &checkpoint.projection.files {
-        let folder_id: i64 = transaction.query_row(
-            "SELECT id FROM folders WHERE folder_uuid=?1",
-            [file.folder_uuid.0.as_bytes().as_slice()],
-            |r| r.get(0),
-        )?;
+    for file in checkpoint
+        .projection
+        .files
+        .iter()
+        .filter(|file| selected.contains(&file.root_uuid.0))
+    {
+        let root_id: i64 = transaction
+            .query_row(
+                "SELECT id FROM roots WHERE root_uuid=?1",
+                [file.root_uuid.0.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("resolve restored file root {}", file.root_uuid.0))?;
+        let folder_id: i64 = transaction
+            .query_row(
+                "SELECT id FROM folders WHERE folder_uuid=?1",
+                [file.folder_uuid.0.as_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .with_context(|| {
+                format!(
+                    "resolve restored file folder {} for asset {}",
+                    file.folder_uuid.0, file.uuid.0
+                )
+            })?;
         transaction.execute("INSERT INTO files(root_id,folder_id,name,ext,size,mtime,ctime,status,asset_uuid) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![root_id,folder_id,file.name,file.ext,file.size,file.mtime,file.ctime,file.status,file.uuid.0.as_bytes().as_slice()])?;
         if let Some(kind) = &file.media_kind {
             transaction.execute("INSERT INTO media(file_id,kind,metadata_status) SELECT id,?1,'pending' FROM files WHERE asset_uuid=?2",params![kind,file.uuid.0.as_bytes().as_slice()])?;
@@ -936,12 +1272,60 @@ fn restore_projection(
 fn validate_browse_projection(
     connection: &Connection,
     checkpoint: &Checkpoint,
+    selected_roots: &[(uuid::Uuid, PathBuf)],
 ) -> anyhow::Result<()> {
     let actual = capture_projection(connection)?;
-    if actual != checkpoint.projection {
+    let selected = selected_roots
+        .iter()
+        .map(|(root_uuid, _)| *root_uuid)
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = CatalogProjectionSnapshot {
+        roots: checkpoint
+            .projection
+            .roots
+            .iter()
+            .filter(|root| selected.contains(&root.root_uuid.0))
+            .cloned()
+            .collect(),
+        folders: checkpoint
+            .projection
+            .folders
+            .iter()
+            .filter(|folder| selected.contains(&folder.root_uuid.0))
+            .cloned()
+            .collect(),
+        files: checkpoint
+            .projection
+            .files
+            .iter()
+            .filter(|file| selected.contains(&file.root_uuid.0))
+            .cloned()
+            .collect(),
+        tags: checkpoint.projection.tags.clone(),
+        metadata: checkpoint
+            .projection
+            .metadata
+            .iter()
+            .filter(|metadata| {
+                actual
+                    .files
+                    .iter()
+                    .any(|file| file.uuid == metadata.asset_uuid)
+            })
+            .cloned()
+            .collect(),
+        memberships: checkpoint
+            .projection
+            .memberships
+            .iter()
+            .filter(|(asset, _)| actual.files.iter().any(|file| file.uuid == *asset))
+            .copied()
+            .collect(),
+    };
+    if actual != expected {
         anyhow::bail!(
             "staging browse projection differs from checkpoint projection: expected={:?} actual={:?}",
-            checkpoint.projection,
+            expected,
             actual
         );
     }
@@ -982,6 +1366,7 @@ pub fn validate_genesis_replay(
             cursor = rowid;
         }
     }
+    state.roots = checkpoint.state.roots.clone();
     if super::checkpoint::state_digest(&state)?
         != super::checkpoint::state_digest(&checkpoint.state)?
     {
@@ -1062,6 +1447,137 @@ mod tests {
         let promoted = directory.join("promoted.sqlite");
         promote_new_staging_catalog(&staging, &promoted).unwrap();
         assert!(promoted.exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn checkpoint_restores_only_selected_root_and_keeps_all_root_truth() {
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let library = uuid::Uuid::from_u128(1);
+        let library_root = uuid::Uuid::from_u128(2);
+        let first_root = uuid::Uuid::from_u128(10);
+        let first_folder = uuid::Uuid::from_u128(11);
+        let second_root = uuid::Uuid::from_u128(20);
+        let second_folder = uuid::Uuid::from_u128(21);
+        for (root_uuid, folder_uuid, path, name, fingerprint) in [
+            (first_root, first_folder, "D:/First", "First", [1; 32]),
+            (second_root, second_folder, "E:/Second", "Second", [2; 32]),
+        ] {
+            database
+                .upsert_sync_root_descriptor(&crate::db::SyncRootDescriptorRecord {
+                    root_uuid: *root_uuid.as_bytes(),
+                    root_folder_uuid: *folder_uuid.as_bytes(),
+                    library_root_uuid: *library_root.as_bytes(),
+                    creation_event_uuid: None,
+                    winning_location_revision_uuid: None,
+                    requested_name: name.into(),
+                    materialized_name: name.into(),
+                    materialization_fingerprint: fingerprint,
+                    lifecycle: "active".into(),
+                    logical_revision: 0,
+                    updated_at: 1,
+                })
+                .unwrap();
+            let root_id = database
+                .add_root(NewRoot {
+                    path: path.into(),
+                    display_name: name.into(),
+                })
+                .unwrap();
+            database
+                .connection_for_fsops()
+                .execute(
+                    "UPDATE roots SET root_uuid=?1 WHERE id=?2",
+                    params![root_uuid.as_bytes().as_slice(), root_id],
+                )
+                .unwrap();
+            database.connection_for_fsops().execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,NULL,'','root','active',?2)",
+                params![root_id, folder_uuid.as_bytes().as_slice()],
+            ).unwrap();
+            database
+                .link_sync_root_descriptor(root_id, root_uuid.as_bytes(), folder_uuid.as_bytes())
+                .unwrap();
+            let asset = uuid::Uuid::from_u128(root_uuid.as_u128() + 100);
+            database.connection_for_fsops().execute(
+                "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status,asset_uuid) SELECT ?1,id,?2,'jpg',1,1,'active',?3 FROM folders WHERE folder_uuid=?4",
+                params![root_id, format!("{name}.jpg"), asset.as_bytes().as_slice(), folder_uuid.as_bytes().as_slice()],
+            ).unwrap();
+        }
+        database
+            .initialize_sync_identity(library, library_root, uuid::Uuid::now_v7())
+            .unwrap();
+        let fence = capture_checkpoint_fence(
+            database.connection_for_fsops(),
+            StreamVector::new(),
+            test_host(library),
+        )
+        .unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("megle-multi-root-{}", uuid::Uuid::now_v7()));
+        let path = build_checkpoint(database.connection_for_fsops(), &fence, &directory).unwrap();
+        let checkpoint: Checkpoint = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(checkpoint.state.roots.len(), 2);
+        let staging = directory.join("subset.sqlite");
+        materialize_staging_catalog_with_roots(
+            &checkpoint,
+            &staging,
+            library_root,
+            uuid::Uuid::now_v7(),
+            &[(second_root, PathBuf::from("F:/Chosen"))],
+        )
+        .unwrap();
+        let restored = Database::open(&staging).unwrap();
+        assert_eq!(restored.list_roots().unwrap().len(), 1);
+        assert_eq!(restored.list_roots().unwrap()[0].path, "F:/Chosen");
+        assert_eq!(
+            restored
+                .connection_for_fsops()
+                .query_row("SELECT COUNT(*) FROM sync_root_descriptors", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            restored
+                .connection_for_fsops()
+                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(restored);
+        let unselected_staging = directory.join("unselected.sqlite");
+        materialize_staging_catalog_with_roots(
+            &checkpoint,
+            &unselected_staging,
+            library_root,
+            uuid::Uuid::now_v7(),
+            &[],
+        )
+        .unwrap();
+        let unselected = Database::open(&unselected_staging).unwrap();
+        assert_eq!(unselected.list_roots().unwrap().len(), 0);
+        assert_eq!(
+            unselected
+                .connection_for_fsops()
+                .query_row("SELECT COUNT(*) FROM sync_root_descriptors", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            unselected
+                .connection_for_fsops()
+                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(unselected);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -1250,6 +1766,21 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate == column));
         }
+        let staging = directory.join("unfinished.sqlite");
+        let restore_error = materialize_staging_catalog_with_roots(
+            &checkpoint,
+            &staging,
+            root_uuid,
+            uuid::Uuid::now_v7(),
+            &[(root_uuid, PathBuf::from("D:/Restored"))],
+        )
+        .unwrap_err();
+        assert!(
+            restore_error
+                .to_string()
+                .contains("checkpoint contains unfinished device-local work"),
+            "unfinished local publication work must remain non-portable: {restore_error:#}"
+        );
         let _ = std::fs::remove_dir_all(directory);
     }
 

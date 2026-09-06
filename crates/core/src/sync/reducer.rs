@@ -1,8 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
+use super::codec::{canonical_bytes, sha256};
 use super::types::*;
+
+pub const MATERIALIZED_NAME_VERSION: u16 = 1;
+const MAX_COMPONENT_UTF16_UNITS: usize = 240;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Versioned<T> {
@@ -16,6 +21,20 @@ pub struct LocationRevision {
     pub parent_uuid: Option<EntityUuid>,
     pub name: String,
     pub version: Version,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncRootTruth {
+    pub root_uuid: EntityUuid,
+    pub root_folder_uuid: EntityUuid,
+    pub library_root_uuid: EntityUuid,
+    pub creation_event_uuid: Option<EventUuid>,
+    pub winning_location_revision_uuid: Option<RevisionUuid>,
+    pub requested_name: String,
+    pub materialized_name: String,
+    pub materialization_fingerprint: [u8; 32],
+    pub lifecycle: String,
+    pub logical_revision: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -82,6 +101,8 @@ impl EntityTruth {
 pub struct ProtocolState {
     pub entities: BTreeMap<EntityUuid, EntityTruth>,
     pub applied_events: BTreeSet<EventUuid>,
+    #[serde(default)]
+    pub roots: BTreeMap<EntityUuid, SyncRootTruth>,
 }
 
 impl ProtocolState {
@@ -213,7 +234,96 @@ fn insert_field_history(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LegalLocation {
     pub parent_uuid: Option<EntityUuid>,
+    pub requested_name: String,
     pub display_name: String,
+    pub compare_key: String,
+    pub materialization_fingerprint: [u8; 32],
+}
+
+fn is_windows_reserved_component(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or_default();
+    let upper = stem.to_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+}
+
+fn truncate_utf16(value: &str, limit: usize) -> String {
+    let mut units = 0usize;
+    value
+        .chars()
+        .take_while(|character| {
+            let next = units + character.len_utf16();
+            if next > limit {
+                false
+            } else {
+                units = next;
+                true
+            }
+        })
+        .collect()
+}
+
+/// Portable component legalization. It deliberately uses no platform locale
+/// or filesystem API, so replay on Windows and Linux produces identical names.
+pub fn canonicalize_materialized_component(requested: &str, suffix: Option<&str>) -> String {
+    let normalized: String = requested.nfc().collect();
+    let mut value: String = normalized
+        .chars()
+        .map(|character| {
+            if character <= '\u{1f}'
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    while value.ends_with([' ', '.']) {
+        value.pop();
+    }
+    if value.is_empty() || value == "." || value == ".." {
+        value = "untitled".to_owned();
+    }
+    if is_windows_reserved_component(&value) {
+        value.insert(0, '_');
+    }
+    let suffix = suffix
+        .map(|value| format!(" ({value})"))
+        .unwrap_or_default();
+    let suffix_units = suffix.encode_utf16().count();
+    let base_budget = MAX_COMPONENT_UTF16_UNITS
+        .saturating_sub(suffix_units)
+        .max(1);
+    let mut base = truncate_utf16(&value, base_budget);
+    while base.ends_with([' ', '.']) {
+        base.pop();
+    }
+    if base.is_empty() {
+        base = "_".to_owned();
+    }
+    base.push_str(&suffix);
+    base
+}
+
+pub fn materialized_name_compare_key(value: &str) -> String {
+    value.nfc().flat_map(char::to_lowercase).collect()
+}
+
+fn suffix_candidates(entity_uuid: EntityUuid) -> Vec<String> {
+    let simple = entity_uuid.0.simple().to_string();
+    [8_usize, 12, 16, 24, 32]
+        .into_iter()
+        .map(|length| simple[..length].to_owned())
+        .collect()
 }
 
 pub fn legalize_locations(
@@ -259,28 +369,70 @@ pub fn legalize_locations(
     }
     let mut groups: HashMap<(Option<EntityUuid>, String), Vec<EntityUuid>> = HashMap::new();
     for (id, loc) in &selected {
+        let canonical = canonicalize_materialized_component(&loc.name, None);
         groups
-            .entry((loc.parent_uuid, loc.name.to_lowercase()))
+            .entry((loc.parent_uuid, materialized_name_compare_key(&canonical)))
             .or_default()
             .push(*id);
     }
     let mut output = BTreeMap::new();
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut used_by_parent: BTreeMap<Option<EntityUuid>, BTreeSet<String>> = BTreeMap::new();
     for ((parent, _), mut ids) in groups {
         ids.sort();
         for (index, id) in ids.into_iter().enumerate() {
             let loc = &selected[&id];
-            let display_name = if index == 0 {
-                loc.name.clone()
-            } else {
-                format!("{} ({})", loc.name, &id.to_string()[..8])
-            };
+            let used = used_by_parent.entry(parent).or_default();
+            let mut display_name = canonicalize_materialized_component(&loc.name, None);
+            if index != 0 || used.contains(&materialized_name_compare_key(&display_name)) {
+                display_name = suffix_candidates(id)
+                    .into_iter()
+                    .map(|suffix| canonicalize_materialized_component(&loc.name, Some(&suffix)))
+                    .find(|candidate| !used.contains(&materialized_name_compare_key(candidate)))
+                    .unwrap_or_else(|| {
+                        canonicalize_materialized_component(
+                            &loc.name,
+                            Some(&id.0.hyphenated().to_string()),
+                        )
+                    });
+            }
+            let compare_key = materialized_name_compare_key(&display_name);
+            used.insert(compare_key.clone());
             output.insert(
                 id,
                 LegalLocation {
                     parent_uuid: parent,
+                    requested_name: loc.name.clone(),
                     display_name,
+                    compare_key,
+                    materialization_fingerprint: [0; 32],
                 },
             );
+        }
+    }
+    let by_parent = output
+        .iter()
+        .map(|(entity, location)| (location.parent_uuid, *entity))
+        .collect::<Vec<_>>();
+    for (parent, _) in by_parent {
+        let siblings = output
+            .iter()
+            .filter(|(_, location)| location.parent_uuid == parent)
+            .map(|(entity, location)| {
+                let winning = selected[entity].revision_uuid;
+                (*entity, winning, location.display_name.clone())
+            })
+            .collect::<Vec<_>>();
+        let fingerprint = sha256(
+            &canonical_bytes(&(MATERIALIZED_NAME_VERSION, parent, siblings))
+                .expect("materialized-name fingerprint serialization"),
+        );
+        for location in output
+            .values_mut()
+            .filter(|location| location.parent_uuid == parent)
+        {
+            location.materialization_fingerprint = fingerprint;
         }
     }
     output

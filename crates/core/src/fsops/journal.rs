@@ -109,6 +109,9 @@ struct JournalIntent {
     entity_kind: Option<EntityKind>,
     entity_id: Option<i64>,
     root_id: Option<i64>,
+    root_uuid: Option<Vec<u8>>,
+    local_binding_uuid: Option<Vec<u8>>,
+    binding_generation: Option<i64>,
     source_path: PathBuf,
     target_path: Option<PathBuf>,
     target_folder_id: Option<i64>,
@@ -1716,6 +1719,12 @@ fn persist_intents(
                 error_detail,
             ],
         )?;
+        let operation_id = transaction.last_insert_rowid();
+        let ownership: (Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>) = transaction.query_row(
+            "SELECT root_uuid,local_binding_uuid,binding_generation FROM file_operations WHERE id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
         if let Some(error) = prepared.preflight_error {
             preflight_failures += 1;
             if first_error.is_none() {
@@ -1724,12 +1733,15 @@ fn persist_intents(
             continue;
         }
         intents.push(JournalIntent {
-            id: transaction.last_insert_rowid(),
+            id: operation_id,
             group_id: group_id.clone(),
             kind: prepared.kind,
             entity_kind: prepared.entity_kind,
             entity_id: prepared.entity_id,
             root_id: prepared.root_id,
+            root_uuid: ownership.0,
+            local_binding_uuid: ownership.1,
+            binding_generation: ownership.2,
             source_path: PathBuf::from(prepared.source_path),
             target_path: prepared.target_path.map(PathBuf::from),
             target_folder_id: prepared.target_folder_id,
@@ -1768,6 +1780,7 @@ fn mark_attempt(database: &Database, intent: &mut JournalIntent) -> FsOpsResult<
         database.connection_for_fsops(),
         TransactionBehavior::Immediate,
     )?;
+    require_current_journal_root_token(&transaction, intent)?;
     let updated = transaction.execute(
         "UPDATE file_operations SET attempt_count = attempt_count + 1, journal_phase = 'executing' WHERE id = ?1 AND status = 'pending' AND journal_phase = 'prepared'",
         [intent.id],
@@ -1782,6 +1795,49 @@ fn mark_attempt(database: &Database, intent: &mut JournalIntent) -> FsOpsResult<
     intent.attempt_count = intent.attempt_count.saturating_add(1);
     intent.phase = JournalPhase::Executing;
     Ok(())
+}
+
+fn require_current_journal_root_token(
+    transaction: &Transaction<'_>,
+    intent: &JournalIntent,
+) -> FsOpsResult<()> {
+    match (
+        intent.root_uuid.as_deref(),
+        intent.local_binding_uuid.as_deref(),
+        intent.binding_generation,
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(root_uuid), Some(local_binding_uuid), Some(binding_generation)) => {
+            let token = crate::db::SyncRootBindingToken {
+                root_uuid: root_uuid.try_into().map_err(|_| {
+                    FsOpsError::new(FsOpsErrorCode::Interrupted, "invalid root UUID in journal")
+                })?,
+                local_binding_uuid: local_binding_uuid.try_into().map_err(|_| {
+                    FsOpsError::new(
+                        FsOpsErrorCode::Interrupted,
+                        "invalid local binding UUID in journal",
+                    )
+                })?,
+                binding_generation: u64::try_from(binding_generation).map_err(|_| {
+                    FsOpsError::new(
+                        FsOpsErrorCode::Interrupted,
+                        "invalid root binding generation in journal",
+                    )
+                })?,
+            };
+            crate::db::Database::require_sync_root_binding_token_in_transaction(transaction, &token)
+                .map_err(|_| {
+                    FsOpsError::new(
+                        FsOpsErrorCode::Interrupted,
+                        "file operation belongs to a stale root binding generation",
+                    )
+                })
+        }
+        _ => Err(FsOpsError::new(
+            FsOpsErrorCode::Interrupted,
+            "file operation root ownership is partial",
+        )),
+    }
 }
 
 fn update_recycle_phase(
@@ -1823,6 +1879,7 @@ fn finalize_intent(
         TransactionBehavior::Immediate,
     )?;
     if error.is_none() {
+        require_current_journal_root_token(&transaction, intent)?;
         apply_success_to_index(&transaction, intent)?;
         capture_successful_intent(&transaction, intent)?;
     }
@@ -2229,7 +2286,7 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                   root_id, source_path, target_path, target_folder_id,
                   attempt_count, journal_phase, source_identity,
                   target_parent_identity, staging_identity, recycle_phase,
-                  error_code, error
+                  error_code, error, root_uuid, local_binding_uuid, binding_generation
            FROM file_operations
            WHERE status = 'pending' AND operation_group_id IS NOT NULL
            ORDER BY id"#,
@@ -2256,6 +2313,9 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                 row.get::<_, String>(14)?,
                 row.get::<_, Option<String>>(15)?,
                 row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<Vec<u8>>>(17)?,
+                row.get::<_, Option<Vec<u8>>>(18)?,
+                row.get::<_, Option<i64>>(19)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2280,6 +2340,9 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                 recycle_phase,
                 error_code,
                 error_detail,
+                root_uuid,
+                local_binding_uuid,
+                binding_generation,
             )| {
                 Ok(JournalIntent {
                     id,
@@ -2293,6 +2356,9 @@ fn load_pending_intents(database: &Database) -> FsOpsResult<Vec<JournalIntent>> 
                     entity_kind: entity_kind.as_deref().map(EntityKind::parse).transpose()?,
                     entity_id,
                     root_id,
+                    root_uuid,
+                    local_binding_uuid,
+                    binding_generation,
                     source_path: PathBuf::from(source_path),
                     target_path: target_path.map(PathBuf::from),
                     target_folder_id,

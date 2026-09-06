@@ -60,6 +60,7 @@ impl PublicationPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationJob {
     pub intent_uuid: uuid::Uuid,
+    pub asset_uuid: uuid::Uuid,
     pub content_revision_uuid: uuid::Uuid,
     pub source_path: String,
     pub expected_source_length: u64,
@@ -160,13 +161,14 @@ pub fn claim_publication_job(
     lease_ms: i64,
 ) -> anyhow::Result<Option<PublicationJob>> {
     let transaction = connection.unchecked_transaction()?;
-    let row: Option<(Vec<u8>, Vec<u8>, String, i64, Option<i64>, Option<String>, String, Option<Vec<u8>>, i64, Option<String>, Option<String>, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>)> = transaction.query_row(
-        "SELECT j.intent_uuid,i.content_revision_uuid,i.source_path,r.byte_size,r.source_mtime_ms,json_extract(j.source_identity_json,'$.expectedContentSha256'),j.phase,j.binding_epoch,j.transport_generation,j.upload_object_key,j.upload_id,j.upload_offset,j.attempt_count,j.root_uuid,j.local_binding_uuid,j.binding_generation FROM media_publication_jobs j JOIN sync_publication_intents i ON i.intent_uuid=j.intent_uuid JOIN asset_content_revisions r ON r.content_revision_uuid=i.content_revision_uuid WHERE j.binding_epoch=?1 AND j.transport_generation=?2 AND j.phase NOT IN ('canonicalized','event-published','cancelled','archived') AND COALESCE(j.next_attempt_at,0)<=?3 AND (j.owner_token IS NULL OR j.lease_expires_at<?3) ORDER BY j.priority DESC,j.updated_at,j.intent_uuid LIMIT 1",
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, String, i64, Option<i64>, Option<String>, String, Option<Vec<u8>>, i64, Option<String>, Option<String>, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>)> = transaction.query_row(
+        "SELECT j.intent_uuid,i.asset_uuid,i.content_revision_uuid,i.source_path,r.byte_size,r.source_mtime_ms,json_extract(j.source_identity_json,'$.expectedContentSha256'),j.phase,j.binding_epoch,j.transport_generation,j.upload_object_key,j.upload_id,j.upload_offset,j.attempt_count,j.root_uuid,j.local_binding_uuid,j.binding_generation FROM media_publication_jobs j JOIN sync_publication_intents i ON i.intent_uuid=j.intent_uuid JOIN asset_content_revisions r ON r.content_revision_uuid=i.content_revision_uuid WHERE j.binding_epoch=?1 AND j.transport_generation=?2 AND j.phase NOT IN ('canonicalized','event-published','cancelled','archived') AND COALESCE(j.next_attempt_at,0)<=?3 AND (j.owner_token IS NULL OR j.lease_expires_at<?3) AND (j.root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=j.root_uuid AND b.local_binding_uuid=j.local_binding_uuid AND b.binding_generation=j.binding_generation AND b.state='active')) ORDER BY j.priority DESC,j.updated_at,j.intent_uuid LIMIT 1",
         params![binding_epoch.as_bytes().as_slice(),transport_generation,now],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?)),
     ).optional()?;
     let Some((
         intent,
+        asset,
         revision,
         source_path,
         expected_source_length,
@@ -187,7 +189,7 @@ pub fn claim_publication_job(
         return Ok(None);
     };
     let changed = transaction.execute(
-        "UPDATE media_publication_jobs SET owner_token=?1,lease_expires_at=?2,attempt_count=attempt_count+1,updated_at=?3 WHERE intent_uuid=?4 AND (owner_token IS NULL OR lease_expires_at<?3)",
+        "UPDATE media_publication_jobs SET owner_token=?1,lease_expires_at=?2,attempt_count=attempt_count+1,updated_at=?3 WHERE intent_uuid=?4 AND (owner_token IS NULL OR lease_expires_at<?3) AND (root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=media_publication_jobs.root_uuid AND b.local_binding_uuid=media_publication_jobs.local_binding_uuid AND b.binding_generation=media_publication_jobs.binding_generation AND b.state='active'))",
         params![owner_token, now.saturating_add(lease_ms), now, intent],
     )?;
     if changed != 1 {
@@ -197,6 +199,7 @@ pub fn claim_publication_job(
     transaction.commit()?;
     Ok(Some(PublicationJob {
         intent_uuid: uuid::Uuid::from_slice(&intent)?,
+        asset_uuid: uuid::Uuid::from_slice(&asset)?,
         content_revision_uuid: uuid::Uuid::from_slice(&revision)?,
         source_path,
         expected_source_length: u64::try_from(expected_source_length)?,
@@ -232,7 +235,7 @@ pub fn set_publication_phase(
     now: i64,
 ) -> anyhow::Result<()> {
     let changed = connection.execute(
-        "UPDATE media_publication_jobs SET phase=?1,error_code=NULL,next_attempt_at=NULL,updated_at=?2 WHERE intent_uuid=?3 AND owner_token=?4",
+        "UPDATE media_publication_jobs SET phase=?1,error_code=NULL,next_attempt_at=NULL,updated_at=?2 WHERE intent_uuid=?3 AND owner_token=?4 AND (root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=media_publication_jobs.root_uuid AND b.local_binding_uuid=media_publication_jobs.local_binding_uuid AND b.binding_generation=media_publication_jobs.binding_generation AND b.state='active'))",
         params![phase.as_str(),now,intent_uuid.as_bytes().as_slice(),owner_token],
     )?;
     if changed != 1 {
@@ -264,10 +267,16 @@ pub fn fail_publication_job(
     if error_code.len() > 128 {
         anyhow::bail!("media error code exceeds limit");
     }
-    connection.execute(
-        "UPDATE media_publication_jobs SET phase='failed',owner_token=NULL,lease_expires_at=NULL,error_code=?1,next_attempt_at=?2,updated_at=?3 WHERE intent_uuid=?4 AND owner_token=?5",
+    let changed = connection.execute(
+        "UPDATE media_publication_jobs SET phase='failed',owner_token=NULL,lease_expires_at=NULL,error_code=?1,next_attempt_at=?2,updated_at=?3 WHERE intent_uuid=?4 AND owner_token=?5 AND (root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=media_publication_jobs.root_uuid AND b.local_binding_uuid=media_publication_jobs.local_binding_uuid AND b.binding_generation=media_publication_jobs.binding_generation AND b.state='active'))",
         params![error_code,next_attempt_at,now,intent_uuid.as_bytes().as_slice(),owner_token],
     )?;
+    if changed == 0 {
+        connection.execute(
+            "UPDATE media_publication_jobs SET owner_token=NULL,lease_expires_at=NULL WHERE intent_uuid=?1 AND owner_token=?2",
+            params![intent_uuid.as_bytes().as_slice(), owner_token],
+        )?;
+    }
     Ok(())
 }
 
@@ -333,7 +342,7 @@ pub fn register_remote_receipt(
     let binding = binding_epoch.map(|value| value.as_bytes().to_vec());
     let transaction = connection.unchecked_transaction()?;
     let fence_matches: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM media_publication_jobs j JOIN sync_local_state s ON s.singleton=1 WHERE j.intent_uuid=?1 AND j.owner_token=?2 AND j.binding_epoch=?3 AND j.transport_generation=?4 AND s.capture_enabled=1 AND s.active_binding_epoch=?3)",
+        "SELECT EXISTS(SELECT 1 FROM media_publication_jobs j JOIN sync_local_state s ON s.singleton=1 WHERE j.intent_uuid=?1 AND j.owner_token=?2 AND j.binding_epoch=?3 AND j.transport_generation=?4 AND s.capture_enabled=1 AND s.active_binding_epoch=?3 AND (j.root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=j.root_uuid AND b.local_binding_uuid=j.local_binding_uuid AND b.binding_generation=j.binding_generation AND b.state='active')))",
         params![intent_uuid.as_bytes().as_slice(),owner_token,binding,generation],
         |row| row.get(0),
     )?;
@@ -377,7 +386,7 @@ pub fn persist_sealed_graph(
 ) -> anyhow::Result<()> {
     let transaction = connection.unchecked_transaction()?;
     let owns_current_attempt = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM media_publication_jobs j JOIN sync_local_state s ON s.singleton=1 WHERE j.intent_uuid=?1 AND j.owner_token=?2 AND j.binding_epoch=?3 AND j.transport_generation=?4 AND j.phase='chunking' AND s.capture_enabled=1 AND s.active_binding_epoch=j.binding_epoch)",
+        "SELECT EXISTS(SELECT 1 FROM media_publication_jobs j JOIN sync_local_state s ON s.singleton=1 WHERE j.intent_uuid=?1 AND j.owner_token=?2 AND j.binding_epoch=?3 AND j.transport_generation=?4 AND j.phase='chunking' AND s.capture_enabled=1 AND s.active_binding_epoch=j.binding_epoch AND (j.root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=j.root_uuid AND b.local_binding_uuid=j.local_binding_uuid AND b.binding_generation=j.binding_generation AND b.state='active')))",
         params![intent_uuid.as_bytes().as_slice(),owner_token,binding_epoch.as_bytes().as_slice(),transport_generation],
         |row| row.get::<_, bool>(0),
     )?;
@@ -396,7 +405,7 @@ pub fn persist_sealed_graph(
     transaction.execute("INSERT INTO media_manifests(manifest_hash,content_hash,byte_length,manifest_pack_hash,pack_offset,record_length,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,'sealed',?7,?7) ON CONFLICT(manifest_hash) DO UPDATE SET manifest_pack_hash=excluded.manifest_pack_hash,pack_offset=excluded.pack_offset,record_length=excluded.record_length,updated_at=excluded.updated_at",params![manifest_hash.as_slice(),content_hash.as_slice(),content_length,manifest_pack_hash.as_slice(),manifest_offset,manifest_length,now])?;
     transaction.execute("INSERT INTO media_content_manifest_links(content_revision_uuid,manifest_hash,linked_at) VALUES (?1,?2,?3) ON CONFLICT(content_revision_uuid) DO UPDATE SET manifest_hash=excluded.manifest_hash,linked_at=excluded.linked_at",params![content_revision_uuid.as_bytes().as_slice(),manifest_hash.as_slice(),now])?;
     transaction.execute("UPDATE asset_content_revisions SET manifest_hash=?1,byte_size=?2,source_mtime_ms=?3 WHERE content_revision_uuid=?4",params![manifest_hash.as_slice(),content_length,source_mtime_ms,content_revision_uuid.as_bytes().as_slice()])?;
-    let changed = transaction.execute("UPDATE media_publication_jobs SET phase='packs-sealed',source_identity_json=json_object('byteLength',?1,'sourceMtimeMs',?2,'fileIdentity',?3),updated_at=?4 WHERE intent_uuid=?5 AND owner_token=?6 AND binding_epoch=?7 AND transport_generation=?8 AND phase='chunking'",params![content_length,source_mtime_ms,source_file_identity,now,intent_uuid.as_bytes().as_slice(),owner_token,binding_epoch.as_bytes().as_slice(),transport_generation])?;
+    let changed = transaction.execute("UPDATE media_publication_jobs SET phase='packs-sealed',source_identity_json=json_object('byteLength',?1,'sourceMtimeMs',?2,'fileIdentity',?3),updated_at=?4 WHERE intent_uuid=?5 AND owner_token=?6 AND binding_epoch=?7 AND transport_generation=?8 AND phase='chunking' AND (root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=media_publication_jobs.root_uuid AND b.local_binding_uuid=media_publication_jobs.local_binding_uuid AND b.binding_generation=media_publication_jobs.binding_generation AND b.state='active'))",params![content_length,source_mtime_ms,source_file_identity,now,intent_uuid.as_bytes().as_slice(),owner_token,binding_epoch.as_bytes().as_slice(),transport_generation])?;
     if changed != 1 {
         anyhow::bail!("publication sealed graph lease is stale");
     }
@@ -430,7 +439,7 @@ pub fn enqueue_missing_materializations(
     now: i64,
 ) -> anyhow::Result<usize> {
     Ok(connection.execute(
-        "WITH RECURSIVE folder_paths(id,root_id,relpath) AS (SELECT id,root_id,'' FROM folders WHERE parent_id IS NULL UNION ALL SELECT f.id,f.root_id,CASE WHEN p.relpath='' THEN f.name ELSE p.relpath||'/'||f.name END FROM folders f JOIN folder_paths p ON f.parent_id=p.id), candidates AS (SELECT r.content_revision_uuid,r.asset_uuid,CASE WHEN h.is_display_winner=1 THEN f.name ELSE f.name||'.megle-conflict-'||substr(lower(hex(r.content_revision_uuid)),1,12) END AS materialized_name,p.relpath,COALESCE(r.byte_size,0) AS byte_size FROM asset_content_revisions r JOIN asset_content_heads h ON h.content_revision_uuid=r.content_revision_uuid JOIN files f ON f.asset_uuid=r.asset_uuid JOIN folder_paths p ON p.id=f.folder_id JOIN roots root ON root.id=f.root_id JOIN media_content_manifest_links l ON l.content_revision_uuid=r.content_revision_uuid JOIN media_manifests m ON m.manifest_hash=l.manifest_hash WHERE h.is_display_winner=1 AND r.manifest_hash IS NOT NULL AND f.status<>'deleted' AND root.enabled=1 AND root.path<>'sync-bootstrap' AND m.manifest_pack_hash IS NOT NULL AND m.pack_offset IS NOT NULL AND m.record_length IS NOT NULL AND NOT EXISTS (SELECT 1 FROM sync_tombstone_tokens t WHERE t.entity_uuid=r.asset_uuid AND NOT EXISTS (SELECT 1 FROM sync_tombstone_removals x WHERE x.observed_token_uuid=t.token_uuid))) INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,downloaded_bytes,priority,binding_epoch,transport_generation,attempt_count,created_at,updated_at) SELECT content_revision_uuid,asset_uuid,CASE WHEN relpath='' THEN materialized_name ELSE relpath||'/'||materialized_name END,'pending',byte_size,0,0,?1,?2,0,?3,?3 FROM candidates WHERE true ON CONFLICT(content_revision_uuid) DO UPDATE SET destination_relpath=excluded.destination_relpath,phase=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath OR media_materialization_jobs.binding_epoch<>excluded.binding_epoch OR media_materialization_jobs.transport_generation<>excluded.transport_generation THEN 'pending' ELSE media_materialization_jobs.phase END,downloaded_bytes=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN 0 ELSE media_materialization_jobs.downloaded_bytes END,binding_epoch=excluded.binding_epoch,transport_generation=excluded.transport_generation,owner_token=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN NULL ELSE media_materialization_jobs.owner_token END,lease_expires_at=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN NULL ELSE media_materialization_jobs.lease_expires_at END,updated_at=excluded.updated_at",
+        "WITH RECURSIVE folder_paths(id,root_id,relpath) AS (SELECT id,root_id,'' FROM folders WHERE parent_id IS NULL UNION ALL SELECT f.id,f.root_id,CASE WHEN p.relpath='' THEN f.name ELSE p.relpath||'/'||f.name END FROM folders f JOIN folder_paths p ON f.parent_id=p.id), candidates AS (SELECT r.content_revision_uuid,r.asset_uuid,CASE WHEN h.is_display_winner=1 THEN f.name ELSE f.name||'.megle-conflict-'||substr(lower(hex(r.content_revision_uuid)),1,12) END AS materialized_name,p.relpath,COALESCE(r.byte_size,0) AS byte_size,CASE WHEN root.root_folder_uuid IS NULL THEN NULL ELSE root.root_uuid END AS root_uuid,binding.local_binding_uuid,binding.binding_generation FROM asset_content_revisions r JOIN asset_content_heads h ON h.content_revision_uuid=r.content_revision_uuid JOIN files f ON f.asset_uuid=r.asset_uuid JOIN folder_paths p ON p.id=f.folder_id JOIN roots root ON root.id=f.root_id LEFT JOIN sync_root_local_bindings binding ON binding.root_id=root.id JOIN media_content_manifest_links l ON l.content_revision_uuid=r.content_revision_uuid JOIN media_manifests m ON m.manifest_hash=l.manifest_hash WHERE h.is_display_winner=1 AND r.manifest_hash IS NOT NULL AND f.status<>'deleted' AND root.enabled=1 AND root.path<>'sync-bootstrap' AND (root.root_folder_uuid IS NULL OR binding.state IN ('materializing','active','reconcile-required')) AND m.manifest_pack_hash IS NOT NULL AND m.pack_offset IS NOT NULL AND m.record_length IS NOT NULL AND NOT EXISTS (SELECT 1 FROM sync_tombstone_tokens t WHERE t.entity_uuid=r.asset_uuid AND NOT EXISTS (SELECT 1 FROM sync_tombstone_removals x WHERE x.observed_token_uuid=t.token_uuid))) INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,downloaded_bytes,priority,binding_epoch,transport_generation,attempt_count,created_at,updated_at,root_uuid,local_binding_uuid,binding_generation) SELECT content_revision_uuid,asset_uuid,CASE WHEN relpath='' THEN materialized_name ELSE relpath||'/'||materialized_name END,'pending',byte_size,0,0,?1,?2,0,?3,?3,root_uuid,local_binding_uuid,binding_generation FROM candidates WHERE true ON CONFLICT(content_revision_uuid) DO UPDATE SET destination_relpath=excluded.destination_relpath,phase=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath OR media_materialization_jobs.binding_epoch<>excluded.binding_epoch OR media_materialization_jobs.transport_generation<>excluded.transport_generation THEN 'pending' ELSE media_materialization_jobs.phase END,downloaded_bytes=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN 0 ELSE media_materialization_jobs.downloaded_bytes END,binding_epoch=excluded.binding_epoch,transport_generation=excluded.transport_generation,owner_token=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN NULL ELSE media_materialization_jobs.owner_token END,lease_expires_at=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN NULL ELSE media_materialization_jobs.lease_expires_at END,updated_at=excluded.updated_at",
         params![binding_epoch.as_bytes().as_slice(),transport_generation,now],
     )?)
 }
@@ -463,7 +472,7 @@ pub fn claim_materialization_job(
     );
     let transaction = connection.unchecked_transaction()?;
     let row: Option<Row> = transaction.query_row(
-        "SELECT j.content_revision_uuid,j.asset_uuid,j.destination_relpath,root.path,j.expected_length,r.source_mtime_ms,l.manifest_hash,m.content_hash,m.manifest_pack_hash,m.pack_offset,m.record_length,j.binding_epoch,j.transport_generation,j.root_uuid,j.local_binding_uuid,j.binding_generation FROM media_materialization_jobs j JOIN asset_content_revisions r ON r.content_revision_uuid=j.content_revision_uuid JOIN media_content_manifest_links l ON l.content_revision_uuid=j.content_revision_uuid JOIN media_manifests m ON m.manifest_hash=l.manifest_hash JOIN files f ON f.asset_uuid=j.asset_uuid JOIN roots root ON root.id=f.root_id WHERE j.binding_epoch=?1 AND j.transport_generation=?2 AND j.phase NOT IN ('complete','cancelled') AND COALESCE(j.next_attempt_at,0)<=?3 AND (j.owner_token IS NULL OR j.lease_expires_at<?3) AND root.path<>'sync-bootstrap' ORDER BY j.priority DESC,j.updated_at,j.content_revision_uuid LIMIT 1",
+        "SELECT j.content_revision_uuid,j.asset_uuid,j.destination_relpath,root.path,j.expected_length,r.source_mtime_ms,l.manifest_hash,m.content_hash,m.manifest_pack_hash,m.pack_offset,m.record_length,j.binding_epoch,j.transport_generation,j.root_uuid,j.local_binding_uuid,j.binding_generation FROM media_materialization_jobs j JOIN asset_content_revisions r ON r.content_revision_uuid=j.content_revision_uuid JOIN media_content_manifest_links l ON l.content_revision_uuid=j.content_revision_uuid JOIN media_manifests m ON m.manifest_hash=l.manifest_hash JOIN files f ON f.asset_uuid=j.asset_uuid JOIN roots root ON root.id=f.root_id WHERE j.binding_epoch=?1 AND j.transport_generation=?2 AND j.phase NOT IN ('complete','cancelled') AND COALESCE(j.next_attempt_at,0)<=?3 AND (j.owner_token IS NULL OR j.lease_expires_at<?3) AND root.path<>'sync-bootstrap' AND (j.root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=j.root_uuid AND b.local_binding_uuid=j.local_binding_uuid AND b.binding_generation=j.binding_generation AND b.state IN ('materializing','active','reconcile-required'))) ORDER BY j.priority DESC,j.updated_at,j.content_revision_uuid LIMIT 1",
         params![binding_epoch.as_bytes().as_slice(),transport_generation,now],
         |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?)),
     ).optional()?;
@@ -489,7 +498,7 @@ pub fn claim_materialization_job(
         return Ok(None);
     };
     let changed = transaction.execute(
-        "UPDATE media_materialization_jobs SET owner_token=?1,lease_expires_at=?2,attempt_count=attempt_count+1,phase='fetching-manifest',error_code=NULL,updated_at=?3 WHERE content_revision_uuid=?4 AND (owner_token IS NULL OR lease_expires_at<?3)",
+        "UPDATE media_materialization_jobs SET owner_token=?1,lease_expires_at=?2,attempt_count=attempt_count+1,phase='fetching-manifest',error_code=NULL,updated_at=?3 WHERE content_revision_uuid=?4 AND (owner_token IS NULL OR lease_expires_at<?3) AND (root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=media_materialization_jobs.root_uuid AND b.local_binding_uuid=media_materialization_jobs.local_binding_uuid AND b.binding_generation=media_materialization_jobs.binding_generation AND b.state IN ('materializing','active','reconcile-required')))",
         params![owner_token,now.saturating_add(lease_ms),now,revision],
     )?;
     if changed != 1 {
@@ -544,7 +553,7 @@ pub fn set_materialization_phase(
         anyhow::bail!("invalid active materialization phase");
     }
     let changed = connection.execute(
-        "UPDATE media_materialization_jobs SET phase=?1,downloaded_bytes=MIN(expected_length,?2),updated_at=?3 WHERE content_revision_uuid=?4 AND owner_token=?5",
+        "UPDATE media_materialization_jobs SET phase=?1,downloaded_bytes=MIN(expected_length,?2),updated_at=?3 WHERE content_revision_uuid=?4 AND owner_token=?5 AND (root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=media_materialization_jobs.root_uuid AND b.local_binding_uuid=media_materialization_jobs.local_binding_uuid AND b.binding_generation=media_materialization_jobs.binding_generation AND b.state IN ('materializing','active','reconcile-required')))",
         params![phase,downloaded_bytes,now,revision.as_bytes().as_slice(),owner_token],
     )?;
     if changed != 1 {
@@ -569,9 +578,24 @@ pub fn fail_materialization_job(
     {
         anyhow::bail!("invalid materialization failure state");
     }
-    connection.execute(
-        "UPDATE media_materialization_jobs SET phase=?1,owner_token=NULL,lease_expires_at=NULL,error_code=?2,next_attempt_at=?3,updated_at=?4 WHERE content_revision_uuid=?5 AND owner_token=?6",
+    let changed = connection.execute(
+        "UPDATE media_materialization_jobs SET phase=?1,owner_token=NULL,lease_expires_at=NULL,error_code=?2,next_attempt_at=?3,updated_at=?4 WHERE content_revision_uuid=?5 AND owner_token=?6 AND (root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=media_materialization_jobs.root_uuid AND b.local_binding_uuid=media_materialization_jobs.local_binding_uuid AND b.binding_generation=media_materialization_jobs.binding_generation AND b.state IN ('materializing','active','reconcile-required')))",
         params![phase,error_code,next_attempt_at,now,revision.as_bytes().as_slice(),owner_token],
+    )?;
+    if changed == 0 {
+        release_materialization_job(connection, revision, owner_token)?;
+    }
+    Ok(())
+}
+
+pub fn release_materialization_job(
+    connection: &Connection,
+    revision: uuid::Uuid,
+    owner_token: &str,
+) -> anyhow::Result<()> {
+    connection.execute(
+        "UPDATE media_materialization_jobs SET phase='pending',owner_token=NULL,lease_expires_at=NULL,error_code=NULL,next_attempt_at=NULL WHERE content_revision_uuid=?1 AND owner_token=?2",
+        params![revision.as_bytes().as_slice(), owner_token],
     )?;
     Ok(())
 }
@@ -594,7 +618,7 @@ pub fn complete_materialization_job(
 ) -> anyhow::Result<()> {
     let transaction = connection.unchecked_transaction()?;
     let changed = transaction.execute(
-        "UPDATE media_materialization_jobs SET phase='complete',downloaded_bytes=expected_length,owner_token=NULL,lease_expires_at=NULL,error_code=NULL,next_attempt_at=NULL,updated_at=?1 WHERE content_revision_uuid=?2 AND owner_token=?3 AND binding_epoch=?4 AND transport_generation=?5 AND EXISTS (SELECT 1 FROM sync_local_state s WHERE s.singleton=1 AND s.active_binding_epoch=?4)",
+        "UPDATE media_materialization_jobs SET phase='complete',downloaded_bytes=expected_length,owner_token=NULL,lease_expires_at=NULL,error_code=NULL,next_attempt_at=NULL,updated_at=?1 WHERE content_revision_uuid=?2 AND owner_token=?3 AND binding_epoch=?4 AND transport_generation=?5 AND EXISTS (SELECT 1 FROM sync_local_state s WHERE s.singleton=1 AND s.active_binding_epoch=?4) AND (root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=media_materialization_jobs.root_uuid AND b.local_binding_uuid=media_materialization_jobs.local_binding_uuid AND b.binding_generation=media_materialization_jobs.binding_generation AND b.state IN ('materializing','active','reconcile-required')))",
         params![now,revision.as_bytes().as_slice(),owner_token,binding_epoch.as_bytes().as_slice(),transport_generation],
     )?;
     if changed != 1 {

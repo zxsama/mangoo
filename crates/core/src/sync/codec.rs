@@ -9,7 +9,8 @@ use super::types::EventEnvelope;
 
 pub const WIRE_VERSION: u16 = 1;
 pub const ENVELOPE_VERSION: u16 = 1;
-pub const REDUCER_VERSION: u16 = 1;
+// v2 adds root-scoped location identity and protocol-stable materialized names.
+pub const REDUCER_VERSION: u16 = 2;
 pub const MAX_EVENT_BYTES: usize = 256 * 1024;
 pub const MAX_SEGMENT_EVENTS: usize = 256;
 pub const MAX_SEGMENT_DECODED_BYTES: usize = 8 * 1024 * 1024;

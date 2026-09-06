@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use crate::db::{
     Database, ExternalFileIdentity, FileUpsert, FolderUpsert, RootRecord, ScanFileUpsert,
-    ScanWriteBatch, TaskScanProgress,
+    ScanWriteBatch, SyncRootBindingToken, TaskScanProgress,
 };
 use crate::decode::formats::{lowercase_extension as extension, media_kind_for_extension};
 
@@ -36,6 +36,7 @@ pub struct ScanOptions<'a> {
     pub progress_callback: Option<&'a mut dyn FnMut(TaskScanProgress)>,
     pub cancellation_callback: Option<&'a mut dyn FnMut() -> anyhow::Result<()>>,
     pub task_attempt_guard: Option<TaskAttemptGuard>,
+    pub root_binding_guard: Option<SyncRootBindingToken>,
     /// When present, batch commits run on the single writer connection instead
     /// of the caller's `&mut Database`, so the WAL is checkpointed and stays
     /// bounded. `None` in unit tests that call `scan_root(&mut db, ...)`
@@ -62,6 +63,7 @@ impl<'a> ScanOptions<'a> {
             progress_callback: None,
             cancellation_callback: None,
             task_attempt_guard: None,
+            root_binding_guard: None,
             writer: None,
             #[cfg(test)]
             batch_observer: None,
@@ -119,7 +121,15 @@ pub fn scan_root_with_options(
     let root_path = PathBuf::from(&root.path);
     check_scan_cancelled(&mut options)?;
     ensure_root_enabled(database, root.id)?;
-    let scan_generation = database.begin_root_scan_reconciliation(root.id)?;
+    ensure_root_binding_current(database, &options)?;
+    let scan_generation = match options.task_attempt_guard {
+        Some(guard) => database.begin_root_scan_reconciliation_for_task_attempt(
+            root.id,
+            guard.task_id,
+            guard.attempt_generation,
+        )?,
+        None => database.begin_root_scan_reconciliation(root.id)?,
+    };
     let root_batch = ScanWriteBatch {
         folders: vec![FolderUpsert {
             root_id: root.id,
@@ -134,6 +144,7 @@ pub fn scan_root_with_options(
     observe_scan_batch(&options, root_batch.folders.len(), root_batch.files.len());
     check_scan_cancelled(&mut options)?;
     ensure_root_enabled(database, root.id)?;
+    ensure_root_binding_current(database, &options)?;
     let root_result = commit_scan_batch_with_optional_task_guard(database, root_batch, &options)?;
     let root_folder_id = root_result.folder_ids[0];
 
@@ -441,11 +452,28 @@ fn ensure_folder_chain_with_optional_writer(
         Some(writer) => {
             let root_path = root_path.to_path_buf();
             let folder_path = folder_path.to_path_buf();
-            writer.write_blocking(move |db| {
-                db.ensure_folder_chain_for_path(root_id, &root_path, &folder_path)
+            let guard = options.task_attempt_guard;
+            writer.write_blocking(move |db| match guard {
+                Some(guard) => db.ensure_folder_chain_for_path_for_task_attempt(
+                    root_id,
+                    &root_path,
+                    &folder_path,
+                    guard.task_id,
+                    guard.attempt_generation,
+                ),
+                None => db.ensure_folder_chain_for_path(root_id, &root_path, &folder_path),
             })
         }
-        None => database.ensure_folder_chain_for_path(root_id, root_path, folder_path),
+        None => match options.task_attempt_guard {
+            Some(guard) => database.ensure_folder_chain_for_path_for_task_attempt(
+                root_id,
+                root_path,
+                folder_path,
+                guard.task_id,
+                guard.attempt_generation,
+            ),
+            None => database.ensure_folder_chain_for_path(root_id, root_path, folder_path),
+        },
     }
 }
 
@@ -459,6 +487,7 @@ pub fn scan_folder_with_options(
     let root_path = PathBuf::from(&root.path);
     check_scan_cancelled(&mut options)?;
     ensure_root_enabled(database, root.id)?;
+    ensure_root_binding_current(database, &options)?;
     let selected_folder_id = ensure_folder_chain_with_optional_writer(
         database,
         root.id,
@@ -699,6 +728,16 @@ fn ensure_root_enabled(database: &Database, root_id: i64) -> anyhow::Result<()> 
     Err(anyhow::anyhow!("root is disabled: {root_id}"))
 }
 
+fn ensure_root_binding_current(
+    database: &Database,
+    options: &ScanOptions<'_>,
+) -> anyhow::Result<()> {
+    if let Some(token) = options.root_binding_guard.as_ref() {
+        database.require_sync_root_binding_token(token)?;
+    }
+    Ok(())
+}
+
 fn observe_scan_batch(options: &ScanOptions, folders: usize, files: usize) {
     #[cfg(test)]
     if let Some(observer) = &options.batch_observer {
@@ -913,6 +952,7 @@ mod tests {
                 progress_callback: None,
                 cancellation_callback: None,
                 task_attempt_guard: None,
+                root_binding_guard: None,
                 writer: None,
                 batch_observer: None,
             },
@@ -1230,6 +1270,7 @@ mod tests {
                 progress_callback: None,
                 cancellation_callback: None,
                 task_attempt_guard: None,
+                root_binding_guard: None,
                 writer: None,
                 batch_observer: Some(Rc::new(move |stats| {
                     observed_batches.borrow_mut().push(stats);
@@ -1284,6 +1325,7 @@ mod tests {
                 progress_callback: Some(&mut progress_callback),
                 cancellation_callback: None,
                 task_attempt_guard: None,
+                root_binding_guard: None,
                 writer: None,
                 batch_observer: None,
             },
@@ -1358,6 +1400,7 @@ mod tests {
                     task_id,
                     attempt_generation: old_attempt,
                 }),
+                root_binding_guard: None,
                 writer: None,
                 batch_observer: None,
             },
@@ -1423,6 +1466,7 @@ mod tests {
                 progress_callback: Some(&mut progress_callback),
                 cancellation_callback: Some(&mut cancellation_callback),
                 task_attempt_guard: None,
+                root_binding_guard: None,
                 writer: None,
                 batch_observer: None,
             },
@@ -1729,6 +1773,7 @@ mod tests {
                     progress_callback: None,
                     cancellation_callback: None,
                     task_attempt_guard: None,
+                    root_binding_guard: None,
                     writer: Some(writer),
                     batch_observer: None,
                 },

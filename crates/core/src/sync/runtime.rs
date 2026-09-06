@@ -6,6 +6,59 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::db::{Database, DbWriter};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RootExecutionToken {
+    pub library_uuid: String,
+    pub root_uuid: String,
+    pub local_binding_uuid: String,
+    pub binding_generation: u64,
+}
+
+#[derive(Clone, Default)]
+pub struct RootRuntimeRegistry {
+    inner: Arc<Mutex<HashMap<String, RootExecutionToken>>>,
+}
+
+impl RootRuntimeRegistry {
+    pub fn replace_all(&self, tokens: impl IntoIterator<Item = RootExecutionToken>) {
+        let mut current = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.clear();
+        current.extend(
+            tokens
+                .into_iter()
+                .map(|token| (token.root_uuid.clone(), token)),
+        );
+    }
+
+    pub fn install(&self, token: RootExecutionToken) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(token.root_uuid.clone(), token);
+    }
+
+    pub fn invalidate(&self, root_uuid: &str) -> Option<RootExecutionToken> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(root_uuid)
+    }
+
+    pub fn require_current(&self, token: &RootExecutionToken) -> anyhow::Result<()> {
+        let current = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.get(&token.root_uuid) != Some(token) {
+            anyhow::bail!("stale-root-binding");
+        }
+        Ok(())
+    }
+}
+
 /// Per-Library fence shared by active promotion, dormant turns and unbind.
 /// Owning the permit is the proof that exactly one writer runtime may exist.
 #[derive(Clone, Default)]
@@ -235,5 +288,29 @@ mod tests {
         assert_eq!(libraries.len(), 8);
         assert_eq!(libraries[0], "library-0");
         assert_eq!(libraries[7], "library-7");
+    }
+
+    #[test]
+    fn root_runtime_registry_fences_only_the_changed_root() {
+        let registry = RootRuntimeRegistry::default();
+        let first = RootExecutionToken {
+            library_uuid: "library".into(),
+            root_uuid: "root-a".into(),
+            local_binding_uuid: "binding-a".into(),
+            binding_generation: 1,
+        };
+        let second = RootExecutionToken {
+            library_uuid: "library".into(),
+            root_uuid: "root-b".into(),
+            local_binding_uuid: "binding-b".into(),
+            binding_generation: 1,
+        };
+        registry.replace_all([first.clone(), second.clone()]);
+        registry.install(RootExecutionToken {
+            binding_generation: 2,
+            ..first.clone()
+        });
+        assert!(registry.require_current(&first).is_err());
+        assert!(registry.require_current(&second).is_ok());
     }
 }

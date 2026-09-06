@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::db::{Database, DbWriter, FileUpsert, NotificationOrigin, RootRecord};
+use crate::db::{
+    Database, DbWriter, FileUpsert, NotificationOrigin, RootRecord, SyncRootBindingToken,
+};
 use crate::decode::formats::{lowercase_extension as extension, media_kind_for_extension};
 use crate::tasks::TaskSender;
 
@@ -81,8 +83,20 @@ struct WatcherState {
     // never contends the WAL write lock with the scan/thumbnail writers.
     writer: DbWriter,
     watcher: RecommendedWatcher,
-    watched_roots: HashMap<i64, PathBuf>,
+    watched_roots: HashMap<i64, WatchedRoot>,
     pending_events: Vec<notify::Result<Event>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WatchedRoot {
+    path: PathBuf,
+    token: Option<SyncRootBindingToken>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedWatchedRoot {
+    root: RootRecord,
+    token: Option<SyncRootBindingToken>,
 }
 
 fn run_watcher(
@@ -213,7 +227,12 @@ fn handle_create_path(state: &mut WatcherState, path: &Path) -> anyhow::Result<(
     };
 
     if metadata.is_dir() {
-        queue_root_rescan(&state.database, &state.task_queue, root.id)?;
+        queue_root_rescan(
+            &state.database,
+            &state.task_queue,
+            root.root.id,
+            root.token.as_ref(),
+        )?;
         Ok(())
     } else if metadata.is_file() {
         upsert_media_file(state, &root, path, &metadata)
@@ -232,13 +251,19 @@ fn handle_modify_path(state: &mut WatcherState, path: &Path) -> anyhow::Result<(
     };
 
     if metadata.is_dir() {
-        let root_id = root.id;
-        let root_path = PathBuf::from(&root.path);
+        let root_id = root.root.id;
+        let root_path = PathBuf::from(&root.root.path);
+        let root_token = root.token;
         let dir_path = path.to_path_buf();
         crate::debug_log!("watcher folder-chain -> writer: {}", dir_path.display());
-        let _ = state.writer.write_blocking(move |db| {
-            db.ensure_folder_chain_for_path(root_id, &root_path, &dir_path)
-        })?;
+        let _ = state
+            .writer
+            .write_blocking(move |db| match root_token.as_ref() {
+                Some(token) => db.ensure_folder_chain_for_path_for_root_token(
+                    token, root_id, &root_path, &dir_path,
+                ),
+                None => db.ensure_folder_chain_for_path(root_id, &root_path, &dir_path),
+            })?;
         return Ok(());
     }
 
@@ -252,22 +277,43 @@ fn handle_remove_path(state: &mut WatcherState, path: &Path) -> anyhow::Result<(
     let Some(root) = root_for_path(state, path) else {
         return Ok(());
     };
-    if state
-        .database
-        .mark_file_missing_by_path(root.id, Path::new(&root.path), path)?
-    {
+    let marked_file = match root.token.as_ref() {
+        Some(token) => state.database.mark_file_missing_by_path_for_root_token(
+            token,
+            root.root.id,
+            Path::new(&root.root.path),
+            path,
+        )?,
+        None => state.database.mark_file_missing_by_path(
+            root.root.id,
+            Path::new(&root.root.path),
+            path,
+        )?,
+    };
+    if marked_file {
         return Ok(());
     }
-    let _ =
-        state
+    let _ = match root.token.as_ref() {
+        Some(token) => state
             .database
-            .mark_folder_subtree_missing_by_path(root.id, Path::new(&root.path), path)?;
+            .mark_folder_subtree_missing_by_path_for_root_token(
+                token,
+                root.root.id,
+                Path::new(&root.root.path),
+                path,
+            )?,
+        None => state.database.mark_folder_subtree_missing_by_path(
+            root.root.id,
+            Path::new(&root.root.path),
+            path,
+        )?,
+    };
     Ok(())
 }
 
 fn upsert_media_file(
     state: &mut WatcherState,
-    root: &RootRecord,
+    root: &ResolvedWatchedRoot,
     path: &Path,
     metadata: &fs::Metadata,
 ) -> anyhow::Result<()> {
@@ -280,16 +326,25 @@ fn upsert_media_file(
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    let root_id = root.id;
-    let root_path = PathBuf::from(&root.path);
+    let root_id = root.root.id;
+    let root_path = PathBuf::from(&root.root.path);
+    let root_token = root.token;
     let parent_path = parent.to_path_buf();
     crate::debug_log!("watcher folder-chain -> writer: {}", parent_path.display());
-    let folder_id = state.writer.write_blocking(move |db| {
-        db.ensure_folder_chain_for_path(root_id, &root_path, &parent_path)
-    })?;
+    let folder_id = state
+        .writer
+        .write_blocking(move |db| match root_token.as_ref() {
+            Some(token) => db.ensure_folder_chain_for_path_for_root_token(
+                token,
+                root_id,
+                &root_path,
+                &parent_path,
+            ),
+            None => db.ensure_folder_chain_for_path(root_id, &root_path, &parent_path),
+        })?;
     crate::debug_log!("watcher upsert -> writer: {}", path.display());
     let file_upsert = FileUpsert {
-        root_id: root.id,
+        root_id: root.root.id,
         folder_id,
         name: file_name(path),
         ext,
@@ -300,22 +355,34 @@ fn upsert_media_file(
     };
     let kind_owned = kind.to_owned();
     let path_owned = path.to_path_buf();
-    let volume_identity = crate::library_path::local_file_identity(Path::new(&root.path))
-        .unwrap_or_else(|_| root.path.clone())
+    let volume_identity = crate::library_path::local_file_identity(Path::new(&root.root.path))
+        .unwrap_or_else(|_| root.root.path.clone())
         .into_bytes();
     let file_identity = crate::library_path::local_file_identity(path)
         .unwrap_or_default()
         .into_bytes();
     let fingerprint = crate::sync::identity::stable_content_fingerprint(path).ok();
+    let root_token = root.token;
     state.writer.write_blocking(move |db| {
-        let file_id = db.upsert_external_media_file(
-            file_upsert,
-            &kind_owned,
-            &volume_identity,
-            &file_identity,
-            fingerprint.as_deref(),
-            &path_owned,
-        )?;
+        let file_id = match root_token.as_ref() {
+            Some(token) => db.upsert_external_media_file_for_root_token(
+                token,
+                file_upsert,
+                &kind_owned,
+                &volume_identity,
+                &file_identity,
+                fingerprint.as_deref(),
+                &path_owned,
+            )?,
+            None => db.upsert_external_media_file(
+                file_upsert,
+                &kind_owned,
+                &volume_identity,
+                &file_identity,
+                fingerprint.as_deref(),
+                &path_owned,
+            )?,
+        };
         Ok(file_id)
     })?;
     Ok(())
@@ -420,28 +487,67 @@ fn sync_enabled_roots(state: &mut WatcherState) -> anyhow::Result<()> {
     let previous_ids: Vec<i64> = state.watched_roots.keys().copied().collect();
     for root_id in previous_ids {
         if !current_by_id.contains_key(&root_id) {
-            if let Some(path) = state.watched_roots.remove(&root_id) {
-                let _ = state.watcher.unwatch(&path);
+            if let Some(registration) = state.watched_roots.remove(&root_id) {
+                let _ = state.watcher.unwatch(&registration.path);
             }
         }
     }
 
     for (root_id, root) in current_by_id {
-        if state.watched_roots.contains_key(&root_id) {
+        let path = PathBuf::from(&root.path);
+        let token = state
+            .database
+            .sync_root_binding_token_for_root_id(root_id)?;
+        if token.as_ref().is_some_and(|token| {
+            !state
+                .database
+                .sync_root_binding_token_is_current(token)
+                .unwrap_or(false)
+        }) {
+            if let Some(previous) = state.watched_roots.remove(&root_id) {
+                let _ = state.watcher.unwatch(&previous.path);
+            }
             continue;
         }
-        let path = PathBuf::from(&root.path);
+        if state
+            .watched_roots
+            .get(&root_id)
+            .is_some_and(|registration| registration.path == path && registration.token == token)
+        {
+            continue;
+        }
+        if let Some(previous) = state.watched_roots.remove(&root_id) {
+            state.watcher.unwatch(&previous.path)?;
+            state.pending_events.retain(|event| {
+                event.as_ref().is_ok_and(|event| {
+                    !event
+                        .paths
+                        .iter()
+                        .any(|candidate| candidate.starts_with(&previous.path))
+                })
+            });
+        }
         state.watcher.watch(&path, RecursiveMode::Recursive)?;
-        state.watched_roots.insert(root_id, path);
+        state
+            .watched_roots
+            .insert(root_id, WatchedRoot { path, token });
     }
 
     Ok(())
 }
 
-fn root_for_path<'a>(state: &'a WatcherState, path: &Path) -> Option<RootRecord> {
-    let mut best: Option<RootRecord> = None;
-    for (root_id, root_path) in &state.watched_roots {
-        if !path.starts_with(root_path) {
+fn root_for_path(state: &WatcherState, path: &Path) -> Option<ResolvedWatchedRoot> {
+    let mut best: Option<ResolvedWatchedRoot> = None;
+    for (root_id, registration) in &state.watched_roots {
+        if !path.starts_with(&registration.path) {
+            continue;
+        }
+        if registration.token.as_ref().is_some_and(|token| {
+            !state
+                .database
+                .sync_root_binding_token_is_current(token)
+                .unwrap_or(false)
+        }) {
             continue;
         }
         let Ok(Some(root)) = state.database.get_root(*root_id) else {
@@ -453,12 +559,15 @@ fn root_for_path<'a>(state: &'a WatcherState, path: &Path) -> Option<RootRecord>
         let replace = best
             .as_ref()
             .map(|existing| {
-                let existing_path = PathBuf::from(&existing.path);
-                root_path.components().count() > existing_path.components().count()
+                let existing_path = PathBuf::from(&existing.root.path);
+                registration.path.components().count() > existing_path.components().count()
             })
             .unwrap_or(true);
         if replace {
-            best = Some(root);
+            best = Some(ResolvedWatchedRoot {
+                root,
+                token: registration.token,
+            });
         }
     }
     best
@@ -467,7 +576,16 @@ fn root_for_path<'a>(state: &'a WatcherState, path: &Path) -> Option<RootRecord>
 fn queue_all_watched_roots_for_rescan(state: &mut WatcherState) -> anyhow::Result<()> {
     let root_ids: Vec<i64> = state.watched_roots.keys().copied().collect();
     for root_id in root_ids {
-        queue_root_rescan(&state.database, &state.task_queue, root_id)?;
+        let root = state.database.get_root(root_id)?;
+        let registration = state.watched_roots.get(&root_id).cloned();
+        if let (Some(root), Some(registration)) = (root, registration) {
+            queue_root_rescan(
+                &state.database,
+                &state.task_queue,
+                root.id,
+                registration.token.as_ref(),
+            )?;
+        }
     }
     Ok(())
 }
@@ -476,6 +594,7 @@ fn queue_root_rescan(
     database: &Database,
     task_queue: &TaskSender,
     root_id: i64,
+    token: Option<&SyncRootBindingToken>,
 ) -> anyhow::Result<bool> {
     if !database.root_enabled(root_id)? {
         return Ok(false);
@@ -487,8 +606,11 @@ fn queue_root_rescan(
     if database.has_pending_root_scan_task(root_id)? {
         return Ok(false);
     }
-    let task_id =
-        database.create_root_scan_task_with_origin(root_id, NotificationOrigin::Background)?;
+    let task_id = database.create_root_scan_task_with_origin_for_root_token(
+        root_id,
+        token,
+        NotificationOrigin::Background,
+    )?;
     match task_queue.try_send(task_id) {
         Ok(()) => {}
         Err(error) => {
@@ -699,6 +821,43 @@ mod tests {
     }
 
     #[test]
+    fn watcher_refresh_retargets_an_existing_root_id_after_path_change() {
+        let old_root = unique_temp_dir("retarget-old");
+        let new_root = unique_temp_dir("retarget-new");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&new_root).unwrap();
+        let db_dir = unique_temp_dir("retarget-db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("watch.sqlite");
+        let database = Database::open(&db_path).unwrap();
+        database.apply_migrations().unwrap();
+        let root_id = add_root(&database, &old_root, "watch-root");
+        let (task_sender, _task_receiver) = tokio::sync::mpsc::channel(8);
+        let mut state = test_watcher_state(database, task_sender, root_id, old_root.clone());
+        state
+            .database
+            .connection_for_fsops()
+            .execute(
+                "UPDATE roots SET path=?1 WHERE id=?2",
+                rusqlite::params![new_root.to_string_lossy(), root_id],
+            )
+            .unwrap();
+        sync_enabled_roots(&mut state).unwrap();
+        assert_eq!(state.watched_roots[&root_id].path, new_root);
+        assert!(root_for_path(&state, &old_root.join("late.jpg")).is_none());
+        assert_eq!(
+            root_for_path(&state, &new_root.join("current.jpg"))
+                .unwrap()
+                .root
+                .id,
+            root_id
+        );
+        let _ = fs::remove_dir_all(old_root);
+        let _ = fs::remove_dir_all(new_root);
+        let _ = fs::remove_dir_all(db_dir);
+    }
+
+    #[test]
     fn overflow_falls_back_to_a_bounded_rescan_or_equivalent_safe_recovery() {
         let temp_root = unique_temp_dir("root");
         fs::create_dir_all(&temp_root).expect("create root dir");
@@ -711,7 +870,7 @@ mod tests {
         let root_id = add_root(&database, &temp_root, "watch-root");
 
         let (task_sender, mut task_receiver) = tokio::sync::mpsc::channel(8);
-        let queued = queue_root_rescan(&database, &task_sender, root_id)
+        let queued = queue_root_rescan(&database, &task_sender, root_id, None)
             .expect("queue root rescan for overflow");
         assert!(queued);
         let task_id = task_receiver
@@ -737,7 +896,7 @@ mod tests {
 
         let (task_sender, mut task_receiver) = tokio::sync::mpsc::channel(1);
         task_sender.try_send(12345).expect("fill task channel");
-        let queued = queue_root_rescan(&database, &task_sender, root_id)
+        let queued = queue_root_rescan(&database, &task_sender, root_id, None)
             .expect("full queue should not fail rescan persistence");
         assert!(queued);
         assert!(database
@@ -780,7 +939,13 @@ mod tests {
             task_queue: task_sender,
             writer: DbWriter::spawn(writer_db),
             watcher,
-            watched_roots: HashMap::from([(root_id, temp_root.clone())]),
+            watched_roots: HashMap::from([(
+                root_id,
+                WatchedRoot {
+                    path: temp_root.clone(),
+                    token: None,
+                },
+            )]),
             pending_events: Vec::new(),
         };
 
@@ -861,7 +1026,7 @@ mod tests {
             .expect("mark task running");
 
         let (task_sender, mut task_receiver) = tokio::sync::mpsc::channel(8);
-        let queued = queue_root_rescan(&database, &task_sender, root_id)
+        let queued = queue_root_rescan(&database, &task_sender, root_id, None)
             .expect("queue root rescan while another scan is running");
         assert!(
             queued,
@@ -886,7 +1051,7 @@ mod tests {
 
         // A second rescan request while the first is still pending should
         // coalesce, leaving exactly one pending follow-up.
-        let coalesced = queue_root_rescan(&database, &task_sender, root_id)
+        let coalesced = queue_root_rescan(&database, &task_sender, root_id, None)
             .expect("coalesce duplicate pending rescan");
         assert!(!coalesced, "duplicate pending rescan should coalesce");
         assert_eq!(
@@ -953,7 +1118,16 @@ mod tests {
         let (mut state, worker_db, temp_root, db_dir, root, path, metadata) =
             watcher_state_with_one_file();
 
-        upsert_media_file(&mut state, &root, &path, &metadata).expect("upsert via writer");
+        upsert_media_file(
+            &mut state,
+            &ResolvedWatchedRoot {
+                root: root.clone(),
+                token: None,
+            },
+            &path,
+            &metadata,
+        )
+        .expect("upsert via writer");
 
         // Read back on an independent connection to the same file-backed DB —
         // the row must be committed and queryable, not merely buffered.
@@ -1014,7 +1188,13 @@ mod tests {
             task_queue,
             writer,
             watcher,
-            watched_roots: HashMap::from([(root_id, root_path)]),
+            watched_roots: HashMap::from([(
+                root_id,
+                WatchedRoot {
+                    path: root_path,
+                    token: None,
+                },
+            )]),
             pending_events: Vec::new(),
         }
     }

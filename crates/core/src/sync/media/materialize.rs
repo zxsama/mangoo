@@ -194,6 +194,26 @@ pub fn materialize_from_verified_ranges(
     chunks: &BTreeMap<[u8; 32], super::recovery::VerifiedChunkSource>,
     source_mtime_ms: Option<i64>,
 ) -> anyhow::Result<MaterializationResult> {
+    materialize_from_verified_ranges_with_pre_publish(
+        managed_root,
+        destination_relative,
+        job_id,
+        manifest,
+        chunks,
+        source_mtime_ms,
+        || Ok(()),
+    )
+}
+
+pub fn materialize_from_verified_ranges_with_pre_publish(
+    managed_root: &Path,
+    destination_relative: &Path,
+    job_id: uuid::Uuid,
+    manifest: &ContentManifestV1,
+    chunks: &BTreeMap<[u8; 32], super::recovery::VerifiedChunkSource>,
+    source_mtime_ms: Option<i64>,
+    pre_publish: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<MaterializationResult> {
     #[cfg(test)]
     if managed_root.join(".megle-test-disk-full").exists() {
         return Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into());
@@ -251,6 +271,10 @@ pub fn materialize_from_verified_ranges(
     output.sync_all()?;
     drop(output);
     crate::sync::fault::hit("media.after-materialization-sync");
+    if let Err(error) = pre_publish() {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
     finish_materialization(
         managed_root,
         destination_relative,
@@ -445,6 +469,44 @@ mod tests {
         .unwrap();
         assert!(matches!(result, MaterializationResult::Published(_)));
         assert_eq!(std::fs::read(root.join("streamed.jpg")).unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_root_fence_removes_staging_without_publishing() {
+        let root = std::env::temp_dir().join(format!(
+            "megle-stale-range-materialize-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let (manifest, chunks) = manifest();
+        let hash = *chunks.keys().next().unwrap();
+        let range_path = root.join("verified.range");
+        std::fs::write(&range_path, b"xxhellozz").unwrap();
+        let sources = BTreeMap::from([(
+            hash,
+            super::super::recovery::VerifiedChunkSource {
+                path: range_path,
+                offset: 2,
+                length: 5,
+            },
+        )]);
+        let job_id = uuid::Uuid::now_v7();
+        let result = materialize_from_verified_ranges_with_pre_publish(
+            &root,
+            Path::new("streamed.jpg"),
+            job_id,
+            &manifest,
+            &sources,
+            None,
+            || anyhow::bail!("stale root binding generation"),
+        );
+        assert!(result.is_err());
+        assert!(!root.join("streamed.jpg").exists());
+        assert!(!root
+            .join(".megle-staging")
+            .join(format!("{}.partial", job_id.simple()))
+            .exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

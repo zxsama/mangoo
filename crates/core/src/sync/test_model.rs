@@ -12,9 +12,9 @@ fn id(n: u128) -> Uuid {
 }
 pub(crate) fn event(seq: u64, entity: u128, operation: Operation) -> EventEnvelope {
     seal_event(EventEnvelope {
-        wire_version: 1,
-        envelope_version: 1,
-        reducer_version: 1,
+        wire_version: WIRE_VERSION,
+        envelope_version: ENVELOPE_VERSION,
+        reducer_version: REDUCER_VERSION,
         library_uuid: LibraryUuid(id(1)),
         event_uuid: EventUuid(id(1000 + seq as u128)),
         entity_uuid: EntityUuid(id(entity)),
@@ -368,6 +368,66 @@ fn legalization_breaks_cycles_and_suffixes_duplicates() {
         .map(|id| legal[&id].display_name.clone())
         .collect();
     assert_eq!(names.len(), 2);
+}
+
+#[test]
+fn materialized_names_are_windows_safe_and_protocol_deterministic() {
+    assert_eq!(
+        canonicalize_materialized_component("CON.txt. ", None),
+        "_CON.txt"
+    );
+    assert_eq!(
+        canonicalize_materialized_component("a<b>:c?.jpg", None),
+        "a_b__c_.jpg"
+    );
+    assert_eq!(canonicalize_materialized_component("...", None), "untitled");
+    assert_eq!(
+        materialized_name_compare_key(&canonicalize_materialized_component("E\u{301}", None)),
+        materialized_name_compare_key(&canonicalize_materialized_component("\u{c9}", None))
+    );
+    let long = "x".repeat(400);
+    assert!(
+        canonicalize_materialized_component(&long, Some("12345678"))
+            .encode_utf16()
+            .count()
+            <= 240
+    );
+}
+
+#[test]
+fn sibling_changes_update_materialization_fingerprint_without_changing_identity() {
+    let root = EntityUuid(id(999));
+    let first = EntityUuid(id(12));
+    let second = EntityUuid(id(13));
+    let mut state = ProtocolState::default();
+    state.apply(&event(
+        1,
+        12,
+        Operation::SetLocation {
+            revision_uuid: RevisionUuid(id(22)),
+            parent_uuid: Some(root),
+            name: "Photos".into(),
+            supersedes: BTreeSet::new(),
+        },
+    ));
+    let before = legalize_locations(&state, root)[&first].clone();
+    state.apply(&event(
+        2,
+        13,
+        Operation::SetLocation {
+            revision_uuid: RevisionUuid(id(23)),
+            parent_uuid: Some(root),
+            name: "photos".into(),
+            supersedes: BTreeSet::new(),
+        },
+    ));
+    let after = legalize_locations(&state, root);
+    assert_eq!(after[&first].display_name, "Photos");
+    assert!(after[&second].display_name.starts_with("photos ("));
+    assert_ne!(
+        before.materialization_fingerprint,
+        after[&first].materialization_fingerprint
+    );
 }
 
 #[test]

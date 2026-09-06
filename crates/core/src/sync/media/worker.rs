@@ -1,5 +1,5 @@
 use crate::{
-    db::writer::DbWriter,
+    db::{writer::DbWriter, SyncRootBindingToken},
     sync::provider::{SyncProvider, TransportContext},
 };
 use std::path::PathBuf;
@@ -354,6 +354,36 @@ impl MediaRestoreWorker {
         let Some(job) = job else {
             return Ok(false);
         };
+        let root_binding_guard = root_binding_token(
+            job.root_uuid,
+            job.local_binding_uuid,
+            job.binding_generation,
+        )?;
+        if let Some(token) = root_binding_guard {
+            let validation = self
+                .writer
+                .write(move |database| {
+                    database.require_sync_root_binding_token_for_materialization(&token)
+                })
+                .await;
+            if let Err(error) = validation {
+                if error.to_string().contains("stale root binding generation") {
+                    let owner = owner.clone();
+                    let revision = job.content_revision_uuid;
+                    self.writer
+                        .write_authoritative(move |database| {
+                            super::inventory::release_materialization_job(
+                                database.connection_for_fsops(),
+                                revision,
+                                &owner,
+                            )
+                        })
+                        .await?;
+                    return Ok(true);
+                }
+                return Err(error);
+            }
+        }
         let foreground_pending = self
             .writer
             .write(|database| database.has_pending_foreground_thumbnail_task())
@@ -588,16 +618,30 @@ impl MediaRestoreWorker {
         let manifest_for_materialization = manifest;
         let source_mtime_ms = job.source_mtime_ms;
         let managed_root_for_materialization = managed_root.clone();
+        let root_binding_database = self.writer.write(|database| database.reopen()).await?;
+        if root_binding_guard.is_some() && root_binding_database.is_none() {
+            anyhow::bail!("managed root materialization requires a reopenable Catalog");
+        }
+        self.phase(&owner, revision, "publishing", downloaded)
+            .await?;
         let result = self
             .limiter
             .run_bounded(1, super::MAX_RANGE_BYTES, move || {
-                super::materialize::materialize_from_verified_ranges(
+                super::materialize::materialize_from_verified_ranges_with_pre_publish(
                     &managed_root_for_materialization,
                     &destination,
                     revision,
                     &manifest_for_materialization,
                     &verified_chunks,
                     source_mtime_ms,
+                    move || {
+                        if let (Some(database), Some(token)) =
+                            (root_binding_database.as_ref(), root_binding_guard)
+                        {
+                            database.require_sync_root_binding_token_for_materialization(&token)?;
+                        }
+                        Ok(())
+                    },
                 )
             })
             .await;
@@ -634,6 +678,19 @@ impl MediaRestoreWorker {
                     .await?;
             }
             Err(error) => {
+                if error.to_string().contains("stale root binding generation") {
+                    let owner = owner.clone();
+                    self.writer
+                        .write_authoritative(move |database| {
+                            super::inventory::release_materialization_job(
+                                database.connection_for_fsops(),
+                                revision,
+                                &owner,
+                            )
+                        })
+                        .await?;
+                    return Ok(true);
+                }
                 let (phase, code) = match error.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
                     Some(std::io::ErrorKind::PermissionDenied) => ("locked", "publish_denied"),
                     Some(std::io::ErrorKind::StorageFull) => ("disk-full", "disk_full"),
@@ -747,6 +804,63 @@ impl MediaPublicationWorker {
         let Some(job) = job else {
             return Ok(false);
         };
+        let root_binding_guard = root_binding_token(
+            job.root_uuid,
+            job.local_binding_uuid,
+            job.binding_generation,
+        )?;
+        let mut job = job;
+        if root_binding_guard.is_some() {
+            let asset_uuid = job.asset_uuid;
+            let current_source = self
+                .writer
+                .write(move |database| {
+                    let token = root_binding_guard.expect("checked managed root token");
+                    database.require_sync_root_binding_token_for_publication(&token)?;
+                    database
+                        .resolve_asset_source_path_with_root_token(asset_uuid)?
+                        .ok_or_else(|| anyhow::anyhow!("publication source is no longer available"))
+                })
+                .await;
+            let (current_source_path, current_root_binding_guard) = match current_source {
+                Ok(source) => source,
+                Err(error)
+                    if error.to_string().contains("stale root binding generation")
+                        || error
+                            .to_string()
+                            .contains("publication source is no longer available") =>
+                {
+                    let owner = owner.clone();
+                    let intent = job.intent_uuid;
+                    self.writer
+                        .write_authoritative(move |database| {
+                            super::inventory::release_publication_job(
+                                database.connection_for_fsops(),
+                                intent,
+                                &owner,
+                            )
+                        })
+                        .await?;
+                    return Ok(true);
+                }
+                Err(error) => return Err(error),
+            };
+            if current_root_binding_guard != root_binding_guard {
+                let owner = owner.clone();
+                let intent = job.intent_uuid;
+                self.writer
+                    .write_authoritative(move |database| {
+                        super::inventory::release_publication_job(
+                            database.connection_for_fsops(),
+                            intent,
+                            &owner,
+                        )
+                    })
+                    .await?;
+                return Ok(true);
+            }
+            job.source_path = current_source_path.to_string_lossy().into_owned();
+        }
         let foreground_pending = self
             .writer
             .write(|database| database.has_pending_foreground_thumbnail_task())
@@ -915,6 +1029,24 @@ impl MediaPublicationWorker {
             }
         }
         Ok(true)
+    }
+}
+
+fn root_binding_token(
+    root_uuid: Option<uuid::Uuid>,
+    local_binding_uuid: Option<uuid::Uuid>,
+    binding_generation: Option<u64>,
+) -> anyhow::Result<Option<SyncRootBindingToken>> {
+    match (root_uuid, local_binding_uuid, binding_generation) {
+        (Some(root_uuid), Some(local_binding_uuid), Some(binding_generation)) => {
+            Ok(Some(SyncRootBindingToken {
+                root_uuid: *root_uuid.as_bytes(),
+                local_binding_uuid: *local_binding_uuid.as_bytes(),
+                binding_generation,
+            }))
+        }
+        (None, None, None) => Ok(None),
+        _ => anyhow::bail!("media job root binding token is partial"),
     }
 }
 

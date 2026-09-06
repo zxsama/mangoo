@@ -7,7 +7,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::db::{Database, DbWriter, NewRoot};
+use crate::db::{Database, DbWriter, NewRoot, SyncRootLocalBindingRecord};
 use crate::host_registry::{CreationIntent, HostRegistry, LibraryDescriptor};
 use crate::library_path::{
     atomic_write_marker_guarded, identity_token, known_cloud_roots, marker_identity, preflight,
@@ -16,7 +16,7 @@ use crate::library_path::{
     MARKER_FILE_NAME,
 };
 use crate::roots::reachability::RootReachability;
-use crate::sync::runtime::{RuntimeLease, RuntimeLeases};
+use crate::sync::runtime::{RootRuntimeRegistry, RuntimeLease, RuntimeLeases};
 use crate::tasks::{start_managed_worker, TaskSender, TaskWorkerHandle};
 use crate::watch::{start_watcher, WatcherHandle};
 
@@ -33,6 +33,7 @@ pub struct LibraryRuntimeResources {
     pub read_database_path: Option<PathBuf>,
     pub plugins_dir: Option<PathBuf>,
     pub root_reachability: RootReachability,
+    pub root_runtime_registry: RootRuntimeRegistry,
     worker: Option<TaskWorkerHandle>,
     watcher: Mutex<Option<WatcherHandle>>,
     cancellation: CancellationToken,
@@ -69,6 +70,7 @@ impl LibraryRuntimeResources {
             read_database_path: None,
             plugins_dir: None,
             root_reachability: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            root_runtime_registry: RootRuntimeRegistry::default(),
             worker: None,
             watcher: Mutex::new(None),
             cancellation: CancellationToken::new(),
@@ -140,6 +142,7 @@ impl LibraryRuntimeResources {
             read_database_path,
             plugins_dir,
             root_reachability: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            root_runtime_registry: RootRuntimeRegistry::default(),
             worker,
             watcher: Mutex::new(watcher),
             cancellation: CancellationToken::new(),
@@ -2269,10 +2272,32 @@ impl LibraryManager {
             Uuid::parse_str(&descriptor.root_uuid)?,
             self.registry.device_uuid()?,
         )?;
+        for host_binding in self
+            .registry
+            .local_root_bindings(&descriptor.library_uuid)?
+        {
+            let root_uuid = Uuid::parse_str(&host_binding.root_uuid)?;
+            let Some(root_id) = database.sync_root_id(root_uuid.as_bytes())? else {
+                continue;
+            };
+            database.upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                library_uuid: *Uuid::parse_str(&descriptor.library_uuid)?.as_bytes(),
+                local_binding_uuid: *Uuid::parse_str(&host_binding.local_binding_uuid)?.as_bytes(),
+                binding_generation: host_binding.binding_generation,
+                state: host_binding.state,
+                root_id,
+                operation_revision: host_binding.operation_revision,
+                updated_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or(0),
+            })?;
+        }
         let registry = Arc::clone(&self.registry);
         let coordinator = self.sync_coordinator.clone();
         let wake_library_uuid = descriptor.library_uuid.clone();
-        LibraryRuntimeResources::from_database_with_commit_hook(
+        let runtime = LibraryRuntimeResources::from_database_with_commit_hook(
             Some(descriptor.library_uuid.clone()),
             generation,
             database,
@@ -2282,7 +2307,12 @@ impl LibraryManager {
                 let _ = registry.wake_binding(&wake_library_uuid);
                 coordinator.wake();
             })),
-        )
+        )?;
+        runtime.root_runtime_registry.replace_all(
+            self.registry
+                .local_root_binding_tokens(&descriptor.library_uuid)?,
+        );
+        Ok(runtime)
     }
 }
 

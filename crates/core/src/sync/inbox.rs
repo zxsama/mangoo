@@ -19,7 +19,10 @@ pub fn apply_remote_batch(
     let mut decoded_bytes = 0usize;
     let mut applied = 0usize;
     for event in events {
-        if event.wire_version > 1 || event.envelope_version > 1 || event.reducer_version > 1 {
+        if event.wire_version > super::codec::WIRE_VERSION
+            || event.envelope_version > super::codec::ENVELOPE_VERSION
+            || event.reducer_version > super::codec::REDUCER_VERSION
+        {
             transaction.execute(
                 "UPDATE sync_local_state SET compatibility_state='compatibility-lock' WHERE singleton=1",
                 [],
@@ -110,6 +113,9 @@ pub(crate) fn materialize_truth(
             )?;
             let winning_value: serde_json::Value = serde_json::from_slice(&winning_value)?;
             materialize_scalar_projection(transaction, entity, field, &winning_value)?;
+            if field == "entity-kind" {
+                rematerialize_location_projection(transaction)?;
+            }
         }
         Operation::SetAdd { member_uuid, .. } => {
             transaction.execute(
@@ -144,39 +150,7 @@ pub(crate) fn materialize_truth(
                 )?;
             }
             rebuild_location_heads(transaction, entity)?;
-            let winning_location: Option<(Option<Vec<u8>>, String)> = transaction
-                .query_row(
-                    "SELECT r.parent_uuid,r.name FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=?1 AND h.is_display_winner=1",
-                    [entity],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((parent_uuid, winning_name)) = winning_location {
-                let parent_id = match parent_uuid {
-                    Some(parent) => transaction
-                        .query_row(
-                            "SELECT id FROM folders WHERE folder_uuid=?1",
-                            [parent],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .optional()?,
-                    None => None,
-                };
-                transaction.execute(
-                    "UPDATE files SET folder_id=?1,name=?2 WHERE asset_uuid=?3",
-                    params![parent_id, winning_name, entity],
-                )?;
-                if let Some(file_id) = transaction
-                    .query_row(
-                        "SELECT id FROM files WHERE asset_uuid=?1",
-                        [entity],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?
-                {
-                    crate::db::sync_media_fts_for_file_in_transaction_pub(transaction, file_id)?;
-                }
-            }
+            rematerialize_location_projection(transaction)?;
         }
         Operation::Delete { token } => {
             transaction.execute(
@@ -186,6 +160,14 @@ pub(crate) fn materialize_truth(
             transaction.execute(
                 "UPDATE files SET status='trashed' WHERE asset_uuid=?1",
                 [entity],
+            )?;
+            transaction.execute(
+                "UPDATE folders SET status='trashed' WHERE folder_uuid=?1 AND parent_id IS NOT NULL",
+                [entity],
+            )?;
+            transaction.execute(
+                "UPDATE sync_root_descriptors SET lifecycle='tombstoned',logical_revision=logical_revision+1,updated_at=?1 WHERE root_folder_uuid=?2",
+                params![unix_timestamp_millis(), entity],
             )?;
         }
         Operation::Restore { observed_tokens } => {
@@ -204,6 +186,17 @@ pub(crate) fn materialize_truth(
                 "UPDATE files SET status=CASE WHEN ?1=0 THEN 'active' ELSE 'trashed' END WHERE asset_uuid=?2",
                 params![live_tokens, entity],
             )?;
+            transaction.execute(
+                "UPDATE folders SET status=CASE WHEN ?1=0 THEN 'active' ELSE 'trashed' END WHERE folder_uuid=?2 AND parent_id IS NOT NULL",
+                params![live_tokens, entity],
+            )?;
+            if live_tokens == 0 {
+                transaction.execute(
+                    "UPDATE sync_root_descriptors SET lifecycle='active',logical_revision=logical_revision+1,updated_at=?1 WHERE root_folder_uuid=?2",
+                    params![unix_timestamp_millis(), entity],
+                )?;
+            }
+            rematerialize_location_projection(transaction)?;
         }
         Operation::SetContent {
             revision_uuid,
@@ -397,6 +390,237 @@ fn rebuild_location_heads(transaction: &Transaction<'_>, entity: &[u8]) -> anyho
     Ok(())
 }
 
+fn rematerialize_location_projection(transaction: &Transaction<'_>) -> anyhow::Result<()> {
+    use super::reducer::{legalize_locations, LocationRevision, ProtocolState};
+    use super::types::{ActorEpochUuid, DeviceUuid, EventUuid, Hlc, RevisionUuid, Version};
+
+    let library_root: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT library_root_uuid FROM sync_root_descriptors ORDER BY library_root_uuid LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(library_root) = library_root else {
+        return materialize_legacy_location_projection(transaction);
+    };
+    let logical_root = super::types::EntityUuid(uuid::Uuid::from_slice(&library_root)?);
+    let mut state = ProtocolState::default();
+    let mut statement = transaction.prepare(
+        "SELECT r.revision_uuid,r.entity_uuid,r.parent_uuid,r.name,COALESCE(e.hlc_wall_ms,0),COALESCE(e.hlc_logical,0),COALESCE(e.device_uuid,zeroblob(16)),COALESCE(e.actor_epoch,zeroblob(16)),COALESCE(e.actor_seq,0),COALESCE(e.event_uuid,r.revision_uuid),EXISTS(SELECT 1 FROM sync_location_heads h WHERE h.entity_uuid=r.entity_uuid AND h.revision_uuid=r.revision_uuid) FROM sync_location_revisions r LEFT JOIN sync_events e ON e.event_uuid=r.event_uuid ORDER BY r.entity_uuid,r.revision_uuid",
+    )?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, Vec<u8>>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, Vec<u8>>(9)?,
+            row.get::<_, bool>(10)?,
+        ))
+    })? {
+        let (revision, entity, parent, name, wall, logical, device, epoch, seq, event, is_head) =
+            row?;
+        let entity_uuid = super::types::EntityUuid(uuid::Uuid::from_slice(&entity)?);
+        let revision_uuid = RevisionUuid(uuid::Uuid::from_slice(&revision)?);
+        let truth = state.entities.entry(entity_uuid).or_default();
+        truth.locations.insert(
+            revision_uuid,
+            LocationRevision {
+                revision_uuid,
+                parent_uuid: parent
+                    .map(|value| uuid::Uuid::from_slice(&value).map(super::types::EntityUuid))
+                    .transpose()?,
+                name,
+                version: Version {
+                    hlc: Hlc {
+                        wall_ms: wall.max(0) as u64,
+                        logical: logical.max(0) as u32,
+                    },
+                    device_uuid: DeviceUuid(uuid::Uuid::from_slice(&device)?),
+                    actor_epoch: ActorEpochUuid(uuid::Uuid::from_slice(&epoch)?),
+                    actor_seq: seq.max(0) as u64,
+                    event_uuid: EventUuid(uuid::Uuid::from_slice(&event)?),
+                },
+            },
+        );
+        if is_head {
+            truth.location_heads.insert(revision_uuid);
+        }
+    }
+    let locations = legalize_locations(&state, logical_root);
+    for (entity_uuid, location) in locations {
+        let entity = entity_uuid.0.as_bytes().as_slice();
+        let heads = state.entities[&entity_uuid]
+            .location_heads
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        persist_location_conflict(transaction, entity_uuid, &heads)?;
+        let root_descriptor: Option<(Vec<u8>, i64)> = transaction
+            .query_row(
+                "SELECT root_uuid,logical_revision FROM sync_root_descriptors WHERE root_folder_uuid=?1",
+                [entity],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((root_uuid, old_revision)) = root_descriptor {
+            let winning = state.entities[&entity_uuid].winning_location();
+            let winning_revision = winning.map(|value| value.revision_uuid.0.as_bytes().to_vec());
+            transaction.execute(
+                "UPDATE sync_root_descriptors SET winning_location_revision_uuid=?1,requested_name=?2,materialized_name=?3,materialization_fingerprint=?4,logical_revision=?5,updated_at=?6 WHERE root_folder_uuid=?7 AND (NOT (winning_location_revision_uuid IS ?1) OR requested_name<>?2 OR materialized_name<>?3 OR materialization_fingerprint<>?4)",
+                params![winning_revision, location.requested_name, location.display_name, location.materialization_fingerprint.as_slice(), old_revision.saturating_add(1), unix_timestamp_millis(), entity],
+            )?;
+            transaction.execute(
+                "UPDATE roots SET display_name=?1 WHERE root_uuid=?2",
+                params![location.display_name, root_uuid],
+            )?;
+            continue;
+        }
+        let parent = location.parent_uuid.and_then(|parent_uuid| {
+            transaction
+                .query_row(
+                    "SELECT id,root_id FROM folders WHERE folder_uuid=?1",
+                    [parent_uuid.0.as_bytes().as_slice()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        });
+        let Some((parent_id, root_id)) = parent else {
+            continue;
+        };
+        if let Some(file_id) = transaction
+            .query_row(
+                "SELECT id FROM files WHERE asset_uuid=?1",
+                [entity],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            transaction.execute(
+                "UPDATE files SET root_id=?1,folder_id=?2,name=?3 WHERE id=?4",
+                params![root_id, parent_id, location.display_name, file_id],
+            )?;
+            crate::db::sync_media_fts_for_file_in_transaction_pub(transaction, file_id)?;
+            continue;
+        }
+        let entity_kind: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT value FROM sync_field_versions WHERE entity_uuid=?1 AND field_name='entity-kind' AND is_winner=1",
+                [entity],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let is_folder = entity_kind
+            .as_deref()
+            .and_then(|value| serde_json::from_slice::<serde_json::Value>(value).ok())
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .is_some_and(|kind| kind == "folder");
+        if is_folder {
+            let updated = transaction.execute(
+                "UPDATE folders SET root_id=?1,parent_id=?2,name=?3,status='active' WHERE folder_uuid=?4",
+                params![root_id, parent_id, location.display_name, entity],
+            )?;
+            if updated == 0 {
+                transaction.execute(
+                    "INSERT INTO folders(root_id,parent_id,name,path_hash,mtime,status,folder_uuid) VALUES (?1,?2,?3,'',NULL,'active',?4)",
+                    params![root_id, parent_id, location.display_name, entity],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_legacy_location_projection(transaction: &Transaction<'_>) -> anyhow::Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT h.entity_uuid,r.parent_uuid,r.name FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.is_display_winner=1",
+    )?;
+    let winners = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (entity, parent, name) in winners {
+        let Some(parent) = parent else { continue };
+        let parent_id: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM folders WHERE folder_uuid=?1",
+                [&parent],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(parent_id) = parent_id else { continue };
+        if let Some(file_id) = transaction
+            .query_row(
+                "SELECT id FROM files WHERE asset_uuid=?1",
+                [&entity],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            transaction.execute(
+                "UPDATE files SET folder_id=?1,name=?2 WHERE id=?3",
+                params![parent_id, name, file_id],
+            )?;
+            crate::db::sync_media_fts_for_file_in_transaction_pub(transaction, file_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn persist_location_conflict(
+    transaction: &Transaction<'_>,
+    entity_uuid: super::types::EntityUuid,
+    heads: &[super::types::RevisionUuid],
+) -> anyhow::Result<()> {
+    let conflict_uuid = deterministic_conflict_uuid(entity_uuid, heads);
+    if heads.len() > 1 {
+        let details = serde_json::to_vec(&serde_json::json!({
+            "locationHeads": heads.iter().map(ToString::to_string).collect::<Vec<_>>()
+        }))?;
+        transaction.execute(
+            "INSERT INTO sync_conflicts(conflict_uuid,entity_uuid,conflict_kind,state,details,created_at) VALUES (?1,?2,'location-heads','open',?3,?4) ON CONFLICT(conflict_uuid) DO UPDATE SET state='open',details=excluded.details,resolved_at=NULL",
+            params![conflict_uuid.as_bytes().as_slice(), entity_uuid.0.as_bytes().as_slice(), details, unix_timestamp_millis()],
+        )?;
+    } else {
+        transaction.execute(
+            "UPDATE sync_conflicts SET state='resolved',resolved_at=?1 WHERE entity_uuid=?2 AND conflict_kind='location-heads' AND state='open'",
+            params![unix_timestamp_millis(), entity_uuid.0.as_bytes().as_slice()],
+        )?;
+    }
+    Ok(())
+}
+
+fn deterministic_conflict_uuid(
+    entity_uuid: super::types::EntityUuid,
+    heads: &[super::types::RevisionUuid],
+) -> uuid::Uuid {
+    let mut material = Vec::with_capacity(16 + heads.len() * 16);
+    material.extend_from_slice(entity_uuid.0.as_bytes());
+    for head in heads {
+        material.extend_from_slice(head.0.as_bytes());
+    }
+    let mut bytes: [u8; 16] = super::codec::sha256(&material)[..16]
+        .try_into()
+        .expect("uuid bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
 pub(crate) fn upsert_frontier_state(
     transaction: &Transaction<'_>,
     actor: &super::types::ActorId,
@@ -585,7 +809,7 @@ mod tests {
     use super::*;
     use crate::sync::segment::seal_segment;
     use crate::sync::test_model::event;
-    use crate::sync::types::{EventUuid, Operation};
+    use crate::sync::types::{EntityUuid, EventUuid, Operation, RevisionUuid};
 
     #[test]
     fn gap_blocks_only_the_affected_actor_and_exact_duplicates_are_noop() {
@@ -679,5 +903,117 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restored, (56, 78, 56, 12, 34));
+    }
+
+    #[test]
+    fn remote_root_and_folder_locations_preserve_sentinel_and_project_folders() {
+        let database = crate::db::Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root_uuid = uuid::Uuid::from_u128(10);
+        let root_folder_uuid = uuid::Uuid::from_u128(20);
+        let library_root_uuid = uuid::Uuid::from_u128(999);
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "D:/Remote".into(),
+                display_name: "Photos".into(),
+            })
+            .unwrap();
+        database
+            .upsert_sync_root_descriptor(&crate::db::SyncRootDescriptorRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                root_folder_uuid: *root_folder_uuid.as_bytes(),
+                library_root_uuid: *library_root_uuid.as_bytes(),
+                creation_event_uuid: None,
+                winning_location_revision_uuid: None,
+                requested_name: "Photos".into(),
+                materialized_name: "Photos".into(),
+                materialization_fingerprint: [1; 32],
+                lifecycle: "active".into(),
+                logical_revision: 0,
+                updated_at: 1,
+            })
+            .unwrap();
+        database.connection_for_fsops().execute(
+            "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,NULL,'','root','active',?2)",
+            params![root_id, root_folder_uuid.as_bytes().as_slice()],
+        ).unwrap();
+        database
+            .link_sync_root_descriptor(root_id, root_uuid.as_bytes(), root_folder_uuid.as_bytes())
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::from_u128(1),
+                library_root_uuid,
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        let bootstrap_head: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1",
+                [root_folder_uuid.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let root_rename = event(
+            1,
+            20,
+            Operation::SetLocation {
+                revision_uuid: RevisionUuid(uuid::Uuid::from_u128(30)),
+                parent_uuid: Some(EntityUuid(library_root_uuid)),
+                name: "Renamed".into(),
+                supersedes: std::collections::BTreeSet::from([RevisionUuid(
+                    uuid::Uuid::from_slice(&bootstrap_head).unwrap(),
+                )]),
+            },
+        );
+        let folder_kind = event(
+            3,
+            40,
+            Operation::SetField {
+                field: "entity-kind".into(),
+                value: serde_json::json!("folder"),
+            },
+        );
+        let folder_location = event(
+            2,
+            40,
+            Operation::SetLocation {
+                revision_uuid: RevisionUuid(uuid::Uuid::from_u128(41)),
+                parent_uuid: Some(EntityUuid(root_folder_uuid)),
+                name: "Nested".into(),
+                supersedes: Default::default(),
+            },
+        );
+        database
+            .apply_remote_sync_events(&[root_rename, folder_location, folder_kind])
+            .unwrap();
+        let sentinel: String = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT name FROM folders WHERE folder_uuid=?1",
+                [root_folder_uuid.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let root_name: String = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT display_name FROM roots WHERE root_uuid=?1",
+                [root_uuid.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let nested: (String, i64) = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT f.name,f.root_id FROM folders f WHERE f.folder_uuid=?1",
+                [uuid::Uuid::from_u128(40).as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sentinel, "");
+        assert_eq!(root_name, "Renamed");
+        assert_eq!(nested, ("Nested".into(), root_id));
     }
 }

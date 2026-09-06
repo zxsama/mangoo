@@ -7,9 +7,9 @@ use super::types::*;
 
 pub type StreamVector = BTreeMap<ActorId, u64>;
 
-// v4 carries verified media index shards so a restored Catalog can resolve
-// content objects without one remote lookup per asset.
-pub const CHECKPOINT_SCHEMA_VERSION: u16 = 4;
+// v5 owns multiple portable root descriptors and records root ownership for
+// browse projection rows while excluding device-local path hashes.
+pub const CHECKPOINT_SCHEMA_VERSION: u16 = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -58,6 +58,8 @@ pub struct HostMetadataSnapshot {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogProjectionSnapshot {
+    #[serde(default)]
+    pub roots: Vec<RootProjectionSnapshot>,
     pub folders: Vec<FolderSnapshot>,
     pub files: Vec<FileSnapshot>,
     pub tags: Vec<TagSnapshot>,
@@ -65,17 +67,24 @@ pub struct CatalogProjectionSnapshot {
     pub memberships: Vec<(EntityUuid, EntityUuid)>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RootProjectionSnapshot {
+    pub root_uuid: EntityUuid,
+    pub root_folder_uuid: EntityUuid,
+    pub display_name: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FolderSnapshot {
     pub uuid: EntityUuid,
+    pub root_uuid: EntityUuid,
     pub parent_uuid: Option<EntityUuid>,
     pub name: String,
-    pub path_hash: String,
     pub mtime: Option<i64>,
     pub status: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileSnapshot {
     pub uuid: EntityUuid,
+    pub root_uuid: EntityUuid,
     pub folder_uuid: EntityUuid,
     pub name: String,
     pub ext: String,

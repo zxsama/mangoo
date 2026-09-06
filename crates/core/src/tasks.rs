@@ -981,6 +981,7 @@ fn run_task_with_database(
         return Ok(());
     }
     let attempt_generation = task.attempt_generation;
+    let root_binding_guard = database.root_binding_token_for_task(task_id)?;
     match task.kind.as_str() {
         "root_scan" => {
             database.mark_task_running_for_attempt(task_id, attempt_generation)?;
@@ -1070,6 +1071,7 @@ fn run_task_with_database(
                         task_id,
                         attempt_generation,
                     },
+                    root_binding_guard,
                     writer,
                 ),
             )?;
@@ -1179,6 +1181,7 @@ fn run_task_with_database(
                         task_id,
                         attempt_generation,
                     },
+                    root_binding_guard,
                     writer,
                 ),
             )?;
@@ -1257,12 +1260,14 @@ fn root_scan_options<'a>(
     progress_callback: &'a mut dyn FnMut(TaskScanProgress),
     cancellation_callback: &'a mut dyn FnMut() -> anyhow::Result<()>,
     task_attempt_guard: TaskAttemptGuard,
+    root_binding_guard: Option<crate::db::SyncRootBindingToken>,
     writer: Option<&DbWriter>,
 ) -> ScanOptions<'a> {
     ScanOptions {
         progress_callback: Some(progress_callback),
         cancellation_callback: Some(cancellation_callback),
         task_attempt_guard: Some(task_attempt_guard),
+        root_binding_guard,
         writer: writer.cloned(),
         ..ScanOptions::background()
     }
@@ -1272,12 +1277,14 @@ fn interactive_scan_options<'a>(
     progress_callback: &'a mut dyn FnMut(TaskScanProgress),
     cancellation_callback: &'a mut dyn FnMut() -> anyhow::Result<()>,
     task_attempt_guard: TaskAttemptGuard,
+    root_binding_guard: Option<crate::db::SyncRootBindingToken>,
     writer: Option<&DbWriter>,
 ) -> ScanOptions<'a> {
     ScanOptions {
         progress_callback: Some(progress_callback),
         cancellation_callback: Some(cancellation_callback),
         task_attempt_guard: Some(task_attempt_guard),
+        root_binding_guard,
         writer: writer.cloned(),
         ..ScanOptions::interactive()
     }
@@ -1366,6 +1373,10 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
     let file_id = task
         .file_id
         .ok_or_else(|| anyhow::anyhow!("thumbnail task missing file id: {task_id}"))?;
+    let root_binding_guard = database.root_binding_token_for_task(task_id)?;
+    if let Some(token) = root_binding_guard.as_ref() {
+        database.require_sync_root_binding_token(token)?;
+    }
     let source = database
         .get_thumbnail_source(file_id)?
         .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?;
@@ -1386,6 +1397,9 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
         ));
     }
     yield_thumbnail_if_higher_priority_pending(database, task_id, attempt_generation)?;
+    if let Some(token) = root_binding_guard.as_ref() {
+        database.require_sync_root_binding_token(token)?;
+    }
 
     let dimensions = if source.metadata_status.as_deref() == Some("ready") {
         (source.width, source.height)
@@ -1402,6 +1416,9 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
             return Err(anyhow::anyhow!(
                 "task {task_id} attempt superseded before thumbnail publish"
             ));
+        }
+        if let Some(token) = root_binding_guard.as_ref() {
+            database.require_sync_root_binding_token(token)?;
         }
         let published = database
             .upsert_thumbnail_state_if_source_fingerprint_and_task_attempt_current(
@@ -1460,6 +1477,9 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
         return Err(anyhow::anyhow!(
             "task {task_id} attempt superseded before thumbnail publish"
         ));
+    }
+    if let Some(token) = root_binding_guard.as_ref() {
+        database.require_sync_root_binding_token(token)?;
     }
     let now = unix_timestamp();
     // Captured from the decode this task already ran; persisted to media in the
@@ -1577,6 +1597,7 @@ mod tests {
             &mut progress_callback,
             &mut cancellation_callback,
             guard,
+            None,
             None,
         );
 

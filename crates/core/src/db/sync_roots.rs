@@ -1,5 +1,7 @@
 use anyhow::{bail, Context};
 use rusqlite::{params, OptionalExtension};
+use std::collections::BTreeSet;
+use uuid::Uuid;
 
 use super::Database;
 
@@ -48,6 +50,129 @@ fn fixed_bytes<const N: usize>(value: Vec<u8>, field: &str) -> anyhow::Result<[u
 }
 
 impl Database {
+    pub(crate) fn sync_root_id(&self, root_uuid: &[u8; 16]) -> anyhow::Result<Option<i64>> {
+        self.connection
+            .query_row(
+                "SELECT id FROM roots WHERE root_uuid=?1 AND root_folder_uuid IS NOT NULL",
+                [root_uuid.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn sync_root_binding_token_for_root_id(
+        &self,
+        root_id: i64,
+    ) -> anyhow::Result<Option<SyncRootBindingToken>> {
+        self.connection
+            .query_row(
+                "SELECT root_uuid,local_binding_uuid,binding_generation FROM sync_root_local_bindings WHERE root_id=?1",
+                [root_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(root_uuid, local_binding_uuid, binding_generation)| {
+                Ok(SyncRootBindingToken {
+                    root_uuid: fixed_bytes(root_uuid, "root_uuid")?,
+                    local_binding_uuid: fixed_bytes(local_binding_uuid, "local_binding_uuid")?,
+                    binding_generation: u64::try_from(binding_generation)
+                        .context("negative binding generation")?,
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn sync_root_binding_token_for_file(
+        &self,
+        file_id: i64,
+    ) -> anyhow::Result<Option<SyncRootBindingToken>> {
+        let root_id = self
+            .connection
+            .query_row("SELECT root_id FROM files WHERE id=?1", [file_id], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?;
+        root_id
+            .map(|root_id| self.sync_root_binding_token_for_root_id(root_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn sync_root_binding_token_is_current(
+        &self,
+        token: &SyncRootBindingToken,
+    ) -> anyhow::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND state IN ('materializing','active','local-only-fork','reconcile-required','relocating','local-rename-required'))",
+                params![
+                    token.root_uuid.as_slice(),
+                    token.local_binding_uuid.as_slice(),
+                    i64::try_from(token.binding_generation)
+                        .context("binding generation exceeds SQLite integer range")?,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn require_sync_root_binding_token(
+        &self,
+        token: &SyncRootBindingToken,
+    ) -> anyhow::Result<()> {
+        if self.sync_root_binding_token_is_current(token)? {
+            return Ok(());
+        }
+        bail!("stale root binding generation")
+    }
+
+    pub(crate) fn require_sync_root_binding_token_for_publication(
+        &self,
+        token: &SyncRootBindingToken,
+    ) -> anyhow::Result<()> {
+        let current = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND state='active')",
+            params![
+                token.root_uuid.as_slice(),
+                token.local_binding_uuid.as_slice(),
+                i64::try_from(token.binding_generation)
+                    .context("binding generation exceeds SQLite integer range")?,
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if current {
+            return Ok(());
+        }
+        bail!("stale root binding generation")
+    }
+
+    pub(crate) fn require_sync_root_binding_token_for_materialization(
+        &self,
+        token: &SyncRootBindingToken,
+    ) -> anyhow::Result<()> {
+        let current = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_uuid=?1 AND local_binding_uuid=?2 AND binding_generation=?3 AND state IN ('materializing','active','reconcile-required'))",
+            params![
+                token.root_uuid.as_slice(),
+                token.local_binding_uuid.as_slice(),
+                i64::try_from(token.binding_generation)
+                    .context("binding generation exceeds SQLite integer range")?,
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if current {
+            return Ok(());
+        }
+        bail!("stale root binding generation")
+    }
+
     /// Applies the Host binding projection without allowing a stale revision
     /// or generation to roll the Catalog execution authority backward.
     #[allow(dead_code)]
@@ -162,6 +287,16 @@ impl Database {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    pub(crate) fn require_sync_root_binding_token_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        token: &SyncRootBindingToken,
+    ) -> anyhow::Result<()> {
+        if Self::sync_root_binding_token_matches_in_transaction(transaction, token)? {
+            return Ok(());
+        }
+        bail!("stale root binding generation")
     }
 
     /// Upserts reducer-derived descriptor fields while preserving the immutable
@@ -297,6 +432,67 @@ impl Database {
         }
         Ok(())
     }
+
+    /// Appends one root/folder logical rename using the operation UUID as its
+    /// stable revision identity. Exact retries return the already-created
+    /// event; stale head sets fail before any ledger or projection mutation.
+    #[allow(dead_code)]
+    pub fn commit_location_rename_once(
+        &self,
+        operation_uuid: Uuid,
+        entity_uuid: Uuid,
+        requested_name: &str,
+        expected_heads: &BTreeSet<Uuid>,
+    ) -> anyhow::Result<Uuid> {
+        if requested_name.is_empty() || expected_heads.is_empty() {
+            bail!("invalid-location-rename");
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let parent_uuid = current_location_parent(&transaction, entity_uuid)?;
+        let event_uuid = commit_location_mutation_once(
+            &transaction,
+            operation_uuid,
+            entity_uuid,
+            parent_uuid,
+            requested_name,
+            expected_heads,
+        )?;
+        transaction.commit()?;
+        Ok(event_uuid)
+    }
+
+    /// Resolves every currently-live location head with one explicit
+    /// superseding revision. Omitting the requested name keeps the display
+    /// winner's logical name; exact retries are idempotent.
+    #[allow(dead_code)]
+    pub fn resolve_location_conflict_once(
+        &self,
+        operation_uuid: Uuid,
+        entity_uuid: Uuid,
+        requested_name: Option<&str>,
+        expected_heads: &BTreeSet<Uuid>,
+        supersedes: &BTreeSet<Uuid>,
+    ) -> anyhow::Result<Uuid> {
+        if expected_heads.is_empty() || supersedes != expected_heads {
+            bail!("stale-location-heads");
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let (parent_uuid, winning_name) = current_winning_location(&transaction, entity_uuid)?;
+        let requested_name = requested_name.unwrap_or(&winning_name);
+        if requested_name.is_empty() {
+            bail!("invalid-location-rename");
+        }
+        let event_uuid = commit_location_mutation_once(
+            &transaction,
+            operation_uuid,
+            entity_uuid,
+            parent_uuid,
+            requested_name,
+            expected_heads,
+        )?;
+        transaction.commit()?;
+        Ok(event_uuid)
+    }
 }
 
 fn is_local_binding_state(state: &str) -> bool {
@@ -312,6 +508,136 @@ fn is_local_binding_state(state: &str) -> bool {
             | "unavailable"
             | "error"
     )
+}
+
+fn commit_location_mutation_once(
+    transaction: &rusqlite::Transaction<'_>,
+    operation_uuid: Uuid,
+    entity_uuid: Uuid,
+    parent_uuid: crate::sync::types::EntityUuid,
+    requested_name: &str,
+    expected_heads: &BTreeSet<Uuid>,
+) -> anyhow::Result<Uuid> {
+    let existing: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>, String)> = transaction
+            .query_row(
+                "SELECT event_uuid,entity_uuid,parent_uuid,name FROM sync_location_revisions WHERE revision_uuid=?1",
+                [operation_uuid.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+    if let Some((event, stored_entity, _parent, stored_name)) = existing {
+        let stored_supersedes = location_supersedes(&transaction, operation_uuid)?;
+        if stored_entity != entity_uuid.as_bytes()
+            || stored_name != requested_name
+            || stored_supersedes != *expected_heads
+        {
+            bail!("idempotency-key-reused");
+        }
+        return Ok(Uuid::from_slice(&event)?);
+    }
+    let live_heads = location_heads(&transaction, entity_uuid)?;
+    if live_heads != *expected_heads {
+        bail!("stale-location-heads");
+    }
+    let capture = crate::sync::capture::capture_catalog_mutation(
+        transaction,
+        crate::sync::capture::MutationOrigin::LocalApi,
+        crate::sync::types::EntityUuid(entity_uuid),
+        crate::sync::types::Operation::SetLocation {
+            revision_uuid: crate::sync::types::RevisionUuid(operation_uuid),
+            parent_uuid: Some(parent_uuid),
+            name: requested_name.to_owned(),
+            supersedes: expected_heads
+                .iter()
+                .copied()
+                .map(crate::sync::types::RevisionUuid)
+                .collect(),
+        },
+    )?;
+    let event_uuid = capture
+        .event_uuid
+        .context("logical rename did not emit an event")?;
+    Ok(Uuid::from_slice(&event_uuid)?)
+}
+
+fn current_location_parent(
+    transaction: &rusqlite::Transaction<'_>,
+    entity_uuid: Uuid,
+) -> anyhow::Result<crate::sync::types::EntityUuid> {
+    Ok(current_winning_location(transaction, entity_uuid)?.0)
+}
+
+fn current_winning_location(
+    transaction: &rusqlite::Transaction<'_>,
+    entity_uuid: Uuid,
+) -> anyhow::Result<(crate::sync::types::EntityUuid, String)> {
+    let root_parent: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT library_root_uuid FROM sync_root_descriptors WHERE root_folder_uuid=?1",
+            [entity_uuid.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(parent) = root_parent {
+        let name: String = transaction.query_row(
+            "SELECT r.name FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=?1 AND h.is_display_winner=1",
+            [entity_uuid.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        return Ok((
+            crate::sync::types::EntityUuid(Uuid::from_slice(&parent)?),
+            name,
+        ));
+    }
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM folders WHERE folder_uuid=?1 AND parent_id IS NOT NULL)",
+        [entity_uuid.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        bail!("folder-not-found");
+    }
+    let (parent, name): (Vec<u8>, String) = transaction.query_row(
+        "SELECT r.parent_uuid,r.name FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=?1 AND h.is_display_winner=1",
+        [entity_uuid.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((
+        crate::sync::types::EntityUuid(Uuid::from_slice(&parent)?),
+        name,
+    ))
+}
+
+fn location_heads(
+    transaction: &rusqlite::Transaction<'_>,
+    entity_uuid: Uuid,
+) -> anyhow::Result<BTreeSet<Uuid>> {
+    let mut statement = transaction.prepare(
+        "SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1 ORDER BY revision_uuid",
+    )?;
+    let mut heads = BTreeSet::new();
+    for row in statement.query_map([entity_uuid.as_bytes().as_slice()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })? {
+        heads.insert(Uuid::from_slice(&row?)?);
+    }
+    Ok(heads)
+}
+
+fn location_supersedes(
+    transaction: &rusqlite::Transaction<'_>,
+    revision_uuid: Uuid,
+) -> anyhow::Result<BTreeSet<Uuid>> {
+    let mut statement = transaction.prepare(
+        "SELECT observed_revision_uuid FROM sync_location_supersedes WHERE revision_uuid=?1 ORDER BY observed_revision_uuid",
+    )?;
+    let mut revisions = BTreeSet::new();
+    for row in statement.query_map([revision_uuid.as_bytes().as_slice()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })? {
+        revisions.insert(Uuid::from_slice(&row?)?);
+    }
+    Ok(revisions)
 }
 
 #[cfg(test)]
@@ -407,6 +733,37 @@ mod tests {
         database
             .link_sync_root_descriptor(root_id, &descriptor.root_uuid, &descriptor.root_folder_uuid)
             .expect("link selected root");
+        database
+            .upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+                root_uuid: descriptor.root_uuid,
+                library_uuid: [8; 16],
+                local_binding_uuid: [9; 16],
+                binding_generation: 1,
+                state: "active".into(),
+                root_id,
+                operation_revision: 1,
+                updated_at: 1,
+            })
+            .expect("project local binding");
+        let file_id = database
+            .upsert_file(super::super::FileUpsert {
+                root_id,
+                folder_id: database
+                    .connection
+                    .query_row(
+                        "SELECT id FROM folders WHERE root_id=?1 AND parent_id IS NULL",
+                        [root_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                name: "photo.jpg".into(),
+                ext: "jpg".into(),
+                size: 1,
+                mtime: 1,
+                ctime: None,
+                file_key: Some("photo".into()),
+            })
+            .expect("insert file");
 
         let linked: Vec<u8> = database
             .connection
@@ -450,5 +807,370 @@ mod tests {
         assert_eq!(relocated.0, root_id);
         assert_eq!(relocated.1, descriptor.root_uuid);
         assert_eq!(relocated.2, descriptor.root_folder_uuid);
+        let (source_path, token) = database
+            .resolve_file_source_path_with_root_token(file_id)
+            .unwrap()
+            .expect("resolve relocated file");
+        assert_eq!(
+            source_path,
+            std::path::PathBuf::from("E:/Migrated/Photos/photo.jpg")
+        );
+        assert_eq!(
+            token,
+            Some(SyncRootBindingToken {
+                root_uuid: descriptor.root_uuid,
+                local_binding_uuid: [9; 16],
+                binding_generation: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn local_binding_projection_is_monotonic_and_fences_stale_work_after_restart() {
+        let database_path = std::env::temp_dir().join(format!(
+            "megle-sync-root-generation-fence-{}.sqlite",
+            Uuid::now_v7()
+        ));
+        let root_uuid = [21; 16];
+        let root_folder_uuid = [22; 16];
+        let library_uuid = [23; 16];
+        let binding_uuid = [24; 16];
+        let root_id;
+        let file_id;
+        {
+            let database = Database::open(&database_path).expect("open database");
+            database.apply_migrations().expect("apply migrations");
+            database
+                .upsert_sync_root_descriptor(&SyncRootDescriptorRecord {
+                    root_uuid,
+                    root_folder_uuid,
+                    library_root_uuid: [25; 16],
+                    creation_event_uuid: None,
+                    winning_location_revision_uuid: None,
+                    requested_name: "Photos".into(),
+                    materialized_name: "Photos".into(),
+                    materialization_fingerprint: [26; 32],
+                    lifecycle: "active".into(),
+                    logical_revision: 1,
+                    updated_at: 1,
+                })
+                .expect("insert descriptor");
+            database
+                .connection
+                .execute(
+                    "INSERT INTO roots(path,display_name,enabled,created_at,root_uuid) VALUES ('D:/Photos','Photos',1,1,?1)",
+                    [root_uuid.as_slice()],
+                )
+                .expect("insert root");
+            root_id = database.connection.last_insert_rowid();
+            database
+                .connection
+                .execute(
+                    "INSERT INTO folders(root_id,parent_id,name,path_hash,folder_uuid) VALUES (?1,NULL,'','root',?2)",
+                    params![root_id, root_folder_uuid.as_slice()],
+                )
+                .expect("insert sentinel");
+            database
+                .link_sync_root_descriptor(root_id, &root_uuid, &root_folder_uuid)
+                .expect("link descriptor");
+            let root_folder_id = database
+                .connection
+                .query_row(
+                    "SELECT id FROM folders WHERE root_id=?1 AND parent_id IS NULL",
+                    [root_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("load root folder");
+            file_id = database
+                .upsert_file(crate::db::FileUpsert {
+                    root_id,
+                    folder_id: root_folder_id,
+                    name: "preview.jpg".into(),
+                    ext: ".jpg".into(),
+                    size: 1,
+                    mtime: 1,
+                    ctime: None,
+                    file_key: Some("preview".into()),
+                })
+                .expect("insert preview source");
+            database
+                .upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+                    root_uuid,
+                    library_uuid,
+                    local_binding_uuid: binding_uuid,
+                    binding_generation: 1,
+                    state: "active".into(),
+                    root_id,
+                    operation_revision: 1,
+                    updated_at: 1,
+                })
+                .expect("insert binding projection");
+            database
+                .connection
+                .execute(
+                    "INSERT INTO tasks(kind,priority,status,root_id,created_at,updated_at) VALUES ('root_scan',0,'pending',?1,1,1)",
+                    [root_id],
+                )
+                .expect("insert managed task");
+            let task_token: (Vec<u8>, Vec<u8>, i64) = database
+                .connection
+                .query_row(
+                    "SELECT root_uuid,local_binding_uuid,binding_generation FROM tasks WHERE root_id=?1",
+                    [root_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("load managed task token");
+            assert_eq!(task_token, (root_uuid.to_vec(), binding_uuid.to_vec(), 1));
+        }
+
+        let database = Database::open(&database_path).expect("reopen database");
+        database.apply_migrations().expect("rerun migrations");
+        let stored = database
+            .sync_root_local_binding(&root_uuid)
+            .expect("load binding projection")
+            .expect("binding projection exists");
+        assert_eq!(stored.binding_generation, 1);
+        let transaction = database
+            .connection
+            .unchecked_transaction()
+            .expect("begin token check");
+        assert!(Database::sync_root_binding_token_matches_in_transaction(
+            &transaction,
+            &SyncRootBindingToken {
+                root_uuid,
+                local_binding_uuid: binding_uuid,
+                binding_generation: 1,
+            },
+        )
+        .expect("validate current token"));
+        transaction.commit().expect("finish token check");
+
+        database
+            .upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+                binding_generation: 2,
+                operation_revision: 2,
+                updated_at: 2,
+                ..stored.clone()
+            })
+            .expect("advance binding generation");
+        assert!(database.upsert_sync_root_local_binding(&stored).is_err());
+        assert!(database
+            .upsert_preview_failure_for_root_token(
+                crate::db::PreviewFailureRecord {
+                    file_id,
+                    profile: "preview_native".into(),
+                    failure_kind: "permanent".into(),
+                    error: "stale decode".into(),
+                    source_size: 1,
+                    source_mtime: 1,
+                    created_at: 2,
+                    updated_at: 2,
+                },
+                Some(&SyncRootBindingToken {
+                    root_uuid,
+                    local_binding_uuid: binding_uuid,
+                    binding_generation: 1,
+                }),
+            )
+            .is_err());
+        assert!(database
+            .get_preview_failure(file_id, "preview_native")
+            .expect("query stale preview failure")
+            .is_none());
+        assert!(!database
+            .task_attempt_is_current(
+                database
+                    .connection
+                    .query_row("SELECT id FROM tasks WHERE root_id=?1", [root_id], |row| {
+                        row.get(0)
+                    },)
+                    .unwrap(),
+                0,
+            )
+            .expect("stale task attempt check"));
+        assert!(database
+            .connection
+            .execute(
+                "UPDATE tasks SET status='running' WHERE root_id=?1",
+                [root_id]
+            )
+            .is_err());
+        database
+            .connection
+            .execute(
+                "INSERT INTO tasks(kind,priority,status,created_at,updated_at) VALUES ('thumbnail',0,'pending',3,3)",
+                [],
+            )
+            .expect("insert legacy unowned task");
+        let legacy_token: (Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>) = database
+            .connection
+            .query_row(
+                "SELECT root_uuid,local_binding_uuid,binding_generation FROM tasks WHERE root_id IS NULL ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load legacy task token");
+        assert_eq!(legacy_token, (None, None, None));
+
+        drop(database);
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn logical_rename_is_idempotent_and_rejects_stale_heads() {
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO roots(path,display_name,enabled,created_at,root_uuid) VALUES ('D:/Photos','Photos',1,1,?1)",
+                [[1_u8; 16].as_slice()],
+            )
+            .unwrap();
+        let root_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,folder_uuid) VALUES (?1,NULL,'','root',?2)",
+                params![root_id, [2_u8; 16].as_slice()],
+            )
+            .unwrap();
+        database.upsert_sync_root_descriptor(&descriptor()).unwrap();
+        database
+            .link_sync_root_descriptor(root_id, &[1; 16], &[2; 16])
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                Uuid::from_bytes([9; 16]),
+                Uuid::from_bytes([3; 16]),
+                Uuid::now_v7(),
+            )
+            .unwrap();
+        database.enable_fake_sync_capture_for_test().unwrap();
+        let head = database
+            .connection
+            .query_row(
+                "SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1",
+                [[2_u8; 16].as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        let heads = BTreeSet::from([Uuid::from_slice(&head).unwrap()]);
+        let operation = Uuid::now_v7();
+        let first = database
+            .commit_location_rename_once(operation, Uuid::from_bytes([2; 16]), "Renamed", &heads)
+            .unwrap();
+        let retry = database
+            .commit_location_rename_once(operation, Uuid::from_bytes([2; 16]), "Renamed", &heads)
+            .unwrap();
+        assert_eq!(first, retry);
+        assert!(
+            database
+                .commit_location_rename_once(
+                    Uuid::now_v7(),
+                    Uuid::from_bytes([2; 16]),
+                    "Stale",
+                    &heads,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            database
+                .sync_root_descriptor(&[1; 16])
+                .unwrap()
+                .unwrap()
+                .requested_name,
+            "Renamed"
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT name FROM folders WHERE folder_uuid=?1",
+                    [[2_u8; 16].as_slice()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            ""
+        );
+
+        let concurrent_revision = Uuid::now_v7();
+        let remote = crate::sync::codec::seal_event(crate::sync::types::EventEnvelope {
+            wire_version: crate::sync::codec::WIRE_VERSION,
+            envelope_version: crate::sync::codec::ENVELOPE_VERSION,
+            reducer_version: crate::sync::codec::REDUCER_VERSION,
+            library_uuid: crate::sync::types::LibraryUuid(Uuid::from_bytes([9; 16])),
+            event_uuid: crate::sync::types::EventUuid::new(),
+            entity_uuid: crate::sync::types::EntityUuid(Uuid::from_bytes([2; 16])),
+            stream_uuid: crate::sync::types::StreamUuid(Uuid::from_bytes([7; 16])),
+            stream_kind: crate::sync::types::StreamKind::Catalog,
+            actor: crate::sync::types::ActorId {
+                device_uuid: crate::sync::types::DeviceUuid(Uuid::from_bytes([8; 16])),
+                stream_uuid: crate::sync::types::StreamUuid(Uuid::from_bytes([7; 16])),
+                actor_epoch: crate::sync::types::ActorEpochUuid(Uuid::from_bytes([6; 16])),
+            },
+            actor_seq: 1,
+            binding_epoch: crate::sync::types::BindingEpochUuid(Uuid::from_bytes([5; 16])),
+            hlc: crate::sync::types::Hlc {
+                wall_ms: 10,
+                logical: 0,
+            },
+            operation: crate::sync::types::Operation::SetLocation {
+                revision_uuid: crate::sync::types::RevisionUuid(concurrent_revision),
+                parent_uuid: Some(crate::sync::types::EntityUuid(Uuid::from_bytes([3; 16]))),
+                name: "Remote".into(),
+                supersedes: BTreeSet::new(),
+            },
+            base_events: BTreeSet::new(),
+            key_version: 0,
+            integrity_hash: [0; 32],
+        })
+        .unwrap();
+        database.apply_remote_sync_events(&[remote]).unwrap();
+        let conflicting_heads = location_heads(
+            &database.connection.unchecked_transaction().unwrap(),
+            Uuid::from_bytes([2; 16]),
+        )
+        .unwrap();
+        assert_eq!(conflicting_heads.len(), 2);
+        let resolution = Uuid::now_v7();
+        let resolved_event = database
+            .resolve_location_conflict_once(
+                resolution,
+                Uuid::from_bytes([2; 16]),
+                Some("Resolved"),
+                &conflicting_heads,
+                &conflicting_heads,
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .resolve_location_conflict_once(
+                    resolution,
+                    Uuid::from_bytes([2; 16]),
+                    Some("Resolved"),
+                    &conflicting_heads,
+                    &conflicting_heads,
+                )
+                .unwrap(),
+            resolved_event
+        );
+        let current_heads = location_heads(
+            &database.connection.unchecked_transaction().unwrap(),
+            Uuid::from_bytes([2; 16]),
+        )
+        .unwrap();
+        assert_eq!(current_heads, BTreeSet::from([resolution]));
+        let conflict_state: String = database
+            .connection
+            .query_row(
+                "SELECT state FROM sync_conflicts WHERE entity_uuid=?1 AND conflict_kind='location-heads' ORDER BY created_at DESC LIMIT 1",
+                [[2_u8; 16].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(conflict_state, "resolved");
     }
 }

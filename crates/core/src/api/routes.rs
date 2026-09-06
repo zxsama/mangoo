@@ -3660,14 +3660,16 @@ async fn get_preview(
     use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
     use tokio_util::io::ReaderStream;
 
-    let (source_path, media_kind, source_max_px) =
+    let (source_path, source_root_token, media_kind, source_max_px) =
         run_read_database(state.clone(), move |database| {
             let media = database
                 .get_media(file_id)?
                 .ok_or_else(|| CoreError::not_found(format!("media item not found: {file_id}")))?;
-            let source_path = database.resolve_file_source_path(file_id)?.ok_or_else(|| {
-                CoreError::not_found(format!("media source not found: {file_id}"))
-            })?;
+            let (source_path, source_root_token) = database
+                .resolve_file_source_path_with_root_token(file_id)?
+                .ok_or_else(|| {
+                    CoreError::not_found(format!("media source not found: {file_id}"))
+                })?;
             // `width`/`height` stay NULL until the thumbnail pass fills them in;
             // 0 then means "unknown", which resolves to "stream the original".
             let source_max_px = media
@@ -3675,10 +3677,18 @@ async fn get_preview(
                 .unwrap_or(0)
                 .max(media.height.unwrap_or(0))
                 .clamp(0, u32::MAX as i64) as u32;
-            Ok((source_path, media.kind, source_max_px))
+            Ok((source_path, source_root_token, media.kind, source_max_px))
         })
         .await?;
 
+    let token_for_open = source_root_token;
+    run_read_database(state.clone(), move |database| {
+        if let Some(token) = token_for_open.as_ref() {
+            database.require_sync_root_binding_token(token)?;
+        }
+        Ok(())
+    })
+    .await?;
     let file = tokio::fs::File::open(&source_path)
         .await
         .map_err(|err| CoreError::not_found(format!("media source file missing: {err}")))?;
@@ -3713,8 +3723,15 @@ async fn get_preview(
         // degradation, not a failure: fall through to the raw-stream branch
         // below, which is exactly what this route served before the preview
         // pipeline existed. Only a decode PANIC propagates as an error.
-        if let Some(response) =
-            serve_cached_preview_webp(state, file_id, plan, &source_path, &metadata).await?
+        if let Some(response) = serve_cached_preview_webp(
+            state,
+            file_id,
+            plan,
+            &source_path,
+            &metadata,
+            token_for_open,
+        )
+        .await?
         {
             return Ok(response);
         }
@@ -3765,6 +3782,7 @@ async fn serve_cached_preview_webp(
     plan: PreviewPlan,
     source_path: &FilePath,
     metadata: &std::fs::Metadata,
+    source_root_token: Option<crate::db::SyncRootBindingToken>,
 ) -> ApiResult<Option<Response>> {
     use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 
@@ -3861,7 +3879,10 @@ async fn serve_cached_preview_webp(
                         };
                         if let Err(cache_error) =
                             run_shared_database(state.clone(), move |database| {
-                                database.upsert_preview_failure(failure)?;
+                                database.upsert_preview_failure_for_root_token(
+                                    failure,
+                                    source_root_token.as_ref(),
+                                )?;
                                 Ok(())
                             })
                             .await
@@ -3901,7 +3922,7 @@ async fn serve_cached_preview_webp(
             // them into a 500 and a blank frame, which is the same hole the
             // decode path already closes by degrading.
             if let Err(error) = run_shared_database(state, move |database| {
-                database.upsert_preview_blob(stored)?;
+                database.upsert_preview_blob_for_root_token(stored, source_root_token.as_ref())?;
                 Ok(())
             })
             .await

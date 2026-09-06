@@ -973,13 +973,21 @@ impl Database {
         let transaction = self.connection.unchecked_transaction()?;
         let root_count: i64 =
             transaction.query_row("SELECT COUNT(*) FROM roots", [], |row| row.get(0))?;
-        if root_count != 1 {
-            anyhow::bail!("managed Catalog must contain exactly one root");
+        let descriptor_count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM sync_root_descriptors", [], |row| {
+                row.get(0)
+            })?;
+        if root_count == 0 && descriptor_count == 0 {
+            anyhow::bail!("managed Catalog must contain at least one root");
         }
-        transaction.execute(
-            "UPDATE roots SET root_uuid=?1 WHERE id=(SELECT id FROM roots LIMIT 1) AND root_uuid != ?1",
-            [root_uuid.as_bytes().as_slice()],
-        )?;
+        // Preserve legacy single-root identity while allowing already-enrolled
+        // managed-root-v2 Catalogs to retain one stable UUID per selected root.
+        if root_count == 1 {
+            transaction.execute(
+                "UPDATE roots SET root_uuid=?1 WHERE id=(SELECT id FROM roots LIMIT 1) AND root_folder_uuid IS NULL AND root_uuid != ?1",
+                [root_uuid.as_bytes().as_slice()],
+            )?;
+        }
         let now = unix_timestamp_millis();
         transaction.execute(
             "INSERT OR IGNORE INTO sync_local_state(singleton,library_uuid,device_uuid,catalog_stream_uuid,next_actor_seq,next_local_mutation_generation,hlc_wall_ms,hlc_logical,capture_enabled,compatibility_state,updated_at) VALUES (1,?1,?2,?3,1,1,0,0,0,'compatible',?4)",
@@ -993,10 +1001,61 @@ impl Database {
         if stored.0 != library_uuid.as_bytes() || stored.1 != device_uuid.as_bytes() {
             anyhow::bail!("Catalog sync identity does not match Host binding");
         }
-        // Seed immutable location truth once. This is bootstrap material, not
-        // an outbox event, and gives later subtree snapshots a historical base.
+        let roots = {
+            let mut statement = transaction.prepare(
+                "SELECT id,root_uuid,display_name,root_folder_uuid FROM roots ORDER BY id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (root_id, root_identity, display_name, linked_folder_uuid) in roots {
+            let Some(sentinel_uuid) = linked_folder_uuid else {
+                continue;
+            };
+            let requested_name = if display_name.is_empty() {
+                "untitled".to_owned()
+            } else {
+                display_name
+            };
+            let materialized_name =
+                crate::sync::reducer::canonicalize_materialized_component(&requested_name, None);
+            let fingerprint = crate::sync::codec::sha256(&crate::sync::codec::canonical_bytes(&(
+                crate::sync::reducer::MATERIALIZED_NAME_VERSION,
+                &root_identity,
+                &sentinel_uuid,
+                &materialized_name,
+            ))?);
+            transaction.execute(
+                "INSERT OR IGNORE INTO sync_root_descriptors(root_uuid,root_folder_uuid,library_root_uuid,requested_name,materialized_name,materialization_fingerprint,lifecycle,logical_revision,updated_at) VALUES (?1,?2,?3,?4,?5,?6,'active',0,?7)",
+                rusqlite::params![root_identity, sentinel_uuid, root_uuid.as_bytes().as_slice(), requested_name, materialized_name, fingerprint.as_slice(), now],
+            )?;
+            transaction.execute(
+                "UPDATE roots SET root_folder_uuid=?1 WHERE id=?2 AND root_folder_uuid IS NULL",
+                rusqlite::params![sentinel_uuid, root_id],
+            )?;
+        }
+        // Seed immutable location truth once. The empty-name sentinel keeps its
+        // local shape; its portable location is the descriptor name under the
+        // virtual Library root.
         transaction.execute(
-            "INSERT INTO sync_location_revisions(revision_uuid,entity_uuid,parent_uuid,name,local_mutation_generation,origin,created_at) SELECT randomblob(16),f.folder_uuid,COALESCE(p.folder_uuid,r.root_uuid),f.name,1,'bootstrap',?1 FROM folders f JOIN roots r ON r.id=f.root_id LEFT JOIN folders p ON p.id=f.parent_id WHERE NOT EXISTS (SELECT 1 FROM sync_location_revisions x WHERE x.entity_uuid=f.folder_uuid)",
+            "INSERT INTO sync_location_revisions(revision_uuid,entity_uuid,parent_uuid,name,local_mutation_generation,origin,created_at) SELECT randomblob(16),d.root_folder_uuid,d.library_root_uuid,d.requested_name,1,'bootstrap',?1 FROM sync_root_descriptors d JOIN roots r ON r.root_uuid=d.root_uuid WHERE NOT EXISTS (SELECT 1 FROM sync_location_revisions x WHERE x.entity_uuid=d.root_folder_uuid)",
+            [now],
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_location_revisions(revision_uuid,entity_uuid,parent_uuid,name,local_mutation_generation,origin,created_at) SELECT randomblob(16),f.folder_uuid,p.folder_uuid,f.name,1,'bootstrap',?1 FROM folders f JOIN roots r ON r.id=f.root_id JOIN folders p ON p.id=f.parent_id WHERE NOT EXISTS (SELECT 1 FROM sync_location_revisions x WHERE x.entity_uuid=f.folder_uuid)",
+            [now],
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_location_revisions(revision_uuid,entity_uuid,parent_uuid,name,local_mutation_generation,origin,created_at) SELECT randomblob(16),f.folder_uuid,COALESCE(p.folder_uuid,r.root_uuid),f.name,1,'bootstrap',?1 FROM folders f JOIN roots r ON r.id=f.root_id LEFT JOIN folders p ON p.id=f.parent_id WHERE r.root_folder_uuid IS NULL AND NOT EXISTS (SELECT 1 FROM sync_location_revisions x WHERE x.entity_uuid=f.folder_uuid)",
             [now],
         )?;
         transaction.execute(
@@ -1229,7 +1288,7 @@ impl Database {
     ) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         let (asset_uuid, revision_uuid, binding_epoch): (Vec<u8>, Vec<u8>, Option<Vec<u8>>) = transaction.query_row(
-            "SELECT i.asset_uuid,i.content_revision_uuid,i.binding_epoch FROM sync_publication_intents i JOIN media_publication_jobs j ON j.intent_uuid=i.intent_uuid WHERE i.intent_uuid=?1 AND i.state IN ('pending-hash','pending-manifest','ready','failed') AND j.phase='canonicalizing' AND j.transport_generation=?2",
+            "SELECT i.asset_uuid,i.content_revision_uuid,i.binding_epoch FROM sync_publication_intents i JOIN media_publication_jobs j ON j.intent_uuid=i.intent_uuid WHERE i.intent_uuid=?1 AND i.state IN ('pending-hash','pending-manifest','ready','failed') AND j.phase='canonicalizing' AND j.transport_generation=?2 AND (j.root_uuid IS NULL OR EXISTS (SELECT 1 FROM sync_root_local_bindings b WHERE b.root_uuid=j.root_uuid AND b.local_binding_uuid=j.local_binding_uuid AND b.binding_generation=j.binding_generation AND b.state='active'))",
             rusqlite::params![intent_uuid.as_bytes().as_slice(),transport_generation],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
         )?;
@@ -1977,6 +2036,15 @@ impl Database {
         root_id: i64,
         origin: NotificationOrigin,
     ) -> anyhow::Result<i64> {
+        self.create_root_scan_task_with_origin_for_root_token(root_id, None, origin)
+    }
+
+    pub(crate) fn create_root_scan_task_with_origin_for_root_token(
+        &self,
+        root_id: i64,
+        token: Option<&SyncRootBindingToken>,
+        origin: NotificationOrigin,
+    ) -> anyhow::Result<i64> {
         let root = self
             .get_root(root_id)?
             .ok_or_else(|| anyhow::anyhow!("root not found: {root_id}"))?;
@@ -1991,11 +2059,21 @@ impl Database {
             transaction.execute(
                 r#"
                 INSERT INTO tasks(
-                    kind, priority, status, root_id, folder_id, file_id, created_at, updated_at, error
+                    kind, priority, status, root_id, folder_id, file_id, created_at, updated_at,
+                    root_uuid, local_binding_uuid, binding_generation, error
                 )
-                VALUES ('root_scan', ?1, 'pending', ?2, NULL, NULL, ?3, ?3, NULL)
+                VALUES ('root_scan', ?1, 'pending', ?2, NULL, NULL, ?3, ?3, ?4, ?5, ?6, NULL)
                 "#,
-                (ROOT_SCAN_TASK_PRIORITY, root_id, now),
+                rusqlite::params![
+                    ROOT_SCAN_TASK_PRIORITY,
+                    root_id,
+                    now,
+                    token.map(|token| token.root_uuid.as_slice()),
+                    token.map(|token| token.local_binding_uuid.as_slice()),
+                    token
+                        .map(|token| i64::try_from(token.binding_generation))
+                        .transpose()?,
+                ],
             )?;
         } else {
             transaction.execute(
@@ -5726,42 +5804,224 @@ impl Database {
         root_path: &Path,
         folder_path: &Path,
     ) -> anyhow::Result<i64> {
-        let _root = self
-            .get_root(root_id)?
-            .ok_or_else(|| anyhow::anyhow!("root not found: {root_id}"))?;
-        let root_folder_id = self.upsert_folder(FolderUpsert {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        ensure_root_enabled_in_transaction(&transaction, root_id)?;
+        let folder_id = ensure_folder_chain_for_path_in_transaction(
+            &transaction,
             root_id,
-            parent_id: None,
-            name: String::new(),
-            path_hash: hash_path(root_path),
-            mtime: metadata_time(root_path.metadata().ok().as_ref()),
-        })?;
-        let Ok(relative) = folder_path.strip_prefix(root_path) else {
-            return Err(anyhow::anyhow!(
-                "folder path is outside root {}: {}",
-                root_path.display(),
-                folder_path.display()
-            ));
+            root_path,
+            folder_path,
+        )?;
+        transaction.commit()?;
+        Ok(folder_id)
+    }
+
+    pub(crate) fn ensure_folder_chain_for_path_for_task_attempt(
+        &self,
+        root_id: i64,
+        root_path: &Path,
+        folder_path: &Path,
+        task_id: i64,
+        attempt_generation: i64,
+    ) -> anyhow::Result<i64> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        ensure_task_attempt_running_in_transaction(&transaction, task_id, attempt_generation)?;
+        ensure_root_enabled_in_transaction(&transaction, root_id)?;
+        let folder_id = ensure_folder_chain_for_path_in_transaction(
+            &transaction,
+            root_id,
+            root_path,
+            folder_path,
+        )?;
+        transaction.commit()?;
+        Ok(folder_id)
+    }
+
+    pub(crate) fn begin_root_scan_reconciliation_for_task_attempt(
+        &self,
+        root_id: i64,
+        task_id: i64,
+        attempt_generation: i64,
+    ) -> anyhow::Result<i64> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        ensure_task_attempt_running_in_transaction(&transaction, task_id, attempt_generation)?;
+        ensure_root_enabled_in_transaction(&transaction, root_id)?;
+        let scan_generation = next_root_scan_generation_in_transaction(&transaction, root_id)?;
+        transaction.execute(
+            "UPDATE roots SET active_scan_generation = ?1 WHERE id = ?2",
+            (scan_generation, root_id),
+        )?;
+        transaction.commit()?;
+        Ok(scan_generation)
+    }
+
+    pub(crate) fn mark_file_missing_by_path_for_root_token(
+        &self,
+        token: &SyncRootBindingToken,
+        root_id: i64,
+        root_path: &Path,
+        file_path: &Path,
+    ) -> anyhow::Result<bool> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        Self::require_sync_root_binding_token_in_transaction(&transaction, token)?;
+        let Some(parent_path) = file_path.parent() else {
+            transaction.commit()?;
+            return Ok(false);
         };
-        if relative.as_os_str().is_empty() {
-            return Ok(root_folder_id);
+        let Some(folder_id) =
+            get_folder_id_by_path_in_transaction(&transaction, root_id, root_path, parent_path)?
+        else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let file_name = file_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let updated = transaction.execute(
+            "UPDATE files SET status = 'missing' WHERE root_id = ?1 AND folder_id = ?2 AND name = ?3 AND status = 'active'",
+            (root_id, folder_id, file_name),
+        )?;
+        if updated != 0 {
+            cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction)?;
         }
+        transaction.commit()?;
+        Ok(updated != 0)
+    }
 
-        let mut parent_id = root_folder_id;
-        let mut current_path = root_path.to_path_buf();
-        for component in relative.components() {
-            current_path.push(component.as_os_str());
-            let name = component.as_os_str().to_string_lossy().to_string();
-            parent_id = self.upsert_folder(FolderUpsert {
-                root_id,
-                parent_id: Some(parent_id),
-                name,
-                path_hash: hash_path(&current_path),
-                mtime: metadata_time(current_path.metadata().ok().as_ref()),
-            })?;
-        }
+    pub(crate) fn mark_folder_subtree_missing_by_path_for_root_token(
+        &self,
+        token: &SyncRootBindingToken,
+        root_id: i64,
+        root_path: &Path,
+        folder_path: &Path,
+    ) -> anyhow::Result<bool> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        Self::require_sync_root_binding_token_in_transaction(&transaction, token)?;
+        let Some(folder_id) =
+            get_folder_id_by_path_in_transaction(&transaction, root_id, root_path, folder_path)?
+        else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        transaction.execute(
+            r#"
+            WITH RECURSIVE subtree(id) AS (
+              SELECT id FROM folders WHERE id = ?1
+              UNION ALL
+              SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+            )
+            UPDATE folders SET status = 'missing' WHERE id IN (SELECT id FROM subtree)
+            "#,
+            [folder_id],
+        )?;
+        transaction.execute(
+            r#"
+            WITH RECURSIVE subtree(id) AS (
+              SELECT id FROM folders WHERE id = ?1
+              UNION ALL
+              SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+            )
+            UPDATE files SET status = 'missing' WHERE folder_id IN (SELECT id FROM subtree)
+            "#,
+            [folder_id],
+        )?;
+        cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction)?;
+        transaction.commit()?;
+        Ok(true)
+    }
 
-        Ok(parent_id)
+    pub(crate) fn upsert_external_media_file_for_root_token(
+        &self,
+        token: &SyncRootBindingToken,
+        file: FileUpsert,
+        media_kind: &str,
+        volume_identity: &[u8],
+        file_identity: &[u8],
+        fingerprint: Option<&[u8]>,
+        path: &Path,
+    ) -> anyhow::Result<i64> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        Self::require_sync_root_binding_token_in_transaction(&transaction, token)?;
+        let scan_generation = active_scan_generation_in_transaction(&transaction, file.root_id)?;
+        let id = Self::upsert_external_media_file_in_transaction(
+            &transaction,
+            file,
+            media_kind,
+            volume_identity,
+            file_identity,
+            fingerprint,
+            path,
+            scan_generation,
+            crate::sync::capture::MutationOrigin::ExternalFs,
+        )?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    pub(crate) fn ensure_folder_chain_for_path_for_root_token(
+        &self,
+        token: &SyncRootBindingToken,
+        root_id: i64,
+        root_path: &Path,
+        folder_path: &Path,
+    ) -> anyhow::Result<i64> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        Self::require_sync_root_binding_token_in_transaction(&transaction, token)?;
+        ensure_root_enabled_in_transaction(&transaction, root_id)?;
+        let folder_id = ensure_folder_chain_for_path_in_transaction(
+            &transaction,
+            root_id,
+            root_path,
+            folder_path,
+        )?;
+        transaction.commit()?;
+        Ok(folder_id)
+    }
+
+    pub(crate) fn root_binding_token_for_task(
+        &self,
+        task_id: i64,
+    ) -> anyhow::Result<Option<SyncRootBindingToken>> {
+        self.connection
+            .query_row(
+                "SELECT root_uuid,local_binding_uuid,binding_generation FROM tasks WHERE id=?1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(root_uuid, local_binding_uuid, binding_generation)| {
+                match (root_uuid, local_binding_uuid, binding_generation) {
+                    (None, None, None) => Ok(None),
+                    (Some(root_uuid), Some(local_binding_uuid), Some(binding_generation)) => {
+                        Ok(Some(SyncRootBindingToken {
+                            root_uuid: root_uuid.try_into().map_err(|_| {
+                                anyhow::anyhow!("task root UUID must contain 16 bytes")
+                            })?,
+                            local_binding_uuid: local_binding_uuid.try_into().map_err(|_| {
+                                anyhow::anyhow!("task binding UUID must contain 16 bytes")
+                            })?,
+                            binding_generation: u64::try_from(binding_generation)?,
+                        }))
+                    }
+                    _ => anyhow::bail!("task root ownership is partial"),
+                }
+            })
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub(crate) fn mark_file_missing_by_path(
@@ -6338,6 +6598,37 @@ impl Database {
         Ok(Some(path))
     }
 
+    pub(crate) fn resolve_file_source_path_with_root_token(
+        &self,
+        file_id: i64,
+    ) -> anyhow::Result<Option<(PathBuf, Option<SyncRootBindingToken>)>> {
+        let Some(path) = self.resolve_file_source_path(file_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            path,
+            self.sync_root_binding_token_for_file(file_id)?,
+        )))
+    }
+
+    pub(crate) fn resolve_asset_source_path_with_root_token(
+        &self,
+        asset_uuid: uuid::Uuid,
+    ) -> anyhow::Result<Option<(PathBuf, Option<SyncRootBindingToken>)>> {
+        let file_id = self
+            .connection
+            .query_row(
+                "SELECT id FROM files WHERE asset_uuid=?1 AND status='active'",
+                [asset_uuid.as_bytes().as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        file_id
+            .map(|file_id| self.resolve_file_source_path_with_root_token(file_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn resolve_folder_source_path(&self, folder_id: i64) -> anyhow::Result<Option<PathBuf>> {
         const FOLDER_WALK_DEPTH_CAP: usize = 4096;
 
@@ -6730,6 +7021,7 @@ impl Database {
         Ok(rows.next()?.map(preview_failure_from_row).transpose()?)
     }
 
+    #[allow(dead_code)]
     pub fn upsert_preview_failure(&self, failure: PreviewFailureRecord) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
@@ -6765,6 +7057,47 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) fn upsert_preview_failure_for_root_token(
+        &self,
+        failure: PreviewFailureRecord,
+        token: Option<&SyncRootBindingToken>,
+    ) -> anyhow::Result<()> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if let Some(token) = token {
+            Self::require_sync_root_binding_token_in_transaction(&transaction, token)?;
+        }
+        transaction.execute(
+            r#"
+            INSERT INTO preview_failures(
+                file_id, profile, failure_kind, error, source_size, source_mtime,
+                created_at, updated_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+            ON CONFLICT(file_id, profile) DO UPDATE SET
+                failure_kind=excluded.failure_kind,error=excluded.error,
+                source_size=excluded.source_size,source_mtime=excluded.source_mtime,
+                updated_at=excluded.updated_at
+            "#,
+            (
+                failure.file_id,
+                &failure.profile,
+                &failure.failure_kind,
+                &failure.error,
+                failure.source_size,
+                failure.source_mtime,
+                failure.created_at,
+                failure.updated_at,
+            ),
+        )?;
+        transaction.execute(
+            "DELETE FROM preview_blobs WHERE file_id=?1 AND profile=?2",
+            (failure.file_id, &failure.profile),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub fn upsert_preview_blob(&self, blob: PreviewBlobRecord) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
@@ -6825,6 +7158,61 @@ impl Database {
             )
               AND NOT (file_id = ?2 AND profile = ?3)
             "#,
+            (PREVIEW_BLOB_CACHE_LIMIT_BYTES, blob.file_id, &blob.profile),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn upsert_preview_blob_for_root_token(
+        &self,
+        blob: PreviewBlobRecord,
+        token: Option<&SyncRootBindingToken>,
+    ) -> anyhow::Result<()> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if let Some(token) = token {
+            Self::require_sync_root_binding_token_in_transaction(&transaction, token)?;
+        }
+        transaction.execute(
+            r#"
+            INSERT INTO preview_blobs(
+                file_id, profile, data, width, height, byte_size, output_format,
+                source_size, source_mtime, created_at, updated_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+            ON CONFLICT(file_id, profile) DO UPDATE SET
+                data=excluded.data,width=excluded.width,height=excluded.height,
+                byte_size=excluded.byte_size,output_format=excluded.output_format,
+                source_size=excluded.source_size,source_mtime=excluded.source_mtime,
+                updated_at=excluded.updated_at
+            "#,
+            (
+                blob.file_id,
+                &blob.profile,
+                &blob.data,
+                blob.width,
+                blob.height,
+                blob.byte_size,
+                &blob.output_format,
+                blob.source_size,
+                blob.source_mtime,
+                blob.created_at,
+                blob.updated_at,
+            ),
+        )?;
+        transaction.execute(
+            "DELETE FROM preview_failures WHERE file_id=?1 AND profile=?2",
+            (blob.file_id, &blob.profile),
+        )?;
+        transaction.execute(
+            r#"DELETE FROM preview_blobs WHERE rowid IN (
+                 SELECT rowid FROM (
+                   SELECT rowid,SUM(byte_size) OVER (
+                     ORDER BY updated_at DESC,rowid DESC
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   ) AS running_bytes FROM preview_blobs
+                 ) WHERE running_bytes>?1
+               ) AND NOT (file_id=?2 AND profile=?3)"#,
             (PREVIEW_BLOB_CACHE_LIMIT_BYTES, blob.file_id, &blob.profile),
         )?;
         transaction.commit()?;
@@ -7028,15 +7416,28 @@ impl Database {
         // Read only `attempt_generation` (not a full `get_task` row): the scan
         // hot path calls this per-file; a whole-row SELECT + deserialization is
         // wasted work for a single-column comparison.
-        let current: Option<i64> = self
+        let current: Option<(i64, bool)> = self
             .connection
             .query_row(
-                "SELECT attempt_generation FROM tasks WHERE id = ?1",
+                r#"
+                SELECT attempt_generation,
+                       root_uuid IS NULL OR EXISTS (
+                         SELECT 1 FROM sync_root_local_bindings binding
+                         WHERE binding.root_uuid = tasks.root_uuid
+                           AND binding.local_binding_uuid = tasks.local_binding_uuid
+                           AND binding.binding_generation = tasks.binding_generation
+                           AND binding.state IN (
+                             'materializing','active','local-only-fork','reconcile-required',
+                             'relocating','local-rename-required'
+                           )
+                       )
+                FROM tasks WHERE id = ?1
+                "#,
                 [task_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        Ok(current == Some(attempt_generation))
+        Ok(current == Some((attempt_generation, true)))
     }
 
     pub fn list_tags(&self) -> anyhow::Result<Vec<TagRecord>> {
@@ -7939,7 +8340,17 @@ fn task_attempt_running_in_transaction(
 ) -> anyhow::Result<bool> {
     let mut statement = transaction.prepare(
         r#"
-        SELECT status, attempt_generation
+        SELECT status, attempt_generation,
+               root_uuid IS NULL OR EXISTS (
+                 SELECT 1 FROM sync_root_local_bindings binding
+                 WHERE binding.root_uuid = tasks.root_uuid
+                   AND binding.local_binding_uuid = tasks.local_binding_uuid
+                   AND binding.binding_generation = tasks.binding_generation
+                   AND binding.state IN (
+                     'materializing','active','local-only-fork','reconcile-required',
+                     'relocating','local-rename-required'
+                   )
+               )
         FROM tasks
         WHERE id = ?1
         "#,
@@ -7950,7 +8361,84 @@ fn task_attempt_running_in_transaction(
     };
     let status: String = row.get(0)?;
     let current_attempt: i64 = row.get(1)?;
-    Ok(status == "running" && current_attempt == attempt_generation)
+    let root_binding_current: bool = row.get(2)?;
+    Ok(status == "running" && current_attempt == attempt_generation && root_binding_current)
+}
+
+fn get_folder_id_by_path_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    root_id: i64,
+    root_path: &Path,
+    folder_path: &Path,
+) -> anyhow::Result<Option<i64>> {
+    let mut folder_id = transaction
+        .query_row(
+            "SELECT id FROM folders WHERE root_id=?1 AND parent_id IS NULL AND name=''",
+            [root_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Ok(relative) = folder_path.strip_prefix(root_path) else {
+        return Ok(None);
+    };
+    for component in relative.components() {
+        let Some(parent_id) = folder_id else {
+            return Ok(None);
+        };
+        let name = component.as_os_str().to_string_lossy();
+        folder_id = transaction
+            .query_row(
+                "SELECT id FROM folders WHERE root_id=?1 AND parent_id=?2 AND name=?3",
+                rusqlite::params![root_id, parent_id, name.as_ref()],
+                |row| row.get(0),
+            )
+            .optional()?;
+    }
+    Ok(folder_id)
+}
+
+fn ensure_folder_chain_for_path_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    root_id: i64,
+    root_path: &Path,
+    folder_path: &Path,
+) -> anyhow::Result<i64> {
+    let scan_generation = active_scan_generation_in_transaction(transaction, root_id)?;
+    let root_folder_id = upsert_folder_in_transaction(
+        transaction,
+        FolderUpsert {
+            root_id,
+            parent_id: None,
+            name: String::new(),
+            path_hash: hash_path(root_path),
+            mtime: metadata_time(root_path.metadata().ok().as_ref()),
+        },
+        scan_generation,
+    )?;
+    let relative = folder_path.strip_prefix(root_path).map_err(|_| {
+        anyhow::anyhow!(
+            "folder path is outside root {}: {}",
+            root_path.display(),
+            folder_path.display()
+        )
+    })?;
+    let mut parent_id = root_folder_id;
+    let mut current_path = root_path.to_path_buf();
+    for component in relative.components() {
+        current_path.push(component.as_os_str());
+        parent_id = upsert_folder_in_transaction(
+            transaction,
+            FolderUpsert {
+                root_id,
+                parent_id: Some(parent_id),
+                name: component.as_os_str().to_string_lossy().into_owned(),
+                path_hash: hash_path(&current_path),
+                mtime: metadata_time(current_path.metadata().ok().as_ref()),
+            },
+            scan_generation,
+        )?;
+    }
+    Ok(parent_id)
 }
 
 fn mark_task_failed_in_transaction(

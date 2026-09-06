@@ -837,6 +837,78 @@ impl HostRegistry {
         .transpose()
     }
 
+    pub fn local_root_binding_tokens(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Vec<crate::sync::runtime::RootExecutionToken>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT root_uuid,local_binding_uuid,binding_generation FROM local_root_bindings WHERE library_uuid=?1 AND state IN ('materializing','active','paused','reconcile-required','relocating','local-rename-required') ORDER BY root_uuid",
+        )?;
+        let rows = statement.query_map([library_uuid], |row| {
+            Ok(crate::sync::runtime::RootExecutionToken {
+                library_uuid: library_uuid.to_owned(),
+                root_uuid: row.get(0)?,
+                local_binding_uuid: row.get(1)?,
+                binding_generation: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn local_root_bindings(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Vec<LocalRootBindingRecord>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT root_uuid FROM local_root_bindings WHERE library_uuid=?1 ORDER BY root_uuid",
+        )?;
+        let root_uuids = statement
+            .query_map([library_uuid], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        drop(connection);
+        root_uuids
+            .into_iter()
+            .map(|root_uuid| {
+                self.local_root_binding(library_uuid, &root_uuid)?
+                    .ok_or_else(|| anyhow::anyhow!("local-root-binding-not-found"))
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn require_current_root_token(
+        &self,
+        token: &crate::sync::runtime::RootExecutionToken,
+    ) -> anyhow::Result<()> {
+        let current = self
+            .local_root_binding(&token.library_uuid, &token.root_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("stale-root-binding"))?;
+        if current.local_binding_uuid != token.local_binding_uuid
+            || current.binding_generation != token.binding_generation
+            || !matches!(
+                current.state.as_str(),
+                "materializing"
+                    | "active"
+                    | "paused"
+                    | "reconcile-required"
+                    | "relocating"
+                    | "local-rename-required"
+            )
+        {
+            anyhow::bail!("stale-root-binding");
+        }
+        Ok(())
+    }
+
     /// Reserves a managed-root-v2 operation journal exactly once. Reusing the
     /// operation UUID with the same immutable payload is idempotent; changing
     /// any identity, kind, or request field is rejected.
@@ -5203,6 +5275,15 @@ mod tests {
             .expect("read local root binding");
         assert_eq!(binding.local_binding_uuid, binding_uuid);
         assert_eq!(binding.binding_generation, 1);
+        assert_eq!(
+            registry
+                .local_root_bindings(library_uuid)
+                .unwrap()
+                .into_iter()
+                .map(|binding| binding.state)
+                .collect::<Vec<_>>(),
+            vec!["active"]
+        );
 
         let request = serde_json::json!({"selected": true, "path": "D:/Library/Photos"});
         let operation_uuid = "00000000-0000-7000-8000-000000000020";
@@ -5310,6 +5391,15 @@ mod tests {
                 )
                 .unwrap();
         }
+        assert_eq!(
+            registry
+                .local_root_bindings(library_uuid)
+                .unwrap()
+                .into_iter()
+                .map(|binding| binding.state)
+                .collect::<Vec<_>>(),
+            vec!["local-only-fork"]
+        );
         let blocked_operation_uuid = "00000000-0000-7000-8000-000000000022";
         let blocked = registry
             .begin_root_operation_once(
@@ -6517,9 +6607,9 @@ mod tests {
         let library = uuid::Uuid::now_v7();
         registry.connection.lock().unwrap().execute("INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES (?1,?2,'Old','local','root','ready','local-only','available',1,'marker',1,1)",params![library.to_string(),uuid::Uuid::now_v7().to_string()]).unwrap();
         let event = crate::sync::codec::seal_event(crate::sync::types::EventEnvelope {
-            wire_version: 1,
-            envelope_version: 1,
-            reducer_version: 1,
+            wire_version: crate::sync::codec::WIRE_VERSION,
+            envelope_version: crate::sync::codec::ENVELOPE_VERSION,
+            reducer_version: crate::sync::codec::REDUCER_VERSION,
             library_uuid: crate::sync::types::LibraryUuid(library),
             event_uuid: crate::sync::types::EventUuid::new(),
             entity_uuid: crate::sync::types::EntityUuid(library),
@@ -6571,9 +6661,9 @@ mod tests {
         let make = |wall, name: &str| {
             let stream = crate::sync::types::StreamUuid(uuid::Uuid::now_v7());
             let event = crate::sync::codec::seal_event(crate::sync::types::EventEnvelope {
-                wire_version: 1,
-                envelope_version: 1,
-                reducer_version: 1,
+                wire_version: crate::sync::codec::WIRE_VERSION,
+                envelope_version: crate::sync::codec::ENVELOPE_VERSION,
+                reducer_version: crate::sync::codec::REDUCER_VERSION,
                 library_uuid: crate::sync::types::LibraryUuid(library),
                 event_uuid: crate::sync::types::EventUuid::new(),
                 entity_uuid: crate::sync::types::EntityUuid(library),
@@ -6749,9 +6839,9 @@ mod tests {
             actor_epoch: crate::sync::types::ActorEpochUuid(uuid::Uuid::now_v7()),
         };
         let event = crate::sync::codec::seal_event(crate::sync::types::EventEnvelope {
-            wire_version: 1,
-            envelope_version: 1,
-            reducer_version: 1,
+            wire_version: crate::sync::codec::WIRE_VERSION,
+            envelope_version: crate::sync::codec::ENVELOPE_VERSION,
+            reducer_version: crate::sync::codec::REDUCER_VERSION,
             library_uuid: crate::sync::types::LibraryUuid(library),
             event_uuid: crate::sync::types::EventUuid::new(),
             entity_uuid: crate::sync::types::EntityUuid(library),
