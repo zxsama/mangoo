@@ -1,4 +1,4 @@
-export type NotificationActionName = "cancel" | "retry";
+export type NotificationActionName = "cancel" | "retry" | "dismiss" | "review";
 export type NotificationActionErrors = Partial<Record<NotificationActionName, string>>;
 export type NotificationActionStates = ReadonlyMap<string, NotificationOperationActionState>;
 

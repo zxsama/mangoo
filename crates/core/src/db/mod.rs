@@ -892,6 +892,7 @@ impl Database {
             root_id: task.root_id,
             library_uuid: None,
             root_uuid: None,
+            managed_root_action: None,
             folder_id: task.folder_id,
             file_id: None,
             current_value: task.items_seen,

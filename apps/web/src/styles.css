@@ -6735,6 +6735,42 @@ button:disabled {
 .settings-sync-card > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .settings-sync-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .settings-sync-actions > .liquid-glass-button { display: inline-flex; align-items: center; gap: 5px; }
+.settings-sync-folders { display: grid; gap: 12px; margin-top: 16px; }
+.settings-sync-folders-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.settings-sync-folders-header h3, .settings-sync-folders-header p, .settings-sync-folder-row p { margin: 0; }
+.settings-sync-folders-header p, .settings-sync-folder-row p, .settings-sync-folder-empty { color: var(--text-muted); font-size: 12px; }
+.settings-sync-folder-list { display: grid; gap: 8px; }
+.settings-sync-folder-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 11px 12px; border-radius: 12px; background: color-mix(in srgb, var(--surface-elevated, #222) 78%, transparent); }
+.settings-sync-folder-copy { display: grid; gap: 5px; min-width: 0; }
+.settings-sync-folder-name { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.settings-sync-folder-name code, .settings-sync-folder-name span { color: var(--text-muted); font-size: 11px; }
+.settings-sync-folder-path { overflow-wrap: anywhere; }
+.settings-sync-folder-meta { overflow-wrap: anywhere; opacity: .82; }
+.settings-sync-folder-error { color: var(--danger); }
+.settings-sync-folder-actions { display: flex; align-content: flex-start; justify-content: flex-end; flex-wrap: wrap; gap: 6px; max-width: 330px; }
+.settings-sync-folder-actions > .liquid-glass-button { display: inline-flex; align-items: center; gap: 5px; }
+.settings-sync-folder-contract-note { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 11px; }
+.sync-folder-name-field { display: grid; gap: 6px; }
+.sync-folder-name-field input { min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-control); color: var(--text-primary); background: var(--glass-control, rgba(255, 255, 255, 0.03)); }
+.sync-folder-rename-preview { display: grid; gap: 4px; overflow-wrap: anywhere; }
+.sync-folder-dialog-body { display: grid; gap: 12px; }
+.sync-folder-dialog-body label { display: grid; gap: 6px; }
+.sync-folder-dialog-body input, .sync-folder-dialog-body select { width: 100%; min-width: 0; }
+.sync-folder-comparison-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.sync-folder-comparison-summary > div { min-width: 0; padding: 8px; border-radius: 9px; background: color-mix(in srgb, var(--surface-elevated, #222) 76%, transparent); }
+.sync-folder-comparison-summary dt { color: var(--text-muted); font-size: 11px; }
+.sync-folder-comparison-summary dd { margin: 3px 0 0; overflow-wrap: anywhere; }
+.sync-folder-comparison-items { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.sync-folder-comparison-items li { display: grid; grid-template-columns: minmax(90px, auto) minmax(0, 1fr) minmax(120px, auto); align-items: center; gap: 8px; }
+.sync-folder-conflict-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.sync-folder-conflict-list li { display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, 1fr) auto; align-items: center; gap: 8px; }
+.sync-folder-conflict-list code { overflow-wrap: anywhere; color: var(--text-muted); font-size: 11px; }
+@media (max-width: 719px) {
+  .settings-sync-folder-row { grid-template-columns: 1fr; }
+  .settings-sync-folder-actions { justify-content: flex-start; max-width: none; }
+  .sync-folder-comparison-items li { grid-template-columns: 1fr; }
+  .sync-folder-conflict-list li { grid-template-columns: 1fr; }
+}
 .settings-sync-account,
 .managed-library-restore-confirm,
 .managed-library-restore-progress > div { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 12px; background: color-mix(in srgb, var(--surface-elevated, #222) 78%, transparent); }
@@ -6747,6 +6783,12 @@ button:disabled {
 .managed-library-restore-progress span { color: var(--text-muted); font-size: 12px; }
 .managed-library-restore-progress { display: grid; gap: 8px; }
 .managed-library-restore-progress-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.managed-library-restore-preflight-roots,
+.managed-library-restore-preflight-volumes { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.managed-library-restore-preflight-roots li,
+.managed-library-restore-preflight-volumes li { display: flex; justify-content: space-between; gap: 12px; min-width: 0; }
+.managed-library-restore-preflight-roots span,
+.managed-library-restore-preflight-volumes span { min-width: 0; overflow-wrap: anywhere; }
 .settings-sync-conflicts { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .settings-sync-conflicts li { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .settings-sync-diagnostics { max-height: min(42vh, 360px); margin: 12px 0 0; padding: 10px; overflow: auto; border-radius: 10px; background: color-mix(in srgb, var(--surface-elevated, #222) 82%, transparent); color: var(--text-muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -2475,6 +2475,7 @@ fn new_group_operation(
         root_id: None,
         library_uuid: None,
         root_uuid: None,
+        managed_root_action: None,
         folder_id: None,
         file_id: None,
         current_value: 0,

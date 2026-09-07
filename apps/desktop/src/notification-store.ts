@@ -185,6 +185,10 @@ export class NotificationStore {
     });
   }
 
+  async dismissManagedRoot(libraryId: string, operationId: string, rootUuid: string, inventoryRevision: number): Promise<void> {
+    await this.request<void>({ requestId:this.nextRequestId(), method:"dismissManagedRoot", params:{libraryId,operationId,rootUuid,inventoryRevision,dismissedAt:Date.now()} });
+  }
+
   async history(query: NotificationHistoryQuery): Promise<NotificationHistoryPage> {
     return this.request<NotificationHistoryPage>({
       requestId: this.nextRequestId(),

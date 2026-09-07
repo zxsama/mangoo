@@ -8,6 +8,7 @@ import type {
   DesktopProcessLogExportResult,
   DesktopProcessLogFilter,
   DesktopProcessLogPage,
+  ManagedRootNotificationTarget,
   ProcessLogSubscriptionHandle as DesktopProcessLogSubscriptionHandle,
   ProcessLogSubscriptionInitialSnapshot
 } from "@megle/notification-contract";
@@ -214,6 +215,14 @@ export class NotificationExternalStore {
 
   retry(libraryId: string, operationId: string) {
     return this.performAction("retry", libraryId, operationId);
+  }
+
+  dismissManagedRoot(target: ManagedRootNotificationTarget) {
+    return this.performManagedRootAction("dismiss", target);
+  }
+
+  reviewManagedRoot(target: ManagedRootNotificationTarget) {
+    return this.performManagedRootAction("review", target);
   }
 
   async refreshCompact(): Promise<NotificationRequestResult<boolean>> {
@@ -564,6 +573,39 @@ export class NotificationExternalStore {
     return request;
   }
 
+  private performManagedRootAction(
+    action: "dismiss" | "review",
+    target: ManagedRootNotificationTarget
+  ): Promise<{ ok: boolean; message: string | null }> {
+    const requestKey = notificationOperationActionKey(target.libraryId, target.operationId);
+    const existing = this.actionRequests.get(requestKey);
+    if (existing) {
+      if (existing.action === action) return existing.request;
+      return Promise.resolve({ ok: false, message: "该操作已有动作正在执行" });
+    }
+    const bridge = this.currentBridge();
+    if (!bridge) return Promise.resolve({ ok: false, message: "通知操作仅在桌面模式可用" });
+    let bridgeRequest: Promise<{ ok: boolean; message: string | null }>;
+    try {
+      bridgeRequest = action === "dismiss"
+        ? bridge.dismissManagedRoot(target)
+        : bridge.reviewManagedRoot(target);
+    } catch (error) {
+      return Promise.resolve({ ok: false, message: errorMessage(error) });
+    }
+    const request = bridgeRequest.catch((error) => ({
+      ok: false,
+      message: errorMessage(error)
+    }));
+    this.actionRequests.set(requestKey, { action, request });
+    void request.then(() => {
+      if (this.actionRequests.get(requestKey)?.request === request) {
+        this.actionRequests.delete(requestKey);
+      }
+    });
+    return request;
+  }
+
   private setSnapshot(snapshot: NotificationStoreSnapshot): void {
     if (snapshot === this.snapshot) return;
     this.snapshot = snapshot;
@@ -582,6 +624,8 @@ const loadHistory = notificationStore.loadHistory.bind(notificationStore);
 const loadMoreHistory = notificationStore.loadMoreHistory.bind(notificationStore);
 const cancel = notificationStore.cancel.bind(notificationStore);
 const retry = notificationStore.retry.bind(notificationStore);
+const dismissManagedRoot = notificationStore.dismissManagedRoot.bind(notificationStore);
+const reviewManagedRoot = notificationStore.reviewManagedRoot.bind(notificationStore);
 const refreshCompact = notificationStore.refreshCompact.bind(notificationStore);
 const getHistoryFacets = notificationStore.getHistoryFacets.bind(notificationStore);
 const getLogPage = notificationStore.getLogPage.bind(notificationStore);
@@ -609,6 +653,8 @@ export function useNotifications() {
     loadMoreHistory,
     cancel,
     retry,
+    dismissManagedRoot,
+    reviewManagedRoot,
     refreshCompact,
     getHistoryFacets,
     getLogPage,

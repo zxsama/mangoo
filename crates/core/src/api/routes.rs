@@ -1207,30 +1207,89 @@ struct RestorePreflightRequest {
     items: Vec<RestoreStartItem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+enum RestoreStartItem {
+    Legacy(RestoreLegacyItem),
+    RootAware(RestoreRootAwareItem),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RestoreStartItem {
+struct RestoreLegacyItem {
+    #[serde(default)]
+    restore_mode: Option<RestoreLegacyMode>,
     account_uuid: String,
     library_uuid: String,
     name: String,
     managed_root: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+enum RestoreLegacyMode {
+    #[serde(rename = "legacy-library")]
+    LegacyLibrary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreRootAwareItem {
+    restore_mode: RestoreRootAwareMode,
+    account_uuid: String,
+    library_uuid: String,
+    placement_base: String,
+    inventory_fence: String,
+    roots: Vec<RestoreRootChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+enum RestoreRootAwareMode {
+    #[serde(rename = "root-aware")]
+    RootAware,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreRootChoice {
+    root_uuid: String,
+    expected_logical_revision: u64,
+    expected_materialization_fingerprint: String,
+    selected: bool,
+    #[serde(default)]
+    target_path: Option<String>,
+}
+
 fn restore_operation_request(items: &[RestoreStartItem]) -> serde_json::Value {
-    serde_json::json!({
-        "items": items.iter().map(|item| serde_json::json!({
-            "accountUuid": item.account_uuid,
-            "libraryUuid": item.library_uuid,
-            "name": item.name,
-            "managedRoot": item.managed_root,
-        })).collect::<Vec<_>>()
-    })
+    let mut items = items.to_vec();
+    items.sort_by(|left, right| restore_item_identity(left).cmp(&restore_item_identity(right)));
+    for item in &mut items {
+        if let RestoreStartItem::RootAware(item) = item {
+            item.roots
+                .sort_by(|left, right| left.root_uuid.cmp(&right.root_uuid));
+        }
+    }
+    serde_json::json!({ "items": items })
+}
+
+fn restore_item_identity(item: &RestoreStartItem) -> (&str, &str) {
+    match item {
+        RestoreStartItem::Legacy(item) => (&item.account_uuid, &item.library_uuid),
+        RestoreStartItem::RootAware(item) => (&item.account_uuid, &item.library_uuid),
+    }
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RestoreListResponse {
     items: Vec<crate::host_registry::SyncRestorePlan>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteRootListResponse {
+    items: Vec<crate::host_registry::RemoteLibraryRootSummary>,
+    next_cursor: Option<String>,
+    inventory_fence: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4829,30 +4888,31 @@ async fn list_remote_library_roots(
     State(state): State<AppState>,
     Path((account_uuid, library_uuid)): Path<(String, String)>,
     Query(query): Query<RemoteRootQuery>,
-) -> ApiResult<Json<ListResponse<crate::host_registry::RemoteLibraryRootSummary>>> {
+) -> ApiResult<Json<RemoteRootListResponse>> {
     validate_contract_uuid(&library_uuid, "libraryUuid")?;
     if let Some(cursor) = query.cursor.as_deref() {
         validate_contract_uuid(cursor, "cursor")?;
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let mut items = library_manager(&state)?
+    let inventory = library_manager(&state)?
         .registry()
-        .list_remote_library_roots(
+        .remote_library_root_inventory(
             &account_uuid,
             &library_uuid,
             query.cursor.as_deref(),
             limit + 1,
         )?;
+    let mut items = inventory.items;
     let next_cursor = if items.len() > limit {
         items.truncate(limit);
         items.last().map(|item| item.root_uuid.clone())
     } else {
         None
     };
-    Ok(Json(ListResponse {
+    Ok(Json(RemoteRootListResponse {
         items,
         next_cursor,
-        total_count: None,
+        inventory_fence: inventory.inventory_fence,
     }))
 }
 
@@ -5249,22 +5309,247 @@ async fn reconnect_commit(
     Ok(Json(finished))
 }
 
+fn invalid_restore_preflight(
+    total_items: usize,
+    root_results: Vec<crate::host_registry::SyncRestoreRootResult>,
+    volume_results: Vec<crate::host_registry::SyncRestoreVolumeResult>,
+) -> crate::host_registry::SyncRestorePreflight {
+    crate::host_registry::SyncRestorePreflight {
+        preflight_token: None,
+        expires_at: 0,
+        total_items: total_items as u64,
+        total_bytes: volume_results.iter().map(|item| item.required_bytes).sum(),
+        ok: false,
+        root_results,
+        volume_results,
+    }
+}
+
+fn volume_key(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\");
+    if let Some(rest) = text.strip_prefix("\\\\") {
+        let mut parts = rest.split('\\');
+        return format!(
+            "unc://{}/{}",
+            parts.next().unwrap_or_default().to_lowercase(),
+            parts.next().unwrap_or_default().to_lowercase()
+        );
+    }
+    path.components()
+        .next()
+        .map(|value| value.as_os_str().to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| text.to_lowercase())
+}
+
 fn validate_restore_items(
     manager: &crate::library_manager::LibraryManager,
     items: &[RestoreStartItem],
-) -> ApiResult<u64> {
+    persist: bool,
+) -> ApiResult<crate::host_registry::SyncRestorePreflight> {
     if items.is_empty() {
         return Err(CoreError::bad_request(
             "restore items cannot be empty".into(),
         ));
     }
+    let root_aware = items
+        .iter()
+        .any(|item| matches!(item, RestoreStartItem::RootAware(_)));
+    if root_aware
+        && items
+            .iter()
+            .any(|item| matches!(item, RestoreStartItem::Legacy(_)))
+    {
+        return Err(CoreError::bad_request("mixed-restore-modes".into()));
+    }
     let mut normalized_roots = Vec::with_capacity(items.len());
+    let mut selected_restore_paths = Vec::<std::path::PathBuf>::new();
     let remote_inventory = manager.registry().list_remote_libraries()?;
-    let mut required_by_volume = std::collections::HashMap::<String, u64>::new();
-    let mut available_by_volume = std::collections::HashMap::<String, u64>::new();
+    let mut required_by_volume = std::collections::BTreeMap::<String, u64>::new();
+    let mut available_by_volume = std::collections::BTreeMap::<String, u64>::new();
+    let mut root_results = Vec::new();
+    let mut submitted_libraries = std::collections::BTreeSet::new();
     for item in items {
-        let check = manager.preflight(&item.name, FilePath::new(&item.managed_root))?;
+        if let RestoreStartItem::RootAware(item) = item {
+            validate_contract_uuid(&item.library_uuid, "libraryUuid")?;
+            if item.inventory_fence.len() != 64
+                || !item
+                    .inventory_fence
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(CoreError::bad_request("invalid-inventory-fence".into()));
+            }
+            for root in &item.roots {
+                validate_contract_uuid(&root.root_uuid, "rootUuid")?;
+                if root.expected_materialization_fingerprint.len() != 64
+                    || !root
+                        .expected_materialization_fingerprint
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(CoreError::bad_request(
+                        "invalid-materialization-fingerprint".into(),
+                    ));
+                }
+            }
+        }
+        let (account_uuid, library_uuid, name, managed_root) = match item {
+            RestoreStartItem::Legacy(item) => (
+                &item.account_uuid,
+                &item.library_uuid,
+                &item.name,
+                &item.managed_root,
+            ),
+            RestoreStartItem::RootAware(item) => {
+                let Some(remote) = remote_inventory.iter().find(|remote| {
+                    remote.account_uuid == item.account_uuid
+                        && remote.library_uuid == item.library_uuid
+                        && remote.compatible
+                }) else {
+                    return Ok(invalid_restore_preflight(items.len(), vec![], vec![]));
+                };
+                let inventory = manager
+                    .registry()
+                    .remote_library_root_inventory(
+                        &item.account_uuid,
+                        &item.library_uuid,
+                        None,
+                        usize::MAX,
+                    )
+                    .map_err(map_library_error)?;
+                let mut reasons = std::collections::BTreeMap::<String, String>::new();
+                if inventory.inventory_fence != item.inventory_fence {
+                    reasons.insert(String::new(), "stale-inventory".into());
+                }
+                let expected = inventory
+                    .items
+                    .iter()
+                    .map(|root| root.root_uuid.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let submitted = item
+                    .roots
+                    .iter()
+                    .map(|root| root.root_uuid.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                if submitted.len() != item.roots.len() {
+                    reasons.insert(String::new(), "duplicate-root".into());
+                }
+                if expected != submitted {
+                    reasons.insert(String::new(), "incomplete-root-inventory".into());
+                }
+                for missing in inventory
+                    .items
+                    .iter()
+                    .filter(|root| !submitted.contains(root.root_uuid.as_str()))
+                {
+                    root_results.push(crate::host_registry::SyncRestoreRootResult {
+                        library_uuid: item.library_uuid.clone(),
+                        root_uuid: missing.root_uuid.clone(),
+                        selected: false,
+                        ok: false,
+                        reason: Some("missing-root".into()),
+                        normalized_target_path: None,
+                        required_bytes: missing.logical_bytes.unwrap_or(0),
+                        available_bytes: None,
+                        volume_key: None,
+                    });
+                }
+                for choice in &item.roots {
+                    let fact = inventory
+                        .items
+                        .iter()
+                        .find(|root| root.root_uuid == choice.root_uuid);
+                    let mut reason = reasons.get("").cloned();
+                    if fact.is_none() {
+                        reason = Some("foreign-root".into());
+                    }
+                    if let Some(fact) = fact {
+                        if fact.logical_revision != choice.expected_logical_revision
+                            || fact.materialization_fingerprint
+                                != choice.expected_materialization_fingerprint
+                        {
+                            reason = Some("stale-root-facts".into());
+                        }
+                    }
+                    if choice.selected != choice.target_path.is_some() {
+                        reason = Some("target-selection-mismatch".into());
+                    }
+                    let mut normalized_target_path = None;
+                    let mut available_bytes = None;
+                    let mut root_volume = None;
+                    if reason.is_none() && choice.selected {
+                        match crate::sync_folders::validate_root_path(
+                            FilePath::new(choice.target_path.as_deref().unwrap_or_default()),
+                            crate::sync_folders::RootPathMode::MaterializeRemote,
+                            FilePath::new(&item.placement_base),
+                            &selected_restore_paths,
+                        ) {
+                            Ok(path) => {
+                                root_volume =
+                                    Some(volume_key(FilePath::new(&path.normalized_path)));
+                                available_bytes = path.available_bytes;
+                                selected_restore_paths
+                                    .push(FilePath::new(&path.normalized_path).to_path_buf());
+                                normalized_target_path = Some(path.normalized_path);
+                            }
+                            Err(error) => reason = Some(error.to_string()),
+                        }
+                    }
+                    let required_bytes = fact.and_then(|root| root.logical_bytes).unwrap_or(0);
+                    if let Some(volume) = root_volume.as_ref() {
+                        *required_by_volume.entry(volume.clone()).or_default() = required_by_volume
+                            .get(volume)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(required_bytes);
+                        if let Some(available) = available_bytes {
+                            available_by_volume
+                                .entry(volume.clone())
+                                .and_modify(|v| *v = (*v).min(available))
+                                .or_insert(available);
+                        }
+                    }
+                    root_results.push(crate::host_registry::SyncRestoreRootResult {
+                        library_uuid: item.library_uuid.clone(),
+                        root_uuid: choice.root_uuid.clone(),
+                        selected: choice.selected,
+                        ok: reason.is_none(),
+                        reason,
+                        normalized_target_path,
+                        required_bytes,
+                        available_bytes,
+                        volume_key: root_volume,
+                    });
+                }
+                (
+                    &item.account_uuid,
+                    &item.library_uuid,
+                    &remote.name,
+                    &item.placement_base,
+                )
+            }
+        };
+        if !submitted_libraries.insert((account_uuid.clone(), library_uuid.clone())) {
+            return Err(CoreError::bad_request("duplicate-restore-library".into()));
+        }
+        let check = manager.preflight(name, FilePath::new(managed_root))?;
         if !check.ok {
+            if root_aware {
+                root_results.push(crate::host_registry::SyncRestoreRootResult {
+                    library_uuid: library_uuid.clone(),
+                    root_uuid: String::new(),
+                    selected: false,
+                    ok: false,
+                    reason: Some(check.reason.as_str().into()),
+                    normalized_target_path: Some(
+                        check.normalized_root.to_string_lossy().into_owned(),
+                    ),
+                    required_bytes: 0,
+                    available_bytes: check.available_bytes,
+                    volume_key: Some(volume_key(&check.normalized_root)),
+                });
+                continue;
+            }
             return Err(CoreError::conflict(check.reason.as_str().into()));
         }
         let comparable = check
@@ -5273,53 +5558,126 @@ fn validate_restore_items(
             .replace('/', "\\")
             .trim_end_matches('\\')
             .to_lowercase();
-        if normalized_roots.iter().any(|existing: &String| {
-            comparable == *existing
+        let overlaps_restore_path = selected_restore_paths.iter().any(|existing| {
+            let existing = existing
+                .to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase();
+            comparable == existing
                 || comparable.starts_with(&format!("{existing}\\"))
                 || existing.starts_with(&format!("{comparable}\\"))
-        }) {
+        });
+        if overlaps_restore_path
+            || normalized_roots.iter().any(|existing: &String| {
+                comparable == *existing
+                    || comparable.starts_with(&format!("{existing}\\"))
+                    || existing.starts_with(&format!("{comparable}\\"))
+            })
+        {
+            if root_aware {
+                root_results.push(crate::host_registry::SyncRestoreRootResult {
+                    library_uuid: library_uuid.clone(),
+                    root_uuid: String::new(),
+                    selected: false,
+                    ok: false,
+                    reason: Some("managed-root-overlap".into()),
+                    normalized_target_path: Some(
+                        check.normalized_root.to_string_lossy().into_owned(),
+                    ),
+                    required_bytes: 0,
+                    available_bytes: check.available_bytes,
+                    volume_key: Some(volume_key(&check.normalized_root)),
+                });
+                continue;
+            }
             return Err(CoreError::conflict("managed-root-overlap".into()));
         }
         let Some(remote) = remote_inventory.iter().find(|remote| {
-            remote.account_uuid == item.account_uuid
-                && remote.library_uuid == item.library_uuid
+            remote.account_uuid == *account_uuid
+                && remote.library_uuid == *library_uuid
                 && remote.compatible
         }) else {
             return Err(CoreError::conflict("remote-library-not-restorable".into()));
         };
-        let volume = check
-            .normalized_root
-            .components()
-            .next()
-            .map(|value| value.as_os_str().to_string_lossy().to_lowercase())
-            .unwrap_or_else(|| check.normalized_root.to_string_lossy().to_lowercase());
-        let required = remote
-            .logical_bytes
-            .unwrap_or(remote.descriptor_size)
-            .saturating_add(256 * 1024 * 1024);
-        *required_by_volume.entry(volume.clone()).or_default() = required_by_volume
-            .get(&volume)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(required);
-        if let Some(available) = check.available_bytes {
-            available_by_volume
-                .entry(volume)
-                .and_modify(|value| *value = (*value).min(available))
-                .or_insert(available);
+        if !root_aware {
+            let volume = volume_key(&check.normalized_root);
+            let required = remote
+                .logical_bytes
+                .unwrap_or(remote.descriptor_size)
+                .saturating_add(256 * 1024 * 1024);
+            *required_by_volume.entry(volume.clone()).or_default() = required_by_volume
+                .get(&volume)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(required);
+            if let Some(available) = check.available_bytes {
+                available_by_volume
+                    .entry(volume)
+                    .and_modify(|value| *value = (*value).min(available))
+                    .or_insert(available);
+            }
         }
         normalized_roots.push(comparable);
     }
-    if required_by_volume.iter().any(|(volume, required)| {
-        available_by_volume
-            .get(volume)
-            .is_some_and(|available| required > available)
-    }) {
+    if root_aware {
+        for required in required_by_volume.values_mut() {
+            *required = required.saturating_add(256 * 1024 * 1024);
+        }
+    }
+    let volume_results = required_by_volume
+        .iter()
+        .map(|(volume, required)| {
+            let available = available_by_volume.get(volume).copied();
+            crate::host_registry::SyncRestoreVolumeResult {
+                volume_key: volume.clone(),
+                required_bytes: *required,
+                available_bytes: available,
+                ok: available.is_none_or(|value| *required <= value),
+            }
+        })
+        .collect::<Vec<_>>();
+    root_results.sort_by(|left, right| {
+        (&left.library_uuid, &left.root_uuid).cmp(&(&right.library_uuid, &right.root_uuid))
+    });
+    if root_aware
+        && (root_results.iter().any(|result| !result.ok)
+            || volume_results.iter().any(|result| !result.ok))
+    {
+        return Ok(invalid_restore_preflight(
+            items.len(),
+            root_results,
+            volume_results,
+        ));
+    }
+    if !root_aware && volume_results.iter().any(|result| !result.ok) {
         return Err(CoreError::conflict(
             "aggregate-disk-space-insufficient".into(),
         ));
     }
-    Ok(required_by_volume.values().copied().sum())
+    let request = restore_operation_request(items);
+    let mut result = if persist {
+        manager.registry().create_restore_preflight(
+            &request,
+            items.len() as u64,
+            required_by_volume.values().copied().sum(),
+            &root_results,
+            &volume_results,
+        )?
+    } else {
+        crate::host_registry::SyncRestorePreflight {
+            preflight_token: None,
+            expires_at: 0,
+            total_items: items.len() as u64,
+            total_bytes: required_by_volume.values().copied().sum(),
+            ok: true,
+            root_results: Vec::new(),
+            volume_results: Vec::new(),
+        }
+    };
+    result.root_results = root_results;
+    result.volume_results = volume_results;
+    Ok(result)
 }
 
 async fn preflight_restore(
@@ -5327,11 +5685,10 @@ async fn preflight_restore(
     Json(request): Json<RestorePreflightRequest>,
 ) -> ApiResult<Json<crate::host_registry::SyncRestorePreflight>> {
     let manager = library_manager(&state)?;
-    let total_bytes = validate_restore_items(&manager, &request.items)?;
-    Ok(Json(manager.registry().create_restore_preflight(
-        &restore_operation_request(&request.items),
-        request.items.len() as u64,
-        total_bytes,
+    Ok(Json(validate_restore_items(
+        &manager,
+        &request.items,
+        true,
     )?))
 }
 
@@ -5339,93 +5696,326 @@ async fn start_restore(
     State(state): State<AppState>,
     Json(request): Json<RestoreStartRequest>,
 ) -> ApiResult<Json<RestoreListResponse>> {
+    validate_contract_uuid(&request.operation_uuid, "operationUuid")?;
+    validate_contract_uuid(&request.preflight_token, "preflightToken")?;
     let manager = library_manager(&state)?;
     let request_value = restore_operation_request(&request.items);
-    let existing_plans = manager
-        .registry()
-        .restore_plans_for_operation(&request.operation_uuid)?;
-    if !existing_plans.is_empty() {
-        return Ok(Json(RestoreListResponse {
-            items: existing_plans,
-        }));
-    }
-    manager
-        .registry()
-        .consume_restore_preflight(&request.preflight_token, &request_value)
-        .map_err(map_library_error)?;
-    validate_restore_items(&manager, &request.items)?;
-    let (_operation, inserted) = manager.registry().begin_sync_operation_once(
+    if let Some(plans) = manager.registry().replay_restore_operation(
+        &request.preflight_token,
         &request.operation_uuid,
-        None,
-        "restore",
-        "catalog-restore",
-        &restore_operation_request(&request.items),
-    )?;
-    if !inserted {
-        return Err(CoreError::conflict(
-            "restore-operation-exists-without-plans".into(),
-        ));
+        &request_value,
+    )? {
+        return Ok(Json(RestoreListResponse { items: plans }));
     }
-    let mut plans: Vec<crate::host_registry::SyncRestorePlan> =
-        Vec::with_capacity(request.items.len());
-    for item in request.items {
-        let plan =
-            match manager
-                .registry()
-                .start_restore_plan(crate::host_registry::StartRestoreRequest {
-                    operation_uuid: &request.operation_uuid,
-                    account_uuid: &item.account_uuid,
-                    library_uuid: &item.library_uuid,
-                    managed_root: FilePath::new(&item.managed_root),
-                }) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    for created in plans.iter().rev() {
-                        let _ = manager.discard_restore_plan(&created.restore_uuid).await;
-                    }
-                    let _ = manager.registry().finish_sync_operation(
-                        &request.operation_uuid,
-                        "failed",
-                        "compensated",
-                        Some("multi-restore-plan-failed"),
-                    );
-                    return Err(map_library_error(error));
-                }
+    let validation = validate_restore_items(&manager, &request.items, false)?;
+    if !validation.ok {
+        return Err(CoreError::conflict("stale-inventory".into()));
+    }
+    let mut plan_inputs = Vec::with_capacity(request.items.len());
+    for item in &request.items {
+        let (account_uuid, library_uuid, managed_root, restore_mode, inventory_fence, root_choices) =
+            match item {
+                RestoreStartItem::Legacy(item) => (
+                    &item.account_uuid,
+                    &item.library_uuid,
+                    &item.managed_root,
+                    "legacy-library",
+                    None,
+                    None,
+                ),
+                RestoreStartItem::RootAware(item) => (
+                    &item.account_uuid,
+                    &item.library_uuid,
+                    &item.placement_base,
+                    "root-aware",
+                    Some(item.inventory_fence.as_str()),
+                    Some(item.roots.as_slice()),
+                ),
             };
+        let mut roots = Vec::new();
+        if let Some(choices) = root_choices {
+            let inventory = manager
+                .registry()
+                .remote_library_root_inventory(account_uuid, library_uuid, None, usize::MAX)
+                .map_err(map_library_error)?;
+            for choice in choices {
+                let fact = inventory
+                    .items
+                    .iter()
+                    .find(|root| root.root_uuid == choice.root_uuid)
+                    .ok_or_else(|| CoreError::conflict("stale-inventory".into()))?;
+                let selected_binding = if choice.selected {
+                    let target = choice.target_path.as_deref().ok_or_else(|| {
+                        CoreError::bad_request("target-selection-mismatch".into())
+                    })?;
+                    let normalized = crate::sync_folders::validate_root_path(
+                        FilePath::new(target),
+                        crate::sync_folders::RootPathMode::MaterializeRemote,
+                        FilePath::new(managed_root),
+                        &[],
+                    )
+                    .map_err(sync_folder_error)?;
+                    Some(crate::host_registry::NewLocalRootBinding {
+                        library_uuid: library_uuid.clone(),
+                        root_uuid: fact.root_uuid.clone(),
+                        local_binding_uuid: uuid::Uuid::now_v7().to_string(),
+                        local_path: normalized.normalized_path.clone(),
+                        canonical_path_key: normalized.canonical_path_key.clone(),
+                        placement_parent: normalized.placement_parent.clone(),
+                        placement_parent_key: normalized.placement_parent_key.clone(),
+                        marker_identity: String::new(),
+                        filesystem_identity: normalized.filesystem_identity.clone(),
+                        state: "materializing".into(),
+                        binding_generation: 1,
+                        root_capture_epoch: Some(uuid::Uuid::now_v7().to_string()),
+                        root_actor_epoch: Some(uuid::Uuid::now_v7().to_string()),
+                        desired_materialized_name: fact.materialized_name.clone(),
+                        desired_materialization_fingerprint: fact
+                            .materialization_fingerprint
+                            .clone(),
+                        operation_revision: 0,
+                        verification_json: serde_json::json!({"inventoryFence":inventory_fence}),
+                    })
+                } else {
+                    None
+                };
+                roots.push(crate::host_registry::RestoreRootPlanInput {
+                    root_uuid: fact.root_uuid.clone(),
+                    root_folder_uuid: fact.root_folder_uuid.clone(),
+                    requested_name: fact.requested_name.clone(),
+                    materialized_name: fact.materialized_name.clone(),
+                    materialization_fingerprint: fact.materialization_fingerprint.clone(),
+                    logical_revision: fact.logical_revision,
+                    logical_bytes: fact.logical_bytes,
+                    selected_binding,
+                });
+            }
+        }
+        plan_inputs.push(crate::host_registry::RestorePlanInput {
+            account_uuid: account_uuid.clone(),
+            library_uuid: library_uuid.clone(),
+            managed_root: FilePath::new(managed_root).to_path_buf(),
+            restore_mode: restore_mode.to_owned(),
+            inventory_fence: inventory_fence.map(ToOwned::to_owned),
+            roots,
+        });
+    }
+    let (inserted, plans) = manager
+        .registry()
+        .claim_restore_and_record_plans(
+            &request.preflight_token,
+            &request.operation_uuid,
+            &request_value,
+            &plan_inputs,
+        )
+        .map_err(map_library_error)?;
+    if !inserted {
+        return Ok(Json(RestoreListResponse { items: plans }));
+    }
+    let mut completed_plans: Vec<crate::host_registry::SyncRestorePlan> =
+        Vec::with_capacity(plans.len());
+    for (plan, input) in plans.into_iter().zip(plan_inputs.iter_mut()) {
         if let Err(error) = manager
             .create_restore_library(
-                item.library_uuid.clone(),
+                input.library_uuid.clone(),
                 plan.name.clone(),
-                FilePath::new(&item.managed_root).to_path_buf(),
-                &item.account_uuid,
+                input.managed_root.clone(),
+                &input.account_uuid,
             )
             .await
         {
             let _ = manager
                 .registry()
                 .fail_restore_plan(&plan.restore_uuid, &error.to_string());
-            for created in plans.iter().rev() {
+            for created in completed_plans.iter().rev() {
                 let _ = manager.discard_restore_plan(&created.restore_uuid).await;
             }
             let _ = manager.discard_restore_plan(&plan.restore_uuid).await;
+            let _ = manager.registry().fail_restore_operation_before_catalog(
+                &request.operation_uuid,
+                "multi-restore-create-failed",
+            );
             let _ = manager.registry().finish_sync_operation(
                 &request.operation_uuid,
                 "failed",
                 "compensated",
                 Some("multi-restore-create-failed"),
             );
+            let _ = manager
+                .registry()
+                .fail_restore_preflight(&request.preflight_token, &request.operation_uuid);
             return Err(error.into());
         }
+        manager
+            .registry()
+            .advance_restore_phase(&input.library_uuid, "library-shell-created")?;
+        if input.restore_mode == "root-aware" {
+            if let Err(error) = manager.registry().import_restore_root_inventory(
+                &plan.restore_uuid,
+                &input.library_uuid,
+                &input.roots,
+            ) {
+                for created in completed_plans.iter().rev() {
+                    let _ = manager.discard_restore_plan(&created.restore_uuid).await;
+                }
+                let _ = manager.discard_restore_plan(&plan.restore_uuid).await;
+                let _ = manager.registry().fail_restore_operation_before_catalog(
+                    &request.operation_uuid,
+                    "restore-inventory-import-failed",
+                );
+                let _ = manager.registry().finish_sync_operation(
+                    &request.operation_uuid,
+                    "failed",
+                    "compensated",
+                    Some("restore-inventory-import-failed"),
+                );
+                let _ = manager
+                    .registry()
+                    .fail_restore_preflight(&request.preflight_token, &request.operation_uuid);
+                return Err(map_library_error(error));
+            }
+            let mut staged_markers: Vec<(std::path::PathBuf, crate::sync_folders::SyncRootMarker)> =
+                Vec::new();
+            for root in &mut input.roots {
+                if let Some(binding) = root.selected_binding.as_mut() {
+                    let marker = crate::sync_folders::SyncRootMarker {
+                        format_version: 1,
+                        library_uuid: input.library_uuid.clone(),
+                        root_uuid: root.root_uuid.clone(),
+                        root_folder_uuid: root.root_folder_uuid.clone(),
+                        local_binding_uuid: binding.local_binding_uuid.clone(),
+                        binding_generation: binding.binding_generation,
+                    };
+                    if let Err(error) = crate::sync_folders::write_root_marker(
+                        FilePath::new(&binding.local_path),
+                        &marker,
+                    ) {
+                        for (path, owned_marker) in staged_markers.iter().rev() {
+                            let _ = crate::sync_folders::remove_root_marker_if_matches(
+                                path,
+                                owned_marker,
+                                false,
+                            );
+                        }
+                        for created in completed_plans.iter().rev() {
+                            let _ = manager.discard_restore_plan(&created.restore_uuid).await;
+                        }
+                        let _ = manager.discard_restore_plan(&plan.restore_uuid).await;
+                        let _ = manager.registry().fail_restore_operation_before_catalog(
+                            &request.operation_uuid,
+                            "restore-marker-write-failed",
+                        );
+                        let _ = manager.registry().finish_sync_operation(
+                            &request.operation_uuid,
+                            "failed",
+                            "compensated",
+                            Some("restore-marker-write-failed"),
+                        );
+                        let _ = manager.registry().fail_restore_preflight(
+                            &request.preflight_token,
+                            &request.operation_uuid,
+                        );
+                        return Err(sync_folder_error(error));
+                    }
+                    staged_markers.push((FilePath::new(&binding.local_path).to_path_buf(), marker));
+                    let marker_identity = match crate::library_path::local_file_identity(
+                        &FilePath::new(&binding.local_path)
+                            .join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+                    ) {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            for (path, owned_marker) in staged_markers.iter().rev() {
+                                let _ = crate::sync_folders::remove_root_marker_if_matches(
+                                    path,
+                                    owned_marker,
+                                    false,
+                                );
+                            }
+                            for created in completed_plans.iter().rev() {
+                                let _ = manager.discard_restore_plan(&created.restore_uuid).await;
+                            }
+                            let _ = manager.discard_restore_plan(&plan.restore_uuid).await;
+                            let _ = manager.registry().fail_restore_operation_before_catalog(
+                                &request.operation_uuid,
+                                "restore-marker-identity-failed",
+                            );
+                            let _ = manager.registry().finish_sync_operation(
+                                &request.operation_uuid,
+                                "failed",
+                                "compensated",
+                                Some("restore-marker-identity-failed"),
+                            );
+                            let _ = manager.registry().fail_restore_preflight(
+                                &request.preflight_token,
+                                &request.operation_uuid,
+                            );
+                            return Err(map_library_error(error.into()));
+                        }
+                    };
+                    binding.marker_identity = marker_identity;
+                    binding.verification_json["restoreUuid"] =
+                        serde_json::Value::String(plan.restore_uuid.clone());
+                }
+            }
+            manager
+                .registry()
+                .advance_restore_phase(&input.library_uuid, "markers-staged")?;
+            if let Err(error) = manager.registry().stage_restore_root_bindings(
+                &plan.restore_uuid,
+                &input.library_uuid,
+                &input.roots,
+            ) {
+                for (path, owned_marker) in staged_markers.iter().rev() {
+                    let _ = crate::sync_folders::remove_root_marker_if_matches(
+                        path,
+                        owned_marker,
+                        false,
+                    );
+                }
+                for created in completed_plans.iter().rev() {
+                    let _ = manager.discard_restore_plan(&created.restore_uuid).await;
+                }
+                let _ = manager.discard_restore_plan(&plan.restore_uuid).await;
+                let _ = manager.registry().fail_restore_operation_before_catalog(
+                    &request.operation_uuid,
+                    "restore-root-staging-failed",
+                );
+                let _ = manager.registry().finish_sync_operation(
+                    &request.operation_uuid,
+                    "failed",
+                    "compensated",
+                    Some("restore-root-staging-failed"),
+                );
+                let _ = manager
+                    .registry()
+                    .fail_restore_preflight(&request.preflight_token, &request.operation_uuid);
+                return Err(map_library_error(error));
+            }
+            manager
+                .registry()
+                .advance_restore_phase(&input.library_uuid, "host-bindings-staged")?;
+        }
         let _ = manager.publish_restore_notification(&plan).await;
-        plans.push(plan);
+        completed_plans.push(plan);
     }
     manager.registry().finish_sync_operation(
         &request.operation_uuid,
         "waiting",
-        "catalog-restore",
+        "workers-published",
         None,
     )?;
-    Ok(Json(RestoreListResponse { items: plans }))
+    manager
+        .registry()
+        .complete_restore_preflight(&request.preflight_token, &request.operation_uuid)?;
+    manager.wake_sync_folder_workers();
+    for plan in &completed_plans {
+        manager
+            .registry()
+            .advance_restore_phase(&plan.library_uuid, "workers-published")?;
+    }
+    Ok(Json(RestoreListResponse {
+        items: completed_plans,
+    }))
 }
 async fn get_restore(
     State(state): State<AppState>,
@@ -8653,8 +9243,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        fallback_display_name, notification_outbox_response, resolve_preview_plan, router,
-        ErrorResponse, PreviewBlobRecord, PREVIEW_NATIVE_MAX_PX, PREVIEW_NATIVE_PROFILE,
+        fallback_display_name, notification_outbox_response, resolve_preview_plan,
+        restore_operation_request, router, ErrorResponse, PreviewBlobRecord,
+        RestorePreflightRequest, RestoreRootAwareItem, RestoreRootAwareMode, RestoreRootChoice,
+        RestoreStartItem, PREVIEW_NATIVE_MAX_PX, PREVIEW_NATIVE_PROFILE,
     };
     use crate::api::{
         router_with_config, ApiConfig, AppState, BasicAuthCredentials, NotificationOutboxTestProbe,
@@ -8665,6 +9257,58 @@ mod tests {
     };
     use crate::db::{Database, NewRoot, ThumbnailTaskPriority};
     use crate::thumbnails::{PREVIEW_2048_PROFILE, PREVIEW_3072_PROFILE};
+
+    #[test]
+    fn restore_contract_keeps_legacy_compatibility_and_rejects_unknown_modes() {
+        let legacy: RestorePreflightRequest = serde_json::from_value(serde_json::json!({
+            "items": [{
+                "accountUuid": "account",
+                "libraryUuid": "00000000-0000-7000-8000-000000000101",
+                "name": "Legacy",
+                "managedRoot": "D:/Legacy"
+            }]
+        }))
+        .expect("legacy restore request");
+        assert!(matches!(legacy.items[0], RestoreStartItem::Legacy(_)));
+        assert!(
+            serde_json::from_value::<RestorePreflightRequest>(serde_json::json!({
+                "items": [{
+                    "restoreMode": "future-mode",
+                    "accountUuid": "account",
+                    "libraryUuid": "00000000-0000-7000-8000-000000000101",
+                    "name": "Legacy",
+                    "managedRoot": "D:/Legacy"
+                }]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn restore_request_hash_input_is_order_independent() {
+        let item = |library: &str, root: &str| {
+            RestoreStartItem::RootAware(RestoreRootAwareItem {
+                restore_mode: RestoreRootAwareMode::RootAware,
+                account_uuid: "account".into(),
+                library_uuid: library.into(),
+                placement_base: format!("D:/{library}"),
+                inventory_fence: "a".repeat(64),
+                roots: vec![RestoreRootChoice {
+                    root_uuid: root.into(),
+                    expected_logical_revision: 1,
+                    expected_materialization_fingerprint: "b".repeat(64),
+                    selected: false,
+                    target_path: None,
+                }],
+            })
+        };
+        let first = vec![item("library-b", "root-b"), item("library-a", "root-a")];
+        let second = vec![item("library-a", "root-a"), item("library-b", "root-b")];
+        assert_eq!(
+            restore_operation_request(&first),
+            restore_operation_request(&second)
+        );
+    }
 
     #[test]
     fn fallback_display_name_uses_last_path_component() {
@@ -13499,6 +14143,7 @@ mod tests {
             root_id: None,
             library_uuid: None,
             root_uuid: None,
+            managed_root_action: None,
             folder_id: None,
             file_id: None,
             current_value: 0,

@@ -58,6 +58,8 @@ test("notification IPC permissions isolate privileged history, action and log ac
 });
 
 test("notification launch intents and media focus requests are narrow and bounded", () => {
+  const libraryUuid = "00000000-0000-7000-8000-000000000101";
+  const rootUuid = "00000000-0000-7000-8000-000000000102";
   assert.deepEqual(
     ipcModule.parseNotificationWindowIntent({
       page: "logs",
@@ -69,6 +71,23 @@ test("notification launch intents and media focus requests are narrow and bounde
       logFilter: { eventKind: "thumbnail_failure", libraryId: "library-a" },
       failureSnapshot: { totalCount: 101, visibleCount: 100, truncated: true }
     }
+  );
+  assert.deepEqual(
+    ipcModule.parseNotificationWindowIntent({
+      page: "sync-folders",
+      libraryUuid,
+      rootUuid
+    }),
+    { page: "sync-folders", libraryUuid, rootUuid }
+  );
+  assert.deepEqual(
+    ipcModule.parseManagedRootNotificationTarget({
+      libraryId: libraryUuid,
+      operationId: "placement-operation",
+      rootUuid,
+      inventoryRevision: 3
+    }),
+    { libraryId: libraryUuid, operationId: "placement-operation", rootUuid, inventoryRevision: 3 }
   );
   assert.deepEqual(
     ipcModule.parseMediaFocusRequest({ libraryId: "library-a", fileId: 42, folderId: 7, rootId: 3 }),
@@ -85,6 +104,14 @@ test("notification launch intents and media focus requests are narrow and bounde
   assert.throws(
     () => ipcModule.parseNotificationWindowIntent({ page: "history", logFilter: {} }),
     /intent/i
+  );
+  assert.throws(
+    () => ipcModule.parseNotificationWindowIntent({ page: "sync-folders", libraryUuid: "bad", rootUuid }),
+    /UUID/i
+  );
+  assert.throws(
+    () => ipcModule.parseManagedRootNotificationTarget({ libraryId: libraryUuid, operationId: "", rootUuid, inventoryRevision: 3 }),
+    /operationId/i
   );
   assert.throws(
     () => ipcModule.parseMediaFocusRequest({ libraryId: "library-a", fileId: 0, folderId: 7, rootId: 3 }),

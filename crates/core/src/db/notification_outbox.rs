@@ -4,6 +4,65 @@ use serde::{Deserialize, Serialize};
 
 use super::Database;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ManagedRootNotificationAction {
+    ReviewPlacement {
+        #[serde(rename = "libraryUuid")]
+        library_uuid: String,
+        #[serde(rename = "rootUuid")]
+        root_uuid: String,
+        #[serde(rename = "inventoryRevision")]
+        inventory_revision: u64,
+    },
+}
+
+pub fn managed_root_placement_notification(
+    library_uuid: &str,
+    root_uuid: &str,
+    inventory_revision: u64,
+    logical_name: &str,
+    now: i64,
+) -> NotificationOperation {
+    NotificationOperation {
+        operation_id: format!(
+            "sync-folder-placement:{library_uuid}:{root_uuid}:{inventory_revision}"
+        ),
+        revision: 0,
+        kind: "sync-folder-placement-required".to_owned(),
+        category: "sync".to_owned(),
+        origin: "background".to_owned(),
+        presentation: "important".to_owned(),
+        status: "pending".to_owned(),
+        phase: Some("placement-required".to_owned()),
+        title: "选择同步文件夹位置".to_owned(),
+        summary: Some(logical_name.to_owned()),
+        task_id: None,
+        root_id: None,
+        library_uuid: Some(library_uuid.to_owned()),
+        root_uuid: Some(root_uuid.to_owned()),
+        managed_root_action: Some(ManagedRootNotificationAction::ReviewPlacement {
+            library_uuid: library_uuid.to_owned(),
+            root_uuid: root_uuid.to_owned(),
+            inventory_revision,
+        }),
+        folder_id: None,
+        file_id: None,
+        current_value: 0,
+        total_value: None,
+        unit: None,
+        error_code: None,
+        error_detail: None,
+        cancellable: false,
+        retryable: false,
+        attempt: 1,
+        occurrence_count: 1,
+        started_at: now,
+        updated_at: now,
+        completed_at: None,
+    }
+}
+
 const MAX_OUTBOX_PAGE: i64 = 200;
 pub(super) const DEFAULT_PROGRESS_EMIT_INTERVAL_MS: i64 = 1_000;
 
@@ -29,6 +88,8 @@ pub struct NotificationOperation {
     pub library_uuid: Option<String>,
     #[serde(default)]
     pub root_uuid: Option<String>,
+    #[serde(default)]
+    pub managed_root_action: Option<ManagedRootNotificationAction>,
     pub folder_id: Option<i64>,
     pub file_id: Option<i64>,
     pub current_value: i64,
@@ -429,6 +490,38 @@ mod tests {
             .expect("notification head")
     }
 
+    #[test]
+    fn managed_root_placement_builder_has_one_stable_identity_and_redacted_intent() {
+        let operation = managed_root_placement_notification(
+            "00000000-0000-7000-8000-000000000101",
+            "00000000-0000-7000-8000-000000000102",
+            7,
+            "Photos",
+            42,
+        );
+        assert_eq!(
+            operation.operation_id,
+            "sync-folder-placement:00000000-0000-7000-8000-000000000101:00000000-0000-7000-8000-000000000102:7"
+        );
+        assert_eq!(
+            operation.library_uuid.as_deref(),
+            Some("00000000-0000-7000-8000-000000000101")
+        );
+        assert_eq!(
+            operation.root_uuid.as_deref(),
+            Some("00000000-0000-7000-8000-000000000102")
+        );
+        assert_eq!(
+            operation.managed_root_action,
+            Some(ManagedRootNotificationAction::ReviewPlacement {
+                library_uuid: "00000000-0000-7000-8000-000000000101".into(),
+                root_uuid: "00000000-0000-7000-8000-000000000102".into(),
+                inventory_revision: 7,
+            })
+        );
+        assert!(!serde_json::to_string(&operation).unwrap().contains(":\\"));
+    }
+
     fn fixture_operation(
         operation_id: &str,
         kind: &str,
@@ -450,6 +543,7 @@ mod tests {
             root_id: Some(3),
             library_uuid: None,
             root_uuid: None,
+            managed_root_action: None,
             folder_id: None,
             file_id: None,
             current_value: 10,

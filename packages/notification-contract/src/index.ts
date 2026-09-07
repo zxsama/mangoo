@@ -2,7 +2,8 @@ import type {
   NotificationOperationSnapshot,
   NotificationOperationStatus,
   NotificationOrigin,
-  NotificationPresentation
+  NotificationPresentation,
+  RootPathPreflightMode
 } from "@megle/core-client/generated-contract";
 
 export type {
@@ -157,6 +158,13 @@ export interface NotificationActionResult {
   message: string | null;
 }
 
+export interface ManagedRootNotificationTarget {
+  libraryId: string;
+  operationId: string;
+  rootUuid: string;
+  inventoryRevision: number;
+}
+
 export type ProcessLogSource = "main" | "core" | "renderer";
 export type ProcessLogLevel = "trace" | "debug" | "info" | "warn" | "error";
 
@@ -191,13 +199,29 @@ export interface ProcessLogFilter {
   readonly limit?: number;
 }
 
-export interface NotificationWindowIntent {
+export interface NotificationLogWindowIntent {
   readonly page: "logs";
   readonly logFilter: {
     readonly eventKind: "thumbnail_failure";
     readonly libraryId: string;
   };
   readonly failureSnapshot: ThumbnailFailureSnapshot;
+}
+
+export interface ManagedRootSettingsIntent {
+  readonly page: "sync-folders";
+  readonly libraryUuid: string;
+  readonly rootUuid: string;
+}
+
+export type NotificationWindowIntent = NotificationLogWindowIntent | ManagedRootSettingsIntent;
+
+export interface DesktopFolderPickerRequest {
+  readonly libraryUuid: string;
+  readonly rootUuid: string | null;
+  readonly mode: RootPathPreflightMode;
+  readonly suggestedPath: string | null;
+  readonly dialogTitle: string;
 }
 
 export interface ThumbnailFailureSnapshot {
@@ -295,6 +319,8 @@ export interface NotificationIpcBridge {
   listHistory(query: NotificationHistoryQuery): Promise<NotificationHistoryPage>;
   cancel(libraryId: string, operationId: string): Promise<NotificationActionResult>;
   retry(libraryId: string, operationId: string): Promise<NotificationActionResult>;
+  dismissManagedRoot(input: ManagedRootNotificationTarget): Promise<NotificationActionResult>;
+  reviewManagedRoot(input: ManagedRootNotificationTarget): Promise<NotificationActionResult>;
   reportError(input: RendererErrorReport): Promise<boolean>;
   publishThumbnailSummary(input: ThumbnailCacheSummary): Promise<boolean>;
   onChanged(cb: (snapshot: NotificationCompactSnapshot) => void): () => void;

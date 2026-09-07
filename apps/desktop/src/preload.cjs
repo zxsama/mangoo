@@ -137,6 +137,10 @@ const notificationsBridge = {
     ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.cancel, libraryId, operationId),
   retry: (libraryId, operationId) =>
     ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.retry, libraryId, operationId),
+  dismissManagedRoot: (input) =>
+    ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.dismissManagedRoot, input),
+  reviewManagedRoot: (input) =>
+    ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.reviewManagedRoot, input),
   reportError: (input) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.reportError, input),
   publishThumbnailSummary: (input) =>
     ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.thumbnailSummary, input),
@@ -158,7 +162,7 @@ const fullBridge = {
   coreUrl: readArg("--megle-core-url="),
   sessionToken: readArg("--megle-session-token="),
   notifyShellReady: () => ipcRenderer.invoke("megle:shell-ready"),
-  pickFolder: () => ipcRenderer.invoke("megle:pick-folder"),
+  pickFolder: (request) => ipcRenderer.invoke("megle:pick-folder", request),
   diagnostics: () => ipcRenderer.invoke("megle:diagnostics"),
   openSettingsWindow: () => ipcRenderer.invoke("megle:open-settings-window"),
   closeSettingsWindow: () => ipcRenderer.invoke("megle:close-settings-window"),

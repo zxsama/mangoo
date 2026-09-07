@@ -2783,10 +2783,11 @@ components:
         errorCode: { anyOf: [{ type: string }, { type: "null" }] }
     RemoteLibraryRootListResponse:
       type: object
-      required: [items, nextCursor]
+      required: [items, nextCursor, inventoryFence]
       properties:
         items: { type: array, items: { $ref: "#/components/schemas/RemoteLibraryRoot" } }
         nextCursor: { anyOf: [{ type: string, format: uuid }, { type: "null" }] }
+        inventoryFence: { type: string, minLength: 64, maxLength: 64 }
     RootLocationConflict:
       type: object
       required: [conflictUuid, rootUuid, locationHeads, state, createdAt]
@@ -3002,17 +3003,45 @@ components:
         items: { type: array, items: { $ref: "#/components/schemas/RemoteLibrarySummary" } }
         nextCursor: { anyOf: [{ type: string }, { type: "null" }] }
         totalCount: { type: integer, minimum: 0 }
-    SyncRestoreStartItem:
+    SyncRestoreLegacyItem:
       type: object
       required: [accountUuid, libraryUuid, name, managedRoot]
+      additionalProperties: false
       properties:
+        restoreMode: { type: string, enum: [legacy-library] }
         accountUuid: { type: string }
         libraryUuid: { type: string, format: uuid }
         name: { type: string }
         managedRoot: { type: string }
+    SyncRestoreRootChoice:
+      type: object
+      required: [rootUuid, expectedLogicalRevision, expectedMaterializationFingerprint, selected]
+      additionalProperties: false
+      properties:
+        rootUuid: { type: string, format: uuid }
+        expectedLogicalRevision: { type: integer, minimum: 0 }
+        expectedMaterializationFingerprint: { type: string, minLength: 64, maxLength: 64 }
+        selected: { type: boolean }
+        targetPath: { type: string }
+    SyncRestoreRootAwareItem:
+      type: object
+      required: [restoreMode, accountUuid, libraryUuid, placementBase, inventoryFence, roots]
+      additionalProperties: false
+      properties:
+        restoreMode: { type: string, enum: [root-aware] }
+        accountUuid: { type: string }
+        libraryUuid: { type: string, format: uuid }
+        placementBase: { type: string }
+        inventoryFence: { type: string, minLength: 64, maxLength: 64 }
+        roots: { type: array, items: { $ref: "#/components/schemas/SyncRestoreRootChoice" } }
+    SyncRestoreStartItem:
+      oneOf:
+        - $ref: "#/components/schemas/SyncRestoreLegacyItem"
+        - $ref: "#/components/schemas/SyncRestoreRootAwareItem"
     SyncRestoreStartRequest:
       type: object
       required: [operationUuid, preflightToken, items]
+      additionalProperties: false
       properties:
         operationUuid: { type: string, format: uuid }
         preflightToken: { type: string, format: uuid }
@@ -3020,16 +3049,41 @@ components:
     SyncRestorePreflightRequest:
       type: object
       required: [items]
+      additionalProperties: false
       properties:
         items: { type: array, minItems: 1, items: { $ref: "#/components/schemas/SyncRestoreStartItem" } }
     SyncRestorePreflight:
       type: object
-      required: [preflightToken, expiresAt, totalItems, totalBytes]
+      required: [preflightToken, expiresAt, totalItems, totalBytes, ok, rootResults, volumeResults]
       properties:
-        preflightToken: { type: string, format: uuid }
+        preflightToken: { anyOf: [{ type: string, format: uuid }, { type: "null" }] }
         expiresAt: { type: integer }
-        totalItems: { type: integer, minimum: 1 }
+        totalItems: { type: integer, minimum: 0 }
         totalBytes: { type: integer, minimum: 0 }
+        ok: { type: boolean }
+        rootResults: { type: array, items: { $ref: "#/components/schemas/SyncRestoreRootResult" } }
+        volumeResults: { type: array, items: { $ref: "#/components/schemas/SyncRestoreVolumeResult" } }
+    SyncRestoreRootResult:
+      type: object
+      required: [libraryUuid, rootUuid, selected, ok, reason, normalizedTargetPath, requiredBytes, availableBytes, volumeKey]
+      properties:
+        libraryUuid: { type: string, format: uuid }
+        rootUuid: { type: string }
+        selected: { type: boolean }
+        ok: { type: boolean }
+        reason: { anyOf: [{ type: string }, { type: "null" }] }
+        normalizedTargetPath: { anyOf: [{ type: string }, { type: "null" }] }
+        requiredBytes: { type: integer, minimum: 0 }
+        availableBytes: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        volumeKey: { anyOf: [{ type: string }, { type: "null" }] }
+    SyncRestoreVolumeResult:
+      type: object
+      required: [volumeKey, requiredBytes, availableBytes, ok]
+      properties:
+        volumeKey: { type: string }
+        requiredBytes: { type: integer, minimum: 0 }
+        availableBytes: { anyOf: [{ type: integer, minimum: 0 }, { type: "null" }] }
+        ok: { type: boolean }
     SyncRestorePlan:
       type: object
       required: [restoreUuid, operationUuid, accountUuid, libraryUuid, name, managedRoot, state, phase, catalogReady, mediaItemsDone, mediaBytesDone, updatedAt]
@@ -3353,6 +3407,8 @@ components:
           type: string
           format: uuid
           nullable: true
+        managedRootAction:
+          $ref: "#/components/schemas/ManagedRootNotificationAction"
         folderId:
           type: integer
           nullable: true
@@ -3388,6 +3444,15 @@ components:
         completedAt:
           type: integer
           nullable: true
+    ManagedRootNotificationAction:
+      type: object
+      required: [kind, libraryUuid, rootUuid, inventoryRevision]
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [review-placement] }
+        libraryUuid: { type: string, format: uuid }
+        rootUuid: { type: string, format: uuid }
+        inventoryRevision: { type: integer, minimum: 0 }
     NotificationOutboxEvent:
       type: object
       required: [sequence, operation]

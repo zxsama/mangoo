@@ -98,6 +98,8 @@ export type {
   LibrarySyncPhase,
   LibrarySyncStatus,
   RemoteLibraryListResponse,
+  RemoteLibraryRoot,
+  RemoteLibraryRootListResponse,
   RemoteLibrarySummary,
   LocalRootBinding,
   LocalRootBindingState,

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 use anyhow::{bail, Context};
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const HOST_MIGRATION_0001: &str = include_str!("../host_migrations/0001_host_registry.sql");
@@ -30,6 +31,8 @@ const HOST_MIGRATION_0013: &str =
 const HOST_MIGRATION_0014: &str = include_str!("../host_migrations/0014_sync_root_preflights.sql");
 const HOST_MIGRATION_0015: &str = include_str!("../host_migrations/0015_sync_root_recovery.sql");
 const HOST_MIGRATION_0016: &str = include_str!("../host_migrations/0016_remote_root_inventory.sql");
+const HOST_MIGRATION_0017: &str =
+    include_str!("../host_migrations/0017_restore_action_contracts.sql");
 
 pub const ONEDRIVE_SECRET_NAMESPACE: &str = "microsoft-onedrive";
 pub const ONEDRIVE_CREDENTIAL_PURPOSE: &str = "oauth-v1";
@@ -164,6 +167,36 @@ pub struct RemoteLibraryRootSummary {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteLibraryRootInventory {
+    pub items: Vec<RemoteLibraryRootSummary>,
+    pub inventory_fence: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncRestoreRootResult {
+    pub library_uuid: String,
+    pub root_uuid: String,
+    pub selected: bool,
+    pub ok: bool,
+    pub reason: Option<String>,
+    pub normalized_target_path: Option<String>,
+    pub required_bytes: u64,
+    pub available_bytes: Option<u64>,
+    pub volume_key: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncRestoreVolumeResult {
+    pub volume_key: String,
+    pub required_bytes: u64,
+    pub available_bytes: Option<u64>,
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncOperation {
     pub operation_uuid: String,
     pub library_uuid: Option<String>,
@@ -233,10 +266,13 @@ pub struct UnbindReconciliation {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncRestorePreflight {
-    pub preflight_token: String,
+    pub preflight_token: Option<String>,
     pub expires_at: i64,
     pub total_items: u64,
     pub total_bytes: u64,
+    pub ok: bool,
+    pub root_results: Vec<SyncRestoreRootResult>,
+    pub volume_results: Vec<SyncRestoreVolumeResult>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -259,12 +295,47 @@ pub struct SyncRestorePlan {
     pub updated_at: i64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct StartRestoreRequest<'a> {
     pub operation_uuid: &'a str,
     pub account_uuid: &'a str,
     pub library_uuid: &'a str,
     pub managed_root: &'a Path,
+    pub restore_mode: &'a str,
+    pub inventory_fence: Option<&'a str>,
+    pub request_hash: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoreRootPlanInput {
+    pub root_uuid: String,
+    pub root_folder_uuid: String,
+    pub requested_name: String,
+    pub materialized_name: String,
+    pub materialization_fingerprint: String,
+    pub logical_revision: u64,
+    pub logical_bytes: Option<u64>,
+    pub selected_binding: Option<NewLocalRootBinding>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoreRootCleanup {
+    pub root_uuid: String,
+    pub root_folder_uuid: String,
+    pub target_path: PathBuf,
+    pub local_binding_uuid: String,
+    pub binding_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestorePlanInput {
+    pub account_uuid: String,
+    pub library_uuid: String,
+    pub managed_root: PathBuf,
+    pub restore_mode: String,
+    pub inventory_fence: Option<String>,
+    pub roots: Vec<RestoreRootPlanInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -465,6 +536,42 @@ fn sync_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncOper
         error_code: row.get(5)?,
         updated_at: row.get(6)?,
     })
+}
+
+fn restore_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncRestorePlan> {
+    Ok(SyncRestorePlan {
+        restore_uuid: row.get(0)?,
+        operation_uuid: row.get(1)?,
+        account_uuid: row.get(2)?,
+        library_uuid: row.get(3)?,
+        name: row.get(4)?,
+        managed_root: row.get(5)?,
+        state: row.get(6)?,
+        phase: row.get(7)?,
+        catalog_ready: row.get::<_, i64>(8)? != 0,
+        media_items_done: row.get::<_, i64>(9)?.max(0) as u64,
+        media_items_total: row
+            .get::<_, Option<i64>>(10)?
+            .map(|value| value.max(0) as u64),
+        media_bytes_done: row.get::<_, i64>(11)?.max(0) as u64,
+        media_bytes_total: row
+            .get::<_, Option<i64>>(12)?
+            .map(|value| value.max(0) as u64),
+        error_code: row.get(13)?,
+        updated_at: row.get(14)?,
+    })
+}
+
+fn restore_plans_for_operation_in_transaction(
+    transaction: &rusqlite::Connection,
+    operation_uuid: &str,
+) -> anyhow::Result<Vec<SyncRestorePlan>> {
+    let mut statement = transaction.prepare("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at FROM sync_restore_plans WHERE operation_uuid=?1 ORDER BY created_at,restore_uuid")?;
+    let plans = statement
+        .query_map([operation_uuid], restore_plan_from_row)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from)?;
+    Ok(plans)
 }
 
 #[allow(dead_code)]
@@ -1146,6 +1253,204 @@ fn rollback_plugin_probation_in_transaction(
 }
 
 impl HostRegistry {
+    pub fn replay_restore_operation(
+        &self,
+        token: &str,
+        operation_uuid: &str,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<Option<Vec<SyncRestorePlan>>> {
+        let request_json = serde_json::to_string(request)?;
+        let request_hash = crate::sync_folders::request_hash(request)?;
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let Some((existing_json, kind)) = connection
+            .query_row(
+                "SELECT request_json,kind FROM sync_orchestration_operations WHERE operation_uuid=?1",
+                [operation_uuid],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if kind != "restore" || existing_json != request_json {
+            bail!("idempotency-key-reused");
+        }
+        let claimed: Option<(String, String)> = connection
+            .query_row(
+                "SELECT COALESCE(operation_uuid,''),COALESCE(request_hash,'') FROM sync_restore_preflights WHERE token=?1",
+                [token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if claimed
+            .as_ref()
+            .is_none_or(|value| value.0 != operation_uuid || value.1 != request_hash)
+        {
+            bail!("restore-preflight-expired-or-changed");
+        }
+        let plans = restore_plans_for_operation_in_transaction(&connection, operation_uuid)?;
+        if plans.is_empty() {
+            bail!("restore-operation-exists-without-plans");
+        }
+        Ok(Some(plans))
+    }
+
+    pub fn claim_restore_and_record_plans(
+        &self,
+        token: &str,
+        operation_uuid: &str,
+        request: &serde_json::Value,
+        plans: &[RestorePlanInput],
+    ) -> anyhow::Result<(bool, Vec<SyncRestorePlan>)> {
+        let now = unix_timestamp_millis();
+        let request_json = serde_json::to_string(request)?;
+        let request_hash = crate::sync_folders::request_hash(request)?;
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if let Some((existing_json, kind)) = transaction
+            .query_row(
+                "SELECT request_json,kind FROM sync_orchestration_operations WHERE operation_uuid=?1",
+                [operation_uuid],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if kind != "restore" || existing_json != request_json {
+                bail!("idempotency-key-reused");
+            }
+            let claimed: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT COALESCE(operation_uuid,''),COALESCE(request_hash,'') FROM sync_restore_preflights WHERE token=?1",
+                    [token],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if claimed
+                .as_ref()
+                .is_none_or(|value| value.0 != operation_uuid || value.1 != request_hash)
+            {
+                bail!("restore-preflight-expired-or-changed");
+            }
+            let existing = restore_plans_for_operation_in_transaction(&transaction, operation_uuid)?;
+            if existing.is_empty() {
+                bail!("restore-operation-exists-without-plans");
+            }
+            transaction.commit()?;
+            return Ok((false, existing));
+        }
+        let changed = transaction.execute(
+            "UPDATE sync_restore_preflights SET state='claimed',operation_uuid=?1,request_hash=?2,consumed_at=?3 WHERE token=?4 AND request_json=?5 AND request_hash=?2 AND state='ready' AND expires_at>=?3",
+            params![operation_uuid,request_hash,now,token,request_json],
+        )?;
+        if changed != 1 {
+            bail!("restore-preflight-expired-or-changed");
+        }
+        transaction.execute(
+            "INSERT INTO sync_orchestration_operations(operation_uuid,library_uuid,kind,state,phase,request_json,created_at,updated_at) VALUES (?1,NULL,'restore','running','operation-and-plans-recorded',?2,?3,?3)",
+            params![operation_uuid,request_json,now],
+        )?;
+        let mut recorded = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let remote: Option<(Vec<u8>, String)> = transaction
+                .query_row(
+                    "SELECT descriptor_sha256,name FROM provider_remote_libraries WHERE account_uuid=?1 AND library_uuid=?2 AND compatible=1",
+                    params![plan.account_uuid, plan.library_uuid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (descriptor_sha256, name) =
+                remote.ok_or_else(|| anyhow::anyhow!("remote-library-not-restorable"))?;
+            let restore_uuid = uuid::Uuid::now_v7().to_string();
+            transaction.execute(
+                "INSERT INTO sync_restore_plans(restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,descriptor_sha256,state,phase,restore_mode,inventory_fence,request_hash,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'restoring','operation-and-plans-recorded',?8,?9,?10,?11,?11)",
+                params![restore_uuid,operation_uuid,plan.account_uuid,plan.library_uuid,name,plan.managed_root.to_string_lossy(),descriptor_sha256,plan.restore_mode,plan.inventory_fence,request_hash,now],
+            )?;
+            for root in &plan.roots {
+                let binding = root.selected_binding.as_ref();
+                transaction.execute(
+                    "INSERT INTO sync_restore_root_plans(restore_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialization_fingerprint,logical_revision,selected,target_path,canonical_target_key,local_binding_uuid,binding_generation,logical_bytes,phase,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'planned',?14,?14)",
+                    params![restore_uuid,root.root_uuid,root.root_folder_uuid,root.requested_name,root.materialized_name,root.materialization_fingerprint,i64::try_from(root.logical_revision)?,i64::from(binding.is_some()),binding.map(|value|value.local_path.as_str()),binding.map(|value|value.canonical_path_key.as_str()),binding.map(|value|value.local_binding_uuid.as_str()),binding.map(|value|i64::try_from(value.binding_generation)).transpose()?,root.logical_bytes.map(i64::try_from).transpose()?,now],
+                )?;
+            }
+            recorded.push(SyncRestorePlan {
+                restore_uuid,
+                operation_uuid: operation_uuid.to_owned(),
+                account_uuid: plan.account_uuid.clone(),
+                library_uuid: plan.library_uuid.clone(),
+                name,
+                managed_root: plan.managed_root.to_string_lossy().into_owned(),
+                state: "restoring".into(),
+                phase: "operation-and-plans-recorded".into(),
+                catalog_ready: false,
+                media_items_done: 0,
+                media_items_total: None,
+                media_bytes_done: 0,
+                media_bytes_total: None,
+                error_code: None,
+                updated_at: now,
+            });
+        }
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok((true, recorded))
+    }
+
+    pub fn import_restore_root_inventory(
+        &self,
+        restore_uuid: &str,
+        library_uuid: &str,
+        roots: &[RestoreRootPlanInput],
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        for root in roots {
+            transaction.execute(
+                "INSERT INTO remote_sync_roots(library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialized_name_key,materialization_fingerprint,logical_revision,lifecycle,inventory_state,logical_bytes,inventory_revision,operation_revision,updated_at) VALUES (?1,?2,?3,?4,?5,lower(?5),?6,?7,'active',?8,?9,1,0,?10)",
+                params![library_uuid,root.root_uuid,root.root_folder_uuid,root.requested_name,root.materialized_name,root.materialization_fingerprint,i64::try_from(root.logical_revision)?,"unselected",root.logical_bytes.map(i64::try_from).transpose()?,now],
+            )?;
+            transaction.execute(
+                "UPDATE sync_restore_root_plans SET phase='inventory-imported',updated_at=?1 WHERE restore_uuid=?2 AND root_uuid=?3",
+                params![now, restore_uuid, root.root_uuid],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE sync_restore_plans SET phase='inventory-imported',updated_at=?2 WHERE restore_uuid=?1",
+            params![restore_uuid, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn stage_restore_root_bindings(
+        &self,
+        restore_uuid: &str,
+        library_uuid: &str,
+        roots: &[RestoreRootPlanInput],
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        for root in roots {
+            if let Some(binding) = &root.selected_binding {
+                transaction.execute(
+                    "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,marker_identity,filesystem_identity,state,binding_generation,root_capture_epoch,root_actor_epoch,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,operation_revision,verification_json,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'materializing',1,?10,?11,?12,lower(?12),?13,0,?14,?15,?15)",
+                    params![library_uuid,root.root_uuid,binding.local_binding_uuid,binding.local_path,binding.canonical_path_key,binding.placement_parent,binding.placement_parent_key,binding.marker_identity,binding.filesystem_identity,binding.root_capture_epoch,binding.root_actor_epoch,binding.desired_materialized_name,binding.desired_materialization_fingerprint,serde_json::to_string(&binding.verification_json)?,now],
+                )?;
+                transaction.execute(
+                    "UPDATE sync_restore_root_plans SET phase='binding-staged',updated_at=?1 WHERE restore_uuid=?2 AND root_uuid=?3",
+                    params![now, restore_uuid, root.root_uuid],
+                )?;
+            }
+        }
+        transaction.execute(
+            "UPDATE sync_restore_plans SET phase='host-bindings-staged',updated_at=?2 WHERE restore_uuid=?1",
+            params![restore_uuid, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Root-aware Catalog execution and the Host operation journal are now
     /// installed. UI and relocation are independent consumers of this gate.
     pub fn sync_folder_v2_enabled(&self) -> bool {
@@ -6074,6 +6379,14 @@ impl HostRegistry {
         if schema_version < 16 {
             connection.execute_batch(HOST_MIGRATION_0016)?;
         }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 17 {
+            connection.execute_batch(HOST_MIGRATION_0017)?;
+        }
         let now = unix_timestamp_millis();
         connection.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_creations", [now])?;
         connection.execute("DELETE FROM plugin_secret_creations", [])?;
@@ -6545,6 +6858,98 @@ impl HostRegistry {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn remote_library_root_inventory(
+        &self,
+        account_uuid: &str,
+        library_uuid: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<RemoteLibraryRootInventory> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        // Keep the page and its fence under one Host snapshot. A provider refresh
+        // cannot otherwise replace the root set between the page read and hash.
+        let placement_base: Option<String> = connection
+            .query_row(
+                "SELECT settings.default_placement_base FROM library_sync_bindings binding JOIN library_local_settings settings ON settings.library_uuid=binding.library_uuid WHERE binding.account_uuid=?1 AND COALESCE(binding.remote_namespace,binding.library_uuid)=?2 LIMIT 1",
+                params![account_uuid, library_uuid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let (generation, descriptor): (i64, Vec<u8>) = connection
+            .query_row(
+                "SELECT library.account_generation,library.descriptor_sha256 FROM provider_remote_libraries library JOIN plugin_accounts account ON account.account_uuid=library.account_uuid WHERE library.account_uuid=?1 AND library.library_uuid=?2 AND library.account_generation=account.generation",
+                params![account_uuid, library_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("remote-library-not-found")?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"megle-remote-root-inventory-v1\0");
+        hasher.update(account_uuid.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(library_uuid.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(generation.to_le_bytes());
+        hasher.update(&descriptor);
+        let mut statement = connection.prepare(
+            "SELECT root_uuid,root_folder_uuid,requested_name,materialized_name,materialization_fingerprint,logical_revision,COALESCE(logical_bytes,-1),compatible,COALESCE(error_code,'') FROM provider_remote_sync_roots WHERE account_uuid=?1 AND library_uuid=?2 ORDER BY root_uuid",
+        )?;
+        let mut rows = statement.query(params![account_uuid, library_uuid])?;
+        while let Some(row) = rows.next()? {
+            for value in 0..5 {
+                let text: String = row.get(value)?;
+                hasher.update(text.as_bytes());
+                hasher.update(b"\0");
+            }
+            let logical_revision: i64 = row.get(5)?;
+            let logical_bytes: i64 = row.get(6)?;
+            let compatible: i64 = row.get(7)?;
+            let error_code: String = row.get(8)?;
+            hasher.update(logical_revision.to_le_bytes());
+            hasher.update(logical_bytes.to_le_bytes());
+            hasher.update(compatible.to_le_bytes());
+            hasher.update(error_code.as_bytes());
+            hasher.update(b"\0");
+        }
+        let mut statement = connection.prepare(
+            "SELECT root.account_uuid,root.library_uuid,root.root_uuid,root.root_folder_uuid,root.requested_name,root.materialized_name,root.materialization_fingerprint,root.logical_revision,root.logical_bytes,root.compatible,root.error_code FROM provider_remote_sync_roots root JOIN provider_remote_libraries library ON library.account_uuid=root.account_uuid AND library.library_uuid=root.library_uuid JOIN plugin_accounts account ON account.account_uuid=root.account_uuid WHERE root.account_uuid=?1 AND root.library_uuid=?2 AND library.account_generation=account.generation AND (?3 IS NULL OR root.root_uuid>?3) ORDER BY root.root_uuid LIMIT ?4",
+        )?;
+        let items = statement
+            .query_map(
+                params![account_uuid, library_uuid, cursor, i64::try_from(limit)?],
+                |row| {
+                    let materialized_name: String = row.get(5)?;
+                    Ok(RemoteLibraryRootSummary {
+                        account_uuid: row.get(0)?,
+                        library_uuid: row.get(1)?,
+                        root_uuid: row.get(2)?,
+                        root_folder_uuid: row.get(3)?,
+                        requested_name: row.get(4)?,
+                        proposed_local_path: placement_base.as_ref().map(|base| {
+                            PathBuf::from(base)
+                                .join(&materialized_name)
+                                .to_string_lossy()
+                                .into_owned()
+                        }),
+                        materialized_name,
+                        materialization_fingerprint: row.get(6)?,
+                        logical_revision: row.get::<_, i64>(7)?.max(0) as u64,
+                        logical_bytes: row
+                            .get::<_, Option<i64>>(8)?
+                            .map(|value| value.max(0) as u64),
+                        selected_by_default: row.get::<_, i64>(9)? != 0,
+                        compatible: row.get::<_, i64>(9)? != 0,
+                        error_code: row.get(10)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let inventory = RemoteLibraryRootInventory {
+            items,
+            inventory_fence: format!("{:x}", hasher.finalize()),
+        };
+        Ok(inventory)
+    }
+
     pub fn begin_sync_operation_once(
         &self,
         operation_uuid: &str,
@@ -6977,6 +7382,7 @@ impl HostRegistry {
         Ok(library_uuid)
     }
 
+    #[cfg(test)]
     pub fn start_restore_plan(
         &self,
         request: StartRestoreRequest<'_>,
@@ -6994,7 +7400,7 @@ impl HostRegistry {
         let (hash, remote_name) =
             remote.ok_or_else(|| anyhow::anyhow!("remote-library-not-restorable"))?;
         let restore_uuid = uuid::Uuid::now_v7().to_string();
-        transaction.execute("INSERT INTO sync_restore_plans(restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,descriptor_sha256,state,phase,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'restoring','catalog-restore',?8,?8)",params![restore_uuid,request.operation_uuid,request.account_uuid,request.library_uuid,remote_name,request.managed_root.to_string_lossy(),hash,now])?;
+        transaction.execute("INSERT INTO sync_restore_plans(restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,descriptor_sha256,state,phase,restore_mode,inventory_fence,request_hash,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'restoring','operation-and-plans-recorded',?8,?9,?10,?11,?11)",params![restore_uuid,request.operation_uuid,request.account_uuid,request.library_uuid,remote_name,request.managed_root.to_string_lossy(),hash,request.restore_mode,request.inventory_fence,request.request_hash,now])?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(SyncRestorePlan {
@@ -7087,22 +7493,124 @@ impl HostRegistry {
         request: &serde_json::Value,
         total_items: u64,
         total_bytes: u64,
+        root_results: &[SyncRestoreRootResult],
+        volume_results: &[SyncRestoreVolumeResult],
     ) -> anyhow::Result<SyncRestorePreflight> {
         let now = unix_timestamp_millis();
         let expires_at = now + 10 * 60 * 1000;
         let token = uuid::Uuid::now_v7().to_string();
-        self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
-            "INSERT INTO sync_restore_preflights(token,request_json,total_items,total_bytes,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![token,serde_json::to_string(request)?,total_items as i64,total_bytes as i64,expires_at,now],
-        )?;
-        Ok(SyncRestorePreflight {
-            preflight_token: token,
+        let request_hash = crate::sync_folders::request_hash(request)?;
+        let result = SyncRestorePreflight {
+            preflight_token: Some(token),
             expires_at,
             total_items,
             total_bytes,
-        })
+            ok: true,
+            root_results: root_results.to_vec(),
+            volume_results: volume_results.to_vec(),
+        };
+        self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+            "INSERT INTO sync_restore_preflights(token,request_json,request_hash,result_json,total_items,total_bytes,expires_at,state,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'ready',?8)",
+            params![result.preflight_token,serde_json::to_string(request)?,request_hash,serde_json::to_string(&result)?,total_items as i64,total_bytes as i64,expires_at,now],
+        )?;
+        Ok(result)
     }
 
+    #[cfg(test)]
+    pub fn claim_restore_preflight(
+        &self,
+        token: &str,
+        operation_uuid: &str,
+        request: &serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let now = unix_timestamp_millis();
+        let request_json = serde_json::to_string(request)?;
+        let request_hash = crate::sync_folders::request_hash(request)?;
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        if let Some((existing_json, kind)) = transaction.query_row(
+            "SELECT request_json,kind FROM sync_orchestration_operations WHERE operation_uuid=?1",
+            [operation_uuid],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)),
+        ).optional()? {
+            if kind != "restore" || existing_json != request_json { bail!("idempotency-key-reused"); }
+            let claimed: Option<(String,String)> = transaction.query_row("SELECT COALESCE(operation_uuid,''),COALESCE(request_hash,'') FROM sync_restore_preflights WHERE token=?1",[token],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+            if claimed.as_ref().is_none_or(|value| value.0 != operation_uuid || value.1 != request_hash) { bail!("restore-preflight-expired-or-changed"); }
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE sync_restore_preflights SET state='claimed',operation_uuid=?1,request_hash=?2,consumed_at=?3 WHERE token=?4 AND request_json=?5 AND request_hash=?2 AND state='ready' AND expires_at>=?3",
+            params![operation_uuid,request_hash,now,token,request_json],
+        )?;
+        if changed != 1 {
+            bail!("restore-preflight-expired-or-changed");
+        }
+        transaction.execute(
+            "INSERT INTO sync_orchestration_operations(operation_uuid,library_uuid,kind,state,phase,request_json,created_at,updated_at) VALUES (?1,NULL,'restore','running','operation-and-plans-recorded',?2,?3,?3)",
+            params![operation_uuid,request_json,now],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn complete_restore_preflight(
+        &self,
+        token: &str,
+        operation_uuid: &str,
+    ) -> anyhow::Result<()> {
+        let changed = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .execute(
+                "UPDATE sync_restore_preflights SET state='completed' WHERE token=?1 AND operation_uuid=?2 AND state IN ('claimed','completed')",
+                params![token, operation_uuid],
+            )?;
+        if changed != 1 {
+            bail!("restore-preflight-expired-or-changed");
+        }
+        Ok(())
+    }
+
+    pub fn fail_restore_preflight(&self, token: &str, operation_uuid: &str) -> anyhow::Result<()> {
+        let changed = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .execute(
+                "UPDATE sync_restore_preflights SET state='failed-recoverable' WHERE token=?1 AND operation_uuid=?2 AND state='claimed'",
+                params![token, operation_uuid],
+            )?;
+        if changed > 1 {
+            bail!("restore-preflight-state-invalid");
+        }
+        Ok(())
+    }
+
+    pub fn fail_restore_operation_before_catalog(
+        &self,
+        operation_uuid: &str,
+        error_code: &str,
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE sync_restore_root_plans SET phase='compensated',updated_at=?1 WHERE restore_uuid IN (SELECT restore_uuid FROM sync_restore_plans WHERE operation_uuid=?2 AND catalog_ready=0)",
+            params![now, operation_uuid],
+        )?;
+        transaction.execute(
+            "UPDATE sync_restore_plans SET state='failed',phase='compensated',error_code=?1,updated_at=?2 WHERE operation_uuid=?3 AND catalog_ready=0 AND state NOT IN ('complete','cancelled')",
+            params![error_code, now, operation_uuid],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn consume_restore_preflight(
         &self,
         token: &str,
@@ -7125,10 +7633,46 @@ impl HostRegistry {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         transaction.execute("UPDATE library_sync_bindings SET last_success_at=?2,poll_after=?3,updated_at=?2 WHERE library_uuid=?1 AND state='restoring'",params![library_uuid,now,now+30_000])?;
-        transaction.execute("UPDATE sync_restore_plans SET state='catalog-ready',phase='restoring-media',catalog_ready=1,updated_at=?2 WHERE library_uuid=?1 AND state='restoring'",params![library_uuid,now])?;
+        transaction.execute("UPDATE sync_restore_plans SET state='catalog-ready',phase='catalog-ready',catalog_ready=1,updated_at=?2 WHERE library_uuid=?1 AND state IN ('restoring','failed')",params![library_uuid,now])?;
+        transaction.execute("UPDATE sync_restore_root_plans SET phase='catalog-ready',updated_at=?2 WHERE restore_uuid IN (SELECT restore_uuid FROM sync_restore_plans WHERE library_uuid=?1) AND phase NOT IN ('completed','compensated')", params![library_uuid, now])?;
         transaction.execute(
             "UPDATE libraries SET availability='available',updated_at=?2 WHERE library_uuid=?1",
             params![library_uuid, now],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn advance_restore_phase(&self, library_uuid: &str, phase: &str) -> anyhow::Result<()> {
+        const PHASES: &[&str] = &[
+            "operation-and-plans-recorded",
+            "library-shell-created",
+            "inventory-imported",
+            "markers-staged",
+            "host-bindings-staged",
+            "catalog-staged",
+            "catalog-ready",
+            "reconciling",
+            "workers-published",
+            "completed",
+        ];
+        if !PHASES.contains(&phase) {
+            bail!("invalid-restore-phase");
+        }
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE sync_restore_plans SET phase=?2,updated_at=?3 WHERE library_uuid=?1 AND state NOT IN ('cancelled')",
+            params![library_uuid, phase, now],
+        )?;
+        if changed == 0 {
+            bail!("restore-not-found");
+        }
+        transaction.execute(
+            "UPDATE sync_orchestration_operations SET phase=?2,updated_at=?3 WHERE operation_uuid IN (SELECT operation_uuid FROM sync_restore_plans WHERE library_uuid=?1)",
+            params![library_uuid, phase, now],
         )?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
@@ -7208,6 +7752,29 @@ impl HostRegistry {
         self.connection.lock().unwrap_or_else(|p|p.into_inner()).query_row("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at FROM sync_restore_plans WHERE restore_uuid=?1",[restore_uuid],|row|Ok(SyncRestorePlan{restore_uuid:row.get(0)?,operation_uuid:row.get(1)?,account_uuid:row.get(2)?,library_uuid:row.get(3)?,name:row.get(4)?,managed_root:row.get(5)?,state:row.get(6)?,phase:row.get(7)?,catalog_ready:row.get::<_,i64>(8)?!=0,media_items_done:row.get::<_,i64>(9)?.max(0) as u64,media_items_total:row.get::<_,Option<i64>>(10)?.map(|v|v.max(0) as u64),media_bytes_done:row.get::<_,i64>(11)?.max(0) as u64,media_bytes_total:row.get::<_,Option<i64>>(12)?.map(|v|v.max(0) as u64),error_code:row.get(13)?,updated_at:row.get(14)?})).optional().map_err(Into::into)
     }
 
+    pub fn restore_root_cleanup_entries(
+        &self,
+        restore_uuid: &str,
+    ) -> anyhow::Result<Vec<RestoreRootCleanup>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT root_uuid,root_folder_uuid,target_path,local_binding_uuid,binding_generation FROM sync_restore_root_plans WHERE restore_uuid=?1 AND selected=1 ORDER BY root_uuid",
+        )?;
+        let entries = statement
+            .query_map([restore_uuid], |row| {
+                Ok(RestoreRootCleanup {
+                    root_uuid: row.get(0)?,
+                    root_folder_uuid: row.get(1)?,
+                    target_path: PathBuf::from(row.get::<_, String>(2)?),
+                    local_binding_uuid: row.get(3)?,
+                    binding_generation: row.get::<_, i64>(4)?.max(1) as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(entries)
+    }
+
     pub fn restore_plan_for_library(
         &self,
         library_uuid: &str,
@@ -7228,6 +7795,15 @@ impl HostRegistry {
             .map(Option::flatten)
     }
 
+    pub fn is_root_aware_restore(&self, library_uuid: &str) -> anyhow::Result<bool> {
+        self.connection.lock().unwrap_or_else(|p|p.into_inner()).query_row(
+            "SELECT restore_mode='root-aware' FROM sync_restore_plans WHERE library_uuid=?1 ORDER BY created_at DESC LIMIT 1",
+            [library_uuid],
+            |row| row.get(0),
+        ).optional().map(|value| value.unwrap_or(false)).map_err(Into::into)
+    }
+
+    #[cfg(test)]
     pub fn restore_plans_for_operation(
         &self,
         operation_uuid: &str,
@@ -7299,9 +7875,11 @@ impl HostRegistry {
             "UPDATE library_sync_bindings SET poll_after=0,updated_at=?1 WHERE state='unbinding'",
             [now],
         )?;
-        // Planned restore rows never exposed a usable Catalog. Mark them failed
-        // so startup cleanup can remove any partially-created local copy.
-        transaction.execute("UPDATE sync_restore_plans SET state='failed',phase='startup-recovery',error_code='interrupted-before-catalog',updated_at=?1 WHERE state='planned' AND catalog_ready=0", [now])?;
+        // Any restore interrupted before Catalog promotion is compensatable.
+        // Mark it failed so startup cleanup removes only its identity-bound
+        // Library shell, staged root markers, and local bindings.
+        transaction.execute("UPDATE sync_restore_plans SET state='failed',phase='startup-recovery',error_code='interrupted-before-catalog',updated_at=?1 WHERE state IN ('planned','restoring') AND catalog_ready=0", [now])?;
+        transaction.execute("UPDATE sync_restore_preflights SET state='failed-recoverable' WHERE state='claimed' AND operation_uuid IN (SELECT operation_uuid FROM sync_restore_plans WHERE state='failed' AND phase='startup-recovery')", [])?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(())
@@ -8322,7 +8900,7 @@ mod tests {
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
-            16
+            17
         );
         assert!(connection
             .execute(
@@ -9686,16 +10264,188 @@ mod tests {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
         let request = serde_json::json!({"items":[{"libraryUuid":"a","managedRoot":"D:/A"}]});
-        let preflight = registry.create_restore_preflight(&request, 1, 42).unwrap();
+        let preflight = registry
+            .create_restore_preflight(&request, 1, 42, &[], &[])
+            .unwrap();
+        let stored_result: String = registry
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT result_json FROM sync_restore_preflights WHERE token=?1",
+                [preflight.preflight_token.as_deref().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_result).unwrap()["totalBytes"],
+            42
+        );
         assert!(registry
-            .consume_restore_preflight(&preflight.preflight_token, &serde_json::json!({"items":[]}))
+            .consume_restore_preflight(
+                preflight.preflight_token.as_deref().unwrap(),
+                &serde_json::json!({"items":[]})
+            )
             .is_err());
         registry
-            .consume_restore_preflight(&preflight.preflight_token, &request)
+            .consume_restore_preflight(preflight.preflight_token.as_deref().unwrap(), &request)
             .unwrap();
         assert!(registry
-            .consume_restore_preflight(&preflight.preflight_token, &request)
+            .consume_restore_preflight(preflight.preflight_token.as_deref().unwrap(), &request)
             .is_err());
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restore_claim_records_all_plans_atomically_and_replays_exact_request() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let now = unix_timestamp_millis();
+        register_test_plugin(&registry, "fake", "account");
+        for library_uuid in ["remote-a", "remote-b"] {
+            registry.connection.lock().unwrap().execute(
+                "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at,name,compatible) VALUES ('account',?1,1,zeroblob(32),1,?2,?1,1)",
+                params![library_uuid, now],
+            ).unwrap();
+        }
+        let request =
+            serde_json::json!({"items":[{"libraryUuid":"remote-a"},{"libraryUuid":"remote-b"}]});
+        let preflight = registry
+            .create_restore_preflight(&request, 2, 0, &[], &[])
+            .unwrap();
+        let operation_uuid = uuid::Uuid::now_v7().to_string();
+        let plans = ["remote-a", "remote-b"].map(|library_uuid| RestorePlanInput {
+            account_uuid: "account".into(),
+            library_uuid: library_uuid.into(),
+            managed_root: PathBuf::from(format!("D:/{library_uuid}")),
+            restore_mode: "legacy-library".into(),
+            inventory_fence: None,
+            roots: Vec::new(),
+        });
+        let (inserted, recorded) = registry
+            .claim_restore_and_record_plans(
+                preflight.preflight_token.as_deref().unwrap(),
+                &operation_uuid,
+                &request,
+                &plans,
+            )
+            .unwrap();
+        assert!(inserted);
+        assert_eq!(recorded.len(), 2);
+        let replayed = registry
+            .replay_restore_operation(
+                preflight.preflight_token.as_deref().unwrap(),
+                &operation_uuid,
+                &request,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert!(registry
+            .replay_restore_operation(
+                preflight.preflight_token.as_deref().unwrap(),
+                &operation_uuid,
+                &serde_json::json!({"items":[]}),
+            )
+            .is_err());
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restore_root_staging_preserves_explicit_deselection_without_placement_prompt() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let now = unix_timestamp_millis();
+        registry.connection.lock().unwrap().execute(
+            "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','library-root','Library','local','D:/Library','ready','local-only','available',1,'library-marker',?1,?1)",
+            [now],
+        ).unwrap();
+        let selected = NewLocalRootBinding {
+            library_uuid: "library".into(),
+            root_uuid: "00000000-0000-7000-8000-000000000201".into(),
+            local_binding_uuid: uuid::Uuid::now_v7().to_string(),
+            local_path: "D:/Library/Selected".into(),
+            canonical_path_key: "d:/library/selected".into(),
+            placement_parent: "D:/Library".into(),
+            placement_parent_key: "d:/library".into(),
+            marker_identity: "selected-marker".into(),
+            filesystem_identity: Some("selected-directory".into()),
+            state: "materializing".into(),
+            binding_generation: 1,
+            root_capture_epoch: Some(uuid::Uuid::now_v7().to_string()),
+            root_actor_epoch: Some(uuid::Uuid::now_v7().to_string()),
+            desired_materialized_name: "Selected".into(),
+            desired_materialization_fingerprint: "a".repeat(64),
+            operation_revision: 0,
+            verification_json: serde_json::json!({}),
+        };
+        let roots = [
+            RestoreRootPlanInput {
+                root_uuid: "00000000-0000-7000-8000-000000000201".into(),
+                root_folder_uuid: uuid::Uuid::now_v7().to_string(),
+                requested_name: "Selected".into(),
+                materialized_name: "Selected".into(),
+                materialization_fingerprint: "a".repeat(64),
+                logical_revision: 1,
+                logical_bytes: Some(10),
+                selected_binding: Some(selected),
+            },
+            RestoreRootPlanInput {
+                root_uuid: "00000000-0000-7000-8000-000000000202".into(),
+                root_folder_uuid: uuid::Uuid::now_v7().to_string(),
+                requested_name: "Deselected".into(),
+                materialized_name: "Deselected".into(),
+                materialization_fingerprint: "b".repeat(64),
+                logical_revision: 2,
+                logical_bytes: Some(20),
+                selected_binding: None,
+            },
+        ];
+        registry
+            .import_restore_root_inventory("restore", "library", &roots)
+            .unwrap();
+        let connection = registry.connection.lock().unwrap();
+        let states = connection
+            .prepare("SELECT root_uuid,inventory_state FROM remote_sync_roots WHERE library_uuid='library' ORDER BY root_uuid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "00000000-0000-7000-8000-000000000201".into(),
+                    "unselected".into()
+                ),
+                (
+                    "00000000-0000-7000-8000-000000000202".into(),
+                    "unselected".into()
+                ),
+            ]
+        );
+        let binding_count_before_stage: i64 = connection
+            .query_row("SELECT COUNT(*) FROM local_root_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(binding_count_before_stage, 0);
+        drop(connection);
+        registry
+            .stage_restore_root_bindings("restore", "library", &roots)
+            .unwrap();
+        let binding_count: i64 = registry
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM local_root_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(binding_count, 1);
         drop(registry);
         let _ = std::fs::remove_file(path);
     }
@@ -9763,7 +10513,10 @@ mod tests {
                 operation_uuid: "operation",
                 account_uuid: "account",
                 library_uuid: "remote",
-                managed_root: Path::new("D:/Remote")
+                managed_root: Path::new("D:/Remote"),
+                restore_mode: "legacy-library",
+                inventory_fence: None,
+                request_hash: "0000000000000000000000000000000000000000000000000000000000000000",
             })
             .is_err());
         let count: i64 = registry
@@ -10134,29 +10887,51 @@ mod tests {
         assert_eq!(remote.media_count, Some(12));
         assert_eq!(remote.logical_bytes, Some(42_000));
         assert_eq!(remote.last_synced_at, Some(1234));
-        let roots = registry
-            .list_remote_library_roots("account", &library_uuid, None, 50)
+        let first_inventory = registry
+            .remote_library_root_inventory("account", &library_uuid, None, 1)
             .unwrap();
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0].root_uuid, "00000000-0000-7000-8000-000000000002");
-        assert_eq!(roots[0].logical_bytes, Some(41_000));
-        let second_page = registry
-            .list_remote_library_roots(
+        let second_inventory = registry
+            .remote_library_root_inventory(
                 "account",
                 &library_uuid,
                 Some("00000000-0000-7000-8000-000000000002"),
                 1,
             )
             .unwrap();
-        assert_eq!(second_page.len(), 1);
+        assert_eq!(first_inventory.items.len(), 1);
         assert_eq!(
-            second_page[0].root_uuid,
+            first_inventory.items[0].root_uuid,
+            "00000000-0000-7000-8000-000000000002"
+        );
+        assert_eq!(first_inventory.items[0].logical_bytes, Some(41_000));
+        assert_eq!(second_inventory.items.len(), 1);
+        assert_eq!(
+            second_inventory.items[0].root_uuid,
             "00000000-0000-7000-8000-000000000004"
         );
-        assert!(registry
-            .list_remote_library_roots("other-account", &library_uuid, None, 50)
+        assert_eq!(
+            first_inventory.inventory_fence,
+            second_inventory.inventory_fence
+        );
+        registry
+            .connection
+            .lock()
             .unwrap()
-            .is_empty());
+            .execute(
+                "UPDATE provider_remote_sync_roots SET logical_revision=logical_revision+1 WHERE account_uuid='account' AND library_uuid=?1 AND root_uuid='00000000-0000-7000-8000-000000000004'",
+                [&library_uuid],
+            )
+            .unwrap();
+        let changed_inventory = registry
+            .remote_library_root_inventory("account", &library_uuid, None, 1)
+            .unwrap();
+        assert_ne!(
+            first_inventory.inventory_fence,
+            changed_inventory.inventory_fence
+        );
+        assert!(registry
+            .remote_library_root_inventory("other-account", &library_uuid, None, 50)
+            .is_err());
         assert!(remote.compatible);
         assert_eq!(remote.error_code, None);
         assert!(registry

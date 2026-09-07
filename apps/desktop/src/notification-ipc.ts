@@ -38,6 +38,8 @@ export interface NotificationIpcChannels {
   readonly history: string;
   readonly cancel: string;
   readonly retry: string;
+  readonly dismissManagedRoot: string;
+  readonly reviewManagedRoot: string;
   readonly reportError: string;
   readonly thumbnailSummary: string;
   readonly changed: string;
@@ -79,6 +81,8 @@ const CHANNEL_PERMISSIONS = new Map<string, ReadonlySet<NotificationIpcWindowRol
   [NOTIFICATION_IPC_CHANNELS.history, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.cancel, NOTIFICATION_WINDOW_ONLY],
   [NOTIFICATION_IPC_CHANNELS.retry, NOTIFICATION_WINDOW_ONLY],
+  [NOTIFICATION_IPC_CHANNELS.dismissManagedRoot, MAIN_AND_NOTIFICATION_ROLES],
+  [NOTIFICATION_IPC_CHANNELS.reviewManagedRoot, MAIN_AND_NOTIFICATION_ROLES],
   [NOTIFICATION_IPC_CHANNELS.reportError, ALL_RENDERER_ROLES],
   [NOTIFICATION_IPC_CHANNELS.thumbnailSummary, THUMBNAIL_SUMMARY_PUBLISHERS],
   [NOTIFICATION_IPC_CHANNELS.logsPage, NOTIFICATION_WINDOW_ONLY],
@@ -96,6 +100,7 @@ const LOG_SOURCES = new Set<ProcessLogSource>(["main", "core", "renderer"]);
 const LOG_LEVELS = new Set<ProcessLogLevel>(["trace", "debug", "info", "warn", "error"]);
 const LOG_EVENT_KINDS = new Set(["thumbnail_failure"] as const);
 const MEDIA_FOCUS_STAGES = new Set(["switching", "locating"] as const);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
 export function canAccessNotificationIpc(
@@ -156,6 +161,21 @@ export function parseNotificationAction(
   return {
     libraryId: boundedString(libraryId, "libraryId", 256),
     operationId: boundedString(operationId, "operationId", 256)
+  };
+}
+
+export function parseManagedRootNotificationTarget(value: unknown) {
+  const input = record(value, "managed root notification target");
+  const libraryId = boundedString(input.libraryId, "libraryId", 36);
+  const rootUuid = boundedString(input.rootUuid, "rootUuid", 36);
+  if (!UUID_PATTERN.test(libraryId) || !UUID_PATTERN.test(rootUuid)) {
+    throw new RangeError("managed root notification target UUID is invalid");
+  }
+  return {
+    libraryId,
+    operationId: boundedString(input.operationId, "operationId", 256),
+    rootUuid,
+    inventoryRevision: boundedInteger(input.inventoryRevision, "inventoryRevision", 0, Number.MAX_SAFE_INTEGER)
   };
 }
 
@@ -327,6 +347,14 @@ export function parseProcessLogFilter(value: unknown): ProcessLogFilter {
 
 export function parseNotificationWindowIntent(value: unknown): NotificationWindowIntent {
   const input = record(value, "notification window intent");
+  if (input.page === "sync-folders") {
+    const libraryUuid = boundedString(input.libraryUuid, "libraryUuid", 36);
+    const rootUuid = boundedString(input.rootUuid, "rootUuid", 36);
+    if (!UUID_PATTERN.test(libraryUuid) || !UUID_PATTERN.test(rootUuid)) {
+      throw new RangeError("notification window intent UUID is invalid");
+    }
+    return { page: "sync-folders", libraryUuid, rootUuid };
+  }
   if (input.page !== "logs") {
     throw new RangeError("notification window intent page must be logs");
   }

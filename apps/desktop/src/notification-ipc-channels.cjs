@@ -14,6 +14,8 @@ const NOTIFICATION_IPC_CHANNELS = Object.freeze({
   history: "megle:notifications-history",
   cancel: "megle:notifications-cancel",
   retry: "megle:notifications-retry",
+  dismissManagedRoot: "megle:notifications-dismiss-managed-root",
+  reviewManagedRoot: "megle:notifications-review-managed-root",
   reportError: "megle:notifications-report-error",
   thumbnailSummary: "megle:notifications-thumbnail-summary",
   changed: "megle:notifications-changed",

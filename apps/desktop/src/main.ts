@@ -9,7 +9,6 @@ import {
   shell,
   type IpcMainEvent,
   type IpcMainInvokeEvent,
-  type OpenDialogOptions,
   type WebContents
 } from "electron";
 import { spawn } from "node:child_process";
@@ -30,6 +29,7 @@ import {
   type DesktopIpcWindowRole
 } from "./desktop-ipc-permissions.js";
 import { desktopLogger, processLogBuffer } from "./desktop-logger.js";
+import { parseFolderPickerRequest, showFolderPicker } from "./folder-picker.js";
 import { openEntraAppRegistrationPage } from "./entra-app-registration.js";
 import { openExternalAuthorizationUrl } from "./oauth-authorization-url.js";
 import {
@@ -54,6 +54,7 @@ import {
   ProcessLogIpcSubscriptions,
   assertNotificationIpcAccess,
   parseNotificationAction,
+  parseManagedRootNotificationTarget,
   parseNotificationHistoryQuery,
   parseMediaFocusRequest,
   parseMediaFocusCompletion,
@@ -73,6 +74,7 @@ import { createNotificationService, type NotificationService } from "./notificat
 import { runRecoverableNotificationShutdown } from "./notification-shutdown.js";
 import { createNotificationStore, notificationDatabasePath } from "./notification-store.js";
 import type { NotificationCompactSnapshot } from "./notification-types.js";
+import type { NotificationWindowIntent } from "@megle/notification-contract";
 import {
   NATIVE_WINDOW_WARMUP_MS,
   createSecondaryWindowRevealState,
@@ -138,6 +140,7 @@ const secondaryWindowReadiness: Record<SecondaryWindowRole, SecondaryWindowReadi
   plugins: null,
   notifications: null
 };
+const pendingSecondaryWindowIntents: Partial<Record<SecondaryWindowRole, NotificationWindowIntent>> = {};
 const secondaryWindowPositions: Record<SecondaryWindowRole, SecondaryWindowPosition | null> = {
   settings: null,
   plugins: null,
@@ -482,14 +485,14 @@ function formatProcessLogExport(
 }
 
 
-ipcMain.handle("megle:pick-folder", async (event) => {
+ipcMain.handle("megle:pick-folder", async (event, rawRequest?: unknown) => {
   requireDesktopIpcAccess(event, "megle:pick-folder");
-  const options: OpenDialogOptions = { properties: ["openDirectory"] };
-  const result = mainWindow
-    ? await dialog.showOpenDialog(mainWindow, options)
-    : await dialog.showOpenDialog(options);
-
-  return result.canceled ? null : result.filePaths[0] ?? null;
+  const request = rawRequest === undefined ? null : parseFolderPickerRequest(rawRequest);
+  if (rawRequest !== undefined && !request) {
+    throw new Error("Invalid folder picker request");
+  }
+  const owner = windowForIpcEvent(event) ?? mainWindow;
+  return showFolderPicker(dialog.showOpenDialog.bind(dialog), owner, request);
 });
 
 ipcMain.handle("megle:diagnostics", async (event) => {
@@ -699,7 +702,12 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.openWindow, async (event, input: unknow
   await openSecondaryWindow("notifications");
   const window = secondaryWindows.notifications;
   if (intent && window && !window.isDestroyed()) {
-    window.webContents.send(NOTIFICATION_IPC_CHANNELS.windowIntent, intent);
+    const readiness = secondaryWindowReadiness.notifications;
+    if (readiness?.windowId === window.id && !readiness.revealState.settled) {
+      pendingSecondaryWindowIntents.notifications = intent;
+    } else {
+      window.webContents.send(NOTIFICATION_IPC_CHANNELS.windowIntent, intent);
+    }
   }
   return true;
 });
@@ -786,6 +794,80 @@ ipcMain.handle(
     );
   }
 );
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.dismissManagedRoot, async (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.dismissManagedRoot);
+  const target = parseManagedRootNotificationTarget(input);
+  return (await ensureNotificationService()).dismissManagedRoot(target.libraryId, target.operationId, target.rootUuid, target.inventoryRevision);
+});
+
+ipcMain.handle(NOTIFICATION_IPC_CHANNELS.reviewManagedRoot, async (event, input: unknown) => {
+  requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.reviewManagedRoot);
+  const target = parseManagedRootNotificationTarget(input);
+  const service = await ensureNotificationService();
+  const validation = await service.validateManagedRootTarget(
+    target.libraryId,
+    target.operationId,
+    target.rootUuid,
+    target.inventoryRevision
+  );
+  if (!validation.ok) return validation;
+  const session = coreSession ?? await ensureCoreReady();
+  const activeResponse = await fetch(`${session.baseUrl}/libraries/active`, {
+    headers: { "x-megle-session": session.sessionToken }
+  });
+  if (!activeResponse.ok) return { ok: false, message: "Unable to read the active Library" };
+  const active = await activeResponse.json() as {
+    library?: { libraryUuid?: string | null } | null;
+    contextRevision?: number;
+  };
+  if (active.library?.libraryUuid !== target.libraryId) {
+    if (!Number.isSafeInteger(active.contextRevision) || (active.contextRevision ?? -1) < 0) {
+      return { ok: false, message: "The active Library context is unavailable" };
+    }
+    const response = await fetch(
+      `${session.baseUrl}/libraries/${encodeURIComponent(target.libraryId)}/activate`,
+      {
+        method: "POST",
+        headers: {
+          "x-megle-session": session.sessionToken,
+          "x-megle-context-revision": String(active.contextRevision)
+        }
+      }
+    );
+    if (!response.ok) return { ok: false, message: "The Library is no longer available" };
+    const activated = await activeHostLibrary(session);
+    if (!activated || activated.id !== target.libraryId) {
+      return { ok: false, message: "The Library could not be activated" };
+    }
+    await service.attachLibrary(activated, {
+      baseUrl: session.baseUrl,
+      sessionToken: session.sessionToken
+    });
+  }
+  const rootResponse = await fetch(
+    `${session.baseUrl}/libraries/${encodeURIComponent(target.libraryId)}/sync-folders/${encodeURIComponent(target.rootUuid)}`,
+    { headers: { "x-megle-session": session.sessionToken } }
+  );
+  if (!rootResponse.ok) return { ok: false, message: "The synchronized folder is no longer available" };
+  await openSecondaryWindow("settings");
+  const window = secondaryWindows.settings;
+  if (!window || window.isDestroyed()) {
+    return { ok: false, message: "Settings could not be opened" };
+  }
+  const intent: NotificationWindowIntent = {
+    page: "sync-folders",
+    libraryUuid: target.libraryId,
+    rootUuid: target.rootUuid
+  };
+  const readiness = secondaryWindowReadiness.settings;
+  if (readiness?.windowId === window.id && !readiness.revealState.settled) {
+    pendingSecondaryWindowIntents.settings = intent;
+  } else {
+    window.webContents.send(NOTIFICATION_IPC_CHANNELS.windowIntent, intent);
+  }
+  return { ok: true, message: null };
+});
 
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.reportError, async (event, input: unknown) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.reportError);
@@ -918,6 +1000,11 @@ ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown) => {
   const readiness = secondaryWindowReadiness[role];
   if (!readiness || readiness.windowId !== window.id) return false;
   readiness.revealState.rendererReady = true;
+  const pendingIntent = pendingSecondaryWindowIntents[role];
+  if (pendingIntent) {
+    delete pendingSecondaryWindowIntents[role];
+    window.webContents.send(NOTIFICATION_IPC_CHANNELS.windowIntent, pendingIntent);
+  }
   revealSecondaryWindowWhenReady(role, window);
   return readiness.revealState.result;
 });
@@ -990,8 +1077,9 @@ ipcMain.handle("megle:pick-new-library-path", async (event, defaultName?: string
     defaultPath: suggestedRoot,
     properties: ["openDirectory", "createDirectory"] as ("openDirectory" | "createDirectory")[]
   };
-  const result = mainWindow
-    ? await dialog.showOpenDialog(mainWindow, options)
+  const owner = windowForIpcEvent(event) ?? mainWindow;
+  const result = owner
+    ? await dialog.showOpenDialog(owner, options)
     : await dialog.showOpenDialog(options);
   return result.canceled ? null : (result.filePaths[0] ?? null);
 });
@@ -1313,6 +1401,7 @@ function clearSecondaryWindowState(
   releaseIpcTargetLifecycle();
   if (activeWindowDrag?.windowId === window.id) activeWindowDrag = null;
   if (secondaryWindows[role] === window) secondaryWindows[role] = null;
+  delete pendingSecondaryWindowIntents[role];
   clearSecondaryWindowReadyFallback(role, window.id);
   const readiness = secondaryWindowReadiness[role];
   if (readiness?.windowId === window.id) {

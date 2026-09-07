@@ -31,6 +31,8 @@ import { thumbnailFailureLogIntentForLibrary } from "../notifications/notificati
 import { LibraryGlyph, LibraryIconPicker } from "../library/libraryGlyph";
 import { ManagedLibraryWizard } from "../library/ManagedLibraryWizard";
 import { SyncManagementPanel } from "../sync/SyncManagementPanel";
+import { SyncFoldersPanel } from "../sync/SyncFoldersPanel";
+import type { ManagedRootSettingsIntent } from "@megle/notification-contract";
 import { useSyncOrchestration } from "../sync/useSyncOrchestration";
 import {
   LIBRARY_GRID_PREFERENCE_LIMITS,
@@ -62,6 +64,7 @@ const SHORTCUT_ACTION_LABELS: Record<string, string> = {
 };
 
 interface SettingsPanelsProps {
+  managedRootIntent?: ManagedRootSettingsIntent | null;
   gridPreferences: LibraryGridPreferences;
   interfaceStyle: InterfaceStyleController;
   library: LibraryState;
@@ -88,6 +91,7 @@ const TABS: Array<{ id: SettingsTabId; label: string; icon: typeof Settings2 }> 
 ];
 
 export function SettingsPanels({
+  managedRootIntent,
   gridPreferences,
   interfaceStyle,
   library,
@@ -96,6 +100,8 @@ export function SettingsPanels({
   previewPreferences
 }: SettingsPanelsProps) {
   const [activeTab, setActiveTab] = useState<SettingsTabId>("general");
+
+  useEffect(() => { if (managedRootIntent) setActiveTab("libraries"); }, [managedRootIntent]);
 
   return (
     <div className="settings-dialog-layout">
@@ -131,7 +137,7 @@ export function SettingsPanels({
               previewPreferences={previewPreferences}
             />
           ) : null}
-          {activeTab === "libraries" ? <LibrariesTab library={library} /> : null}
+          {activeTab === "libraries" ? <LibrariesTab library={library} focusRootUuid={managedRootIntent?.rootUuid ?? null} /> : null}
           {activeTab === "thumbnails" ? (
             <ThumbnailsTab
               library={library}
@@ -637,7 +643,7 @@ function ShortcutsTab() {
 
 // ---- Libraries tab: full library management (superset of the switcher) -----
 
-function LibrariesTab({ library }: { library: LibraryState }) {
+function LibrariesTab({ library, focusRootUuid }: { library: LibraryState; focusRootUuid: string | null }) {
   const overlays = useOverlayStack();
   const sync = useSyncOrchestration();
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
@@ -859,6 +865,7 @@ function LibrariesTab({ library }: { library: LibraryState }) {
           setDeleteConfirmText("");
         }}
       />
+      <SyncFoldersPanel focusRootUuid={focusRootUuid} libraryUuid={libs.find((item) => item.active)?.libraryUuid ?? null} />
       <ManagedLibraryWizard
         initialMode={wizardMode}
         onClose={closeManagedLibraryWizard}

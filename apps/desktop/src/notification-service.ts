@@ -75,6 +75,7 @@ export interface NotificationServiceStore {
   syncState(libraryId: string): Promise<NotificationSyncState>;
   markAcknowledged(libraryId: string, sequence: number): Promise<void>;
   compactSnapshot(): Promise<NotificationStoredSnapshot>;
+  dismissManagedRoot(libraryId: string, operationId: string, rootUuid: string, inventoryRevision: number): Promise<void>;
   history(query: NotificationHistoryQuery): Promise<NotificationHistoryPage>;
   historyFacets(): Promise<NotificationHistoryFacets>;
   getOperation(
@@ -594,6 +595,39 @@ export class NotificationService {
     operationId: string
   ): Promise<NotificationActionResult> {
     return this.performTaskAction("retry", libraryId, operationId);
+  }
+
+  async dismissManagedRoot(libraryId: string, operationId: string, rootUuid: string, inventoryRevision: number): Promise<NotificationActionResult> {
+    if (!this.store) return { ok:false, message:"Notification history store is unavailable" };
+    const operation = await this.findOperation(libraryId, operationId);
+    const action = operation?.managedRootAction;
+    if (
+      action?.kind !== "review-placement" ||
+      action.libraryUuid !== libraryId ||
+      action.rootUuid !== rootUuid ||
+      action.inventoryRevision !== inventoryRevision
+    ) {
+      return { ok: false, message: "The managed-root notification is no longer available" };
+    }
+    try {
+      await this.store.dismissManagedRoot(libraryId, operationId, rootUuid, inventoryRevision);
+      this.storedSnapshot = await this.store.compactSnapshot();
+      this.emitSnapshot();
+      return { ok:true, message:null };
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  async validateManagedRootTarget(libraryId: string, operationId: string, rootUuid: string, inventoryRevision: number): Promise<NotificationActionResult> {
+    const operation = await this.findOperation(libraryId, operationId);
+    const action = operation?.managedRootAction;
+    return action?.kind === "review-placement" &&
+      action.libraryUuid === libraryId &&
+      action.rootUuid === rootUuid &&
+      action.inventoryRevision === inventoryRevision
+      ? { ok: true, message: null }
+      : { ok: false, message: "The managed-root notification is no longer available" };
   }
 
   async reportRendererError(report: RendererErrorReport): Promise<void> {

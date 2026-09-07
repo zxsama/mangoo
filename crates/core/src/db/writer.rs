@@ -995,6 +995,7 @@ mod tests {
             root_id: Some(1),
             library_uuid: None,
             root_uuid: None,
+            managed_root_action: None,
             folder_id: None,
             file_id: None,
             current_value: 0,

@@ -144,7 +144,7 @@ export interface RootOperation { operationUuid: string; libraryUuid: string; roo
 export interface RootOperationListResponse { items: RootOperation[]; }
 export interface RootOperationPageResponse { items: RootOperation[]; nextCursor: string | null; }
 export interface RemoteLibraryRoot { accountUuid: string; libraryUuid: string; rootUuid: string; rootFolderUuid: string; requestedName: string; materializedName: string; materializationFingerprint: string; logicalRevision: number; logicalBytes: number | null; proposedLocalPath: string | null; selectedByDefault: boolean; compatible: boolean; errorCode: string | null; }
-export interface RemoteLibraryRootListResponse { items: RemoteLibraryRoot[]; nextCursor: string | null; }
+export interface RemoteLibraryRootListResponse { items: RemoteLibraryRoot[]; nextCursor: string | null; inventoryFence: string; }
 export interface RootLocationConflict { conflictUuid: string; rootUuid: string; locationHeads: string[]; state: "open" | "resolved"; createdAt: number; resolvedAt?: number | null; }
 export interface RootConflictListResponse { items: RootLocationConflict[]; nextCursor: string | null; }
 export interface RootLocationConflictResolutionRequest { operationUuid: string; expectedOperationRevision: number; expectedBindingGeneration?: number | null; expectedLocationHeads: string[]; supersedes: string[]; requestedName?: string | null; }
@@ -169,9 +169,14 @@ export interface SyncReconnectPlan { planUuid: string; libraryUuid: string; remo
 export interface SyncReconnectCommitRequest { operationUuid: string; planUuid: string; choice: "merge-local-fork" | "publish-new-remote"; }
 export interface RemoteLibrarySummary { accountUuid: string; libraryUuid: string; name: string; icon: string | null; mediaCount: number | null; logicalBytes: number | null; lastSyncedAt: number | null; descriptorSize: number; updatedAt: number; compatible: boolean; boundLocally: boolean; errorCode: string | null; }
 export interface RemoteLibraryListResponse { items: RemoteLibrarySummary[]; nextCursor: string | null; totalCount?: number; }
-export interface SyncRestoreStartItem { accountUuid: string; libraryUuid: string; name: string; managedRoot: string; }
+export interface SyncRestoreLegacyItem { restoreMode?: "legacy-library"; accountUuid: string; libraryUuid: string; name: string; managedRoot: string; }
+export interface SyncRestoreRootChoice { rootUuid: string; expectedLogicalRevision: number; expectedMaterializationFingerprint: string; selected: boolean; targetPath?: string; }
+export interface SyncRestoreRootAwareItem { restoreMode: "root-aware"; accountUuid: string; libraryUuid: string; placementBase: string; inventoryFence: string; roots: SyncRestoreRootChoice[]; }
+export type SyncRestoreStartItem = SyncRestoreLegacyItem | SyncRestoreRootAwareItem;
 export interface SyncRestorePreflightRequest { items: SyncRestoreStartItem[]; }
-export interface SyncRestorePreflight { preflightToken: string; expiresAt: number; totalItems: number; totalBytes: number; }
+export interface SyncRestoreRootResult { libraryUuid: string; rootUuid: string; selected: boolean; ok: boolean; reason: string | null; normalizedTargetPath: string | null; requiredBytes: number; availableBytes: number | null; volumeKey: string | null; }
+export interface SyncRestoreVolumeResult { volumeKey: string; requiredBytes: number; availableBytes: number | null; ok: boolean; }
+export interface SyncRestorePreflight { preflightToken: string | null; expiresAt: number; totalItems: number; totalBytes: number; ok: boolean; rootResults: SyncRestoreRootResult[]; volumeResults: SyncRestoreVolumeResult[]; }
 export interface SyncRestoreStartRequest { operationUuid: string; preflightToken: string; items: SyncRestoreStartItem[]; }
 export interface SyncRestorePlan { restoreUuid: string; operationUuid: string; accountUuid: string; libraryUuid: string; name: string; managedRoot: string; state: string; phase: string; catalogReady: boolean; mediaItemsDone: number; mediaItemsTotal?: number | null; mediaBytesDone: number; mediaBytesTotal?: number | null; errorCode?: string | null; updatedAt: number; }
 export interface SyncRestoreListResponse { items: SyncRestorePlan[]; }
@@ -335,6 +340,7 @@ export interface NotificationOperationSnapshot {
   rootId: number | null;
   libraryUuid?: string | null;
   rootUuid?: string | null;
+  managedRootAction?: ManagedRootNotificationAction;
   folderId: number | null;
   fileId: number | null;
   currentValue: number;
@@ -349,6 +355,13 @@ export interface NotificationOperationSnapshot {
   startedAt: number;
   updatedAt: number;
   completedAt: number | null;
+}
+
+export interface ManagedRootNotificationAction {
+  kind: "review-placement";
+  libraryUuid: string;
+  rootUuid: string;
+  inventoryRevision: number;
 }
 
 export interface NotificationOutboxEvent {

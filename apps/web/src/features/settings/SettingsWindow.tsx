@@ -17,6 +17,7 @@ import {
   type PreviewPreferences
 } from "../preview/previewPreferences";
 import { SettingsPanels } from "./settingsPanels";
+import type { ManagedRootSettingsIntent } from "@megle/notification-contract";
 
 // The renderer entry for the SEPARATE settings OS window (a second frameless
 // BrowserWindow at #/settings). It owns its own preference state (loaded from
@@ -36,6 +37,11 @@ export function SettingsWindow() {
     libraryId: string;
     libraryName: string;
   } | null>(null);
+  const [managedRootIntent, setManagedRootIntent] = useState<ManagedRootSettingsIntent | null>(null);
+
+  useEffect(() => getDesktopBridge()?.onNotificationWindowIntent?.((intent) => {
+    if (intent.page === "sync-folders") setManagedRootIntent(intent);
+  }), []);
 
   useEffect(() => {
     const tracker = createLibraryContextTracker({
@@ -102,6 +108,7 @@ export function SettingsWindow() {
       windowClassName="settings-window"
     >
       <SettingsPanels
+        managedRootIntent={managedRootIntent}
         gridPreferences={gridPreferences}
         interfaceStyle={interfaceStyle}
         library={library}

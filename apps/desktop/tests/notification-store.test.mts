@@ -1329,7 +1329,7 @@ describe("notification store", () => {
     const inspection = new DatabaseSync(databasePath, { readOnly: true });
     try {
       assert.equal(inspection.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
-      assert.equal(inspection.prepare("PRAGMA user_version").get()?.user_version, 4);
+      assert.equal(inspection.prepare("PRAGMA user_version").get()?.user_version, 5);
       const tables = inspection
         .prepare(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
@@ -1340,6 +1340,7 @@ describe("notification store", () => {
         "action_errors",
         "legacy_imports",
         "local_recovery_batches",
+        "managed_root_dismissals",
         "operations",
         "sync_cursors",
         "thumbnail_summaries"
@@ -1377,7 +1378,7 @@ describe("notification store", () => {
 
     const upgraded = new DatabaseSync(databasePath, { readOnly: true });
     try {
-      assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 4);
+      assert.equal(upgraded.prepare("PRAGMA user_version").get()?.user_version, 5);
       const indexSql = upgraded
         .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_operations_history'")
         .get()?.sql as string;
@@ -1398,6 +1399,64 @@ describe("notification store", () => {
     } finally {
       upgraded.close();
     }
+  });
+
+  it("persists managed-root dismissal without advancing the transport cursor and shows newer revisions", async () => {
+    const databasePath = testDatabasePath();
+    const libraryUuid = "00000000-0000-7000-8000-000000000101";
+    const rootUuid = "00000000-0000-7000-8000-000000000102";
+    const operationId = `sync-folder-placement:${libraryUuid}:${rootUuid}:3`;
+    let store = await createTestStore(databasePath);
+    await store.applyOutboxBatch(
+      { id: libraryUuid, name: "Managed" },
+      [event(7, operation(operationId, 1, "running", {
+        kind: "sync-folder-placement-required",
+        category: "sync",
+        taskId: null,
+        rootId: null,
+        libraryUuid,
+        rootUuid,
+        managedRootAction: {
+          kind: "review-placement",
+          libraryUuid,
+          rootUuid,
+          inventoryRevision: 3
+        }
+      }))],
+      7
+    );
+    await store.dismissManagedRoot(libraryUuid, operationId, rootUuid, 3);
+    assert.equal((await store.compactSnapshot()).active.length, 0);
+    assert.equal((await store.syncState(libraryUuid)).persistedSequence, 7);
+    assert.equal((await store.syncState(libraryUuid)).ackedSequence, 0);
+    await store.close();
+
+    store = await createTestStore(databasePath);
+    assert.equal((await store.compactSnapshot()).active.length, 0);
+    const newerOperationId = `sync-folder-placement:${libraryUuid}:${rootUuid}:4`;
+    await store.applyOutboxBatch(
+      { id: libraryUuid, name: "Managed" },
+      [event(8, operation(newerOperationId, 1, "running", {
+        kind: "sync-folder-placement-required",
+        category: "sync",
+        taskId: null,
+        rootId: null,
+        libraryUuid,
+        rootUuid,
+        managedRootAction: {
+          kind: "review-placement",
+          libraryUuid,
+          rootUuid,
+          inventoryRevision: 4
+        }
+      }))],
+      8
+    );
+    assert.deepEqual(
+      (await store.compactSnapshot()).active.map((item) => item.operationId),
+      [newerOperationId]
+    );
+    await store.close();
   });
 
   it("allows concurrent first opens of the same empty v0 database", async () => {

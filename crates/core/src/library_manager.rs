@@ -513,38 +513,14 @@ impl LibraryManager {
         revision: u64,
         logical_name: &str,
     ) -> anyhow::Result<()> {
-        let operation_id = format!("sync-folder-placement:{library_uuid}:{root_uuid}:{revision}");
         let now = crate::host_registry::unix_timestamp_millis_for_runtime();
-        let mut notification = crate::db::notification_outbox::NotificationOperation {
-            operation_id,
-            revision: 0,
-            kind: "sync-folder-placement-required".to_owned(),
-            category: "sync".to_owned(),
-            origin: "background".to_owned(),
-            presentation: "important".to_owned(),
-            status: "pending".to_owned(),
-            phase: Some("placement-required".to_owned()),
-            title: "选择同步文件夹位置".to_owned(),
-            summary: Some(logical_name.to_owned()),
-            task_id: None,
-            root_id: None,
-            library_uuid: Some(library_uuid.to_owned()),
-            root_uuid: Some(root_uuid.to_owned()),
-            folder_id: None,
-            file_id: None,
-            current_value: 0,
-            total_value: None,
-            unit: None,
-            error_code: None,
-            error_detail: None,
-            cancellable: false,
-            retryable: false,
-            attempt: 1,
-            occurrence_count: 1,
-            started_at: now,
-            updated_at: now,
-            completed_at: None,
-        };
+        let mut notification = crate::db::notification_outbox::managed_root_placement_notification(
+            library_uuid,
+            root_uuid,
+            revision,
+            logical_name,
+            now,
+        );
         self.write_sync_folder_catalog(library_uuid, move |database| {
             database
                 .publish_notification_operation(
@@ -1758,6 +1734,7 @@ impl LibraryManager {
             root_id: None,
             library_uuid: operation.library_uuid.clone(),
             root_uuid: None,
+            managed_root_action: None,
             folder_id: None,
             file_id: None,
             current_value: 0,
@@ -1843,6 +1820,7 @@ impl LibraryManager {
             root_id: None,
             library_uuid: Some(plan.library_uuid.clone()),
             root_uuid: None,
+            managed_root_action: None,
             folder_id: None,
             file_id: None,
             current_value: i64::try_from(plan.media_items_done).unwrap_or(i64::MAX),
@@ -2510,11 +2488,11 @@ impl LibraryManager {
                     self.registry
                         .mark_restore_catalog_ready(&restore.library_uuid)?;
                 } else if restore.state == "failed" {
-                    let _ = self.cancel_restore(&restore.restore_uuid).await;
+                    let _ = self.discard_restore_plan(&restore.restore_uuid).await;
                 } else {
                     let _ = self.registry.wake_binding(&restore.library_uuid);
                 }
-            } else if restore.state == "failed" {
+            } else {
                 let _ = self
                     .registry
                     .commit_cancelled_restore_cleanup(&restore.restore_uuid, &restore.library_uuid);
@@ -2795,7 +2773,6 @@ impl LibraryManager {
             .await?;
         self.registry
             .begin_restore_binding(&descriptor.library_uuid, account_uuid)?;
-        self.sync_coordinator.wake();
         Ok(descriptor)
     }
 
@@ -3561,6 +3538,18 @@ impl LibraryManager {
             .registry
             .restore_plan(restore_uuid)?
             .ok_or_else(|| anyhow::anyhow!("restore-not-found"))?;
+        let root_cleanup = self.registry.restore_root_cleanup_entries(restore_uuid)?;
+        for root in root_cleanup {
+            let marker = crate::sync_folders::SyncRootMarker {
+                format_version: 1,
+                library_uuid: plan.library_uuid.clone(),
+                root_uuid: root.root_uuid,
+                root_folder_uuid: root.root_folder_uuid,
+                local_binding_uuid: root.local_binding_uuid,
+                binding_generation: root.binding_generation,
+            };
+            crate::sync_folders::remove_root_marker_if_matches(&root.target_path, &marker, true)?;
+        }
         if self.registry.library(&plan.library_uuid)?.is_some() {
             self.cancel_restore(restore_uuid).await
         } else {

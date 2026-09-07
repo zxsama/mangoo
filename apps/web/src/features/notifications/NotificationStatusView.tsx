@@ -10,6 +10,7 @@ import {
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   DesktopThumbnailCacheSummary,
+  ManagedRootNotificationTarget,
   NotificationWindowIntent
 } from "@megle/notification-contract";
 import { LiquidGlassButton } from "../../design/liquid-glass";
@@ -34,15 +35,23 @@ type NotificationAction = (
   operationId: string
 ) => Promise<{ ok: boolean; message: string | null }>;
 
+type ManagedRootAction = (
+  target: ManagedRootNotificationTarget
+) => Promise<{ ok: boolean; message: string | null }>;
+
 export function NotificationStatusView({
   cancel,
+  dismissManagedRoot,
   model,
   onOpenFailureLogs,
+  reviewManagedRoot,
   refreshCompact
 }: {
   cancel: NotificationAction;
+  dismissManagedRoot: ManagedRootAction;
   model: CompactNotificationModel;
   onOpenFailureLogs(intent: NotificationWindowIntent): void;
+  reviewManagedRoot: ManagedRootAction;
   refreshCompact(): Promise<NotificationRequestResult<boolean>>;
 }) {
   const [actionStates, setActionStates] = useState<NotificationActionStates>(() => new Map());
@@ -107,10 +116,44 @@ export function NotificationStatusView({
                 operation.operationId
               );
               const actionState = actionStates.get(actionKey);
+              const managedRootTarget = operation.managedRootAction?.kind === "review-placement"
+                ? {
+                    libraryId: operation.managedRootAction.libraryUuid,
+                    operationId: operation.operationId,
+                    rootUuid: operation.managedRootAction.rootUuid,
+                    inventoryRevision: operation.managedRootAction.inventoryRevision
+                  }
+                : null;
+              const runManagedRootAction = async (action: "dismiss" | "review") => {
+                if (!managedRootTarget) return;
+                const requestId = ++actionRequestIdRef.current;
+                const started = beginNotificationAction(
+                  actionStatesRef.current,
+                  actionKey,
+                  action,
+                  requestId
+                );
+                if (!started.started) return;
+                commitActionStates(started.states);
+                const result = action === "dismiss"
+                  ? await dismissManagedRoot(managedRootTarget)
+                  : await reviewManagedRoot(managedRootTarget);
+                await refreshCompact();
+                commitActionStates(
+                  settleNotificationAction(
+                    actionStatesRef.current,
+                    actionKey,
+                    action,
+                    requestId,
+                    result.ok ? null : result.message || "操作失败"
+                  )
+                );
+              };
               return (
                 <ActiveOperation
                   cancelError={actionState?.errors.cancel ?? null}
                   cancelling={actionState?.pendingAction === "cancel"}
+                  dismissing={actionState?.pendingAction === "dismiss"}
                   key={`${operation.libraryId}:${operation.operationId}`}
                   onCancel={async () => {
                     const requestId = ++actionRequestIdRef.current;
@@ -142,7 +185,13 @@ export function NotificationStatusView({
                       )
                     );
                   }}
+                  onDismiss={() => runManagedRootAction("dismiss")}
+                  onReview={() => runManagedRootAction("review")}
                   operation={operation}
+                  reviewing={actionState?.pendingAction === "review"}
+                  managedRootActionError={
+                    actionState?.errors.dismiss ?? actionState?.errors.review ?? null
+                  }
                 />
               );
             })}
@@ -244,14 +293,25 @@ function StatusSection({
 function ActiveOperation({
   cancelError,
   cancelling,
+  dismissing,
+  managedRootActionError,
   onCancel,
-  operation
+  onDismiss,
+  onReview,
+  operation,
+  reviewing
 }: {
   cancelError: string | null;
   cancelling: boolean;
+  dismissing: boolean;
+  managedRootActionError: string | null;
   onCancel(): Promise<void>;
+  onDismiss(): Promise<void>;
+  onReview(): Promise<void>;
   operation: NotificationOperationViewModel;
+  reviewing: boolean;
 }) {
+  const hasManagedRootAction = operation.managedRootAction?.kind === "review-placement";
   return (
     <article className="notification-status-operation">
       <div className="notification-status-row-heading">
@@ -281,6 +341,25 @@ function ActiveOperation({
       </div>
       <div className="notification-status-operation-footer">
         <span className="notification-status-progress-caption">{operation.progress.label}</span>
+        {hasManagedRootAction ? (
+          <>
+            <LiquidGlassButton
+              disabled={reviewing || dismissing}
+              onClick={() => void onReview()}
+              tone="primary"
+              type="button"
+            >
+              {reviewing ? "打开中…" : "查看位置"}
+            </LiquidGlassButton>
+            <LiquidGlassButton
+              disabled={reviewing || dismissing}
+              onClick={() => void onDismiss()}
+              type="button"
+            >
+              {dismissing ? "关闭中…" : "关闭"}
+            </LiquidGlassButton>
+          </>
+        ) : null}
         {operation.cancellable ? (
           <LiquidGlassButton
             aria-label={`取消 ${operation.title}`}
@@ -295,6 +374,9 @@ function ActiveOperation({
         ) : null}
       </div>
       {cancelError ? <p className="notification-row-action-error" role="alert">{cancelError}</p> : null}
+      {managedRootActionError ? (
+        <p className="notification-row-action-error" role="alert">{managedRootActionError}</p>
+      ) : null}
     </article>
   );
 }

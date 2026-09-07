@@ -450,7 +450,8 @@ for (const name of [
   "SyncUnbindPlan", "SyncUnbindCommitRequest", "SyncReconnectPreflightRequest",
   "SyncReconnectPlan", "SyncReconnectCommitRequest", "RemoteLibrarySummary",
   "RemoteLibraryRoot", "RemoteLibraryRootListResponse",
-  "SyncRestoreStartItem", "SyncRestorePreflightRequest", "SyncRestorePreflight", "SyncRestoreStartRequest", "SyncRestorePlan",
+  "SyncRestoreLegacyItem", "SyncRestoreRootChoice", "SyncRestoreRootAwareItem",
+  "SyncRestorePreflightRequest", "SyncRestorePreflight", "SyncRestoreRootResult", "SyncRestoreVolumeResult", "SyncRestoreStartRequest", "SyncRestorePlan",
   "SyncRestoreListResponse", "SyncConflictRecord", "SyncConflictListResponse",
   "SyncConflictResolutionRequest", "SyncFolderDescriptor", "LocalRootBinding",
   "SyncFolderRecord", "SyncFolderListResponse", "SyncFolderSettings",
@@ -465,6 +466,10 @@ for (const name of [
   "RootOperation", "RootOperationListResponse", "RootOperationPageResponse", "RootLocationConflict",
   "RootConflictListResponse", "RootLocationConflictResolutionRequest", "SyncFolderErrorResponse"
 ]) assertInterfaceMatchesSchema(name);
+
+if (generatedTypeBody("SyncRestoreStartItem") !== "SyncRestoreLegacyItem | SyncRestoreRootAwareItem") {
+  fail("generated-contract.ts SyncRestoreStartItem must preserve the strict legacy/root-aware union");
+}
 
 for (const name of [
   "SyncFolderInventoryState", "LocalRootBindingState", "SyncFolderAllowedAction",

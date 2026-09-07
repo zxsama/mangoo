@@ -983,7 +983,10 @@ impl SyncCoordinator {
             })?;
         let staging = catalog_path.with_extension("sqlite.sync-staging");
         let host_bindings = self.registry.local_root_bindings(library_uuid)?;
-        if checkpoint.projection.roots.len() > 1 || !host_bindings.is_empty() {
+        if self.registry.is_root_aware_restore(library_uuid)?
+            || checkpoint.projection.roots.len() > 1
+            || !host_bindings.is_empty()
+        {
             let selected_roots = host_bindings
                 .iter()
                 .filter(|binding| binding.state != "local-only-fork")
@@ -994,7 +997,10 @@ impl SyncCoordinator {
                     ))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            if selected_roots.is_empty() && checkpoint.projection.roots.len() > 1 {
+            if selected_roots.is_empty()
+                && checkpoint.projection.roots.len() > 1
+                && !self.registry.is_root_aware_restore(library_uuid)?
+            {
                 anyhow::bail!(
                     "multi-root checkpoint restore is awaiting selected local root bindings"
                 );
@@ -1032,6 +1038,9 @@ impl SyncCoordinator {
             )
             .context("materialize staging Catalog")?;
         }
+        self.registry
+            .advance_restore_phase(library_uuid, "catalog-staged")
+            .context("record staged restore Catalog")?;
         let transport = self
             .registry
             .binding_transport(library_uuid, "library")?
@@ -1046,7 +1055,10 @@ impl SyncCoordinator {
             .restore_host_checkpoint_metadata(&checkpoint.host_metadata)
             .context("restore Host checkpoint metadata")?;
         super::persistence::promote_new_staging_catalog(&staging, catalog_path)
-            .context("promote restored staging Catalog")
+            .context("promote restored staging Catalog")?;
+        self.registry
+            .mark_restore_catalog_ready(library_uuid)
+            .context("record restored Catalog cutover")
     }
 
     pub async fn run_active_turn(
@@ -1213,38 +1225,14 @@ impl SyncCoordinator {
                     .map(|root| root.inventory_revision)
                     .unwrap_or(1);
                 let now = crate::host_registry::unix_timestamp_millis_for_runtime();
-                let mut notification = crate::db::notification_outbox::NotificationOperation {
-                    operation_id: format!(
-                        "sync-folder-placement:{library_uuid}:{root_uuid}:{inventory_revision}"
-                    ),
-                    revision: 0,
-                    kind: "sync-folder-placement-required".to_owned(),
-                    category: "sync".to_owned(),
-                    origin: "background".to_owned(),
-                    presentation: "important".to_owned(),
-                    status: "pending".to_owned(),
-                    phase: Some("placement-required".to_owned()),
-                    title: "选择同步文件夹位置".to_owned(),
-                    summary: Some(descriptor.requested_name.clone()),
-                    task_id: None,
-                    root_id: None,
-                    library_uuid: Some(library_uuid.to_owned()),
-                    root_uuid: Some(root_uuid.clone()),
-                    folder_id: None,
-                    file_id: None,
-                    current_value: 0,
-                    total_value: None,
-                    unit: None,
-                    error_code: None,
-                    error_detail: None,
-                    cancellable: false,
-                    retryable: false,
-                    attempt: 1,
-                    occurrence_count: 1,
-                    started_at: now,
-                    updated_at: now,
-                    completed_at: None,
-                };
+                let mut notification =
+                    crate::db::notification_outbox::managed_root_placement_notification(
+                        library_uuid,
+                        &root_uuid,
+                        inventory_revision,
+                        &descriptor.requested_name,
+                        now,
+                    );
                 database.publish_notification_operation(
                     &mut notification,
                     crate::db::notification_outbox::PublishMode::Phase,
@@ -1420,6 +1408,7 @@ impl SyncCoordinator {
                 root_id: None,
                 library_uuid: Some(library_uuid.to_owned()),
                 root_uuid: None,
+                managed_root_action: None,
                 folder_id: None,
                 file_id: None,
                 current_value: i64::try_from(plan.media_items_done).unwrap_or(i64::MAX),

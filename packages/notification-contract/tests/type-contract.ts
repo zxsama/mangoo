@@ -42,8 +42,13 @@ void bridge.snapshotAndSubscribeLogs;
 void bridge.getHistoryFacets;
 void bridge.exportLogs;
 void rendererReport.reportId;
-void intent.logFilter.eventKind;
-void intent.failureSnapshot.truncated;
+if (intent.page === "logs") {
+  void intent.logFilter.eventKind;
+  void intent.failureSnapshot.truncated;
+} else {
+  void intent.libraryUuid;
+  void intent.rootUuid;
+}
 void focus.fileId;
 void focusCancellation.requestId;
 void focusStage.stage;

@@ -1,9 +1,16 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
-import type { RemoteLibrarySummary, SyncRestorePlan, SyncRestorePreflight } from "@megle/core-client";
+import type {
+  RemoteLibraryRoot,
+  RemoteLibrarySummary,
+  SyncRestorePlan,
+  SyncRestorePreflight,
+  SyncRestoreStartItem,
+} from "@megle/core-client";
 import {
   createLibrary,
   pickNewLibraryPath,
+  pickSyncFolder,
   preflightLibrary,
 } from "../../core/desktop";
 import { LiquidGlassButton } from "../../design/liquid-glass";
@@ -32,6 +39,15 @@ export interface ManagedLibraryWizardProps {
   onFailure: (cause: unknown) => void;
   open: boolean;
   restoreFocusRef?: RefObject<HTMLElement | null>;
+}
+
+interface RestoreRootInventory {
+  inventoryFence: string;
+  roots: Array<RemoteLibraryRoot & { selected: boolean; targetPath: string | null }>;
+}
+
+function proposedRestoreRootPath(placementBase: string, materializedName: string): string {
+  return `${placementBase.replace(/[\\/]+$/u, "")}\\${materializedName}`;
 }
 
 function formatRemoteSize(bytes: number | null) {
@@ -63,7 +79,8 @@ export function ManagedLibraryWizard({
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [selectedRemoteIds, setSelectedRemoteIds] = useState<Set<string>>(new Set());
   const [restoreRoots, setRestoreRoots] = useState<Record<string, string>>({});
-  const [restoreItems, setRestoreItems] = useState<Array<{ accountUuid: string; libraryUuid: string; name: string; managedRoot: string }> | null>(null);
+  const [restoreRootInventories, setRestoreRootInventories] = useState<Record<string, RestoreRootInventory>>({});
+  const [restoreItems, setRestoreItems] = useState<SyncRestoreStartItem[] | null>(null);
   const [restorePreflight, setRestorePreflight] = useState<SyncRestorePreflight | null>(null);
   const [restorePlans, setRestorePlans] = useState<SyncRestorePlan[]>([]);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -205,14 +222,99 @@ export function ManagedLibraryWizard({
 
   async function chooseRestoreRoot(remote: RemoteLibrarySummary) {
     try {
-      const selected = await pickNewLibraryPath(remote.name);
+      const selected = await pickSyncFolder({
+        libraryUuid: remote.libraryUuid,
+        rootUuid: null,
+        mode: "materialize-remote",
+        suggestedPath: restoreRoots[remote.libraryUuid] ?? null,
+        dialogTitle: `选择“${remote.name}”的本机位置`
+      });
       if (selected) {
         setRestoreRoots((current) => ({ ...current, [remote.libraryUuid]: selected }));
+        setRestoreRootInventories((current) => {
+          const inventory = current[remote.libraryUuid];
+          if (!inventory) return current;
+          return {
+            ...current,
+            [remote.libraryUuid]: {
+              ...inventory,
+              roots: inventory.roots.map((root) => ({
+                ...root,
+                targetPath: root.selected
+                  ? proposedRestoreRootPath(selected, root.materializedName)
+                  : null,
+              })),
+            },
+          };
+        });
         setRestorePreflight(null);
         setRestoreItems(null);
       }
     } catch (cause) {
       setError(String(cause));
+      onFailure(cause);
+    }
+  }
+
+  async function loadRestoreRootInventory(remote: RemoteLibrarySummary) {
+    const client = createCoreClient();
+    const roots: RemoteLibraryRoot[] = [];
+    let cursor: string | undefined;
+    let inventoryFence: string | null = null;
+    do {
+      const page = await client.listRemoteLibraryRoots(
+        remote.accountUuid,
+        remote.libraryUuid,
+        { cursor, limit: 200 },
+      );
+      if (inventoryFence !== null && inventoryFence !== page.inventoryFence) {
+        throw new Error(`“${remote.name}”的远端文件夹清单已变化，请重试。`);
+      }
+      inventoryFence = page.inventoryFence;
+      roots.push(...page.items);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    const placementBase = restoreRoots[remote.libraryUuid] ?? null;
+    const nextInventory: RestoreRootInventory = {
+      inventoryFence: inventoryFence ?? "",
+      roots: roots.map((root) => ({
+        ...root,
+        selected: root.compatible,
+        targetPath: root.compatible && placementBase
+          ? proposedRestoreRootPath(placementBase, root.materializedName)
+          : null,
+      })),
+    };
+    setRestoreRootInventories((current) => ({
+      ...current,
+      [remote.libraryUuid]: nextInventory,
+    }));
+    return nextInventory;
+  }
+
+  async function chooseRestoreSyncRoot(remote: RemoteLibrarySummary, root: RemoteLibraryRoot) {
+    try {
+      const selected = await pickSyncFolder({
+        libraryUuid: remote.libraryUuid,
+        rootUuid: root.rootUuid,
+        mode: "materialize-remote",
+        suggestedPath: restoreRootInventories[remote.libraryUuid]?.roots.find((item) => item.rootUuid === root.rootUuid)?.targetPath ?? null,
+        dialogTitle: `选择“${root.requestedName}”的同步位置`,
+      });
+      if (!selected) return;
+      setRestoreRootInventories((current) => ({
+        ...current,
+        [remote.libraryUuid]: {
+          ...current[remote.libraryUuid]!,
+          roots: current[remote.libraryUuid]!.roots.map((item) => item.rootUuid === root.rootUuid
+            ? { ...item, selected: true, targetPath: selected }
+            : item),
+        },
+      }));
+      setRestorePreflight(null);
+      setRestoreItems(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
       onFailure(cause);
     }
   }
@@ -284,11 +386,38 @@ export function ManagedLibraryWizard({
     setBusy(true);
     setError(null);
     try {
-      const items = [];
+      const items: SyncRestoreStartItem[] = [];
       for (const remote of selectedRemote) {
         const checked = await preflightLibrary({ name: remote.name, managedRoot: restoreRoots[remote.libraryUuid] });
         if (!checked.ok) throw new Error(`“${remote.name}”无法使用该目录：${checked.reason}`);
-        items.push({ accountUuid: remote.accountUuid, libraryUuid: remote.libraryUuid, name: remote.name, managedRoot: checked.normalizedRoot });
+        const inventory = restoreRootInventories[remote.libraryUuid]
+          ?? await loadRestoreRootInventory(remote);
+        const missingTarget = inventory.roots.find((root) => root.selected && !root.targetPath);
+        if (missingTarget) throw new Error(`请为“${missingTarget.requestedName}”选择同步位置。`);
+        if (inventory.roots.length === 0) {
+          items.push({
+            restoreMode: "legacy-library",
+            accountUuid: remote.accountUuid,
+            libraryUuid: remote.libraryUuid,
+            name: remote.name,
+            managedRoot: checked.normalizedRoot,
+          });
+        } else {
+          items.push({
+            restoreMode: "root-aware",
+            accountUuid: remote.accountUuid,
+            libraryUuid: remote.libraryUuid,
+            placementBase: checked.normalizedRoot,
+            inventoryFence: inventory.inventoryFence,
+            roots: inventory.roots.map((root) => ({
+              rootUuid: root.rootUuid,
+              expectedLogicalRevision: root.logicalRevision,
+              expectedMaterializationFingerprint: root.materializationFingerprint,
+              selected: root.selected,
+              ...(root.selected ? { targetPath: root.targetPath! } : {}),
+            })),
+          });
+        }
       }
       const preflight = await createCoreClient().preflightSyncRestore({ items });
       setRestoreItems(items);
@@ -302,7 +431,7 @@ export function ManagedLibraryWizard({
   }
 
   async function confirmRestore() {
-    if (!restorePreflight || !restoreItems || busy) return;
+    if (!restorePreflight?.preflightToken || !restoreItems || busy) return;
     setBusy(true); setError(null);
     try {
       const response = await createCoreClient().startSyncRestore({ operationUuid: crypto.randomUUID(), preflightToken: restorePreflight.preflightToken, items: restoreItems });
@@ -418,21 +547,35 @@ export function ManagedLibraryWizard({
               <label>
                 <input checked={selected} disabled={!remote.compatible || remote.boundLocally} onChange={(event) => setSelectedRemoteIds((current) => {
                   const next = new Set(current);
-                  if (event.target.checked) next.add(remote.libraryUuid); else next.delete(remote.libraryUuid);
+                  if (event.target.checked) {
+                    next.add(remote.libraryUuid);
+                    if (!restoreRootInventories[remote.libraryUuid]) {
+                      void loadRestoreRootInventory(remote).catch((cause) => {
+                        setError(cause instanceof Error ? cause.message : String(cause));
+                        onFailure(cause);
+                      });
+                    }
+                  } else next.delete(remote.libraryUuid);
                   setRestorePreflight(null);
                   setRestoreItems(null);
                   return next;
                 })} type="checkbox" />
                 <span><strong>{remote.name}</strong><small>{remote.boundLocally ? "已在本机绑定" : remote.compatible ? "可恢复" : remote.errorCode ?? "描述损坏或版本不兼容"}</small>{remoteDetails ? <small>{remoteDetails}</small> : null}</span>
               </label>
-              {selected ? <div className="managed-library-wizard-root"><span>{restoreRoots[remote.libraryUuid] ?? "尚未选择目录"}</span><LiquidGlassButton disabled={busy} onClick={() => void chooseRestoreRoot(remote)} type="button">选择目录…</LiquidGlassButton></div> : null}
+              {selected ? <><div className="managed-library-wizard-root"><span>{restoreRoots[remote.libraryUuid] ?? "尚未选择资源库放置目录"}</span><LiquidGlassButton disabled={busy} onClick={() => void chooseRestoreRoot(remote)} type="button">选择放置目录…</LiquidGlassButton></div>{restoreRootInventories[remote.libraryUuid]?.roots.map((root) => <div className="managed-library-wizard-root" key={root.rootUuid}><label><input checked={root.selected} disabled={!root.compatible || busy} onChange={(event) => { const checked = event.target.checked; setRestoreRootInventories((current) => ({ ...current, [remote.libraryUuid]: { ...current[remote.libraryUuid]!, roots: current[remote.libraryUuid]!.roots.map((item) => item.rootUuid === root.rootUuid ? { ...item, selected: checked, targetPath: checked ? item.targetPath ?? (restoreRoots[remote.libraryUuid] ? proposedRestoreRootPath(restoreRoots[remote.libraryUuid], item.materializedName) : null) : null } : item) } })); setRestorePreflight(null); setRestoreItems(null); }} type="checkbox" /><span>{root.requestedName}</span></label><span>{root.selected ? root.targetPath ?? "尚未选择同步位置" : "仅保留远端清单"}</span>{root.selected ? <LiquidGlassButton disabled={busy} onClick={() => void chooseRestoreSyncRoot(remote, root)} type="button">选择位置…</LiquidGlassButton> : null}</div>)}</> : null}
             </div>;
           })}
         </section>}
         {mode === "restore" && restorePreflight ? <div className="managed-library-restore-confirm" role="status">
-          <strong>恢复预检已通过</strong>
+          <strong>{restorePreflight.ok ? "恢复预检已通过" : "恢复预检需要调整"}</strong>
           <span>{restorePreflight.totalItems} 个资源库 · 预计占用 {formatRemoteSize(restorePreflight.totalBytes)}</span>
-          <small>确认后才会创建本机资源库和启动恢复任务。</small>
+          <small>{restorePreflight.ok ? "确认后才会创建本机资源库和启动恢复任务。" : "请按下方逐项检查容量与目录选择。"}</small>
+          <ul className="managed-library-restore-preflight-roots">
+            {restorePreflight.rootResults.map((result) => <li key={`${result.libraryUuid}:${result.rootUuid}`}><span>{result.rootUuid.slice(0, 8)} · {result.selected ? result.normalizedTargetPath ?? "未提供位置" : "此设备不放置"}</span><span>{result.ok ? `需要 ${formatRemoteSize(result.requiredBytes)}` : result.reason ?? "预检失败"}</span></li>)}
+          </ul>
+          {restorePreflight.volumeResults.length ? <ul aria-label="分卷容量检查" className="managed-library-restore-preflight-volumes">
+            {restorePreflight.volumeResults.map((volume) => <li key={volume.volumeKey}><span>{volume.volumeKey}</span><span>需要 {formatRemoteSize(volume.requiredBytes)} · 可用 {volume.availableBytes == null ? "未知" : formatRemoteSize(volume.availableBytes)} · {volume.ok ? "容量足够" : "容量不足"}</span></li>)}
+          </ul> : null}
         </div> : null}
         {mode === "restore" && restorePlans.length ? <div aria-live="polite" className="managed-library-restore-progress">
           {visibleRestorePlans.map((plan) => <div key={plan.restoreUuid}>
@@ -447,8 +590,8 @@ export function ManagedLibraryWizard({
       </OverlayDialogBody>
       <OverlayDialogActions className="managed-library-wizard-actions">
         {!firstRun ? <LiquidGlassButton disabled={busy} onClick={onClose} type="button">取消</LiquidGlassButton> : null}
-        {mode === "restore" && restorePlans.length ? <LiquidGlassButton onClick={onClose} type="button">完成</LiquidGlassButton> : <LiquidGlassButton disabled={busy || (mode === "restore" && selectedRemote.length === 0)} onClick={() => void (mode === "create" ? submit() : restorePreflight ? confirmRestore() : submitRestore())} type="button">
-          {busy ? (mode === "restore" ? "正在处理…" : "正在创建…") : mode === "restore" ? restorePreflight ? `确认并恢复 ${restorePreflight.totalItems} 个资源库` : `预检 ${selectedRemote.length || ""} 个资源库` : "创建并打开"}
+        {mode === "restore" && restorePlans.length ? <LiquidGlassButton onClick={onClose} type="button">完成</LiquidGlassButton> : <LiquidGlassButton disabled={busy || (mode === "restore" && selectedRemote.length === 0)} onClick={() => void (mode === "create" ? submit() : restorePreflight?.ok ? confirmRestore() : submitRestore())} type="button">
+          {busy ? (mode === "restore" ? "正在处理…" : "正在创建…") : mode === "restore" ? restorePreflight?.ok ? `确认并恢复 ${restorePreflight.totalItems} 个资源库` : `预检 ${selectedRemote.length || ""} 个资源库` : "创建并打开"}
         </LiquidGlassButton>}
       </OverlayDialogActions>
     </ModalSurface>

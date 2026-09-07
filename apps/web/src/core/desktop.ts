@@ -8,6 +8,7 @@ import type {
 import { createCoreClient } from "./client.ts";
 import type {
   DesktopNotificationsBridge,
+  DesktopFolderPickerRequest,
   MediaFocusCommand,
   MediaFocusCancellation,
   MediaFocusCompletion,
@@ -24,6 +25,7 @@ export type {
   DesktopNotificationHistoryQuery,
   DesktopNotificationOperation,
   DesktopNotificationsBridge,
+  DesktopFolderPickerRequest,
   DesktopNotificationStatus,
   DesktopProcessLogBatch,
   DesktopProcessLogExportResult,
@@ -102,7 +104,7 @@ export interface MegleDesktopBridge {
   notifySecondaryWindowReady?: (
     role: DesktopSecondaryWindowRole
   ) => Promise<DesktopSecondaryWindowRevealResult | false>;
-  pickFolder?: () => Promise<string | null>;
+  pickFolder?: (request?: DesktopFolderPickerRequest) => Promise<string | null>;
   diagnostics?: () => Promise<DesktopDiagnostics>;
   openSettingsWindow?: () => Promise<boolean>;
   closeSettingsWindow?: () => Promise<boolean>;
@@ -216,8 +218,12 @@ export function canPickNativeFolder(): boolean {
   return typeof getDesktopBridge()?.pickFolder === "function";
 }
 
-export async function pickNativeFolder(): Promise<string | null> {
-  return (await getDesktopBridge()?.pickFolder?.()) ?? null;
+export async function pickNativeFolder(request?: DesktopFolderPickerRequest): Promise<string | null> {
+  return (await getDesktopBridge()?.pickFolder?.(request)) ?? null;
+}
+
+export async function pickSyncFolder(request: DesktopFolderPickerRequest): Promise<string | null> {
+  return pickNativeFolder(request);
 }
 
 export function getWindowControls(): DesktopWindowControls | null {

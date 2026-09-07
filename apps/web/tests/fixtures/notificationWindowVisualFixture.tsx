@@ -398,12 +398,14 @@ function NotificationWindowVisualFixture() {
               {page === "status" ? (
                 <NotificationStatusView
                   cancel={cancel}
+                  dismissManagedRoot={async () => ({ ok: true, message: null })}
                   model={buildCompactNotificationModel(compactSnapshot)}
                   onOpenFailureLogs={(intent) => {
                     setLogIntent(intent);
                     setPage("logs");
                   }}
                   refreshCompact={async () => ({ ok: true, value: true })}
+                  reviewManagedRoot={async () => ({ ok: true, message: null })}
                 />
               ) : null}
               {page === "history" ? (
@@ -430,7 +432,7 @@ function NotificationWindowVisualFixture() {
               {page === "logs" ? (
                 <ProcessLogView
                   authoritativeFailures={
-                    logIntent?.logFilter.eventKind === "thumbnail_failure"
+                    logIntent?.page === "logs" && logIntent.logFilter.eventKind === "thumbnail_failure"
                       ? compactSnapshot.thumbnailSummaries.find(
                           (summary) => summary.libraryId === logIntent.logFilter.libraryId
                         )?.failureDetails ?? []
@@ -447,10 +449,10 @@ function NotificationWindowVisualFixture() {
                       error: null
                     }
                   })}
-                  failureSnapshot={logIntent?.failureSnapshot}
+                  failureSnapshot={logIntent?.page === "logs" ? logIntent.failureSnapshot : null}
                   getLogPage={async (query) => ({ ok: true, value: pageLogs(query) })}
-                  initialFilter={logIntent?.logFilter}
-                  key={`${logIntent?.logFilter.eventKind ?? "session"}:${logIntent?.logFilter.libraryId ?? "all"}`}
+                  initialFilter={logIntent?.page === "logs" ? logIntent.logFilter : undefined}
+                  key={`${logIntent?.page === "logs" ? logIntent.logFilter.eventKind : "session"}:${logIntent?.page === "logs" ? logIntent.logFilter.libraryId : "all"}`}
                   openLogSubscription={openLogSubscription}
                 />
               ) : null}

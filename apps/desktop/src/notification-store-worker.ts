@@ -27,7 +27,7 @@ import type {
   ThumbnailCacheSummary
 } from "./notification-types.js";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 const SQLITE_INITIALIZATION_RETRY_DELAYS_MS = [2, 4, 8, 16, 32, 64, 128, 256] as const;
 const SQLITE_RETRY_SLEEP = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
@@ -169,6 +169,30 @@ function validateOperation(operation: NotificationOperationInput): void {
   assertNullableString(operation.summary, "operation.summary");
   assertNullableSafeInteger(operation.taskId, "operation.taskId");
   assertNullableSafeInteger(operation.rootId, "operation.rootId");
+  if (operation.libraryUuid !== undefined && operation.libraryUuid !== null) {
+    assertString(operation.libraryUuid, "operation.libraryUuid");
+  }
+  if (operation.rootUuid !== undefined && operation.rootUuid !== null) {
+    assertString(operation.rootUuid, "operation.rootUuid");
+  }
+  if (operation.managedRootAction !== undefined) {
+    assertObject(operation.managedRootAction, "operation.managedRootAction");
+    if (operation.managedRootAction.kind !== "review-placement") {
+      throw new TypeError("operation.managedRootAction.kind is invalid");
+    }
+    assertString(operation.managedRootAction.libraryUuid, "operation.managedRootAction.libraryUuid");
+    assertString(operation.managedRootAction.rootUuid, "operation.managedRootAction.rootUuid");
+    assertSafeInteger(
+      operation.managedRootAction.inventoryRevision,
+      "operation.managedRootAction.inventoryRevision"
+    );
+    if (
+      operation.libraryUuid !== operation.managedRootAction.libraryUuid ||
+      operation.rootUuid !== operation.managedRootAction.rootUuid
+    ) {
+      throw new RangeError("managed root action identity must match operation identity");
+    }
+  }
   assertNullableSafeInteger(operation.folderId, "operation.folderId");
   assertNullableSafeInteger(operation.fileId, "operation.fileId");
   assertSafeInteger(operation.currentValue, "operation.currentValue");
@@ -372,6 +396,14 @@ function initializeSchema(database: DatabaseSync): void {
           batch_id TEXT PRIMARY KEY,
           applied_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS managed_root_dismissals (
+          library_id TEXT NOT NULL,
+          operation_id TEXT NOT NULL,
+          root_uuid TEXT NOT NULL,
+          inventory_revision INTEGER NOT NULL CHECK(inventory_revision >= 0),
+          dismissed_at INTEGER NOT NULL,
+          PRIMARY KEY(library_id, operation_id, root_uuid)
+        );
       `);
     }
     if (lockedVersion > 0 && lockedVersion < SCHEMA_VERSION) {
@@ -408,6 +440,18 @@ function initializeSchema(database: DatabaseSync): void {
           CREATE TABLE IF NOT EXISTS local_recovery_batches (
             batch_id TEXT PRIMARY KEY,
             applied_at INTEGER NOT NULL
+          );
+        `);
+      }
+      if (lockedVersion < 5) {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS managed_root_dismissals (
+            library_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            root_uuid TEXT NOT NULL,
+            inventory_revision INTEGER NOT NULL CHECK(inventory_revision >= 0),
+            dismissed_at INTEGER NOT NULL,
+            PRIMARY KEY(library_id, operation_id, root_uuid)
           );
         `);
       }
@@ -653,6 +697,13 @@ class NotificationStoreDatabase {
          FROM operations
          LEFT JOIN action_errors USING(library_id, operation_id)
          WHERE operations.status IN ('pending', 'running')
+           AND NOT EXISTS (
+             SELECT 1 FROM managed_root_dismissals dismissal
+             WHERE dismissal.library_id=operations.library_id
+               AND dismissal.operation_id=operations.operation_id
+               AND dismissal.root_uuid=json_extract(operations.payload_json,'$.managedRootAction.rootUuid')
+               AND dismissal.inventory_revision>=json_extract(operations.payload_json,'$.managedRootAction.inventoryRevision')
+           )
          ORDER BY operations.updated_at DESC, operations.library_id ASC,
                   operations.operation_id ASC`
       )
@@ -714,6 +765,20 @@ class NotificationStoreDatabase {
       latestImportantResults: latestImportantResults.map(rowToOperation),
       retryableFailures
     };
+  }
+
+  dismissManagedRoot(libraryId: string, operationId: string, rootUuid: string, inventoryRevision: number, dismissedAt: number): void {
+    const operation = this.getOperation(libraryId, operationId);
+    const action = operation?.managedRootAction;
+    if (
+      action?.kind !== "review-placement" ||
+      action.libraryUuid !== libraryId ||
+      action.rootUuid !== rootUuid ||
+      action.inventoryRevision !== inventoryRevision
+    ) {
+      throw new Error("managed-root-notification-not-found");
+    }
+    this.database.prepare(`INSERT INTO managed_root_dismissals(library_id,operation_id,root_uuid,inventory_revision,dismissed_at) VALUES (?,?,?,?,?) ON CONFLICT(library_id,operation_id,root_uuid) DO UPDATE SET inventory_revision=MAX(inventory_revision,excluded.inventory_revision),dismissed_at=excluded.dismissed_at`).run(libraryId,operationId,rootUuid,inventoryRevision,dismissedAt);
   }
 
   history(query: NotificationHistoryQuery): NotificationHistoryPage {
@@ -1241,6 +1306,9 @@ function executeRequest(store: NotificationStoreDatabase, request: NotificationS
       return null;
     case "compactSnapshot":
       return store.compactSnapshot();
+    case "dismissManagedRoot":
+      store.dismissManagedRoot(request.params.libraryId, request.params.operationId, request.params.rootUuid, request.params.inventoryRevision, request.params.dismissedAt);
+      return null;
     case "history":
       return store.history(request.params.query);
     case "historyFacets":
@@ -1289,6 +1357,7 @@ const REQUEST_METHODS = new Set<NotificationStoreRequest["method"]>([
   "syncState",
   "markAcknowledged",
   "compactSnapshot",
+  "dismissManagedRoot",
   "history",
   "historyFacets",
   "getOperation",

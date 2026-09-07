@@ -58,6 +58,7 @@ export function NotificationWindow() {
   const tabOrientation = useNotificationTabOrientation();
 
   const applyIntent = useCallback((intent: NotificationWindowIntent) => {
+    if (intent.page !== "logs") return;
     focusIntentPanelRef.current = true;
     setLogFilter(intent.logFilter);
     setFailureSnapshot(intent.failureSnapshot);
@@ -166,9 +167,11 @@ export function NotificationWindow() {
           >
             <NotificationStatusView
               cancel={notifications.cancel}
+              dismissManagedRoot={notifications.dismissManagedRoot}
               model={notifications.compact}
               onOpenFailureLogs={applyIntent}
               refreshCompact={notifications.refreshCompact}
+              reviewManagedRoot={notifications.reviewManagedRoot}
             />
           </section>
         ) : null}

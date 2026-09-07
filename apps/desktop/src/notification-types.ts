@@ -115,6 +115,11 @@ export type NotificationStoreRequest =
   | { requestId: string; method: "historyFacets"; params: Record<string, never> }
   | {
       requestId: string;
+      method: "dismissManagedRoot";
+      params: { libraryId: string; operationId: string; rootUuid: string; inventoryRevision: number; dismissedAt: number };
+    }
+  | {
+      requestId: string;
       method: "getOperation";
       params: { libraryId: string; operationId: string };
     }
