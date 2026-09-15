@@ -2173,27 +2173,6 @@ async fn sync_folder_contract_read(
 ) -> ApiResult<Response> {
     sync_folder_v2_gate(&state, &library_uuid)?;
     let manager = sync_folder_library_manager(&state)?;
-    let actionable = manager
-        .refresh_sync_folder_inventory(&library_uuid)
-        .await
-        .map_err(sync_folder_error)?;
-    for root_uuid in actionable {
-        if let Some(root) = manager
-            .registry()
-            .remote_sync_root(&library_uuid, &root_uuid)
-            .map_err(sync_folder_error)?
-        {
-            manager
-                .publish_sync_folder_placement_required(
-                    &library_uuid,
-                    &root_uuid,
-                    root.inventory_revision,
-                    &root.requested_name,
-                )
-                .await
-                .map_err(sync_folder_error)?;
-        }
-    }
     let settings = manager
         .registry()
         .sync_folder_settings(&library_uuid)
@@ -2278,8 +2257,35 @@ async fn sync_folder_contract_write(
             if stored_mode != mode_name || stored_hash != request_hash {
                 return Err(sync_folder_error(anyhow::anyhow!("idempotency-key-reused")));
             }
-            if expires_at < crate::host_registry::unix_timestamp_millis_for_runtime() {
+            let operation_started = manager
+                .registry()
+                .root_operation(&token)
+                .map_err(sync_folder_error)?
+                .is_some_and(|operation| {
+                    operation.kind == "enroll"
+                        && matches!(operation.state.as_str(), "pending" | "running" | "waiting")
+                });
+            if expires_at < crate::host_registry::unix_timestamp_millis_for_runtime()
+                && !operation_started
+            {
                 return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+            }
+            let mut result = result;
+            if operation_started
+                && expires_at < crate::host_registry::unix_timestamp_millis_for_runtime()
+            {
+                let refreshed_expires_at =
+                    crate::host_registry::unix_timestamp_millis_for_runtime()
+                        + crate::sync_folders::PLAN_TTL_MILLIS;
+                manager
+                    .registry()
+                    .refresh_started_root_path_preflight(
+                        &token,
+                        &library_uuid,
+                        refreshed_expires_at,
+                    )
+                    .map_err(sync_folder_error)?;
+                result["expiresAt"] = serde_json::json!(refreshed_expires_at);
             }
             return Ok(Json(result).into_response());
         }
@@ -2287,25 +2293,190 @@ async fn sync_folder_contract_write(
             .registry()
             .local_root_bindings(&library_uuid)
             .map_err(sync_folder_error)?;
+        let candidate_key = crate::sync_folders::canonical_path_key(FilePath::new(&request.path));
+        let path_binding = manager
+            .registry()
+            .local_root_binding_for_canonical_path(&candidate_key)
+            .map_err(sync_folder_error)?;
+        if path_binding
+            .as_ref()
+            .is_some_and(|binding| binding.library_uuid != library_uuid)
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+        }
+        let matching_binding = path_binding.as_ref();
+        let recovery_marker = if matching_binding.is_none()
+            && FilePath::new(&request.path)
+                .join(crate::sync_folders::ROOT_MARKER_FILE_NAME)
+                .is_file()
+        {
+            Some(
+                crate::sync_folders::read_root_marker(FilePath::new(&request.path))
+                    .map_err(sync_folder_error)?,
+            )
+        } else {
+            None
+        };
         let paths = bindings
             .iter()
+            .filter(|binding| {
+                matching_binding.is_none_or(|matching| {
+                    binding.local_binding_uuid != matching.local_binding_uuid
+                })
+            })
             .map(|value| std::path::PathBuf::from(&value.local_path))
             .collect::<Vec<_>>();
         let validated = crate::sync_folders::validate_root_path(
             FilePath::new(&request.path),
-            mode,
+            if matching_binding.is_some() || recovery_marker.is_some() {
+                crate::sync_folders::RootPathMode::RebindExisting
+            } else {
+                mode
+            },
             FilePath::new(&settings.default_placement_base),
             &paths,
         )
         .map_err(sync_folder_error)?;
-        let root_uuid = request
-            .root_uuid
+        let identity_bindings = validated
+            .filesystem_identity
+            .as_deref()
+            .map(|identity| {
+                manager
+                    .registry()
+                    .local_root_bindings_for_filesystem_identity(identity)
+            })
+            .transpose()
+            .map_err(sync_folder_error)?
+            .unwrap_or_default();
+        if identity_bindings.iter().any(|identity_binding| {
+            matching_binding.is_none_or(|binding| {
+                binding.local_binding_uuid != identity_binding.local_binding_uuid
+            })
+        }) {
+            return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+        }
+        if manager
+            .other_library_sync_root_identity_for_path(
+                &library_uuid,
+                validated.normalized_path.clone(),
+            )
+            .await
+            .map_err(sync_folder_error)?
+            .is_some()
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+        }
+        let existing_identity = manager
+            .sync_root_identity_for_path(&library_uuid, validated.normalized_path.clone())
+            .await
+            .map_err(sync_folder_error)?;
+        if let Some(requested_root_uuid) = request.root_uuid.as_deref() {
+            let discovered_root_uuid = existing_identity
+                .as_ref()
+                .map(|(root_uuid, _)| root_uuid.to_string())
+                .or_else(|| {
+                    recovery_marker
+                        .as_ref()
+                        .map(|marker| marker.root_uuid.clone())
+                });
+            if discovered_root_uuid
+                .as_deref()
+                .is_some_and(|root_uuid| root_uuid != requested_root_uuid)
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+            }
+        }
+        let root_uuid = existing_identity
+            .as_ref()
+            .map(|(root_uuid, _)| root_uuid.to_string())
+            .or_else(|| {
+                recovery_marker
+                    .as_ref()
+                    .map(|marker| marker.root_uuid.clone())
+            })
+            .or(request.root_uuid)
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        if let Some(binding) = matching_binding {
+            if binding.root_uuid != root_uuid {
+                return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+            }
+            let marker =
+                crate::sync_folders::read_root_marker(FilePath::new(&validated.normalized_path))
+                    .map_err(sync_folder_error)?;
+            if marker.library_uuid != library_uuid
+                || marker.root_uuid != root_uuid
+                || marker.local_binding_uuid != binding.local_binding_uuid
+                || marker.binding_generation != binding.binding_generation
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("marker-mismatch")));
+            }
+        }
+        if let Some(operation) = manager
+            .registry()
+            .latest_root_operation_of_kind(&library_uuid, &root_uuid, "enroll")
+            .map_err(sync_folder_error)?
+            .filter(|operation| {
+                matches!(operation.state.as_str(), "pending" | "running" | "waiting")
+            })
+        {
+            let stored_request: SyncFolderEnrollmentMutation =
+                serde_json::from_str(&operation.request_json)
+                    .map_err(|error| sync_folder_error(error.into()))?;
+            if crate::sync_folders::canonical_path_key(FilePath::new(&stored_request.path))
+                != validated.canonical_path_key
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("operation-in-progress")));
+            }
+            let (_, stored_mode, _, _, mut result, expires_at, _) = manager
+                .registry()
+                .root_path_preflight(&stored_request.preflight_token, &library_uuid)
+                .map_err(sync_folder_error)?;
+            if stored_mode != mode_name {
+                return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+            }
+            if let Some(marker) = recovery_marker.as_ref() {
+                let expected_root_folder_uuid = existing_identity
+                    .as_ref()
+                    .map(|(_, root_folder_uuid)| root_folder_uuid.to_string())
+                    .unwrap_or_else(|| stored_request.root_folder_uuid.clone());
+                if marker.library_uuid != library_uuid
+                    || marker.root_uuid != operation.root_uuid
+                    || marker.root_folder_uuid != expected_root_folder_uuid
+                    || marker.local_binding_uuid
+                        != result
+                            .get("bindingUuid")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                    || marker.binding_generation != 1
+                {
+                    return Err(sync_folder_error(anyhow::anyhow!("marker-mismatch")));
+                }
+            }
+            if expires_at < crate::host_registry::unix_timestamp_millis_for_runtime() {
+                let refreshed_expires_at =
+                    crate::host_registry::unix_timestamp_millis_for_runtime()
+                        + crate::sync_folders::PLAN_TTL_MILLIS;
+                manager
+                    .registry()
+                    .refresh_started_root_path_preflight(
+                        &stored_request.preflight_token,
+                        &library_uuid,
+                        refreshed_expires_at,
+                    )
+                    .map_err(sync_folder_error)?;
+                result["expiresAt"] = serde_json::json!(refreshed_expires_at);
+            }
+            return Ok(Json(result).into_response());
+        }
+        if recovery_marker.is_some() {
+            return Err(sync_folder_error(anyhow::anyhow!("marker-mismatch")));
+        }
         let occupied = manager
             .registry()
             .remote_sync_roots(&library_uuid)
             .map_err(sync_folder_error)?
             .into_iter()
+            .filter(|item| item.root_uuid != root_uuid)
             .map(|item| {
                 crate::sync::reducer::materialized_name_compare_key(&item.materialized_name)
             })
@@ -2328,7 +2499,9 @@ async fn sync_folder_contract_write(
             expires_at,
             Some(&materialized_name),
         );
-        result["bindingUuid"] = serde_json::json!(uuid::Uuid::now_v7().to_string());
+        result["bindingUuid"] = serde_json::json!(matching_binding
+            .map(|binding| binding.local_binding_uuid.clone())
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()));
         manager
             .registry()
             .store_root_path_preflight(
@@ -2345,87 +2518,119 @@ async fn sync_folder_contract_write(
         return Ok(Json(result).into_response());
     }
     if uri.path().ends_with("/enrollment/commit") {
-        let request: SyncFolderEnrollmentMutation = deserialize_sync_folder_body(&body)?;
-        if let Some(operation) = manager
+        let submitted_request: SyncFolderEnrollmentMutation = deserialize_sync_folder_body(&body)?;
+        let submitted_preflight_token = submitted_request.preflight_token.clone();
+        let exact_operation = manager
             .registry()
-            .root_operation(&request.operation_uuid)
-            .map_err(sync_folder_error)?
+            .root_operation(&submitted_request.operation_uuid)
+            .map_err(sync_folder_error)?;
+        let existing_binding = manager
+            .registry()
+            .local_root_binding(&library_uuid, &submitted_request.root_uuid)
+            .map_err(sync_folder_error)?;
+        if let Some(operation) = exact_operation
+            .as_ref()
+            .filter(|operation| operation.state == "completed")
         {
             let request_hash =
                 crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
             if operation.library_uuid != library_uuid
-                || operation.root_uuid != request.root_uuid
+                || operation.root_uuid != submitted_request.root_uuid
                 || operation.kind != "enroll"
                 || operation.request_hash != request_hash
             {
                 return Err(sync_folder_error(anyhow::anyhow!("idempotency-key-reused")));
             }
-            if operation.state == "completed" {
-                let descriptor = manager
-                    .registry()
-                    .remote_sync_root(&library_uuid, &request.root_uuid)
-                    .map_err(sync_folder_error)?
-                    .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-not-found")))?;
-                let binding = manager
-                    .registry()
-                    .local_root_binding(&library_uuid, &request.root_uuid)
-                    .map_err(sync_folder_error)?
-                    .ok_or_else(|| {
-                        sync_folder_error(anyhow::anyhow!("local-root-binding-not-found"))
-                    })?;
-                manager
-                    .ensure_selected_sync_root(
-                        &library_uuid,
-                        uuid::Uuid::parse_str(&request.root_uuid)
-                            .map_err(|error| sync_folder_error(error.into()))?,
-                        uuid::Uuid::parse_str(&descriptor.root_folder_uuid)
-                            .map_err(|error| sync_folder_error(error.into()))?,
-                        binding.local_path,
-                        descriptor.requested_name,
-                        descriptor.materialized_name,
-                        crate::sync::media::parse_hash(&descriptor.materialization_fingerprint)
-                            .map_err(sync_folder_error)?,
-                        uuid::Uuid::parse_str(&binding.local_binding_uuid)
-                            .map_err(|error| sync_folder_error(error.into()))?,
-                        uuid::Uuid::parse_str(
-                            binding
-                                .root_capture_epoch
-                                .as_deref()
-                                .unwrap_or(&binding.local_binding_uuid),
-                        )
-                        .map_err(|error| sync_folder_error(error.into()))?,
-                        uuid::Uuid::parse_str(
-                            binding
-                                .root_actor_epoch
-                                .as_deref()
-                                .unwrap_or(&binding.local_binding_uuid),
-                        )
-                        .map_err(|error| sync_folder_error(error.into()))?,
-                        binding.binding_generation,
-                        binding.state,
-                        binding.operation_revision,
-                        true,
-                    )
-                    .await
-                    .map_err(sync_folder_error)?;
-                return Ok(
-                    (StatusCode::ACCEPTED, Json(root_operation_json(&operation))).into_response(),
-                );
+            return Ok((StatusCode::ACCEPTED, Json(root_operation_json(operation))).into_response());
+        }
+        let coordinated_operation = if exact_operation.is_none() {
+            manager
+                .registry()
+                .latest_root_operation_of_kind(
+                    &library_uuid,
+                    &submitted_request.root_uuid,
+                    "enroll",
+                )
+                .map_err(sync_folder_error)?
+                .filter(|operation| {
+                    matches!(operation.state.as_str(), "pending" | "running" | "waiting")
+                        || (operation.state == "completed"
+                            && existing_binding.as_ref().is_some_and(|binding| {
+                                binding.state == "local-rename-required"
+                                    || binding.applied_materialized_name.is_none()
+                                    || binding.applied_materialization_fingerprint.is_none()
+                            }))
+                })
+        } else {
+            None
+        };
+        let existing_operation = exact_operation.or(coordinated_operation);
+        let (request, operation_body) = if let Some(operation) = existing_operation.as_ref() {
+            let stored_request: SyncFolderEnrollmentMutation =
+                serde_json::from_str(&operation.request_json)
+                    .map_err(|error| sync_folder_error(error.into()))?;
+            let same_request = operation.operation_uuid == submitted_request.operation_uuid;
+            if same_request {
+                let request_hash =
+                    crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
+                if operation.library_uuid != library_uuid
+                    || operation.root_uuid != submitted_request.root_uuid
+                    || operation.kind != "enroll"
+                    || operation.request_hash != request_hash
+                {
+                    return Err(sync_folder_error(anyhow::anyhow!("idempotency-key-reused")));
+                }
+            } else if operation.library_uuid != library_uuid
+                || operation.root_uuid != submitted_request.root_uuid
+                || crate::sync_folders::canonical_path_key(FilePath::new(&stored_request.path))
+                    != crate::sync_folders::canonical_path_key(FilePath::new(
+                        &submitted_request.path,
+                    ))
+                || stored_request.requested_name != submitted_request.requested_name
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("operation-in-progress")));
+            }
+            let stored_body = serde_json::from_str(&operation.request_json)
+                .map_err(|error| sync_folder_error(error.into()))?;
+            (stored_request, stored_body)
+        } else {
+            (submitted_request, body)
+        };
+        if let Some(operation) = existing_operation.as_ref() {
+            if operation.library_uuid != library_uuid
+                || operation.root_uuid != request.root_uuid
+                || operation.kind != "enroll"
+            {
+                return Err(sync_folder_error(anyhow::anyhow!("idempotency-key-reused")));
             }
         }
+        let resuming_unfinished_operation = existing_operation.as_ref().is_some_and(|operation| {
+            matches!(operation.state.as_str(), "pending" | "running" | "waiting")
+        });
+        let validation_preflight_token = if existing_operation
+            .as_ref()
+            .is_some_and(|operation| operation.state == "completed")
+        {
+            &submitted_preflight_token
+        } else {
+            &request.preflight_token
+        };
         let (planned_root, mode, _hash, planned, result, expires_at, _) = manager
             .registry()
-            .root_path_preflight(&request.preflight_token, &library_uuid)
+            .root_path_preflight(validation_preflight_token, &library_uuid)
             .map_err(sync_folder_error)?;
         if mode != "enroll-existing"
             || planned_root.as_deref() != Some(&request.root_uuid)
-            || expires_at < crate::host_registry::unix_timestamp_millis_for_runtime()
+            || (expires_at < crate::host_registry::unix_timestamp_millis_for_runtime()
+                && !resuming_unfinished_operation)
         {
             return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
         }
         let planned_request: SyncFolderPathPreflightMutation =
             serde_json::from_value(planned).map_err(|error| sync_folder_error(error.into()))?;
-        if planned_request.path != request.path {
+        if crate::sync_folders::canonical_path_key(FilePath::new(&planned_request.path))
+            != crate::sync_folders::canonical_path_key(FilePath::new(&request.path))
+        {
             return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
         }
         let evidence: crate::sync_folders::ValidatedRootPath = serde_json::from_value(
@@ -2435,29 +2640,145 @@ async fn sync_folder_contract_write(
                 .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?,
         )
         .map_err(|error| sync_folder_error(error.into()))?;
+        let identity_bindings = evidence
+            .filesystem_identity
+            .as_deref()
+            .map(|identity| {
+                manager
+                    .registry()
+                    .local_root_bindings_for_filesystem_identity(identity)
+            })
+            .transpose()
+            .map_err(sync_folder_error)?
+            .unwrap_or_default();
+        let evidence_path_key =
+            crate::sync_folders::canonical_path_key(FilePath::new(&evidence.normalized_path));
+        if identity_bindings.iter().any(|identity_binding| {
+            identity_binding.library_uuid != library_uuid
+                || identity_binding.root_uuid != request.root_uuid
+                || identity_binding.canonical_path_key != evidence_path_key
+        }) {
+            return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+        }
+        if manager
+            .other_library_sync_root_identity_for_path(
+                &library_uuid,
+                evidence.normalized_path.clone(),
+            )
+            .await
+            .map_err(sync_folder_error)?
+            .is_some()
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+        }
+        let bindings = manager
+            .registry()
+            .local_root_bindings(&library_uuid)
+            .map_err(sync_folder_error)?;
+        let request_path_key =
+            crate::sync_folders::canonical_path_key(FilePath::new(&request.path));
+        let path_binding = manager
+            .registry()
+            .local_root_binding_for_canonical_path(&request_path_key)
+            .map_err(sync_folder_error)?;
+        if path_binding.as_ref().is_some_and(|binding| {
+            binding.library_uuid != library_uuid || binding.root_uuid != request.root_uuid
+        }) {
+            return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+        }
+        let matching_binding = path_binding.as_ref();
+        let existing_identity = manager
+            .sync_root_identity_for_path(&library_uuid, evidence.normalized_path.clone())
+            .await
+            .map_err(sync_folder_error)?;
+        let root_uuid = uuid::Uuid::parse_str(&request.root_uuid)
+            .map_err(|error| sync_folder_error(error.into()))?;
+        let catalog_identity = existing_identity;
+        let root_folder_uuid =
+            if let Some((existing_root_uuid, existing_root_folder_uuid)) = catalog_identity {
+                if existing_root_uuid != root_uuid {
+                    return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
+                }
+                existing_root_folder_uuid
+            } else if matching_binding.is_some() {
+                let remote = manager
+                    .registry()
+                    .remote_sync_root(&library_uuid, &request.root_uuid)
+                    .map_err(sync_folder_error)?
+                    .ok_or_else(|| sync_folder_error(anyhow::anyhow!("path-changed")))?;
+                uuid::Uuid::parse_str(&remote.root_folder_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?
+            } else {
+                uuid::Uuid::parse_str(&request.root_folder_uuid)
+                    .map_err(|error| sync_folder_error(error.into()))?
+            };
+        let root_folder_uuid_string = root_folder_uuid.to_string();
+        let local_binding_uuid = result
+            .get("bindingUuid")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?
+            .parse::<uuid::Uuid>()
+            .map_err(|error| sync_folder_error(error.into()))?;
+        if matching_binding
+            .is_some_and(|binding| binding.local_binding_uuid != local_binding_uuid.to_string())
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("stale-plan")));
+        }
+        let marker = crate::sync_folders::SyncRootMarker {
+            format_version: 1,
+            library_uuid: library_uuid.clone(),
+            root_uuid: request.root_uuid.clone(),
+            root_folder_uuid: root_folder_uuid_string.clone(),
+            local_binding_uuid: local_binding_uuid.to_string(),
+            binding_generation: 1,
+        };
+        // Publication can finish before the Host binding transaction. Only the
+        // unfinished durable operation's exact marker may cross that boundary;
+        // the guarded publisher verifies it again before any binding is committed.
+        let recovering_published_marker = resuming_unfinished_operation
+            && matching_binding.is_none()
+            && FilePath::new(&request.path)
+                .join(crate::sync_folders::ROOT_MARKER_FILE_NAME)
+                .exists();
+        if recovering_published_marker
+            && crate::sync_folders::read_root_marker(FilePath::new(&request.path))
+                .map_err(sync_folder_error)?
+                != marker
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("marker-mismatch")));
+        }
+        let replaying_owned_browse_root = resuming_unfinished_operation
+            && request_path_key == evidence.canonical_path_key
+            && (matching_binding.is_some()
+                || existing_identity
+                    .as_ref()
+                    .is_some_and(|(existing_root_uuid, _)| *existing_root_uuid == root_uuid));
         let current = crate::sync_folders::validate_root_path(
             FilePath::new(&request.path),
-            crate::sync_folders::RootPathMode::EnrollExisting,
+            if matching_binding.is_some() || recovering_published_marker {
+                crate::sync_folders::RootPathMode::RebindExisting
+            } else {
+                crate::sync_folders::RootPathMode::EnrollExisting
+            },
             FilePath::new(&settings.default_placement_base),
-            &manager
-                .registry()
-                .local_root_bindings(&library_uuid)
-                .map_err(sync_folder_error)?
+            &bindings
                 .iter()
+                .filter(|binding| {
+                    matching_binding.is_none_or(|matching| {
+                        binding.local_binding_uuid != matching.local_binding_uuid
+                    })
+                })
                 .map(|value| std::path::PathBuf::from(&value.local_path))
                 .collect::<Vec<_>>(),
         )
         .map_err(sync_folder_error)?;
         if current.identity_token != evidence.identity_token
-            || current.content_evidence_digest != evidence.content_evidence_digest
-            || current.normalized_path != evidence.normalized_path
+            || current.canonical_path_key != evidence.canonical_path_key
+            || (!replaying_owned_browse_root
+                && current.content_evidence_digest != evidence.content_evidence_digest)
         {
             return Err(sync_folder_error(anyhow::anyhow!("path-changed")));
         }
-        let root_uuid = uuid::Uuid::parse_str(&request.root_uuid)
-            .map_err(|error| sync_folder_error(error.into()))?;
-        let root_folder_uuid = uuid::Uuid::parse_str(&request.root_folder_uuid)
-            .map_err(|error| sync_folder_error(error.into()))?;
         let occupied = manager
             .registry()
             .remote_sync_roots(&library_uuid)
@@ -2479,7 +2800,7 @@ async fn sync_folder_contract_write(
             .upsert_remote_sync_root(
                 &library_uuid,
                 &request.root_uuid,
-                &request.root_folder_uuid,
+                &root_folder_uuid_string,
                 &request.requested_name,
                 &materialized,
                 &fingerprint,
@@ -2489,8 +2810,9 @@ async fn sync_folder_contract_write(
                 None,
             )
             .map_err(sync_folder_error)?;
-        let request_hash = crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
-        let (operation, _) = manager
+        let request_hash =
+            crate::sync_folders::request_hash(&operation_body).map_err(sync_folder_error)?;
+        let (_operation, _) = manager
             .registry()
             .begin_root_operation_once(
                 &request.operation_uuid,
@@ -2499,16 +2821,11 @@ async fn sync_folder_contract_write(
                 "enroll",
                 "preflighting",
                 &request_hash,
-                &body,
+                &operation_body,
                 request.expected_operation_revision,
                 None,
             )
             .map_err(sync_folder_error)?;
-        if operation.state == "completed" {
-            return Ok(
-                (StatusCode::ACCEPTED, Json(root_operation_json(&operation))).into_response(),
-            );
-        }
         let plan =
             serde_json::json!({"preflightToken":request.preflight_token,"pathEvidence":current});
         manager
@@ -2520,33 +2837,44 @@ async fn sync_folder_contract_write(
                 "capturing-seed",
             )
             .map_err(sync_folder_error)?;
-        let local_binding_uuid = result
-            .get("bindingUuid")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?
-            .parse::<uuid::Uuid>()
+        let marker_operation_uuid = uuid::Uuid::parse_str(&request.operation_uuid)
             .map_err(|error| sync_folder_error(error.into()))?;
-        let marker = crate::sync_folders::SyncRootMarker {
-            format_version: 1,
-            library_uuid: library_uuid.clone(),
-            root_uuid: request.root_uuid.clone(),
-            root_folder_uuid: request.root_folder_uuid.clone(),
-            local_binding_uuid: local_binding_uuid.to_string(),
-            binding_generation: 1,
-        };
-        crate::sync_folders::write_root_marker(FilePath::new(&current.normalized_path), &marker)
-            .map_err(sync_folder_error)?;
+        let operation_temporary_marker = crate::sync_folders::root_marker_temporary_path(
+            FilePath::new(&current.normalized_path),
+            marker_operation_uuid,
+        );
+        if operation_temporary_marker.exists()
+            && (!resuming_unfinished_operation
+                || catalog_identity != Some((root_uuid, root_folder_uuid)))
+        {
+            return Err(sync_folder_error(anyhow::anyhow!("marker-mismatch")));
+        }
+        let marker_preexisted = FilePath::new(&current.normalized_path)
+            .join(crate::sync_folders::ROOT_MARKER_FILE_NAME)
+            .exists();
+        crate::sync_folders::write_root_marker_for_operation(
+            FilePath::new(&current.normalized_path),
+            &marker,
+            marker_operation_uuid,
+            current
+                .filesystem_identity
+                .as_deref()
+                .ok_or_else(|| sync_folder_error(anyhow::anyhow!("path-changed")))?,
+        )
+        .map_err(sync_folder_error)?;
         let marker_identity = match crate::library_path::local_file_identity(
             &FilePath::new(&current.normalized_path)
                 .join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
         ) {
             Ok(identity) => identity,
             Err(error) => {
-                let _ = crate::sync_folders::remove_root_marker_if_matches(
-                    FilePath::new(&current.normalized_path),
-                    &marker,
-                    false,
-                );
+                if !marker_preexisted {
+                    let _ = crate::sync_folders::remove_root_marker_if_matches(
+                        FilePath::new(&current.normalized_path),
+                        &marker,
+                        false,
+                    );
+                }
                 return Err(sync_folder_error(error.into()));
             }
         };
@@ -2562,11 +2890,28 @@ async fn sync_folder_contract_write(
             filesystem_identity: current.filesystem_identity.clone(),
             state: "active".to_owned(),
             binding_generation: 1,
-            root_capture_epoch: Some(uuid::Uuid::now_v7().to_string()),
-            root_actor_epoch: Some(uuid::Uuid::now_v7().to_string()),
+            root_capture_epoch: matching_binding
+                .and_then(|binding| binding.root_capture_epoch.clone())
+                .or_else(|| Some(uuid::Uuid::now_v7().to_string())),
+            root_actor_epoch: matching_binding
+                .and_then(|binding| binding.root_actor_epoch.clone())
+                .or_else(|| Some(uuid::Uuid::now_v7().to_string())),
             desired_materialized_name: materialized.clone(),
             desired_materialization_fingerprint: fingerprint.clone(),
-            operation_revision: request.expected_operation_revision + 1,
+            applied_materialized_name: Some(materialized.clone()),
+            applied_materialization_fingerprint: Some(fingerprint.clone()),
+            operation_revision: matching_binding
+                .map(|binding| {
+                    if binding.state == "local-rename-required"
+                        || binding.applied_materialization_fingerprint.as_deref()
+                            != Some(fingerprint.as_str())
+                    {
+                        binding.operation_revision.saturating_add(1)
+                    } else {
+                        binding.operation_revision
+                    }
+                })
+                .unwrap_or(request.expected_operation_revision + 1),
             verification_json: plan,
         };
         let stored = match manager.registry().commit_local_root_binding(
@@ -2576,11 +2921,13 @@ async fn sync_folder_contract_write(
         ) {
             Ok(stored) => stored,
             Err(error) => {
-                let _ = crate::sync_folders::remove_root_marker_if_matches(
-                    FilePath::new(&current.normalized_path),
-                    &marker,
-                    false,
-                );
+                if !marker_preexisted {
+                    let _ = crate::sync_folders::remove_root_marker_if_matches(
+                        FilePath::new(&current.normalized_path),
+                        &marker,
+                        false,
+                    );
+                }
                 return Err(sync_folder_error(error));
             }
         };
@@ -2615,15 +2962,20 @@ async fn sync_folder_contract_write(
             )
             .await
             .map_err(sync_folder_error)?;
-        manager
-            .registry()
-            .consume_root_path_preflight(&request.preflight_token, &library_uuid)
-            .map_err(sync_folder_error)?;
         let completed = manager
             .registry()
-            .root_operation(&request.operation_uuid)
-            .map_err(sync_folder_error)?
-            .ok_or_else(|| sync_folder_error(anyhow::anyhow!("root-operation-not-found")))?;
+            .complete_root_enrollment(
+                &request.operation_uuid,
+                &request.preflight_token,
+                &request.preflight_token,
+            )
+            .map_err(sync_folder_error)?;
+        if submitted_preflight_token != request.preflight_token {
+            let _ = manager
+                .registry()
+                .consume_root_path_preflight(&submitted_preflight_token, &library_uuid);
+        }
+        manager.wake_sync_folder_workers();
         return Ok((StatusCode::ACCEPTED, Json(root_operation_json(&completed))).into_response());
     }
     if uri.path().ends_with("/selection/preflight") {
@@ -3014,7 +3366,7 @@ async fn sync_folder_contract_write(
         }
         let mut bindings = Vec::new();
         for (item, descriptor, current, binding_uuid, marker_identity) in &owned {
-            bindings.push(crate::host_registry::NewLocalRootBinding{library_uuid:library_uuid.clone(),root_uuid:item.root_uuid.clone(),local_binding_uuid:binding_uuid.to_string(),local_path:current.normalized_path.clone(),canonical_path_key:current.canonical_path_key.clone(),placement_parent:current.placement_parent.clone(),placement_parent_key:current.placement_parent_key.clone(),marker_identity:marker_identity.clone(),filesystem_identity:current.filesystem_identity.clone(),state:"materializing".to_owned(),binding_generation:1,root_capture_epoch:Some(uuid::Uuid::now_v7().to_string()),root_actor_epoch:Some(uuid::Uuid::now_v7().to_string()),desired_materialized_name:descriptor.materialized_name.clone(),desired_materialization_fingerprint:descriptor.materialization_fingerprint.clone(),operation_revision:item.expected_operation_revision+1,verification_json:serde_json::json!({"preflightToken":request.preflight_token,"pathEvidence":current})});
+            bindings.push(crate::host_registry::NewLocalRootBinding{library_uuid:library_uuid.clone(),root_uuid:item.root_uuid.clone(),local_binding_uuid:binding_uuid.to_string(),local_path:current.normalized_path.clone(),canonical_path_key:current.canonical_path_key.clone(),placement_parent:current.placement_parent.clone(),placement_parent_key:current.placement_parent_key.clone(),marker_identity:marker_identity.clone(),filesystem_identity:current.filesystem_identity.clone(),state:"materializing".to_owned(),binding_generation:1,root_capture_epoch:Some(uuid::Uuid::now_v7().to_string()),root_actor_epoch:Some(uuid::Uuid::now_v7().to_string()),desired_materialized_name:descriptor.materialized_name.clone(),desired_materialization_fingerprint:descriptor.materialization_fingerprint.clone(),applied_materialized_name:None,applied_materialization_fingerprint:None,operation_revision:item.expected_operation_revision+1,verification_json:serde_json::json!({"preflightToken":request.preflight_token,"pathEvidence":current})});
         }
         let deselections = request
             .items
@@ -3952,6 +4304,8 @@ async fn sync_folder_contract_root_write(
             root_actor_epoch: Some(uuid::Uuid::now_v7().to_string()),
             desired_materialized_name: descriptor.materialized_name.clone(),
             desired_materialization_fingerprint: descriptor.materialization_fingerprint.clone(),
+            applied_materialized_name: None,
+            applied_materialization_fingerprint: None,
             operation_revision: request.expected_operation_revision + 1,
             verification_json: plan,
         };
@@ -5093,6 +5447,11 @@ async fn run_sync_command(
                 .resume_library_sync_with_revision(&library_uuid, expected)
                 .await
         }
+        "retry" => {
+            manager
+                .retry_library_sync_with_revision(&library_uuid, expected)
+                .await
+        }
         _ => {
             manager
                 .wake_library_sync_with_revision(&library_uuid, expected)
@@ -5773,6 +6132,8 @@ async fn start_restore(
                         desired_materialization_fingerprint: fact
                             .materialization_fingerprint
                             .clone(),
+                        applied_materialized_name: None,
+                        applied_materialization_fingerprint: None,
                         operation_revision: 0,
                         verification_json: serde_json::json!({"inventoryFence":inventory_fence}),
                     })
@@ -9257,6 +9618,16 @@ mod tests {
     };
     use crate::db::{Database, NewRoot, ThumbnailTaskPriority};
     use crate::thumbnails::{PREVIEW_2048_PROFILE, PREVIEW_3072_PROFILE};
+
+    #[test]
+    fn sync_folder_marker_write_failures_are_redacted_as_internal_errors() {
+        let error = super::sync_folder_error(anyhow::anyhow!(
+            "marker-write-failed: publish marker: sensitive path"
+        ));
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code.as_deref(), Some("internal-error"));
+        assert_eq!(error.message, "Synchronized-folder operation failed");
+    }
 
     #[test]
     fn restore_contract_keeps_legacy_compatibility_and_rejects_unknown_modes() {
@@ -12763,6 +13134,1019 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[tokio::test]
+    async fn sync_folder_reads_do_not_schedule_work_and_refresh_deduplicates_placement() {
+        let base = unique_temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
+            .await
+            .unwrap();
+        let manager = state.library_manager.clone().unwrap();
+        manager.shutdown_sync_coordinator().await.unwrap();
+        let library = manager
+            .create_library(
+                "Read-only inventory".into(),
+                None,
+                None,
+                base.join("managed"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        let library_uuid = &library.library_uuid;
+        let registry = manager.registry();
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.megle.read-fixture",
+                version: "1.0.0",
+                manifest_json: "{}",
+                entry_relative_path: "fake-provider",
+                entry_sha256: &[0; 32],
+                install_root: &base,
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account(
+                "read-fixture-account",
+                "com.megle.read-fixture",
+                None,
+                "authenticated",
+            )
+            .unwrap();
+        registry
+            .set_plugin_intent("com.megle.read-fixture", true, true)
+            .unwrap();
+        registry
+            .record_plugin_runtime_ready(
+                "com.megle.read-fixture",
+                "test-session",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+        registry
+            .begin_sync_binding(
+                library_uuid,
+                "com.megle.read-fixture",
+                "read-fixture-account",
+            )
+            .unwrap();
+        let root_uuid = uuid::Uuid::now_v7();
+        let descriptor = crate::db::SyncRootDescriptorRecord {
+            root_uuid: *root_uuid.as_bytes(),
+            root_folder_uuid: *uuid::Uuid::now_v7().as_bytes(),
+            library_root_uuid: *uuid::Uuid::parse_str(&library.root_uuid)
+                .unwrap()
+                .as_bytes(),
+            creation_event_uuid: None,
+            winning_location_revision_uuid: None,
+            requested_name: "Photos".into(),
+            materialized_name: "Photos".into(),
+            materialization_fingerprint: [1; 32],
+            lifecycle: "active".into(),
+            logical_revision: 1,
+            updated_at: 1,
+        };
+        let root_text = root_uuid.to_string();
+        let runtime = state.resources().unwrap();
+        let catalog = state.open_read_database().unwrap().unwrap();
+        let app = router(state.clone());
+        let sync_status = || {
+            let mut status =
+                serde_json::to_value(registry.sync_status_snapshot().unwrap()).unwrap();
+            status.as_object_mut().unwrap().remove("generatedAt");
+            status
+        };
+        for revision in [1, 2] {
+            let mut descriptor = descriptor.clone();
+            descriptor.logical_revision = revision;
+            descriptor.materialization_fingerprint = [revision as u8; 32];
+            runtime
+                .writer
+                .write(move |database| database.upsert_sync_root_descriptor(&descriptor))
+                .await
+                .unwrap();
+            // A real authoritative-commit hook would reset this future poll
+            // and increment the Host status revision, even with no scheduler.
+            registry
+                .record_sync_turn_success(library_uuid, true)
+                .unwrap();
+            let before = sync_status();
+            assert!(before["libraries"][0]["pollAfter"].as_i64().unwrap() > 0);
+            let inventory = registry.remote_sync_roots(library_uuid).unwrap();
+            let notifications = catalog.list_notification_outbox(0, 100).unwrap();
+            let mut suffixes = vec![String::new(), "/settings".into()];
+            if revision > 1 {
+                suffixes.push(format!("/{root_uuid}"));
+            }
+            for _ in 0..2 {
+                for suffix in &suffixes {
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(format!(
+                                    "/api/libraries/{library_uuid}/sync-folders{suffix}"
+                                ))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let response = response_json(response).await;
+                    if suffix.is_empty() {
+                        assert_eq!(response["items"].as_array().unwrap().len(), inventory.len());
+                    }
+                }
+            }
+            assert_eq!(
+                sync_status(),
+                before,
+                "GET must not invoke the active writer's authoritative-commit wake"
+            );
+            assert_eq!(registry.remote_sync_roots(library_uuid).unwrap(), inventory);
+            assert!(registry
+                .local_root_bindings(library_uuid)
+                .unwrap()
+                .is_empty());
+            assert!(registry
+                .root_operations(library_uuid, &root_text, None, 100, "all")
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                catalog.list_notification_outbox(0, 100).unwrap(),
+                notifications
+            );
+            assert_eq!(
+                manager
+                    .refresh_sync_folder_inventory(library_uuid)
+                    .await
+                    .unwrap(),
+                vec![root_text.clone()]
+            );
+            let published = catalog.list_notification_outbox(0, 100).unwrap();
+            assert_eq!(published.len(), revision as usize);
+            let notification = &published.last().unwrap().operation;
+            assert_eq!(
+                notification.library_uuid.as_deref(),
+                Some(library_uuid.as_str())
+            );
+            assert_eq!(notification.root_uuid.as_deref(), Some(root_text.as_str()));
+            assert_eq!(
+                notification.operation_id,
+                format!("sync-folder-placement:{library_uuid}:{root_uuid}:{revision}")
+            );
+            assert!(manager
+                .refresh_sync_folder_inventory(library_uuid)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(catalog.list_notification_outbox(0, 100).unwrap(), published);
+        }
+        drop(catalog);
+        runtime.shutdown().await.unwrap();
+        drop(app);
+        drop(state);
+        drop(manager);
+        drop(runtime);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    enum EnrollmentRecoveryBoundary {
+        TemporaryMarker,
+        PublishedMarker,
+        HostBinding,
+    }
+
+    #[tokio::test]
+    async fn enrollment_replays_a_catalog_owned_existing_root_after_marker_publish_failure() {
+        verify_catalog_owned_enrollment_recovery(EnrollmentRecoveryBoundary::TemporaryMarker).await;
+    }
+
+    #[tokio::test]
+    async fn enrollment_recovers_a_published_marker_before_host_binding_commit() {
+        verify_catalog_owned_enrollment_recovery(EnrollmentRecoveryBoundary::PublishedMarker).await;
+    }
+
+    #[tokio::test]
+    async fn enrollment_activation_recovers_host_binding_before_catalog_projection() {
+        verify_catalog_owned_enrollment_recovery(EnrollmentRecoveryBoundary::HostBinding).await;
+    }
+
+    async fn verify_catalog_owned_enrollment_recovery(boundary: EnrollmentRecoveryBoundary) {
+        let base = unique_temp_dir();
+        let existing_root = base.join("existing-root");
+        fs::create_dir_all(&existing_root).expect("create existing browse root");
+        fs::write(existing_root.join("photo.jpg"), b"existing media").expect("seed existing media");
+        let host_path = base.join("host.sqlite");
+        let state = AppState::new_host(host_path.clone(), base.join("libraries"))
+            .await
+            .expect("create Host state");
+        let manager = state.library_manager.clone().expect("library manager");
+        let created = manager
+            .create_library(
+                "Enrollment replay".to_string(),
+                None,
+                None,
+                base.join("managed"),
+                None,
+                true,
+            )
+            .await
+            .expect("create library");
+        let library_uuid = created.0.library_uuid;
+        let mut context_revision = manager.active_snapshot().context_revision;
+        let app = router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/roots")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "path": existing_root.to_string_lossy(),
+                            "displayName": "Existing Root"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build add-root request"),
+            )
+            .await
+            .expect("add browse root");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let task_id = response_json(response).await["taskId"]
+            .as_i64()
+            .expect("scan task id");
+        wait_for_task_status(&app, task_id, "succeeded").await;
+
+        let foreign_library_uuid = manager
+            .create_library(
+                "Foreign catalog owner".to_string(),
+                None,
+                None,
+                base.join("foreign-managed"),
+                None,
+                false,
+            )
+            .await
+            .expect("create foreign library")
+            .0
+            .library_uuid;
+        let catalog_only_root = base.join("catalog-only-root");
+        fs::create_dir_all(&catalog_only_root).expect("create Catalog-only root");
+        let foreign_root_id = manager
+            .write_sync_folder_catalog(&foreign_library_uuid, {
+                let catalog_only_root = catalog_only_root.clone();
+                move |database| {
+                    let root_id = database.add_root(crate::db::NewRoot {
+                        path: fs::canonicalize(&catalog_only_root)?
+                            .to_string_lossy()
+                            .into_owned(),
+                        display_name: "Catalog-only Root".to_string(),
+                    })?;
+                    database.upsert_folder(crate::db::FolderUpsert {
+                        root_id,
+                        parent_id: None,
+                        name: String::new(),
+                        path_hash: "foreign-root-sentinel".to_string(),
+                        mtime: Some(1),
+                    })?;
+                    Ok(root_id)
+                }
+            })
+            .await
+            .expect("seed foreign Catalog ownership");
+        assert!(foreign_root_id > 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": uuid::Uuid::now_v7().to_string(),
+                            "expectedOperationRevision": 0,
+                            "rootUuid": null,
+                            "mode": "enroll-existing",
+                            "path": catalog_only_root.to_string_lossy()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build cross-library Catalog preflight request"),
+            )
+            .await
+            .expect("reject Catalog-owned path from another Library");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = response_json(response).await;
+        assert_eq!(response["code"], "path-occupied", "{response}");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": uuid::Uuid::now_v7().to_string(),
+                            "expectedOperationRevision": 0,
+                            "rootUuid": uuid::Uuid::now_v7().to_string(),
+                            "mode": "enroll-existing",
+                            "path": existing_root.to_string_lossy()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build mismatched root preflight request"),
+            )
+            .await
+            .expect("reject mismatched existing root identity");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = response_json(response).await;
+        assert_eq!(response["code"], "path-occupied", "{response}");
+
+        let original_operation_uuid = uuid::Uuid::now_v7().to_string();
+        let preflight_request = serde_json::json!({
+            "operationUuid": original_operation_uuid,
+            "expectedOperationRevision": 0,
+            "rootUuid": null,
+            "mode": "enroll-existing",
+            "path": existing_root.to_string_lossy()
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(preflight_request.to_string()))
+                    .expect("build enrollment preflight request"),
+            )
+            .await
+            .expect("preflight enrollment");
+        assert_eq!(response.status(), StatusCode::OK);
+        let preflight = response_json(response).await;
+        let root_uuid = preflight["rootUuid"].as_str().expect("root uuid");
+        let binding_uuid = preflight["bindingUuid"].as_str().expect("binding uuid");
+        let normalized_path = preflight["normalizedPath"]
+            .as_str()
+            .expect("normalized path");
+        let (_, root_folder_uuid) = manager
+            .sync_root_identity_for_path(&library_uuid, normalized_path.to_owned())
+            .await
+            .expect("read existing root identity")
+            .expect("existing root identity");
+        let requested_name = existing_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("root name");
+        #[cfg(windows)]
+        let equivalent_commit_path = {
+            let mut path = normalized_path.to_owned();
+            path.replace_range(..1, &path[..1].to_ascii_lowercase());
+            path
+        };
+        #[cfg(not(windows))]
+        let equivalent_commit_path = normalized_path.to_owned();
+        let commit_body = serde_json::json!({
+            "operationUuid": original_operation_uuid,
+            "expectedOperationRevision": 0,
+            "rootUuid": root_uuid,
+            "rootFolderUuid": uuid::Uuid::now_v7().to_string(),
+            "preflightToken": original_operation_uuid,
+            "path": equivalent_commit_path,
+            "requestedName": requested_name
+        });
+        let materialized = crate::sync_folders::default_materialized_name(
+            requested_name,
+            uuid::Uuid::parse_str(root_uuid).expect("valid root uuid"),
+            &std::collections::BTreeSet::new(),
+        );
+        let fingerprint = crate::sync_folders::materialization_fingerprint(&materialized);
+        manager
+            .registry()
+            .upsert_remote_sync_root(
+                &library_uuid,
+                root_uuid,
+                &root_folder_uuid.to_string(),
+                requested_name,
+                &materialized,
+                &fingerprint,
+                0,
+                "active",
+                None,
+                None,
+            )
+            .expect("stage remote root");
+        let request_hash = crate::sync_folders::request_hash(&commit_body).unwrap();
+        manager
+            .registry()
+            .begin_root_operation_once(
+                &original_operation_uuid,
+                &library_uuid,
+                root_uuid,
+                "enroll",
+                "preflighting",
+                &request_hash,
+                &commit_body,
+                0,
+                None,
+            )
+            .expect("begin enrollment");
+        let evidence: crate::sync_folders::ValidatedRootPath =
+            serde_json::from_value(preflight["pathEvidence"].clone()).expect("path evidence");
+        let plan = serde_json::json!({
+            "preflightToken": original_operation_uuid,
+            "pathEvidence": evidence
+        });
+        manager
+            .registry()
+            .set_root_operation_plan(
+                &original_operation_uuid,
+                &original_operation_uuid,
+                &plan,
+                "capturing-seed",
+            )
+            .expect("set enrollment plan");
+        fs::write(
+            existing_root.join("arrived-after-preflight.jpg"),
+            b"late media",
+        )
+        .expect("add media while enrollment waits");
+        let marker = crate::sync_folders::SyncRootMarker {
+            format_version: 1,
+            library_uuid: library_uuid.clone(),
+            root_uuid: root_uuid.to_owned(),
+            root_folder_uuid: root_folder_uuid.to_string(),
+            local_binding_uuid: binding_uuid.to_owned(),
+            binding_generation: 1,
+        };
+        let unrelated_temporary_marker = existing_root.join(format!(
+            "{}.{}.tmp",
+            crate::sync_folders::ROOT_MARKER_FILE_NAME,
+            uuid::Uuid::now_v7()
+        ));
+        fs::write(
+            &unrelated_temporary_marker,
+            serde_json::to_vec_pretty(&marker).expect("serialize unrelated marker"),
+        )
+        .expect("leave unrelated temporary marker");
+        let interrupted_temporary_marker = existing_root.join(format!(
+            "{}.{}.tmp",
+            crate::sync_folders::ROOT_MARKER_FILE_NAME,
+            original_operation_uuid
+        ));
+        let mismatched_marker = crate::sync_folders::SyncRootMarker {
+            root_folder_uuid: uuid::Uuid::now_v7().to_string(),
+            ..marker.clone()
+        };
+        fs::write(
+            &interrupted_temporary_marker,
+            serde_json::to_vec_pretty(&mismatched_marker)
+                .expect("serialize mismatched operation marker"),
+        )
+        .expect("leave mismatched interrupted temporary marker");
+        let interrupted_revision = manager
+            .registry()
+            .root_operation(&original_operation_uuid)
+            .unwrap()
+            .expect("interrupted enrollment operation")
+            .operation_revision;
+        rusqlite::Connection::open(&host_path)
+            .expect("open Host database")
+            .execute(
+                "UPDATE root_path_preflights SET expires_at=0 WHERE preflight_token=?1",
+                [&original_operation_uuid],
+            )
+            .expect("expire interrupted preflight");
+
+        let replacement_operation_uuid = uuid::Uuid::now_v7().to_string();
+        let replacement_preflight = serde_json::json!({
+            "operationUuid": replacement_operation_uuid,
+            "expectedOperationRevision": 0,
+            "rootUuid": null,
+            "mode": "enroll-existing",
+            "path": existing_root.to_string_lossy()
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(replacement_preflight.to_string()))
+                    .expect("build replacement preflight request"),
+            )
+            .await
+            .expect("resume staged preflight");
+        assert_eq!(response.status(), StatusCode::OK);
+        let resumed_preflight = response_json(response).await;
+        assert_eq!(resumed_preflight["preflightToken"], original_operation_uuid);
+        assert_eq!(resumed_preflight["bindingUuid"], binding_uuid);
+        assert_eq!(
+            manager
+                .registry()
+                .root_operation(&original_operation_uuid)
+                .unwrap()
+                .expect("unchanged interrupted enrollment operation")
+                .operation_revision,
+            interrupted_revision
+        );
+        let replacement_commit = serde_json::json!({
+            "operationUuid": replacement_operation_uuid,
+            "expectedOperationRevision": 0,
+            "rootUuid": root_uuid,
+            "rootFolderUuid": uuid::Uuid::now_v7().to_string(),
+            "preflightToken": resumed_preflight["preflightToken"],
+            "path": resumed_preflight["normalizedPath"],
+            "requestedName": requested_name
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-megle-context-revision", context_revision.to_string())
+                    .body(Body::from(replacement_commit.to_string()))
+                    .expect("build replacement enrollment commit"),
+            )
+            .await
+            .expect("reject mismatched staged marker");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = response_json(response).await;
+        assert_eq!(response["code"], "path-occupied", "{response}");
+        assert!(!existing_root
+            .join(crate::sync_folders::ROOT_MARKER_FILE_NAME)
+            .exists());
+        assert!(manager
+            .registry()
+            .local_root_binding(&library_uuid, root_uuid)
+            .unwrap()
+            .is_none());
+        fs::write(
+            &interrupted_temporary_marker,
+            serde_json::to_vec_pretty(&marker).expect("serialize operation marker"),
+        )
+        .expect("repair interrupted temporary marker");
+
+        if matches!(
+            boundary,
+            EnrollmentRecoveryBoundary::PublishedMarker | EnrollmentRecoveryBoundary::HostBinding
+        ) {
+            crate::sync_folders::write_root_marker_for_operation(
+                &existing_root,
+                &marker,
+                uuid::Uuid::parse_str(&original_operation_uuid).unwrap(),
+                evidence.filesystem_identity.as_deref().unwrap(),
+            )
+            .expect("publish marker before the simulated Host commit interruption");
+            assert!(manager
+                .registry()
+                .local_root_binding(&library_uuid, root_uuid)
+                .unwrap()
+                .is_none());
+            let final_path = existing_root.join(crate::sync_folders::ROOT_MARKER_FILE_NAME);
+            let final_identity = crate::library_path::local_file_identity(&final_path).unwrap();
+            for field in [
+                "libraryUuid",
+                "rootUuid",
+                "rootFolderUuid",
+                "localBindingUuid",
+                "bindingGeneration",
+            ] {
+                let mut foreign_marker = serde_json::to_value(&marker).unwrap();
+                foreign_marker[field] = if field == "bindingGeneration" {
+                    serde_json::json!(2)
+                } else {
+                    serde_json::json!(uuid::Uuid::now_v7().to_string())
+                };
+                let foreign_bytes = serde_json::to_vec_pretty(&foreign_marker).unwrap();
+                fs::write(&final_path, &foreign_bytes).unwrap();
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(format!(
+                                "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
+                            ))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header("x-megle-context-revision", context_revision.to_string())
+                            .body(Body::from(replacement_commit.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT, "{field}");
+                assert!(manager
+                    .registry()
+                    .local_root_binding(&library_uuid, root_uuid)
+                    .unwrap()
+                    .is_none());
+                assert_eq!(fs::read(&final_path).unwrap(), foreign_bytes, "{field}");
+            }
+            fs::write(&final_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+            assert_eq!(
+                crate::library_path::local_file_identity(&final_path).unwrap(),
+                final_identity
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!(
+                            "/api/libraries/{library_uuid}/sync-folders/enrollment/preflight"
+                        ))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(replacement_preflight.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let resumed = response_json(response).await;
+            assert_eq!(resumed["preflightToken"], original_operation_uuid);
+            assert_eq!(resumed["bindingUuid"], binding_uuid);
+        }
+
+        if matches!(boundary, EnrollmentRecoveryBoundary::HostBinding) {
+            let projected_root_uuid = uuid::Uuid::parse_str(root_uuid).unwrap();
+            manager
+                .write_sync_folder_catalog(&library_uuid, move |database| {
+                    assert!(database
+                        .sync_root_descriptor(projected_root_uuid.as_bytes())?
+                        .is_none());
+                    assert!(database
+                        .sync_root_local_binding(projected_root_uuid.as_bytes())?
+                        .is_none());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            manager
+                .registry()
+                .commit_local_root_binding(
+                    &original_operation_uuid,
+                    &original_operation_uuid,
+                    &crate::host_registry::NewLocalRootBinding {
+                        library_uuid: library_uuid.clone(),
+                        root_uuid: root_uuid.to_owned(),
+                        local_binding_uuid: binding_uuid.to_owned(),
+                        local_path: equivalent_commit_path.clone(),
+                        canonical_path_key: evidence.canonical_path_key.clone(),
+                        placement_parent: evidence.placement_parent.clone(),
+                        placement_parent_key: evidence.placement_parent_key.clone(),
+                        marker_identity: crate::library_path::local_file_identity(
+                            &existing_root.join(crate::sync_folders::ROOT_MARKER_FILE_NAME),
+                        )
+                        .unwrap(),
+                        filesystem_identity: evidence.filesystem_identity.clone(),
+                        state: "active".into(),
+                        binding_generation: 1,
+                        root_capture_epoch: Some(uuid::Uuid::now_v7().to_string()),
+                        root_actor_epoch: Some(uuid::Uuid::now_v7().to_string()),
+                        desired_materialized_name: materialized.clone(),
+                        desired_materialization_fingerprint: fingerprint.clone(),
+                        applied_materialized_name: Some(materialized.clone()),
+                        applied_materialization_fingerprint: Some(fingerprint.clone()),
+                        operation_revision: 1,
+                        verification_json: plan.clone(),
+                    },
+                )
+                .expect("commit Host binding before the simulated Catalog interruption");
+            manager.activate(&foreign_library_uuid).await.unwrap();
+            manager
+                .activate(&library_uuid)
+                .await
+                .expect("activation must finish the inherited Catalog root projection");
+            context_revision = manager.active_snapshot().context_revision;
+            manager
+                .write_sync_folder_catalog(&library_uuid, move |database| {
+                    let descriptor = database
+                        .sync_root_descriptor(projected_root_uuid.as_bytes())?
+                        .expect("recovered descriptor");
+                    assert_eq!(descriptor.root_folder_uuid, *root_folder_uuid.as_bytes());
+                    assert!(database
+                        .sync_root_local_binding(projected_root_uuid.as_bytes())?
+                        .is_some());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-megle-context-revision", context_revision.to_string())
+                    .body(Body::from(replacement_commit.to_string()))
+                    .expect("build corrected replacement enrollment commit"),
+            )
+            .await
+            .expect("complete staged enrollment with matching marker");
+        let response_status = response.status();
+        let completed = response_json(response).await;
+        assert_eq!(response_status, StatusCode::ACCEPTED, "{completed}");
+        assert_eq!(completed["operationUuid"], original_operation_uuid);
+        assert_eq!(completed["state"], "completed");
+        assert_eq!(
+            crate::sync_folders::read_root_marker(&existing_root).unwrap(),
+            marker
+        );
+        assert!(!interrupted_temporary_marker.exists());
+        assert!(
+            unrelated_temporary_marker.exists(),
+            "recovery must not adopt or clean an unrelated operation's marker"
+        );
+
+        let binding = manager
+            .registry()
+            .local_root_binding(&library_uuid, root_uuid)
+            .unwrap()
+            .expect("read completed binding");
+        assert_eq!(binding.state, "active");
+        assert_eq!(
+            binding.applied_materialized_name.as_deref(),
+            Some(materialized.as_str())
+        );
+        assert_eq!(
+            binding.applied_materialization_fingerprint.as_deref(),
+            Some(fingerprint.as_str())
+        );
+        assert!(manager
+            .registry()
+            .pending_automatic_root_renames(&library_uuid)
+            .unwrap()
+            .is_empty());
+        let tasks = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/tasks")
+                    .body(Body::empty())
+                    .expect("build task list request"),
+            )
+            .await
+            .expect("list tasks after enrollment");
+        assert_eq!(tasks.status(), StatusCode::OK);
+        let tasks = response_json(tasks).await;
+        assert!(
+            tasks["items"].as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .filter(|task| task["kind"] == "root_scan")
+                    .count()
+                    >= 2
+                    && items.iter().any(|task| {
+                        task["kind"] == "root_scan"
+                            && matches!(
+                                task["status"].as_str(),
+                                Some("pending" | "running" | "succeeded")
+                            )
+                    })
+            }),
+            "{tasks}"
+        );
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/libraries/{library_uuid}/sync-folders"))
+                    .body(Body::empty())
+                    .expect("build synchronized-root list request"),
+            )
+            .await
+            .expect("list synchronized roots");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = response_json(listed).await;
+        assert!(
+            listed["items"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["descriptor"]["rootUuid"] == root_uuid
+                        && item["binding"]["state"] == "active"
+                })
+            }),
+            "{listed}"
+        );
+
+        #[cfg(windows)]
+        let foreign_path = {
+            let direct_text = existing_root.to_string_lossy();
+            let drive = direct_text.chars().next().expect("drive letter");
+            assert_eq!(direct_text.as_bytes().get(1), Some(&b':'));
+            format!(
+                r"\\localhost\{}$\{}",
+                drive,
+                direct_text[3..].replace('/', r"\")
+            )
+        };
+        #[cfg(not(windows))]
+        let foreign_path = existing_root.to_string_lossy().into_owned();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{foreign_library_uuid}/sync-folders/enrollment/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": uuid::Uuid::now_v7().to_string(),
+                            "expectedOperationRevision": 0,
+                            "rootUuid": null,
+                            "mode": "enroll-existing",
+                            "path": foreign_path
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build cross-library preflight request"),
+            )
+            .await
+            .expect("reject path bound to another Library");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = response_json(response).await;
+        assert_eq!(response["code"], "path-occupied", "{response}");
+
+        let changed_operation_uuid = uuid::Uuid::now_v7().to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": changed_operation_uuid,
+                            "expectedOperationRevision": 0,
+                            "rootUuid": null,
+                            "mode": "enroll-existing",
+                            "path": existing_root.to_string_lossy()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build completed enrollment replay preflight"),
+            )
+            .await
+            .expect("preflight completed enrollment replay");
+        assert_eq!(response.status(), StatusCode::OK);
+        let changed_preflight = response_json(response).await;
+        fs::write(
+            existing_root.join("arrived-after-completed-preflight.jpg"),
+            b"new content",
+        )
+        .expect("change content after completed enrollment preflight");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-megle-context-revision", context_revision.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": changed_operation_uuid,
+                            "expectedOperationRevision": 0,
+                            "rootUuid": root_uuid,
+                            "rootFolderUuid": uuid::Uuid::now_v7().to_string(),
+                            "preflightToken": changed_preflight["preflightToken"],
+                            "path": changed_preflight["normalizedPath"],
+                            "requestedName": requested_name
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build changed completed enrollment commit"),
+            )
+            .await
+            .expect("reject changed completed enrollment replay");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = response_json(response).await;
+        assert_eq!(response["code"], "path-occupied", "{response}");
+
+        rusqlite::Connection::open(&host_path)
+            .expect("reopen Host database")
+            .execute(
+                "UPDATE local_root_bindings SET state='local-rename-required',applied_materialized_name=NULL,applied_materialized_name_key=NULL,applied_materialization_fingerprint=NULL,last_error_code='local-rename-required',operation_revision=operation_revision+1 WHERE library_uuid=?1 AND root_uuid=?2",
+                rusqlite::params![library_uuid,root_uuid],
+            )
+            .expect("simulate legacy automatic rename failure");
+        let repair_operation_uuid = uuid::Uuid::now_v7().to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/preflight"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": repair_operation_uuid,
+                            "expectedOperationRevision": 0,
+                            "rootUuid": null,
+                            "mode": "enroll-existing",
+                            "path": existing_root.to_string_lossy()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build legacy repair preflight"),
+            )
+            .await
+            .expect("preflight legacy repair");
+        assert_eq!(response.status(), StatusCode::OK);
+        let repair_preflight = response_json(response).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-megle-context-revision", context_revision.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "operationUuid": repair_operation_uuid,
+                            "expectedOperationRevision": 0,
+                            "rootUuid": root_uuid,
+                            "rootFolderUuid": uuid::Uuid::now_v7().to_string(),
+                            "preflightToken": repair_preflight["preflightToken"],
+                            "path": repair_preflight["normalizedPath"],
+                            "requestedName": requested_name
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build legacy repair commit"),
+            )
+            .await
+            .expect("repair completed legacy enrollment");
+        let response_status = response.status();
+        let repaired = response_json(response).await;
+        assert_eq!(response_status, StatusCode::ACCEPTED, "{repaired}");
+        assert_eq!(repaired["operationUuid"], original_operation_uuid);
+        let repaired_binding = manager
+            .registry()
+            .local_root_binding(&library_uuid, root_uuid)
+            .unwrap()
+            .expect("read repaired binding");
+        assert_eq!(repaired_binding.state, "active");
+        assert_eq!(
+            repaired_binding
+                .applied_materialization_fingerprint
+                .as_deref(),
+            Some(fingerprint.as_str())
+        );
+
+        drop(app);
+        drop(state);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        fs::remove_file(unrelated_temporary_marker).expect("remove unrelated temporary marker");
+        let _ = fs::remove_dir_all(base);
+    }
+
     /// Empty-string env vars (e.g. `${MEGLE_SESSION_TOKEN:-}` from
     /// `compose.yaml`) used to be threaded into `ApiConfig.session_token` as
     /// `Some("")`, which made the auth middleware compare every incoming
@@ -14867,6 +16251,267 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = response_json(response).await;
         assert_eq!(body["code"], "plugin_not_found");
+    }
+
+    #[tokio::test]
+    async fn sync_retry_route_recovers_runnable_phase_and_preserves_command_fences() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
+            .await
+            .unwrap();
+        let manager = state.library_manager.clone().unwrap();
+        // Drive actual coordinator turns explicitly so assertions cannot race
+        // the scheduler or the test-only Provider supervisor.
+        manager.shutdown_sync_coordinator().await.unwrap();
+        let registry = manager.registry();
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.megle.fake",
+                version: "1.0.0",
+                manifest_json: "{}",
+                entry_relative_path: "fake-provider",
+                entry_sha256: &[0; 32],
+                install_root: &base,
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account(
+                "fake-account",
+                "com.megle.fake",
+                Some("Test"),
+                "authenticated",
+            )
+            .unwrap();
+        registry
+            .set_plugin_intent("com.megle.fake", true, true)
+            .unwrap();
+        registry
+            .record_plugin_runtime_ready(
+                "com.megle.fake",
+                "test-session",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+        manager
+            .provider_manager()
+            .register(
+                "com.megle.fake",
+                "fake-account",
+                std::sync::Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
+            )
+            .unwrap();
+        let created = manager
+            .create_library(
+                "Retry Library".into(),
+                None,
+                None,
+                base.join("managed"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        let library_uuid = &created.library_uuid;
+        let revision = manager.active_snapshot().context_revision;
+        registry
+            .begin_sync_binding(library_uuid, "com.megle.fake", "fake-account")
+            .unwrap();
+        registry
+            .record_sync_turn_error(library_uuid, "test_failure")
+            .unwrap();
+        let original = registry
+            .binding_transport(library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        let app = router(state);
+        let request = |operation: &str, context: u64| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/libraries/{library_uuid}/sync/retry"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-megle-context-revision", context.to_string())
+                .body(Body::from(
+                    serde_json::json!({"operationUuid":operation}).to_string(),
+                ))
+                .unwrap()
+        };
+        let operation = uuid::Uuid::now_v7().to_string();
+        let stale = app
+            .clone()
+            .oneshot(request(&uuid::Uuid::now_v7().to_string(), revision + 1))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(response_json(stale).await["code"], "stale_library_context");
+        assert_eq!(
+            registry
+                .binding_transport(library_uuid, "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "error"
+        );
+        assert_eq!(
+            registry.sync_status_snapshot().unwrap().libraries[0]
+                .last_error_code
+                .as_deref(),
+            Some("test_failure")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(request(&operation, revision))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["state"], "complete");
+        let recovered = registry
+            .binding_transport(library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, "preparing");
+        assert_eq!(recovered.binding_epoch, original.binding_epoch);
+        assert_eq!(recovered.actor_epoch, original.actor_epoch);
+        assert_eq!(
+            recovered.transport_generation,
+            original.transport_generation
+        );
+        assert!(registry
+            .pending_sync_capture_generation(library_uuid)
+            .unwrap()
+            .is_some());
+        let coordinator = crate::sync::coordinator::SyncCoordinator::with_providers(
+            std::sync::Arc::clone(registry),
+            crate::sync::runtime::RuntimeLeases::default(),
+            manager.provider_manager(),
+        );
+        let catalog_path = created.local_data_dir.join("catalog.sqlite");
+        coordinator
+            .run_library_turn(library_uuid, &catalog_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .binding_transport(library_uuid, "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "seed_ready"
+        );
+        coordinator
+            .run_library_turn(library_uuid, &catalog_path)
+            .await
+            .unwrap();
+        let published = registry
+            .binding_transport(library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        assert_eq!(published.state, "active");
+        assert!(
+            published.cursor.is_some(),
+            "the real Provider transport turn must run after retry"
+        );
+
+        registry
+            .record_sync_turn_error(library_uuid, "second_failure")
+            .unwrap();
+        let repeated = app
+            .clone()
+            .oneshot(request(&operation, revision))
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(
+            registry
+                .binding_transport(library_uuid, "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "error",
+            "replayed completed commands must have no new effect"
+        );
+        let second_operation = uuid::Uuid::now_v7().to_string();
+        let second = app
+            .clone()
+            .oneshot(request(&second_operation, revision))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let recovered = registry
+            .binding_transport(library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, "active");
+        assert_eq!(recovered.binding_epoch, published.binding_epoch);
+        assert_eq!(
+            recovered.transport_generation,
+            published.transport_generation
+        );
+        assert_eq!(
+            recovered.latest_checkpoint_uuid,
+            published.latest_checkpoint_uuid
+        );
+        assert_eq!(recovered.cursor, published.cursor);
+        assert!(registry.sync_status_snapshot().unwrap().libraries[0]
+            .last_error_code
+            .is_none());
+        coordinator
+            .run_library_turn(library_uuid, &catalog_path)
+            .await
+            .unwrap();
+
+        registry
+            .record_sync_turn_error(library_uuid, "authorization_failure")
+            .unwrap();
+        registry
+            .update_plugin_account_auth("com.megle.fake", "expired", None)
+            .unwrap();
+        let unauthorized = app
+            .clone()
+            .oneshot(request(&uuid::Uuid::now_v7().to_string(), revision))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            registry
+                .binding_transport(library_uuid, "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "error"
+        );
+        registry
+            .update_plugin_account_auth("com.megle.fake", "authenticated", None)
+            .unwrap();
+        registry.pause_binding(library_uuid).unwrap();
+        let paused = registry
+            .binding_transport(library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        let repeated = app
+            .clone()
+            .oneshot(request(&second_operation, revision))
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
+        let rejected = app
+            .oneshot(request(&uuid::Uuid::now_v7().to_string(), revision))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let after = registry
+            .binding_transport(library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, "paused");
+        assert_eq!(after.transport_generation, paused.transport_generation);
+        coordinator.shutdown_media_workers().await.unwrap();
+        manager.provider_manager().shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]

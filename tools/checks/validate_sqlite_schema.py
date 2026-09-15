@@ -23,6 +23,7 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0015_sync_root_recovery.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0016_remote_root_inventory.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0017_restore_action_contracts.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0018_descriptor_snapshots.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -56,6 +57,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0030_sync_root_identity.sql",
     ROOT / "crates" / "core" / "migrations" / "0031_sync_root_generation_fence.sql",
     ROOT / "crates" / "core" / "migrations" / "0032_sync_root_reconciliation.sql",
+    ROOT / "crates" / "core" / "migrations" / "0033_media_materialization_destination.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -290,6 +292,10 @@ def index_key_columns(conn: sqlite3.Connection, index_name: str):
 
 def apply_migration(conn: sqlite3.Connection, migration: Path) -> None:
     name = migration.name
+    if name == "0033_media_materialization_destination.sql":
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=33").fetchone() is None:
+            conn.executescript(migration.read_text(encoding="utf-8"))
+        return
     if name in {"0027_sync_protocol_foundation.sql", "0029_media_object_storage.sql"}:
         version = 27 if name.startswith("0027") else 29
         already_applied = conn.execute(
@@ -805,6 +811,88 @@ def verify_sync_root_generation_fence_upgrade_from_v30() -> None:
         conn.close()
 
 
+def verify_materialization_destination_upgrade_from_v32() -> None:
+    migration = ROOT / "crates/core/migrations/0033_media_materialization_destination.sql"
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "catalog.sqlite"
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            for prior in MIGRATIONS:
+                if prior == migration:
+                    break
+                apply_migration(conn, prior)
+            if conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone() != (32,):
+                fail("materialization upgrade fixture did not stop at Catalog schema 32")
+            root_uuid, folder_uuid, library_uuid, binding_uuid = [bytes([n]) * 16 for n in range(1, 5)]
+            conn.execute("INSERT INTO roots(path,display_name,enabled,created_at,root_uuid) VALUES ('D:/Legacy','Legacy',1,1,?)", (root_uuid,))
+            root = conn.execute("SELECT id FROM roots").fetchone()[0]
+            conn.execute("INSERT INTO folders(root_id,parent_id,name,path_hash,folder_uuid) VALUES (?,NULL,'','root',?)", (root, folder_uuid))
+            folder = conn.execute("SELECT id FROM folders").fetchone()[0]
+            for n, phase, owner, lease in [(10, "complete", None, None), (11, "downloading", "worker", 90)]:
+                asset, revision = bytes([n]) * 16, bytes([n + 10]) * 16
+                conn.execute("INSERT INTO files(root_id,folder_id,name,ext,size,mtime,asset_uuid) VALUES (?,?,?,'jpg',3,1,?)", (root, folder, f"photo{n}.jpg", asset))
+                conn.execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?,?,3,1,1)", (revision, asset))
+                conn.execute("INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,downloaded_bytes,staging_relpath,priority,binding_epoch,transport_generation,owner_token,lease_expires_at,attempt_count,next_attempt_at,error_code,created_at,updated_at) VALUES (?,?,'photo.jpg',?,3,2,'staging/a',2,?,5,?,?,4,100,'retry',1,2)", (revision, asset, phase, bytes([5])*16, owner, lease))
+            legacy_revision = bytes([20]) * 16
+            expect_integrity_error(conn, "UPDATE media_materialization_jobs SET destination_relpath='a..b.jpg' WHERE content_revision_uuid=?", (legacy_revision,))
+            conn.execute("INSERT INTO sync_root_descriptors(root_uuid,root_folder_uuid,library_root_uuid,requested_name,materialized_name,materialization_fingerprint,lifecycle,updated_at) VALUES (?,?,?,?,?,?,'active',1)", (root_uuid, folder_uuid, library_uuid, "Legacy", "Legacy", bytes(32)))
+            conn.execute("UPDATE roots SET root_folder_uuid=? WHERE id=?", (folder_uuid, root))
+            conn.execute("INSERT INTO sync_root_local_bindings(root_uuid,library_uuid,local_binding_uuid,binding_generation,state,root_id,operation_revision,updated_at) VALUES (?,?,?,1,'active',?,1,1)", (root_uuid, library_uuid, binding_uuid, root))
+            conn.execute("UPDATE media_materialization_jobs SET root_uuid=?,local_binding_uuid=?,binding_generation=1 WHERE content_revision_uuid=?", (root_uuid, binding_uuid, bytes([21])*16))
+            before = conn.execute("SELECT * FROM media_materialization_jobs ORDER BY content_revision_uuid").fetchall()
+            columns = conn.execute("PRAGMA table_info(media_materialization_jobs)").fetchall()
+            foreign_keys = conn.execute("PRAGMA foreign_key_list(media_materialization_jobs)").fetchall()
+            objects = conn.execute("SELECT type,name,sql FROM sqlite_master WHERE tbl_name='media_materialization_jobs' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY name").fetchall()
+            if sum(row[0] == "index" for row in objects) != 3 or sum(row[0] == "trigger" for row in objects) != 6:
+                fail("materialization upgrade fixture must include all three indexes and six fences")
+            conn.commit()
+            apply_migration(conn, migration)
+            if conn.execute("SELECT * FROM media_materialization_jobs ORDER BY content_revision_uuid").fetchall() != before:
+                fail("materialization upgrade changed durable jobs or guessed legacy ownership")
+            if conn.execute("PRAGMA table_info(media_materialization_jobs)").fetchall() != columns:
+                fail("materialization upgrade changed column metadata")
+            if conn.execute("PRAGMA foreign_key_list(media_materialization_jobs)").fetchall() != foreign_keys:
+                fail("materialization upgrade changed foreign keys")
+            if conn.execute("SELECT type,name,sql FROM sqlite_master WHERE tbl_name='media_materialization_jobs' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY name").fetchall() != objects:
+                fail("materialization upgrade changed indexes or ownership triggers")
+            for legal in ("a..b.jpg", "dir..x/a..b.jpg", "dir..x\\a..b.jpg", "dir..x/sub..y\\a..b.jpg", "a" * 1024):
+                conn.execute("UPDATE media_materialization_jobs SET destination_relpath=? WHERE content_revision_uuid=?", (legal, legacy_revision))
+                if conn.execute("SELECT destination_relpath FROM media_materialization_jobs WHERE content_revision_uuid=?", (legacy_revision,)).fetchone() != (legal,):
+                    fail("materialization destination changed a legal stored path")
+            invalid = ["", "a" * 1025, "..", "../a", "a/../b", "a/..", "a//../b", "a/..//b", "/a", "\\a", "C:/a", "c:a", "C:\\a", "\\\\server\\share", "\\\\?\\C:\\a", "\\\\.\\device"]
+            for left in ("/", "\\"):
+                for right in ("/", "\\"):
+                    invalid.extend([".." + right + "a", "a" + left + "..", "a" + left + ".." + right + "b"])
+            for unsafe in invalid:
+                expect_integrity_error(conn, "UPDATE media_materialization_jobs SET destination_relpath=? WHERE content_revision_uuid=?", (unsafe, legacy_revision))
+            expect_integrity_error(conn, "UPDATE media_materialization_jobs SET phase='complete' WHERE content_revision_uuid=?", (legacy_revision,))
+            expect_integrity_error(conn, "UPDATE media_materialization_jobs SET local_binding_uuid=NULL WHERE content_revision_uuid=?", (bytes([21])*16,))
+            expect_integrity_error(conn, "UPDATE media_materialization_jobs SET binding_generation=2 WHERE content_revision_uuid=?", (bytes([21])*16,))
+            conn.execute("UPDATE sync_root_local_bindings SET binding_generation=2,operation_revision=2")
+            expect_integrity_error(conn, "UPDATE media_materialization_jobs SET phase='complete' WHERE content_revision_uuid=?", (bytes([21])*16,))
+            expect_integrity_error(conn, "DELETE FROM asset_content_revisions WHERE content_revision_uuid=?", (legacy_revision,))
+            expect_integrity_error(conn, "UPDATE media_materialization_jobs SET staging_relpath='a..b'")
+            if conn.execute("PRAGMA foreign_key_check").fetchall() or conn.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                fail("materialization upgrade violated database integrity")
+            conn.commit()
+            stable = conn.execute("SELECT * FROM media_materialization_jobs ORDER BY content_revision_uuid").fetchall()
+        finally:
+            conn.close()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            apply_migration(conn, migration)
+            if conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=33").fetchone() != (1,):
+                fail("materialization migration is not version-gated")
+            if conn.execute("SELECT * FROM media_materialization_jobs ORDER BY content_revision_uuid").fetchall() != stable:
+                fail("materialization reopen changed durable jobs")
+            if conn.execute("PRAGMA foreign_key_check").fetchall() or conn.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                fail("materialization reopen violated database integrity")
+        finally:
+            conn.close()
+
+
 def verify_host_sync_root_binding_contract() -> None:
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -1182,7 +1270,7 @@ def verify_host_sync_root_binding_contract() -> None:
             "DELETE FROM remote_sync_roots WHERE library_uuid=? AND root_uuid=?",
             (library_uuid, "00000000-0000-7000-8000-000000000002"),
         )
-        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 17:
+        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 18:
             fail("managed-root orchestration migrations did not update schema_version")
         expected_host_tables = {
             "library_local_settings",
@@ -1213,7 +1301,7 @@ def verify_host_remote_root_inventory_upgrade_and_rollback() -> None:
     upgrade = sqlite3.connect(":memory:")
     upgrade.execute("PRAGMA foreign_keys = ON")
     try:
-        for migration in HOST_MIGRATIONS[:-2]:
+        for migration in HOST_MIGRATIONS[:15]:
             upgrade.executescript(migration.read_text(encoding="utf-8"))
         if upgrade.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone() != (15,):
             fail("remote-root inventory upgrade fixture did not stop at Host schema 15")
@@ -1227,7 +1315,7 @@ def verify_host_remote_root_inventory_upgrade_and_rollback() -> None:
             "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at) VALUES ('account','00000000-0000-7000-8000-000000000001',1,zeroblob(32),1,1)"
         )
         upgrade.commit()
-        upgrade.executescript(HOST_MIGRATIONS[-2].read_text(encoding="utf-8"))
+        upgrade.executescript(HOST_MIGRATIONS[15].read_text(encoding="utf-8"))
         if upgrade.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone() != (16,):
             fail("remote-root inventory migration did not upgrade Host schema 15 to 16")
         upgrade.execute(
@@ -1244,12 +1332,12 @@ def verify_host_remote_root_inventory_upgrade_and_rollback() -> None:
 
     rollback = sqlite3.connect(":memory:")
     try:
-        for migration in HOST_MIGRATIONS[:-2]:
+        for migration in HOST_MIGRATIONS[:15]:
             rollback.executescript(migration.read_text(encoding="utf-8"))
         rollback.execute("CREATE TABLE provider_remote_sync_roots(sentinel TEXT NOT NULL)")
         rollback.commit()
         try:
-            rollback.executescript(HOST_MIGRATIONS[-2].read_text(encoding="utf-8"))
+            rollback.executescript(HOST_MIGRATIONS[15].read_text(encoding="utf-8"))
         except sqlite3.OperationalError:
             rollback.rollback()
         else:
@@ -1267,11 +1355,11 @@ def verify_host_restore_action_contract_upgrade_and_rollback() -> None:
     upgrade = sqlite3.connect(":memory:")
     upgrade.execute("PRAGMA foreign_keys = ON")
     try:
-        for migration in HOST_MIGRATIONS[:-1]:
+        for migration in HOST_MIGRATIONS[:16]:
             upgrade.executescript(migration.read_text(encoding="utf-8"))
         if upgrade.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone() != (16,):
             fail("restore-action upgrade fixture did not stop at Host schema 16")
-        upgrade.executescript(HOST_MIGRATIONS[-1].read_text(encoding="utf-8"))
+        upgrade.executescript(HOST_MIGRATIONS[16].read_text(encoding="utf-8"))
         if upgrade.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone() != (17,):
             fail("restore-action migration did not upgrade Host schema 16 to 17")
         tables = {row[0] for row in upgrade.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -1292,12 +1380,12 @@ def verify_host_restore_action_contract_upgrade_and_rollback() -> None:
 
     rollback = sqlite3.connect(":memory:")
     try:
-        for migration in HOST_MIGRATIONS[:-1]:
+        for migration in HOST_MIGRATIONS[:16]:
             rollback.executescript(migration.read_text(encoding="utf-8"))
         rollback.execute("CREATE TABLE sync_restore_root_plans(sentinel TEXT NOT NULL)")
         rollback.commit()
         try:
-            rollback.executescript(HOST_MIGRATIONS[-1].read_text(encoding="utf-8"))
+            rollback.executescript(HOST_MIGRATIONS[16].read_text(encoding="utf-8"))
         except sqlite3.OperationalError:
             rollback.rollback()
         else:
@@ -1416,6 +1504,7 @@ def main() -> None:
     verify_sync_root_identity_contract()
     verify_sync_root_generation_fence_contract()
     verify_sync_root_generation_fence_upgrade_from_v30()
+    verify_materialization_destination_upgrade_from_v32()
     verify_host_sync_root_binding_contract()
     verify_host_remote_root_inventory_upgrade_and_rollback()
     verify_host_restore_action_contract_upgrade_and_rollback()
@@ -1477,7 +1566,7 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (17, None, 0, "stopped"):
+        if meta != (18, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         auth_flow_columns = {
             row[1]

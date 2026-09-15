@@ -79,6 +79,7 @@ tools/
 - Plugin manifest: `contracts/plugins/manifest.schema.json`
 - Per-Library catalog SQLite migrations: `crates/core/migrations/`
 - Host Registry SQLite migrations: `crates/core/host_migrations/`; `host.sqlite` owns Library UUIDs, managed-root bindings, active context revision, account-root Provider cursors and validated remote-Library discovery inventory, and creation/removal journals, while inactive local-only catalogs stay closed.
+- Immutable Library discovery: `crates/core/src/sync/descriptor.rs` owns descriptor/checkpoint integrity and causal evidence. Core selects validated `descriptors/<sha256>.json` snapshots while retaining the fixed `library-descriptor` seed; Host migration `0018_descriptor_snapshots.sql` persists causal heads and exact restore-object identity. Providers enumerate opaque candidates, not business-state winners.
 - Phase-level implementation notes: `docs/implementation-roadmap.md`
 - Performance benchmark results: `docs/performance-results/`
 - Managed-Library lifecycle/load harness boundary: `tools/dev/managed-library-harness.mjs`; the reproducible AC15 baseline driver is `tools/bench/managed-library-lifecycle-bench.mjs`.

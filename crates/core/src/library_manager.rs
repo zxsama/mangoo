@@ -345,14 +345,24 @@ impl LibraryManager {
         library_uuid: &str,
         root_uuid: Uuid,
     ) -> anyhow::Result<Vec<String>> {
-        self.write_sync_folder_catalog(library_uuid, move |database| {
+        let read_heads = move |database: &mut Database| {
             Ok(database
                 .sync_location_heads(root_uuid)?
                 .into_iter()
                 .map(|head| head.to_string())
                 .collect())
-        })
-        .await
+        };
+        let active = self.active_snapshot();
+        if active.library_uuid.as_deref() == Some(library_uuid) {
+            let runtime = active
+                .runtime
+                .ok_or_else(|| anyhow::anyhow!("library-runtime-unavailable"))?;
+            // GET projection reads must not trigger the local-mutation wake.
+            runtime.writer.write(read_heads).await
+        } else {
+            self.write_sync_folder_catalog(library_uuid, read_heads)
+                .await
+        }
     }
 
     pub async fn sync_folder_stop_work(
@@ -389,10 +399,36 @@ impl LibraryManager {
                 None,
                 checkpoint_uuid,
             )? {
+                if let Some(root) = self.registry.remote_sync_root(library_uuid, &root_uuid)? {
+                    self.publish_sync_folder_placement_required(
+                        library_uuid,
+                        &root_uuid,
+                        root.inventory_revision,
+                        &root.requested_name,
+                    )
+                    .await?;
+                }
                 actionable.push(root_uuid);
             }
         }
         for (binding, descriptor) in self.registry.pending_automatic_root_renames(library_uuid)? {
+            let registry = self.registry.clone();
+            let binding_for_reconcile = binding.clone();
+            let descriptor_for_reconcile = descriptor.clone();
+            match tokio::task::spawn_blocking(move || {
+                registry.reconcile_same_name_root_materialization(
+                    &binding_for_reconcile,
+                    &descriptor_for_reconcile,
+                )
+            })
+            .await
+            .context("root materialization reconciliation task failed")?
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) if error.to_string() == "operation-in-progress" => continue,
+                Err(error) => return Err(error),
+            }
             let target = Path::new(&binding.placement_parent).join(&descriptor.materialized_name);
             let operation_uuid = Uuid::now_v7().to_string();
             let resume_state = if binding.state == "paused" {
@@ -503,6 +539,14 @@ impl LibraryManager {
                 Err(error) => return Err(error),
             }
         }
+        // Also repairs a previous Host commit interrupted before Catalog
+        // projection. Workers continue to enforce the Catalog token fence.
+        let coordinator = self.sync_coordinator.clone();
+        let library_for_projection = library_uuid.to_owned();
+        self.write_sync_folder_catalog(library_uuid, move |database| {
+            coordinator.project_root_binding_tokens(&library_for_projection, database)
+        })
+        .await?;
         Ok(actionable)
     }
 
@@ -1477,6 +1521,7 @@ impl LibraryManager {
                 )
             })
             .await?;
+        self.refresh_active_root_runtime(library_uuid)?;
         if let Some(task_id) = task {
             let active = self.active_snapshot();
             if active.library_uuid.as_deref() == Some(library_uuid) {
@@ -1486,6 +1531,36 @@ impl LibraryManager {
             }
         }
         Ok(task)
+    }
+
+    pub async fn sync_root_identity_for_path(
+        &self,
+        library_uuid: &str,
+        path: String,
+    ) -> anyhow::Result<Option<(Uuid, Uuid)>> {
+        self.write_sync_folder_catalog(library_uuid, move |database| {
+            database.sync_root_identity_for_path(&path)
+        })
+        .await
+    }
+
+    pub async fn other_library_sync_root_identity_for_path(
+        &self,
+        library_uuid: &str,
+        path: String,
+    ) -> anyhow::Result<Option<(String, Uuid, Uuid)>> {
+        for descriptor in self.registry.snapshot()?.libraries {
+            if descriptor.library_uuid == library_uuid {
+                continue;
+            }
+            if let Some((root_uuid, root_folder_uuid)) = self
+                .sync_root_identity_for_path(&descriptor.library_uuid, path.clone())
+                .await?
+            {
+                return Ok(Some((descriptor.library_uuid, root_uuid, root_folder_uuid)));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn fence_sync_root_local_only(
@@ -3577,6 +3652,75 @@ impl LibraryManager {
         Ok(())
     }
 
+    pub async fn retry_library_sync_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+    ) -> anyhow::Result<()> {
+        let _operation = self.operation.lock().await;
+        self.ensure_context_revision(expected_revision)?;
+        let transport = self
+            .registry
+            .binding_transport(library_uuid, "library")?
+            .ok_or_else(|| anyhow::anyhow!("sync-binding-not-found"))?;
+        self.registry
+            .require_ready_sync_provider(&transport.plugin_id, &transport.account_uuid)?;
+        if self
+            .sync_coordinator
+            .provider_manager()
+            .resolve(&transport.plugin_id, &transport.account_uuid)?
+            .is_none()
+        {
+            anyhow::bail!("provider-not-ready");
+        }
+        let needs_capture =
+            self.registry
+                .retry_binding(library_uuid, expected_revision, &transport)?;
+        if needs_capture {
+            let result: anyhow::Result<()> = async {
+                let active = self.active_snapshot();
+                let generation = if active.library_uuid.as_deref() == Some(library_uuid) {
+                    active
+                        .runtime
+                        .ok_or_else(|| anyhow::anyhow!("library-runtime-unavailable"))?
+                        .writer
+                        .write_authoritative(move |database| {
+                            database
+                                .begin_sync_capture(transport.binding_epoch, transport.actor_epoch)
+                        })
+                        .await?
+                } else {
+                    let descriptor = self
+                        .registry
+                        .library(library_uuid)?
+                        .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+                    crate::sync::runtime::DormantSyncRuntime::new(
+                        library_uuid,
+                        descriptor.local_data_dir.join("catalog.sqlite"),
+                        self.runtime_leases.clone(),
+                    )
+                    .run_turn(move |database| {
+                        database.begin_sync_capture(transport.binding_epoch, transport.actor_epoch)
+                    })
+                    .await?
+                };
+                self.registry.set_sync_capture_generation(
+                    library_uuid,
+                    transport.binding_epoch,
+                    generation,
+                )
+            }
+            .await;
+            if let Err(error) = result {
+                self.registry
+                    .record_sync_turn_error(library_uuid, "sync-capture-recovery-failed")?;
+                return Err(error);
+            }
+        }
+        self.sync_coordinator.wake();
+        Ok(())
+    }
+
     pub async fn wake_library_sync_with_revision(
         &self,
         library_uuid: &str,
@@ -3803,7 +3947,7 @@ impl LibraryManager {
             let remote = self
                 .registry
                 .remote_sync_root(&descriptor.library_uuid, &host_binding.root_uuid)?;
-            if database.sync_root_id(root_uuid.as_bytes())?.is_none() {
+            if !database.sync_root_projection_ready(root_uuid.as_bytes())? {
                 let remote = remote
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("root-not-found"))?;
@@ -3986,6 +4130,439 @@ mod tests {
 
     fn test_manager(base: &Path) -> LibraryManager {
         isolated_manager(base, base.join("bundled-plugins"))
+    }
+
+    async fn same_name_root_fixture(
+        state: &str,
+    ) -> (PathBuf, LibraryManager, crate::sync_folders::SyncRootMarker) {
+        let base = std::env::temp_dir().join(format!("megle-same-name-{}", Uuid::now_v7()));
+        fs::create_dir_all(&base).unwrap();
+        let manager = test_manager(&base);
+        let library = manager
+            .create_library(
+                "Same name".into(),
+                None,
+                None,
+                base.join("managed"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        let marker = crate::sync_folders::SyncRootMarker {
+            format_version: 1,
+            library_uuid: library.library_uuid.clone(),
+            root_uuid: Uuid::now_v7().to_string(),
+            root_folder_uuid: Uuid::now_v7().to_string(),
+            local_binding_uuid: Uuid::now_v7().to_string(),
+            binding_generation: 1,
+        };
+        let source = base.join("Photos");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("photo.jpg"), b"unchanged source").unwrap();
+        crate::sync_folders::write_root_marker(&source, &marker).unwrap();
+        let source = crate::library_path::normalize_absolute(&source).unwrap();
+        let parent = source.parent().unwrap();
+        manager
+            .registry
+            .upsert_remote_sync_root(
+                &marker.library_uuid,
+                &marker.root_uuid,
+                &marker.root_folder_uuid,
+                "Photos",
+                "Photos",
+                &"aa".repeat(32),
+                0,
+                "active",
+                None,
+                None,
+            )
+            .unwrap();
+        // Isolated persisted enrollment fixture; production recovery below is
+        // exercised through the same inventory turn used by the scheduler.
+        let host = rusqlite::Connection::open(base.join("host.sqlite")).unwrap();
+        host.execute(
+            "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,marker_identity,filesystem_identity,state,binding_generation,root_capture_epoch,root_actor_epoch,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,applied_materialized_name,applied_materialized_name_key,applied_materialization_fingerprint,operation_revision,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?3,?3,'Photos','photos',?11,'Photos','photos',?11,1,1,1)",
+            rusqlite::params![marker.library_uuid,marker.root_uuid,marker.local_binding_uuid,source.to_string_lossy(),crate::sync_folders::canonical_path_key(&source),parent.to_string_lossy(),crate::sync_folders::canonical_path_key(parent),crate::library_path::local_file_identity(&source.join(crate::sync_folders::ROOT_MARKER_FILE_NAME)).unwrap(),crate::library_path::local_file_identity(&source).unwrap(),state,"aa".repeat(32)],
+        ).unwrap();
+        drop(host);
+        let marker_for_catalog = marker.clone();
+        let state = state.to_owned();
+        manager
+            .write_sync_folder_catalog(&marker.library_uuid, move |database| {
+                let root = Uuid::parse_str(&marker_for_catalog.root_uuid)?;
+                let binding = Uuid::parse_str(&marker_for_catalog.local_binding_uuid)?;
+                database.ensure_selected_sync_root(
+                    Uuid::parse_str(&library.library_uuid)?,
+                    root,
+                    Uuid::parse_str(&marker_for_catalog.root_folder_uuid)?,
+                    Uuid::parse_str(&library.root_uuid)?,
+                    &source.to_string_lossy(),
+                    "Photos",
+                    "Photos",
+                    [0xaa; 32],
+                    binding,
+                    binding,
+                    binding,
+                    1,
+                    &state,
+                    1,
+                    false,
+                )?;
+                let mut descriptor = database.sync_root_descriptor(root.as_bytes())?.unwrap();
+                descriptor.logical_revision += 1;
+                descriptor.materialization_fingerprint = [0xbb; 32];
+                database.upsert_sync_root_descriptor(&descriptor)
+            })
+            .await
+            .unwrap();
+        (base, manager, marker)
+    }
+
+    #[tokio::test]
+    async fn same_name_root_refresh_adopts_fingerprint_without_relocation() {
+        for state in ["active", "paused"] {
+            let (base, manager, marker) = same_name_root_fixture(state).await;
+            let before = manager
+                .registry
+                .local_root_binding(&marker.library_uuid, &marker.root_uuid)
+                .unwrap()
+                .unwrap();
+            let source = Path::new(&before.local_path);
+            let source_identity = crate::library_path::local_file_identity(source).unwrap();
+            let marker_path = source.join(crate::sync_folders::ROOT_MARKER_FILE_NAME);
+            let marker_bytes = fs::read(&marker_path).unwrap();
+            let marker_identity = crate::library_path::local_file_identity(&marker_path).unwrap();
+            manager
+                .refresh_sync_folder_inventory(&marker.library_uuid)
+                .await
+                .unwrap();
+            let after = manager
+                .registry
+                .local_root_binding(&marker.library_uuid, &marker.root_uuid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.state, state);
+            assert_eq!(after.local_path, before.local_path);
+            assert_eq!(after.local_binding_uuid, before.local_binding_uuid);
+            assert_eq!(after.binding_generation, before.binding_generation);
+            assert_eq!(after.root_capture_epoch, before.root_capture_epoch);
+            assert_eq!(after.root_actor_epoch, before.root_actor_epoch);
+            assert_eq!(
+                after.applied_materialization_fingerprint.as_deref(),
+                Some("bb".repeat(32).as_str())
+            );
+            assert_eq!(after.operation_revision, before.operation_revision + 1);
+            assert!(manager
+                .registry
+                .root_operations(&marker.library_uuid, &marker.root_uuid, None, 50, "all")
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                crate::library_path::local_file_identity(source).unwrap(),
+                source_identity
+            );
+            assert_eq!(
+                crate::library_path::local_file_identity(&marker_path).unwrap(),
+                marker_identity
+            );
+            assert_eq!(fs::read(&marker_path).unwrap(), marker_bytes);
+            assert_eq!(
+                fs::read(source.join("photo.jpg")).unwrap(),
+                b"unchanged source"
+            );
+            manager
+                .refresh_sync_folder_inventory(&marker.library_uuid)
+                .await
+                .unwrap();
+            assert_eq!(
+                manager
+                    .registry
+                    .local_root_binding(&marker.library_uuid, &marker.root_uuid)
+                    .unwrap()
+                    .unwrap(),
+                after
+            );
+            drop(manager);
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn same_name_root_recovers_failed_rename_and_catalog_after_reopen() {
+        for (resume_state, interrupted_projection) in [
+            ("active", false),
+            ("paused", false),
+            ("active", true),
+            ("paused", true),
+        ] {
+            let (base, manager, marker) = same_name_root_fixture(resume_state).await;
+            manager
+                .registry
+                .upsert_remote_sync_root(
+                    &marker.library_uuid,
+                    &marker.root_uuid,
+                    &marker.root_folder_uuid,
+                    "Photos",
+                    "Photos",
+                    &"bb".repeat(32),
+                    1,
+                    "active",
+                    None,
+                    None,
+                )
+                .unwrap();
+            let binding = manager
+                .registry
+                .local_root_binding(&marker.library_uuid, &marker.root_uuid)
+                .unwrap()
+                .unwrap();
+            let operation_uuid = Uuid::now_v7().to_string();
+            let request = serde_json::json!({
+                "operationUuid":operation_uuid,"localBindingUuid":marker.local_binding_uuid,
+                "resumeState":resume_state,"expectedBindingGeneration":1,
+                "targetPath":binding.local_path,"desiredMaterializationFingerprint":"bb".repeat(32)
+            });
+            manager
+                .registry
+                .record_automatic_root_rename_preflight_failure(
+                    &operation_uuid,
+                    &marker.library_uuid,
+                    &marker.root_uuid,
+                    &crate::sync_folders::request_hash(&request).unwrap(),
+                    &request,
+                    binding.operation_revision,
+                    1,
+                    &"bb".repeat(32),
+                    Path::new(&binding.local_path),
+                )
+                .unwrap();
+            let coordinator = manager.sync_coordinator.clone();
+            let library_uuid = marker.library_uuid.clone();
+            manager
+                .write_sync_folder_catalog(&marker.library_uuid, move |database| {
+                    coordinator.project_root_binding_tokens(&library_uuid, database)
+                })
+                .await
+                .unwrap();
+            drop(manager);
+            let manager = test_manager(&base);
+            let (failed, descriptor) = manager
+                .registry
+                .pending_automatic_root_renames(&marker.library_uuid)
+                .unwrap()
+                .pop()
+                .unwrap();
+            // Model interruption after the atomic Host acknowledgement but
+            // before Catalog projection; the next normal turn must finish it.
+            if interrupted_projection {
+                assert!(manager
+                    .registry
+                    .reconcile_same_name_root_materialization(&failed, &descriptor)
+                    .unwrap());
+            }
+            let root = Uuid::parse_str(&marker.root_uuid).unwrap();
+            manager
+                .write_sync_folder_catalog(&marker.library_uuid, move |database| {
+                    assert_eq!(
+                        database
+                            .sync_root_local_binding(root.as_bytes())?
+                            .unwrap()
+                            .state,
+                        "local-rename-required"
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            drop(manager);
+            let manager = test_manager(&base);
+            manager
+                .refresh_sync_folder_inventory(&marker.library_uuid)
+                .await
+                .unwrap();
+            let binding = manager
+                .registry
+                .local_root_binding(&marker.library_uuid, &marker.root_uuid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.state, resume_state);
+            assert_eq!(binding.binding_generation, 1);
+            assert_eq!(binding.last_error_code, None);
+            assert_eq!(
+                binding.applied_materialization_fingerprint,
+                binding.desired_materialization_fingerprint.clone().into()
+            );
+            let expected = binding.clone();
+            manager
+                .write_sync_folder_catalog(&marker.library_uuid, move |database| {
+                    let projected = database.sync_root_local_binding(root.as_bytes())?.unwrap();
+                    assert_eq!(projected.state, expected.state);
+                    assert_eq!(projected.binding_generation, expected.binding_generation);
+                    assert_eq!(projected.operation_revision, expected.operation_revision);
+                    assert_eq!(
+                        projected.local_binding_uuid,
+                        *Uuid::parse_str(&expected.local_binding_uuid)?.as_bytes()
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            manager
+                .refresh_sync_folder_inventory(&marker.library_uuid)
+                .await
+                .unwrap();
+            assert_eq!(
+                manager
+                    .registry
+                    .local_root_binding(&marker.library_uuid, &marker.root_uuid)
+                    .unwrap()
+                    .unwrap(),
+                binding
+            );
+            let operations = manager
+                .registry
+                .root_operations(&marker.library_uuid, &marker.root_uuid, None, 50, "all")
+                .unwrap();
+            assert_eq!(operations.len(), 1);
+            assert_eq!(operations[0].state, "failed");
+            assert_eq!(operations[0].operation_uuid, operation_uuid);
+            assert_eq!(
+                crate::sync_folders::read_root_marker(Path::new(&binding.local_path)).unwrap(),
+                marker
+            );
+            drop(manager);
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn same_name_root_rejects_stale_identity_and_open_operation() {
+        let (base, manager, marker) = same_name_root_fixture("active").await;
+        manager
+            .registry
+            .upsert_remote_sync_root(
+                &marker.library_uuid,
+                &marker.root_uuid,
+                &marker.root_folder_uuid,
+                "Photos",
+                "Photos",
+                &"bb".repeat(32),
+                1,
+                "active",
+                None,
+                None,
+            )
+            .unwrap();
+        let (binding, descriptor) = manager
+            .registry
+            .pending_automatic_root_renames(&marker.library_uuid)
+            .unwrap()
+            .pop()
+            .unwrap();
+        for field in ["generation", "revision", "binding", "fingerprint"] {
+            let mut stale = binding.clone();
+            match field {
+                "generation" => stale.binding_generation += 1,
+                "revision" => stale.operation_revision += 1,
+                "binding" => stale.local_binding_uuid = Uuid::now_v7().to_string(),
+                "fingerprint" => stale.desired_materialization_fingerprint = "cc".repeat(32),
+                _ => unreachable!(),
+            }
+            assert!(
+                manager
+                    .registry
+                    .reconcile_same_name_root_materialization(&stale, &descriptor)
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let mut stale_descriptor = descriptor.clone();
+        stale_descriptor.logical_revision += 1;
+        assert!(manager
+            .registry
+            .reconcile_same_name_root_materialization(&binding, &stale_descriptor)
+            .is_err());
+        for name in ["Changed", "photos"] {
+            let mut renamed = descriptor.clone();
+            renamed.materialized_name = name.into();
+            assert!(!manager
+                .registry
+                .reconcile_same_name_root_materialization(&binding, &renamed)
+                .unwrap());
+        }
+        let marker_path =
+            Path::new(&binding.local_path).join(crate::sync_folders::ROOT_MARKER_FILE_NAME);
+        let marker_bytes = fs::read(&marker_path).unwrap();
+        let mut foreign = marker.clone();
+        foreign.root_folder_uuid = Uuid::now_v7().to_string();
+        fs::write(&marker_path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        assert!(manager
+            .registry
+            .reconcile_same_name_root_materialization(&binding, &descriptor)
+            .is_err());
+        fs::write(&marker_path, &marker_bytes).unwrap();
+        let host = rusqlite::Connection::open(base.join("host.sqlite")).unwrap();
+        let old_identity: String = host
+            .query_row(
+                "SELECT filesystem_identity FROM local_root_bindings WHERE root_uuid=?1",
+                [&marker.root_uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        host.execute(
+            "UPDATE local_root_bindings SET filesystem_identity='foreign' WHERE root_uuid=?1",
+            [&marker.root_uuid],
+        )
+        .unwrap();
+        assert!(manager
+            .registry
+            .reconcile_same_name_root_materialization(&binding, &descriptor)
+            .is_err());
+        host.execute(
+            "UPDATE local_root_bindings SET filesystem_identity=?1 WHERE root_uuid=?2",
+            rusqlite::params![old_identity, marker.root_uuid],
+        )
+        .unwrap();
+        drop(host);
+        manager
+            .registry
+            .begin_root_operation_once(
+                &Uuid::now_v7().to_string(),
+                &marker.library_uuid,
+                &marker.root_uuid,
+                "logical-rename",
+                "planned",
+                &"ff".repeat(32),
+                &serde_json::json!({}),
+                binding.operation_revision,
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .registry
+                .reconcile_same_name_root_materialization(&binding, &descriptor)
+                .unwrap_err()
+                .to_string(),
+            "operation-in-progress"
+        );
+        assert_eq!(
+            manager
+                .registry
+                .local_root_binding(&marker.library_uuid, &marker.root_uuid)
+                .unwrap()
+                .unwrap(),
+            binding
+        );
+        assert_eq!(fs::read(&marker_path).unwrap(), marker_bytes);
+        assert_eq!(
+            fs::read(Path::new(&binding.local_path).join("photo.jpg")).unwrap(),
+            b"unchanged source"
+        );
+        drop(manager);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -4409,7 +4986,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(migration, 32);
+        assert_eq!(migration, 33);
         assert_eq!(
             Uuid::from_slice(&identity.0).unwrap().to_string(),
             created.library_uuid

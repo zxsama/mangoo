@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -15,21 +15,23 @@ impl FramedSyncProvider {
     pub fn new(session: FramedSession, timeout: Duration) -> Self {
         Self { session, timeout }
     }
-    fn rpc<'a>(&'a self, method: &'a str, payload: Value) -> ProviderFuture<'a, Value> {
+    fn rpc<'a>(&'a self, method: &'static str, payload: Value) -> ProviderFuture<'a, Value> {
         Box::pin(async move {
+            let started = Instant::now();
             self.session
                 .call(method, payload, self.timeout, None, None)
                 .await
-                .map_err(map_error)
+                .map_err(|error| self.call_error(method, "provider", "control", started, error))
         })
     }
     fn transport_rpc<'a>(
         &'a self,
         context: &'a TransportContext,
-        method: &'a str,
+        method: &'static str,
         payload: Value,
     ) -> ProviderFuture<'a, Value> {
         Box::pin(async move {
+            let started = Instant::now();
             self.session
                 .call(
                     method,
@@ -39,8 +41,39 @@ impl FramedSyncProvider {
                     Some(context.transport_generation),
                 )
                 .await
-                .map_err(map_error)
+                .map_err(|error| self.call_error(method, "library", "control", started, error))
         })
+    }
+
+    // Log only fixed call labels and typed error classes, never payloads or error detail.
+    fn call_error(
+        &self,
+        method: &'static str,
+        scope: &'static str,
+        stage: &'static str,
+        started: Instant,
+        error: RpcError,
+    ) -> ProviderError {
+        let (source, kind) = match &error {
+            RpcError::Closed => ("local_rpc", "closed"),
+            RpcError::DeadlineExceeded => ("local_rpc", "deadline_exceeded"),
+            RpcError::Protocol => ("local_rpc", "protocol_error"),
+            RpcError::Remote { .. } => ("remote_provider", "remote"),
+        };
+        let error = map_error(error);
+        tracing::warn!(
+            rpc_method = method,
+            rpc_scope = scope,
+            rpc_stage = stage,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            timeout_ms = u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
+            error_source = source,
+            error_kind = kind,
+            error_code = ?error.code,
+            retryable = error.retryable,
+            "provider adapter call failed"
+        );
+        error
     }
 }
 fn map_error(e: RpcError) -> ProviderError {
@@ -240,6 +273,10 @@ impl SyncProvider for FramedSyncProvider {
         limit: usize,
     ) -> ProviderFuture<'a, DeltaPage> {
         Box::pin(async move {
+            let scope_kind = match &scope {
+                DeltaScope::Root => "root",
+                DeltaScope::Library { .. } => "library",
+            };
             let scope = match scope {
                 DeltaScope::Root => (json!({"kind":"root"}), None, None),
                 DeltaScope::Library {
@@ -252,6 +289,7 @@ impl SyncProvider for FramedSyncProvider {
                     Some(transport_generation),
                 ),
             };
+            let started = Instant::now();
             let v = self
                 .session
                 .call(
@@ -262,7 +300,9 @@ impl SyncProvider for FramedSyncProvider {
                     scope.2,
                 )
                 .await
-                .map_err(map_error)?;
+                .map_err(|error| {
+                    self.call_error("delta.list", scope_kind, "control", started, error)
+                })?;
             let objects = v
                 .get("objects")
                 .and_then(Value::as_array)
@@ -325,11 +365,14 @@ impl SyncProvider for FramedSyncProvider {
                 .get("streamId")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| map_error(RpcError::Protocol))?;
+            let started = Instant::now();
             let path = self
                 .session
                 .receive_file(stream_id, self.timeout)
                 .await
-                .map_err(map_error)?;
+                .map_err(|error| {
+                    self.call_error("object.get", "library", "receive", started, error)
+                })?;
             let object = DownloadedObject {
                 metadata: meta,
                 path,
@@ -382,11 +425,14 @@ impl SyncProvider for FramedSyncProvider {
                 .get("wholeObject")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let started = Instant::now();
             let path = self
                 .session
                 .receive_file(stream_id, self.timeout)
                 .await
-                .map_err(map_error)?;
+                .map_err(|error| {
+                    self.call_error("object.get_range", "library", "receive", started, error)
+                })?;
             let actual = std::fs::metadata(&path)
                 .map_err(|error| ProviderError {
                     code: ProviderErrorCode::Internal,
@@ -435,6 +481,7 @@ impl SyncProvider for FramedSyncProvider {
         sha256: [u8; 32],
     ) -> ProviderFuture<'a, PutImmutableResult> {
         Box::pin(async move {
+            let started = Instant::now();
             put(self
                 .session
                 .call_with_bytes(
@@ -446,7 +493,9 @@ impl SyncProvider for FramedSyncProvider {
                     Some(context.transport_generation),
                 )
                 .await
-                .map_err(map_error)?)
+                .map_err(|error| {
+                    self.call_error("object.put_immutable", "library", "control", started, error)
+                })?)
         })
     }
     fn upload_begin<'a>(
@@ -481,6 +530,7 @@ impl SyncProvider for FramedSyncProvider {
         bytes: &'a [u8],
     ) -> ProviderFuture<'a, u64> {
         Box::pin(async move {
+            let started = Instant::now();
             let v = self
                 .session
                 .call_with_bytes(
@@ -492,7 +542,9 @@ impl SyncProvider for FramedSyncProvider {
                     Some(context.transport_generation),
                 )
                 .await
-                .map_err(map_error)?;
+                .map_err(|error| {
+                    self.call_error("upload.write", "library", "control", started, error)
+                })?;
             v.get("committedBytes")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| map_error(RpcError::Protocol))
@@ -586,7 +638,248 @@ fn canonical_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::runtime::frame::{encode, Frame, FrameKind, FrameLimits};
+    use crate::plugins::runtime::rpc::{ControlEnvelope, ControlType};
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct DiagnosticLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for DiagnosticLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DiagnosticLog {
+        fn subscriber(&self) -> tracing::Dispatch {
+            let output = self.clone();
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .json()
+                    .without_time()
+                    .with_writer(move || output.clone())
+                    .finish(),
+            )
+        }
+
+        fn records(&self) -> Vec<Value> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    fn diagnostic_provider() -> (FramedSyncProvider, tokio::io::DuplexStream) {
+        let (host, child) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(host);
+        (
+            FramedSyncProvider::new(
+                FramedSession::start(reader, writer, FrameLimits::default(), 1),
+                Duration::from_millis(100),
+            ),
+            child,
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_control_calls_report_method_scope_and_local_deadline() {
+        let log = DiagnosticLog::default();
+        async {
+            let (provider, _child) = diagnostic_provider();
+            let context = TransportContext {
+                namespace: "private-namespace".into(),
+                binding_epoch: "private-binding".into(),
+                transport_generation: 1,
+            };
+            let errors = [
+                provider.health().await.unwrap_err(),
+                provider
+                    .delta_list(DeltaScope::Root, None, None, 1)
+                    .await
+                    .unwrap_err(),
+                provider
+                    .delta_list(
+                        DeltaScope::Library {
+                            namespace: context.namespace.clone(),
+                            binding_epoch: context.binding_epoch.clone(),
+                            transport_generation: 1,
+                        },
+                        None,
+                        None,
+                        1,
+                    )
+                    .await
+                    .unwrap_err(),
+                provider
+                    .object_head(&context, "private-key")
+                    .await
+                    .unwrap_err(),
+                provider
+                    .object_put_immutable(&context, "private-key", b"private-body", [0; 32])
+                    .await
+                    .unwrap_err(),
+                provider
+                    .upload_write(&context, "private-upload", 0, b"private-body")
+                    .await
+                    .unwrap_err(),
+            ];
+            for error in errors {
+                assert_eq!(error.code, ProviderErrorCode::DeadlineExceeded);
+                assert!(error.retryable);
+                assert_eq!(error.detail, "DeadlineExceeded");
+            }
+        }
+        .with_subscriber(log.subscriber())
+        .await;
+        let records = log.records();
+        assert_eq!(records.len(), 6);
+        for (record, (method, scope)) in records.iter().zip([
+            ("health", "provider"),
+            ("delta.list", "root"),
+            ("delta.list", "library"),
+            ("object.head", "library"),
+            ("object.put_immutable", "library"),
+            ("upload.write", "library"),
+        ]) {
+            let fields = &record["fields"];
+            assert_eq!(fields["rpc_method"], method);
+            assert_eq!(fields["rpc_scope"], scope);
+            assert_eq!(fields["rpc_stage"], "control");
+            assert_eq!(fields["error_source"], "local_rpc");
+            assert_eq!(fields["error_kind"], "deadline_exceeded");
+            assert_eq!(fields["timeout_ms"], 100);
+            assert!(fields["elapsed_ms"].as_u64().unwrap() >= 100);
+            assert!(!record.to_string().contains("private-"));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_call_diagnostics_preserve_error_mapping_and_omit_remote_text() {
+        let log = DiagnosticLog::default();
+        let (provider, _child) = diagnostic_provider();
+        tracing::dispatcher::with_default(&log.subscriber(), || {
+            for error in [
+                RpcError::Closed,
+                RpcError::Protocol,
+                RpcError::Remote {
+                    code: "deadline_exceeded".into(),
+                    retryable: false,
+                    retry_after_ms: Some(123),
+                    detail: "private-remote-detail".into(),
+                },
+                RpcError::Remote {
+                    code: "private-unknown-code".into(),
+                    retryable: true,
+                    retry_after_ms: None,
+                    detail: "private-remote-detail".into(),
+                },
+            ] {
+                let expected = map_error(error.clone());
+                let actual =
+                    provider.call_error("health", "provider", "control", Instant::now(), error);
+                assert_eq!(actual.code, expected.code);
+                assert_eq!(actual.retryable, expected.retryable);
+                assert_eq!(actual.retry_after_ms, expected.retry_after_ms);
+                assert_eq!(actual.detail, expected.detail);
+            }
+        });
+        let records = log.records();
+        assert_eq!(records.len(), 4);
+        for (record, (source, kind, code)) in records.iter().zip([
+            ("local_rpc", "closed", "Unavailable"),
+            ("local_rpc", "protocol_error", "ProtocolError"),
+            ("remote_provider", "remote", "DeadlineExceeded"),
+            ("remote_provider", "remote", "Internal"),
+        ]) {
+            assert_eq!(record["fields"]["error_source"], source);
+            assert_eq!(record["fields"]["error_kind"], kind);
+            assert_eq!(record["fields"]["error_code"], code);
+            assert!(!record.to_string().contains("private-"));
+        }
+    }
+
+    #[tokio::test]
+    async fn download_receive_deadline_is_distinct_from_control_deadline() {
+        let log = DiagnosticLog::default();
+        async {
+            for range in [false, true] {
+                let (provider, mut child) = diagnostic_provider();
+                let context = TransportContext {
+                    namespace: "private-namespace".into(),
+                    binding_epoch: "private-binding".into(),
+                    transport_generation: 1,
+                };
+                let download = async {
+                    if range {
+                        provider
+                            .object_get_range(&context, "private-key", 0, 1, 1)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        provider
+                            .object_get(&context, "private-key", 1)
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                let response_without_stream = async {
+                    let mut header = [0; 17];
+                    child.read_exact(&mut header).await.unwrap();
+                    let size = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+                    let mut payload = vec![0; size];
+                    child.read_exact(&mut payload).await.unwrap();
+                    let mut response: ControlEnvelope = serde_json::from_slice(&payload).unwrap();
+                    response.message_type = ControlType::Response;
+                    response.payload = json!({
+                        "metadata": {"key":"private-key", "size":1, "sha256":hex(&[0;32])},
+                        "streamId":2, "responseStart":0, "responseEnd":1, "wholeObject":false
+                    });
+                    child
+                        .write_all(
+                            &encode(&Frame {
+                                kind: FrameKind::Control,
+                                stream_id: 0,
+                                sequence: 0,
+                                payload: serde_json::to_vec(&response).unwrap(),
+                            })
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    child
+                };
+                // Retain the peer after its control reply so only the receive timer can fail.
+                let (result, _child) = tokio::join!(download, response_without_stream);
+                assert_eq!(
+                    result.unwrap_err().code,
+                    ProviderErrorCode::DeadlineExceeded
+                );
+            }
+        }
+        .with_subscriber(log.subscriber())
+        .await;
+        let records = log.records();
+        assert_eq!(records.len(), 2);
+        for (record, method) in records.iter().zip(["object.get", "object.get_range"]) {
+            assert_eq!(record["fields"]["rpc_method"], method);
+            assert_eq!(record["fields"]["rpc_scope"], "library");
+            assert_eq!(record["fields"]["rpc_stage"], "receive");
+            assert_eq!(record["fields"]["error_source"], "local_rpc");
+            assert_eq!(record["fields"]["error_kind"], "deadline_exceeded");
+            assert!(!record.to_string().contains("private-"));
+        }
+    }
 
     #[test]
     fn stable_account_identity_is_canonical_across_object_key_order() {

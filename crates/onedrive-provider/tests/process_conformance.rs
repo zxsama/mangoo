@@ -21,6 +21,11 @@ struct GraphState {
     uploads: HashMap<String, (String, Vec<u8>, u64)>,
     namespaces: HashSet<String>,
     download_counts: HashMap<String, usize>,
+    download_bytes: HashMap<String, u64>,
+    metadata_ids: HashMap<String, String>,
+    absent_etags: HashSet<String>,
+    weak_etags: HashSet<String>,
+    change_during_download: HashMap<String, Vec<u8>>,
     capability_bearer_leaks: usize,
     reject_next_graph_request: bool,
     reject_next_token_refresh: bool,
@@ -29,6 +34,8 @@ struct GraphState {
     token_authorization_codes: Vec<String>,
     drive_requires_app_root: bool,
     app_root_requested: bool,
+    root_delta_files_first: bool,
+    duplicate_root_delta_items: bool,
 }
 
 struct Emulator {
@@ -1045,6 +1052,79 @@ fn real_child_runs_oauth_secret_delta_object_range_and_resumable_upload_against_
         json!({"scope":{"kind":"root"},"cursor":null,"pageToken":null,"limit":100}),
     );
     assert_eq!(root_delta["objects"].as_array().unwrap().len(), 8);
+    let snapshot_hash = hex(&Sha256::digest(&first_descriptor));
+    let snapshot_key = format!("descriptors/{snapshot_hash}.json");
+    assert_eq!(
+        provider.call_with_bytes(
+            "object.put_immutable",
+            json!({"namespace":namespace,"key":snapshot_key,"sha256":snapshot_hash}),
+            &first_descriptor
+        )["status"],
+        "created"
+    );
+    let snapshot_root_delta = provider.call(
+        "delta.list",
+        json!({"scope":{"kind":"root"},"cursor":null,"pageToken":null,"limit":100}),
+    );
+    assert_eq!(snapshot_root_delta["objects"].as_array().unwrap().len(), 9);
+    assert!(snapshot_root_delta["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| object["key"] == format!("{namespace}/{snapshot_key}")));
+    let snapshot_library_delta=provider.call("delta.list",json!({"scope":{"kind":"library","namespace":namespace},"cursor":null,"pageToken":null,"limit":100}));
+    assert!(snapshot_library_delta["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| object["key"] == snapshot_key));
+    let expected_root_keys = snapshot_root_delta["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| object["key"].as_str().unwrap().to_owned())
+        .collect::<HashSet<_>>();
+    for files_first in [false, true] {
+        {
+            let mut state = emulator.state.lock().unwrap();
+            state.root_delta_files_first = files_first;
+            state.duplicate_root_delta_items = true;
+        }
+        let repeated = provider.call(
+            "delta.list",
+            json!({"scope":{"kind":"root"},"cursor":null,"pageToken":null,"limit":100}),
+        );
+        let objects = repeated["objects"].as_array().unwrap();
+        let keys = objects
+            .iter()
+            .map(|object| object["key"].as_str().unwrap().to_owned())
+            .collect::<HashSet<_>>();
+        assert_eq!(keys, expected_root_keys, "files_first={files_first}");
+        assert_eq!(objects.len(), keys.len(), "deduplicate each root page");
+    }
+    let first_page = provider.call(
+        "delta.list",
+        json!({"scope":{"kind":"root"},"cursor":format!("{}v1.0/delta-root-descriptors-first",emulator.base),"pageToken":null,"limit":100}),
+    );
+    assert_eq!(first_page["objects"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        first_page["objects"][0]["key"],
+        format!("{namespace}/library-descriptor")
+    );
+    let last_page = provider.call(
+        "delta.list",
+        json!({"scope":{"kind":"root"},"cursor":null,"pageToken":first_page["pageToken"],"limit":100}),
+    );
+    let last_page_objects = last_page["objects"].as_array().unwrap();
+    assert_eq!(last_page_objects.len(), 2);
+    assert!(last_page_objects
+        .iter()
+        .any(|object| object["key"] == format!("{namespace}/{snapshot_key}")));
+    assert!(last_page_objects
+        .iter()
+        .any(|object| object["key"] == format!("{namespace}/library-descriptor")));
+    assert!(last_page["pageToken"].is_null());
+    assert!(last_page["completedCursor"].is_string());
     assert_eq!(emulator.state.lock().unwrap().capability_bearer_leaks, 0);
 
     provider.call(
@@ -1065,6 +1145,126 @@ fn real_child_runs_oauth_secret_delta_object_range_and_resumable_upload_against_
     );
     provider.call("shutdown", Value::Null);
     assert!(provider.child.wait().unwrap().success());
+}
+
+#[test]
+fn graph_head_reuses_only_verified_unchanged_authenticated_object_identity() {
+    use megle_onedrive_provider::config::{AuthMode, ProviderConfig};
+    use megle_onedrive_provider::graph::GraphClient;
+
+    let emulator = Emulator::start();
+    let config = ProviderConfig {
+        client_id: "emulator-client".into(),
+        authority: Url::parse(&emulator.base).unwrap(),
+        graph_endpoint: Url::parse(&format!("{}v1.0/", emulator.base)).unwrap(),
+        allow_http_emulator: true,
+        auth_mode: AuthMode::ManualResponseUri,
+    };
+    let client = GraphClient::new(&config).unwrap();
+    let namespace = "018f0000-0000-7000-8000-000000000001";
+    let key = "content/data/head-cache.pack";
+    let full_key = format!("{namespace}/{key}");
+    emulator
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .insert(full_key.clone(), b"first".to_vec());
+    let head = |client: &GraphClient, token: &str, key: &str| {
+        client.head(token, namespace, key).unwrap().unwrap().sha256
+    };
+    assert_eq!(
+        head(&client, "scope-a", key),
+        hex(&Sha256::digest(b"first"))
+    );
+    assert_eq!(
+        head(&client.clone(), "scope-a", key),
+        hex(&Sha256::digest(b"first"))
+    );
+    assert_eq!(emulator.state.lock().unwrap().download_bytes[&full_key], 5);
+    {
+        let mut state = emulator.state.lock().unwrap();
+        state.objects.insert(full_key.clone(), b"other".to_vec());
+    }
+    assert_eq!(
+        head(&client, "scope-a", key),
+        hex(&Sha256::digest(b"other"))
+    );
+    assert_eq!(emulator.state.lock().unwrap().download_bytes[&full_key], 10);
+    emulator
+        .state
+        .lock()
+        .unwrap()
+        .metadata_ids
+        .insert(full_key.clone(), "replacement-id".into());
+    head(&client, "scope-a", key);
+    assert_eq!(emulator.state.lock().unwrap().download_bytes[&full_key], 15);
+    head(&client, "scope-b", key);
+    assert_eq!(emulator.state.lock().unwrap().download_bytes[&full_key], 20);
+    head(&GraphClient::new(&config).unwrap(), "scope-b", key);
+    assert_eq!(emulator.state.lock().unwrap().download_bytes[&full_key], 25);
+
+    for (name, weak) in [("absent-etag.pack", false), ("weak-etag.pack", true)] {
+        let key = format!("content/data/{name}");
+        let full_key = format!("{namespace}/{key}");
+        {
+            let mut state = emulator.state.lock().unwrap();
+            state
+                .objects
+                .insert(full_key.clone(), b"always-read".to_vec());
+            if weak {
+                state.weak_etags.insert(full_key.clone());
+            } else {
+                state.absent_etags.insert(full_key.clone());
+            }
+        }
+        head(&client, "scope-a", &key);
+        head(&client, "scope-a", &key);
+        assert_eq!(emulator.state.lock().unwrap().download_bytes[&full_key], 22);
+    }
+
+    let race_key = "content/data/head-race.pack";
+    let race_full_key = format!("{namespace}/{race_key}");
+    {
+        let mut state = emulator.state.lock().unwrap();
+        state
+            .objects
+            .insert(race_full_key.clone(), b"before".to_vec());
+        state
+            .change_during_download
+            .insert(race_full_key.clone(), b"after!".to_vec());
+    }
+    assert_eq!(
+        client
+            .head("scope-a", namespace, race_key)
+            .unwrap_err()
+            .code,
+        "protocol_error"
+    );
+    assert_eq!(
+        head(&client, "scope-a", race_key),
+        hex(&Sha256::digest(b"after!"))
+    );
+    assert_eq!(
+        emulator.state.lock().unwrap().download_bytes[&race_full_key],
+        12
+    );
+    head(&client, "scope-a", race_key);
+    assert_eq!(
+        emulator.state.lock().unwrap().download_bytes[&race_full_key],
+        12
+    );
+    emulator
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .remove(&race_full_key);
+    assert!(client
+        .head("scope-a", namespace, race_key)
+        .unwrap()
+        .is_none());
+    assert_eq!(emulator.state.lock().unwrap().capability_bearer_leaks, 0);
 }
 
 #[test]
@@ -1252,6 +1452,32 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
                 .to_string()
                 .into_bytes(),
         )
+    } else if matches!(
+        path,
+        "/v1.0/delta-root-descriptors-first" | "/v1.0/delta-root-descriptors-last"
+    ) && method == "GET"
+    {
+        let namespace = "018f0000-0000-7000-8000-000000000001";
+        let state = state.lock().unwrap();
+        let legacy = state
+            .objects
+            .get(&format!("{namespace}/library-descriptor"))
+            .unwrap();
+        let legacy_item = json!({"name":"library-descriptor","size":legacy.len(),"parentReference":{"path":format!("/drive/root:/Apps/Megle/Megle/libraries/{namespace}")}});
+        let folder = json!({"name":namespace,"folder":{},"parentReference":{"path":"/drive/root:/Apps/Megle/Megle/libraries"}});
+        let response = if path.ends_with("first") {
+            json!({"value":[legacy_item.clone(),folder.clone(),legacy_item,folder],"@odata.nextLink":format!("{base}v1.0/delta-root-descriptors-last")})
+        } else {
+            let (snapshot_key, snapshot) = state
+                .objects
+                .iter()
+                .find(|(key, _)| key.starts_with(&format!("{namespace}/descriptors/")))
+                .unwrap();
+            let snapshot_name = snapshot_key.rsplit('/').next().unwrap();
+            let snapshot_item = json!({"name":snapshot_name,"size":snapshot.len(),"parentReference":{"path":format!("/drive/root:/Apps/Megle/Megle/libraries/{namespace}/descriptors")}});
+            json!({"value":[snapshot_item.clone(),legacy_item,folder,snapshot_item],"@odata.deltaLink":format!("{base}v1.0/delta-final")})
+        };
+        (200, vec![], response.to_string().into_bytes())
     } else if path == "/v1.0/me/drive" && method == "GET" {
         let state = state.lock().unwrap();
         if state.drive_requires_app_root && !state.app_root_requested {
@@ -1286,11 +1512,23 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
             .strip_prefix("/v1.0/me/drive/items/folder-")
             .and_then(|value| value.strip_suffix("/delta"));
         let values = if namespace == Some("libraries") {
-            state
+            let mut values = state
                 .namespaces
                 .iter()
                 .map(|namespace| json!({"name":namespace,"folder":{},"size":0,"parentReference":{"path":"/drive/root:/Apps/Megle/Megle/libraries"}}))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            values.extend(state.objects.iter().filter_map(|(key,value)| {
+                let (namespace,key)=key.split_once('/')?;
+                let (parent,name)=key.rsplit_once('/').unwrap_or(("",key));
+                Some(json!({"name":name,"size":value.len(),"eTag":hex(&Sha256::digest(value)),"parentReference":{"path":format!("/drive/root:/Apps/Megle/Megle/libraries/{namespace}/{parent}").trim_end_matches('/')}}))
+            }));
+            if state.root_delta_files_first {
+                values.reverse();
+            }
+            if state.duplicate_root_delta_items {
+                values.extend(values.clone());
+            }
+            values
         } else {
             state
                 .objects
@@ -1431,12 +1669,15 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
             state.lock().unwrap().capability_bearer_leaks += 1;
         }
         let key = percent_decode(encoded);
-        let mut state = state.lock().unwrap();
-        let mut data = state.objects.get(&key).unwrap().clone();
-        let download_count = state.download_counts.entry(key.clone()).or_default();
+        let mut graph_state = state.lock().unwrap();
+        let mut data = graph_state.objects.get(&key).unwrap().clone();
+        let download_count = graph_state.download_counts.entry(key.clone()).or_default();
         *download_count += 1;
         let download_count = *download_count;
-        drop(state);
+        if let Some(replacement) = graph_state.change_during_download.remove(&key) {
+            graph_state.objects.insert(key.clone(), replacement);
+        }
+        drop(graph_state);
         let range = headers.lines().find_map(|line| {
             line.split_once(':')
                 .filter(|(key, _)| key.eq_ignore_ascii_case("range"))
@@ -1448,7 +1689,7 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
         if key.ends_with("corrupt-fallback.json") && download_count > 1 && !data.is_empty() {
             data[0] ^= 0xff;
         }
-        if let Some(range) = range.filter(|_| {
+        let reply = if let Some(range) = range.filter(|_| {
             !key.ends_with("range-fallback.json") && !key.ends_with("corrupt-fallback.json")
         }) {
             let (start, end) = range
@@ -1473,7 +1714,9 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
             )
         } else {
             (200, vec![], data)
-        }
+        };
+        *state.lock().unwrap().download_bytes.entry(key).or_default() += reply.2.len() as u64;
+        reply
     } else if path.contains("/special/approot:/") {
         let is_content = path.ends_with(":/content");
         let key = graph_key(path, if is_content { ":/content" } else { "" });
@@ -1481,15 +1724,57 @@ fn serve_graph(mut stream: TcpStream, base: &str, state: &Arc<Mutex<GraphState>>
             "PUT" => {
                 let mut state = state.lock().unwrap();
                 if state.objects.contains_key(&key) {
-                    (409, vec![], json!({"error":{"code":"nameAlreadyExists"}}).to_string().into_bytes())
+                    (
+                        409,
+                        vec![],
+                        json!({"error":{"code":"nameAlreadyExists"}})
+                            .to_string()
+                            .into_bytes(),
+                    )
                 } else {
                     state.objects.insert(key, body.to_vec());
-                    (201,vec![],json!({"id":"object","eTag":hex(&Sha256::digest(body))}).to_string().into_bytes())
+                    (
+                        201,
+                        vec![],
+                        json!({"id":"object","eTag":hex(&Sha256::digest(body))})
+                            .to_string()
+                            .into_bytes(),
+                    )
                 }
             }
-            "GET" if is_content => (302,vec![("Location".into(),format!("{base}download/{}",percent_encode(&key)))],Vec::new()),
-            "GET" => match state.lock().unwrap().objects.get(&key) { Some(data)=>(200,vec![],json!({"id":"object","name":key.rsplit('/').next(),"size":if key.ends_with("over-limit.json") { 96*1024*1024u64+1 } else { data.len() as u64 },"eTag":hex(&Sha256::digest(data))}).to_string().into_bytes()),None=>(404,vec![],json!({"error":{"code":"itemNotFound"}}).to_string().into_bytes()) },
-            _ => (405,vec![],Vec::new()),
+            "GET" if is_content => (
+                302,
+                vec![(
+                    "Location".into(),
+                    format!("{base}download/{}", percent_encode(&key)),
+                )],
+                Vec::new(),
+            ),
+            "GET" => {
+                let state = state.lock().unwrap();
+                match state.objects.get(&key) {
+                    Some(data) => {
+                        let mut item = json!({"id":state.metadata_ids.get(&key).map(String::as_str).unwrap_or("object"),"name":key.rsplit('/').next(),"size":if key.ends_with("over-limit.json") { 96*1024*1024u64+1 } else { data.len() as u64 }});
+                        if !state.absent_etags.contains(&key) {
+                            let tag = hex(&Sha256::digest(data));
+                            item["eTag"] = json!(if state.weak_etags.contains(&key) {
+                                format!("W/{tag}")
+                            } else {
+                                tag
+                            });
+                        }
+                        (200, vec![], item.to_string().into_bytes())
+                    }
+                    None => (
+                        404,
+                        vec![],
+                        json!({"error":{"code":"itemNotFound"}})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                }
+            }
+            _ => (405, vec![], Vec::new()),
         }
     } else {
         (

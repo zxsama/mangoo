@@ -59,3 +59,5 @@ pub const SYNC_ROOT_GENERATION_FENCE_MIGRATION: &str =
     include_str!("../../migrations/0031_sync_root_generation_fence.sql");
 pub const SYNC_ROOT_RECONCILIATION_MIGRATION: &str =
     include_str!("../../migrations/0032_sync_root_reconciliation.sql");
+pub const MEDIA_MATERIALIZATION_DESTINATION_MIGRATION: &str =
+    include_str!("../../migrations/0033_media_materialization_destination.sql");

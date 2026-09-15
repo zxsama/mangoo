@@ -67,6 +67,40 @@ fn fixed_bytes<const N: usize>(value: Vec<u8>, field: &str) -> anyhow::Result<[u
 }
 
 impl Database {
+    pub(crate) fn sync_root_identity_for_path(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<Option<(Uuid, Uuid)>> {
+        let mut candidates = vec![path.to_owned()];
+        if let Ok(canonical) = std::fs::canonicalize(Path::new(path)) {
+            let canonical = canonical.to_string_lossy().into_owned();
+            if canonical != path {
+                candidates.push(canonical);
+            }
+        }
+        for candidate in candidates {
+            let identity = self
+                .connection
+                .query_row(
+                    "SELECT root.root_uuid,sentinel.folder_uuid FROM roots root JOIN folders sentinel ON sentinel.root_id=root.id AND sentinel.parent_id IS NULL AND sentinel.name='' WHERE root.path=?1",
+                    [candidate],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()?
+                .map(|(root_uuid, root_folder_uuid)| -> anyhow::Result<(Uuid, Uuid)> {
+                    Ok((
+                        Uuid::from_slice(&root_uuid)?,
+                        Uuid::from_slice(&root_folder_uuid)?,
+                    ))
+                })
+                .transpose()?;
+            if identity.is_some() {
+                return Ok(identity);
+            }
+        }
+        Ok(None)
+    }
+
     pub fn sync_location_heads(&self, entity_uuid: Uuid) -> anyhow::Result<BTreeSet<Uuid>> {
         let transaction = self.connection.unchecked_transaction()?;
         let heads = location_heads(&transaction, entity_uuid)?;
@@ -359,7 +393,63 @@ impl Database {
         enqueue_scan: bool,
     ) -> anyhow::Result<Option<i64>> {
         if let Some(root_id) = self.sync_root_id(root_uuid.as_bytes())? {
-            self.upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+            let descriptor = self.sync_root_descriptor(root_uuid.as_bytes())?;
+            if descriptor.as_ref().is_some_and(|descriptor| {
+                descriptor.root_folder_uuid != *root_folder_uuid.as_bytes()
+                    || descriptor.library_root_uuid != *library_root_uuid.as_bytes()
+            }) {
+                bail!("sync root identity does not match the existing descriptor");
+            }
+            let existing_sentinel: Option<Vec<u8>> = self
+                .connection
+                .query_row(
+                    "SELECT folder_uuid FROM folders WHERE root_id=?1 AND parent_id IS NULL AND name=''",
+                    [root_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match existing_sentinel.as_deref() {
+                Some(existing) if existing != root_folder_uuid.as_bytes().as_slice() => {
+                    bail!("sync root sentinel identity does not match existing browse root");
+                }
+                None => {
+                    // A crash after allocating/linking the root UUID but before
+                    // creating its sentinel must be forward-recoverable.
+                    self.connection.execute(
+                        "INSERT INTO folders(root_id,parent_id,name,path_hash,mtime,status,folder_uuid) VALUES (?1,NULL,'','',NULL,'active',?2)",
+                        params![root_id, root_folder_uuid.as_bytes().as_slice()],
+                    )?;
+                }
+                Some(_) => {}
+            }
+            if descriptor.is_none() {
+                self.upsert_sync_root_descriptor(&SyncRootDescriptorRecord {
+                    root_uuid: *root_uuid.as_bytes(),
+                    root_folder_uuid: *root_folder_uuid.as_bytes(),
+                    library_root_uuid: *library_root_uuid.as_bytes(),
+                    creation_event_uuid: None,
+                    winning_location_revision_uuid: None,
+                    requested_name: requested_name.to_owned(),
+                    materialized_name: materialized_name.to_owned(),
+                    materialization_fingerprint,
+                    lifecycle: "active".to_owned(),
+                    logical_revision: 0,
+                    updated_at: root_now_millis(),
+                })?;
+            }
+            let linked_root_folder_uuid: Option<Vec<u8>> = self.connection.query_row(
+                "SELECT root_folder_uuid FROM roots WHERE id=?1",
+                [root_id],
+                |row| row.get(0),
+            )?;
+            if linked_root_folder_uuid.is_none() {
+                self.link_sync_root_descriptor(
+                    root_id,
+                    root_uuid.as_bytes(),
+                    root_folder_uuid.as_bytes(),
+                )?;
+            }
+            let binding = SyncRootLocalBindingRecord {
                 root_uuid: *root_uuid.as_bytes(),
                 library_uuid: *library_uuid.as_bytes(),
                 local_binding_uuid: *local_binding_uuid.as_bytes(),
@@ -370,7 +460,17 @@ impl Database {
                 root_id,
                 operation_revision,
                 updated_at: root_now_millis(),
-            })?;
+            };
+            self.upsert_sync_root_local_binding(&binding)?;
+            self.adopt_unowned_publication_work(root_id, &binding)?;
+            if enqueue_scan {
+                let token = SyncRootBindingToken {
+                    root_uuid: *root_uuid.as_bytes(),
+                    local_binding_uuid: *local_binding_uuid.as_bytes(),
+                    binding_generation,
+                };
+                return self.ensure_root_scan_task_for_token(root_id, &token);
+            }
             return Ok(None);
         }
         let root_id = self.add_root(crate::db::NewRoot {
@@ -396,7 +496,7 @@ impl Database {
             updated_at: root_now_millis(),
         })?;
         self.link_sync_root_descriptor(root_id, root_uuid.as_bytes(), root_folder_uuid.as_bytes())?;
-        self.upsert_sync_root_local_binding(&SyncRootLocalBindingRecord {
+        let binding = SyncRootLocalBindingRecord {
             root_uuid: *root_uuid.as_bytes(),
             library_uuid: *library_uuid.as_bytes(),
             local_binding_uuid: *local_binding_uuid.as_bytes(),
@@ -407,22 +507,130 @@ impl Database {
             root_id,
             operation_revision,
             updated_at: root_now_millis(),
-        })?;
+        };
+        self.upsert_sync_root_local_binding(&binding)?;
+        self.adopt_unowned_publication_work(root_id, &binding)?;
         if enqueue_scan {
             let token = SyncRootBindingToken {
                 root_uuid: *root_uuid.as_bytes(),
                 local_binding_uuid: *local_binding_uuid.as_bytes(),
                 binding_generation,
             };
-            return Ok(Some(
-                self.create_root_scan_task_with_origin_for_root_token(
-                    root_id,
-                    Some(&token),
-                    crate::db::NotificationOrigin::User,
-                )?,
-            ));
+            return self.ensure_root_scan_task_for_token(root_id, &token);
         }
         Ok(None)
+    }
+
+    fn ensure_root_scan_task_for_token(
+        &self,
+        root_id: i64,
+        token: &SyncRootBindingToken,
+    ) -> anyhow::Result<Option<i64>> {
+        let generation = i64::try_from(token.binding_generation)
+            .context("binding generation exceeds SQLite integer range")?;
+        let already_enqueued: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE kind='root_scan' AND root_id=?1 AND root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND status IN ('pending','running','succeeded'))",
+            params![root_id, token.root_uuid.as_slice(), token.local_binding_uuid.as_slice(), generation],
+            |row| row.get(0),
+        )?;
+        if already_enqueued {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.create_root_scan_task_with_origin_for_root_token(
+                root_id,
+                Some(token),
+                crate::db::NotificationOrigin::User,
+            )?,
+        ))
+    }
+
+    fn adopt_unowned_publication_work(
+        &self,
+        root_id: i64,
+        binding: &SyncRootLocalBindingRecord,
+    ) -> anyhow::Result<usize> {
+        type PendingIntent = (
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let transaction = self.connection.unchecked_transaction()?;
+        let pending = {
+            let mut statement = transaction.prepare(
+                "SELECT intent.intent_uuid,job.intent_uuid,job.source_identity_json,intent.binding_epoch,job.transport_generation,job.priority,job.created_at FROM sync_publication_intents intent LEFT JOIN media_publication_jobs job ON job.intent_uuid=intent.intent_uuid JOIN files file ON file.asset_uuid=intent.asset_uuid WHERE file.root_id=?1 AND intent.root_uuid IS NULL AND intent.state IN ('pending-hash','pending-manifest','ready','failed') ORDER BY intent.intent_uuid",
+            )?;
+            let rows = statement
+                .query_map([root_id], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<PendingIntent>>>()?;
+            rows
+        };
+        let now = root_now_millis();
+        let generation = i64::try_from(binding.binding_generation)
+            .context("binding generation exceeds SQLite integer range")?;
+        for (
+            intent_uuid,
+            existing_job,
+            source_identity,
+            binding_epoch,
+            transport_generation,
+            priority,
+            created_at,
+        ) in &pending
+        {
+            // Parent/child ownership triggers intentionally reject partial
+            // updates. Requeue unfinished legacy work as one fresh job after
+            // the root becomes managed; already-published work is untouched.
+            if existing_job.is_some() {
+                transaction.execute(
+                    "DELETE FROM media_publication_jobs WHERE intent_uuid=?1",
+                    [intent_uuid],
+                )?;
+            }
+            transaction.execute(
+                "UPDATE sync_publication_intents SET root_uuid=?1,local_binding_uuid=?2,binding_generation=?3,state='pending-hash',attempt_count=0,next_attempt_at=NULL,error_code=NULL,updated_at=?4 WHERE intent_uuid=?5 AND root_uuid IS NULL",
+                params![
+                    binding.root_uuid.as_slice(),
+                    binding.local_binding_uuid.as_slice(),
+                    generation,
+                    now,
+                    intent_uuid,
+                ],
+            )?;
+            if existing_job.is_some() {
+                transaction.execute(
+                    "INSERT INTO media_publication_jobs(intent_uuid,phase,source_identity_json,binding_epoch,transport_generation,priority,attempt_count,created_at,updated_at,root_uuid,local_binding_uuid,binding_generation) VALUES (?1,'pending-hash',?2,?3,?4,?5,0,?6,?7,?8,?9,?10)",
+                    params![
+                        intent_uuid,
+                        source_identity,
+                        binding_epoch,
+                        transport_generation.context("publication job transport generation missing")?,
+                        priority.context("publication job priority missing")?,
+                        created_at.context("publication job creation timestamp missing")?,
+                        now,
+                        binding.root_uuid.as_slice(),
+                        binding.local_binding_uuid.as_slice(),
+                        generation,
+                    ],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(pending.len())
     }
 
     pub fn fence_root_as_local_only(
@@ -830,11 +1038,23 @@ impl Database {
     pub(crate) fn sync_root_id(&self, root_uuid: &[u8; 16]) -> anyhow::Result<Option<i64>> {
         self.connection
             .query_row(
-                "SELECT id FROM roots WHERE root_uuid=?1 AND root_folder_uuid IS NOT NULL",
+                // An existing browse root already owns its root UUID before
+                // enrollment links the portable root-folder sentinel.
+                "SELECT id FROM roots WHERE root_uuid=?1",
                 [root_uuid.as_slice()],
                 |row| row.get(0),
             )
             .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn sync_root_projection_ready(&self, root_uuid: &[u8; 16]) -> anyhow::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM roots root JOIN sync_root_descriptors descriptor ON descriptor.root_uuid=root.root_uuid AND descriptor.root_folder_uuid=root.root_folder_uuid JOIN folders sentinel ON sentinel.root_id=root.id AND sentinel.parent_id IS NULL AND sentinel.name='' AND sentinel.folder_uuid=root.root_folder_uuid WHERE root.root_uuid=?1)",
+                [root_uuid.as_slice()],
+                |row| row.get(0),
+            )
             .map_err(Into::into)
     }
 
@@ -2038,6 +2258,413 @@ mod tests {
                 .unwrap(),
             Some(advanced)
         );
+    }
+
+    #[test]
+    fn enrollment_adopts_an_existing_browse_root_and_requeues_unfinished_publication() {
+        let database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let library_uuid = Uuid::from_bytes([9; 16]);
+        let library_root_uuid = Uuid::from_bytes([10; 16]);
+        let binding_epoch = Uuid::from_bytes([11; 16]);
+        database
+            .add_root(crate::db::NewRoot {
+                path: "D:/Library".into(),
+                display_name: "Library".into(),
+            })
+            .expect("create bootstrap root");
+        database
+            .initialize_sync_identity(library_uuid, library_root_uuid, Uuid::from_bytes([12; 16]))
+            .expect("initialize sync identity");
+        database
+            .begin_sync_capture(binding_epoch, Uuid::from_bytes([13; 16]))
+            .expect("enable sync capture");
+
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "D:/Library/Existing".into(),
+                display_name: "Existing".into(),
+            })
+            .expect("create browse root");
+        database
+            .connection
+            .execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status) VALUES (?1,NULL,'','root','active')",
+                [root_id],
+            )
+            .expect("create browse root sentinel");
+        let sentinel_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status) VALUES (?1,?2,'photo.jpg','jpg',7,1,'active')",
+                params![root_id, sentinel_id],
+            )
+            .expect("create existing asset");
+        let asset_uuid: Vec<u8> = database
+            .connection
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE root_id=?1",
+                [root_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let content_revision_uuid = Uuid::from_bytes([14; 16]);
+        let intent_uuid = Uuid::from_bytes([15; 16]);
+        database.connection.execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?1,?2,7,1,1)",params![content_revision_uuid.as_bytes().as_slice(),asset_uuid]).unwrap();
+        database.connection.execute("INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,binding_epoch,local_mutation_generation,source_path,state,attempt_count,next_attempt_at,error_code,created_at,updated_at) VALUES (?1,(SELECT asset_uuid FROM files WHERE root_id=?2),?3,?4,1,'D:/Library/Existing/photo.jpg','failed',4,99,'transient',1,1)",params![intent_uuid.as_bytes().as_slice(),root_id,content_revision_uuid.as_bytes().as_slice(),binding_epoch.as_bytes().as_slice()]).unwrap();
+        database.connection.execute("INSERT INTO media_publication_jobs(intent_uuid,phase,binding_epoch,transport_generation,attempt_count,next_attempt_at,error_code,created_at,updated_at) VALUES (?1,'failed',?2,3,5,99,'transient',1,1)",params![intent_uuid.as_bytes().as_slice(),binding_epoch.as_bytes().as_slice()]).unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status) VALUES (?1,?2,'published.jpg','jpg',8,1,'active')",
+                params![root_id, sentinel_id],
+            )
+            .expect("create published asset");
+        let published_revision_uuid = Uuid::from_bytes([20; 16]);
+        let published_intent_uuid = Uuid::from_bytes([21; 16]);
+        database.connection.execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?1,(SELECT asset_uuid FROM files WHERE root_id=?2 AND name='published.jpg'),8,1,1)",params![published_revision_uuid.as_bytes().as_slice(),root_id]).unwrap();
+        database.connection.execute("INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,binding_epoch,local_mutation_generation,source_path,state,attempt_count,created_at,updated_at) VALUES (?1,(SELECT asset_uuid FROM files WHERE root_id=?2 AND name='published.jpg'),?3,?4,1,'D:/Library/Existing/published.jpg','canonicalized',1,1,1)",params![published_intent_uuid.as_bytes().as_slice(),root_id,published_revision_uuid.as_bytes().as_slice(),binding_epoch.as_bytes().as_slice()]).unwrap();
+        database.connection.execute("INSERT INTO media_publication_jobs(intent_uuid,phase,binding_epoch,transport_generation,attempt_count,created_at,updated_at) VALUES (?1,'event-published',?2,3,1,1,1)",params![published_intent_uuid.as_bytes().as_slice(),binding_epoch.as_bytes().as_slice()]).unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status) VALUES (?1,?2,'intent-only.jpg','jpg',9,1,'active')",
+                params![root_id, sentinel_id],
+            )
+            .expect("create intent-only asset");
+        let intent_only_revision_uuid = Uuid::from_bytes([22; 16]);
+        let intent_only_uuid = Uuid::from_bytes([23; 16]);
+        database.connection.execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?1,(SELECT asset_uuid FROM files WHERE root_id=?2 AND name='intent-only.jpg'),9,1,1)",params![intent_only_revision_uuid.as_bytes().as_slice(),root_id]).unwrap();
+        database.connection.execute("INSERT INTO sync_publication_intents(intent_uuid,asset_uuid,content_revision_uuid,binding_epoch,local_mutation_generation,source_path,state,attempt_count,created_at,updated_at) VALUES (?1,(SELECT asset_uuid FROM files WHERE root_id=?2 AND name='intent-only.jpg'),?3,?4,1,'D:/Library/Existing/intent-only.jpg','pending-hash',0,1,1)",params![intent_only_uuid.as_bytes().as_slice(),root_id,intent_only_revision_uuid.as_bytes().as_slice(),binding_epoch.as_bytes().as_slice()]).unwrap();
+
+        let (root_uuid, root_folder_uuid) = database
+            .sync_root_identity_for_path("D:/Library/Existing")
+            .unwrap()
+            .expect("existing browse identity");
+        let local_binding_uuid = Uuid::from_bytes([16; 16]);
+        let enrollment_scan = database
+            .ensure_selected_sync_root(
+                library_uuid,
+                root_uuid,
+                root_folder_uuid,
+                library_root_uuid,
+                "D:/Library/Existing",
+                "Existing",
+                "Existing",
+                [17; 32],
+                local_binding_uuid,
+                Uuid::from_bytes([18; 16]),
+                Uuid::from_bytes([19; 16]),
+                1,
+                "active",
+                1,
+                true,
+            )
+            .expect("adopt existing browse root");
+        assert!(enrollment_scan.is_some());
+
+        let stored: (i64, Vec<u8>, Vec<u8>) = database
+            .connection
+            .query_row(
+                "SELECT id,root_uuid,root_folder_uuid FROM roots WHERE path='D:/Library/Existing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, root_id);
+        assert_eq!(stored.1, root_uuid.as_bytes());
+        assert_eq!(stored.2, root_folder_uuid.as_bytes());
+        let descriptors = database
+            .sync_root_descriptors()
+            .expect("list synchronized root descriptors");
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].root_uuid, *root_uuid.as_bytes());
+        let binding = database
+            .sync_root_local_binding(root_uuid.as_bytes())
+            .expect("read synchronized root binding")
+            .expect("synchronized root binding");
+        assert_eq!(binding.root_id, root_id);
+        assert_eq!(binding.local_binding_uuid, *local_binding_uuid.as_bytes());
+        let intent: (String, Vec<u8>, Vec<u8>, i64, i64, Option<i64>, Option<String>) = database.connection.query_row("SELECT state,root_uuid,local_binding_uuid,binding_generation,attempt_count,next_attempt_at,error_code FROM sync_publication_intents WHERE intent_uuid=?1",[intent_uuid.as_bytes().as_slice()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).unwrap();
+        assert_eq!(intent.0, "pending-hash");
+        assert_eq!(intent.1, root_uuid.as_bytes());
+        assert_eq!(intent.2, local_binding_uuid.as_bytes());
+        assert_eq!(intent.3, 1);
+        assert_eq!(intent.4, 0);
+        assert_eq!(intent.5, None);
+        assert_eq!(intent.6, None);
+        let job: (String, Vec<u8>, Vec<u8>, i64, i64, Option<i64>, Option<String>) = database.connection.query_row("SELECT phase,root_uuid,local_binding_uuid,binding_generation,attempt_count,next_attempt_at,error_code FROM media_publication_jobs WHERE intent_uuid=?1",[intent_uuid.as_bytes().as_slice()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).unwrap();
+        assert_eq!(job.0, "pending-hash");
+        assert_eq!(job.1, root_uuid.as_bytes());
+        assert_eq!(job.2, local_binding_uuid.as_bytes());
+        assert_eq!(job.3, 1);
+        assert_eq!(job.4, 0);
+        assert_eq!(job.5, None);
+        assert_eq!(job.6, None);
+        let intent_only: (String, Vec<u8>, Vec<u8>, i64) = database.connection.query_row("SELECT state,root_uuid,local_binding_uuid,binding_generation FROM sync_publication_intents WHERE intent_uuid=?1",[intent_only_uuid.as_bytes().as_slice()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(intent_only.0, "pending-hash");
+        assert_eq!(intent_only.1, root_uuid.as_bytes());
+        assert_eq!(intent_only.2, local_binding_uuid.as_bytes());
+        assert_eq!(intent_only.3, 1);
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM media_publication_jobs WHERE intent_uuid=?1",
+                    [intent_only_uuid.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let published: (String, Option<Vec<u8>>, String, Option<Vec<u8>>) = database.connection.query_row("SELECT intent.state,intent.root_uuid,job.phase,job.root_uuid FROM sync_publication_intents intent JOIN media_publication_jobs job ON job.intent_uuid=intent.intent_uuid WHERE intent.intent_uuid=?1",[published_intent_uuid.as_bytes().as_slice()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(
+            published,
+            ("canonicalized".into(), None, "event-published".into(), None)
+        );
+        assert_eq!(
+            database
+                .sync_root_identity_for_path("D:/Library/Existing")
+                .unwrap(),
+            Some((root_uuid, root_folder_uuid))
+        );
+
+        let replay_scan = database
+            .ensure_selected_sync_root(
+                library_uuid,
+                root_uuid,
+                root_folder_uuid,
+                library_root_uuid,
+                "D:/Library/Existing",
+                "Existing",
+                "Existing",
+                [17; 32],
+                local_binding_uuid,
+                Uuid::from_bytes([18; 16]),
+                Uuid::from_bytes([19; 16]),
+                1,
+                "active",
+                1,
+                true,
+            )
+            .expect("retry existing enrollment projection");
+        assert_eq!(replay_scan, None);
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_publication_intents WHERE intent_uuid=?1",
+                    [intent_uuid.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE kind='root_scan' AND root_id=?1 AND root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=1",
+                    params![root_id, root_uuid.as_bytes().as_slice(), local_binding_uuid.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        database
+            .connection
+            .execute(
+                "UPDATE tasks SET status='failed' WHERE id=?1",
+                [enrollment_scan.expect("enrollment scan task")],
+            )
+            .expect("fail enrollment scan");
+        assert!(database
+            .ensure_selected_sync_root(
+                library_uuid,
+                root_uuid,
+                root_folder_uuid,
+                library_root_uuid,
+                "D:/Library/Existing",
+                "Existing",
+                "Existing",
+                [17; 32],
+                local_binding_uuid,
+                Uuid::from_bytes([18; 16]),
+                Uuid::from_bytes([19; 16]),
+                1,
+                "active",
+                1,
+                true,
+            )
+            .expect("retry failed enrollment scan")
+            .is_some());
+    }
+
+    #[test]
+    fn enrollment_recovers_a_root_allocated_before_its_sentinel() {
+        let database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "D:/Library/Interrupted".into(),
+                display_name: "Interrupted".into(),
+            })
+            .expect("create interrupted browse root");
+        let root_uuid: Vec<u8> = database
+            .connection
+            .query_row(
+                "SELECT root_uuid FROM roots WHERE id=?1",
+                [root_id],
+                |row| row.get(0),
+            )
+            .expect("read allocated root identity");
+        let root_uuid = Uuid::from_slice(&root_uuid).expect("valid root uuid");
+        let root_folder_uuid = Uuid::from_bytes([31; 16]);
+
+        database
+            .ensure_selected_sync_root(
+                Uuid::from_bytes([30; 16]),
+                root_uuid,
+                root_folder_uuid,
+                Uuid::from_bytes([29; 16]),
+                "D:/Library/Interrupted",
+                "Interrupted",
+                "Interrupted",
+                [28; 32],
+                Uuid::from_bytes([27; 16]),
+                Uuid::from_bytes([26; 16]),
+                Uuid::from_bytes([25; 16]),
+                1,
+                "active",
+                1,
+                false,
+            )
+            .expect("recover interrupted Catalog projection");
+
+        let linked: (Vec<u8>, Vec<u8>) = database
+            .connection
+            .query_row(
+                "SELECT root.root_folder_uuid,sentinel.folder_uuid FROM roots root JOIN folders sentinel ON sentinel.root_id=root.id AND sentinel.parent_id IS NULL AND sentinel.name='' WHERE root.id=?1",
+                [root_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read recovered root identity");
+        assert_eq!(linked.0, root_folder_uuid.as_bytes());
+        assert_eq!(linked.1, root_folder_uuid.as_bytes());
+    }
+
+    #[test]
+    fn enrollment_replay_preserves_an_existing_canonical_root_descriptor() {
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let canonical = descriptor();
+        database.upsert_sync_root_descriptor(&canonical).unwrap();
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "D:/Existing".into(),
+                display_name: "Existing".into(),
+            })
+            .unwrap();
+        database.connection.execute(
+            "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,NULL,'','root','active',?2)",
+            params![root_id, canonical.root_folder_uuid.as_slice()],
+        ).unwrap();
+        database
+            .link_sync_root_descriptor(root_id, &canonical.root_uuid, &canonical.root_folder_uuid)
+            .unwrap();
+        let ensure = |root_folder_uuid, library_root_uuid| {
+            database.ensure_selected_sync_root(
+                Uuid::from_bytes([9; 16]),
+                Uuid::from_bytes(canonical.root_uuid),
+                root_folder_uuid,
+                library_root_uuid,
+                "D:/Existing",
+                "Stale enrollment name",
+                "Stale enrollment name",
+                [10; 32],
+                Uuid::from_bytes([11; 16]),
+                Uuid::from_bytes([12; 16]),
+                Uuid::from_bytes([13; 16]),
+                1,
+                "active",
+                1,
+                false,
+            )
+        };
+        ensure(
+            Uuid::from_bytes(canonical.root_folder_uuid),
+            Uuid::from_bytes(canonical.library_root_uuid),
+        )
+        .expect("replay must not replace canonical revision, names or event identity");
+        assert_eq!(
+            database.sync_root_descriptor(&canonical.root_uuid).unwrap(),
+            Some(canonical.clone())
+        );
+        assert!(ensure(
+            Uuid::from_bytes([99; 16]),
+            Uuid::from_bytes(canonical.library_root_uuid),
+        )
+        .is_err());
+        assert!(ensure(
+            Uuid::from_bytes(canonical.root_folder_uuid),
+            Uuid::from_bytes([99; 16]),
+        )
+        .is_err());
+        assert_eq!(
+            database.sync_root_descriptor(&canonical.root_uuid).unwrap(),
+            Some(canonical)
+        );
+    }
+
+    #[test]
+    fn enrollment_finds_an_existing_root_stored_with_its_canonical_path() {
+        let database = Database::open_in_memory().expect("open database");
+        database.apply_migrations().expect("apply migrations");
+        let directory = std::env::temp_dir().join(format!(
+            "megle-enrollment-canonical-path-{}",
+            Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&directory).expect("create root directory");
+        let canonical = std::fs::canonicalize(&directory)
+            .expect("canonicalize root directory")
+            .to_string_lossy()
+            .into_owned();
+        let selected = directory.to_string_lossy().into_owned();
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: canonical,
+                display_name: "Existing".into(),
+            })
+            .expect("create browse root");
+        database
+            .connection
+            .execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status) VALUES (?1,NULL,'','root','active')",
+                [root_id],
+            )
+            .expect("create browse root sentinel");
+        let expected: (Vec<u8>, Vec<u8>) = database
+            .connection
+            .query_row(
+                "SELECT root.root_uuid,sentinel.folder_uuid FROM roots root JOIN folders sentinel ON sentinel.root_id=root.id AND sentinel.parent_id IS NULL AND sentinel.name='' WHERE root.id=?1",
+                [root_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read browse root identity");
+
+        assert_eq!(
+            database
+                .sync_root_identity_for_path(&selected)
+                .expect("find canonical browse root identity"),
+            Some((
+                Uuid::from_slice(&expected.0).expect("valid root uuid"),
+                Uuid::from_slice(&expected.1).expect("valid sentinel uuid"),
+            ))
+        );
+
+        drop(database);
+        std::fs::remove_dir_all(directory).expect("remove root directory");
     }
 
     #[test]

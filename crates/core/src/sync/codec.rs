@@ -120,6 +120,12 @@ pub fn verify_event(event: &EventEnvelope) -> Result<(), CodecError> {
             "event actor sequence or stream identity is invalid".into(),
         ));
     }
+    if let super::types::Operation::SetField { field, value } = &event.operation {
+        if field == super::reducer::ROOT_IDENTITY_FIELD {
+            super::reducer::decode_root_identity(event.entity_uuid, value)
+                .map_err(|_| CodecError::Decode("invalid synchronized root identity".into()))?;
+        }
+    }
     if sha256(&event_signing_bytes(event)?) != event.integrity_hash {
         return Err(CodecError::IntegrityMismatch);
     }

@@ -103,6 +103,26 @@ interface LibrarySwitcherLifecycleResult {
     reports: number;
     unhandledRejections: number;
   };
+  addFolderAfterBlur?: {
+    addedPath: string | null;
+    addCalls: number;
+    committedRootUuid: string | null;
+    commitCalls: number;
+    enrollmentMode: string | null;
+    enrolledExistingRoot: boolean;
+    refreshCalls: number;
+    reloadsAfterSelection: number;
+    requestedName: string | null;
+    rootFolderUuidIsValid: boolean;
+    localAddedPath: string | null;
+    localAddCalls: number;
+    localEnrollmentCalls: number;
+    localReloadsAfterSelection: number;
+    switchedLibraryAddCalls: number;
+    switchedLibraryEnrollmentCalls: number;
+    switchedLibraryReports: number;
+    switcherClosed: boolean;
+  };
   managedLibraryWizard?: {
     createPersisted: boolean;
     explicitCloseRemoved: boolean;
@@ -200,6 +220,7 @@ function createLibraryState(overrides: Partial<LibraryState> = {}): LibraryState
 }
 
 type FixtureBridgeOverrides = Partial<MegleDesktopBridge> & {
+  coreRequest?: (url: URL, method: string, init?: RequestInit) => Promise<Response | null> | Response | null;
   createLibrary?: () => Promise<unknown>;
   listLibraries?: () => Promise<LibrarySummary[]> | LibrarySummary[];
   openLibrary?: () => Promise<unknown>;
@@ -219,6 +240,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 function installBridge(overrides: FixtureBridgeOverrides = {}): void {
   const {
+    coreRequest,
     createLibrary: createLibraryOverride,
     listLibraries: listLibrariesOverride,
     openLibrary: _openLibraryOverride,
@@ -241,6 +263,8 @@ function installBridge(overrides: FixtureBridgeOverrides = {}): void {
       throw new Error(`Unexpected fixture request: ${url.href}`);
     }
     const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+    const overridden = await coreRequest?.(url, method, init);
+    if (overridden) return overridden;
     if (url.pathname === "/api/libraries" && method === "GET") {
       const items = await (listLibrariesOverride?.() ?? [ACTIVE_LIBRARY, INACTIVE_LIBRARY]);
       return jsonResponse({ items });
@@ -1293,6 +1317,218 @@ async function runMutationFailureScenario() {
   return result;
 }
 
+async function runAddFolderAfterBlurScenario() {
+  const picker = deferred<string | null>();
+  let addCalls = 0;
+  let addedPath: string | null = null;
+  let committedRootUuid: string | null = null;
+  let commitCalls = 0;
+  let enrollmentMode: string | null = null;
+  let requestedName: string | null = null;
+  let rootFolderUuid: string | null = null;
+  let refreshCalls = 0;
+  let listCalls = 0;
+  const selectedPath = "C:\\Fixture\\selected-folder";
+  const rootUuid = "11111111-1111-4111-8111-111111111111";
+  const preflightToken = "22222222-2222-4222-8222-222222222222";
+  installBridge({
+    coreRequest: async (url, method, init) => {
+      if (url.pathname === "/api/sync/status" && method === "GET") {
+        return jsonResponse({ generatedAt: 1, libraries: [], providers: [], revision: 1, schedulerState: "running" });
+      }
+      if (url.pathname.endsWith("/sync-folders/enrollment/preflight") && method === "POST") {
+        const body = JSON.parse(String(init?.body)) as { mode?: string };
+        enrollmentMode = body.mode ?? null;
+        return jsonResponse({
+          expiresAt: Date.now() + 60_000,
+          normalizedPath: selectedPath,
+          ok: true,
+          preflightToken,
+          proposedMaterializedName: "selected-folder",
+          reason: "ok",
+          rootUuid,
+        });
+      }
+      if (url.pathname.endsWith("/sync-folders/enrollment/commit") && method === "POST") {
+        commitCalls += 1;
+        const body = JSON.parse(String(init?.body)) as {
+          requestedName?: string;
+          rootFolderUuid?: string;
+          rootUuid?: string;
+        };
+        committedRootUuid = body.rootUuid ?? null;
+        requestedName = body.requestedName ?? null;
+        rootFolderUuid = body.rootFolderUuid ?? null;
+        return jsonResponse({
+          errorCode: null,
+          kind: "enroll",
+          libraryUuid: ACTIVE_LIBRARY.libraryUuid,
+          operationRevision: 1,
+          operationUuid: "33333333-3333-4333-8333-333333333333",
+          phase: "completed",
+          rootUuid,
+          state: "completed",
+          updatedAt: 1,
+        }, 202);
+      }
+      return null;
+    },
+    listLibraries: () => {
+      listCalls += 1;
+      return [{ ...ACTIVE_LIBRARY, bindingState: "synchronized" }, INACTIVE_LIBRARY];
+    },
+    pickFolder: () => picker.promise,
+  });
+  const library = createLibraryState({
+    roots: [{ createdAt: 1, displayName: "selected-folder", enabled: true, id: 7, lastScanAt: 1, mediaCount: 1, path: selectedPath, reachable: true, rootFolderId: 1 }],
+    addRoot: async (path) => {
+      addCalls += 1;
+      addedPath = path;
+    },
+    refresh: async () => {
+      refreshCalls += 1;
+    },
+  });
+  const control: ScenarioControl = { api: null };
+  const mounted = await mountScenario(
+    <OverlayProvider>
+      <ProductionLibrarySwitcherScenario control={control} library={library} />
+    </OverlayProvider>,
+  );
+  const trigger = await findElement('[data-titlebar-control="library-switcher"]');
+  await act(async () => trigger.click());
+  const surface = await findOpenSurface("library-root");
+  if (!surface) throw new Error("Library root did not open for add-folder blur test");
+  await requestNativeClick(await findElement('button[aria-label="Add folder"]', surface));
+  await act(async () => window.dispatchEvent(new Event("blur")));
+  await waitForLayerRemoval("library-root");
+  const listCallsBeforeSelection = listCalls;
+  await act(async () => picker.resolve(selectedPath));
+  await waitFor(() => commitCalls === 1, "selected folder to be enrolled after window blur");
+  await settle(30);
+
+  const result = {
+    addedPath,
+    addCalls,
+    committedRootUuid,
+    commitCalls,
+    enrollmentMode,
+    enrolledExistingRoot: library.roots.some((root) => root.path === selectedPath),
+    refreshCalls,
+    reloadsAfterSelection: listCalls - listCallsBeforeSelection,
+    requestedName,
+    rootFolderUuidIsValid: rootFolderUuid !== null && /^[0-9a-f-]{36}$/u.test(rootFolderUuid),
+    switcherClosed: document.getElementById("library-root") === null,
+    localAddedPath: null as string | null,
+    localAddCalls: 0,
+    localEnrollmentCalls: 0,
+    localReloadsAfterSelection: 0,
+    switchedLibraryAddCalls: 0,
+    switchedLibraryEnrollmentCalls: 0,
+    switchedLibraryReports: 0,
+  };
+  await unmountScenario(mounted);
+
+  const localPicker = deferred<string | null>();
+  const localSelectedPath = "C:\\Fixture\\local-folder";
+  let localListCalls = 0;
+  installBridge({
+    coreRequest: (url, method) => {
+      if (url.pathname === "/api/sync/status" && method === "GET") {
+        return jsonResponse({ generatedAt: 1, libraries: [], providers: [], revision: 1, schedulerState: "running" });
+      }
+      if (url.pathname.includes("/sync-folders/enrollment/")) {
+        result.localEnrollmentCalls += 1;
+      }
+      return null;
+    },
+    listLibraries: () => {
+      localListCalls += 1;
+      return [ACTIVE_LIBRARY, INACTIVE_LIBRARY];
+    },
+    pickFolder: () => localPicker.promise,
+  });
+  const localLibrary = createLibraryState({
+    addRoot: async (path) => {
+      result.localAddCalls += 1;
+      result.localAddedPath = path;
+    },
+  });
+  const localControl: ScenarioControl = { api: null };
+  const localMounted = await mountScenario(
+    <OverlayProvider>
+      <ProductionLibrarySwitcherScenario control={localControl} library={localLibrary} />
+    </OverlayProvider>,
+  );
+  const localTrigger = await findElement('[data-titlebar-control="library-switcher"]');
+  await act(async () => localTrigger.click());
+  const localSurface = await findOpenSurface("library-root");
+  if (!localSurface) throw new Error("Library root did not open for local add-folder blur test");
+  await requestNativeClick(await findElement('button[aria-label="Add folder"]', localSurface));
+  await act(async () => window.dispatchEvent(new Event("blur")));
+  await waitForLayerRemoval("library-root");
+  const localListCallsBeforeSelection = localListCalls;
+  await act(async () => localPicker.resolve(localSelectedPath));
+  await waitFor(() => result.localAddCalls === 1, "local folder to be added after window blur");
+  await settle(30);
+  result.localReloadsAfterSelection = localListCalls - localListCallsBeforeSelection;
+  await unmountScenario(localMounted);
+  for (const synchronized of [false, true]) {
+    const switchedPicker = deferred<string | null>();
+    let switched = false;
+    installBridge({
+      coreRequest: (url, method) => {
+        if (url.pathname === "/api/libraries/active" && method === "GET" && switched) {
+          return jsonResponse({
+            contextRevision: ACTIVE_LIBRARY.contextRevision + 1,
+            library: { ...INACTIVE_LIBRARY, active: true },
+          });
+        }
+        if (url.pathname === "/api/sync/status" && method === "GET") {
+          return jsonResponse({ generatedAt: 1, libraries: [], providers: [], revision: 1, schedulerState: "running" });
+        }
+        if (url.pathname.includes("/sync-folders/enrollment/")) {
+          result.switchedLibraryEnrollmentCalls += 1;
+        }
+        return null;
+      },
+      listLibraries: () => [
+        { ...ACTIVE_LIBRARY, bindingState: synchronized ? "synchronized" : "local-only" },
+        INACTIVE_LIBRARY,
+      ],
+      pickFolder: () => switchedPicker.promise,
+      notifications: {
+        reportError: async () => {
+          result.switchedLibraryReports += 1;
+          return true;
+        },
+      } as unknown as MegleDesktopBridge["notifications"],
+    });
+    const switchedControl: ScenarioControl = { api: null };
+    const switchedMounted = await mountScenario(
+      <OverlayProvider>
+        <ProductionLibrarySwitcherScenario
+          control={switchedControl}
+          library={createLibraryState({ addRoot: async () => { result.switchedLibraryAddCalls += 1; } })}
+        />
+      </OverlayProvider>,
+    );
+    const switchedTrigger = await findElement('[data-titlebar-control="library-switcher"]');
+    await act(async () => switchedTrigger.click());
+    const switchedSurface = await findOpenSurface("library-root");
+    if (!switchedSurface) throw new Error("Library root did not open for changed Library test");
+    await requestNativeClick(await findElement('button[aria-label="Add folder"]', switchedSurface));
+    await act(async () => window.dispatchEvent(new Event("blur")));
+    await waitForLayerRemoval("library-root");
+    const previousReports = result.switchedLibraryReports;
+    switched = true;
+    await act(async () => switchedPicker.resolve("C:\\Fixture\\different-library-folder"));
+    await waitFor(() => result.switchedLibraryReports === previousReports + 1, "changed Library to reject the stale folder choice");
+    await unmountScenario(switchedMounted);
+  }
+  return result;
+}
+
 async function run(): Promise<void> {
   try {
     lifecycleWindow.__overlayLifecycleResult = {
@@ -1316,6 +1552,7 @@ async function run(): Promise<void> {
       requestOwnership: await runRequestOwnershipScenario(),
       hardMediaCancellation: await runHardMediaCancellationScenario(),
       mutationFailures: await runMutationFailureScenario(),
+      addFolderAfterBlur: await runAddFolderAfterBlurScenario(),
       managedLibraryWizard: await runManagedLibraryWizardScenario(),
       ok: true,
     };

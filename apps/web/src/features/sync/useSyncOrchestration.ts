@@ -12,6 +12,39 @@ function hasActiveWork(libraries: LibrarySyncStatus[] | undefined): boolean {
   ));
 }
 
+function folderNameFromPath(path: string): string {
+  const normalized = path.replace(/[\\/]+$/u, "");
+  return normalized.slice(Math.max(normalized.lastIndexOf("\\"), normalized.lastIndexOf("/")) + 1);
+}
+
+export async function enrollExistingSyncFolder(libraryUuid: string, path: string): Promise<void> {
+  const client = createCoreClient();
+  const operationUuid = crypto.randomUUID();
+  const preflight = await client.preflightSyncFolderEnrollment(libraryUuid, {
+    expectedOperationRevision: 0,
+    mode: "enroll-existing",
+    operationUuid,
+    path,
+    rootUuid: null,
+  });
+  if (!preflight.ok || !preflight.preflightToken || !preflight.rootUuid) {
+    throw new Error(`无法添加同步文件夹：${preflight.reason}`);
+  }
+  const active = await client.getActiveLibrary();
+  if (active.library?.libraryUuid !== libraryUuid) {
+    throw new Error("活动资源库已改变，请重新选择文件夹。");
+  }
+  await client.commitSyncFolderEnrollment(libraryUuid, active.contextRevision, {
+    expectedOperationRevision: 0,
+    operationUuid,
+    path: preflight.normalizedPath,
+    preflightToken: preflight.preflightToken,
+    requestedName: folderNameFromPath(preflight.normalizedPath),
+    rootFolderUuid: crypto.randomUUID(),
+    rootUuid: preflight.rootUuid,
+  });
+}
+
 export function useSyncOrchestration() {
   const queryClient = useQueryClient();
   const [busyLibraryId, setBusyLibraryId] = useState<string | null>(null);

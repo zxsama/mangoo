@@ -6,6 +6,7 @@ pub mod capture;
 pub mod checkpoint;
 pub mod codec;
 pub mod coordinator;
+pub mod descriptor;
 pub mod fault;
 pub mod identity;
 pub mod inbox;

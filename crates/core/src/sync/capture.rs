@@ -31,6 +31,128 @@ pub struct CaptureResult {
     pub actor_seq: Option<i64>,
 }
 
+/// Complete durable enrollment capture, including roots enrolled by older builds.
+/// Only an active local binding may originate this event; remote roots never echo.
+pub fn capture_enrolled_root_identities(connection: &rusqlite::Connection) -> anyhow::Result<()> {
+    let transaction = connection.unchecked_transaction()?;
+    let enabled: bool = transaction
+        .query_row(
+            "SELECT capture_enabled=1 FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(());
+    }
+    super::inbox::reconcile_bootstrap_location_conflicts(&transaction)?;
+    let mut statement = transaction.prepare("SELECT d.root_uuid,d.root_folder_uuid,d.library_root_uuid,d.requested_name,d.materialized_name,d.materialization_fingerprint,d.lifecycle,d.logical_revision FROM sync_root_descriptors d JOIN sync_root_local_bindings b ON b.root_uuid=d.root_uuid WHERE d.creation_event_uuid IS NULL AND b.state='active' ORDER BY d.root_uuid LIMIT 100")?;
+    let roots = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, u64>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (root, folder, library_root, requested, materialized, fingerprint, lifecycle, revision) in
+        roots
+    {
+        let truth = super::reducer::SyncRootTruth {
+            root_uuid: EntityUuid(Uuid::from_slice(&root)?),
+            root_folder_uuid: EntityUuid(Uuid::from_slice(&folder)?),
+            library_root_uuid: EntityUuid(Uuid::from_slice(&library_root)?),
+            creation_event_uuid: None,
+            winning_location_revision_uuid: None,
+            requested_name: requested,
+            materialized_name: materialized,
+            materialization_fingerprint: fingerprint.as_slice().try_into()?,
+            lifecycle,
+            logical_revision: revision,
+        };
+        capture_catalog_mutation(
+            &transaction,
+            MutationOrigin::LocalApi,
+            truth.root_folder_uuid,
+            Operation::SetField {
+                field: super::reducer::ROOT_IDENTITY_FIELD.into(),
+                value: serde_json::to_value(truth)?,
+            },
+        )?;
+    }
+    // Scanned assets may already have a content event before their location
+    // was captured by an older build. Do not infer their root from local browse
+    // rows at publication time; backfill stable UUID/name relationships now.
+    let mut statement = transaction.prepare(
+        "SELECT f.asset_uuid,p.folder_uuid,f.name,'asset',f.ext FROM files f JOIN folders p ON p.id=f.folder_id JOIN sync_root_local_bindings b ON b.root_id=f.root_id WHERE b.state='active' AND f.status='active' AND NOT EXISTS(SELECT 1 FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=f.asset_uuid AND r.event_uuid IS NOT NULL) UNION ALL SELECT f.folder_uuid,p.folder_uuid,f.name,'folder','' FROM folders f JOIN folders p ON p.id=f.parent_id JOIN sync_root_local_bindings b ON b.root_id=f.root_id WHERE b.state='active' AND f.status='active' AND NOT EXISTS(SELECT 1 FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=f.folder_uuid AND r.event_uuid IS NOT NULL) LIMIT 100",
+    )?;
+    let entities = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (entity, parent, name, kind, extension) in entities {
+        let entity = EntityUuid(Uuid::from_slice(&entity)?);
+        let mut heads = transaction
+            .prepare("SELECT h.revision_uuid FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=?1 AND r.event_uuid IS NOT NULL")?;
+        let supersedes = heads
+            .query_map([entity.0.as_bytes().as_slice()], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?
+            .map(|row| Ok(super::types::RevisionUuid(Uuid::from_slice(&row?)?)))
+            .collect::<anyhow::Result<BTreeSet<_>>>()?;
+        drop(heads);
+        capture_catalog_mutation(
+            &transaction,
+            MutationOrigin::LocalApi,
+            entity,
+            Operation::SetField {
+                field: "entity-kind".into(),
+                value: serde_json::json!(kind),
+            },
+        )?;
+        capture_catalog_mutation(
+            &transaction,
+            MutationOrigin::LocalApi,
+            entity,
+            Operation::SetLocation {
+                revision_uuid: super::types::RevisionUuid::new(),
+                parent_uuid: Some(EntityUuid(Uuid::from_slice(&parent)?)),
+                name,
+                supersedes,
+            },
+        )?;
+        if kind == "asset" {
+            capture_catalog_mutation(
+                &transaction,
+                MutationOrigin::LocalApi,
+                entity,
+                Operation::SetField {
+                    field: "extension".into(),
+                    value: serde_json::json!(extension),
+                },
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalFileIdentity {
     pub asset_uuid: Uuid,

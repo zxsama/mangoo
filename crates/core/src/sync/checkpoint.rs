@@ -129,7 +129,7 @@ pub struct Checkpoint {
     pub digest: [u8; 32],
 }
 
-mod stream_vector_serde {
+pub(crate) mod stream_vector_serde {
     use super::{ActorId, StreamVector};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

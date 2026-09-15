@@ -92,6 +92,17 @@ pub(crate) fn materialize_truth(
     let event_uuid = event.event_uuid.0.as_bytes().as_slice();
     match &event.operation {
         Operation::SetField { field, value } => {
+            if field == super::reducer::ROOT_IDENTITY_FIELD {
+                let root = super::reducer::decode_root_identity(event.entity_uuid, value)?;
+                let existing: Option<(Vec<u8>,Vec<u8>)> = transaction.query_row("SELECT root_folder_uuid,library_root_uuid FROM sync_root_descriptors WHERE root_uuid=?1",[root.root_uuid.0.as_bytes().as_slice()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+                if existing.as_ref().is_some_and(|(folder, parent)| {
+                    folder.as_slice() != root.root_folder_uuid.0.as_bytes()
+                        || parent.as_slice() != root.library_root_uuid.0.as_bytes()
+                }) {
+                    anyhow::bail!("synchronized root identity conflict");
+                }
+                transaction.execute("INSERT INTO sync_root_descriptors(root_uuid,root_folder_uuid,library_root_uuid,creation_event_uuid,winning_location_revision_uuid,requested_name,materialized_name,materialization_fingerprint,lifecycle,logical_revision,updated_at) VALUES (?1,?2,?3,?4,NULL,?5,?6,?7,?8,?9,?10) ON CONFLICT(root_uuid) DO UPDATE SET creation_event_uuid=excluded.creation_event_uuid,logical_revision=sync_root_descriptors.logical_revision+1 WHERE sync_root_descriptors.creation_event_uuid IS NULL",params![root.root_uuid.0.as_bytes().as_slice(),entity,root.library_root_uuid.0.as_bytes().as_slice(),event_uuid,root.requested_name,root.materialized_name,root.materialization_fingerprint.as_slice(),root.lifecycle,i64::try_from(root.logical_revision)?.checked_add(1).context("root revision overflow")?,unix_timestamp_millis()])?;
+            }
             transaction.execute(
                 "INSERT INTO sync_field_versions(entity_uuid,field_name,event_uuid,is_winner,value) VALUES (?1,?2,?3,0,?4)",
                 params![entity,field,event_uuid,serde_json::to_vec(value)?],
@@ -395,13 +406,67 @@ fn materialize_tag_projection(transaction: &Transaction<'_>, entity: &[u8]) -> a
     Ok(())
 }
 
+// `r` is a local location row. An exact canonical location permanently replaces
+// its bootstrap placeholder, even after a later canonical rename supersedes it.
+// Both immutable revisions remain; independent canonical heads never collapse.
+const REDUNDANT_BOOTSTRAP_LOCATION: &str = "r.event_uuid IS NULL AND r.origin='bootstrap' AND EXISTS(SELECT 1 FROM sync_location_revisions canonical WHERE canonical.entity_uuid=r.entity_uuid AND canonical.event_uuid IS NOT NULL AND canonical.parent_uuid IS r.parent_uuid AND canonical.name=r.name)";
+
+pub(crate) fn seed_bootstrap_location_heads(transaction: &Transaction<'_>) -> anyhow::Result<()> {
+    transaction.execute(
+        &format!("INSERT OR IGNORE INTO sync_location_heads(entity_uuid,revision_uuid,is_display_winner) SELECT r.entity_uuid,r.revision_uuid,1 FROM sync_location_revisions r WHERE r.origin='bootstrap' AND NOT ({REDUNDANT_BOOTSTRAP_LOCATION})"),
+        [],
+    )?;
+    Ok(())
+}
+
+/// Repair derived conflicts left by older capture code without rewriting any
+/// canonical events or bootstrap evidence. The open-conflict index bounds the
+/// candidate set, and only matching shadows consume the per-turn work budget.
+pub(crate) fn reconcile_bootstrap_location_conflicts(
+    transaction: &Transaction<'_>,
+) -> anyhow::Result<()> {
+    let mut statement = transaction.prepare(&format!(
+        "SELECT DISTINCT c.entity_uuid FROM sync_conflicts c WHERE c.state='open' AND c.conflict_kind='location-heads' AND EXISTS(SELECT 1 FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=c.entity_uuid AND ({REDUNDANT_BOOTSTRAP_LOCATION})) LIMIT 100"
+    ))?;
+    let entities = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for entity in entities {
+        rebuild_location_heads(transaction, &entity)?;
+        let mut statement = transaction.prepare(
+            "SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1 ORDER BY revision_uuid"
+        )?;
+        let heads = statement
+            .query_map([&entity], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| Ok(super::types::RevisionUuid(uuid::Uuid::from_slice(&row?)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // Retire this entity's obsolete derived head-set identity even when a
+        // real multi-canonical conflict remains after removing the shadow.
+        let conflict_uuid = deterministic_conflict_uuid(
+            super::types::EntityUuid(uuid::Uuid::from_slice(&entity)?),
+            &heads,
+        );
+        transaction.execute(
+            "UPDATE sync_conflicts SET state='resolved',resolved_at=?1 WHERE entity_uuid=?2 AND conflict_kind='location-heads' AND state='open' AND conflict_uuid<>?3",
+            params![unix_timestamp_millis(), entity, conflict_uuid.as_bytes().as_slice()],
+        )?;
+        persist_location_conflict(
+            transaction,
+            super::types::EntityUuid(uuid::Uuid::from_slice(&entity)?),
+            &heads,
+        )?;
+    }
+    Ok(())
+}
+
 fn rebuild_location_heads(transaction: &Transaction<'_>, entity: &[u8]) -> anyhow::Result<()> {
     transaction.execute(
         "DELETE FROM sync_location_heads WHERE entity_uuid=?1",
         [entity],
     )?;
     transaction.execute(
-        "INSERT INTO sync_location_heads(entity_uuid,revision_uuid,is_display_winner) SELECT r.entity_uuid,r.revision_uuid,CASE WHEN r.revision_uuid=(SELECT rr.revision_uuid FROM sync_location_revisions rr JOIN sync_events e ON e.event_uuid=rr.event_uuid WHERE rr.entity_uuid=?1 AND NOT EXISTS (SELECT 1 FROM sync_location_supersedes s WHERE s.observed_revision_uuid=rr.revision_uuid) ORDER BY e.hlc_wall_ms DESC,e.hlc_logical DESC,e.device_uuid DESC,e.actor_epoch DESC,e.actor_seq DESC,e.event_uuid DESC LIMIT 1) THEN 1 ELSE 0 END FROM sync_location_revisions r WHERE r.entity_uuid=?1 AND NOT EXISTS (SELECT 1 FROM sync_location_supersedes s WHERE s.observed_revision_uuid=r.revision_uuid)",
+        &format!("INSERT INTO sync_location_heads(entity_uuid,revision_uuid,is_display_winner) SELECT r.entity_uuid,r.revision_uuid,CASE WHEN r.revision_uuid=(SELECT rr.revision_uuid FROM sync_location_revisions rr JOIN sync_events e ON e.event_uuid=rr.event_uuid WHERE rr.entity_uuid=?1 AND NOT EXISTS (SELECT 1 FROM sync_location_supersedes s WHERE s.observed_revision_uuid=rr.revision_uuid) ORDER BY e.hlc_wall_ms DESC,e.hlc_logical DESC,e.device_uuid DESC,e.actor_epoch DESC,e.actor_seq DESC,e.event_uuid DESC LIMIT 1) THEN 1 ELSE 0 END FROM sync_location_revisions r WHERE r.entity_uuid=?1 AND NOT EXISTS (SELECT 1 FROM sync_location_supersedes s WHERE s.observed_revision_uuid=r.revision_uuid) AND NOT ({REDUNDANT_BOOTSTRAP_LOCATION})"),
         [entity],
     )?;
     Ok(())
@@ -426,8 +491,11 @@ fn rematerialize_location_projection(
     };
     let logical_root = super::types::EntityUuid(uuid::Uuid::from_slice(&library_root)?);
     let mut state = ProtocolState::default();
+    // A browse root bootstrapped before enrollment has an empty-name sentinel
+    // location. Interpret only that local placeholder through its descriptor;
+    // retain the anchor for children and leave immutable revisions untouched.
     let mut statement = transaction.prepare(
-        "SELECT r.revision_uuid,r.entity_uuid,r.parent_uuid,r.name,COALESCE(e.hlc_wall_ms,0),COALESCE(e.hlc_logical,0),COALESCE(e.device_uuid,zeroblob(16)),COALESCE(e.actor_epoch,zeroblob(16)),COALESCE(e.actor_seq,0),COALESCE(e.event_uuid,r.revision_uuid),EXISTS(SELECT 1 FROM sync_location_heads h WHERE h.entity_uuid=r.entity_uuid AND h.revision_uuid=r.revision_uuid) FROM sync_location_revisions r LEFT JOIN sync_events e ON e.event_uuid=r.event_uuid ORDER BY r.entity_uuid,r.revision_uuid",
+        "SELECT r.revision_uuid,r.entity_uuid,CASE WHEN d.root_uuid IS NOT NULL THEN d.library_root_uuid ELSE r.parent_uuid END,CASE WHEN d.root_uuid IS NOT NULL THEN d.requested_name ELSE r.name END,COALESCE(e.hlc_wall_ms,0),COALESCE(e.hlc_logical,0),COALESCE(e.device_uuid,zeroblob(16)),COALESCE(e.actor_epoch,zeroblob(16)),COALESCE(e.actor_seq,0),COALESCE(e.event_uuid,r.revision_uuid),EXISTS(SELECT 1 FROM sync_location_heads h WHERE h.entity_uuid=r.entity_uuid AND h.revision_uuid=r.revision_uuid) FROM sync_location_revisions r LEFT JOIN sync_events e ON e.event_uuid=r.event_uuid LEFT JOIN sync_root_descriptors d ON d.root_folder_uuid=r.entity_uuid AND r.event_uuid IS NULL AND r.origin='bootstrap' AND r.name='' ORDER BY r.entity_uuid,r.revision_uuid",
     )?;
     for row in statement.query_map([], |row| {
         Ok((
@@ -987,6 +1055,438 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restored, (56, 78, 56, 12, 34));
+    }
+
+    #[test]
+    fn enrolled_legacy_root_sentinels_preserve_names_during_first_capture() {
+        let database = crate::db::Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let library_uuid = uuid::Uuid::from_u128(1);
+        let library_root_uuid = uuid::Uuid::from_u128(999);
+        let mut roots = Vec::new();
+        for (index, name) in ["Photos", "Archive"].into_iter().enumerate() {
+            let root_id = database
+                .add_root(crate::db::NewRoot {
+                    path: format!("D:/Legacy-{index}"),
+                    display_name: name.into(),
+                })
+                .unwrap();
+            let root_uuid: Vec<u8> = database
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT root_uuid FROM roots WHERE id=?1",
+                    [root_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let root_uuid = uuid::Uuid::from_slice(&root_uuid).unwrap();
+            let sentinel = uuid::Uuid::from_u128(20 + index as u128);
+            let child = uuid::Uuid::from_u128(40 + index as u128);
+            database.connection_for_fsops().execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,NULL,'','root','active',?2)",
+                params![root_id, sentinel.as_bytes().as_slice()],
+            ).unwrap();
+            let sentinel_id = database.connection_for_fsops().last_insert_rowid();
+            database.connection_for_fsops().execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,?2,'Nested','child','active',?3)",
+                params![root_id, sentinel_id, child.as_bytes().as_slice()],
+            ).unwrap();
+            roots.push((root_id, root_uuid, sentinel, sentinel_id, child, name));
+        }
+        // Match an existing browse Library: its empty sentinels were bootstrapped
+        // before either root acquired a managed descriptor and active binding.
+        database
+            .initialize_sync_identity(library_uuid, library_root_uuid, uuid::Uuid::now_v7())
+            .unwrap();
+        for (root_id, root_uuid, sentinel, _, _, name) in &roots {
+            database
+                .ensure_selected_sync_root(
+                    library_uuid,
+                    *root_uuid,
+                    *sentinel,
+                    library_root_uuid,
+                    &format!("D:/Legacy-{root_id}"),
+                    name,
+                    name,
+                    [1; 32],
+                    uuid::Uuid::now_v7(),
+                    uuid::Uuid::now_v7(),
+                    uuid::Uuid::now_v7(),
+                    1,
+                    "active",
+                    1,
+                    false,
+                )
+                .unwrap();
+        }
+        let legacy_locations = || {
+            let mut statement = database.connection_for_fsops().prepare(
+                "SELECT r.revision_uuid,r.entity_uuid,r.parent_uuid,r.name,r.origin,r.event_uuid FROM sync_location_revisions r JOIN sync_root_descriptors d ON d.root_folder_uuid=r.entity_uuid WHERE r.origin='bootstrap' ORDER BY r.entity_uuid",
+            ).unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let before = legacy_locations();
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|row| row.3.is_empty() && row.5.is_none()));
+        let transaction = database
+            .connection_for_fsops()
+            .unchecked_transaction()
+            .unwrap();
+        rematerialize_location_projection(&transaction, false).unwrap();
+        transaction.commit().unwrap();
+        database
+            .begin_sync_capture(uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+            .unwrap();
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+        assert_eq!(
+            legacy_locations(),
+            before,
+            "projection must preserve the original bootstrap evidence"
+        );
+        for (root_id, root_uuid, sentinel, sentinel_id, child, name) in &roots {
+            let descriptor = database
+                .sync_root_descriptor(root_uuid.as_bytes())
+                .unwrap()
+                .unwrap();
+            assert_eq!(descriptor.root_folder_uuid, *sentinel.as_bytes());
+            assert_eq!(descriptor.requested_name, *name);
+            assert_eq!(descriptor.materialized_name, *name);
+            assert!(descriptor.creation_event_uuid.is_some());
+            let sentinel_row: (String, Option<i64>) = database
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT name,parent_id FROM folders WHERE folder_uuid=?1",
+                    [sentinel.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(sentinel_row, (String::new(), None));
+            let child_row: (String, i64, i64) = database
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT name,parent_id,root_id FROM folders WHERE folder_uuid=?1",
+                    [child.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(child_row, ("Nested".into(), *sentinel_id, *root_id));
+        }
+        let descriptors = database.sync_root_descriptors().unwrap();
+        let open_conflicts: i64 = database.connection_for_fsops().query_row(
+            "SELECT COUNT(*) FROM sync_conflicts WHERE conflict_kind='location-heads' AND state='open'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            open_conflicts, 0,
+            "canonical capture must not conflict with its identical bootstrap location"
+        );
+        let counts = database.sync_capture_counts_for_test().unwrap();
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+        assert_eq!(database.sync_root_descriptors().unwrap(), descriptors);
+        assert_eq!(database.sync_capture_counts_for_test().unwrap(), counts);
+
+        // A real location event must still win, and invalid canonical names must
+        // not receive the compatibility interpretation reserved for bootstrap.
+        let sentinel = roots[0].2;
+        let revision = RevisionUuid::new();
+        let transaction = database
+            .connection_for_fsops()
+            .unchecked_transaction()
+            .unwrap();
+        crate::sync::capture::capture_catalog_mutation(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            EntityUuid(sentinel),
+            Operation::SetLocation {
+                revision_uuid: revision,
+                parent_uuid: Some(EntityUuid(library_root_uuid)),
+                name: "Renamed".into(),
+                supersedes: Default::default(),
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let renamed = database
+            .sync_root_descriptor(roots[0].1.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.requested_name, "Renamed");
+        assert_eq!(
+            renamed.winning_location_revision_uuid,
+            Some(*revision.0.as_bytes())
+        );
+        let transaction = database
+            .connection_for_fsops()
+            .unchecked_transaction()
+            .unwrap();
+        let result = crate::sync::capture::capture_catalog_mutation(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            EntityUuid(sentinel),
+            Operation::SetLocation {
+                revision_uuid: RevisionUuid::new(),
+                parent_uuid: Some(EntityUuid(library_root_uuid)),
+                name: String::new(),
+                supersedes: std::collections::BTreeSet::from([revision]),
+            },
+        );
+        assert!(result.is_err());
+        transaction.rollback().unwrap();
+        assert_eq!(
+            database
+                .sync_root_descriptor(roots[0].1.as_bytes())
+                .unwrap()
+                .unwrap(),
+            renamed
+        );
+        assert_eq!(legacy_locations(), before);
+    }
+
+    #[test]
+    fn bootstrap_conflict_recovery_is_bounded_preserves_truth_and_survives_reopen() {
+        let directory =
+            std::env::temp_dir().join(format!("megle-bootstrap-conflict-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("catalog.sqlite");
+        let library = uuid::Uuid::from_u128(1);
+        let library_root = uuid::Uuid::from_u128(999);
+        let device = uuid::Uuid::now_v7();
+        let sentinel = uuid::Uuid::from_u128(20);
+        let database = crate::db::Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        let root_id = database
+            .add_root(crate::db::NewRoot {
+                path: "D:/Legacy-Conflict-Fixture".into(),
+                display_name: "Photos".into(),
+            })
+            .unwrap();
+        database.connection_for_fsops().execute(
+            "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,NULL,'','root','active',?2)",
+            params![root_id, sentinel.as_bytes().as_slice()],
+        ).unwrap();
+        let sentinel_id = database.connection_for_fsops().last_insert_rowid();
+        for index in 0..103 {
+            database.connection_for_fsops().execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,?2,?3,'child','active',?4)",
+                params![root_id,sentinel_id,format!("Item-{index}"),uuid::Uuid::from_u128(1000+index).as_bytes().as_slice()],
+            ).unwrap();
+        }
+        database
+            .initialize_sync_identity(library, library_root, device)
+            .unwrap();
+        database
+            .ensure_selected_sync_root(
+                library,
+                library_root,
+                sentinel,
+                library_root,
+                "D:/Legacy-Conflict-Fixture",
+                "Photos",
+                "Photos",
+                [1; 32],
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                1,
+                "active",
+                1,
+                false,
+            )
+            .unwrap();
+        database
+            .begin_sync_capture(uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+            .unwrap();
+        let transaction = database
+            .connection_for_fsops()
+            .unchecked_transaction()
+            .unwrap();
+        for index in 0..103 {
+            let entity = EntityUuid(uuid::Uuid::from_u128(1000 + index));
+            crate::sync::capture::capture_catalog_mutation(
+                &transaction,
+                crate::sync::capture::MutationOrigin::LocalApi,
+                entity,
+                Operation::SetLocation {
+                    revision_uuid: RevisionUuid::new(),
+                    parent_uuid: Some(EntityUuid(sentinel)),
+                    name: if index == 101 {
+                        "Changed-101".into()
+                    } else {
+                        format!("Item-{index}")
+                    },
+                    supersedes: Default::default(),
+                },
+            )
+            .unwrap();
+            if index == 102 {
+                crate::sync::capture::capture_catalog_mutation(
+                    &transaction,
+                    crate::sync::capture::MutationOrigin::LocalApi,
+                    entity,
+                    Operation::SetLocation {
+                        revision_uuid: RevisionUuid::new(),
+                        parent_uuid: Some(EntityUuid(sentinel)),
+                        name: "Item-102".into(),
+                        supersedes: Default::default(),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+
+        // Reproduce only the old derived rows. All canonical events above were
+        // captured through the production writer and remain unchanged below.
+        let transaction = database
+            .connection_for_fsops()
+            .unchecked_transaction()
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE sync_conflicts SET state='resolved' WHERE state='open'",
+                [],
+            )
+            .unwrap();
+        transaction.execute(
+            "INSERT OR IGNORE INTO sync_location_heads(entity_uuid,revision_uuid,is_display_winner) SELECT entity_uuid,revision_uuid,0 FROM sync_location_revisions WHERE origin='bootstrap' AND entity_uuid<>?1",
+            [sentinel.as_bytes().as_slice()],
+        ).unwrap();
+        for index in 0..103 {
+            let entity = EntityUuid(uuid::Uuid::from_u128(1000 + index));
+            let mut statement = transaction.prepare("SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1 ORDER BY revision_uuid").unwrap();
+            let heads = statement
+                .query_map([entity.0.as_bytes().as_slice()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .unwrap()
+                .map(|row| RevisionUuid(uuid::Uuid::from_slice(&row.unwrap()).unwrap()))
+                .collect::<Vec<_>>();
+            persist_location_conflict(&transaction, entity, &heads).unwrap();
+        }
+        transaction.commit().unwrap();
+        let truth = |database: &crate::db::Database| {
+            let connection = database.connection_for_fsops();
+            let revisions: String = connection.query_row(
+                "SELECT json_group_array(json_array(hex(revision_uuid),hex(entity_uuid),hex(event_uuid),hex(parent_uuid),name,origin,local_mutation_generation)) FROM (SELECT * FROM sync_location_revisions ORDER BY revision_uuid)",[],|row|row.get(0),
+            ).unwrap();
+            let events: String = connection.query_row(
+                "SELECT json_group_array(json_array(hex(event_uuid),hex(payload),hex(integrity_hash))) FROM (SELECT * FROM sync_events ORDER BY event_uuid)",[],|row|row.get(0),
+            ).unwrap();
+            (
+                revisions,
+                events,
+                database.sync_capture_counts_for_test().unwrap(),
+            )
+        };
+        let original_truth = truth(&database);
+        drop(database);
+        let database = crate::db::Database::open(&path).unwrap();
+        database
+            .initialize_sync_identity(library, library_root, device)
+            .unwrap();
+        let counts = || -> (i64, i64) {
+            database.connection_for_fsops().query_row(
+                &format!("SELECT (SELECT count(*) FROM sync_conflicts WHERE conflict_kind='location-heads' AND state='open'),(SELECT count(*) FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE {REDUNDANT_BOOTSTRAP_LOCATION})"),
+                [],|row|Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap()
+        };
+        assert_eq!(counts(), (103, 102));
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+        assert_eq!(
+            counts().1,
+            2,
+            "one turn repairs at most 100 shadow entities"
+        );
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+        assert_eq!(
+            counts(),
+            (2, 0),
+            "genuine differing/bootstrap and multi-canonical conflicts remain"
+        );
+        assert_eq!(truth(&database), original_truth);
+        for (index, expected_canonical) in [(101, 1), (102, 2)] {
+            let actual:(i64,i64)=database.connection_for_fsops().query_row(
+                "SELECT count(*),sum(r.event_uuid IS NOT NULL) FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=?1",
+                [uuid::Uuid::from_u128(1000+index).as_bytes().as_slice()],|row|Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert_eq!(actual, (2, expected_canonical));
+        }
+        let entity = EntityUuid(uuid::Uuid::from_u128(1000));
+        let previous: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1",
+                [entity.0.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let transaction = database
+            .connection_for_fsops()
+            .unchecked_transaction()
+            .unwrap();
+        crate::sync::capture::capture_catalog_mutation(
+            &transaction,
+            crate::sync::capture::MutationOrigin::LocalApi,
+            entity,
+            Operation::SetLocation {
+                revision_uuid: RevisionUuid::new(),
+                parent_uuid: Some(EntityUuid(sentinel)),
+                name: "Renamed-0".into(),
+                supersedes: std::collections::BTreeSet::from([RevisionUuid(
+                    uuid::Uuid::from_slice(&previous).unwrap(),
+                )]),
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(
+            counts(),
+            (2, 0),
+            "superseding canonical history must not resurrect its bootstrap"
+        );
+        let renamed_truth = truth(&database);
+        drop(database);
+        let database = crate::db::Database::open(&path).unwrap();
+        database
+            .initialize_sync_identity(library, library_root, device)
+            .unwrap();
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+        let open: i64 = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT count(*) FROM sync_conflicts WHERE state='open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 2);
+        let renamed_head:(i64,i64)=database.connection_for_fsops().query_row(
+            "SELECT count(*),sum(r.event_uuid IS NOT NULL) FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=?1",
+            [entity.0.as_bytes().as_slice()],|row|Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(renamed_head, (1, 1));
+        assert_eq!(truth(&database), renamed_truth);
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

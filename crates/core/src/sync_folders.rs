@@ -11,10 +11,11 @@ use uuid::Uuid;
 use crate::library_path::{
     free_space_bytes, has_existing_reparse_component, identity_token, is_platform_sync_root,
     known_cloud_roots, local_file_identity, normalize_absolute, paths_overlap, probe_writable,
-    SafeDirectory,
+    MarkerDirectoryGuard, SafeDirectory,
 };
 
 pub const ROOT_MARKER_FILE_NAME: &str = ".megle-sync-root";
+const MAX_ROOT_MARKER_BYTES: u64 = 16 * 1024;
 pub const PLAN_TTL_MILLIS: i64 = 15 * 60 * 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -892,33 +893,241 @@ pub fn read_root_marker(path: &Path) -> anyhow::Result<SyncRootMarker> {
     serde_json::from_slice(&bytes).context("marker-mismatch")
 }
 
-pub fn write_root_marker(path: &Path, marker: &SyncRootMarker) -> anyhow::Result<()> {
-    fs::create_dir_all(path)?;
-    let marker_path = path.join(ROOT_MARKER_FILE_NAME);
-    if marker_path.exists() {
-        let existing = read_root_marker(path)?;
-        if existing == *marker {
-            return Ok(());
+/// Read-only evidence held until a same-path binding update has committed.
+pub(crate) struct VerifiedRootMarker {
+    directory: MarkerDirectoryGuard,
+    file: fs::File,
+    marker: SyncRootMarker,
+    marker_identity: String,
+}
+
+impl VerifiedRootMarker {
+    pub(crate) fn open(path: &Path, marker: &SyncRootMarker) -> anyhow::Result<Self> {
+        let directory =
+            MarkerDirectoryGuard::open(path).map_err(|_| anyhow::anyhow!("path-changed"))?;
+        let mut file = directory
+            .open_marker(std::ffi::OsStr::new(ROOT_MARKER_FILE_NAME), false)
+            .map_err(|_| anyhow::anyhow!("marker-mismatch"))?;
+        if read_marker_file(&mut file)? != *marker {
+            bail!("marker-mismatch");
         }
+        let marker_identity = directory.file_identity(&file)?;
+        Ok(Self {
+            directory,
+            file,
+            marker: marker.clone(),
+            marker_identity,
+        })
+    }
+
+    pub(crate) fn directory_identity(&self) -> &str {
+        self.directory.identity()
+    }
+
+    pub(crate) fn marker_identity(&self) -> &str {
+        &self.marker_identity
+    }
+
+    pub(crate) fn verify_unchanged(&mut self) -> anyhow::Result<()> {
+        self.directory
+            .verify_unchanged()
+            .map_err(|_| anyhow::anyhow!("path-changed"))?;
+        let mut current = self
+            .directory
+            .open_marker(std::ffi::OsStr::new(ROOT_MARKER_FILE_NAME), false)
+            .map_err(|_| anyhow::anyhow!("marker-mismatch"))?;
+        if self.directory.file_identity(&current)? != self.marker_identity
+            || read_marker_file(&mut current)? != self.marker
+            || read_marker_file(&mut self.file)? != self.marker
+        {
+            bail!("marker-mismatch");
+        }
+        Ok(())
+    }
+}
+
+pub fn write_root_marker(path: &Path, marker: &SyncRootMarker) -> anyhow::Result<()> {
+    write_root_marker_with_temporary_uuid(path, marker, Uuid::now_v7(), None)
+}
+
+pub fn write_root_marker_for_operation(
+    path: &Path,
+    marker: &SyncRootMarker,
+    operation_uuid: Uuid,
+    expected_root_identity: &str,
+) -> anyhow::Result<()> {
+    write_root_marker_with_temporary_uuid(
+        path,
+        marker,
+        operation_uuid,
+        Some(expected_root_identity),
+    )
+}
+
+pub fn root_marker_temporary_path(path: &Path, operation_uuid: Uuid) -> PathBuf {
+    path.join(format!("{ROOT_MARKER_FILE_NAME}.{operation_uuid}.tmp"))
+}
+
+fn write_root_marker_with_temporary_uuid(
+    path: &Path,
+    marker: &SyncRootMarker,
+    temporary_uuid: Uuid,
+    expected_root_identity: Option<&str>,
+) -> anyhow::Result<()> {
+    write_root_marker_with_temporary_uuid_impl(
+        path,
+        marker,
+        temporary_uuid,
+        expected_root_identity,
+        |_, _, _| Ok(()),
+    )
+}
+
+fn write_root_marker_with_temporary_uuid_impl<F>(
+    path: &Path,
+    marker: &SyncRootMarker,
+    temporary_uuid: Uuid,
+    expected_root_identity: Option<&str>,
+    before_publish: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&MarkerDirectoryGuard, &fs::File, &std::ffi::OsStr) -> anyhow::Result<()>,
+{
+    if expected_root_identity.is_none() {
+        fs::create_dir_all(path)?;
+    }
+    let directory = MarkerDirectoryGuard::open(path).map_err(|error| {
+        if expected_root_identity.is_some() && error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!("path-changed: {}", marker_io_error("guard-root", error))
+        } else {
+            marker_io_error("guard-root", error)
+        }
+    })?;
+    if expected_root_identity.is_some_and(|expected| directory.identity() != expected) {
+        bail!("path-changed");
+    }
+    let marker_name = std::ffi::OsStr::new(ROOT_MARKER_FILE_NAME);
+    match directory.open_marker(marker_name, false) {
+        Ok(mut file) => {
+            let existing = read_marker_file(&mut file)?;
+            if existing == *marker {
+                directory
+                    .verify_unchanged()
+                    .map_err(|error| marker_io_error("verify-root", error))?;
+                // An earlier attempt may have reached rename before reporting
+                // failure. Replay still completes the directory durability step.
+                sync_root_directory_after_marker_publish(&directory)?;
+                return Ok(());
+            }
+            bail!("marker-mismatch");
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(marker_io_error("open-marker", error)),
+    }
+    let temporary_name = format!("{ROOT_MARKER_FILE_NAME}.{temporary_uuid}.tmp");
+    let temporary = std::ffi::OsStr::new(&temporary_name);
+    let mut file = match directory.open_temporary(temporary, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match directory.open_temporary(temporary, true) {
+                Ok(mut file) => {
+                    let encoded = serde_json::to_vec_pretty(marker)?;
+                    file.write_all(&encoded)
+                        .map_err(|error| marker_io_error("write-temporary", error))?;
+                    file
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => directory
+                    .open_temporary(temporary, false)
+                    .map_err(|error| marker_io_error("reopen-temporary", error))?,
+                Err(error) => return Err(marker_io_error("create-temporary", error)),
+            }
+        }
+        Err(error) => return Err(marker_io_error("open-temporary", error)),
+    };
+    if read_marker_file(&mut file)? != *marker {
         bail!("marker-mismatch");
     }
-    let directory = SafeDirectory::open(path).map_err(|_| anyhow::anyhow!("path-changed"))?;
-    let temporary_name = format!("{ROOT_MARKER_FILE_NAME}.{}.tmp", Uuid::now_v7());
-    let temporary = std::ffi::OsStr::new(&temporary_name);
-    let mut file = directory.create_file(temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(marker)?)?;
-    file.sync_all()?;
-    drop(file);
-    directory.rename_child(
-        temporary,
-        std::ffi::OsStr::new(ROOT_MARKER_FILE_NAME),
-        false,
-    )?;
+    file.sync_all()
+        .map_err(|error| marker_io_error("flush-temporary", error))?;
+    before_publish(&directory, &file, temporary)?;
+    publish_root_marker(&directory, temporary, &mut file, marker)
+}
+
+fn marker_io_error(stage: &'static str, error: std::io::Error) -> anyhow::Error {
+    let os_code = error
+        .raw_os_error()
+        .map_or_else(|| "none".to_owned(), |code| code.to_string());
+    anyhow::anyhow!(
+        "marker-write-failed: stage={stage}; os={os_code}; kind={:?}",
+        error.kind()
+    )
+}
+
+fn read_marker_file(file: &mut fs::File) -> anyhow::Result<SyncRootMarker> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| marker_io_error("read-marker", error))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_ROOT_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| marker_io_error("read-marker", error))?;
+    if bytes.len() as u64 > MAX_ROOT_MARKER_BYTES {
+        bail!("marker-mismatch: marker-too-large");
+    }
+    serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("marker-mismatch"))
+}
+
+fn publish_root_marker(
+    directory: &MarkerDirectoryGuard,
+    temporary: &std::ffi::OsStr,
+    file: &mut fs::File,
+    marker: &SyncRootMarker,
+) -> anyhow::Result<()> {
+    let expected_temporary_identity = directory
+        .file_identity(file)
+        .map_err(|error| marker_io_error("identify-temporary", error))?;
+    directory
+        .publish(file, temporary, std::ffi::OsStr::new(ROOT_MARKER_FILE_NAME))
+        .map_err(|error| marker_io_error("publish-marker", error))?;
     directory
         .verify_unchanged()
-        .map_err(|_| anyhow::anyhow!("path-changed"))?;
-    directory.sync_all()?;
+        .map_err(|error| marker_io_error("verify-root", error))?;
+    let mut published = directory
+        .open_marker(std::ffi::OsStr::new(ROOT_MARKER_FILE_NAME), true)
+        .map_err(|error| marker_io_error("reopen-marker", error))?;
+    if directory
+        .file_identity(&published)
+        .map_err(|error| marker_io_error("identify-marker", error))?
+        != expected_temporary_identity
+        || read_marker_file(&mut published)? != *marker
+        || read_marker_file(file)? != *marker
+    {
+        bail!("marker-mismatch");
+    }
+    directory
+        .verify_unchanged()
+        .map_err(|error| marker_io_error("verify-root", error))?;
+    sync_root_directory_after_marker_publish(directory)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn sync_root_directory_after_marker_publish(
+    directory: &MarkerDirectoryGuard,
+) -> anyhow::Result<()> {
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 50 | 87)) => Ok(()),
+        Err(error) => Err(marker_io_error("flush-root", error)),
+    }
+}
+
+#[cfg(not(windows))]
+fn sync_root_directory_after_marker_publish(
+    directory: &MarkerDirectoryGuard,
+) -> anyhow::Result<()> {
+    directory
+        .sync_all()
+        .map_err(|error| marker_io_error("flush-root", error))
 }
 
 pub fn replace_root_marker(path: &Path, marker: &SyncRootMarker) -> anyhow::Result<()> {
@@ -1168,7 +1377,10 @@ pub fn snapshot_from_checkpoint(
     snapshot_from_protocol_state(
         &checkpoint.state,
         root_uuid,
-        serde_json::to_value(&checkpoint.catalog_vector)?,
+        crate::sync::checkpoint::stream_vector_serde::serialize(
+            &checkpoint.catalog_vector,
+            serde_json::value::Serializer,
+        )?,
     )
 }
 
@@ -1746,6 +1958,459 @@ mod tests {
         assert!(validate_platform_path(&base.join("folder. ")).is_err());
         let long = base.join("x".repeat(32_768));
         assert!(validate_platform_path(&long).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_marker_write_supports_a_unc_path() {
+        let direct = std::env::current_dir()
+            .unwrap()
+            .join(".tmp")
+            .join(format!("megle-unc-marker-{}", Uuid::now_v7()));
+        fs::create_dir_all(&direct).unwrap();
+        let direct_text = direct.to_string_lossy();
+        let drive = direct_text.chars().next().expect("drive letter");
+        assert_eq!(direct_text.as_bytes().get(1), Some(&b':'));
+        let unc = PathBuf::from(format!(
+            r"\\localhost\{}$\{}",
+            drive,
+            direct_text[3..].replace('/', r"\")
+        ));
+        run_windows_marker_publication_probe(&unc);
+        fs::remove_dir_all(direct).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_marker_publication_guards_block_replacement_on_ntfs() {
+        run_windows_marker_publication_probe(&std::env::temp_dir());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn root_marker_native_publication_supports_fresh_and_exact_operation_replay() {
+        let base = std::env::temp_dir().join(format!("megle-native-marker-{}", Uuid::now_v7()));
+        fs::create_dir(&base).unwrap();
+        for resumed in [false, true] {
+            let root = base.join(if resumed { "resumed" } else { "fresh" });
+            fs::create_dir(&root).unwrap();
+            let expected = marker(15);
+            let operation = Uuid::now_v7();
+            let temporary = root_marker_temporary_path(&root, operation);
+            if resumed {
+                fs::write(&temporary, serde_json::to_vec_pretty(&expected).unwrap()).unwrap();
+            }
+            let identity = crate::library_path::local_file_identity(&root).unwrap();
+            write_root_marker_for_operation(&root, &expected, operation, &identity).unwrap();
+            assert_eq!(read_root_marker(&root).unwrap(), expected);
+            assert!(!temporary.exists());
+            write_root_marker_for_operation(&root, &expected, operation, &identity).unwrap();
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Explicit opt-in: this writes only inside one uniquely named directory
+    /// below the supplied existing base, then removes that owned directory.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires explicit MEGLE_MARKER_TEST_BASE on the target filesystem"]
+    fn root_marker_publication_on_explicit_test_base() {
+        let base =
+            PathBuf::from(std::env::var_os("MEGLE_MARKER_TEST_BASE").expect("explicit test base"));
+        assert!(
+            base.is_absolute() && base.is_dir(),
+            "test base must be an existing absolute directory"
+        );
+        run_windows_marker_publication_probe(&base);
+    }
+
+    #[cfg(windows)]
+    fn open_test_delete_handle(path: &Path, directory: bool) -> std::io::Result<fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        0
+                    },
+            )
+            .open(path)
+    }
+
+    #[cfg(windows)]
+    fn assert_marker_publication_guards(root: &Path, temporary: &std::ffi::OsStr) {
+        let parent = root.parent().unwrap();
+        let temporary = root.join(temporary);
+        for directory in [root, parent] {
+            let error = open_test_delete_handle(directory, true).unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(32),
+                "directory DELETE must fail with sharing violation"
+            );
+            let error = fs::rename(directory, directory.with_extension("moved")).unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(32),
+                "directory rename must fail with sharing violation"
+            );
+        }
+        let error = open_test_delete_handle(&temporary, false).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(32),
+            "source DELETE must fail with sharing violation"
+        );
+        let error = fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
+            .unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(32),
+            "source WRITE must fail with sharing violation"
+        );
+        let error = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&temporary)
+            .unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(32),
+            "source truncation must fail with sharing violation"
+        );
+        assert_eq!(
+            fs::remove_file(&temporary).unwrap_err().raw_os_error(),
+            Some(32)
+        );
+        assert_eq!(
+            fs::rename(&temporary, temporary.with_extension("moved"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
+    }
+
+    #[cfg(windows)]
+    fn run_windows_marker_publication_probe(base: &Path) {
+        let owned = base.join(format!("megle-marker-probe-{}", Uuid::now_v7()));
+        fs::create_dir(&owned).expect("create unique marker test directory");
+        let parent = owned.join("ancestor");
+        let fresh = parent.join("fresh");
+        let resumed = parent.join("resumed");
+        fs::create_dir_all(&fresh).unwrap();
+        fs::create_dir(&resumed).unwrap();
+        // Prove the fixture permits DELETE before asserting guards deny it.
+        drop(open_test_delete_handle(&parent, true).unwrap());
+        drop(open_test_delete_handle(&fresh, true).unwrap());
+        let expected = marker(9);
+        let fresh_operation = Uuid::now_v7();
+        let fresh_identity = crate::library_path::local_file_identity(&fresh).unwrap();
+        write_root_marker_with_temporary_uuid_impl(
+            &fresh,
+            &expected,
+            fresh_operation,
+            Some(&fresh_identity),
+            |_, _, temporary| {
+                assert_marker_publication_guards(&fresh, temporary);
+                Ok(())
+            },
+        )
+        .expect("fresh marker publication with all guards held");
+        assert_eq!(read_root_marker(&fresh).unwrap(), expected);
+        assert!(!root_marker_temporary_path(&fresh, fresh_operation).exists());
+        // Final-marker replay must also use compatible bounded read access.
+        write_root_marker_for_operation(&fresh, &expected, fresh_operation, &fresh_identity)
+            .unwrap();
+
+        let operation_uuid = Uuid::now_v7();
+        let interrupted_temporary_marker = root_marker_temporary_path(&resumed, operation_uuid);
+        let mut interrupted = fs::File::create(&interrupted_temporary_marker).unwrap();
+        interrupted
+            .write_all(&serde_json::to_vec_pretty(&expected).unwrap())
+            .unwrap();
+        interrupted.sync_all().unwrap();
+        drop(interrupted);
+        drop(open_test_delete_handle(&interrupted_temporary_marker, false).unwrap());
+
+        let expected_root_identity = crate::library_path::local_file_identity(&resumed).unwrap();
+        write_root_marker_with_temporary_uuid_impl(
+            &resumed,
+            &expected,
+            operation_uuid,
+            Some(&expected_root_identity),
+            |_, _, temporary| {
+                assert_marker_publication_guards(&resumed, temporary);
+                Ok(())
+            },
+        )
+        .expect("resume exact operation temporary marker with all guards held");
+
+        assert_eq!(read_root_marker(&resumed).unwrap(), expected);
+        assert!(
+            crate::library_path::local_file_identity(&resumed.join(ROOT_MARKER_FILE_NAME)).is_ok()
+        );
+        assert!(!interrupted_temporary_marker.exists());
+        assert!(!fs::read_dir(&resumed).unwrap().any(|entry| {
+            entry.is_ok_and(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        }));
+        assert_eq!(
+            crate::library_path::local_file_identity(&resumed).unwrap(),
+            expected_root_identity
+        );
+        // All guards have left scope; cleanup only this generated child.
+        fs::remove_dir_all(&owned).unwrap();
+        eprintln!("marker publication probe passed: fresh, replay, root/ancestor DELETE, source WRITE/DELETE, cleanup");
+    }
+
+    #[test]
+    fn root_marker_write_rejects_a_replaced_root_before_publishing() {
+        let base = std::env::temp_dir().join(format!("megle-root-marker-fence-{}", Uuid::now_v7()));
+        let root = base.join("root");
+        let replacement = base.join("replacement");
+        fs::create_dir_all(&root).unwrap();
+        let original_identity = crate::library_path::local_file_identity(&root).unwrap();
+        fs::rename(&root, &replacement).unwrap();
+
+        let operation_uuid = Uuid::now_v7();
+        let error =
+            write_root_marker_for_operation(&root, &marker(10), operation_uuid, &original_identity)
+                .unwrap_err();
+        assert!(error.to_string().contains("path-changed"), "{error:#}");
+        assert!(!root.exists(), "recovery must not recreate a missing root");
+
+        fs::create_dir_all(&root).unwrap();
+        let error =
+            write_root_marker_for_operation(&root, &marker(10), operation_uuid, &original_identity)
+                .unwrap_err();
+        assert!(error.to_string().contains("path-changed"), "{error:#}");
+        assert!(!root.join(ROOT_MARKER_FILE_NAME).exists());
+        assert!(!root_marker_temporary_path(&root, operation_uuid).exists());
+
+        // Even a copied matching marker is not evidence for a replaced root.
+        fs::write(
+            root.join(ROOT_MARKER_FILE_NAME),
+            serde_json::to_vec_pretty(&marker(10)).unwrap(),
+        )
+        .unwrap();
+        assert!(write_root_marker_for_operation(
+            &root,
+            &marker(10),
+            operation_uuid,
+            &original_identity
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("path-changed"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn root_marker_publish_failure_preserves_the_operation_temporary_marker() {
+        let root = std::env::temp_dir().join(format!("megle-root-marker-retry-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let expected = marker(11);
+        let operation_uuid = Uuid::now_v7();
+        let temporary = root_marker_temporary_path(&root, operation_uuid);
+        let root_identity = crate::library_path::local_file_identity(&root).unwrap();
+        let unrelated = root_marker_temporary_path(&root, Uuid::now_v7());
+        fs::write(&unrelated, b"unrelated-operation").unwrap();
+        let mut temporary_identity = String::new();
+
+        let error = write_root_marker_with_temporary_uuid_impl(
+            &root,
+            &expected,
+            operation_uuid,
+            Some(&root_identity),
+            |directory, file, _| {
+                temporary_identity = directory.file_identity(file).unwrap();
+                Err(marker_io_error(
+                    "publish-marker",
+                    std::io::Error::from_raw_os_error(50),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("stage=publish-marker; os=50"),
+            "{error:#}"
+        );
+        assert!(
+            !error.to_string().contains(root.to_str().unwrap()),
+            "diagnostics must omit source paths"
+        );
+        assert!(!root.join(ROOT_MARKER_FILE_NAME).exists());
+        assert_eq!(
+            serde_json::from_slice::<SyncRootMarker>(&fs::read(&temporary).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            crate::library_path::local_file_identity(&temporary).unwrap(),
+            temporary_identity
+        );
+        write_root_marker_for_operation(&root, &expected, operation_uuid, &root_identity).unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(read_root_marker(&root).unwrap(), expected);
+        assert_eq!(
+            crate::library_path::local_file_identity(&root.join(ROOT_MARKER_FILE_NAME)).unwrap(),
+            temporary_identity
+        );
+        write_root_marker_for_operation(&root, &expected, operation_uuid, &root_identity).unwrap();
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated-operation");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_marker_publication_never_overwrites_a_racing_matching_target() {
+        let root =
+            std::env::temp_dir().join(format!("megle-marker-target-race-{}", Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let expected = marker(12);
+        let operation_uuid = Uuid::now_v7();
+        let root_identity = crate::library_path::local_file_identity(&root).unwrap();
+        let final_path = root.join(ROOT_MARKER_FILE_NAME);
+        let mut target_identity = String::new();
+        let error = write_root_marker_with_temporary_uuid_impl(
+            &root,
+            &expected,
+            operation_uuid,
+            Some(&root_identity),
+            |_, _, _| {
+                fs::write(&final_path, serde_json::to_vec_pretty(&expected).unwrap()).unwrap();
+                target_identity = crate::library_path::local_file_identity(&final_path).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("stage=publish-marker"),
+            "{error:#}"
+        );
+        assert_eq!(
+            crate::library_path::local_file_identity(&final_path).unwrap(),
+            target_identity
+        );
+        let temporary = root_marker_temporary_path(&root, operation_uuid);
+        assert!(temporary.exists());
+        assert_ne!(
+            crate::library_path::local_file_identity(&temporary).unwrap(),
+            target_identity
+        );
+        assert_eq!(read_root_marker(&root).unwrap(), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_marker_publication_rejects_foreign_and_oversized_markers_without_changes() {
+        let base = std::env::temp_dir().join(format!("megle-marker-content-{}", Uuid::now_v7()));
+        fs::create_dir(&base).unwrap();
+        for final_marker in [false, true] {
+            for bytes in [
+                serde_json::to_vec_pretty(&marker(99)).unwrap(),
+                vec![b'x'; MAX_ROOT_MARKER_BYTES as usize + 1],
+            ] {
+                let root = base.join(Uuid::now_v7().to_string());
+                fs::create_dir(&root).unwrap();
+                let operation = Uuid::now_v7();
+                let temporary = root_marker_temporary_path(&root, operation);
+                let target = if final_marker {
+                    root.join(ROOT_MARKER_FILE_NAME)
+                } else {
+                    temporary.clone()
+                };
+                fs::write(&target, &bytes).unwrap();
+                let before_identity = crate::library_path::local_file_identity(&target).unwrap();
+                let root_identity = crate::library_path::local_file_identity(&root).unwrap();
+                let error =
+                    write_root_marker_for_operation(&root, &marker(13), operation, &root_identity)
+                        .unwrap_err();
+                assert!(error.to_string().contains("marker-mismatch"));
+                assert_eq!(fs::read(&target).unwrap(), bytes);
+                assert_eq!(
+                    crate::library_path::local_file_identity(&target).unwrap(),
+                    before_identity
+                );
+                if final_marker {
+                    assert!(!temporary.exists());
+                } else {
+                    assert!(!root.join(ROOT_MARKER_FILE_NAME).exists());
+                }
+            }
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_marker_publication_refuses_preexisting_conflicting_handles() {
+        let base =
+            std::env::temp_dir().join(format!("megle-marker-preexisting-{}", Uuid::now_v7()));
+        let ancestor = base.join("ancestor");
+        let root = ancestor.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let expected = marker(14);
+        let operation = Uuid::now_v7();
+        let temporary = root_marker_temporary_path(&root, operation);
+        let encoded = serde_json::to_vec_pretty(&expected).unwrap();
+        fs::write(&temporary, &encoded).unwrap();
+        let root_identity = crate::library_path::local_file_identity(&root).unwrap();
+        for path in [&ancestor, &root] {
+            let conflicting = open_test_delete_handle(path, true).unwrap();
+            let error =
+                write_root_marker_for_operation(&root, &expected, operation, &root_identity)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("stage=guard-root; os=32"),
+                "{error:#}"
+            );
+            assert!(!root.join(ROOT_MARKER_FILE_NAME).exists());
+            assert_eq!(fs::read(&temporary).unwrap(), encoded);
+            drop(conflicting);
+        }
+        for conflicting in [
+            fs::OpenOptions::new().write(true).open(&temporary).unwrap(),
+            open_test_delete_handle(&temporary, false).unwrap(),
+        ] {
+            let error =
+                write_root_marker_for_operation(&root, &expected, operation, &root_identity)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("stage=open-temporary; os=32"),
+                "{error:#}"
+            );
+            assert!(!root.join(ROOT_MARKER_FILE_NAME).exists());
+            assert_eq!(fs::read(&temporary).unwrap(), encoded);
+            drop(conflicting);
+        }
+        write_root_marker_for_operation(&root, &expected, operation, &root_identity).unwrap();
+        // A final marker is idempotent only while its contents are pinned too.
+        let published = root.join(ROOT_MARKER_FILE_NAME);
+        for conflicting in [
+            fs::OpenOptions::new().write(true).open(&published).unwrap(),
+            open_test_delete_handle(&published, false).unwrap(),
+        ] {
+            let error =
+                write_root_marker_for_operation(&root, &expected, operation, &root_identity)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("stage=open-marker; os=32"),
+                "{error:#}"
+            );
+            drop(conflicting);
+        }
+        write_root_marker_for_operation(&root, &expected, operation, &root_identity).unwrap();
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

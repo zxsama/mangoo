@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { Check, FolderMinus, FolderPlus, Search, X } from "lucide-react";
+import { createCoreClient } from "../../core/client";
 import {
   listLibraries,
   pickNativeFolder,
@@ -33,7 +34,10 @@ import {
   LibraryIconPicker,
 } from "./libraryGlyph";
 import { ManagedLibraryWizard } from "./ManagedLibraryWizard";
-import { useSyncOrchestration } from "../sync/useSyncOrchestration";
+import {
+  enrollExistingSyncFolder,
+  useSyncOrchestration,
+} from "../sync/useSyncOrchestration";
 import { syncStatusLabel } from "../sync/syncModel";
 import {
   INITIAL_LIBRARY_SWITCHER_INTERACTION_STATE,
@@ -206,9 +210,40 @@ export function LibrarySwitcher({
       await reportFailure("library-add-root", "folder-picker", cause);
       return;
     }
-    if (!folder || !ownsSession(session)) return;
-    const succeeded = await runMutation("library-add-root", folder, () => library.addRoot(folder));
-    if (succeeded && ownsSession(session)) void reload();
+    if (!folder) return;
+    const activeLibrary = libs.find((item) => item.active);
+    const activeSyncStatus = (sync.snapshot?.libraries ?? []).find(
+      (item) => item.libraryUuid === activeLibrary?.libraryUuid,
+    );
+    const shouldEnroll = Boolean(
+      activeLibrary &&
+        (activeLibrary.bindingState !== "local-only" ||
+          (activeSyncStatus !== undefined && activeSyncStatus.lifecycle !== "local-only")),
+    );
+    const succeeded = await runMutation(
+      shouldEnroll ? "sync-folder-enroll" : "library-add-root",
+      folder,
+      async () => {
+        const active = await createCoreClient().getActiveLibrary();
+        if (!activeLibrary || active.library?.libraryUuid !== activeLibrary.libraryUuid) {
+          throw new Error("活动资源库已改变，请重新选择文件夹。");
+        }
+        if (shouldEnroll && activeLibrary) {
+          await enrollExistingSyncFolder(activeLibrary.libraryUuid, folder);
+          return;
+        }
+        await library.addRoot(folder);
+      },
+    );
+    if (succeeded) {
+      if (shouldEnroll) {
+        void library.refresh().catch((cause) => {
+          void reportFailure("sync-folder-refresh", folder, cause);
+        });
+        void sync.refresh();
+      }
+      if (ownsSession(session)) void reload();
+    }
   }
 
   async function confirmRootRemoval() {

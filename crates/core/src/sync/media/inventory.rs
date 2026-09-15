@@ -438,8 +438,20 @@ pub fn enqueue_missing_materializations(
     transport_generation: u64,
     now: i64,
 ) -> anyhow::Result<usize> {
+    // Enrollment can leave completed legacy jobs unowned. Adopt only unclaimed
+    // all-NULL ownership; mismatched tokens stay fenced without aborting other roots.
     Ok(connection.execute(
-        "WITH RECURSIVE folder_paths(id,root_id,relpath) AS (SELECT id,root_id,'' FROM folders WHERE parent_id IS NULL UNION ALL SELECT f.id,f.root_id,CASE WHEN p.relpath='' THEN f.name ELSE p.relpath||'/'||f.name END FROM folders f JOIN folder_paths p ON f.parent_id=p.id), candidates AS (SELECT r.content_revision_uuid,r.asset_uuid,CASE WHEN h.is_display_winner=1 THEN f.name ELSE f.name||'.megle-conflict-'||substr(lower(hex(r.content_revision_uuid)),1,12) END AS materialized_name,p.relpath,COALESCE(r.byte_size,0) AS byte_size,CASE WHEN root.root_folder_uuid IS NULL THEN NULL ELSE root.root_uuid END AS root_uuid,binding.local_binding_uuid,binding.binding_generation FROM asset_content_revisions r JOIN asset_content_heads h ON h.content_revision_uuid=r.content_revision_uuid JOIN files f ON f.asset_uuid=r.asset_uuid JOIN folder_paths p ON p.id=f.folder_id JOIN roots root ON root.id=f.root_id LEFT JOIN sync_root_local_bindings binding ON binding.root_id=root.id JOIN media_content_manifest_links l ON l.content_revision_uuid=r.content_revision_uuid JOIN media_manifests m ON m.manifest_hash=l.manifest_hash WHERE h.is_display_winner=1 AND r.manifest_hash IS NOT NULL AND f.status<>'deleted' AND root.enabled=1 AND root.path<>'sync-bootstrap' AND (root.root_folder_uuid IS NULL OR binding.state IN ('materializing','active','reconcile-required')) AND m.manifest_pack_hash IS NOT NULL AND m.pack_offset IS NOT NULL AND m.record_length IS NOT NULL AND NOT EXISTS (SELECT 1 FROM sync_tombstone_tokens t WHERE t.entity_uuid=r.asset_uuid AND NOT EXISTS (SELECT 1 FROM sync_tombstone_removals x WHERE x.observed_token_uuid=t.token_uuid))) INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,downloaded_bytes,priority,binding_epoch,transport_generation,attempt_count,created_at,updated_at,root_uuid,local_binding_uuid,binding_generation) SELECT content_revision_uuid,asset_uuid,CASE WHEN relpath='' THEN materialized_name ELSE relpath||'/'||materialized_name END,'pending',byte_size,0,0,?1,?2,0,?3,?3,root_uuid,local_binding_uuid,binding_generation FROM candidates WHERE true ON CONFLICT(content_revision_uuid) DO UPDATE SET destination_relpath=excluded.destination_relpath,phase=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath OR media_materialization_jobs.binding_epoch<>excluded.binding_epoch OR media_materialization_jobs.transport_generation<>excluded.transport_generation THEN 'pending' ELSE media_materialization_jobs.phase END,downloaded_bytes=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN 0 ELSE media_materialization_jobs.downloaded_bytes END,binding_epoch=excluded.binding_epoch,transport_generation=excluded.transport_generation,owner_token=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN NULL ELSE media_materialization_jobs.owner_token END,lease_expires_at=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN NULL ELSE media_materialization_jobs.lease_expires_at END,updated_at=excluded.updated_at",
+        "WITH RECURSIVE folder_paths(id,root_id,relpath) AS (SELECT id,root_id,'' FROM folders WHERE parent_id IS NULL UNION ALL SELECT f.id,f.root_id,CASE WHEN p.relpath='' THEN f.name ELSE p.relpath||'/'||f.name END FROM folders f JOIN folder_paths p ON f.parent_id=p.id), candidates AS (SELECT r.content_revision_uuid,r.asset_uuid,CASE WHEN h.is_display_winner=1 THEN f.name ELSE f.name||'.megle-conflict-'||substr(lower(hex(r.content_revision_uuid)),1,12) END AS materialized_name,p.relpath,COALESCE(r.byte_size,0) AS byte_size,CASE WHEN root.root_folder_uuid IS NULL THEN NULL ELSE root.root_uuid END AS root_uuid,binding.local_binding_uuid,binding.binding_generation FROM asset_content_revisions r JOIN asset_content_heads h ON h.content_revision_uuid=r.content_revision_uuid JOIN files f ON f.asset_uuid=r.asset_uuid JOIN folder_paths p ON p.id=f.folder_id JOIN roots root ON root.id=f.root_id LEFT JOIN sync_root_local_bindings binding ON binding.root_id=root.id JOIN media_content_manifest_links l ON l.content_revision_uuid=r.content_revision_uuid JOIN media_manifests m ON m.manifest_hash=l.manifest_hash WHERE h.is_display_winner=1 AND r.manifest_hash IS NOT NULL AND f.status<>'deleted' AND root.enabled=1 AND root.path<>'sync-bootstrap' AND (root.root_folder_uuid IS NULL OR binding.state IN ('materializing','active','reconcile-required')) AND m.manifest_pack_hash IS NOT NULL AND m.pack_offset IS NOT NULL AND m.record_length IS NOT NULL AND NOT EXISTS (SELECT 1 FROM sync_tombstone_tokens t WHERE t.entity_uuid=r.asset_uuid AND NOT EXISTS (SELECT 1 FROM sync_tombstone_removals x WHERE x.observed_token_uuid=t.token_uuid))) INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,downloaded_bytes,priority,binding_epoch,transport_generation,attempt_count,created_at,updated_at,root_uuid,local_binding_uuid,binding_generation) SELECT content_revision_uuid,asset_uuid,CASE WHEN relpath='' THEN materialized_name ELSE relpath||'/'||materialized_name END,'pending',byte_size,0,0,?1,?2,0,?3,?3,root_uuid,local_binding_uuid,binding_generation FROM candidates WHERE true ON CONFLICT(content_revision_uuid) DO UPDATE SET destination_relpath=excluded.destination_relpath,phase=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath OR media_materialization_jobs.binding_epoch<>excluded.binding_epoch OR media_materialization_jobs.transport_generation<>excluded.transport_generation THEN 'pending' ELSE media_materialization_jobs.phase END,downloaded_bytes=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN 0 ELSE media_materialization_jobs.downloaded_bytes END,binding_epoch=excluded.binding_epoch,transport_generation=excluded.transport_generation,owner_token=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN NULL ELSE media_materialization_jobs.owner_token END,lease_expires_at=CASE WHEN media_materialization_jobs.destination_relpath<>excluded.destination_relpath THEN NULL ELSE media_materialization_jobs.lease_expires_at END,updated_at=excluded.updated_at,
+         root_uuid=excluded.root_uuid,local_binding_uuid=excluded.local_binding_uuid,binding_generation=excluded.binding_generation
+         WHERE media_materialization_jobs.asset_uuid=excluded.asset_uuid AND (
+           (media_materialization_jobs.root_uuid IS excluded.root_uuid
+            AND media_materialization_jobs.local_binding_uuid IS excluded.local_binding_uuid
+            AND media_materialization_jobs.binding_generation IS excluded.binding_generation)
+           OR (media_materialization_jobs.root_uuid IS NULL
+               AND media_materialization_jobs.local_binding_uuid IS NULL
+               AND media_materialization_jobs.binding_generation IS NULL
+               AND media_materialization_jobs.owner_token IS NULL
+               AND (media_materialization_jobs.lease_expires_at IS NULL OR media_materialization_jobs.lease_expires_at<=?3)))",
         params![binding_epoch.as_bytes().as_slice(),transport_generation,now],
     )?)
 }
@@ -713,6 +725,362 @@ pub fn validate_relative(value: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn materialization_database() -> (crate::db::Database, uuid::Uuid) {
+        let database = crate::db::Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        database
+            .add_root(crate::db::NewRoot {
+                path: "D:/Library".into(),
+                display_name: "Library".into(),
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::from_bytes([1; 16]),
+                uuid::Uuid::from_bytes([2; 16]),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        let epoch = uuid::Uuid::now_v7();
+        database
+            .begin_sync_capture(epoch, uuid::Uuid::now_v7())
+            .unwrap();
+        (database, epoch)
+    }
+
+    fn materialization_candidate(database: &crate::db::Database, name: &str) -> (i64, uuid::Uuid) {
+        let root = database
+            .add_root(crate::db::NewRoot {
+                path: format!("D:/Library/{name}"),
+                display_name: name.into(),
+            })
+            .unwrap();
+        let connection = database.connection_for_fsops();
+        connection.execute("INSERT INTO folders(root_id,parent_id,name,path_hash,status) VALUES (?1,NULL,'',?2,'active')", params![root,name]).unwrap();
+        let folder = connection.last_insert_rowid();
+        connection.execute("INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status) VALUES (?1,?2,'photo.jpg','jpg',3,1,'active')", params![root,folder]).unwrap();
+        let revision = uuid::Uuid::now_v7();
+        connection.execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,manifest_hash,byte_size,local_mutation_generation,created_at) SELECT ?1,asset_uuid,?2,3,1,1 FROM files WHERE root_id=?3", params![revision.as_bytes().as_slice(), [7u8;32].as_slice(), root]).unwrap();
+        connection.execute("INSERT INTO asset_content_heads(asset_uuid,content_revision_uuid,is_display_winner) SELECT asset_uuid,content_revision_uuid,1 FROM asset_content_revisions WHERE content_revision_uuid=?1", [revision.as_bytes().as_slice()]).unwrap();
+        connection.execute("INSERT OR IGNORE INTO media_manifests(manifest_hash,content_hash,byte_length,manifest_pack_hash,pack_offset,record_length,state,created_at,updated_at) VALUES (?1,?2,3,?3,0,10,'durable',1,1)", params![[7u8;32].as_slice(),[8u8;32].as_slice(),[9u8;32].as_slice()]).unwrap();
+        connection.execute("INSERT INTO media_content_manifest_links(content_revision_uuid,manifest_hash,linked_at) VALUES (?1,?2,1)", params![revision.as_bytes().as_slice(),[7u8;32].as_slice()]).unwrap();
+        (root, revision)
+    }
+
+    fn enroll_materialization_root(
+        database: &crate::db::Database,
+        root: i64,
+        state: &str,
+    ) -> crate::db::SyncRootLocalBindingRecord {
+        let path: String = database
+            .connection_for_fsops()
+            .query_row("SELECT path FROM roots WHERE id=?1", [root], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let (root_uuid, folder_uuid) = database
+            .sync_root_identity_for_path(&path)
+            .unwrap()
+            .unwrap();
+        database
+            .ensure_selected_sync_root(
+                uuid::Uuid::from_bytes([1; 16]),
+                root_uuid,
+                folder_uuid,
+                uuid::Uuid::from_bytes([2; 16]),
+                &path,
+                &format!("Root{root}"),
+                &format!("Root{root}"),
+                [10; 32],
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                1,
+                state,
+                1,
+                false,
+            )
+            .unwrap();
+        database
+            .sync_root_local_binding(root_uuid.as_bytes())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn materialization_snapshot(
+        connection: &Connection,
+        revision: uuid::Uuid,
+    ) -> Vec<rusqlite::types::Value> {
+        connection
+            .query_row(
+                "SELECT * FROM media_materialization_jobs WHERE content_revision_uuid=?1",
+                [revision.as_bytes().as_slice()],
+                |row| {
+                    (0..row.as_ref().column_count())
+                        .map(|index| row.get(index))
+                        .collect()
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn materialization_admission_adopts_legacy_complete_without_restarting_it() {
+        let (database, epoch) = materialization_database();
+        let (root, revision) = materialization_candidate(&database, "Legacy");
+        let connection = database.connection_for_fsops();
+        assert_eq!(
+            enqueue_missing_materializations(connection, epoch, 1, 10).unwrap(),
+            1
+        );
+        connection.execute("UPDATE media_materialization_jobs SET phase='complete',downloaded_bytes=3,attempt_count=4", []).unwrap();
+        let binding = enroll_materialization_root(&database, root, "active");
+        let (other_root, other_revision) = materialization_candidate(&database, "Other");
+        enroll_materialization_root(&database, other_root, "active");
+        // Keep the real migration fence enabled: the old complete-to-complete update fails.
+        let error = connection
+            .execute(
+                "UPDATE media_materialization_jobs SET phase=phase WHERE content_revision_uuid=?1",
+                [revision.as_bytes().as_slice()],
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("managed materialization has no root ownership"));
+        for now in [20, 30] {
+            assert_eq!(
+                enqueue_missing_materializations(connection, epoch, 1, now).unwrap(),
+                2
+            );
+            let stored: (String, i64, i64, Vec<u8>, Vec<u8>, u64) = connection.query_row("SELECT phase,attempt_count,downloaded_bytes,root_uuid,local_binding_uuid,binding_generation FROM media_materialization_jobs WHERE content_revision_uuid=?1", [revision.as_bytes().as_slice()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).unwrap();
+            assert_eq!(
+                stored,
+                (
+                    "complete".into(),
+                    4,
+                    3,
+                    binding.root_uuid.to_vec(),
+                    binding.local_binding_uuid.to_vec(),
+                    1
+                )
+            );
+            assert_eq!(connection.query_row("SELECT phase FROM media_materialization_jobs WHERE content_revision_uuid=?1", [other_revision.as_bytes().as_slice()], |row| row.get::<_,String>(0)).unwrap(), "pending");
+        }
+        let job = claim_materialization_job(connection, "worker", epoch, 1, 31, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.content_revision_uuid, other_revision);
+    }
+
+    #[test]
+    fn materialization_admission_preserves_double_dot_filenames() {
+        for destination in ["a..b.jpg", "dir..x/a..b.jpg"] {
+            let (database, epoch) = materialization_database();
+            let (root, revision) = materialization_candidate(&database, "Legacy");
+            let connection = database.connection_for_fsops();
+            enqueue_missing_materializations(connection, epoch, 1, 10).unwrap();
+            connection
+                .execute(
+                    "UPDATE media_materialization_jobs SET phase='complete',attempt_count=4",
+                    [],
+                )
+                .unwrap();
+            enroll_materialization_root(&database, root, "active");
+            let (other_root, other_revision) = materialization_candidate(&database, "Other");
+            connection
+                .execute(
+                    "UPDATE files SET name='a..b.jpg' WHERE root_id=?1",
+                    [other_root],
+                )
+                .unwrap();
+            if let Some((parent, _)) = destination.split_once('/') {
+                connection.execute(
+                "INSERT INTO folders(root_id,parent_id,name,path_hash,status) SELECT ?1,id,?2,?2,'active' FROM folders WHERE root_id=?1 AND parent_id IS NULL",
+                params![other_root, parent],
+            ).unwrap();
+                let folder = connection.last_insert_rowid();
+                connection
+                    .execute(
+                        "UPDATE files SET folder_id=?1 WHERE root_id=?2",
+                        params![folder, other_root],
+                    )
+                    .unwrap();
+            }
+            enroll_materialization_root(&database, other_root, "active");
+            validate_relative(destination).unwrap();
+            assert_eq!(
+                super::super::materialize::windows_safe_relative_path(
+                    Path::new(destination),
+                    "stable"
+                )
+                .unwrap(),
+                Path::new(destination)
+            );
+            for now in [20, 30] {
+                assert_eq!(
+                    enqueue_missing_materializations(connection, epoch, 1, now).unwrap(),
+                    2
+                );
+            }
+            let before_reopen = [revision, other_revision]
+                .map(|revision| materialization_snapshot(connection, revision));
+            database.apply_migrations().unwrap();
+            assert_eq!(
+                [revision, other_revision]
+                    .map(|revision| materialization_snapshot(connection, revision)),
+                before_reopen
+            );
+            let stored: (String, i64, bool) = connection.query_row("SELECT phase,attempt_count,root_uuid IS NOT NULL FROM media_materialization_jobs WHERE content_revision_uuid=?1", [revision.as_bytes().as_slice()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(stored, ("complete".into(), 4, true));
+            let job = claim_materialization_job(connection, "worker", epoch, 1, 31, 100)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.content_revision_uuid, other_revision);
+            assert_eq!(job.destination_relpath, destination);
+        }
+    }
+
+    #[test]
+    fn materialization_admission_adopts_only_unclaimed_legacy_pending_jobs() {
+        for (owner, lease, adopt) in [
+            (None, None, true),
+            (None, Some(19), true),
+            (None, Some(50), false),
+            (Some("worker"), Some(50), false),
+            (Some("worker"), Some(19), false),
+        ] {
+            let (database, epoch) = materialization_database();
+            let (root, revision) = materialization_candidate(&database, "Legacy");
+            let connection = database.connection_for_fsops();
+            enqueue_missing_materializations(connection, epoch, 1, 10).unwrap();
+            connection
+                .execute(
+                    "UPDATE media_materialization_jobs SET owner_token=?1,lease_expires_at=?2",
+                    params![owner, lease],
+                )
+                .unwrap();
+            enroll_materialization_root(&database, root, "active");
+            let before = materialization_snapshot(connection, revision);
+            let (other_root, _) = materialization_candidate(&database, "Other");
+            enroll_materialization_root(&database, other_root, "active");
+            assert_eq!(
+                enqueue_missing_materializations(connection, epoch, 1, 20).unwrap(),
+                if adopt { 2 } else { 1 }
+            );
+            if adopt {
+                let stored: (String, i64, bool) = connection.query_row("SELECT phase,attempt_count,root_uuid IS NOT NULL FROM media_materialization_jobs WHERE content_revision_uuid=?1", [revision.as_bytes().as_slice()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+                assert_eq!(stored, ("pending".into(), 0, true));
+            } else {
+                assert_eq!(materialization_snapshot(connection, revision), before);
+            }
+        }
+    }
+
+    #[test]
+    fn materialization_admission_preserves_stale_and_foreign_ownership() {
+        for foreign in [false, true] {
+            let (database, epoch) = materialization_database();
+            let (root, revision) = materialization_candidate(&database, "Original");
+            let mut binding = enroll_materialization_root(&database, root, "active");
+            let connection = database.connection_for_fsops();
+            enqueue_missing_materializations(connection, epoch, 1, 10).unwrap();
+            connection
+                .execute(
+                    "UPDATE media_materialization_jobs SET phase='complete',downloaded_bytes=3",
+                    [],
+                )
+                .unwrap();
+            let before = materialization_snapshot(connection, revision);
+            let (other_root, _) = materialization_candidate(&database, "Other");
+            enroll_materialization_root(&database, other_root, "active");
+            if foreign {
+                connection.execute("UPDATE files SET root_id=?1,folder_id=(SELECT id FROM folders WHERE root_id=?1 AND parent_id IS NULL),name='moved.jpg' WHERE root_id=?2", params![other_root,root]).unwrap();
+            } else {
+                binding.binding_generation += 1;
+                binding.operation_revision += 1;
+                database.upsert_sync_root_local_binding(&binding).unwrap();
+            }
+            assert_eq!(
+                enqueue_missing_materializations(connection, epoch, 1, 20).unwrap(),
+                1
+            );
+            assert_eq!(materialization_snapshot(connection, revision), before);
+        }
+    }
+
+    #[test]
+    fn materialization_admission_leaves_paused_and_unbound_legacy_jobs_untouched() {
+        for unbound in [false, true] {
+            let (database, epoch) = materialization_database();
+            let (root, revision) = materialization_candidate(&database, "Legacy");
+            let connection = database.connection_for_fsops();
+            enqueue_missing_materializations(connection, epoch, 1, 10).unwrap();
+            connection
+                .execute("UPDATE media_materialization_jobs SET phase='complete'", [])
+                .unwrap();
+            let binding = enroll_materialization_root(&database, root, "paused");
+            if unbound {
+                connection
+                    .execute(
+                        "DELETE FROM sync_root_local_bindings WHERE root_uuid=?1",
+                        [binding.root_uuid.as_slice()],
+                    )
+                    .unwrap();
+            }
+            let before = materialization_snapshot(connection, revision);
+            let (other_root, _) = materialization_candidate(&database, "Other");
+            enroll_materialization_root(&database, other_root, "active");
+            assert_eq!(
+                enqueue_missing_materializations(connection, epoch, 1, 20).unwrap(),
+                1
+            );
+            assert_eq!(materialization_snapshot(connection, revision), before);
+        }
+    }
+
+    #[test]
+    fn materialization_admission_preserves_destination_and_transport_reset_behavior() {
+        for change in ["destination", "epoch", "transport"] {
+            let (database, epoch) = materialization_database();
+            let (root, revision) = materialization_candidate(&database, "Legacy");
+            let connection = database.connection_for_fsops();
+            enqueue_missing_materializations(connection, epoch, 1, 10).unwrap();
+            connection.execute("UPDATE media_materialization_jobs SET phase='complete',downloaded_bytes=3,attempt_count=4", []).unwrap();
+            enroll_materialization_root(&database, root, "active");
+            enqueue_missing_materializations(connection, epoch, 1, 20).unwrap();
+            if change == "destination" {
+                connection
+                    .execute(
+                        "UPDATE files SET name='renamed.jpg' WHERE root_id=?1",
+                        [root],
+                    )
+                    .unwrap();
+            }
+            let next_epoch = if change == "epoch" {
+                uuid::Uuid::now_v7()
+            } else {
+                epoch
+            };
+            let generation = if change == "transport" { 2 } else { 1 };
+            enqueue_missing_materializations(connection, next_epoch, generation, 30).unwrap();
+            let state: (String, i64, i64, String) = connection.query_row("SELECT phase,downloaded_bytes,attempt_count,destination_relpath FROM media_materialization_jobs WHERE content_revision_uuid=?1", [revision.as_bytes().as_slice()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+            assert_eq!(
+                state,
+                (
+                    "pending".into(),
+                    if change == "destination" { 0 } else { 3 },
+                    4,
+                    if change == "destination" {
+                        "renamed.jpg"
+                    } else {
+                        "photo.jpg"
+                    }
+                    .into()
+                )
+            );
+        }
+    }
 
     #[test]
     fn claim_is_leased_and_reclaimed_after_expiry() {

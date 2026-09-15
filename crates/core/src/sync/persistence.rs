@@ -12,10 +12,11 @@ use super::checkpoint::{
     TableSnapshot, TagSnapshot, CHECKPOINT_SCHEMA_VERSION,
 };
 use super::codec::{canonical_bytes, decode_event, seal_event, sha256, REDUCER_VERSION};
-use super::reducer::ProtocolState;
+use super::reducer::{legalize_locations, LocationRevision, ProtocolState};
 use super::types::{
     ActorEpochUuid, ActorId, BindingEpochUuid, CheckpointUuid, DeviceUuid, EntityUuid,
     EventEnvelope, EventUuid, Hlc, LibraryUuid, Operation, RevisionUuid, StreamKind, StreamUuid,
+    Version,
 };
 
 #[derive(Debug, Clone)]
@@ -110,6 +111,34 @@ pub fn build_checkpoint(
     let snapshot = Connection::open(&fence.snapshot_path)?;
     let mut state = ProtocolState::default();
     let mut events = Vec::new();
+    // Older initial seeds contain deterministic bootstrap events that were not
+    // persisted in the live ledger. Carry their exact history forward rather
+    // than regenerating shorter/reassigned actor sequences after canonical edits.
+    let previous: Option<Vec<u8>> = snapshot.query_row(
+        "SELECT checkpoint_uuid FROM sync_checkpoints WHERE state='ready' ORDER BY rowid DESC LIMIT 1",[],|row|row.get(0),
+    ).optional()?;
+    if let Some(previous) = previous {
+        let previous = load_and_validate_checkpoint(
+            &snapshot,
+            CheckpointUuid(uuid::Uuid::from_slice(&previous)?),
+        )?;
+        if previous.library_uuid != fence.library_uuid {
+            anyhow::bail!("checkpoint lineage identity mismatch");
+        }
+        let bootstrap_device = DeviceUuid(deterministic_uuid(
+            fence.library_uuid.0.as_bytes(),
+            b"bootstrap-device",
+        ));
+        for event in previous
+            .events
+            .into_iter()
+            .filter(|event| event.actor.device_uuid == bootstrap_device)
+        {
+            if state.apply(&event) {
+                events.push(event);
+            }
+        }
+    }
     let mut cursor = 0_i64;
     loop {
         let mut statement = snapshot.prepare("SELECT rowid,payload FROM sync_events WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT 100")?;
@@ -123,20 +152,22 @@ pub fn build_checkpoint(
         }
         for (rowid, payload) in &rows {
             let event = decode_event(payload)?;
-            state.apply(&event);
-            events.push(event);
+            if state.apply(&event) {
+                events.push(event);
+            }
             cursor = *rowid;
         }
     }
-    let projection = capture_projection(&snapshot)?;
+    let mut projection = capture_projection(&snapshot)?;
     capture_root_truth(&snapshot, &mut state)?;
-    let bootstrap = bootstrap_projection_events(fence.library_uuid, &projection, &state)?;
+    let bootstrap = bootstrap_projection_events(fence.library_uuid, &projection, &state, &events)?;
     for event in bootstrap {
         if !state.applied_events.contains(&event.event_uuid) {
             state.apply(&event);
             events.push(event);
         }
     }
+    complete_portable_projection(&mut projection, &state)?;
     let mut checkpoint_vector = fence.catalog_vector.clone();
     for event in &events {
         checkpoint_vector
@@ -191,6 +222,223 @@ pub fn build_checkpoint(
     Ok(final_path)
 }
 
+/// A restored device may materialize no local roots. Retain a complete portable
+/// browse seed by reconstructing absent rows from canonical identity/content
+/// truth, while keeping observational media metadata for rows held locally.
+fn complete_portable_projection(
+    projection: &mut CatalogProjectionSnapshot,
+    state: &ProtocolState,
+) -> anyhow::Result<()> {
+    // Root sentinels can precede their canonical location event. Supply only a
+    // derived anchor, matching their bootstrap location, so the shared name and
+    // parent legalization sees the same namespace as ordinary inbox projection.
+    let mut location_state = state.clone();
+    for root in state.roots.values() {
+        let entity = location_state
+            .entities
+            .entry(root.root_folder_uuid)
+            .or_default();
+        if entity.winning_location().is_none() {
+            let revision_uuid = RevisionUuid(root.root_folder_uuid.0);
+            entity.locations.insert(
+                revision_uuid,
+                LocationRevision {
+                    revision_uuid,
+                    parent_uuid: Some(root.library_root_uuid),
+                    name: root.requested_name.clone(),
+                    version: Version {
+                        hlc: Hlc {
+                            wall_ms: 0,
+                            logical: 0,
+                        },
+                        device_uuid: DeviceUuid(uuid::Uuid::nil()),
+                        actor_epoch: ActorEpochUuid(uuid::Uuid::nil()),
+                        actor_seq: 0,
+                        event_uuid: EventUuid(root.root_folder_uuid.0),
+                    },
+                },
+            );
+            entity.location_heads.insert(revision_uuid);
+        }
+    }
+    let locations = state
+        .roots
+        .values()
+        .next()
+        .map(|root| legalize_locations(&location_state, root.library_root_uuid))
+        .unwrap_or_default();
+    for root in state
+        .roots
+        .values()
+        .filter(|root| root.lifecycle == "active")
+    {
+        if !projection
+            .roots
+            .iter()
+            .any(|item| item.root_uuid == root.root_uuid)
+        {
+            projection.roots.push(RootProjectionSnapshot {
+                root_uuid: root.root_uuid,
+                root_folder_uuid: root.root_folder_uuid,
+                display_name: root.materialized_name.clone(),
+            });
+        }
+        if !projection
+            .folders
+            .iter()
+            .any(|item| item.uuid == root.root_folder_uuid)
+        {
+            projection.folders.push(FolderSnapshot {
+                uuid: root.root_folder_uuid,
+                root_uuid: root.root_uuid,
+                parent_uuid: None,
+                name: String::new(),
+                mtime: None,
+                status: "active".into(),
+            });
+        }
+    }
+    for (uuid, entity) in &state.entities {
+        if entity.is_deleted() {
+            continue;
+        }
+        let Some(location) = locations.get(uuid) else {
+            continue;
+        };
+        let Some(parent) = location.parent_uuid else {
+            continue;
+        };
+        let mut cursor = parent;
+        let mut seen = std::collections::BTreeSet::new();
+        let root = loop {
+            if let Some(root) = state
+                .roots
+                .values()
+                .find(|root| root.root_folder_uuid == cursor || root.root_uuid == cursor)
+            {
+                break (root.lifecycle == "active").then_some(root.root_uuid);
+            }
+            if !seen.insert(cursor) {
+                break None;
+            }
+            let Some(parent) = locations
+                .get(&cursor)
+                .and_then(|location| location.parent_uuid)
+            else {
+                break None;
+            };
+            cursor = parent;
+        };
+        let Some(root_uuid) = root else { continue };
+        if let Some(content) = entity.winning_content() {
+            if !projection.files.iter().any(|item| item.uuid == *uuid) {
+                projection.files.push(FileSnapshot {
+                    uuid: *uuid,
+                    root_uuid,
+                    folder_uuid: parent,
+                    name: location.display_name.clone(),
+                    ext: entity
+                        .fields
+                        .get("extension")
+                        .and_then(|field| field.value.as_str())
+                        .unwrap_or_default()
+                        .into(),
+                    size: i64::try_from(
+                        content
+                            .byte_length
+                            .context("portable content length missing")?,
+                    )?,
+                    mtime: content.source_mtime_ms.unwrap_or(0),
+                    ctime: None,
+                    status: "active".into(),
+                    media_kind: None,
+                });
+            }
+            if !projection
+                .metadata
+                .iter()
+                .any(|item| item.asset_uuid == *uuid)
+                && ["rating", "favorite", "note"]
+                    .iter()
+                    .any(|field| entity.fields.contains_key(*field))
+            {
+                projection.metadata.push(MetadataSnapshot {
+                    asset_uuid: *uuid,
+                    rating: entity
+                        .fields
+                        .get("rating")
+                        .and_then(|field| field.value.as_i64()),
+                    favorite: entity
+                        .fields
+                        .get("favorite")
+                        .and_then(|field| field.value.as_bool())
+                        .unwrap_or(false),
+                    note: entity
+                        .fields
+                        .get("note")
+                        .and_then(|field| field.value.as_str())
+                        .map(ToOwned::to_owned),
+                    updated_at: 0,
+                });
+            }
+            for tag in entity.live_set_members("tags") {
+                if !projection.memberships.contains(&(*uuid, tag)) {
+                    projection.memberships.push((*uuid, tag));
+                }
+            }
+        } else if entity
+            .fields
+            .get("entity-kind")
+            .and_then(|field| field.value.as_str())
+            == Some("folder")
+            && !projection.folders.iter().any(|item| item.uuid == *uuid)
+        {
+            projection.folders.push(FolderSnapshot {
+                uuid: *uuid,
+                root_uuid,
+                parent_uuid: Some(parent),
+                name: location.display_name.clone(),
+                mtime: None,
+                status: "active".into(),
+            });
+        }
+    }
+    for (uuid, entity) in &state.entities {
+        if !entity.is_deleted()
+            && entity
+                .fields
+                .get("entity-kind")
+                .and_then(|field| field.value.as_str())
+                == Some("tag")
+            && !projection.tags.iter().any(|tag| tag.uuid == *uuid)
+        {
+            projection.tags.push(TagSnapshot {
+                uuid: *uuid,
+                name: entity
+                    .fields
+                    .get("name")
+                    .and_then(|field| field.value.as_str())
+                    .unwrap_or_default()
+                    .into(),
+                color: entity
+                    .fields
+                    .get("color")
+                    .and_then(|field| field.value.as_str())
+                    .map(ToOwned::to_owned),
+            });
+        }
+    }
+    projection.roots.sort_by_key(|root| root.root_uuid);
+    projection.folders.sort_by_key(|folder| folder.uuid);
+    projection.files.sort_by_key(|file| file.uuid);
+    projection.tags.sort_by_key(|tag| tag.uuid);
+    projection
+        .metadata
+        .sort_by_key(|metadata| metadata.asset_uuid);
+    projection.memberships.sort();
+    Ok(())
+}
+
 /// Captures the same canonical protocol truth used by checkpoints without
 /// writing a checkpoint file. Re-enable comparison uses this boundary so it
 /// never falls back to filesystem mtimes or other projection-only metadata.
@@ -215,7 +463,7 @@ pub fn capture_protocol_state(
     drop(statement);
     capture_root_truth(connection, &mut state)?;
     let projection = capture_projection(connection)?;
-    for event in bootstrap_projection_events(library, &projection, &state)? {
+    for event in bootstrap_projection_events(library, &projection, &state, &events)? {
         if !state.applied_events.contains(&event.event_uuid) {
             state.apply(&event);
             events.push(event);
@@ -543,6 +791,7 @@ fn bootstrap_projection_events(
     library: LibraryUuid,
     projection: &CatalogProjectionSnapshot,
     existing: &ProtocolState,
+    events: &[EventEnvelope],
 ) -> anyhow::Result<Vec<EventEnvelope>> {
     let actor = ActorId {
         device_uuid: DeviceUuid(deterministic_uuid(
@@ -559,7 +808,12 @@ fn bootstrap_projection_events(
         library.0.as_bytes(),
         b"bootstrap-binding",
     ));
-    let mut seq = 0u64;
+    let mut seq = events
+        .iter()
+        .filter(|event| event.actor == actor)
+        .map(|event| event.actor_seq)
+        .max()
+        .unwrap_or(0);
     let mut output = Vec::new();
     let root_folders = projection
         .roots
@@ -849,6 +1103,42 @@ fn materialize_staging_catalog_internal(
     database
         .apply_migrations()
         .context("apply staging migrations")?;
+    // Replay canonical history before installing its final browse projection.
+    // Historical locations may temporarily use a name occupied by another row
+    // in the final snapshot, even though the final legalized names are unique.
+    database.connection_for_fsops().execute("INSERT INTO sync_local_state(singleton,library_uuid,device_uuid,catalog_stream_uuid,next_actor_seq,next_local_mutation_generation,hlc_wall_ms,hlc_logical,capture_enabled,compatibility_state,updated_at) VALUES (1,?1,?2,?3,1,2,0,0,0,'compatible',?4)",params![checkpoint.library_uuid.0.as_bytes().as_slice(),device_uuid.as_bytes().as_slice(),uuid::Uuid::now_v7().as_bytes().as_slice(),now_ms()])?;
+    let mut by_actor = checkpoint.events.clone();
+    by_actor.sort_by(|a, b| a.actor.cmp(&b.actor).then(a.actor_seq.cmp(&b.actor_seq)));
+    let replay = database.connection_for_fsops().unchecked_transaction()?;
+    // A verified checkpoint contains all actors' history. An observed revision
+    // can belong to a later-sorted actor; enforce those references at the end
+    // of this isolated replay rather than imposing a new actor ordering rule.
+    replay.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
+    for event in by_actor {
+        super::inbox::apply_remote_batch(&replay, std::slice::from_ref(&event))
+            .context("apply restored event")?;
+    }
+    replay
+        .commit()
+        .context("commit restored event references")?;
+    // Replay can build transient descriptor revisions. This new staging
+    // Catalog has no bindings or browse roots yet; replace only that derived
+    // projection with the exact checkpoint truth after checking its identity.
+    for restored in database.sync_root_descriptors()? {
+        let expected = checkpoint
+            .state
+            .roots
+            .get(&EntityUuid(uuid::Uuid::from_bytes(restored.root_uuid)))
+            .context("restored root is absent from checkpoint truth")?;
+        if restored.root_folder_uuid != *expected.root_folder_uuid.0.as_bytes()
+            || restored.library_root_uuid != *expected.library_root_uuid.0.as_bytes()
+        {
+            anyhow::bail!("restored root identity differs from checkpoint truth");
+        }
+    }
+    database
+        .connection_for_fsops()
+        .execute("DELETE FROM sync_root_descriptors", [])?;
     for (root_uuid, path) in selected_roots {
         let descriptor = checkpoint
             .state
@@ -919,18 +1209,13 @@ fn materialize_staging_catalog_internal(
             })?;
         }
     }
-    database
-        .initialize_sync_identity(checkpoint.library_uuid.0, library_root_uuid, device_uuid)
-        .context("initialize restored sync identity")?;
+    if !selected_roots.is_empty() || !checkpoint.state.roots.is_empty() {
+        database
+            .initialize_sync_identity(checkpoint.library_uuid.0, library_root_uuid, device_uuid)
+            .context("initialize restored sync identity")?;
+    }
     restore_projection(database.connection_for_fsops(), checkpoint, selected_roots)
         .context("restore browse projection")?;
-    let mut by_actor = checkpoint.events.clone();
-    by_actor.sort_by(|a, b| a.actor.cmp(&b.actor).then(a.actor_seq.cmp(&b.actor_seq)));
-    for event in by_actor {
-        database
-            .apply_remote_sync_events(std::slice::from_ref(&event))
-            .context("apply restored event")?;
-    }
     restore_recovery_snapshot(database.connection_for_fsops(), &checkpoint.recovery)
         .context("restore recovery snapshot")?;
     ingest_media_index_shards(
@@ -1315,6 +1600,19 @@ fn restore_projection(
         }
     }
     for tag in &checkpoint.projection.tags {
+        let existing: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT name,color FROM tags WHERE tag_uuid=?1",
+                [tag.uuid.0.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((name, color)) = existing {
+            if name != tag.name || color != tag.color {
+                anyhow::bail!("checkpoint tag projection differs from replayed truth");
+            }
+            continue;
+        }
         transaction.execute(
             "INSERT INTO tags(name,color,tag_uuid) VALUES (?1,?2,?3)",
             params![tag.name, tag.color, tag.uuid.0.as_bytes().as_slice()],
@@ -1326,6 +1624,19 @@ fn restore_projection(
     for (asset, tag) in &checkpoint.projection.memberships {
         transaction.execute("INSERT INTO file_tags(file_id,tag_id) SELECT f.id,t.id FROM files f,tags t WHERE f.asset_uuid=?1 AND t.tag_uuid=?2",params![asset.0.as_bytes().as_slice(),tag.0.as_bytes().as_slice()])?;
     }
+    for file in checkpoint
+        .projection
+        .files
+        .iter()
+        .filter(|file| selected.contains(&file.root_uuid.0))
+    {
+        let file_id = transaction.query_row(
+            "SELECT id FROM files WHERE asset_uuid=?1",
+            [file.uuid.0.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        crate::db::sync_media_fts_for_file_in_transaction_pub(&transaction, file_id)?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -1335,12 +1646,12 @@ fn validate_browse_projection(
     checkpoint: &Checkpoint,
     selected_roots: &[(uuid::Uuid, PathBuf)],
 ) -> anyhow::Result<()> {
-    let actual = capture_projection(connection)?;
+    let mut actual = capture_projection(connection)?;
     let selected = selected_roots
         .iter()
         .map(|(root_uuid, _)| *root_uuid)
         .collect::<std::collections::BTreeSet<_>>();
-    let expected = CatalogProjectionSnapshot {
+    let mut expected = CatalogProjectionSnapshot {
         roots: checkpoint
             .projection
             .roots
@@ -1383,6 +1694,14 @@ fn validate_browse_projection(
             .copied()
             .collect(),
     };
+    // Applying a field stamps the receiving clock; it is not portable truth.
+    for metadata in actual
+        .metadata
+        .iter_mut()
+        .chain(expected.metadata.iter_mut())
+    {
+        metadata.updated_at = 0;
+    }
     if actual != expected {
         anyhow::bail!(
             "staging browse projection differs from checkpoint projection: expected={:?} actual={:?}",
@@ -1509,6 +1828,63 @@ mod tests {
         promote_new_staging_catalog(&staging, &promoted).unwrap();
         assert!(promoted.exists());
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn descriptor_refresh_preserves_legacy_bootstrap_causality() {
+        let database = database();
+        let tag = database.create_tag("before-enable", None).unwrap();
+        let connection = database.connection_for_fsops();
+        let library: Vec<u8> = connection
+            .query_row(
+                "SELECT library_uuid FROM sync_local_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let library = uuid::Uuid::from_slice(&library).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "megle-descriptor-bootstrap-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let first =
+            capture_checkpoint_fence(connection, StreamVector::new(), test_host(library)).unwrap();
+        build_checkpoint(connection, &first, &directory).unwrap();
+        let seed = load_and_validate_checkpoint(connection, first.checkpoint_uuid).unwrap();
+        assert!(!seed.events.is_empty());
+        database.enable_fake_sync_capture_for_test().unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        let tag_uuid: Vec<u8> = transaction
+            .query_row("SELECT tag_uuid FROM tags WHERE id=?1", [tag.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        super::super::capture::capture_catalog_mutation(
+            &transaction,
+            super::super::capture::MutationOrigin::LocalApi,
+            EntityUuid(uuid::Uuid::from_slice(&tag_uuid).unwrap()),
+            Operation::SetField {
+                field: "name".into(),
+                value: serde_json::json!("after-enable"),
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let second =
+            capture_checkpoint_fence(connection, StreamVector::new(), test_host(library)).unwrap();
+        build_checkpoint(connection, &second, &directory).unwrap();
+        let current = load_and_validate_checkpoint(connection, second.checkpoint_uuid).unwrap();
+        assert!(super::super::checkpoint::checkpoint_covers(&current, &seed));
+        for event in &seed.events {
+            assert!(current.events.contains(event));
+        }
+        let unique = current
+            .events
+            .iter()
+            .map(|event| (&event.actor, event.actor_seq))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), current.events.len());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1640,6 +2016,292 @@ mod tests {
         );
         drop(unselected);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn checkpoint_restore_installs_final_names_after_both_actor_history_orders() {
+        let library = uuid::Uuid::from_u128(1);
+        let library_root = EntityUuid(uuid::Uuid::from_u128(2));
+        let roots = [10_u128, 20].map(|id| EntityUuid(uuid::Uuid::from_u128(id)));
+        let sentinels = [11_u128, 21].map(|id| EntityUuid(uuid::Uuid::from_u128(id)));
+        // The later moved sibling sorts before the old name owner, so the
+        // final unsuffixed name is occupied during an old-order browse replay.
+        let folders = [50_u128, 40].map(|id| EntityUuid(uuid::Uuid::from_u128(id)));
+        let assets = [70_u128, 60].map(|id| EntityUuid(uuid::Uuid::from_u128(id)));
+        let tag = EntityUuid(uuid::Uuid::from_u128(80));
+        let mut original = CatalogProjectionSnapshot::default();
+        let mut root_truth = BTreeMap::new();
+        for index in 0..2 {
+            let name = format!("Root {index}");
+            root_truth.insert(
+                roots[index],
+                super::super::reducer::SyncRootTruth {
+                    root_uuid: roots[index],
+                    root_folder_uuid: sentinels[index],
+                    library_root_uuid: library_root,
+                    creation_event_uuid: None,
+                    winning_location_revision_uuid: None,
+                    requested_name: name.clone(),
+                    materialized_name: name.clone(),
+                    materialization_fingerprint: [index as u8; 32],
+                    lifecycle: "active".into(),
+                    logical_revision: 0,
+                },
+            );
+            original.roots.push(RootProjectionSnapshot {
+                root_uuid: roots[index],
+                root_folder_uuid: sentinels[index],
+                display_name: name,
+            });
+            original.folders.push(FolderSnapshot {
+                uuid: sentinels[index],
+                root_uuid: roots[index],
+                parent_uuid: None,
+                name: String::new(),
+                mtime: None,
+                status: "active".into(),
+            });
+            original.folders.push(FolderSnapshot {
+                uuid: folders[index],
+                root_uuid: roots[index],
+                parent_uuid: Some(sentinels[index]),
+                name: "Shared".into(),
+                mtime: None,
+                status: "active".into(),
+            });
+            original.files.push(FileSnapshot {
+                uuid: assets[index],
+                root_uuid: roots[index],
+                folder_uuid: folders[index],
+                name: "shared.jpg".into(),
+                ext: "jpg".into(),
+                size: 7,
+                mtime: 1,
+                ctime: None,
+                status: "active".into(),
+                media_kind: None,
+            });
+            original.metadata.push(MetadataSnapshot {
+                asset_uuid: assets[index],
+                rating: Some(4),
+                favorite: true,
+                note: Some("portable note".into()),
+                updated_at: 0,
+            });
+            original.memberships.push((assets[index], tag));
+        }
+        original.tags.push(TagSnapshot {
+            uuid: tag,
+            name: "reviewed".into(),
+            color: Some("#112233".into()),
+        });
+        let directory =
+            std::env::temp_dir().join(format!("megle-checkpoint-order-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery_database = Database::open_in_memory().unwrap();
+        recovery_database.apply_migrations().unwrap();
+        let recovery = capture_recovery_snapshot(recovery_database.connection_for_fsops()).unwrap();
+        for history_first in [true, false] {
+            let mut events = bootstrap_projection_events(
+                LibraryUuid(library),
+                &original,
+                &ProtocolState::default(),
+                &[],
+            )
+            .unwrap();
+            for event in &mut events {
+                event.actor.device_uuid =
+                    DeviceUuid(uuid::Uuid::from_u128(if history_first { 100 } else { 300 }));
+                *event = seal_event(event.clone()).unwrap();
+            }
+            let actor = ActorId {
+                device_uuid: DeviceUuid(uuid::Uuid::from_u128(200)),
+                stream_uuid: StreamUuid(uuid::Uuid::from_u128(201)),
+                actor_epoch: ActorEpochUuid(uuid::Uuid::from_u128(202)),
+            };
+            let mut append = |seq, entity, parent, name: &str| {
+                let supersedes = events
+                    .iter()
+                    .filter_map(|event| match &event.operation {
+                        Operation::SetLocation { revision_uuid, .. }
+                            if event.entity_uuid == entity =>
+                        {
+                            Some(*revision_uuid)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                events.push(
+                    seal_event(EventEnvelope {
+                        wire_version: super::super::codec::WIRE_VERSION,
+                        envelope_version: super::super::codec::ENVELOPE_VERSION,
+                        reducer_version: REDUCER_VERSION,
+                        library_uuid: LibraryUuid(library),
+                        event_uuid: EventUuid(uuid::Uuid::from_u128(1000 + seq as u128)),
+                        entity_uuid: entity,
+                        stream_uuid: actor.stream_uuid,
+                        stream_kind: StreamKind::Catalog,
+                        actor: actor.clone(),
+                        actor_seq: seq,
+                        binding_epoch: BindingEpochUuid(uuid::Uuid::from_u128(203)),
+                        hlc: Hlc {
+                            wall_ms: 10,
+                            logical: seq as u32,
+                        },
+                        operation: Operation::SetLocation {
+                            revision_uuid: RevisionUuid(uuid::Uuid::from_u128(2000 + seq as u128)),
+                            parent_uuid: Some(parent),
+                            name: name.into(),
+                            supersedes,
+                        },
+                        base_events: Default::default(),
+                        key_version: 0,
+                        integrity_hash: [0; 32],
+                    })
+                    .unwrap(),
+                );
+            };
+            append(1, sentinels[0], library_root, "Root 0");
+            append(2, sentinels[1], library_root, "Root 1");
+            append(3, folders[1], sentinels[0], "Shared");
+            append(4, assets[1], folders[0], "shared.jpg");
+            let mut state = ProtocolState::default();
+            let mut vector = StreamVector::new();
+            for event in &events {
+                state.apply(event);
+                vector
+                    .entry(event.actor.clone())
+                    .and_modify(|seq| *seq = (*seq).max(event.actor_seq))
+                    .or_insert(event.actor_seq);
+            }
+            state.roots = root_truth.clone();
+            let locations = legalize_locations(&state, library_root);
+            let mut projection = original.clone();
+            for folder in projection
+                .folders
+                .iter_mut()
+                .filter(|folder| folders.contains(&folder.uuid))
+            {
+                folder.root_uuid = roots[0];
+                folder.parent_uuid = locations[&folder.uuid].parent_uuid;
+                folder.name = locations[&folder.uuid].display_name.clone();
+            }
+            for file in &mut projection.files {
+                file.root_uuid = roots[0];
+                file.folder_uuid = locations[&file.uuid].parent_uuid.unwrap();
+                file.name = locations[&file.uuid].display_name.clone();
+            }
+            complete_portable_projection(&mut projection, &state).unwrap();
+            let checkpoint = Checkpoint::build(
+                CheckpointUuid::new(),
+                LibraryUuid(library),
+                vector,
+                StreamVector::new(),
+                test_host(library),
+                projection,
+                state,
+                events,
+                recovery.clone(),
+                vec![],
+            )
+            .unwrap();
+            for selected_count in 0..=2 {
+                let selected = roots[..selected_count]
+                    .iter()
+                    .map(|root| (root.0, directory.join(root.to_string())))
+                    .collect::<Vec<_>>();
+                let path = directory.join(format!("{history_first}-{selected_count}.sqlite"));
+                materialize_staging_catalog_with_roots(
+                    &checkpoint,
+                    &path,
+                    library_root.0,
+                    uuid::Uuid::now_v7(),
+                    &selected,
+                )
+                .unwrap();
+                let restored = Database::open(&path).unwrap();
+                assert_eq!(restored.list_roots().unwrap().len(), selected_count);
+                assert_eq!(restored.sync_root_descriptors().unwrap().len(), 2);
+                let expected_files = if selected_count == 0 { 0 } else { 2 };
+                let facts: (i64, i64, i64, i64) = restored.connection_for_fsops().query_row(
+                    "SELECT (SELECT COUNT(DISTINCT name) FROM files),(SELECT COUNT(*) FROM file_tags),(SELECT COUNT(*) FROM user_metadata WHERE note='portable note' AND rating=4 AND favorite=1),(SELECT COUNT(*) FROM tags WHERE name='reviewed' AND color='#112233')",
+                    [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+                ).unwrap();
+                assert_eq!(facts, (expected_files, expected_files, expected_files, 1));
+                assert_eq!(
+                    restored
+                        .connection_for_fsops()
+                        .query_row(
+                            "SELECT COUNT(*) FROM media_fts WHERE media_fts MATCH 'shared'",
+                            [],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    expected_files
+                );
+                for descriptor in restored.sync_root_descriptors().unwrap() {
+                    let expected =
+                        &root_truth[&EntityUuid(uuid::Uuid::from_bytes(descriptor.root_uuid))];
+                    assert_eq!(descriptor.logical_revision, expected.logical_revision);
+                    assert_eq!(
+                        descriptor.materialization_fingerprint,
+                        expected.materialization_fingerprint
+                    );
+                }
+            }
+            let mut invalid = checkpoint.clone();
+            let event = invalid
+                .events
+                .iter_mut()
+                .find(|event| event.actor == actor && event.actor_seq == 3)
+                .unwrap();
+            let Operation::SetLocation { supersedes, .. } = &mut event.operation else {
+                unreachable!()
+            };
+            supersedes.insert(RevisionUuid(uuid::Uuid::from_u128(9999)));
+            *event = seal_event(event.clone()).unwrap();
+            invalid.state = ProtocolState::default();
+            for event in &invalid.events {
+                invalid.state.apply(event);
+            }
+            invalid.state.roots = root_truth.clone();
+            let invalid = Checkpoint::build(
+                invalid.checkpoint_uuid,
+                invalid.library_uuid,
+                invalid.catalog_vector,
+                invalid.host_vector,
+                invalid.host_metadata,
+                invalid.projection,
+                invalid.state,
+                invalid.events,
+                invalid.recovery,
+                invalid.media_index_shards,
+            )
+            .unwrap();
+            let path = directory.join(format!("missing-reference-{history_first}.sqlite"));
+            let error = materialize_staging_catalog_with_roots(
+                &invalid,
+                &path,
+                library_root.0,
+                uuid::Uuid::now_v7(),
+                &[(roots[0].0, directory.join("invalid-root"))],
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("FOREIGN KEY constraint failed"));
+            let rejected = Database::open(&path).unwrap();
+            assert_eq!(rejected.connection_for_fsops().query_row(
+                "SELECT (SELECT COUNT(*) FROM roots)+(SELECT COUNT(*) FROM files)+(SELECT COUNT(*) FROM sync_events)",
+                [], |row| row.get::<_, i64>(0),
+            ).unwrap(), 0);
+            assert_eq!(
+                rejected
+                    .connection_for_fsops()
+                    .query_row("PRAGMA defer_foreign_keys", [], |row| row.get::<_, i64>(0),)
+                    .unwrap(),
+                0
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

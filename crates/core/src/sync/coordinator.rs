@@ -68,6 +68,7 @@ pub struct SyncCoordinator {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncTurnResult {
+    pub capture_pending: bool,
     pub applied_events: usize,
     pub checkpoint_built: bool,
     /// Wall time spent in the bounded authoritative ledger/truth/projection
@@ -161,7 +162,10 @@ impl SyncCoordinator {
             transport_generation: binding.transport_generation as u64,
         };
         let mut page_token = None;
-        let mut checkpoints = Vec::new();
+        let mut candidates: Vec<(
+            crate::host_registry::DiscoveredRemoteLibrary,
+            super::checkpoint::Checkpoint,
+        )> = Vec::new();
         let mut listing_complete = false;
         for _ in 0..1024 {
             let requested_page = page_token.clone();
@@ -181,29 +185,32 @@ impl SyncCoordinator {
             for metadata in page
                 .objects
                 .iter()
-                .filter(|metadata| metadata.key.starts_with("checkpoints/"))
+                .filter(|metadata| super::descriptor::is_descriptor_key(&metadata.key))
             {
-                let object = provider
-                    .object_get(&context, &metadata.key, 64 * 1024 * 1024)
-                    .await
-                    .map_err(anyhow::Error::new)?;
-                super::provider::validate_download(&object, 64 * 1024 * 1024)
-                    .map_err(anyhow::Error::new)?;
-                if object.metadata.key != metadata.key
-                    || object.metadata.size != metadata.size
-                    || object.metadata.sha256 != metadata.sha256
-                {
-                    anyhow::bail!("provider-checkpoint-metadata-mismatch");
+                let (descriptor, checkpoint, _) =
+                    super::descriptor::download_candidate(provider.as_ref(), &context, metadata)
+                        .await?;
+                let mut dominated = false;
+                let mut retained = Vec::new();
+                for (previous, checkpoint) in candidates.drain(..) {
+                    let (covers, covered) =
+                        super::descriptor::causal_relation(&descriptor, &previous)?;
+                    let same_truth = descriptor.evidence.as_ref().unwrap().truth_sha256
+                        == previous.evidence.as_ref().unwrap().truth_sha256;
+                    if covered && (!covers || same_truth) {
+                        dominated = true;
+                        retained.push((previous, checkpoint));
+                    } else if !covers || (covered && !same_truth) {
+                        retained.push((previous, checkpoint));
+                    }
                 }
-                let checkpoint: super::checkpoint::Checkpoint =
-                    serde_json::from_slice(&std::fs::read(&object.path)?)?;
-                checkpoint.verify()?;
-                if checkpoint
-                    .state
-                    .roots
-                    .contains_key(&super::types::EntityUuid(root_uuid))
-                {
-                    checkpoints.push(checkpoint);
+                candidates = retained;
+                if dominated {
+                    continue;
+                }
+                candidates.push((descriptor, checkpoint));
+                if candidates.len() > 64 {
+                    anyhow::bail!("descriptor causal head limit exceeded");
                 }
             }
             page_token = page.page_token;
@@ -218,12 +225,12 @@ impl SyncCoordinator {
         if !listing_complete {
             anyhow::bail!("provider-pagination-limit");
         }
-        let checkpoint = super::checkpoint::maximal_checkpoints(&checkpoints)
-            .into_iter()
-            .max_by_key(|checkpoint| checkpoint.catalog_vector.values().sum::<u64>())
-            .context("remote-checkpoint-unavailable")?;
+        if candidates.len() > 1 {
+            anyhow::bail!("descriptor-causal-conflict");
+        }
+        let (_, checkpoint) = candidates.pop().context("remote-checkpoint-unavailable")?;
         Ok((
-            crate::sync_folders::snapshot_from_checkpoint(checkpoint, root_uuid)?,
+            crate::sync_folders::snapshot_from_checkpoint(&checkpoint, root_uuid)?,
             Some(checkpoint.checkpoint_uuid.0.to_string()),
         ))
     }
@@ -534,11 +541,12 @@ impl SyncCoordinator {
                         .run_active_metadata_turn(library_uuid, path, writer)
                         .await
                     {
-                        Ok(_) => {
+                        Ok(result) if !result.capture_pending => {
                             let _ = coordinator
                                 .registry
                                 .record_sync_turn_success(library_uuid, true);
                         }
+                        Ok(_) => {}
                         Err(error) => {
                             let code = normalize_sync_error_code(&error);
                             let _ = coordinator
@@ -546,6 +554,9 @@ impl SyncCoordinator {
                                 .record_sync_turn_error(library_uuid, &code);
                             tracing::warn!(%error,%library_uuid,"active sync metadata turn failed");
                         }
+                    }
+                    if let Err(error) = coordinator.refresh_pending_metrics(library_uuid, path) {
+                        tracing::warn!(%error,"refresh sync pending metrics failed");
                     }
                 }
 
@@ -588,11 +599,12 @@ impl SyncCoordinator {
                             .run_library_metadata_turn(&library.library_uuid, &path)
                             .await
                         {
-                            Ok(_) => {
+                            Ok(result) if !result.capture_pending => {
                                 let _ = coordinator
                                     .registry
                                     .record_sync_turn_success(&library.library_uuid, false);
                             }
+                            Ok(_) => {}
                             Err(error) => {
                                 let code = normalize_sync_error_code(&error);
                                 let _ = coordinator
@@ -601,6 +613,7 @@ impl SyncCoordinator {
                                 tracing::warn!(%error,library_uuid=%library.library_uuid,"dormant sync metadata turn failed");
                             }
                         }
+                        if let Err(error) = coordinator.refresh_pending_metrics(&library.library_uuid,&path) { tracing::warn!(%error,"refresh sync pending metrics failed"); }
                     });
                 }
                 while let Some(result) = metadata_turns.join_next().await {
@@ -621,6 +634,9 @@ impl SyncCoordinator {
                     {
                         tracing::warn!(%error,%library_uuid,"active sync media turn failed");
                     }
+                    if let Err(error) = coordinator.refresh_pending_metrics(library_uuid, path) {
+                        tracing::warn!(%error,"refresh sync pending metrics failed");
+                    }
                 }
                 let mut media_turns = tokio::task::JoinSet::new();
                 for library in libraries {
@@ -640,6 +656,7 @@ impl SyncCoordinator {
                         {
                             tracing::warn!(%error,library_uuid=%library.library_uuid,"dormant sync media turn failed");
                         }
+                        if let Err(error) = coordinator.refresh_pending_metrics(&library.library_uuid,&path) { tracing::warn!(%error,"refresh sync pending metrics failed"); }
                     });
                 }
                 while let Some(result) = media_turns.join_next().await {
@@ -712,94 +729,31 @@ impl SyncCoordinator {
                 };
                 let mut discovered = Vec::with_capacity(page.objects.len());
                 for metadata in &page.objects {
-                    let Some(library_uuid) = metadata.key.strip_suffix("/library-descriptor")
-                    else {
-                        anyhow::bail!("invalid provider root descriptor key");
-                    };
+                    let (library_uuid, key) = super::descriptor::split_root_key(&metadata.key)?;
                     let context = super::provider::TransportContext {
                         namespace: library_uuid.to_owned(),
                         binding_epoch: uuid::Uuid::nil().to_string(),
                         transport_generation: 1,
                     };
-                    let parsed = async {
-                        let object = provider
-                            .object_get(&context, "library-descriptor", 1024 * 1024)
-                            .await
-                            .map_err(anyhow::Error::new)?;
-                        super::provider::validate_download(&object, 1024 * 1024)
-                            .map_err(anyhow::Error::new)?;
-                        if object.metadata.size != metadata.size
-                            || object.metadata.sha256 != metadata.sha256
-                        {
-                            anyhow::bail!("remote descriptor metadata mismatch");
-                        }
-                        let bytes = std::fs::read(&object.path)?;
-                        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-                        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-                            || value.get("libraryUuid").and_then(serde_json::Value::as_str)
-                                != Some(library_uuid)
-                        {
-                            anyhow::bail!("remote descriptor is incompatible");
-                        }
-                        let roots = value
-                            .get("roots")
-                            .cloned()
-                            .map(
-                                serde_json::from_value::<
-                                    Vec<crate::host_registry::DiscoveredRemoteRoot>,
-                                >,
-                            )
-                            .transpose()?
-                            .unwrap_or_default();
-                        Ok::<_, anyhow::Error>((
-                            value
-                                .get("name")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned),
-                            value
-                                .get("icon")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned),
-                            value.get("mediaCount").and_then(serde_json::Value::as_u64),
-                            value
-                                .get("logicalBytes")
-                                .and_then(serde_json::Value::as_u64),
-                            value
-                                .get("lastSyncedAt")
-                                .and_then(serde_json::Value::as_i64),
-                            roots,
-                        ))
+                    let relative = super::provider::ObjectMetadata {
+                        key: key.to_owned(),
+                        ..metadata.clone()
+                    };
+                    if let Some(candidate) = self.registry.verified_remote_descriptor(
+                        &transport.account_uuid,
+                        library_uuid,
+                        &relative,
+                    )? {
+                        discovered.push(candidate);
+                        continue;
                     }
-                    .await;
-                    discovered.push(match parsed {
-                        Ok((name, icon, media_count, logical_bytes, last_synced_at, roots)) => {
-                            crate::host_registry::DiscoveredRemoteLibrary {
-                                metadata: metadata.clone(),
-                                name,
-                                icon,
-                                media_count,
-                                logical_bytes,
-                                last_synced_at,
-                                compatible: true,
-                                error_code: None,
-                                roots,
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, %library_uuid, "remote Library descriptor is unavailable or incompatible");
-                            crate::host_registry::DiscoveredRemoteLibrary {
-                                metadata: metadata.clone(),
-                                name: None,
-                                icon: None,
-                                media_count: None,
-                                logical_bytes: None,
-                                last_synced_at: None,
-                                compatible: false,
-                                error_code: Some("descriptor-invalid".to_owned()),
-                                roots: Vec::new(),
-                            }
-                        }
-                    });
+                    let (candidate, _, _) = super::descriptor::download_candidate(
+                        provider.as_ref(),
+                        &context,
+                        &relative,
+                    )
+                    .await?;
+                    discovered.push(candidate);
                 }
                 page_token = page.page_token.clone();
                 completed_cursor = page.completed_cursor.clone().or(completed_cursor);
@@ -862,6 +816,12 @@ impl SyncCoordinator {
         catalog_path: &Path,
     ) -> anyhow::Result<SyncTurnResult> {
         let _metadata_permit = self.metadata_budget.acquire().await?;
+        if self.registry.sync_capture_boundary_pending(library_uuid)? {
+            return Ok(SyncTurnResult {
+                capture_pending: true,
+                ..Default::default()
+            });
+        }
         let restoring_catalog = !catalog_path.exists();
         let published = self
             .provider_transport_turn(library_uuid, catalog_path)
@@ -884,42 +844,8 @@ impl SyncCoordinator {
         let result = runtime
             .run_turn(move |database| {
                 Self::project_root_binding_records(database, root_bindings)?;
-                let connection = database.connection_for_fsops();
-                commit_published_segments(connection, &published_for_catalog)?;
-                super::persistence::recover_interrupted_checkpoints(connection)?;
-                register_unindexed_segments(connection, &spool_dir)?;
-                seal_next_outbox_segment(connection, &spool_dir)?;
-                let apply_started = std::time::Instant::now();
-                let applied_events = super::spool::apply_next_durable_segment(connection)?;
-                let apply_transaction_micros = apply_started.elapsed().as_micros() as u64;
-                advance_bulk_turn(connection)?;
-                let portable_checkpoint = latest_portable_checkpoint(connection)?;
-                let (checkpoint_built, seed_checkpoint) = if portable_checkpoint.is_none() {
-                    let fence = super::persistence::capture_checkpoint_fence(
-                        connection,
-                        host_vector,
-                        host_metadata,
-                    )?;
-                    super::persistence::build_checkpoint(
-                        connection,
-                        &fence,
-                        &spool_dir.join("checkpoints"),
-                    )?;
-                    let ready =
-                        super::persistence::descriptor_ready(connection, fence.checkpoint_uuid)?;
-                    (
-                        true,
-                        ready.then_some((fence.checkpoint_uuid.0, fence.local_generation)),
-                    )
-                } else {
-                    (false, portable_checkpoint)
-                };
-                Ok(SyncTurnResult {
-                    applied_events,
-                    checkpoint_built,
-                    apply_transaction_micros,
-                    seed_checkpoint,
-                })
+                commit_published_segments(database.connection_for_fsops(), &published_for_catalog)?;
+                perform_turn(database, host_vector, host_metadata, spool_dir)
             })
             .await
             .context("apply dormant Catalog turn")?;
@@ -975,12 +901,30 @@ impl SyncCoordinator {
             .into_iter()
             .filter(|checkpoint| checkpoint.recovery.portable_complete)
             .collect::<Vec<_>>();
-        let checkpoint = super::checkpoint::maximal_checkpoints(&portable_candidates)
-            .into_iter()
-            .max_by_key(|value| value.catalog_vector.values().sum::<u64>())
-            .ok_or_else(|| {
-                anyhow::anyhow!("synchronized Library is awaiting a portable checkpoint")
-            })?;
+        let chosen = self.registry.chosen_descriptor(library_uuid)?;
+        let checkpoint = if let Some((_, Some(key), Some(hash))) = chosen {
+            let checkpoint = portable_candidates
+                .iter()
+                .find(|checkpoint| {
+                    format!("checkpoints/{}.checkpoint", checkpoint.checkpoint_uuid) == key
+                })
+                .context("synchronized Library is awaiting its chosen descriptor checkpoint")?;
+            if hex_hash(&super::codec::sha256(&super::codec::canonical_bytes(
+                checkpoint,
+            )?)) != hash
+            {
+                anyhow::bail!("chosen descriptor checkpoint hash mismatch");
+            }
+            checkpoint
+        } else if chosen.is_some() {
+            anyhow::bail!("synchronized Library is awaiting its pinned descriptor validation");
+        } else {
+            let maximal = super::checkpoint::maximal_checkpoints(&portable_candidates);
+            if maximal.len() != 1 {
+                anyhow::bail!("synchronized Library has no unambiguous portable checkpoint");
+            }
+            maximal[0]
+        };
         let staging = catalog_path.with_extension("sqlite.sync-staging");
         let host_bindings = self.registry.local_root_bindings(library_uuid)?;
         if self.registry.is_root_aware_restore(library_uuid)?
@@ -1084,6 +1028,14 @@ impl SyncCoordinator {
         writer: &crate::db::DbWriter,
     ) -> anyhow::Result<SyncTurnResult> {
         let _metadata_permit = self.metadata_budget.acquire().await?;
+        // Enable/retry commits Host intent before its asynchronous Catalog capture.
+        // This is a waiting boundary, not a failed capture or permission to seed.
+        if self.registry.sync_capture_boundary_pending(library_uuid)? {
+            return Ok(SyncTurnResult {
+                capture_pending: true,
+                ..Default::default()
+            });
+        }
         let published = self
             .provider_transport_turn(library_uuid, catalog_path)
             .await?;
@@ -1260,7 +1212,7 @@ impl SyncCoordinator {
         shutdown
     }
 
-    fn project_root_binding_tokens(
+    pub(crate) fn project_root_binding_tokens(
         &self,
         library_uuid: &str,
         database: &crate::db::Database,
@@ -1340,11 +1292,43 @@ impl SyncCoordinator {
         Ok(())
     }
 
+    fn refresh_pending_metrics(
+        &self,
+        library_uuid: &str,
+        catalog_path: &Path,
+    ) -> anyhow::Result<()> {
+        if !catalog_path.exists() {
+            return Ok(());
+        }
+        let connection = rusqlite::Connection::open_with_flags(
+            catalog_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let (metadata,metadata_bytes): (u64,u64) = connection.query_row("SELECT COUNT(*),COALESCE(SUM(length(e.payload)),0) FROM sync_outbox o JOIN sync_events e ON e.event_uuid=o.event_uuid WHERE o.state IN ('pending','sealed')",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        let (objects,object_bytes): (u64,u64) = connection.query_row("SELECT COUNT(*),COALESCE(SUM(o.byte_length),0) FROM media_publication_objects o JOIN media_publication_jobs j ON j.intent_uuid=o.intent_uuid WHERE o.state IN ('sealed','uploading','failed') AND j.phase NOT IN ('event-published','cancelled','archived')",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        let (capture,capture_bytes): (u64,u64) = connection.query_row("SELECT COUNT(*),COALESCE(SUM(MAX(0,COALESCE(r.byte_size,0))),0) FROM sync_publication_intents i JOIN asset_content_revisions r ON r.content_revision_uuid=i.content_revision_uuid WHERE i.state IN ('pending-hash','pending-manifest','ready','failed') AND NOT EXISTS(SELECT 1 FROM media_publication_objects o WHERE o.intent_uuid=i.intent_uuid)",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        let (download,download_bytes): (u64,u64) = connection.query_row("SELECT COUNT(*),COALESCE(SUM(MAX(0,expected_length-downloaded_bytes)),0) FROM media_materialization_jobs WHERE phase<>'complete'",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        let conflicts: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM sync_conflicts WHERE state='open'",
+            [],
+            |row| row.get(0),
+        )?;
+        self.registry.update_sync_pending_metrics(
+            library_uuid,
+            metadata + objects + capture,
+            metadata_bytes + object_bytes + capture_bytes,
+            download,
+            download_bytes,
+            conflicts,
+        )
+    }
+
     async fn record_restore_progress(
         &self,
         library_uuid: &str,
         catalog_path: &Path,
     ) -> anyhow::Result<()> {
+        self.refresh_pending_metrics(library_uuid, catalog_path)?;
         let database = crate::db::Database::open(catalog_path)?;
         let connection = database.connection_for_fsops();
         let (total, done, bytes_total, bytes_done): (i64, i64, i64, i64) = connection
@@ -1357,24 +1341,6 @@ impl SyncCoordinator {
             "SELECT COUNT(*) FROM sync_conflicts WHERE state='open'",
             [],
             |row| row.get(0),
-        )?;
-        let (metadata_uploads, metadata_upload_bytes): (i64, i64) = connection.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(length(e.payload)),0) FROM sync_outbox o JOIN sync_events e ON e.event_uuid=o.event_uuid WHERE o.state IN ('pending','sealed')",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let (media_uploads, media_upload_bytes): (i64, i64) = connection.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(o.byte_length),0) FROM media_publication_objects o JOIN media_publication_jobs j ON j.intent_uuid=o.intent_uuid WHERE o.state IN ('sealed','uploading','failed') AND j.phase NOT IN ('event-published','cancelled','archived')",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        self.registry.update_sync_pending_metrics(
-            library_uuid,
-            metadata_uploads.max(0) as u64 + media_uploads.max(0) as u64,
-            metadata_upload_bytes.max(0) as u64 + media_upload_bytes.max(0) as u64,
-            total.saturating_sub(done).max(0) as u64,
-            bytes_total.saturating_sub(bytes_done).max(0) as u64,
-            conflicts.max(0) as u64,
         )?;
         self.registry.update_restore_progress(
             library_uuid,
@@ -1466,6 +1432,9 @@ impl SyncCoordinator {
         catalog_path: &Path,
         writer: &crate::db::DbWriter,
     ) -> anyhow::Result<()> {
+        if self.registry.sync_capture_boundary_pending(library_uuid)? {
+            return Ok(());
+        }
         let Some(binding) = self.registry.binding_transport(library_uuid, "library")? else {
             return Ok(());
         };
@@ -1571,6 +1540,69 @@ impl SyncCoordinator {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("sync-spool");
+        if binding.state == "restoring" && !catalog_path.exists() {
+            let (key, hash) = self
+                .registry
+                .chosen_descriptor_identity(library_uuid)?
+                .context("restore descriptor identity missing")?;
+            let object = provider
+                .object_get(&context, &key, super::descriptor::MAX_DESCRIPTOR_BYTES)
+                .await
+                .map_err(anyhow::Error::new)?;
+            super::provider::validate_download(&object, super::descriptor::MAX_DESCRIPTOR_BYTES)
+                .map_err(anyhow::Error::new)?;
+            if object.metadata.key != key || object.metadata.sha256.as_slice() != hash {
+                anyhow::bail!("pinned restore descriptor identity mismatch");
+            }
+            let (candidate, checkpoint, bytes) = super::descriptor::download_candidate(
+                provider.as_ref(),
+                &context,
+                &object.metadata,
+            )
+            .await?;
+            self.registry
+                .complete_restore_descriptor_pin(library_uuid, &binding, &candidate)?;
+            std::fs::create_dir_all(spool.join("descriptors"))?;
+            std::fs::create_dir_all(spool.join("checkpoints"))?;
+            std::fs::create_dir_all(spool.join("indexes"))?;
+            atomic_write(
+                &spool
+                    .join("descriptors")
+                    .join(format!("{}.json", hex_hash(&object.metadata.sha256))),
+                &bytes,
+            )?;
+            atomic_write(
+                &spool
+                    .join("checkpoints")
+                    .join(format!("{}.checkpoint", checkpoint.checkpoint_uuid)),
+                &super::codec::canonical_bytes(&checkpoint)?,
+            )?;
+            for shard in &checkpoint.media_index_shards {
+                let object = provider
+                    .object_get(
+                        &context,
+                        &shard.object_key,
+                        super::media::MAX_INDEX_SHARD_BYTES as u64,
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                super::provider::validate_download(
+                    &object,
+                    super::media::MAX_INDEX_SHARD_BYTES as u64,
+                )
+                .map_err(anyhow::Error::new)?;
+                if object.metadata.key != shard.object_key
+                    || object.metadata.sha256 != super::media::parse_hash(&shard.sha256)?
+                    || object.metadata.size != shard.byte_length
+                {
+                    anyhow::bail!("restore index identity mismatch");
+                }
+                atomic_write(
+                    &spool.join("indexes").join(format!("{}.idx", shard.sha256)),
+                    &std::fs::read(&object.path)?,
+                )?;
+            }
+        }
         let mut pages = 0usize;
         let mut reset_attempted = false;
         loop {
@@ -1613,6 +1645,45 @@ impl SyncCoordinator {
                 Err(error) => return Err(anyhow::Error::new(error)),
             };
             for metadata in &page.objects {
+                if super::descriptor::is_descriptor_key(&metadata.key) {
+                    let verified = self.registry.verified_remote_descriptor(
+                        &binding.account_uuid,
+                        library_uuid,
+                        metadata,
+                    )?;
+                    let (candidate, checkpoint, bytes) =
+                        super::descriptor::download_candidate_reusing(
+                            provider.as_ref(),
+                            &context,
+                            metadata,
+                            verified.as_ref(),
+                        )
+                        .await?;
+                    self.registry
+                        .cache_bound_descriptor(library_uuid, &binding, &candidate)?;
+                    let directory = spool.join("descriptors");
+                    std::fs::create_dir_all(&directory)?;
+                    atomic_write(
+                        &directory.join(format!("{}.json", hex_hash(&metadata.sha256))),
+                        &bytes,
+                    )?;
+                    let directory = spool.join("checkpoints");
+                    std::fs::create_dir_all(&directory)?;
+                    atomic_write(
+                        &directory.join(format!("{}.checkpoint", checkpoint.checkpoint_uuid)),
+                        &super::codec::canonical_bytes(&checkpoint)?,
+                    )?;
+                    self.registry.record_provider_receipt(
+                        library_uuid,
+                        binding.binding_epoch,
+                        binding.transport_generation,
+                        &metadata.key,
+                        metadata.etag.as_deref(),
+                        &metadata.sha256,
+                        "durable",
+                    )?;
+                    continue;
+                }
                 if !metadata.key.starts_with("segments/")
                     && !metadata.key.starts_with("host/")
                     && !metadata.key.starts_with("checkpoints/")
@@ -1768,166 +1839,283 @@ impl SyncCoordinator {
                     .with_context(|| format!("verify outgoing sync segment {}", path.display()))?;
                 let hash: [u8; 32] = sha2::Sha256::digest(&bytes).into();
                 let key = format!("segments/{}.json", hex_hash(&hash));
-                let result = provider
-                    .object_put_immutable(&context, &key, &bytes, hash)
-                    .await
-                    .map_err(anyhow::Error::new)?;
-                let (state, etag) = put_receipt(&result)?;
-                self.registry.record_provider_receipt(
+                self.publish_protocol_object(
+                    provider,
+                    &context,
                     library_uuid,
-                    binding.binding_epoch,
-                    binding.transport_generation,
+                    binding,
                     &key,
-                    etag,
-                    &hash,
-                    state,
-                )?;
+                    &bytes,
+                )
+                .await?;
                 let mut segment_uuid = [0u8; 16];
                 segment_uuid.copy_from_slice(&segment.segment_hash[..16]);
                 published.push(PublishedSegment {
                     segment_uuid,
-                    actor_epoch: binding.actor_epoch,
+                    actor_epoch: segment.header.actor.actor_epoch.0,
                     last_seq: segment.header.last_seq,
                     object_key: key,
                 });
             }
         }
-        if binding.state == "seed_ready" || binding.state == "publishing" {
-            let checkpoint_uuid = binding
-                .latest_checkpoint_uuid
-                .ok_or_else(|| anyhow::anyhow!("seed binding has no ready checkpoint"))?;
+        let seed_publication = matches!(binding.state.as_str(), "seed_ready" | "publishing");
+        if seed_publication || binding.state == "active" {
             let connection = rusqlite::Connection::open_with_flags(
                 catalog_path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )?;
-            let (checkpoint_path, expected_hash): (String, Vec<u8>) = connection.query_row(
-                "SELECT spool_path,payload_hash FROM sync_checkpoints WHERE checkpoint_uuid=?1 AND state='ready'",
-                [checkpoint_uuid.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
+            let checkpoint_uuid = if seed_publication {
+                binding.latest_checkpoint_uuid
+            } else {
+                latest_portable_checkpoint(&connection)?.map(|value| value.0)
+            };
+            let Some(checkpoint_uuid) = checkpoint_uuid else {
+                return Ok(published);
+            };
+            let (checkpoint_path, expected_hash, created_at): (String,Vec<u8>,i64) = connection.query_row(
+                "SELECT spool_path,payload_hash,created_at FROM sync_checkpoints WHERE checkpoint_uuid=?1 AND state='ready'",
+                [checkpoint_uuid.as_bytes().as_slice()], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
             drop(connection);
             let checkpoint = std::fs::read(&checkpoint_path)?;
-            let checkpoint_hash: [u8; 32] = sha2::Sha256::digest(&checkpoint).into();
+            let checkpoint_hash = super::codec::sha256(&checkpoint);
             if expected_hash.as_slice() != checkpoint_hash {
-                anyhow::bail!("seed checkpoint payload hash mismatch");
+                anyhow::bail!("checkpoint payload hash mismatch");
+            }
+            let payload: super::checkpoint::Checkpoint = serde_json::from_slice(&checkpoint)?;
+            payload.verify()?;
+            if !payload.recovery.portable_complete {
+                return Ok(published);
             }
             let checkpoint_key = format!("checkpoints/{checkpoint_uuid}.checkpoint");
-            let checkpoint_result = provider
-                .object_put_immutable(&context, &checkpoint_key, &checkpoint, checkpoint_hash)
-                .await
-                .map_err(anyhow::Error::new)?;
-            let (checkpoint_state, checkpoint_etag) = put_receipt(&checkpoint_result)?;
-            self.registry.record_provider_receipt(
-                library_uuid,
-                binding.binding_epoch,
-                binding.transport_generation,
-                &checkpoint_key,
-                checkpoint_etag,
-                &checkpoint_hash,
-                checkpoint_state,
-            )?;
-            let checkpoint_payload: super::checkpoint::Checkpoint =
-                serde_json::from_slice(&checkpoint)?;
-            checkpoint_payload.verify()?;
-            let mut dependencies = vec![checkpoint_key.clone()];
-            let index_root = spool.join("indexes");
-            for shard in &checkpoint_payload.media_index_shards {
-                let bytes = std::fs::read(index_root.join(format!("{}.idx", shard.sha256)))?;
-                let shard_hash = super::media::parse_hash(&shard.sha256)?;
-                if bytes.len() as u64 != shard.byte_length
-                    || sha2::Sha256::digest(&bytes).as_slice() != shard_hash
+            if seed_publication {
+                if let Some(metadata) = provider
+                    .object_head(&context, super::descriptor::LEGACY_KEY)
+                    .await
+                    .map_err(anyhow::Error::new)?
                 {
-                    anyhow::bail!("seed media index shard identity mismatch");
+                    // Earlier clients could downgrade their own publication receipts
+                    // to download-only receipts. Recover authority from the verified
+                    // remote seed's exact bytes, never from a newly serialized seed.
+                    let (_, remote_checkpoint, remote_bytes) =
+                        super::descriptor::download_candidate(provider, &context, &metadata)
+                            .await?;
+                    let remote: super::descriptor::LibraryDescriptor =
+                        serde_json::from_slice(&remote_bytes)?;
+                    if remote.binding_epoch != binding.binding_epoch
+                        || remote_checkpoint.checkpoint_uuid.0 != checkpoint_uuid
+                        || super::media::parse_hash(&remote.seed.sha256)? != checkpoint_hash
+                    {
+                        anyhow::bail!("existing seed does not match the binding capture");
+                    }
+                    self.publish_protocol_object(
+                        provider,
+                        &context,
+                        library_uuid,
+                        binding,
+                        &checkpoint_key,
+                        &checkpoint,
+                    )
+                    .await?;
+                    self.publish_protocol_object(
+                        provider,
+                        &context,
+                        library_uuid,
+                        binding,
+                        super::descriptor::LEGACY_KEY,
+                        &remote_bytes,
+                    )
+                    .await?;
+                    self.registry.confirm_remote_descriptor(
+                        library_uuid,
+                        binding.binding_epoch,
+                        binding.transport_generation,
+                        &checkpoint_key,
+                    )?;
+                    return Ok(published);
                 }
-                let result = provider
-                    .object_put_immutable(&context, &shard.object_key, &bytes, shard_hash)
+            }
+            let legacy = if seed_publication {
+                None
+            } else {
+                let object = provider
+                    .object_get(
+                        &context,
+                        super::descriptor::LEGACY_KEY,
+                        super::descriptor::MAX_DESCRIPTOR_BYTES,
+                    )
                     .await
                     .map_err(anyhow::Error::new)?;
-                let (state, etag) = put_receipt(&result)?;
-                self.registry.record_provider_receipt(
+                super::provider::validate_download(
+                    &object,
+                    super::descriptor::MAX_DESCRIPTOR_BYTES,
+                )
+                .map_err(anyhow::Error::new)?;
+                let verified = self.registry.verified_remote_descriptor(
+                    &binding.account_uuid,
+                    library_uuid,
+                    &object.metadata,
+                )?;
+                let (candidate, seed, _) = super::descriptor::download_candidate_reusing(
+                    provider,
+                    &context,
+                    &object.metadata,
+                    verified.as_ref(),
+                )
+                .await?;
+                self.registry
+                    .cache_bound_descriptor(library_uuid, binding, &candidate)?;
+                if !super::checkpoint::checkpoint_covers(&payload, &seed)
+                    || !super::descriptor::history_covers(
+                        &super::descriptor::verified_history(&payload)?,
+                        &super::descriptor::verified_history(&seed)?,
+                    )
+                {
+                    anyhow::bail!("descriptor snapshot does not cover seed");
+                }
+                Some(hex_hash(&object.metadata.sha256))
+            };
+            let mut dependencies = vec![checkpoint_key.clone()];
+            dependencies.extend(
+                payload
+                    .media_index_shards
+                    .iter()
+                    .map(|shard| shard.object_key.clone()),
+            );
+            let descriptor = super::descriptor::from_checkpoint(
+                &payload,
+                checkpoint_hash,
+                binding.binding_epoch,
+                created_at,
+                dependencies,
+                legacy,
+            )?;
+            let bytes = super::codec::canonical_bytes(&descriptor)?;
+            let descriptor_key = if seed_publication {
+                super::descriptor::LEGACY_KEY.to_owned()
+            } else {
+                super::descriptor::snapshot_key(&bytes)
+            };
+            let descriptor_hash = super::codec::sha256(&bytes);
+            if self.registry.has_published_receipt(
+                library_uuid,
+                binding,
+                &descriptor_key,
+                &descriptor_hash,
+            )? {
+                if seed_publication {
+                    self.registry.confirm_remote_descriptor(
+                        library_uuid,
+                        binding.binding_epoch,
+                        binding.transport_generation,
+                        &checkpoint_key,
+                    )?;
+                }
+                return Ok(published);
+            }
+            // Check every media dependency before advertising the checkpoint. The
+            // publication worker owns uploads; this path verifies its remote receipts.
+            let mut media_dependencies = std::collections::BTreeMap::new();
+            for shard in &payload.media_index_shards {
+                let shard_bytes =
+                    std::fs::read(spool.join("indexes").join(format!("{}.idx", shard.sha256)))?;
+                if shard_bytes.len() as u64 != shard.byte_length
+                    || super::codec::sha256(&shard_bytes)
+                        != super::media::parse_hash(&shard.sha256)?
+                {
+                    anyhow::bail!("checkpoint index shard identity mismatch");
+                }
+                for entry in super::media::format::IndexShardV1::decode(&shard_bytes)?.entries {
+                    media_dependencies
+                        .insert(entry.object_key, (entry.object_hash, entry.object_length));
+                }
+            }
+            for (key, (hash, length)) in media_dependencies {
+                let object = provider
+                    .object_head(&context, &key)
+                    .await
+                    .map_err(anyhow::Error::new)?
+                    .context("checkpoint media dependency unavailable")?;
+                if object.key != key
+                    || object.size != length
+                    || object.sha256 != super::media::parse_hash(&hash)?
+                {
+                    anyhow::bail!("checkpoint media dependency mismatch");
+                }
+            }
+            self.publish_protocol_object(
+                provider,
+                &context,
+                library_uuid,
+                binding,
+                &checkpoint_key,
+                &checkpoint,
+            )
+            .await?;
+            for shard in &payload.media_index_shards {
+                let shard_bytes =
+                    std::fs::read(spool.join("indexes").join(format!("{}.idx", shard.sha256)))?;
+                self.publish_protocol_object(
+                    provider,
+                    &context,
+                    library_uuid,
+                    binding,
+                    &shard.object_key,
+                    &shard_bytes,
+                )
+                .await?;
+            }
+            super::fault::hit("descriptor.after-dependencies");
+            self.publish_protocol_object(
+                provider,
+                &context,
+                library_uuid,
+                binding,
+                &descriptor_key,
+                &bytes,
+            )
+            .await?;
+            if seed_publication {
+                self.registry.confirm_remote_descriptor(
                     library_uuid,
                     binding.binding_epoch,
                     binding.transport_generation,
-                    &shard.object_key,
-                    etag,
-                    &shard_hash,
-                    state,
+                    &checkpoint_key,
                 )?;
-                dependencies.push(shard.object_key.clone());
             }
-            let library = self
-                .registry
-                .library(library_uuid)?
-                .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
-            let connection = rusqlite::Connection::open_with_flags(
-                catalog_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )?;
-            let (media_count, logical_bytes): (i64, i64) = connection.query_row(
-                "SELECT COUNT(*),COALESCE(SUM(size),0) FROM files WHERE status='active'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            drop(connection);
-            let catalog = crate::db::Database::open(catalog_path)?;
-            let roots = catalog
-                .sync_root_descriptors()?
-                .into_iter()
-                .filter(|root| root.lifecycle == "active")
-                .map(|root| -> anyhow::Result<serde_json::Value> {
-                    let logical_bytes = catalog.sync_root_logical_bytes(&root.root_uuid)?;
-                    Ok(serde_json::json!({
-                        "rootUuid":uuid::Uuid::from_bytes(root.root_uuid),
-                        "rootFolderUuid":uuid::Uuid::from_bytes(root.root_folder_uuid),
-                        "requestedName":root.requested_name,
-                        "materializedName":root.materialized_name,
-                        "materializationFingerprint":hex_hash(&root.materialization_fingerprint),
-                        "logicalRevision":root.logical_revision,
-                        "logicalBytes":logical_bytes,
-                    }))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let descriptor = serde_json::to_vec(&serde_json::json!({
-                "version":1,
-                "libraryUuid":library_uuid,
-                "name":library.name,
-                "icon":library.icon,
-                "mediaCount":media_count.max(0),
-                "logicalBytes":logical_bytes.max(0),
-                "lastSyncedAt":crate::host_registry::unix_timestamp_millis_for_runtime(),
-                "bindingEpoch":binding.binding_epoch,
-                "namespace":binding.remote_namespace.as_deref().unwrap_or(library_uuid),
-                "seed":{
-                    "checkpointUuid":checkpoint_uuid,
-                    "objectKey":checkpoint_key,
-                    "sha256":hex_hash(&checkpoint_hash)
-                },
-                "dependencies":dependencies
-                ,"roots":roots
-            }))?;
-            let hash: [u8; 32] = sha2::Sha256::digest(&descriptor).into();
-            let result = provider
-                .object_put_immutable(&context, "library-descriptor", &descriptor, hash)
-                .await
-                .map_err(anyhow::Error::new)?;
-            let (state, etag) = put_receipt(&result)?;
-            self.registry.record_provider_receipt(
-                library_uuid,
-                binding.binding_epoch,
-                binding.transport_generation,
-                "library-descriptor",
-                etag,
-                &hash,
-                state,
-            )?;
-            self.registry.confirm_remote_descriptor(
-                library_uuid,
-                binding.binding_epoch,
-                binding.transport_generation,
-                &checkpoint_key,
-            )?;
         }
         Ok(published)
+    }
+
+    async fn publish_protocol_object(
+        &self,
+        provider: &dyn super::provider::SyncProvider,
+        context: &super::provider::TransportContext,
+        library_uuid: &str,
+        binding: &crate::host_registry::BindingTransport,
+        key: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let hash = super::codec::sha256(bytes);
+        if self
+            .registry
+            .has_published_receipt(library_uuid, binding, key, &hash)?
+        {
+            return Ok(());
+        }
+        let result = provider
+            .object_put_immutable(context, key, bytes, hash)
+            .await
+            .map_err(anyhow::Error::new)?;
+        let (state, etag) = put_receipt(&result)?;
+        self.registry.record_provider_receipt(
+            library_uuid,
+            binding.binding_epoch,
+            binding.transport_generation,
+            key,
+            etag,
+            &hash,
+            state,
+        )
     }
 
     fn commit_host_published_frontier(
@@ -2034,6 +2222,7 @@ fn perform_turn(
     spool_dir: PathBuf,
 ) -> anyhow::Result<SyncTurnResult> {
     let connection = database.connection_for_fsops();
+    super::capture::capture_enrolled_root_identities(connection)?;
     super::persistence::recover_interrupted_checkpoints(connection)?;
     register_unindexed_segments(connection, &spool_dir)?;
     seal_next_outbox_segment(connection, &spool_dir)?;
@@ -2042,7 +2231,48 @@ fn perform_turn(
     let apply_transaction_micros = apply_started.elapsed().as_micros() as u64;
     advance_bulk_turn(connection)?;
     let portable_checkpoint = latest_portable_checkpoint(connection)?;
-    let (checkpoint_built, seed_checkpoint) = if portable_checkpoint.is_none() {
+    let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sync_publication_intents WHERE state IN ('pending-hash','pending-manifest','ready','failed')) OR EXISTS(SELECT 1 FROM media_publication_jobs WHERE phase NOT IN ('event-published','cancelled','archived'))",[],|row|row.get(0))?;
+    let current: Option<(Vec<u8>,i64)> = connection.query_row("SELECT checkpoint_uuid,capture_local_mutation_generation FROM sync_checkpoints WHERE state='ready' ORDER BY rowid DESC LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    let matches = if let Some((id, generation)) = &current {
+        let local_generation: i64 = connection.query_row(
+            "SELECT next_local_mutation_generation FROM sync_local_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let checkpoint = super::persistence::load_and_validate_checkpoint(
+            connection,
+            super::types::CheckpointUuid(uuid::Uuid::from_slice(id)?),
+        )?;
+        let mut statement = connection.prepare("SELECT device_uuid,stream_uuid,actor_epoch,applied_through_seq FROM sync_actor_frontiers")?;
+        let vectors = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut covers = true;
+        for (device, stream, epoch, seq) in vectors {
+            let actor = super::types::ActorId {
+                device_uuid: super::types::DeviceUuid(uuid::Uuid::from_slice(&device)?),
+                stream_uuid: super::types::StreamUuid(uuid::Uuid::from_slice(&stream)?),
+                actor_epoch: super::types::ActorEpochUuid(uuid::Uuid::from_slice(&epoch)?),
+            };
+            covers &= checkpoint.catalog_vector.get(&actor).copied().unwrap_or(0) == seq;
+        }
+        *generation == local_generation
+            && covers
+            && checkpoint.host_vector == host_vector
+            && checkpoint.host_metadata.name == host_metadata.name
+            && checkpoint.host_metadata.icon == host_metadata.icon
+            && (pending || checkpoint.recovery.portable_complete)
+    } else {
+        false
+    };
+    let (checkpoint_built, seed_checkpoint) = if !matches && (!pending || current.is_none()) {
         let fence =
             super::persistence::capture_checkpoint_fence(connection, host_vector, host_metadata)?;
         super::persistence::build_checkpoint(connection, &fence, &spool_dir.join("checkpoints"))?;
@@ -2055,6 +2285,7 @@ fn perform_turn(
         (false, portable_checkpoint)
     };
     Ok(SyncTurnResult {
+        capture_pending: false,
         applied_events,
         checkpoint_built,
         apply_transaction_micros,
@@ -2066,7 +2297,7 @@ fn latest_portable_checkpoint(
     connection: &rusqlite::Connection,
 ) -> anyhow::Result<Option<(uuid::Uuid, i64)>> {
     let mut statement = connection.prepare(
-        "SELECT checkpoint_uuid,capture_local_mutation_generation FROM sync_checkpoints WHERE state='ready' ORDER BY ready_at DESC",
+        "SELECT checkpoint_uuid,capture_local_mutation_generation FROM sync_checkpoints WHERE state='ready' ORDER BY rowid DESC",
     )?;
     let rows = statement
         .query_map([], |row| {
@@ -2341,6 +2572,1007 @@ mod tests {
         registry
             .record_plugin_runtime_ready(plugin_id, "test-session", &["sync-provider.v1".into()])
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn descriptor_refresh_enrolled_roots_media_discovery_and_idle() {
+        let base =
+            std::env::temp_dir().join(format!("megle-descriptor-refresh-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let library = uuid::Uuid::now_v7();
+        let library_root = uuid::Uuid::now_v7();
+        let registry = Arc::new(HostRegistry::open(base.join("host.sqlite")).unwrap());
+        register_test_provider_account(&registry, "fake", "account");
+        registry
+            .commit_creation(
+                "create",
+                &LibraryDescriptor {
+                    library_uuid: library.to_string(),
+                    root_uuid: library_root.to_string(),
+                    name: "Library".into(),
+                    icon: None,
+                    color: None,
+                    local_data_dir: base.join("catalog"),
+                    managed_root: base.join("managed"),
+                    lifecycle_state: "ready".into(),
+                    binding_state: "local-only".into(),
+                    availability: "available".into(),
+                    marker_identity: "fixture".into(),
+                },
+            )
+            .unwrap();
+        std::fs::create_dir_all(base.join("catalog")).unwrap();
+        let path = base.join("catalog/catalog.sqlite");
+        let database = Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        database
+            .add_root(NewRoot {
+                path: base.join("managed").to_string_lossy().into_owned(),
+                display_name: "Library".into(),
+            })
+            .unwrap();
+        database
+            .initialize_sync_identity(library, library_root, registry.device_uuid().unwrap())
+            .unwrap();
+        // Empty managed seed before any user directory is enrolled.
+        database
+            .connection_for_fsops()
+            .execute("DELETE FROM roots", [])
+            .unwrap();
+        let (binding, actor) = registry
+            .begin_sync_binding(&library.to_string(), "fake", "account")
+            .unwrap();
+        let writer = DbWriter::spawn(database);
+        let coordinator = SyncCoordinator::new(registry.clone(), RuntimeLeases::default());
+        let provider = Arc::new(crate::sync::provider::InMemorySyncProvider::default());
+        coordinator
+            .provider_manager()
+            .register("fake", "account", provider.clone())
+            .unwrap();
+        // Retry commits preparing before the asynchronous Catalog boundary.
+        registry
+            .record_sync_turn_error(&library.to_string(), "interrupted-capture")
+            .unwrap();
+        assert!(registry
+            .retry_binding(
+                &library.to_string(),
+                0,
+                &registry
+                    .binding_transport(&library.to_string(), "library")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap());
+        let scheduler = coordinator.spawn_scheduler(std::time::Duration::from_millis(10), 1, {
+            let library = library.to_string();
+            let path = path.clone();
+            let writer = writer.clone();
+            move || Some((library.clone(), path.clone(), writer.clone()))
+        });
+        for _ in 0..50 {
+            let polled: bool = rusqlite::Connection::open(base.join("host.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT last_success_at IS NOT NULL FROM library_sync_bindings",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if polled {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(registry
+            .sync_capture_boundary_pending(&library.to_string())
+            .unwrap());
+        assert_eq!(
+            registry
+                .binding_transport(&library.to_string(), "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "preparing"
+        );
+        assert_eq!(
+            writer
+                .write(|db| Ok(db.connection_for_fsops().query_row(
+                    "SELECT COUNT(*) FROM sync_checkpoints",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )?))
+                .await
+                .unwrap(),
+            0
+        );
+        let generation = writer
+            .write_authoritative(move |db| db.begin_sync_capture(binding, actor))
+            .await
+            .unwrap();
+        registry
+            .set_sync_capture_generation(&library.to_string(), binding, generation)
+            .unwrap();
+        coordinator.wake();
+        for _ in 0..50 {
+            if registry
+                .binding_transport(&library.to_string(), "library")
+                .unwrap()
+                .unwrap()
+                .latest_checkpoint_uuid
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            registry
+                .binding_transport(&library.to_string(), "library")
+                .unwrap()
+                .unwrap()
+                .latest_checkpoint_uuid
+                .is_some(),
+            "capture completion must be eligible immediately, not after a dormant poll delay"
+        );
+        scheduler.shutdown().await.unwrap();
+        for _ in 0..1 {
+            coordinator
+                .run_active_turn(&library.to_string(), &path, &writer)
+                .await
+                .unwrap();
+        }
+        let context = crate::sync::provider::TransportContext {
+            namespace: library.to_string(),
+            binding_epoch: binding.to_string(),
+            transport_generation: 1,
+        };
+        let legacy = provider
+            .object_get(&context, "library-descriptor", 1024 * 1024)
+            .await
+            .unwrap();
+        let mut historical: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&legacy.path).unwrap()).unwrap();
+        historical["lastSyncedAt"] = serde_json::json!(1);
+        let historical_bytes = serde_json::to_vec_pretty(&historical).unwrap();
+        let legacy_hash = super::super::codec::sha256(&historical_bytes);
+        provider.replace_fixture_object("library-descriptor", historical_bytes.clone());
+        let host_fixture = rusqlite::Connection::open(base.join("host.sqlite")).unwrap();
+        host_fixture.execute("UPDATE provider_object_receipts SET state='durable' WHERE object_key='library-descriptor' OR object_key LIKE 'checkpoints/%'",[]).unwrap();
+        host_fixture.execute("UPDATE provider_object_receipts SET sha256=?1 WHERE object_key='library-descriptor'",[legacy_hash.as_slice()]).unwrap();
+        host_fixture
+            .execute("DELETE FROM provider_verified_descriptors", [])
+            .unwrap();
+        host_fixture
+            .execute("DELETE FROM provider_remote_descriptor_heads", [])
+            .unwrap();
+        drop(host_fixture);
+        registry
+            .record_sync_turn_error(&library.to_string(), "old-build-self-poll")
+            .unwrap();
+        registry
+            .retry_binding(
+                &library.to_string(),
+                0,
+                &registry
+                    .binding_transport(&library.to_string(), "library")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .binding_transport(&library.to_string(), "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "seed_ready"
+        );
+        coordinator
+            .run_active_turn(&library.to_string(), &path, &writer)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .binding_transport(&library.to_string(), "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+        assert_eq!(
+            std::fs::read(
+                &provider
+                    .object_get(&context, "library-descriptor", 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .path
+            )
+            .unwrap(),
+            historical_bytes
+        );
+        let legacy_doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&legacy.path).unwrap()).unwrap();
+        assert_eq!(legacy_doc["mediaCount"], 0);
+        assert_eq!(legacy_doc["roots"].as_array().unwrap().len(), 0);
+        let first_seed_checkpoint = registry
+            .binding_transport(&library.to_string(), "library")
+            .unwrap()
+            .unwrap()
+            .latest_checkpoint_uuid;
+        let mut expected_bytes = 0;
+        for index in 0..2 {
+            let root_path = base.join(format!("source-{index}"));
+            std::fs::create_dir_all(&root_path).unwrap();
+            let contents = vec![index as u8 + 31; 1024 + index];
+            let length = contents.len() as i64;
+            expected_bytes += length;
+            std::fs::create_dir_all(root_path.join("nested")).unwrap();
+            let source = root_path.join("nested/media.jpg");
+            std::fs::write(&source, &contents).unwrap();
+            let root_uuid = uuid::Uuid::now_v7();
+            let folder = uuid::Uuid::now_v7();
+            writer
+                .write_authoritative(move |db| {
+                    db.ensure_selected_sync_root(
+                        library,
+                        root_uuid,
+                        folder,
+                        library_root,
+                        &root_path.to_string_lossy(),
+                        &format!("Root{index}"),
+                        &format!("Root{index}"),
+                        [index as u8 + 1; 32],
+                        uuid::Uuid::now_v7(),
+                        binding,
+                        uuid::Uuid::now_v7(),
+                        1,
+                        "active",
+                        1,
+                        false,
+                    )?;
+                    let root_id = db.sync_root_id(root_uuid.as_bytes())?.unwrap();
+                    let parent_id:i64 = db.connection_for_fsops().query_row(
+                        "SELECT id FROM folders WHERE folder_uuid=?1",
+                        [folder.as_bytes().as_slice()],
+                        |row| row.get(0),
+                    )?;
+                    db.connection_for_fsops().execute("INSERT INTO folders(root_id,parent_id,name,path_hash,status,folder_uuid) VALUES (?1,?2,'nested','nested','active',?3)",params![root_id,parent_id,uuid::Uuid::now_v7().as_bytes().as_slice()])?;
+                    let folder_id=db.connection_for_fsops().last_insert_rowid();
+                    let file = db.upsert_file(FileUpsert {
+                        root_id,
+                        folder_id,
+                        name: "media.jpg".into(),
+                        ext: "jpg".into(),
+                        size: length,
+                        mtime: 1,
+                        ctime: None,
+                        file_key: None,
+                    })?;
+                    let device:Vec<u8>=db.connection_for_fsops().query_row("SELECT device_uuid FROM sync_local_state WHERE singleton=1",[],|row|row.get(0))?;
+                    db.initialize_sync_identity(library,library_root,uuid::Uuid::from_slice(&device)?)?;
+                    db.create_sync_publication_intent(file, &source.to_string_lossy(), length)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        // Saturate only the media budget so production metadata turns must
+        // expose pre-object jobs without the convenience turn wrapper.
+        registry.wake_binding(&library.to_string()).unwrap();
+        let media_permits = coordinator.media_budget.acquire_many(2).await.unwrap();
+        let scheduler = coordinator.spawn_scheduler(std::time::Duration::from_millis(10), 1, {
+            let library = library.to_string();
+            let path = path.clone();
+            let writer = writer.clone();
+            move || Some((library.clone(), path.clone(), writer.clone()))
+        });
+        for _ in 0..50 {
+            if registry.sync_status_snapshot().unwrap().libraries[0].pending_upload_items >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(registry.sync_status_snapshot().unwrap().libraries[0].pending_upload_items >= 2);
+        drop(media_permits);
+        scheduler.shutdown().await.unwrap();
+        *provider.rejected_put_prefix.lock().unwrap() = Some("descriptors/".into());
+        let mut failed = false;
+        for _ in 0..12 {
+            if coordinator
+                .run_active_turn(&library.to_string(), &path, &writer)
+                .await
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+        }
+        assert!(
+            failed,
+            "snapshot failure must occur after dependencies publish"
+        );
+        let failed_snapshot = provider
+            .put_attempts
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert!(failed_snapshot.0.starts_with("descriptors/"));
+        let checkpoint_count = writer
+            .write(|db| {
+                Ok(db.connection_for_fsops().query_row(
+                    "SELECT COUNT(*) FROM sync_checkpoints",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        coordinator.shutdown_media_workers().await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(coordinator);
+        drop(registry);
+        *provider.rejected_put_prefix.lock().unwrap() = None;
+        let registry = Arc::new(HostRegistry::open(base.join("host.sqlite")).unwrap());
+        let coordinator = SyncCoordinator::new(registry.clone(), RuntimeLeases::default());
+        coordinator
+            .provider_manager()
+            .register("fake", "account", provider.clone())
+            .unwrap();
+        let writer = DbWriter::spawn(Database::open(&path).unwrap());
+        provider.put_attempts.lock().unwrap().clear();
+        for _ in 0..3 {
+            coordinator
+                .run_active_turn(&library.to_string(), &path, &writer)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *provider.put_attempts.lock().unwrap(),
+            vec![failed_snapshot]
+        );
+        assert_eq!(
+            checkpoint_count,
+            writer
+                .write(|db| Ok(db.connection_for_fsops().query_row(
+                    "SELECT COUNT(*) FROM sync_checkpoints",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )?))
+                .await
+                .unwrap()
+        );
+        coordinator.run_root_discovery_turns().await.unwrap();
+        let chosen = registry
+            .chosen_descriptor(&library.to_string())
+            .unwrap()
+            .unwrap();
+        assert!(chosen.0.starts_with("descriptors/"));
+        let latest = provider
+            .object_get(&context, &chosen.0, 1024 * 1024)
+            .await
+            .unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&latest.path).unwrap()).unwrap();
+        assert_eq!(document["roots"].as_array().unwrap().len(), 2);
+        assert_eq!(document["mediaCount"], 2);
+        assert_eq!(document["logicalBytes"], expected_bytes);
+        let candidate = super::super::descriptor::download_candidate(
+            provider.as_ref(),
+            &context,
+            &latest.metadata,
+        )
+        .await
+        .unwrap()
+        .0;
+        let cached = registry
+            .verified_remote_descriptor("account", &library.to_string(), &latest.metadata)
+            .unwrap()
+            .unwrap();
+        let before_heads = provider
+            .head_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+        super::super::descriptor::download_candidate_reusing(
+            provider.as_ref(),
+            &context,
+            &latest.metadata,
+            Some(&cached),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider
+                .head_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before_heads,
+            "same verified candidate must not revalidate media bodies"
+        );
+        for etag in [
+            None,
+            Some(String::new()),
+            Some("W/weak".into()),
+            Some("changed".into()),
+        ] {
+            let mut changed = latest.metadata.clone();
+            changed.etag = etag;
+            assert!(registry
+                .verified_remote_descriptor("account", &library.to_string(), &changed)
+                .unwrap()
+                .is_none());
+        }
+        let mut changed = latest.metadata.clone();
+        changed.size += 1;
+        assert!(registry
+            .verified_remote_descriptor("account", &library.to_string(), &changed)
+            .unwrap()
+            .is_none());
+        changed = latest.metadata.clone();
+        changed.sha256 = [19; 32];
+        assert!(registry
+            .verified_remote_descriptor("account", &library.to_string(), &changed)
+            .unwrap()
+            .is_none());
+        let host_fixture = rusqlite::Connection::open(base.join("host.sqlite")).unwrap();
+        host_fixture.execute("UPDATE provider_verified_descriptors SET account_generation=account_generation+1 WHERE descriptor_key=?1",[&latest.metadata.key]).unwrap();
+        assert!(registry
+            .verified_remote_descriptor("account", &library.to_string(), &latest.metadata)
+            .unwrap()
+            .is_none());
+        host_fixture.execute("UPDATE provider_verified_descriptors SET account_generation=account_generation-1 WHERE descriptor_key=?1",[&latest.metadata.key]).unwrap();
+        drop(host_fixture);
+        let discovered = registry.list_remote_libraries().unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].media_count, Some(2));
+        assert!(discovered[0].compatible);
+        let restore_root = base.join("restore");
+        std::fs::create_dir_all(&restore_root).unwrap();
+        let restore_registry =
+            Arc::new(HostRegistry::open(restore_root.join("host.sqlite")).unwrap());
+        register_test_provider_account(&restore_registry, "fake", "account");
+        restore_registry
+            .commit_creation(
+                "restore-create",
+                &LibraryDescriptor {
+                    library_uuid: library.to_string(),
+                    root_uuid: library_root.to_string(),
+                    name: "Library".into(),
+                    icon: None,
+                    color: None,
+                    local_data_dir: restore_root.clone(),
+                    managed_root: restore_root.join("managed"),
+                    lifecycle_state: "ready".into(),
+                    binding_state: "local-only".into(),
+                    availability: "available".into(),
+                    marker_identity: "fixture".into(),
+                },
+            )
+            .unwrap();
+        let restore_coordinator =
+            SyncCoordinator::new(restore_registry.clone(), RuntimeLeases::default());
+        let restore_provider = Arc::new(provider.fork_fixture());
+        restore_coordinator
+            .provider_manager()
+            .register("fake", "account", restore_provider.clone())
+            .unwrap();
+        restore_coordinator
+            .run_root_discovery_turns()
+            .await
+            .unwrap();
+        restore_registry
+            .begin_sync_operation_once(
+                "restore",
+                None,
+                "restore",
+                "preparing",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        restore_registry
+            .start_restore_plan(crate::host_registry::StartRestoreRequest {
+                operation_uuid: "restore",
+                account_uuid: "account",
+                library_uuid: &library.to_string(),
+                managed_root: &restore_root.join("managed"),
+                restore_mode: "root-aware",
+                inventory_fence: None,
+                request_hash: &"1".repeat(64),
+            })
+            .unwrap();
+        restore_registry
+            .begin_restore_binding(&library.to_string(), "account")
+            .unwrap();
+        let restore_chosen = restore_registry
+            .chosen_descriptor(&library.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(restore_chosen, chosen);
+        let restore_catalog = restore_root.join("catalog.sqlite");
+        restore_coordinator
+            .provider_transport_turn(&library.to_string(), &restore_catalog)
+            .await
+            .unwrap();
+        restore_coordinator
+            .bootstrap_missing_catalog(&library.to_string(), &restore_catalog)
+            .unwrap();
+        let restored = Database::open(&restore_catalog).unwrap();
+        assert_eq!(restored.sync_root_descriptors().unwrap().len(), 2);
+        assert_eq!(
+            restored
+                .connection_for_fsops()
+                .query_row("SELECT COUNT(*) FROM roots", [], |row| row.get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        drop(restored);
+        let restore_writer = DbWriter::spawn(Database::open(&restore_catalog).unwrap());
+        for _ in 0..3 {
+            restore_coordinator
+                .run_active_turn(&library.to_string(), &restore_catalog, &restore_writer)
+                .await
+                .unwrap();
+        }
+        restore_coordinator
+            .run_root_discovery_turns()
+            .await
+            .unwrap();
+        let restored_view = restore_registry.list_remote_libraries().unwrap();
+        assert!(restored_view[0].compatible);
+        assert_eq!(restored_view[0].media_count, Some(2));
+        assert_eq!(restored_view[0].logical_bytes, Some(expected_bytes as u64));
+        assert_eq!(
+            restore_registry
+                .binding_transport(&library.to_string(), "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+        restore_registry
+            .update_library_metadata(&library.to_string(), Some("Renamed remotely"), None, None)
+            .unwrap();
+        restore_writer
+            .write_authoritative(|db| {
+                // This receiver has no local files. Concurrent same-name folder
+                // and file requests must still produce a complete, legal seed
+                // for the next device's selected-root restore.
+                let assets = {
+                    let mut statement = db.connection_for_fsops().prepare(
+                        "SELECT h.asset_uuid,r.parent_uuid,r.name FROM asset_content_heads h JOIN sync_location_heads l ON l.entity_uuid=h.asset_uuid AND l.is_display_winner=1 JOIN sync_location_revisions r ON r.revision_uuid=l.revision_uuid ORDER BY h.asset_uuid",
+                    )?;
+                    let rows = statement.query_map([], |row| Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                    )))?.collect::<Result<Vec<_>, _>>()?;
+                    rows
+                };
+                assert_eq!(assets.len(), 2);
+                let (folder_parent, folder_name): (Vec<u8>, String) = db.connection_for_fsops().query_row(
+                    "SELECT r.parent_uuid,r.name FROM sync_location_heads h JOIN sync_location_revisions r ON r.revision_uuid=h.revision_uuid WHERE h.entity_uuid=?1 AND h.is_display_winner=1",
+                    [assets[0].1.as_slice()], |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let transaction = db.connection_for_fsops().unchecked_transaction()?;
+                super::super::capture::capture_catalog_mutation(
+                    &transaction,
+                    super::super::capture::MutationOrigin::LocalApi,
+                    super::super::types::EntityUuid(uuid::Uuid::from_slice(&assets[0].0)?),
+                    super::super::types::Operation::SetField {
+                        field: "note".into(),
+                        value: serde_json::json!("portable note"),
+                    },
+                )?;
+                for (entity, parent, name) in [
+                    (&assets[1].1, &folder_parent, &folder_name),
+                    (&assets[1].0, &assets[0].1, &assets[0].2),
+                ] {
+                    let supersedes = {
+                        let mut statement = transaction.prepare("SELECT revision_uuid FROM sync_location_heads WHERE entity_uuid=?1")?;
+                        let revisions = statement.query_map([entity.as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        revisions.into_iter().map(|revision| uuid::Uuid::from_slice(&revision).map(super::super::types::RevisionUuid)).collect::<Result<std::collections::BTreeSet<_>, _>>()?
+                    };
+                    super::super::capture::capture_catalog_mutation(
+                        &transaction,
+                        super::super::capture::MutationOrigin::LocalApi,
+                        super::super::types::EntityUuid(uuid::Uuid::from_slice(entity)?),
+                        super::super::types::Operation::SetLocation {
+                            revision_uuid: super::super::types::RevisionUuid(uuid::Uuid::now_v7()),
+                            parent_uuid: Some(super::super::types::EntityUuid(uuid::Uuid::from_slice(parent)?)),
+                            name: name.clone(),
+                            supersedes,
+                        },
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            restore_coordinator
+                .run_active_turn(&library.to_string(), &restore_catalog, &restore_writer)
+                .await
+                .unwrap();
+        }
+        restore_coordinator
+            .run_root_discovery_turns()
+            .await
+            .unwrap();
+        let updated = restore_registry
+            .chosen_descriptor(&library.to_string())
+            .unwrap()
+            .unwrap();
+        assert_ne!(updated.0, chosen.0);
+        let published = restore_provider
+            .object_get(&context, &updated.0, 1024 * 1024)
+            .await
+            .unwrap();
+        let (_, third_checkpoint, _) = super::super::descriptor::download_candidate(
+            restore_provider.as_ref(),
+            &context,
+            &published.metadata,
+        )
+        .await
+        .unwrap();
+        assert_eq!(third_checkpoint.projection.files.len(), 2);
+        let third_path = restore_root.join("third.sqlite");
+        let selected = third_checkpoint
+            .state
+            .roots
+            .values()
+            .map(|root| {
+                (
+                    root.root_uuid.0,
+                    restore_root.join(format!("third-{}", root.root_uuid)),
+                )
+            })
+            .collect::<Vec<_>>();
+        super::super::persistence::materialize_staging_catalog_with_roots(
+            &third_checkpoint,
+            &third_path,
+            library_root,
+            uuid::Uuid::now_v7(),
+            &selected,
+        )
+        .unwrap();
+        let third = Database::open(&third_path).unwrap();
+        assert_eq!(
+            third
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT COUNT(*) FROM user_metadata WHERE note='portable note'",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            third
+                .connection_for_fsops()
+                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, u64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            third
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT COUNT(DISTINCT name),COUNT(DISTINCT folder_id) FROM files",
+                    [],
+                    |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                )
+                .unwrap(),
+            (2, 1),
+        );
+        assert_eq!(
+            third.connection_for_fsops().query_row(
+                "SELECT COUNT(*),COUNT(DISTINCT name),COUNT(DISTINCT parent_id) FROM folders WHERE parent_id IS NOT NULL",
+                [], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?)),
+            ).unwrap(),
+            (2, 2, 1),
+        );
+        assert_eq!(
+            third
+                .connection_for_fsops()
+                .query_row("SELECT SUM(size) FROM files", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            expected_bytes
+        );
+        drop(third);
+        restore_coordinator.shutdown_media_workers().await.unwrap();
+        restore_writer.shutdown().await.unwrap();
+        // Migration 18 initializes old confirmed plans with their exact fixed
+        // key/hash but no checkpoint fields. A newer snapshot must not replace it.
+        let legacy_fixture = rusqlite::Connection::open(restore_root.join("host.sqlite")).unwrap();
+        legacy_fixture.execute("UPDATE sync_restore_plans SET catalog_ready=0,state='restoring',descriptor_key='library-descriptor',descriptor_sha256=?1,checkpoint_key=NULL,checkpoint_sha256=NULL",[legacy_hash.as_slice()]).unwrap();
+        legacy_fixture
+            .execute("UPDATE library_sync_bindings SET state='restoring'", [])
+            .unwrap();
+        drop(legacy_fixture);
+        let legacy_catalog = restore_root.join("legacy.sqlite");
+        restore_coordinator
+            .provider_transport_turn(&library.to_string(), &legacy_catalog)
+            .await
+            .unwrap();
+        let legacy_chosen = restore_registry
+            .chosen_descriptor(&library.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_chosen.0, "library-descriptor");
+        assert_eq!(
+            legacy_chosen.1,
+            Some(format!(
+                "checkpoints/{}.checkpoint",
+                first_seed_checkpoint.unwrap()
+            ))
+        );
+        restore_coordinator
+            .bootstrap_missing_catalog(&library.to_string(), &legacy_catalog)
+            .unwrap();
+        let legacy_restored = Database::open(&legacy_catalog).unwrap();
+        assert_eq!(legacy_restored.sync_root_descriptors().unwrap().len(), 0);
+        drop(legacy_restored);
+        drop(restore_coordinator);
+        drop(restore_registry);
+        let checkpoint_bytes = provider
+            .object_get(&context, &chosen.1.clone().unwrap(), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        let checkpoint: super::super::checkpoint::Checkpoint =
+            serde_json::from_slice(&std::fs::read(&checkpoint_bytes.path).unwrap()).unwrap();
+        let remote = Database::open_in_memory().unwrap();
+        remote.apply_migrations().unwrap();
+        let transaction = remote
+            .connection_for_fsops()
+            .unchecked_transaction()
+            .unwrap();
+        let mut events = checkpoint.events.clone();
+        events.sort_by_key(|event| (event.actor.clone(), event.actor_seq));
+        for events in events.chunks(100) {
+            super::super::inbox::apply_remote_batch(&transaction, events).unwrap();
+        }
+        transaction.commit().unwrap();
+        assert_eq!(remote.sync_root_descriptors().unwrap().len(), 2);
+        assert!(remote
+            .sync_root_descriptors()
+            .unwrap()
+            .iter()
+            .all(|root| root.creation_event_uuid.is_some()));
+        // Same immutable seed pointer remains retry authority even after refresh.
+        assert_eq!(
+            registry
+                .binding_transport(&library.to_string(), "library")
+                .unwrap()
+                .unwrap()
+                .latest_checkpoint_uuid,
+            first_seed_checkpoint
+        );
+        registry
+            .record_sync_turn_error(&library.to_string(), "fixture-retry")
+            .unwrap();
+        registry
+            .retry_binding(
+                &library.to_string(),
+                0,
+                &registry
+                    .binding_transport(&library.to_string(), "library")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .binding_transport(&library.to_string(), "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+        assert_eq!(
+            provider
+                .object_head(&context, "library-descriptor")
+                .await
+                .unwrap()
+                .unwrap()
+                .sha256,
+            legacy_hash
+        );
+        let writes_before_idle = provider.put_attempts.lock().unwrap().len();
+        let before = writer
+            .write(|db| {
+                Ok(db.connection_for_fsops().query_row(
+                    "SELECT COUNT(*) FROM sync_checkpoints",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            assert!(
+                !coordinator
+                    .run_active_turn(&library.to_string(), &path, &writer)
+                    .await
+                    .unwrap()
+                    .checkpoint_built
+            );
+        }
+        assert_eq!(
+            before,
+            writer
+                .write(|db| Ok(db.connection_for_fsops().query_row(
+                    "SELECT COUNT(*) FROM sync_checkpoints",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )?))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            registry.sync_status_snapshot().unwrap().libraries[0].pending_upload_items,
+            0
+        );
+        assert_eq!(
+            writes_before_idle,
+            provider.put_attempts.lock().unwrap().len()
+        );
+        let selected_root = checkpoint.state.roots.values().next().unwrap().root_uuid.0;
+        coordinator
+            .fetch_remote_root_snapshot(&library.to_string(), selected_root)
+            .await
+            .unwrap();
+        let fork_provider = Arc::new(provider.fork_fixture());
+        let fork_coordinator = SyncCoordinator::new(registry.clone(), RuntimeLeases::default());
+        fork_coordinator
+            .provider_manager()
+            .register("fake", "account", fork_provider.clone())
+            .unwrap();
+        let mut fork_checkpoint = checkpoint.clone();
+        fork_checkpoint.checkpoint_uuid = super::super::types::CheckpointUuid::new();
+        let index=fork_checkpoint.events.iter().position(|event|matches!(&event.operation,super::super::types::Operation::SetField{field,..} if field=="extension")).unwrap();
+        fork_checkpoint.events[index].operation = super::super::types::Operation::SetField {
+            field: "extension".into(),
+            value: serde_json::json!("jpeg"),
+        };
+        fork_checkpoint.events[index] =
+            super::super::codec::seal_event(fork_checkpoint.events[index].clone()).unwrap();
+        let mut replay = super::super::reducer::ProtocolState::default();
+        for event in &fork_checkpoint.events {
+            replay.apply(event);
+        }
+        replay.roots = fork_checkpoint.state.roots.clone();
+        fork_checkpoint.state = replay;
+        fork_checkpoint.digest = [0; 32];
+        fork_checkpoint.digest = super::super::codec::sha256(
+            &super::super::codec::canonical_bytes(&fork_checkpoint).unwrap(),
+        );
+        let fork_bytes = super::super::codec::canonical_bytes(&fork_checkpoint).unwrap();
+        let fork_key = format!("checkpoints/{}.checkpoint", fork_checkpoint.checkpoint_uuid);
+        fork_provider
+            .object_put_immutable(
+                &context,
+                &fork_key,
+                &fork_bytes,
+                super::super::codec::sha256(&fork_bytes),
+            )
+            .await
+            .unwrap();
+        let mut dependencies = vec![fork_key];
+        dependencies.extend(
+            fork_checkpoint
+                .media_index_shards
+                .iter()
+                .map(|shard| shard.object_key.clone()),
+        );
+        let fork_document = super::super::descriptor::from_checkpoint(
+            &fork_checkpoint,
+            super::super::codec::sha256(&fork_bytes),
+            binding,
+            1,
+            dependencies,
+            Some(hex_hash(&legacy_hash)),
+        )
+        .unwrap();
+        let fork_bytes = super::super::codec::canonical_bytes(&fork_document).unwrap();
+        fork_provider
+            .object_put_immutable(
+                &context,
+                &super::super::descriptor::snapshot_key(&fork_bytes),
+                &fork_bytes,
+                super::super::codec::sha256(&fork_bytes),
+            )
+            .await
+            .unwrap();
+        assert!(fork_coordinator
+            .fetch_remote_root_snapshot(&library.to_string(), selected_root)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("history fork"));
+        drop(fork_coordinator);
+        let transport = registry
+            .binding_transport(&library.to_string(), "library")
+            .unwrap()
+            .unwrap();
+        let mut actor_fork = candidate.clone();
+        actor_fork.metadata.key = format!("{library}/descriptors/{}.json", "b".repeat(64));
+        *actor_fork.history.values_mut().next().unwrap() = "c".repeat(64);
+        for sequence in actor_fork
+            .evidence
+            .as_mut()
+            .unwrap()
+            .catalog_vector
+            .values_mut()
+        {
+            *sequence += 1;
+        }
+        assert!(registry
+            .cache_bound_descriptor(&library.to_string(), &transport, &actor_fork)
+            .unwrap_err()
+            .to_string()
+            .contains("history fork"));
+        assert!(registry.list_remote_libraries().unwrap()[0].compatible);
+        let mut conflict = candidate.clone();
+        conflict.metadata.key = format!("{library}/descriptors/{}.json", "f".repeat(64));
+        conflict.evidence.as_mut().unwrap().truth_sha256 = "e".repeat(64);
+        registry
+            .cache_bound_descriptor(&library.to_string(), &transport, &conflict)
+            .unwrap();
+        assert!(!registry.list_remote_libraries().unwrap()[0].compatible);
+        let mut resolving = candidate.clone();
+        resolving.metadata.key = format!("{library}/descriptors/{}.json", "a".repeat(64));
+        for seq in resolving
+            .evidence
+            .as_mut()
+            .unwrap()
+            .catalog_vector
+            .values_mut()
+        {
+            *seq += 1;
+        }
+        registry
+            .cache_bound_descriptor(&library.to_string(), &transport, &resolving)
+            .unwrap();
+        assert!(registry.list_remote_libraries().unwrap()[0].compatible);
+        registry
+            .cache_bound_descriptor(&library.to_string(), &transport, &candidate)
+            .unwrap();
+        assert_eq!(
+            registry
+                .chosen_descriptor(&library.to_string())
+                .unwrap()
+                .unwrap()
+                .0,
+            format!("descriptors/{}.json", "a".repeat(64))
+        );
+        let mut concurrent = resolving.clone();
+        concurrent.metadata.key = format!("{library}/descriptors/{}.json", "b".repeat(64));
+        let vector = &mut concurrent.evidence.as_mut().unwrap().catalog_vector;
+        let actor = vector.keys().next().unwrap().clone();
+        vector.remove(&actor);
+        let mut other_actor = actor;
+        other_actor.actor_epoch = super::super::types::ActorEpochUuid(uuid::Uuid::now_v7());
+        vector.insert(other_actor, 1);
+        registry
+            .cache_bound_descriptor(&library.to_string(), &transport, &concurrent)
+            .unwrap();
+        assert!(!registry.list_remote_libraries().unwrap()[0].compatible);
+        assert!(registry
+            .has_published_receipt(
+                &library.to_string(),
+                &transport,
+                "library-descriptor",
+                &legacy_hash
+            )
+            .unwrap());
+        coordinator.shutdown_media_workers().await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(coordinator);
+        drop(registry);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

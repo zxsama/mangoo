@@ -7,6 +7,7 @@ use super::codec::{canonical_bytes, sha256};
 use super::types::*;
 
 pub const MATERIALIZED_NAME_VERSION: u16 = 1;
+pub const ROOT_IDENTITY_FIELD: &str = "sync-root-identity-v1";
 const MAX_COMPONENT_UTF16_UNITS: usize = 240;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -35,6 +36,24 @@ pub struct SyncRootTruth {
     pub materialization_fingerprint: [u8; 32],
     pub lifecycle: String,
     pub logical_revision: u64,
+}
+
+pub fn decode_root_identity(
+    entity: EntityUuid,
+    value: &serde_json::Value,
+) -> anyhow::Result<SyncRootTruth> {
+    let root: SyncRootTruth = serde_json::from_value(value.clone())?;
+    if root.root_folder_uuid != entity
+        || root.root_uuid == root.root_folder_uuid
+        || root.creation_event_uuid.is_some()
+        || root.winning_location_revision_uuid.is_some()
+        || !matches!(root.lifecycle.as_str(), "active" | "tombstoned")
+        || root.materialized_name.is_empty()
+        || root.requested_name.is_empty()
+    {
+        anyhow::bail!("invalid synchronized root identity event");
+    }
+    Ok(root)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -124,6 +143,13 @@ impl ProtocolState {
         let entity = self.entities.entry(event.entity_uuid).or_default();
         match &event.operation {
             Operation::SetField { field, value } => {
+                if field == ROOT_IDENTITY_FIELD {
+                    if let Ok(mut root) = decode_root_identity(event.entity_uuid, value) {
+                        root.creation_event_uuid = Some(event.event_uuid);
+                        root.logical_revision = root.logical_revision.saturating_add(1);
+                        self.roots.entry(root.root_uuid).or_insert(root);
+                    }
+                }
                 let incoming = Versioned {
                     value: value.clone(),
                     version,

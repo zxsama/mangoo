@@ -75,7 +75,7 @@ pub enum DeltaScope {
         transport_generation: u64,
     },
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ObjectMetadata {
     pub key: String,
     pub size: u64,
@@ -342,7 +342,7 @@ fn file_size_and_sha256(path: &Path) -> ProviderResult<(u64, [u8; 32])> {
     Ok((size, hasher.finalize().into()))
 }
 
-fn validate_object_key(key: &str) -> ProviderResult<()> {
+pub(crate) fn validate_object_key(key: &str) -> ProviderResult<()> {
     if key.is_empty()
         || key.len() > 1024
         || key.starts_with('/')
@@ -438,6 +438,25 @@ pub struct InMemorySyncProvider {
     objects: Mutex<BTreeMap<String, Vec<u8>>>,
     uploads: Mutex<HashMap<String, (String, u64, [u8; 32], Vec<u8>)>>,
     authenticated: Mutex<bool>,
+    #[cfg(test)]
+    pub(crate) rejected_put_prefix: Mutex<Option<String>>,
+    #[cfg(test)]
+    pub(crate) put_attempts: Mutex<Vec<(String, [u8; 32])>>,
+    #[cfg(test)]
+    pub(crate) head_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl InMemorySyncProvider {
+    pub(crate) fn replace_fixture_object(&self, key: &str, bytes: Vec<u8>) {
+        self.objects.lock().unwrap().insert(key.into(), bytes);
+    }
+    pub(crate) fn fork_fixture(&self) -> Self {
+        Self {
+            objects: Mutex::new(self.objects.lock().unwrap().clone()),
+            ..Self::default()
+        }
+    }
 }
 impl SyncProvider for InMemorySyncProvider {
     fn describe(&self) -> ProviderFuture<'_, ProviderDescription> {
@@ -576,7 +595,7 @@ impl SyncProvider for InMemorySyncProvider {
     }
     fn delta_list<'a>(
         &'a self,
-        _: DeltaScope,
+        scope: DeltaScope,
         cursor: Option<&'a str>,
         page_token: Option<&'a str>,
         limit: usize,
@@ -588,7 +607,22 @@ impl SyncProvider for InMemorySyncProvider {
                 .map_err(|e| error(ProviderErrorCode::Internal, true, e.to_string()))?;
             let start = page_token.and_then(|v| v.parse().ok()).unwrap_or(0);
             let limit = limit.clamp(1, 100);
-            let items = objects
+            let listing = objects
+                .iter()
+                .filter_map(|(key, bytes)| {
+                    let key = if scope == DeltaScope::Root {
+                        if !super::descriptor::is_descriptor_key(key) {
+                            return None;
+                        }
+                        let descriptor: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+                        format!("{}/{}", descriptor.get("libraryUuid")?.as_str()?, key)
+                    } else {
+                        key.clone()
+                    };
+                    Some((key, bytes))
+                })
+                .collect::<Vec<_>>();
+            let items = listing
                 .iter()
                 .skip(start)
                 .take(limit)
@@ -602,8 +636,8 @@ impl SyncProvider for InMemorySyncProvider {
             let next = start + items.len();
             Ok(DeltaPage {
                 objects: items,
-                page_token: (next < objects.len()).then(|| next.to_string()),
-                completed_cursor: (next >= objects.len())
+                page_token: (next < listing.len()).then(|| next.to_string()),
+                completed_cursor: (next >= listing.len())
                     .then(|| format!("v{}", objects.len()))
                     .or_else(|| cursor.map(str::to_owned)),
             })
@@ -615,6 +649,9 @@ impl SyncProvider for InMemorySyncProvider {
         key: &'a str,
     ) -> ProviderFuture<'a, Option<ObjectMetadata>> {
         Box::pin(async move {
+            #[cfg(test)]
+            self.head_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let objects = self
                 .objects
                 .lock()
@@ -683,6 +720,26 @@ impl SyncProvider for InMemorySyncProvider {
         sha256: [u8; 32],
     ) -> ProviderFuture<'a, PutImmutableResult> {
         Box::pin(async move {
+            #[cfg(test)]
+            {
+                self.put_attempts
+                    .lock()
+                    .unwrap()
+                    .push((key.to_owned(), sha256));
+                if self
+                    .rejected_put_prefix
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|prefix| key.starts_with(prefix))
+                {
+                    return Err(error(
+                        ProviderErrorCode::Internal,
+                        true,
+                        "injected immutable put failure",
+                    ));
+                }
+            }
             if Sha256::digest(bytes).as_slice() != sha256 {
                 return Err(error(
                     ProviderErrorCode::InvalidArgument,
@@ -824,7 +881,16 @@ mod tests {
             .unwrap();
         validate_download(&read, 1024).unwrap();
         let page = provider
-            .delta_list(DeltaScope::Root, None, None, 10)
+            .delta_list(
+                DeltaScope::Library {
+                    namespace: context.namespace.clone(),
+                    binding_epoch: context.binding_epoch.clone(),
+                    transport_generation: 1,
+                },
+                None,
+                None,
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(page.objects.len(), 1);

@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use reqwest::blocking::{Client, Response};
@@ -21,6 +22,55 @@ const MAX_URL_BYTES: usize = 8192;
 const MAX_REDIRECTS: usize = 3;
 const MAX_LIBRARY_DESCRIPTOR_BYTES: u64 = 1024 * 1024;
 const MAX_JSON_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_VERIFIED_OBJECT_HASHES: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphItemIdentity {
+    id: Option<String>,
+    size: u64,
+    etag: Option<String>,
+}
+
+impl GraphItemIdentity {
+    fn cache_key(&self, access_token: &str, namespace: &str, key: &str) -> Option<[u8; 32]> {
+        let id = self.id.as_deref().filter(|value| !value.is_empty())?;
+        let etag = self
+            .etag
+            .as_deref()
+            .filter(|value| !value.is_empty() && !value.starts_with("W/"))?;
+        // Graph eTag identifies the complete item, including content. Include
+        // authenticated scope and item ID so no account/key alias shares proof.
+        // Only the digest is retained; access tokens are never stored here.
+        let mut digest = Sha256::new();
+        for value in [access_token, namespace, key, id, etag] {
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        digest.update(self.size.to_le_bytes());
+        Some(digest.finalize().into())
+    }
+}
+
+#[derive(Debug, Default)]
+struct VerifiedObjectHashes {
+    hashes: HashMap<[u8; 32], String>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl VerifiedObjectHashes {
+    fn insert(&mut self, identity: [u8; 32], hash: String) {
+        if self.hashes.contains_key(&identity) {
+            return;
+        }
+        while self.hashes.len() >= MAX_VERIFIED_OBJECT_HASHES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.hashes.remove(&oldest);
+            }
+        }
+        self.order.push_back(identity);
+        self.hashes.insert(identity, hash);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +120,7 @@ pub struct GraphClient {
     http: Client,
     endpoint: Url,
     allow_http_emulator: bool,
+    verified_object_hashes: Arc<Mutex<VerifiedObjectHashes>>,
 }
 
 impl GraphClient {
@@ -85,6 +136,7 @@ impl GraphClient {
             http,
             endpoint: config.graph_endpoint.clone(),
             allow_http_emulator: config.allow_http_emulator,
+            verified_object_hashes: Arc::new(Mutex::new(VerifiedObjectHashes::default())),
         })
     }
 
@@ -250,12 +302,11 @@ impl GraphClient {
                 if library_uuid.to_string() != name {
                     continue;
                 }
-                if !discovered_libraries.insert(name.to_owned()) {
-                    return Err(ProviderError::protocol(
-                        "duplicate OneDrive Library namespace",
-                    ));
+                if !discovered_libraries.insert(format!("{name}/library-descriptor")) {
+                    continue;
                 }
-                let Some(mut descriptor) = self.valid_library_descriptor(access_token, name)?
+                let Some(mut descriptor) =
+                    self.valid_library_descriptor(access_token, name, "library-descriptor")?
                 else {
                     continue;
                 };
@@ -264,6 +315,39 @@ impl GraphClient {
                 continue;
             }
             if item.get("folder").is_some() {
+                continue;
+            }
+            if namespace.is_none() {
+                let Some(path) = item
+                    .pointer("/parentReference/path")
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some((_, tail)) = path.rsplit_once("/Megle/libraries/") else {
+                    continue;
+                };
+                let library = tail.split('/').next().unwrap_or_default();
+                if !uuid::Uuid::parse_str(library).is_ok_and(|id| id.to_string() == library) {
+                    continue;
+                }
+                let Some(key) = delta_relative_key(item, library)? else {
+                    continue;
+                };
+                if !is_descriptor_candidate_key(&key) {
+                    continue;
+                }
+                let identity = format!("{library}/{key}");
+                if !discovered_libraries.insert(identity.clone()) {
+                    continue;
+                }
+                let Some(mut descriptor) =
+                    self.valid_library_descriptor(access_token, library, &key)?
+                else {
+                    continue;
+                };
+                descriptor.key = identity;
+                objects.push(object_value(descriptor));
                 continue;
             }
             let Some(relative_key) = namespace
@@ -310,11 +394,12 @@ impl GraphClient {
         &self,
         access_token: &str,
         namespace: &str,
+        key: &str,
     ) -> Result<Option<RemoteObject>, ProviderError> {
         let mut download = match self.download(
             access_token,
             namespace,
-            "library-descriptor",
+            key,
             None,
             MAX_LIBRARY_DESCRIPTOR_BYTES,
         ) {
@@ -330,6 +415,13 @@ impl GraphClient {
             .map_err(body_io_error)?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| ProviderError::protocol("invalid OneDrive Library descriptor"))?;
+        if key != "library-descriptor"
+            && key != format!("descriptors/{}.json", hex(&Sha256::digest(&bytes)))
+        {
+            return Err(ProviderError::protocol(
+                "OneDrive descriptor key hash mismatch",
+            ));
+        }
         let valid = value.get("version").and_then(Value::as_u64) == Some(1)
             && value.get("libraryUuid").and_then(Value::as_str) == Some(namespace)
             && value.get("namespace").and_then(Value::as_str) == Some(namespace)
@@ -383,6 +475,51 @@ impl GraphClient {
         namespace: &str,
         key: &str,
     ) -> Result<Option<RemoteObject>, ProviderError> {
+        let Some(identity) = self.object_identity(access_token, namespace, key)? else {
+            return Ok(None);
+        };
+        let cache_key = identity.cache_key(access_token, namespace, key);
+        let cached_hash = cache_key.and_then(|cache_key| {
+            self.verified_object_hashes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .hashes
+                .get(&cache_key)
+                .cloned()
+        });
+        let hash = if let Some(hash) = cached_hash {
+            hash
+        } else {
+            let hash = self.hash_object_body(access_token, namespace, key, identity.size)?;
+            // Do not bind downloaded bytes to metadata read before a concurrent
+            // replacement. In particular, a same-size change must fail closed.
+            if self.object_identity(access_token, namespace, key)?.as_ref() != Some(&identity) {
+                return Err(ProviderError::protocol(
+                    "Graph object changed during validation",
+                ));
+            }
+            if let Some(cache_key) = cache_key {
+                self.verified_object_hashes
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(cache_key, hash.clone());
+            }
+            hash
+        };
+        Ok(Some(RemoteObject {
+            key: key.to_owned(),
+            size: identity.size,
+            sha256: hash,
+            etag: identity.etag,
+        }))
+    }
+
+    fn object_identity(
+        &self,
+        access_token: &str,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<GraphItemIdentity>, ProviderError> {
         let url = self.item_url(namespace, key, "?$select=id,name,size,eTag")?;
         let response = self.send_graph(Method::GET, url, access_token, None, None)?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -398,11 +535,9 @@ impl GraphClient {
                 "Graph object exceeds Provider limit",
             ));
         }
-        let hash = self.hash_object_body(access_token, namespace, key, size)?;
-        Ok(Some(RemoteObject {
-            key: key.to_owned(),
+        Ok(Some(GraphItemIdentity {
+            id: value.get("id").and_then(Value::as_str).map(str::to_owned),
             size,
-            sha256: hash,
             etag: value.get("eTag").and_then(Value::as_str).map(str::to_owned),
         }))
     }
@@ -1033,6 +1168,19 @@ fn trusted_capability_host(host: &str) -> bool {
     .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
+fn is_descriptor_candidate_key(key: &str) -> bool {
+    key == "library-descriptor"
+        || key
+            .strip_prefix("descriptors/")
+            .and_then(|v| v.strip_suffix(".json"))
+            .is_some_and(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+}
+
 fn is_direct_library_folder(item: &Value) -> bool {
     item.pointer("/parentReference/path")
         .and_then(Value::as_str)
@@ -1169,6 +1317,59 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_object_hash_cache_is_bounded_and_identity_scoped() {
+        let mut cache = VerifiedObjectHashes::default();
+        let identity = GraphItemIdentity {
+            id: Some("item-id".into()),
+            size: 20,
+            etag: Some("version-1".into()),
+        };
+        let first = identity.cache_key("scope-a", "library-a", "key").unwrap();
+        assert_ne!(
+            first,
+            identity.cache_key("scope-b", "library-a", "key").unwrap()
+        );
+        assert_ne!(
+            first,
+            identity.cache_key("scope-a", "library-b", "key").unwrap()
+        );
+        assert_ne!(
+            first,
+            identity
+                .cache_key("scope-a", "library-a", "other-key")
+                .unwrap()
+        );
+        assert_ne!(
+            first,
+            GraphItemIdentity {
+                size: 21,
+                ..identity.clone()
+            }
+            .cache_key("scope-a", "library-a", "key")
+            .unwrap()
+        );
+        assert!(GraphItemIdentity {
+            id: None,
+            ..identity.clone()
+        }
+        .cache_key("scope-a", "library-a", "key")
+        .is_none());
+        cache.insert(first, "verified-first".into());
+        cache.insert(first, "not-a-new-proof".into());
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(cache.hashes[&first], "verified-first");
+        for index in 0..MAX_VERIFIED_OBJECT_HASHES {
+            let key = identity
+                .cache_key("scope-a", "library-a", &format!("key-{index}"))
+                .unwrap();
+            cache.insert(key, "verified".into());
+        }
+        assert_eq!(cache.hashes.len(), MAX_VERIFIED_OBJECT_HASHES);
+        assert_eq!(cache.order.len(), MAX_VERIFIED_OBJECT_HASHES);
+        assert!(!cache.hashes.contains_key(&first));
+    }
 
     #[test]
     fn freezes_fragment_and_range_contracts() {

@@ -80,6 +80,26 @@ interface LibrarySwitcherLifecycleResult {
     reports: number;
     unhandledRejections: number;
   };
+  addFolderAfterBlur: {
+    addedPath: string | null;
+    addCalls: number;
+    committedRootUuid: string | null;
+    commitCalls: number;
+    enrollmentMode: string | null;
+    enrolledExistingRoot: boolean;
+    refreshCalls: number;
+    reloadsAfterSelection: number;
+    requestedName: string | null;
+    rootFolderUuidIsValid: boolean;
+    localAddedPath: string | null;
+    localAddCalls: number;
+    localEnrollmentCalls: number;
+    localReloadsAfterSelection: number;
+    switchedLibraryAddCalls: number;
+    switchedLibraryEnrollmentCalls: number;
+    switchedLibraryReports: number;
+    switcherClosed: boolean;
+  };
   managedLibraryWizard: {
     createPersisted: boolean;
     explicitCloseRemoved: boolean;
@@ -287,6 +307,29 @@ describe("mounted LibrarySwitcher lifecycle", () => {
     assert.deepEqual(result.mutationFailures, {
       reports: 3,
       unhandledRejections: 0,
+    });
+  });
+
+  it("enrolls an existing selected folder after the native picker closes the switcher on window blur", () => {
+    assert.deepEqual(result.addFolderAfterBlur, {
+      addedPath: null,
+      addCalls: 0,
+      committedRootUuid: "11111111-1111-4111-8111-111111111111",
+      commitCalls: 1,
+      enrollmentMode: "enroll-existing",
+      enrolledExistingRoot: true,
+      refreshCalls: 1,
+      reloadsAfterSelection: 0,
+      requestedName: "selected-folder",
+      rootFolderUuidIsValid: true,
+      localAddedPath: "C:\\Fixture\\local-folder",
+      localAddCalls: 1,
+      localEnrollmentCalls: 0,
+      localReloadsAfterSelection: 0,
+      switchedLibraryAddCalls: 0,
+      switchedLibraryEnrollmentCalls: 0,
+      switchedLibraryReports: 2,
+      switcherClosed: true,
     });
   });
 

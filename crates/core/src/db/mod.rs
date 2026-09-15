@@ -1065,10 +1065,7 @@ impl Database {
             "INSERT INTO sync_location_revisions(revision_uuid,entity_uuid,parent_uuid,name,local_mutation_generation,origin,created_at) SELECT randomblob(16),f.asset_uuid,p.folder_uuid,f.name,1,'bootstrap',?1 FROM files f JOIN folders p ON p.id=f.folder_id WHERE NOT EXISTS (SELECT 1 FROM sync_location_revisions x WHERE x.entity_uuid=f.asset_uuid)",
             [now],
         )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO sync_location_heads(entity_uuid,revision_uuid,is_display_winner) SELECT entity_uuid,revision_uuid,1 FROM sync_location_revisions WHERE origin='bootstrap'",
-            [],
-        )?;
+        crate::sync::inbox::seed_bootstrap_location_heads(&transaction)?;
         transaction.execute(
             "UPDATE sync_local_state SET next_local_mutation_generation=MAX(next_local_mutation_generation,2),updated_at=?1 WHERE singleton=1",
             [now],
@@ -1560,6 +1557,10 @@ impl Database {
         if !self.migration_applied(32)? {
             self.connection
                 .execute_batch(migrations::SYNC_ROOT_RECONCILIATION_MIGRATION)?;
+        }
+        if !self.migration_applied(33)? {
+            self.connection
+                .execute_batch(migrations::MEDIA_MATERIALIZATION_DESTINATION_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;

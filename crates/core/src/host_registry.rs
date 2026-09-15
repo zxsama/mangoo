@@ -33,9 +33,95 @@ const HOST_MIGRATION_0015: &str = include_str!("../host_migrations/0015_sync_roo
 const HOST_MIGRATION_0016: &str = include_str!("../host_migrations/0016_remote_root_inventory.sql");
 const HOST_MIGRATION_0017: &str =
     include_str!("../host_migrations/0017_restore_action_contracts.sql");
+const HOST_MIGRATION_0018: &str = include_str!("../host_migrations/0018_descriptor_snapshots.sql");
 
 pub const ONEDRIVE_SECRET_NAMESPACE: &str = "microsoft-onedrive";
 pub const ONEDRIVE_CREDENTIAL_PURPOSE: &str = "oauth-v1";
+
+fn cache_remote_descriptor(
+    transaction: &rusqlite::Transaction<'_>,
+    account_uuid: &str,
+    account_generation: i64,
+    incoming: &DiscoveredRemoteLibrary,
+) -> anyhow::Result<()> {
+    let (library_uuid, descriptor_key) =
+        crate::sync::descriptor::split_root_key(&incoming.metadata.key)?;
+    let mut selected = incoming.clone();
+    if let Some(evidence) = &incoming.evidence {
+        transaction.execute("INSERT INTO provider_verified_descriptors(account_uuid,library_uuid,descriptor_key,account_generation,candidate_json) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(account_uuid,library_uuid,descriptor_key) DO UPDATE SET account_generation=excluded.account_generation,candidate_json=excluded.candidate_json",params![account_uuid,library_uuid,descriptor_key,account_generation,serde_json::to_string(incoming)?])?;
+        transaction.execute("DELETE FROM provider_remote_descriptor_heads WHERE account_uuid=?1 AND library_uuid=?2 AND account_generation<>?3", params![account_uuid,library_uuid,account_generation])?;
+        let mut statement = transaction.prepare("SELECT descriptor_key,candidate_json FROM provider_remote_descriptor_heads WHERE account_uuid=?1 AND library_uuid=?2 ORDER BY descriptor_key LIMIT 65")?;
+        let rows = statement
+            .query_map(params![account_uuid, library_uuid], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        if rows.len() > 64 {
+            bail!("descriptor causal head limit exceeded");
+        }
+        let mut heads = Vec::new();
+        let mut dominated = false;
+        for (key, json) in rows {
+            let existing: DiscoveredRemoteLibrary = serde_json::from_str(&json)?;
+            let previous = existing
+                .evidence
+                .as_ref()
+                .context("cached descriptor evidence missing")?;
+            let (covers, covered) = crate::sync::descriptor::causal_relation(incoming, &existing)?;
+            if covered && (!covers || evidence.truth_sha256 == previous.truth_sha256) {
+                // Equivalent truth keeps a deterministic immutable identity, preferring
+                // a snapshot over its legacy seed without using arrival or wall time.
+                let prefer_incoming =
+                    covers && key == crate::sync::descriptor::LEGACY_KEY && descriptor_key != key;
+                if !prefer_incoming {
+                    dominated = true;
+                    heads.push(existing);
+                    continue;
+                }
+            }
+            if covers && (!covered || evidence.truth_sha256 == previous.truth_sha256) {
+                transaction.execute("DELETE FROM provider_remote_descriptor_heads WHERE account_uuid=?1 AND library_uuid=?2 AND descriptor_key=?3", params![account_uuid,library_uuid,key])?;
+            } else {
+                heads.push(existing);
+            }
+        }
+        if !dominated {
+            transaction.execute("INSERT INTO provider_remote_descriptor_heads(account_uuid,library_uuid,descriptor_key,account_generation,candidate_json) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(account_uuid,library_uuid,descriptor_key) DO UPDATE SET candidate_json=excluded.candidate_json,account_generation=excluded.account_generation", params![account_uuid,library_uuid,descriptor_key,account_generation,serde_json::to_string(incoming)?])?;
+            heads.push(incoming.clone());
+        }
+        if heads.len() != 1 {
+            transaction.execute("UPDATE provider_remote_libraries SET compatible=0,descriptor_error_code='descriptor-causal-conflict' WHERE account_uuid=?1 AND library_uuid=?2",params![account_uuid,library_uuid])?;
+            transaction.execute("UPDATE provider_remote_sync_roots SET compatible=0,error_code='descriptor-causal-conflict' WHERE account_uuid=?1 AND library_uuid=?2",params![account_uuid,library_uuid])?;
+            return Ok(());
+        }
+        selected = heads.remove(0);
+    }
+    let metadata = &selected.metadata;
+    let (_, descriptor_key) = crate::sync::descriptor::split_root_key(&metadata.key)?;
+    let now = unix_timestamp_millis();
+    transaction.execute(
+        "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,descriptor_etag,account_generation,updated_at,name,icon,media_count,logical_bytes,last_synced_at,compatible,descriptor_error_code,descriptor_key,checkpoint_key,checkpoint_sha256) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) ON CONFLICT(account_uuid,library_uuid) DO UPDATE SET descriptor_size=excluded.descriptor_size,descriptor_sha256=excluded.descriptor_sha256,descriptor_etag=excluded.descriptor_etag,account_generation=excluded.account_generation,updated_at=excluded.updated_at,name=excluded.name,icon=excluded.icon,media_count=excluded.media_count,logical_bytes=excluded.logical_bytes,last_synced_at=excluded.last_synced_at,compatible=excluded.compatible,descriptor_error_code=excluded.descriptor_error_code,descriptor_key=excluded.descriptor_key,checkpoint_key=excluded.checkpoint_key,checkpoint_sha256=excluded.checkpoint_sha256",
+        params![account_uuid,library_uuid,i64::try_from(metadata.size)?,metadata.sha256.as_slice(),metadata.etag,account_generation,now,selected.name,selected.icon,selected.media_count.map(i64::try_from).transpose()?,selected.logical_bytes.map(i64::try_from).transpose()?,selected.last_synced_at,selected.compatible as i64,selected.error_code,descriptor_key,selected.evidence.as_ref().map(|v|&v.checkpoint_key),selected.evidence.as_ref().map(|v|&v.checkpoint_sha256)],
+    )?;
+    transaction.execute(
+        "DELETE FROM provider_remote_sync_roots WHERE account_uuid=?1 AND library_uuid=?2",
+        params![account_uuid, library_uuid],
+    )?;
+    if selected.compatible {
+        for root in &selected.roots {
+            if uuid::Uuid::parse_str(&root.root_uuid)?.to_string() != root.root_uuid
+                || uuid::Uuid::parse_str(&root.root_folder_uuid)?.to_string()
+                    != root.root_folder_uuid
+                || crate::sync::media::parse_hash(&root.materialization_fingerprint).is_err()
+            {
+                bail!("invalid remote root descriptor");
+            }
+            transaction.execute("INSERT INTO provider_remote_sync_roots(account_uuid,library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialization_fingerprint,logical_revision,logical_bytes,compatible,error_code,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,NULL,?10)",params![account_uuid,library_uuid,root.root_uuid,root.root_folder_uuid,root.requested_name,root.materialized_name,root.materialization_fingerprint,i64::try_from(root.logical_revision)?,root.logical_bytes.map(i64::try_from).transpose()?,now])?;
+        }
+    }
+    Ok(())
+}
 
 fn enqueue_onedrive_secret_retirements(
     transaction: &rusqlite::Transaction<'_>,
@@ -121,7 +207,7 @@ pub struct RemoteLibrarySummary {
     pub error_code: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiscoveredRemoteLibrary {
     pub metadata: super::sync::provider::ObjectMetadata,
     pub name: Option<String>,
@@ -132,6 +218,10 @@ pub struct DiscoveredRemoteLibrary {
     pub compatible: bool,
     pub error_code: Option<String>,
     pub roots: Vec<DiscoveredRemoteRoot>,
+    #[serde(default)]
+    pub evidence: Option<crate::sync::descriptor::DescriptorEvidence>,
+    #[serde(default)]
+    pub history: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -1039,6 +1129,8 @@ pub struct NewLocalRootBinding {
     pub root_actor_epoch: Option<String>,
     pub desired_materialized_name: String,
     pub desired_materialization_fingerprint: String,
+    pub applied_materialized_name: Option<String>,
+    pub applied_materialization_fingerprint: Option<String>,
     pub operation_revision: u64,
     pub verification_json: serde_json::Value,
 }
@@ -1589,8 +1681,9 @@ impl HostRegistry {
             if !matches!(
                 binding.state.as_str(),
                 "active" | "paused" | "local-rename-required"
-            ) || binding.applied_materialization_fingerprint.as_deref()
-                == Some(binding.desired_materialization_fingerprint.as_str())
+            ) || (binding.state != "local-rename-required"
+                && binding.applied_materialization_fingerprint.as_deref()
+                    == Some(binding.desired_materialization_fingerprint.as_str()))
             {
                 continue;
             }
@@ -1599,6 +1692,93 @@ impl HostRegistry {
             }
         }
         Ok(pending)
+    }
+
+    /// A canonical revision may change the fingerprint without moving the root.
+    /// Confirm that fact under physical identity and Host revision fences.
+    pub(crate) fn reconcile_same_name_root_materialization(
+        &self,
+        binding: &LocalRootBindingRecord,
+        descriptor: &RemoteSyncRootRecord,
+    ) -> anyhow::Result<bool> {
+        use crate::sync_folders::{canonical_path_key, SyncRootMarker, VerifiedRootMarker};
+        let source = Path::new(&binding.local_path);
+        let target = Path::new(&binding.placement_parent).join(&descriptor.materialized_name);
+        if source.file_name() != Some(std::ffi::OsStr::new(&descriptor.materialized_name))
+            || canonical_path_key(source) != canonical_path_key(&target)
+        {
+            return Ok(false);
+        }
+        if binding.library_uuid != descriptor.library_uuid
+            || binding.root_uuid != descriptor.root_uuid
+            || binding.desired_materialized_name != descriptor.materialized_name
+            || binding.desired_materialization_fingerprint != descriptor.materialization_fingerprint
+            || binding.canonical_path_key != canonical_path_key(source)
+            || !matches!(
+                binding.state.as_str(),
+                "active" | "paused" | "local-rename-required"
+            )
+            || descriptor.lifecycle != "active"
+        {
+            bail!("stale-root-materialization");
+        }
+        let marker = SyncRootMarker {
+            format_version: 1,
+            library_uuid: binding.library_uuid.clone(),
+            root_uuid: binding.root_uuid.clone(),
+            root_folder_uuid: descriptor.root_folder_uuid.clone(),
+            local_binding_uuid: binding.local_binding_uuid.clone(),
+            binding_generation: binding.binding_generation,
+        };
+        let mut evidence = VerifiedRootMarker::open(source, &marker)?;
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let (current, marker_identity, filesystem_identity) = transaction.query_row(
+            "SELECT library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,state,binding_generation,root_capture_epoch,root_actor_epoch,desired_materialized_name,desired_materialization_fingerprint,applied_materialized_name,applied_materialization_fingerprint,operation_revision,last_error_code,marker_identity,filesystem_identity FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2",
+            params![binding.library_uuid,binding.root_uuid],
+            |row| Ok((local_root_binding_record_from_row(row)?, row.get::<_, Option<String>>(17)?, row.get::<_, Option<String>>(18)?)),
+        )?;
+        if current != *binding {
+            bail!("stale-root-materialization");
+        }
+        if marker_identity.as_deref() != Some(evidence.marker_identity())
+            || filesystem_identity.as_deref() != Some(evidence.directory_identity())
+        {
+            bail!("path-changed");
+        }
+        let descriptor_current: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM remote_sync_roots WHERE library_uuid=?1 AND root_uuid=?2 AND root_folder_uuid=?3 AND materialized_name=?4 AND materialization_fingerprint=?5 AND logical_revision=?6 AND lifecycle='active')",
+            params![descriptor.library_uuid,descriptor.root_uuid,descriptor.root_folder_uuid,descriptor.materialized_name,descriptor.materialization_fingerprint,i64::try_from(descriptor.logical_revision)?],
+            |row| row.get(0),
+        )?;
+        if !descriptor_current {
+            bail!("stale-root-materialization");
+        }
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root_operations WHERE library_uuid=?1 AND root_uuid=?2 AND state IN ('pending','running','waiting'))",
+            params![binding.library_uuid,binding.root_uuid],
+            |row| row.get::<_, bool>(0),
+        )? {
+            bail!("operation-in-progress");
+        }
+        let resume_state = if binding.state == "local-rename-required" {
+            // The first failure in this generation retains the original pause
+            // intent even if later fingerprint revisions caused another failure.
+            transaction.query_row(
+                "SELECT json_extract(operation.request_json,'$.resumeState') FROM root_operations operation JOIN root_relocation_operations relocation USING(operation_uuid) WHERE operation.library_uuid=?1 AND operation.root_uuid=?2 AND operation.kind='automatic-rename' AND operation.state='failed' AND operation.phase='local-rename-required' AND operation.cutover_committed=0 AND operation.expected_binding_generation=?3 AND json_extract(operation.request_json,'$.localBindingUuid')=?4 AND relocation.source_canonical_key=?5 AND json_extract(operation.request_json,'$.resumeState') IN ('active','paused') ORDER BY operation.expected_operation_revision,operation.created_at,operation.operation_uuid LIMIT 1",
+                params![binding.library_uuid,binding.root_uuid,i64::try_from(binding.binding_generation)?,binding.local_binding_uuid,binding.canonical_path_key],
+                |row| row.get::<_, String>(0),
+            ).optional()?.context("invalid-root-state")?
+        } else {
+            binding.state.clone()
+        };
+        evidence.verify_unchanged()?;
+        transaction.execute(
+            "UPDATE local_root_bindings SET applied_materialized_name=desired_materialized_name,applied_materialized_name_key=desired_materialized_name_key,applied_materialization_fingerprint=desired_materialization_fingerprint,state=?1,last_error_code=NULL,last_error_detail=NULL,operation_revision=operation_revision+1,updated_at=?2 WHERE library_uuid=?3 AND root_uuid=?4 AND (applied_materialized_name IS NOT desired_materialized_name OR applied_materialization_fingerprint IS NOT desired_materialization_fingerprint OR state<>?1 OR last_error_code IS NOT NULL)",
+            params![resume_state,unix_timestamp_millis(),binding.library_uuid,binding.root_uuid],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn remote_sync_roots(
@@ -1675,6 +1855,24 @@ impl HostRegistry {
             root_operation_record_from_row,
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn latest_root_operation_of_kind(
+        &self,
+        library_uuid: &str,
+        root_uuid: &str,
+        kind: &str,
+    ) -> anyhow::Result<Option<RootOperationRecord>> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .query_row(
+                "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE library_uuid=?1 AND root_uuid=?2 AND kind=?3 ORDER BY updated_at DESC,operation_uuid DESC LIMIT 1",
+                params![library_uuid,root_uuid,kind],
+                root_operation_record_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn root_rebind_evidence(
@@ -1975,8 +2173,8 @@ impl HostRegistry {
             )?;
             let verification_json = serde_json::to_string(&binding.verification_json)?;
             transaction.execute(
-                "INSERT OR IGNORE INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,marker_identity,filesystem_identity,state,binding_generation,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,operation_revision,verification_json,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)",
-                params![binding.library_uuid,binding.root_uuid,binding.local_binding_uuid,binding.local_path,binding.canonical_path_key,binding.placement_parent,binding.placement_parent_key,binding.marker_identity,binding.filesystem_identity,binding.state,i64::try_from(binding.binding_generation)?,binding.desired_materialized_name,binding.desired_materialized_name.to_lowercase(),binding.desired_materialization_fingerprint,i64::try_from(binding.operation_revision)?,verification_json,now],
+                "INSERT OR IGNORE INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,marker_identity,filesystem_identity,state,binding_generation,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,applied_materialized_name,applied_materialized_name_key,applied_materialization_fingerprint,operation_revision,verification_json,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,CASE WHEN ?15 IS NULL THEN NULL ELSE lower(?15) END,?16,?17,?18,?19,?19)",
+                params![binding.library_uuid,binding.root_uuid,binding.local_binding_uuid,binding.local_path,binding.canonical_path_key,binding.placement_parent,binding.placement_parent_key,binding.marker_identity,binding.filesystem_identity,binding.state,i64::try_from(binding.binding_generation)?,binding.desired_materialized_name,binding.desired_materialized_name.to_lowercase(),binding.desired_materialization_fingerprint,binding.applied_materialized_name,binding.applied_materialization_fingerprint,i64::try_from(binding.operation_revision)?,verification_json,now],
             )?;
             transaction.execute("UPDATE root_operations SET state='completed',phase='completed',operation_revision=operation_revision+1,updated_at=?1 WHERE operation_uuid=?2",params![now,operation_uuid])?;
             transaction.execute("UPDATE remote_sync_roots SET inventory_state='unselected',operation_revision=operation_revision+1,updated_at=?1 WHERE library_uuid=?2 AND root_uuid=?3",params![now,library_uuid,binding.root_uuid])?;
@@ -2893,41 +3091,70 @@ impl HostRegistry {
         Ok(())
     }
 
+    pub fn refresh_started_root_path_preflight(
+        &self,
+        token: &str,
+        library_uuid: &str,
+        expires_at: i64,
+    ) -> anyhow::Result<()> {
+        let changed = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .execute(
+                "UPDATE root_path_preflights SET expires_at=MAX(expires_at,?1) WHERE preflight_token=?2 AND library_uuid=?3 AND EXISTS(SELECT 1 FROM root_operations WHERE operation_uuid=?2 AND library_uuid=?3 AND kind='enroll' AND state IN ('pending','running','waiting'))",
+                params![expires_at,token,library_uuid],
+            )?;
+        if changed != 1 {
+            bail!("stale-plan");
+        }
+        Ok(())
+    }
+
     pub fn commit_local_root_binding(
         &self,
         operation_uuid: &str,
         plan_uuid: &str,
         binding: &NewLocalRootBinding,
     ) -> anyhow::Result<LocalRootBindingRecord> {
+        if binding.applied_materialized_name.is_some()
+            != binding.applied_materialization_fingerprint.is_some()
+        {
+            bail!("invalid-root-materialization");
+        }
         let generation = i64::try_from(binding.binding_generation)?;
         let revision = i64::try_from(binding.operation_revision)?;
         let now = unix_timestamp_millis();
         let verification_json = serde_json::to_string(&binding.verification_json)?;
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
-        let operation: (String,String,String,String) = transaction.query_row(
-            "SELECT library_uuid,root_uuid,state,COALESCE(plan_uuid,'') FROM root_operations WHERE operation_uuid=?1",
-            [operation_uuid],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        let operation: (String,String,String,String,String) = transaction.query_row(
+            "SELECT library_uuid,root_uuid,kind,state,COALESCE(plan_uuid,'') FROM root_operations WHERE operation_uuid=?1",
+            [operation_uuid],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         ).context("root-operation-not-found")?;
         if operation.0 != binding.library_uuid
             || operation.1 != binding.root_uuid
-            || operation.3 != plan_uuid
+            || operation.4 != plan_uuid
         {
             bail!("stale-plan");
         }
-        if operation.2 == "completed" {
+        let enrollment = operation.2 == "enroll";
+        if enrollment && binding.applied_materialized_name.is_none() {
+            bail!("invalid-root-materialization");
+        }
+        if operation.3 == "completed" && !enrollment {
             transaction.commit()?;
             drop(connection);
             return self
                 .local_root_binding(&binding.library_uuid, &binding.root_uuid)?
                 .context("local-root-binding-not-found");
         }
-        if operation.2 != "waiting" {
+        if operation.3 != "waiting" && operation.3 != "completed" {
             bail!("operation-in-progress");
         }
-        let previous: Option<(String,i64)> = transaction.query_row(
-            "SELECT state,binding_generation FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2",
-            params![binding.library_uuid,binding.root_uuid],|row|Ok((row.get(0)?,row.get(1)?)),
+        let previous: Option<(String,i64,String,String,String)> = transaction.query_row(
+            "SELECT state,binding_generation,local_binding_uuid,local_path,canonical_path_key FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2",
+            params![binding.library_uuid,binding.root_uuid],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         ).optional()?;
         let sealed_lineage: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM root_cutover_snapshots WHERE library_uuid=?1 AND root_uuid=?2)",
@@ -2936,37 +3163,97 @@ impl HostRegistry {
         )?;
         if previous
             .as_ref()
-            .is_some_and(|(state, _)| state == "local-only-fork")
+            .is_some_and(|(state, _, _, _, _)| state == "local-only-fork")
             || sealed_lineage
         {
             bail!("comparison-required");
         }
-        if let Some((_, previous_generation)) = previous {
-            if generation <= previous_generation {
+        if let Some((_, previous_generation, previous_binding_uuid, previous_path, previous_key)) =
+            previous
+        {
+            let replaying_enrollment = enrollment
+                && generation == previous_generation
+                && binding.local_binding_uuid == previous_binding_uuid
+                && binding.local_path == previous_path
+                && binding.canonical_path_key == previous_key;
+            if generation < previous_generation
+                || (generation == previous_generation && !replaying_enrollment)
+            {
                 bail!("stale-binding-generation");
             }
             transaction.execute(
-                "UPDATE local_root_bindings SET local_binding_uuid=?1,local_path=?2,canonical_path_key=?3,placement_parent=?4,placement_parent_key=?5,marker_identity=?6,filesystem_identity=?7,state=?8,binding_generation=?9,root_capture_epoch=?10,root_actor_epoch=?11,desired_materialized_name=?12,desired_materialized_name_key=?13,desired_materialization_fingerprint=?14,operation_revision=?15,verification_json=?16,last_error_code=NULL,last_error_detail=NULL,updated_at=?17 WHERE library_uuid=?18 AND root_uuid=?19",
-                params![binding.local_binding_uuid,binding.local_path,binding.canonical_path_key,binding.placement_parent,binding.placement_parent_key,binding.marker_identity,binding.filesystem_identity,binding.state,generation,binding.root_capture_epoch,binding.root_actor_epoch,binding.desired_materialized_name,binding.desired_materialized_name.to_lowercase(),binding.desired_materialization_fingerprint,revision,verification_json,now,binding.library_uuid,binding.root_uuid],
+                "UPDATE local_root_bindings SET local_binding_uuid=?1,local_path=?2,canonical_path_key=?3,placement_parent=?4,placement_parent_key=?5,marker_identity=?6,filesystem_identity=?7,state=?8,binding_generation=?9,root_capture_epoch=?10,root_actor_epoch=?11,desired_materialized_name=?12,desired_materialized_name_key=?13,desired_materialization_fingerprint=?14,applied_materialized_name=COALESCE(?15,applied_materialized_name),applied_materialized_name_key=CASE WHEN ?15 IS NULL THEN applied_materialized_name_key ELSE lower(?15) END,applied_materialization_fingerprint=COALESCE(?16,applied_materialization_fingerprint),operation_revision=?17,verification_json=?18,last_error_code=NULL,last_error_detail=NULL,updated_at=?19 WHERE library_uuid=?20 AND root_uuid=?21",
+                params![binding.local_binding_uuid,binding.local_path,binding.canonical_path_key,binding.placement_parent,binding.placement_parent_key,binding.marker_identity,binding.filesystem_identity,binding.state,generation,binding.root_capture_epoch,binding.root_actor_epoch,binding.desired_materialized_name,binding.desired_materialized_name.to_lowercase(),binding.desired_materialization_fingerprint,binding.applied_materialized_name,binding.applied_materialization_fingerprint,revision,verification_json,now,binding.library_uuid,binding.root_uuid],
             )?;
         } else {
             transaction.execute(
-                "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,marker_identity,filesystem_identity,state,binding_generation,root_capture_epoch,root_actor_epoch,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,operation_revision,verification_json,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?19)",
-                params![binding.library_uuid,binding.root_uuid,binding.local_binding_uuid,binding.local_path,binding.canonical_path_key,binding.placement_parent,binding.placement_parent_key,binding.marker_identity,binding.filesystem_identity,binding.state,generation,binding.root_capture_epoch,binding.root_actor_epoch,binding.desired_materialized_name,binding.desired_materialized_name.to_lowercase(),binding.desired_materialization_fingerprint,revision,verification_json,now],
+                "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,marker_identity,filesystem_identity,state,binding_generation,root_capture_epoch,root_actor_epoch,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,applied_materialized_name,applied_materialized_name_key,applied_materialization_fingerprint,operation_revision,verification_json,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,CASE WHEN ?17 IS NULL THEN NULL ELSE lower(?17) END,?18,?19,?20,?21,?21)",
+                params![binding.library_uuid,binding.root_uuid,binding.local_binding_uuid,binding.local_path,binding.canonical_path_key,binding.placement_parent,binding.placement_parent_key,binding.marker_identity,binding.filesystem_identity,binding.state,generation,binding.root_capture_epoch,binding.root_actor_epoch,binding.desired_materialized_name,binding.desired_materialized_name.to_lowercase(),binding.desired_materialization_fingerprint,binding.applied_materialized_name,binding.applied_materialization_fingerprint,revision,verification_json,now],
             )?;
         }
         transaction.execute(
-            "UPDATE remote_sync_roots SET inventory_state='unselected',operation_revision=operation_revision+1,updated_at=?1 WHERE library_uuid=?2 AND root_uuid=?3",
+            "UPDATE remote_sync_roots SET inventory_state='unselected',operation_revision=operation_revision+CASE WHEN inventory_state='unselected' THEN 0 ELSE 1 END,updated_at=?1 WHERE library_uuid=?2 AND root_uuid=?3",
             params![now,binding.library_uuid,binding.root_uuid],
         )?;
-        transaction.execute(
-            "UPDATE root_operations SET state='completed',phase='completed',operation_revision=operation_revision+1,updated_at=?1 WHERE operation_uuid=?2",
-            params![now,operation_uuid],
-        )?;
+        if enrollment {
+            transaction.execute(
+                "UPDATE root_operations SET state=CASE WHEN state='completed' THEN state ELSE 'waiting' END,phase=CASE WHEN state='completed' THEN phase ELSE 'publishing-descriptor' END,operation_revision=operation_revision+CASE WHEN state='completed' OR phase='publishing-descriptor' THEN 0 ELSE 1 END,updated_at=?1 WHERE operation_uuid=?2",
+                params![now,operation_uuid],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE root_operations SET state='completed',phase='completed',operation_revision=operation_revision+1,updated_at=?1 WHERE operation_uuid=?2",
+                params![now,operation_uuid],
+            )?;
+        }
         transaction.commit()?;
         drop(connection);
         self.local_root_binding(&binding.library_uuid, &binding.root_uuid)?
             .context("local-root-binding-not-found")
+    }
+
+    pub fn complete_root_enrollment(
+        &self,
+        operation_uuid: &str,
+        plan_uuid: &str,
+        preflight_token: &str,
+    ) -> anyhow::Result<RootOperationRecord> {
+        let now = unix_timestamp_millis();
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let operation: (String, String, String, String, String) = transaction
+            .query_row(
+                "SELECT library_uuid,root_uuid,kind,state,COALESCE(plan_uuid,'') FROM root_operations WHERE operation_uuid=?1",
+                [operation_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .context("root-operation-not-found")?;
+        if operation.2 != "enroll" || operation.4 != plan_uuid {
+            bail!("stale-plan");
+        }
+        let binding_ready: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_root_bindings WHERE library_uuid=?1 AND root_uuid=?2 AND applied_materialized_name=desired_materialized_name AND applied_materialization_fingerprint=desired_materialization_fingerprint AND state IN ('active','paused'))",
+            params![operation.0, operation.1],
+            |row| row.get(0),
+        )?;
+        if !binding_ready {
+            bail!("local-root-binding-not-ready");
+        }
+        transaction.execute(
+            "UPDATE root_path_preflights SET consumed_at=COALESCE(consumed_at,?1) WHERE preflight_token=?2 AND library_uuid=?3",
+            params![now,preflight_token,operation.0],
+        )?;
+        transaction.execute(
+            "UPDATE root_operations SET state='completed',phase='completed',operation_revision=operation_revision+CASE WHEN state='completed' AND phase='completed' THEN 0 ELSE 1 END,error_code=NULL,error_detail=NULL,updated_at=?1 WHERE operation_uuid=?2",
+            params![now,operation_uuid],
+        )?;
+        let completed = transaction.query_row(
+            "SELECT operation_uuid,library_uuid,root_uuid,kind,state,phase,request_hash,request_json,expected_operation_revision,expected_binding_generation,operation_revision,cutover_committed,error_code,created_at,updated_at FROM root_operations WHERE operation_uuid=?1",
+            [operation_uuid],
+            root_operation_record_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(completed)
     }
 
     #[allow(dead_code)]
@@ -3092,6 +3379,55 @@ impl HostRegistry {
             .map(|root_uuid| {
                 self.local_root_binding(library_uuid, &root_uuid)?
                     .ok_or_else(|| anyhow::anyhow!("local-root-binding-not-found"))
+            })
+            .collect()
+    }
+
+    pub(crate) fn local_root_binding_for_canonical_path(
+        &self,
+        canonical_path_key: &str,
+    ) -> anyhow::Result<Option<LocalRootBindingRecord>> {
+        let identity = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .query_row(
+                "SELECT library_uuid,root_uuid FROM local_root_bindings WHERE canonical_path_key=?1",
+                [canonical_path_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        identity
+            .map(|(library_uuid, root_uuid)| {
+                self.local_root_binding(&library_uuid, &root_uuid)?
+                    .context("local-root-binding-not-found")
+            })
+            .transpose()
+    }
+
+    pub(crate) fn local_root_bindings_for_filesystem_identity(
+        &self,
+        filesystem_identity: &str,
+    ) -> anyhow::Result<Vec<LocalRootBindingRecord>> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT library_uuid,root_uuid FROM local_root_bindings WHERE filesystem_identity=?1 ORDER BY library_uuid,root_uuid",
+        )?;
+        let identities = statement
+            .query_map([filesystem_identity], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        drop(connection);
+        identities
+            .into_iter()
+            .map(|(library_uuid, root_uuid)| {
+                self.local_root_binding(&library_uuid, &root_uuid)?
+                    .context("local-root-binding-not-found")
             })
             .collect()
     }
@@ -5902,39 +6238,7 @@ impl HostRegistry {
             anyhow::bail!("stale-provider-account-generation");
         }
         for discovered in libraries {
-            let metadata = &discovered.metadata;
-            let library_uuid = metadata
-                .key
-                .strip_suffix("/library-descriptor")
-                .ok_or_else(|| anyhow::anyhow!("invalid provider root descriptor key"))?;
-            let canonical = uuid::Uuid::parse_str(library_uuid)?;
-            if canonical.to_string() != library_uuid {
-                anyhow::bail!("non-canonical provider root Library UUID");
-            }
-            transaction.execute(
-                "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,descriptor_etag,account_generation,updated_at,name,icon,media_count,logical_bytes,last_synced_at,compatible,descriptor_error_code) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(account_uuid,library_uuid) DO UPDATE SET descriptor_size=excluded.descriptor_size,descriptor_sha256=excluded.descriptor_sha256,descriptor_etag=excluded.descriptor_etag,account_generation=excluded.account_generation,updated_at=excluded.updated_at,name=excluded.name,icon=excluded.icon,media_count=excluded.media_count,logical_bytes=excluded.logical_bytes,last_synced_at=excluded.last_synced_at,compatible=excluded.compatible,descriptor_error_code=excluded.descriptor_error_code",
-                params![account_uuid,library_uuid,metadata.size as i64,metadata.sha256.as_slice(),metadata.etag,account_generation,now,discovered.name,discovered.icon,discovered.media_count.map(|v|v as i64),discovered.logical_bytes.map(|v|v as i64),discovered.last_synced_at,discovered.compatible as i64,discovered.error_code],
-            )?;
-            transaction.execute(
-                "DELETE FROM provider_remote_sync_roots WHERE account_uuid=?1 AND library_uuid=?2",
-                params![account_uuid, library_uuid],
-            )?;
-            if discovered.compatible {
-                for root in &discovered.roots {
-                    let root_uuid = uuid::Uuid::parse_str(&root.root_uuid)?;
-                    let root_folder_uuid = uuid::Uuid::parse_str(&root.root_folder_uuid)?;
-                    if root_uuid.to_string() != root.root_uuid
-                        || root_folder_uuid.to_string() != root.root_folder_uuid
-                        || root.materialization_fingerprint.len() != 64
-                    {
-                        anyhow::bail!("invalid remote root descriptor");
-                    }
-                    transaction.execute(
-                        "INSERT INTO provider_remote_sync_roots(account_uuid,library_uuid,root_uuid,root_folder_uuid,requested_name,materialized_name,materialization_fingerprint,logical_revision,logical_bytes,compatible,error_code,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,NULL,?10)",
-                        params![account_uuid,library_uuid,root.root_uuid,root.root_folder_uuid,root.requested_name,root.materialized_name,root.materialization_fingerprint,i64::try_from(root.logical_revision)?,root.logical_bytes.map(i64::try_from).transpose()?,now],
-                    )?;
-                }
-            }
+            cache_remote_descriptor(&transaction, account_uuid, account_generation, discovered)?;
         }
         transaction.execute(
             "INSERT INTO provider_account_root_cursors(account_uuid,scope,cursor,page_token,generation,updated_at) VALUES (?1,'root',?2,?3,?4,?5) ON CONFLICT(account_uuid,scope) DO UPDATE SET cursor=excluded.cursor,page_token=excluded.page_token,generation=excluded.generation,updated_at=excluded.updated_at",
@@ -6020,9 +6324,97 @@ impl HostRegistry {
         }
         let now = unix_timestamp_millis();
         connection.execute(
-            "INSERT INTO provider_object_receipts(library_uuid,binding_epoch,object_key,etag,sha256,state,generation,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8) ON CONFLICT(library_uuid,binding_epoch,object_key) DO UPDATE SET etag=excluded.etag,sha256=excluded.sha256,state=excluded.state,generation=excluded.generation,updated_at=excluded.updated_at",
+            "INSERT INTO provider_object_receipts(library_uuid,binding_epoch,object_key,etag,sha256,state,generation,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8) ON CONFLICT(library_uuid,binding_epoch,object_key) DO UPDATE SET etag=excluded.etag,sha256=excluded.sha256,state=CASE WHEN excluded.state='durable' AND provider_object_receipts.sha256=excluded.sha256 AND provider_object_receipts.state IN ('created','already-exists-matching') THEN provider_object_receipts.state ELSE excluded.state END,generation=excluded.generation,updated_at=excluded.updated_at",
             params![library_uuid,binding_epoch.as_bytes().as_slice(),object_key,etag,sha256.as_slice(),state,transport_generation,now],
         )?;
+        Ok(())
+    }
+
+    pub fn has_published_receipt(
+        &self,
+        library_uuid: &str,
+        binding: &BindingTransport,
+        key: &str,
+        hash: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM provider_object_receipts WHERE library_uuid=?1 AND binding_epoch=?2 AND generation<=?3 AND object_key=?4 AND sha256=?5 AND state IN ('created','already-exists-matching'))",params![library_uuid,binding.binding_epoch.as_bytes().as_slice(),binding.transport_generation,key,hash.as_slice()],|row|row.get(0))?)
+    }
+
+    pub fn cache_bound_descriptor(
+        &self,
+        library_uuid: &str,
+        binding: &BindingTransport,
+        discovered: &DiscoveredRemoteLibrary,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let generation: Option<i64> = transaction.query_row("SELECT a.generation FROM library_sync_bindings b JOIN plugin_accounts a ON a.account_uuid=b.account_uuid WHERE b.library_uuid=?1 AND b.binding_epoch=?2 AND b.transport_generation=?3 AND a.account_uuid=?4",params![library_uuid,binding.binding_epoch.as_bytes().as_slice(),binding.transport_generation,binding.account_uuid],|row|row.get(0)).optional()?;
+        let generation = generation.context("stale-provider-transport-generation")?;
+        cache_remote_descriptor(&transaction, &binding.account_uuid, generation, discovered)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn chosen_descriptor(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let restoring: Option<(String,Option<String>,Option<String>)> = connection.query_row("SELECT descriptor_key,checkpoint_key,checkpoint_sha256 FROM sync_restore_plans WHERE library_uuid=?1 AND catalog_ready=0 AND state NOT IN ('failed','cancelled') ORDER BY created_at DESC LIMIT 1",[library_uuid],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        if restoring.is_some() {
+            return Ok(restoring);
+        }
+        Ok(connection.query_row("SELECT r.descriptor_key,r.checkpoint_key,r.checkpoint_sha256 FROM provider_remote_libraries r JOIN library_sync_bindings b ON b.account_uuid=r.account_uuid AND b.library_uuid=r.library_uuid JOIN plugin_accounts a ON a.account_uuid=r.account_uuid AND a.generation=r.account_generation WHERE r.library_uuid=?1 AND r.compatible=1",[library_uuid],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?)
+    }
+
+    pub fn verified_remote_descriptor(
+        &self,
+        account_uuid: &str,
+        library_uuid: &str,
+        metadata: &crate::sync::provider::ObjectMetadata,
+    ) -> anyhow::Result<Option<DiscoveredRemoteLibrary>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let row:Option<String> = connection.query_row("SELECT v.candidate_json FROM provider_verified_descriptors v JOIN plugin_accounts a ON a.account_uuid=v.account_uuid AND a.generation=v.account_generation WHERE v.account_uuid=?1 AND v.library_uuid=?2 AND v.descriptor_key=?3",params![account_uuid,library_uuid,metadata.key],|row|row.get(0)).optional()?;
+        let candidate = row
+            .map(|json| serde_json::from_str::<DiscoveredRemoteLibrary>(&json))
+            .transpose()?;
+        Ok(candidate.filter(|candidate| {
+            metadata
+                .etag
+                .as_deref()
+                .is_some_and(|etag| !etag.is_empty() && !etag.starts_with("W/"))
+                && candidate.metadata.size == metadata.size
+                && candidate.metadata.sha256 == metadata.sha256
+                && candidate.metadata.etag == metadata.etag
+        }))
+    }
+
+    pub fn chosen_descriptor_identity(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let pinned = connection.query_row("SELECT p.descriptor_key,p.descriptor_sha256 FROM sync_restore_plans p JOIN library_sync_bindings b ON b.library_uuid=p.library_uuid AND b.account_uuid=p.account_uuid WHERE p.library_uuid=?1 AND p.catalog_ready=0 AND p.state NOT IN ('failed','cancelled') ORDER BY p.created_at DESC LIMIT 1",[library_uuid],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        if pinned.is_some() {
+            return Ok(pinned);
+        }
+        Ok(connection.query_row("SELECT r.descriptor_key,r.descriptor_sha256 FROM provider_remote_libraries r JOIN library_sync_bindings b ON b.account_uuid=r.account_uuid AND b.library_uuid=r.library_uuid JOIN plugin_accounts a ON a.account_uuid=r.account_uuid AND a.generation=r.account_generation WHERE r.library_uuid=?1 AND r.compatible=1",[library_uuid],|row|Ok((row.get(0)?,row.get(1)?))).optional()?)
+    }
+
+    pub fn complete_restore_descriptor_pin(
+        &self,
+        library_uuid: &str,
+        binding: &BindingTransport,
+        candidate: &DiscoveredRemoteLibrary,
+    ) -> anyhow::Result<()> {
+        let (_, key) = crate::sync::descriptor::split_root_key(&candidate.metadata.key)?;
+        let evidence = candidate
+            .evidence
+            .as_ref()
+            .context("descriptor evidence missing")?;
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection.execute("UPDATE sync_restore_plans SET checkpoint_key=?1,checkpoint_sha256=?2 WHERE library_uuid=?3 AND account_uuid=?4 AND catalog_ready=0 AND state NOT IN ('failed','cancelled') AND descriptor_key=?5 AND descriptor_sha256=?6 AND (checkpoint_key IS NULL OR (checkpoint_key=?1 AND checkpoint_sha256=?2)) AND EXISTS(SELECT 1 FROM library_sync_bindings b WHERE b.library_uuid=?3 AND b.account_uuid=?4 AND b.binding_epoch=?7 AND b.transport_generation=?8)",params![evidence.checkpoint_key,evidence.checkpoint_sha256,library_uuid,binding.account_uuid,key,candidate.metadata.sha256.as_slice(),binding.binding_epoch.as_bytes().as_slice(),binding.transport_generation])?;
         Ok(())
     }
 
@@ -6387,6 +6779,14 @@ impl HostRegistry {
         if schema_version < 17 {
             connection.execute_batch(HOST_MIGRATION_0017)?;
         }
+        let schema_version: i64 = connection.query_row(
+            "SELECT schema_version FROM host_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_version < 18 {
+            connection.execute_batch(HOST_MIGRATION_0018)?;
+        }
         let now = unix_timestamp_millis();
         connection.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_creations", [now])?;
         connection.execute("DELETE FROM plugin_secret_creations", [])?;
@@ -6501,7 +6901,7 @@ impl HostRegistry {
         generation: i64,
     ) -> anyhow::Result<()> {
         let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
-            "UPDATE library_sync_bindings SET capture_generation=?1,updated_at=?2 WHERE library_uuid=?3 AND binding_epoch=?4 AND state='preparing'",
+            "UPDATE library_sync_bindings SET capture_generation=?1,poll_after=0,updated_at=?2 WHERE library_uuid=?3 AND binding_epoch=?4 AND state='preparing'",
             params![generation,unix_timestamp_millis(),library_uuid,binding_epoch.as_bytes().as_slice()],
         )?;
         if changed != 1 {
@@ -6515,9 +6915,16 @@ impl HostRegistry {
         library_uuid: &str,
     ) -> anyhow::Result<Option<i64>> {
         Ok(self.connection.lock().unwrap_or_else(|p|p.into_inner()).query_row(
-            "SELECT capture_generation FROM library_sync_bindings WHERE library_uuid=?1 AND state IN ('preparing','capturing','seed_ready','publishing')",
+            "SELECT capture_generation FROM library_sync_bindings WHERE library_uuid=?1 AND state IN ('preparing','capturing','seed_ready','publishing') AND capture_generation IS NOT NULL",
             [library_uuid],|row|row.get(0),
         ).optional()?)
+    }
+
+    pub fn sync_capture_boundary_pending(&self, library_uuid: &str) -> anyhow::Result<bool> {
+        Ok(self.connection.lock().unwrap_or_else(|p| p.into_inner()).query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_sync_bindings WHERE library_uuid=?1 AND state IN ('preparing','capturing') AND capture_generation IS NULL)",
+            [library_uuid], |row| row.get(0),
+        )?)
     }
 
     /// Descriptor publication is fenced on a durable, validated Catalog
@@ -6552,7 +6959,7 @@ impl HostRegistry {
         checkpoint_key: &str,
     ) -> anyhow::Result<()> {
         let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
-            "UPDATE library_sync_bindings SET state='active',updated_at=?1 WHERE library_uuid=?2 AND binding_epoch=?3 AND transport_generation=?4 AND state IN ('seed_ready','publishing') AND EXISTS (SELECT 1 FROM provider_object_receipts r WHERE r.library_uuid=library_sync_bindings.library_uuid AND r.binding_epoch=library_sync_bindings.binding_epoch AND r.object_key='library-descriptor' AND r.generation=?4 AND r.state IN ('created','already-exists-matching')) AND EXISTS (SELECT 1 FROM provider_object_receipts r WHERE r.library_uuid=library_sync_bindings.library_uuid AND r.binding_epoch=library_sync_bindings.binding_epoch AND r.object_key=?5 AND r.generation=?4 AND r.state IN ('created','already-exists-matching'))",
+            "UPDATE library_sync_bindings SET state='active',updated_at=?1 WHERE library_uuid=?2 AND binding_epoch=?3 AND transport_generation=?4 AND state IN ('seed_ready','publishing') AND EXISTS (SELECT 1 FROM provider_object_receipts r WHERE r.library_uuid=library_sync_bindings.library_uuid AND r.binding_epoch=library_sync_bindings.binding_epoch AND r.object_key='library-descriptor' AND r.generation<=?4 AND r.state IN ('created','already-exists-matching')) AND EXISTS (SELECT 1 FROM provider_object_receipts r WHERE r.library_uuid=library_sync_bindings.library_uuid AND r.binding_epoch=library_sync_bindings.binding_epoch AND r.object_key=?5 AND r.generation<=?4 AND r.state IN ('created','already-exists-matching'))",
             params![unix_timestamp_millis(),library_uuid,binding_epoch.as_bytes().as_slice(),transport_generation,checkpoint_key],
         )?;
         if changed != 1 {
@@ -6809,55 +7216,6 @@ impl HostRegistry {
         Ok(rows)
     }
 
-    pub fn list_remote_library_roots(
-        &self,
-        account_uuid: &str,
-        library_uuid: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> anyhow::Result<Vec<RemoteLibraryRootSummary>> {
-        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let placement_base: Option<String> = connection
-            .query_row(
-                "SELECT settings.default_placement_base FROM library_sync_bindings binding JOIN library_local_settings settings ON settings.library_uuid=binding.library_uuid WHERE binding.account_uuid=?1 AND COALESCE(binding.remote_namespace,binding.library_uuid)=?2 LIMIT 1",
-                params![account_uuid, library_uuid],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let mut statement = connection.prepare(
-            "SELECT root.account_uuid,root.library_uuid,root.root_uuid,root.root_folder_uuid,root.requested_name,root.materialized_name,root.materialization_fingerprint,root.logical_revision,root.logical_bytes,root.compatible,root.error_code FROM provider_remote_sync_roots root JOIN provider_remote_libraries library ON library.account_uuid=root.account_uuid AND library.library_uuid=root.library_uuid JOIN plugin_accounts account ON account.account_uuid=root.account_uuid WHERE root.account_uuid=?1 AND root.library_uuid=?2 AND library.account_generation=account.generation AND (?3 IS NULL OR root.root_uuid>?3) ORDER BY root.root_uuid LIMIT ?4",
-        )?;
-        let rows = statement.query_map(
-            params![account_uuid, library_uuid, cursor, i64::try_from(limit)?],
-            |row| {
-                let materialized_name: String = row.get(5)?;
-                Ok(RemoteLibraryRootSummary {
-                    account_uuid: row.get(0)?,
-                    library_uuid: row.get(1)?,
-                    root_uuid: row.get(2)?,
-                    root_folder_uuid: row.get(3)?,
-                    requested_name: row.get(4)?,
-                    proposed_local_path: placement_base.as_ref().map(|base| {
-                        PathBuf::from(base)
-                            .join(&materialized_name)
-                            .to_string_lossy()
-                            .into_owned()
-                    }),
-                    materialized_name,
-                    materialization_fingerprint: row.get(6)?,
-                    logical_revision: row.get::<_, i64>(7)?.max(0) as u64,
-                    logical_bytes: row
-                        .get::<_, Option<i64>>(8)?
-                        .map(|value| value.max(0) as u64),
-                    selected_by_default: row.get::<_, i64>(9)? != 0,
-                    compatible: row.get::<_, i64>(9)? != 0,
-                    error_code: row.get(10)?,
-                })
-            },
-        )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
     pub fn remote_library_root_inventory(
         &self,
         account_uuid: &str,
@@ -7027,10 +7385,101 @@ impl HostRegistry {
         Ok(next)
     }
 
+    /// An explicit retry restores eligibility from durable publication facts.
+    /// Ordinary wake signals must never reopen an errored or fenced binding.
+    /// Returns whether the interrupted initial Catalog capture still needs setup.
+    pub fn retry_binding(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+        expected: &BindingTransport,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let revision: u64 = transaction.query_row(
+            "SELECT context_revision FROM host_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if revision != expected_revision {
+            anyhow::bail!("stale-library-context");
+        }
+        let (state, checkpoint, capture_generation): (String, Option<Vec<u8>>, Option<i64>) =
+            transaction.query_row(
+                "SELECT state,latest_checkpoint_uuid,capture_generation FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2 AND transport_generation=?3 AND plugin_id=?4 AND account_uuid=?5 AND actor_epoch=?6",
+                params![library_uuid,expected.binding_epoch.as_bytes().as_slice(),expected.transport_generation,expected.plugin_id,expected.account_uuid,expected.actor_epoch.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).optional()?.ok_or_else(|| anyhow::anyhow!("stale-provider-transport-generation"))?;
+        let unbinding: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_unbind_plans WHERE library_uuid=?1 AND state IN ('cutover','reconciling'))",
+            [library_uuid],
+            |row| row.get(0),
+        )?;
+        if unbinding
+            || !matches!(state.as_str(), "error" | "preparing" | "capturing")
+            || !sync_public_state(Some(&state)).3.contains(&"retry")
+        {
+            anyhow::bail!("sync-action-not-allowed");
+        }
+        let provider_ready: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE i.plugin_id=?1 AND a.account_uuid=?2 AND i.enabled_intent=1 AND r.state='ready' AND a.auth_state='authenticated' AND EXISTS(SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1'))",
+            params![expected.plugin_id,expected.account_uuid],
+            |row| row.get(0),
+        )?;
+        if !provider_ready {
+            anyhow::bail!("provider-not-ready");
+        }
+        let next_state = if state != "error" {
+            state.as_str()
+        } else if let Some(checkpoint) = checkpoint.as_ref() {
+            let checkpoint_key = format!(
+                "checkpoints/{}.checkpoint",
+                uuid::Uuid::from_slice(checkpoint)?
+            );
+            // Pausing advances the transport generation, not the immutable
+            // remote publication. Earlier receipts remain evidence within the
+            // same binding epoch; a future or foreign epoch is never accepted.
+            let published: bool = transaction.query_row(
+                "SELECT COUNT(*)=2 FROM provider_object_receipts WHERE library_uuid=?1 AND binding_epoch=?2 AND generation<=?3 AND object_key IN ('library-descriptor',?4) AND state IN ('created','already-exists-matching')",
+                params![library_uuid,expected.binding_epoch.as_bytes().as_slice(),expected.transport_generation,checkpoint_key],
+                |row| row.get(0),
+            )?;
+            if published {
+                "active"
+            } else {
+                "seed_ready"
+            }
+        } else if capture_generation.is_none() && expected.remote_namespace.is_some() {
+            // A restored Catalog has no locally published seed receipt. Keep
+            // restore work in its own phase instead of starting a new capture.
+            let restore_state: Option<String> = transaction.query_row(
+                "SELECT state FROM sync_restore_plans WHERE library_uuid=?1 AND account_uuid=?2 ORDER BY created_at DESC LIMIT 1",
+                params![library_uuid,expected.account_uuid],
+                |row| row.get(0),
+            ).optional()?;
+            match restore_state.as_deref() {
+                Some("complete") => "active",
+                Some("restoring" | "catalog-ready") => "restoring",
+                Some(_) => anyhow::bail!("sync-action-not-allowed"),
+                None => "preparing",
+            }
+        } else {
+            "preparing"
+        };
+        let needs_capture = next_state == "preparing" && capture_generation.is_none();
+        transaction.execute(
+            "UPDATE library_sync_bindings SET state=?2,poll_after=0,retry_after=NULL,last_error_code=NULL,updated_at=?3 WHERE library_uuid=?1",
+            params![library_uuid,next_state,unix_timestamp_millis()],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(needs_capture)
+    }
+
     pub fn wake_binding(&self, library_uuid: &str) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
-        if transaction.execute("UPDATE library_sync_bindings SET poll_after=0,retry_after=NULL,last_error_code=NULL,updated_at=?2 WHERE library_uuid=?1 AND state NOT IN ('paused','unbinding')",params![library_uuid,unix_timestamp_millis()])? == 0 { anyhow::bail!("sync-action-not-allowed"); }
+        if transaction.execute("UPDATE library_sync_bindings SET poll_after=0,retry_after=NULL,last_error_code=NULL,updated_at=?2 WHERE library_uuid=?1 AND state IN ('preparing','capturing','seed_ready','publishing','active','restoring')",params![library_uuid,unix_timestamp_millis()])? == 0 { anyhow::bail!("sync-action-not-allowed"); }
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(())
@@ -7040,7 +7489,7 @@ impl HostRegistry {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
-            "UPDATE library_sync_bindings SET poll_after=0,retry_after=NULL,last_error_code=NULL,updated_at=?1 WHERE state NOT IN ('paused','unbinding')",
+            "UPDATE library_sync_bindings SET poll_after=0,retry_after=NULL,last_error_code=NULL,updated_at=?1 WHERE state IN ('preparing','capturing','seed_ready','publishing','active','restoring')",
             [unix_timestamp_millis()],
         )?;
         if changed > 0 {
@@ -7055,11 +7504,13 @@ impl HostRegistry {
         let next_poll = now + if active { 30_000 } else { 180_000 };
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "UPDATE library_sync_bindings SET last_success_at=?2,last_error_code=NULL,retry_after=NULL,poll_after=?3,updated_at=?2 WHERE library_uuid=?1 AND state NOT IN ('paused','unbinding')",
+        let changed = transaction.execute(
+            "UPDATE library_sync_bindings SET last_success_at=?2,last_error_code=NULL,retry_after=NULL,poll_after=?3,updated_at=?2 WHERE library_uuid=?1 AND state IN ('preparing','capturing','seed_ready','publishing','active','restoring')",
             params![library_uuid,now,next_poll],
         )?;
-        Self::bump_sync_status_revision(&transaction)?;
+        if changed > 0 {
+            Self::bump_sync_status_revision(&transaction)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -7072,11 +7523,13 @@ impl HostRegistry {
         let now = unix_timestamp_millis();
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "UPDATE library_sync_bindings SET state='error',last_error_code=?2,retry_after=?3,poll_after=NULL,updated_at=?4 WHERE library_uuid=?1 AND state NOT IN ('paused','unbinding')",
+        let changed = transaction.execute(
+            "UPDATE library_sync_bindings SET state='error',last_error_code=?2,retry_after=?3,poll_after=NULL,updated_at=?4 WHERE library_uuid=?1 AND state IN ('preparing','capturing','seed_ready','publishing','active','restoring')",
             params![library_uuid,error_code,now+15_000,now],
         )?;
-        Self::bump_sync_status_revision(&transaction)?;
+        if changed > 0 {
+            Self::bump_sync_status_revision(&transaction)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -7440,6 +7893,12 @@ impl HostRegistry {
         )?;
         if ready != 1 {
             anyhow::bail!("provider-not-ready");
+        }
+        let (device,stream,host_actor):(Vec<u8>,Vec<u8>,Option<Vec<u8>>)=transaction.query_row("SELECT device_uuid,stream_uuid,active_actor_epoch FROM host_sync_local_state WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        if host_actor.is_none() {
+            let host_actor = uuid::Uuid::now_v7();
+            transaction.execute("INSERT INTO host_sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,state,next_actor_seq,published_through_seq,created_at) VALUES (?1,?2,?3,'active',1,0,?4)",params![host_actor.as_bytes().as_slice(),device,stream,unix_timestamp_millis()])?;
+            transaction.execute("UPDATE host_sync_local_state SET active_actor_epoch=?1,capture_enabled=1,updated_at=?2 WHERE singleton=1",params![host_actor.as_bytes().as_slice(),unix_timestamp_millis()])?;
         }
         let binding = uuid::Uuid::now_v7();
         let actor = uuid::Uuid::now_v7();
@@ -8900,8 +9359,31 @@ mod tests {
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
-            17
+            18
         );
+        for table in [
+            "provider_remote_descriptor_heads",
+            "provider_verified_descriptors",
+        ] {
+            assert!(connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap());
+        }
+        for table in ["provider_remote_libraries", "sync_restore_plans"] {
+            for column in ["descriptor_key", "checkpoint_key", "checkpoint_sha256"] {
+                assert!(connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                        params![table, column],
+                        |row| row.get::<_, bool>(0)
+                    )
+                    .unwrap());
+            }
+        }
         assert!(connection
             .execute(
                 "UPDATE remote_sync_roots SET root_folder_uuid='00000000-0000-7000-8000-000000000008' WHERE library_uuid=?1 AND root_uuid=?2",
@@ -8926,6 +9408,218 @@ mod tests {
         ).is_err());
         drop(connection);
         drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn enrollment_binding_stages_applied_name_and_completes_after_catalog_projection() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).expect("open host registry");
+        let library_uuid = "00000000-0000-7000-8000-000000000301";
+        let root_uuid = "00000000-0000-7000-8000-000000000302";
+        let root_folder_uuid = "00000000-0000-7000-8000-000000000303";
+        let operation_uuid = "00000000-0000-7000-8000-000000000304";
+        let binding_uuid = "00000000-0000-7000-8000-000000000305";
+        register_test_library(&registry, library_uuid);
+        registry
+            .upsert_remote_sync_root(
+                library_uuid,
+                root_uuid,
+                root_folder_uuid,
+                "Existing",
+                "Existing",
+                &"a".repeat(64),
+                0,
+                "active",
+                None,
+                None,
+            )
+            .expect("store remote root");
+        let request = serde_json::json!({
+            "operationUuid": operation_uuid,
+            "expectedOperationRevision": 0,
+            "rootUuid": root_uuid,
+            "rootFolderUuid": root_folder_uuid,
+            "preflightToken": operation_uuid,
+            "path": "D:/Existing",
+            "requestedName": "Existing"
+        });
+        let request_hash = crate::sync_folders::request_hash(&request).unwrap();
+        registry
+            .store_root_path_preflight(
+                operation_uuid,
+                library_uuid,
+                Some(root_uuid),
+                "enroll-existing",
+                &request_hash,
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                unix_timestamp_millis() + 60_000,
+            )
+            .expect("store preflight");
+        registry
+            .begin_root_operation_once(
+                operation_uuid,
+                library_uuid,
+                root_uuid,
+                "enroll",
+                "preflighting",
+                &request_hash,
+                &request,
+                0,
+                None,
+            )
+            .expect("begin enrollment");
+        registry
+            .set_root_operation_plan(
+                operation_uuid,
+                operation_uuid,
+                &serde_json::json!({"preflightToken":operation_uuid}),
+                "capturing-seed",
+            )
+            .expect("set enrollment plan");
+        let binding = NewLocalRootBinding {
+            library_uuid: library_uuid.into(),
+            root_uuid: root_uuid.into(),
+            local_binding_uuid: binding_uuid.into(),
+            local_path: "D:/Existing".into(),
+            canonical_path_key: "d:/existing".into(),
+            placement_parent: "D:/".into(),
+            placement_parent_key: "d:".into(),
+            marker_identity: "marker".into(),
+            filesystem_identity: Some("filesystem".into()),
+            state: "active".into(),
+            binding_generation: 1,
+            root_capture_epoch: Some(Uuid::now_v7().to_string()),
+            root_actor_epoch: Some(Uuid::now_v7().to_string()),
+            desired_materialized_name: "Existing".into(),
+            desired_materialization_fingerprint: "a".repeat(64),
+            applied_materialized_name: Some("Existing".into()),
+            applied_materialization_fingerprint: Some("a".repeat(64)),
+            operation_revision: 1,
+            verification_json: serde_json::json!({}),
+        };
+
+        let staged = registry
+            .commit_local_root_binding(operation_uuid, operation_uuid, &binding)
+            .expect("stage enrollment binding");
+        assert_eq!(staged.state, "active");
+        assert_eq!(
+            staged.applied_materialized_name.as_deref(),
+            Some("Existing")
+        );
+        assert_eq!(
+            staged.applied_materialization_fingerprint.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let operation = registry
+            .root_operation(operation_uuid)
+            .unwrap()
+            .expect("staged enrollment operation");
+        assert_eq!(
+            (operation.state.as_str(), operation.phase.as_str()),
+            ("waiting", "publishing-descriptor")
+        );
+        assert!(registry
+            .pending_automatic_root_renames(library_uuid)
+            .unwrap()
+            .is_empty());
+
+        registry
+            .commit_local_root_binding(operation_uuid, operation_uuid, &binding)
+            .expect("replay staged enrollment binding");
+        registry
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE root_path_preflights SET expires_at=0 WHERE preflight_token=?1",
+                [operation_uuid],
+            )
+            .unwrap();
+        let completed = registry
+            .complete_root_enrollment(operation_uuid, operation_uuid, operation_uuid)
+            .expect("complete staged enrollment after catalog projection");
+        assert_eq!(
+            (completed.state.as_str(), completed.phase.as_str()),
+            ("completed", "completed")
+        );
+
+        let preflight = registry
+            .root_path_preflight(operation_uuid, library_uuid)
+            .expect("read consumed preflight");
+        assert!(preflight.6.is_some());
+
+        registry
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE local_root_bindings SET state='local-rename-required',applied_materialized_name=NULL,applied_materialized_name_key=NULL,applied_materialization_fingerprint=NULL,last_error_code='local-rename-required',operation_revision=operation_revision+1 WHERE library_uuid=?1 AND root_uuid=?2",
+                params![library_uuid,root_uuid],
+            )
+            .expect("simulate legacy enrollment rename failure");
+        let mut replay = binding.clone();
+        replay.operation_revision = completed.operation_revision + 1;
+        let repaired = registry
+            .commit_local_root_binding(operation_uuid, operation_uuid, &replay)
+            .expect("repair legacy completed enrollment");
+        assert_eq!(repaired.state, "active");
+        assert_eq!(repaired.last_error_code, None);
+        assert_eq!(
+            repaired.applied_materialization_fingerprint,
+            Some("a".repeat(64))
+        );
+        assert!(registry
+            .pending_automatic_root_renames(library_uuid)
+            .unwrap()
+            .is_empty());
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn filesystem_identity_lookup_detects_cross_library_aliases() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).expect("open host registry");
+        let owner_library_uuid = "00000000-0000-7000-8000-000000000311";
+        let other_library_uuid = "00000000-0000-7000-8000-000000000312";
+        let root_uuid = "00000000-0000-7000-8000-000000000313";
+        register_test_library(&registry, owner_library_uuid);
+        register_test_library(&registry, other_library_uuid);
+        registry
+            .upsert_remote_sync_root(
+                owner_library_uuid,
+                root_uuid,
+                "00000000-0000-7000-8000-000000000314",
+                "Existing",
+                "Existing",
+                &"a".repeat(64),
+                0,
+                "active",
+                None,
+                None,
+            )
+            .expect("store remote root");
+        registry
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO local_root_bindings(library_uuid,root_uuid,local_binding_uuid,local_path,canonical_path_key,placement_parent,placement_parent_key,marker_identity,filesystem_identity,state,binding_generation,desired_materialized_name,desired_materialized_name_key,desired_materialization_fingerprint,applied_materialized_name,applied_materialized_name_key,applied_materialization_fingerprint,operation_revision,verification_json,created_at,updated_at) VALUES (?1,?2,'00000000-0000-7000-8000-000000000315','D:/Owned','d:/owned','D:/','d:','marker','volume-file','active',1,'Existing','existing',?3,'Existing','existing',?3,1,'{}',1,1)",
+                params![owner_library_uuid, root_uuid, "a".repeat(64)],
+            )
+            .expect("store local binding");
+
+        let bindings = registry
+            .local_root_bindings_for_filesystem_identity("volume-file")
+            .expect("find filesystem owner");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].library_uuid, owner_library_uuid);
+        assert_ne!(bindings[0].library_uuid, other_library_uuid);
+        assert_eq!(bindings[0].root_uuid, root_uuid);
+
+        drop(registry);
         let _ = std::fs::remove_file(path);
     }
 
@@ -9572,6 +10266,8 @@ mod tests {
             root_actor_epoch: Some(Uuid::now_v7().to_string()),
             desired_materialized_name: "Photos".into(),
             desired_materialization_fingerprint: "a".repeat(64),
+            applied_materialized_name: None,
+            applied_materialization_fingerprint: None,
             operation_revision: 1,
             verification_json: serde_json::json!({}),
         };
@@ -9609,6 +10305,228 @@ mod tests {
         registry
             .commit_creation("test-creation", &descriptor)
             .unwrap();
+    }
+
+    #[test]
+    fn retry_binding_uses_durable_seed_receipts_and_preserves_transport_work() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "fake", "account");
+        register_test_library(&registry, "library");
+        let (epoch, _) = registry
+            .begin_sync_binding("library", "fake", "account")
+            .unwrap();
+        let revision = registry.snapshot().unwrap().context_revision;
+        let checkpoint = uuid::Uuid::now_v7();
+        let checkpoint_key = format!("checkpoints/{checkpoint}.checkpoint");
+
+        registry
+            .record_sync_turn_error("library", "test_failure")
+            .unwrap();
+        let initial = registry
+            .binding_transport("library", "library")
+            .unwrap()
+            .unwrap();
+        assert!(registry
+            .retry_binding("library", revision, &initial)
+            .unwrap());
+        assert_eq!(
+            registry
+                .binding_transport("library", "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "preparing"
+        );
+        registry
+            .set_sync_capture_generation("library", epoch, 7)
+            .unwrap();
+        registry
+            .mark_local_seed_ready("library", checkpoint, 7, true)
+            .unwrap();
+        registry
+            .commit_binding_cursor(
+                "library",
+                epoch,
+                1,
+                "library",
+                "library",
+                Some("retained-cursor"),
+            )
+            .unwrap();
+        registry.connection.lock().unwrap().execute(
+            "UPDATE library_sync_bindings SET pending_upload_items=48,pending_upload_bytes=1091197953,published_through_seq=19 WHERE library_uuid='library'",
+            [],
+        ).unwrap();
+
+        for (receipt, phase) in [
+            (None, "seed_ready"),
+            (Some("library-descriptor"), "seed_ready"),
+            (Some(checkpoint_key.as_str()), "active"),
+        ] {
+            if let Some(key) = receipt {
+                registry
+                    .record_provider_receipt("library", epoch, 1, key, None, &[4; 32], "created")
+                    .unwrap();
+            }
+            registry
+                .record_sync_turn_error("library", "test_failure")
+                .unwrap();
+            let before = registry
+                .binding_transport("library", "library")
+                .unwrap()
+                .unwrap();
+            let status_before = registry.sync_status_snapshot().unwrap().libraries.remove(0);
+            assert_eq!(
+                status_before.last_error_code.as_deref(),
+                Some("test_failure")
+            );
+            assert!(!registry
+                .retry_binding("library", revision, &before)
+                .unwrap());
+            let after = registry
+                .binding_transport("library", "library")
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.state, phase);
+            assert_eq!(after.binding_epoch, before.binding_epoch);
+            assert_eq!(after.actor_epoch, before.actor_epoch);
+            assert_eq!(after.transport_generation, before.transport_generation);
+            assert_eq!(after.cursor, before.cursor);
+            assert_eq!(after.latest_checkpoint_uuid, before.latest_checkpoint_uuid);
+            let status_after = registry.sync_status_snapshot().unwrap().libraries.remove(0);
+            assert!(status_after.last_error_code.is_none());
+            assert!(status_after.retry_after.is_none());
+            assert_eq!(status_after.poll_after, Some(0));
+            assert_eq!(status_after.pending_upload_items, 48);
+            assert_eq!(status_after.pending_upload_bytes, 1091197953);
+            let preserved: (i64, i64) = registry.connection.lock().unwrap().query_row(
+                "SELECT capture_generation,published_through_seq FROM library_sync_bindings WHERE library_uuid='library'",
+                [], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert_eq!(preserved, (7, 19));
+        }
+        // A completed pause/resume cannot erase the original publication
+        // facts or make retry rebuild its immutable descriptor.
+        registry.pause_binding("library").unwrap();
+        registry.set_binding_state("library", "active").unwrap();
+        registry
+            .record_sync_turn_error("library", "after_resume")
+            .unwrap();
+        let resumed = registry
+            .binding_transport("library", "library")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.transport_generation, 2);
+        assert!(!registry
+            .retry_binding("library", revision, &resumed)
+            .unwrap());
+        assert_eq!(
+            registry
+                .binding_transport("library", "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn retry_binding_rejects_stale_fenced_and_unready_states_without_erasing_error() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "fake", "account");
+        register_test_library(&registry, "library");
+        registry
+            .begin_sync_binding("library", "fake", "account")
+            .unwrap();
+        registry
+            .record_sync_turn_error("library", "original_failure")
+            .unwrap();
+        let expected = registry
+            .binding_transport("library", "library")
+            .unwrap()
+            .unwrap();
+        let revision = registry.snapshot().unwrap().context_revision;
+        let before = registry.sync_status_snapshot().unwrap().libraries.remove(0);
+        assert!(registry.wake_binding("library").is_err());
+        assert_eq!(registry.wake_all_sync_bindings().unwrap(), 0);
+        registry.record_sync_turn_success("library", true).unwrap();
+        registry
+            .record_sync_turn_error("library", "late_failure")
+            .unwrap();
+        let after = registry.sync_status_snapshot().unwrap().libraries.remove(0);
+        assert_eq!(after.last_error_code, before.last_error_code);
+        assert_eq!(after.retry_after, before.retry_after);
+        assert_eq!(after.last_success_at, before.last_success_at);
+        assert_eq!(
+            registry
+                .retry_binding("library", revision + 1, &expected)
+                .unwrap_err()
+                .to_string(),
+            "stale-library-context"
+        );
+        let mut stale = expected.clone();
+        stale.transport_generation += 1;
+        assert_eq!(
+            registry
+                .retry_binding("library", revision, &stale)
+                .unwrap_err()
+                .to_string(),
+            "stale-provider-transport-generation"
+        );
+        registry
+            .update_plugin_account_auth("fake", "expired", None)
+            .unwrap();
+        assert_eq!(
+            registry
+                .retry_binding("library", revision, &expected)
+                .unwrap_err()
+                .to_string(),
+            "provider-not-ready"
+        );
+        registry
+            .update_plugin_account_auth("fake", "authenticated", None)
+            .unwrap();
+        for state in [
+            "paused",
+            "unbinding",
+            "compatibility_locked",
+            "active",
+            "restoring",
+        ] {
+            registry.set_binding_state("library", state).unwrap();
+            let expected = registry
+                .binding_transport("library", "library")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                registry
+                    .retry_binding("library", revision, &expected)
+                    .unwrap_err()
+                    .to_string(),
+                "sync-action-not-allowed"
+            );
+            if matches!(state, "paused" | "unbinding" | "compatibility_locked") {
+                registry
+                    .record_sync_turn_error("library", "late_failure")
+                    .unwrap();
+                registry.record_sync_turn_success("library", true).unwrap();
+                assert!(registry.wake_binding("library").is_err());
+            }
+            assert_eq!(
+                registry
+                    .binding_transport("library", "library")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                state
+            );
+        }
+        drop(registry);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -10378,6 +11296,8 @@ mod tests {
             root_actor_epoch: Some(uuid::Uuid::now_v7().to_string()),
             desired_materialized_name: "Selected".into(),
             desired_materialization_fingerprint: "a".repeat(64),
+            applied_materialized_name: None,
+            applied_materialization_fingerprint: None,
             operation_revision: 0,
             verification_json: serde_json::json!({}),
         };
@@ -10812,6 +11732,8 @@ mod tests {
             etag: Some("etag-one".into()),
         };
         let discovered = DiscoveredRemoteLibrary {
+            evidence: None,
+            history: BTreeMap::new(),
             metadata,
             name: Some("Remote library".into()),
             icon: Some("folder".into()),
